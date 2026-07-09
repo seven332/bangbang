@@ -340,6 +340,7 @@ pub enum VmmActionError {
     NetworkInterfaceUpdate(network::NetworkInterfaceUpdateError),
     NetworkInterfaceUpdateUnsupported,
     MemoryHotplugConfig(memory_hotplug::MemoryHotplugConfigError),
+    MemoryHotplugStatus(memory_hotplug::MemoryHotplugStatusError),
     MemoryHotplugUpdate(memory_hotplug::MemoryHotplugUpdateError),
     MemoryHotplugUnsupported,
     PmemConfig(pmem::PmemConfigError),
@@ -393,6 +394,7 @@ impl fmt::Display for VmmActionError {
                 f.write_str("Network interface updates are not supported.")
             }
             Self::MemoryHotplugConfig(err) => write!(f, "{err}"),
+            Self::MemoryHotplugStatus(err) => write!(f, "{err}"),
             Self::MemoryHotplugUpdate(err) => write!(f, "{err}"),
             Self::MemoryHotplugUnsupported => f.write_str("Memory hotplug is not supported."),
             Self::PmemConfig(err) => write!(f, "{err}"),
@@ -430,6 +432,7 @@ impl std::error::Error for VmmActionError {
             Self::NetworkInterfaceConfig(err) => Some(err),
             Self::NetworkInterfaceUpdate(err) => Some(err),
             Self::MemoryHotplugConfig(err) => Some(err),
+            Self::MemoryHotplugStatus(err) => Some(err),
             Self::MemoryHotplugUpdate(err) => Some(err),
             Self::PmemConfig(err) => Some(err),
             Self::PmemUpdate(err) => Some(err),

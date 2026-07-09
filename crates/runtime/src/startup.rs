@@ -40,10 +40,10 @@ use crate::memory::{
     GuestMemory, GuestMemoryAllocationError, GuestMemoryError, GuestMemoryLayout, aarch64,
 };
 use crate::memory_hotplug::{
-    MemoryHotplugSizeUpdate, MemoryHotplugUpdateError, PreparedVirtioMemDevice,
-    VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError,
-    VirtioMemMmioDeviceRegistration, VirtioMemMmioHandler, VirtioMemMmioLayout,
-    VirtioMemMmioRegistrationError, VirtioMemPrepareError,
+    MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
+    MemoryHotplugUpdateError, PreparedVirtioMemDevice, VirtioMemDeviceNotificationDispatch,
+    VirtioMemDeviceNotificationError, VirtioMemMmioDeviceRegistration, VirtioMemMmioHandler,
+    VirtioMemMmioLayout, VirtioMemMmioRegistrationError, VirtioMemPrepareError,
 };
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
@@ -1832,6 +1832,21 @@ pub fn update_memory_hotplug_config_for_device(
         .update_mem_requested_size(update)
 }
 
+pub fn memory_hotplug_status_for_device(
+    device: &Arm64BootMemoryHotplugDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: MemoryHotplugConfig,
+    requested_size_mib: u64,
+) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+    let plugged_size = mmio_dispatcher
+        .handler_mut::<VirtioMemMmioHandler>(device.registration.region_id())
+        .map_err(MemoryHotplugStatusError::HandlerLookup)?
+        .device_config_handler()
+        .plugged_size();
+
+    MemoryHotplugStatus::try_from_plugged_size_bytes(config, plugged_size, requested_size_mib)
+}
+
 pub fn update_balloon_statistics_for_device(
     device: &Arm64BootBalloonDevice,
     mmio_dispatcher: &mut MmioDispatcher,
@@ -3013,8 +3028,9 @@ mod tests {
     use crate::machine::{MachineConfig, MachineConfigInput};
     use crate::memory::{GuestAddress, aarch64};
     use crate::memory_hotplug::{
-        MemoryHotplugConfigInput, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE,
-        VIRTIO_MEM_RESPONSE_SIZE, VirtioMemMmioHandler, VirtioMemMmioLayout,
+        MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
+        VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
+        VirtioMemMmioHandler, VirtioMemMmioLayout,
     };
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBusError, MmioDispatchOutcome, MmioDispatcher,
@@ -4643,12 +4659,18 @@ mod tests {
         write_available_heads_at(memory, TEST_BALLOON_STATS_AVAILABLE_RING, &[0]);
     }
 
-    fn write_queued_memory_hotplug_state_request(memory: &mut crate::memory::GuestMemory) {
+    fn write_queued_memory_hotplug_request(
+        memory: &mut crate::memory::GuestMemory,
+        request_type: u16,
+        address: u64,
+        nb_blocks: u16,
+        available_index: u16,
+    ) {
         let mut request = Vec::new();
-        request.extend_from_slice(&3u16.to_le_bytes());
+        request.extend_from_slice(&request_type.to_le_bytes());
         request.extend_from_slice(&[0; 6]);
-        request.extend_from_slice(&VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value().to_le_bytes());
-        request.extend_from_slice(&1u16.to_le_bytes());
+        request.extend_from_slice(&address.to_le_bytes());
+        request.extend_from_slice(&nb_blocks.to_le_bytes());
         request.extend_from_slice(&[0; 6]);
         assert_eq!(request.len(), VIRTIO_MEM_REQUEST_SIZE);
         memory
@@ -4672,7 +4694,26 @@ mod tests {
                 None,
             ),
         );
-        write_available_heads(memory, &[0]);
+        write_guest_u16(
+            memory,
+            available_ring_entry_address_at(TEST_AVAILABLE_RING, available_index - 1),
+            0,
+        );
+        write_guest_u16(
+            memory,
+            available_ring_idx_address_at(TEST_AVAILABLE_RING),
+            available_index,
+        );
+    }
+
+    fn write_queued_memory_hotplug_state_request(memory: &mut crate::memory::GuestMemory) {
+        write_queued_memory_hotplug_request(
+            memory,
+            3,
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value(),
+            1,
+            1,
+        );
     }
 
     fn read_boot_memory_hotplug_response(memory: &crate::memory::GuestMemory) -> (u16, u16) {
@@ -4708,6 +4749,29 @@ mod tests {
                     .expect("memory-hotplug used len address should not overflow"),
             ),
         )
+    }
+
+    fn dispatch_boot_memory_hotplug_request(
+        memory: &mut crate::memory::GuestMemory,
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        request_type: u16,
+        address: u64,
+        nb_blocks: u16,
+        available_index: u16,
+    ) -> super::Arm64BootMemoryHotplugNotificationDispatches {
+        write_queued_memory_hotplug_request(
+            memory,
+            request_type,
+            address,
+            nb_blocks,
+            available_index,
+        );
+        notify_boot_memory_hotplug_queue(runtime, mmio_dispatcher);
+
+        runtime
+            .dispatch_memory_hotplug_queue_notifications(memory, mmio_dispatcher)
+            .expect("memory-hotplug dispatch result should allocate")
     }
 
     fn read_boot_entropy_used_index(memory: &crate::memory::GuestMemory) -> u16 {
@@ -7050,6 +7114,86 @@ mod tests {
                 VirtioMmioRegister::InterruptStatus,
             ),
             1
+        );
+    }
+
+    #[test]
+    fn boot_runtime_memory_hotplug_status_reads_active_plugged_size() {
+        const VIRTIO_MEM_REQ_PLUG: u16 = 0;
+        const VIRTIO_MEM_REQ_UNPLUG: u16 = 1;
+        const VIRTIO_MEM_REQ_UNPLUG_ALL: u16 = 2;
+
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_memory_hotplug("kernel-memory-hotplug-active-status");
+        configure_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher, TEST_USED_RING);
+        let device = runtime
+            .memory_hotplug_device
+            .as_ref()
+            .expect("memory-hotplug device should exist")
+            .clone();
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("memory-hotplug config should validate");
+        let update = config
+            .validate_size_update(MemoryHotplugSizeUpdateInput::new(4))
+            .expect("memory-hotplug size update should validate");
+        super::update_memory_hotplug_config_for_device(&device, &mut mmio_dispatcher, update)
+            .expect("active memory-hotplug requested size should update");
+
+        let dispatches = dispatch_boot_memory_hotplug_request(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_MEM_REQ_PLUG,
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value(),
+            2,
+            1,
+        );
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        assert_eq!(read_boot_memory_hotplug_response(&memory), (0, 0));
+        assert_eq!(read_boot_memory_hotplug_used_index(&memory), 1);
+        assert_eq!(
+            super::memory_hotplug_status_for_device(&device, &mut mmio_dispatcher, config, 4)
+                .expect("memory-hotplug status should read active handler"),
+            crate::memory_hotplug::MemoryHotplugStatus::new(config, 4, 4)
+        );
+
+        let dispatches = dispatch_boot_memory_hotplug_request(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_MEM_REQ_UNPLUG,
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value(),
+            1,
+            2,
+        );
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        assert_eq!(read_boot_memory_hotplug_response(&memory), (0, 0));
+        assert_eq!(read_boot_memory_hotplug_used_index(&memory), 2);
+        assert_eq!(
+            super::memory_hotplug_status_for_device(&device, &mut mmio_dispatcher, config, 4)
+                .expect("memory-hotplug status should reflect unplug"),
+            crate::memory_hotplug::MemoryHotplugStatus::new(config, 2, 4)
+        );
+
+        let dispatches = dispatch_boot_memory_hotplug_request(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_MEM_REQ_UNPLUG_ALL,
+            0,
+            0,
+            3,
+        );
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        assert_eq!(read_boot_memory_hotplug_response(&memory), (0, 0));
+        assert_eq!(read_boot_memory_hotplug_used_index(&memory), 3);
+        assert_eq!(
+            super::memory_hotplug_status_for_device(&device, &mut mmio_dispatcher, config, 4)
+                .expect("memory-hotplug status should reflect unplug-all"),
+            crate::memory_hotplug::MemoryHotplugStatus::new(config, 0, 4)
         );
     }
 

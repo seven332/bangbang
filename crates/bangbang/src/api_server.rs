@@ -1891,7 +1891,10 @@ mod tests {
     use bangbang_runtime::block::DriveUpdateError;
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
-    use bangbang_runtime::memory_hotplug::{MemoryHotplugSizeUpdate, MemoryHotplugUpdateError};
+    use bangbang_runtime::memory_hotplug::{
+        MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus,
+        MemoryHotplugStatusError, MemoryHotplugUpdateError,
+    };
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
@@ -1917,6 +1920,7 @@ mod tests {
         drive_update_result: Option<DriveUpdateError>,
         hinting_host_cmd: u32,
         hinting_last_cmd: u32,
+        memory_hotplug_status_plugged_size_mib: u64,
     }
 
     impl TestSession {
@@ -1927,6 +1931,7 @@ mod tests {
                 drive_update_result: None,
                 hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
                 hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                memory_hotplug_status_plugged_size_mib: 0,
             }
         }
 
@@ -1937,6 +1942,7 @@ mod tests {
                 drive_update_result: None,
                 hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
                 hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                memory_hotplug_status_plugged_size_mib: 0,
             }
         }
 
@@ -1947,6 +1953,18 @@ mod tests {
                 drive_update_result: None,
                 hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
                 hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                memory_hotplug_status_plugged_size_mib: 0,
+            }
+        }
+
+        const fn with_memory_hotplug_status_plugged_size_mib(plugged_size_mib: u64) -> Self {
+            Self {
+                boot_run_loop_status: None,
+                process_exit_signal: None,
+                drive_update_result: None,
+                hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                memory_hotplug_status_plugged_size_mib: plugged_size_mib,
             }
         }
     }
@@ -2031,6 +2049,18 @@ mod tests {
             _update: MemoryHotplugSizeUpdate,
         ) -> Result<(), MemoryHotplugUpdateError> {
             Ok(())
+        }
+
+        fn memory_hotplug_status(
+            &mut self,
+            config: MemoryHotplugConfig,
+            requested_size_mib: u64,
+        ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+            Ok(MemoryHotplugStatus::new(
+                config,
+                self.memory_hotplug_status_plugged_size_mib,
+                requested_size_mib,
+            ))
         }
 
         fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
@@ -2138,6 +2168,16 @@ mod tests {
         fn success_with_process_exit_signal(signal: TestProcessExitSignal) -> Self {
             Self {
                 result: Ok(TestSession::with_process_exit_signal(signal)),
+            }
+        }
+
+        const fn success_with_memory_hotplug_status_plugged_size_mib(
+            plugged_size_mib: u64,
+        ) -> Self {
+            Self {
+                result: Ok(TestSession::with_memory_hotplug_status_plugged_size_mib(
+                    plugged_size_mib,
+                )),
             }
         }
 
@@ -7013,7 +7053,9 @@ mod tests {
 
     #[test]
     fn running_state_accepts_memory_hotplug_patch_and_updates_status() {
-        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let mut vmm = test_controller_with_starter(
+            TestInstanceStarter::success_with_memory_hotplug_status_plugged_size_mib(128),
+        );
         let memory_hotplug_request = request_with_body(
             "PUT",
             "/hotplug/memory",
@@ -7056,7 +7098,7 @@ mod tests {
         );
         assert!(
             get_response.contains(
-                r#"{"block_size_mib":2,"plugged_size_mib":0,"requested_size_mib":256,"slot_size_mib":128,"total_size_mib":1024}"#
+                r#"{"block_size_mib":2,"plugged_size_mib":128,"requested_size_mib":256,"slot_size_mib":128,"total_size_mib":1024}"#
             ),
             "{get_response}"
         );

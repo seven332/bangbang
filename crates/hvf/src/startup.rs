@@ -25,7 +25,8 @@ use bangbang_runtime::interrupt::{
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::memory_hotplug::{
-    MemoryHotplugSizeUpdate, MemoryHotplugUpdateError, VirtioMemMmioLayout,
+    MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
+    MemoryHotplugUpdateError, VirtioMemMmioLayout,
 };
 use bangbang_runtime::metrics::{
     SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
@@ -55,7 +56,7 @@ use bangbang_runtime::startup::{
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
     Arm64BootVsockNotificationDispatches, Arm64BootVsockWakeupFdsError,
-    update_memory_hotplug_config_for_device,
+    memory_hotplug_status_for_device, update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -1195,6 +1196,19 @@ impl HvfArm64BootSession<'_> {
         )
     }
 
+    pub fn memory_hotplug_status(
+        &mut self,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        memory_hotplug_status(
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            config,
+            requested_size_mib,
+        )
+    }
+
     pub fn trigger_balloon_statistics_update_and_signal_interrupts(
         &mut self,
     ) -> Result<(), BalloonUpdateError> {
@@ -1677,6 +1691,19 @@ impl OwnedHvfArm64BootSession {
             &self.mmio_dispatcher,
             &self.gic,
             update,
+        )
+    }
+
+    pub fn memory_hotplug_status(
+        &mut self,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        memory_hotplug_status(
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            config,
+            requested_size_mib,
         )
     }
 
@@ -3989,6 +4016,25 @@ fn update_memory_hotplug_requested_size_and_signal_interrupt(
     }
 
     Ok(())
+}
+
+fn memory_hotplug_status(
+    runtime_resources: &Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    config: MemoryHotplugConfig,
+    requested_size_mib: u64,
+) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+    let device = runtime_resources
+        .memory_hotplug_device
+        .as_ref()
+        .ok_or(MemoryHotplugStatusError::ActiveSessionUnavailable)?;
+    let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
+        MemoryHotplugStatusError::ActiveSessionCommand {
+            message: source.to_string(),
+        }
+    })?;
+
+    memory_hotplug_status_for_device(device, &mut mmio_dispatcher, config, requested_size_mib)
 }
 
 fn balloon_update_error_from_display(source: impl fmt::Display) -> BalloonUpdateError {
