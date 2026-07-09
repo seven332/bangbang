@@ -1778,6 +1778,36 @@ mod tests {
     }
 
     #[test]
+    fn guest_memory_remove_region_allows_empty_memory_and_reinsert() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let original_range = range(0, page_size);
+        let reinserted_range = range(page_size, page_size);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = CountingMapper {
+            maps: 0,
+            drop_count: Arc::clone(&drop_count),
+        };
+        let mut memory = GuestMemory::allocate_with_mapper(
+            &GuestMemoryLayout::new(vec![original_range]).expect("layout should be valid"),
+            page_size,
+            &mut mapper,
+        )
+        .expect("guest memory should allocate");
+
+        memory
+            .remove_region(original_range)
+            .expect("removing the only region should succeed");
+        memory
+            .insert_region_with_mapper(reinserted_range, page_size, &mut mapper)
+            .expect("reinserting into empty guest memory should succeed");
+
+        assert_eq!(memory_ranges(&memory), vec![reinserted_range]);
+        assert_eq!(memory.total_size(), page_size);
+        assert_eq!(mapper.maps, 2);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn guest_memory_remove_region_rejects_missing_range_without_mutation() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let existing_range = range(0, page_size);
