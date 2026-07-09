@@ -24,7 +24,9 @@ use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
-use bangbang_runtime::memory_hotplug::VirtioMemMmioLayout;
+use bangbang_runtime::memory_hotplug::{
+    MemoryHotplugSizeUpdate, MemoryHotplugUpdateError, VirtioMemMmioLayout,
+};
 use bangbang_runtime::metrics::{
     SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
     SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
@@ -53,6 +55,7 @@ use bangbang_runtime::startup::{
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
     Arm64BootVsockNotificationDispatches, Arm64BootVsockWakeupFdsError,
+    update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -1180,6 +1183,18 @@ impl HvfArm64BootSession<'_> {
         collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic)
     }
 
+    pub fn update_memory_hotplug_requested_size_and_signal_interrupt(
+        &mut self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        update_memory_hotplug_requested_size_and_signal_interrupt(
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            &self.gic,
+            update,
+        )
+    }
+
     pub fn trigger_balloon_statistics_update_and_signal_interrupts(
         &mut self,
     ) -> Result<(), BalloonUpdateError> {
@@ -1651,6 +1666,18 @@ impl OwnedHvfArm64BootSession {
         };
 
         collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic)
+    }
+
+    pub fn update_memory_hotplug_requested_size_and_signal_interrupt(
+        &mut self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        update_memory_hotplug_requested_size_and_signal_interrupt(
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            &self.gic,
+            update,
+        )
     }
 
     pub fn trigger_balloon_statistics_update_and_signal_interrupts(
@@ -3934,6 +3961,36 @@ fn dispatch_memory_hotplug_runtime_notifications(
         })
 }
 
+fn update_memory_hotplug_requested_size_and_signal_interrupt(
+    runtime_resources: &Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    gic: &HvfGicMetadata,
+    update: MemoryHotplugSizeUpdate,
+) -> Result<(), MemoryHotplugUpdateError> {
+    let device = runtime_resources
+        .memory_hotplug_device
+        .as_ref()
+        .ok_or(MemoryHotplugUpdateError::ActiveSessionUnavailable)?;
+    {
+        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
+            MemoryHotplugUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            }
+        })?;
+        update_memory_hotplug_config_for_device(device, &mut mmio_dispatcher, update)?;
+    }
+
+    if let Ok(signaler) = HvfGicSpiSignaler::from_metadata(gic) {
+        let _ = signal_device_interrupt(
+            device.fdt_device.interrupt_line,
+            DeviceInterruptKind::Config,
+            &signaler,
+        );
+    }
+
+    Ok(())
+}
+
 fn balloon_update_error_from_display(source: impl fmt::Display) -> BalloonUpdateError {
     BalloonUpdateError::ActiveSessionCommand {
         message: source.to_string(),
@@ -4535,13 +4592,17 @@ fn signal_queue_interrupt(
     line: GuestInterruptLine,
     signaler: &dyn InterruptSink,
 ) -> Result<(), DeviceInterruptTriggerError> {
+    signal_device_interrupt(line, DeviceInterruptKind::Queue, signaler)
+}
+
+fn signal_device_interrupt(
+    line: GuestInterruptLine,
+    kind: DeviceInterruptKind,
+    signaler: &dyn InterruptSink,
+) -> Result<(), DeviceInterruptTriggerError> {
     signaler
         .signal(line)
-        .map_err(|source| DeviceInterruptTriggerError::Signal {
-            line,
-            kind: DeviceInterruptKind::Queue,
-            source,
-        })
+        .map_err(|source| DeviceInterruptTriggerError::Signal { line, kind, source })
 }
 
 #[derive(Debug)]

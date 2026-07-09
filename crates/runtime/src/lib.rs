@@ -340,6 +340,7 @@ pub enum VmmActionError {
     NetworkInterfaceUpdate(network::NetworkInterfaceUpdateError),
     NetworkInterfaceUpdateUnsupported,
     MemoryHotplugConfig(memory_hotplug::MemoryHotplugConfigError),
+    MemoryHotplugUpdate(memory_hotplug::MemoryHotplugUpdateError),
     MemoryHotplugUnsupported,
     PmemConfig(pmem::PmemConfigError),
     PmemUpdate(pmem::PmemUpdateError),
@@ -392,6 +393,7 @@ impl fmt::Display for VmmActionError {
                 f.write_str("Network interface updates are not supported.")
             }
             Self::MemoryHotplugConfig(err) => write!(f, "{err}"),
+            Self::MemoryHotplugUpdate(err) => write!(f, "{err}"),
             Self::MemoryHotplugUnsupported => f.write_str("Memory hotplug is not supported."),
             Self::PmemConfig(err) => write!(f, "{err}"),
             Self::PmemUpdate(err) => write!(f, "{err}"),
@@ -428,6 +430,7 @@ impl std::error::Error for VmmActionError {
             Self::NetworkInterfaceConfig(err) => Some(err),
             Self::NetworkInterfaceUpdate(err) => Some(err),
             Self::MemoryHotplugConfig(err) => Some(err),
+            Self::MemoryHotplugUpdate(err) => Some(err),
             Self::PmemConfig(err) => Some(err),
             Self::PmemUpdate(err) => Some(err),
             Self::SerialConfig(err) => Some(err),
@@ -456,6 +459,7 @@ pub struct VmmController {
     vsock_config: Option<vsock::VsockConfig>,
     entropy_config: Option<entropy::EntropyConfig>,
     memory_hotplug_config: Option<memory_hotplug::MemoryHotplugConfig>,
+    memory_hotplug_requested_size_mib: u64,
     balloon_config: Option<balloon::BalloonConfig>,
     pmem_configs: pmem::PmemConfigs,
     serial_config: serial::SerialConfig,
@@ -498,6 +502,7 @@ impl VmmController {
             vsock_config: None,
             entropy_config: None,
             memory_hotplug_config: None,
+            memory_hotplug_requested_size_mib: 0,
             balloon_config: None,
             pmem_configs: pmem::PmemConfigs::new(),
             serial_config: serial::SerialConfig::default(),
@@ -531,6 +536,16 @@ impl VmmController {
 
     pub const fn memory_hotplug_config(&self) -> Option<memory_hotplug::MemoryHotplugConfig> {
         self.memory_hotplug_config
+    }
+
+    pub fn memory_hotplug_status(&self) -> Option<memory_hotplug::MemoryHotplugStatus> {
+        self.memory_hotplug_config.map(|config| {
+            memory_hotplug::MemoryHotplugStatus::new(
+                config,
+                0,
+                self.memory_hotplug_requested_size_mib,
+            )
+        })
     }
 
     pub const fn balloon_config(&self) -> Option<balloon::BalloonConfig> {
@@ -703,6 +718,30 @@ impl VmmController {
 
     pub fn commit_balloon_update(&mut self, config: balloon::BalloonConfig) {
         self.balloon_config = Some(config);
+    }
+
+    pub fn memory_hotplug_size_update(
+        &self,
+        input: memory_hotplug::MemoryHotplugSizeUpdateInput,
+    ) -> Result<memory_hotplug::MemoryHotplugSizeUpdate, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::PatchMemoryHotplug(input).name(),
+                state: self.instance_info.state,
+            });
+        }
+
+        self.memory_hotplug_config
+            .ok_or(VmmActionError::MemoryHotplugUnsupported)?
+            .validate_size_update(input)
+            .map_err(VmmActionError::MemoryHotplugUpdate)
+    }
+
+    pub fn commit_memory_hotplug_size_update(
+        &mut self,
+        update: memory_hotplug::MemoryHotplugSizeUpdate,
+    ) {
+        self.memory_hotplug_requested_size_mib = update.requested_size_mib();
     }
 
     pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {
@@ -1086,22 +1125,17 @@ impl VmmController {
                         .try_into()
                         .map_err(VmmActionError::MemoryHotplugConfig)?,
                 );
+                self.memory_hotplug_requested_size_mib = 0;
                 Ok(VmmData::Empty)
             }
             VmmAction::GetMemoryHotplug => self
-                .memory_hotplug_config
-                .map(memory_hotplug::MemoryHotplugConfig::initial_status)
+                .memory_hotplug_status()
                 .map(VmmData::MemoryHotplugStatus)
                 .ok_or(VmmActionError::MemoryHotplugUnsupported),
-            VmmAction::PatchMemoryHotplug(_) => {
-                if self.instance_info.state == InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
-                Err(VmmActionError::MemoryHotplugUnsupported)
+            VmmAction::PatchMemoryHotplug(input) => {
+                let update = self.memory_hotplug_size_update(input)?;
+                self.commit_memory_hotplug_size_update(update);
+                Ok(VmmData::Empty)
             }
             VmmAction::PutPmem(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -1442,7 +1476,7 @@ mod tests {
         },
         memory_hotplug::{
             MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugConfigInput,
-            MemoryHotplugSizeUpdateInput,
+            MemoryHotplugSizeUpdateInput, MemoryHotplugStatus, MemoryHotplugUpdateError,
         },
         metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics},
         mmds::{
@@ -2867,7 +2901,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_memory_hotplug_reaches_memory_hotplug_fault_after_start_without_mutating() {
+    fn patch_memory_hotplug_updates_requested_size_after_start() {
         for state in [InstanceState::Running, InstanceState::Paused] {
             let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
             controller
@@ -2878,22 +2912,60 @@ mod tests {
                 .expect("memory hotplug config should be stored");
             controller.instance_info.state = state;
 
-            let err = controller
-                .handle_action(VmmAction::PatchMemoryHotplug(
-                    memory_hotplug_size_update_input(),
-                ))
-                .expect_err("memory hotplug update should remain unsupported");
+            assert_eq!(
+                controller
+                    .handle_action(VmmAction::PatchMemoryHotplug(
+                        memory_hotplug_size_update_input(),
+                    ))
+                    .expect("memory hotplug update should succeed"),
+                VmmData::Empty
+            );
 
-            assert_eq!(err, VmmActionError::MemoryHotplugUnsupported);
             assert_eq!(controller.instance_info().state, state);
             assert_eq!(
                 controller.memory_hotplug_config(),
                 Some(memory_hotplug_config())
             );
+            assert_eq!(
+                controller.memory_hotplug_status(),
+                Some(MemoryHotplugStatus::new(memory_hotplug_config(), 0, 256))
+            );
             assert!(controller.boot_source_config().is_some());
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
         }
+    }
+
+    #[test]
+    fn patch_memory_hotplug_rejects_invalid_size_after_start_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("memory hotplug config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::PatchMemoryHotplug(
+                MemoryHotplugSizeUpdateInput::new(3),
+            ))
+            .expect_err("unaligned memory hotplug update should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::MemoryHotplugUpdate(
+                MemoryHotplugUpdateError::RequestedSizeNotMultipleOfBlockSize {
+                    requested_size_mib: 3,
+                    block_size_mib: 2,
+                }
+            )
+        );
+        assert_eq!(
+            controller.memory_hotplug_status(),
+            Some(memory_hotplug_config().initial_status())
+        );
     }
 
     #[test]

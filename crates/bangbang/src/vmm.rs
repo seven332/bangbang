@@ -34,7 +34,8 @@ use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::memory_hotplug::{
-    MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput, VirtioMemMmioLayout,
+    MemoryHotplugConfigInput, MemoryHotplugSizeUpdate, MemoryHotplugSizeUpdateInput,
+    MemoryHotplugUpdateError, VirtioMemMmioLayout,
 };
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
@@ -155,6 +156,13 @@ pub(crate) trait ProcessSessionDiagnostics {
         _input: BalloonStatsUpdateInput,
     ) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
+    }
+
+    fn update_memory_hotplug(
+        &mut self,
+        _update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        Err(MemoryHotplugUpdateError::ActiveSessionUnavailable)
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -953,6 +961,7 @@ where
             VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::PatchBalloonStats(input) => self.update_balloon_statistics(input),
+            VmmAction::PatchMemoryHotplug(input) => self.update_memory_hotplug(input),
             VmmAction::GetBalloonStats => self.balloon_stats(),
             VmmAction::GetBalloonHintingStatus => self.balloon_hinting_status(),
             VmmAction::PatchBalloonHintingStart(input) => self.start_balloon_hinting(input),
@@ -1125,6 +1134,25 @@ where
             .update_balloon_statistics(input)
             .map_err(VmmActionError::BalloonUpdate)?;
         self.controller.commit_balloon_update(updated_config);
+
+        Ok(VmmData::Empty)
+    }
+
+    fn update_memory_hotplug(
+        &mut self,
+        input: MemoryHotplugSizeUpdateInput,
+    ) -> Result<VmmData, VmmActionError> {
+        let update = self.controller.memory_hotplug_size_update(input)?;
+        let Some(session) = self.started_session.as_mut() else {
+            return Err(VmmActionError::MemoryHotplugUpdate(
+                MemoryHotplugUpdateError::ActiveSessionUnavailable,
+            ));
+        };
+
+        session
+            .update_memory_hotplug(update)
+            .map_err(VmmActionError::MemoryHotplugUpdate)?;
+        self.controller.commit_memory_hotplug_size_update(update);
 
         Ok(VmmData::Empty)
     }
@@ -1953,6 +1981,13 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
 
+    fn update_memory_hotplug(
+        &mut self,
+        _update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        Err(MemoryHotplugUpdateError::ActiveSessionUnavailable)
+    }
+
     fn run_loop_with_network_packet_io<P>(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -2020,6 +2055,15 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         OwnedHvfArm64BootSession::trigger_balloon_statistics_update_and_signal_interrupts(self)
+    }
+
+    fn update_memory_hotplug(
+        &mut self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        OwnedHvfArm64BootSession::update_memory_hotplug_requested_size_and_signal_interrupt(
+            self, update,
+        )
     }
 
     fn run_loop_with_network_packet_io<P>(
@@ -2116,6 +2160,13 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
 
+    fn update_memory_hotplug(
+        &mut self,
+        _update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        Err(MemoryHotplugUpdateError::ActiveSessionUnavailable)
+    }
+
     fn run_loop(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -2182,6 +2233,15 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         OwnedHvfArm64BootSession::trigger_balloon_statistics_update_and_signal_interrupts(self)
     }
 
+    fn update_memory_hotplug(
+        &mut self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        OwnedHvfArm64BootSession::update_memory_hotplug_requested_size_and_signal_interrupt(
+            self, update,
+        )
+    }
+
     fn run_loop(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -2246,6 +2306,13 @@ where
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         self.session.trigger_balloon_statistics_update()
+    }
+
+    fn update_memory_hotplug(
+        &mut self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        self.session.update_memory_hotplug(update)
     }
 
     fn run_loop(
@@ -2495,6 +2562,20 @@ where
     match err {
         BootRunLoopCommandError::Command { source } => source,
         other => BalloonUpdateError::ActiveSessionCommand {
+            message: other.to_string(),
+        },
+    }
+}
+
+fn memory_hotplug_update_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, MemoryHotplugUpdateError>,
+) -> MemoryHotplugUpdateError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        other => MemoryHotplugUpdateError::ActiveSessionCommand {
             message: other.to_string(),
         },
     }
@@ -3046,6 +3127,21 @@ where
             .map_err(balloon_update_error_from_boot_run_loop_command)
     }
 
+    fn update_memory_hotplug(
+        &mut self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(MemoryHotplugUpdateError::ActiveSessionUnavailable);
+        }
+
+        self.run_command(move |session| session.update_memory_hotplug(update))
+            .map_err(memory_hotplug_update_error_from_boot_run_loop_command)
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         if self.balloon_device_updater.is_none() {
             return Err(BalloonUpdateError::ActiveSessionUnavailable);
@@ -3226,7 +3322,10 @@ mod tests {
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
-    use bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput;
+    use bangbang_runtime::memory_hotplug::{
+        MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdate,
+        MemoryHotplugSizeUpdateInput, MemoryHotplugStatus, MemoryHotplugUpdateError,
+    };
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigInput, MetricsDiagnostics,
@@ -3325,6 +3424,25 @@ mod tests {
         BalloonStatsUpdateInput::new(stats_polling_interval_s)
     }
 
+    const fn memory_hotplug_config_input() -> MemoryHotplugConfigInput {
+        MemoryHotplugConfigInput::new(1024, 2, 128)
+    }
+
+    const fn memory_hotplug_size_update_input(
+        requested_size_mib: u64,
+    ) -> MemoryHotplugSizeUpdateInput {
+        MemoryHotplugSizeUpdateInput::new(requested_size_mib)
+    }
+
+    fn memory_hotplug_status(requested_size_mib: u64) -> MemoryHotplugStatus {
+        MemoryHotplugStatus::new(
+            MemoryHotplugConfig::try_from(memory_hotplug_config_input())
+                .expect("test memory hotplug config should validate"),
+            0,
+            requested_size_mib,
+        )
+    }
+
     fn block_device_updater_fixture(
         drive_id: &str,
         backing_path: &Path,
@@ -3411,6 +3529,9 @@ mod tests {
         balloon_hinting_start_result: Option<Result<(), BalloonHintingCommandError>>,
         balloon_hinting_stop_count: usize,
         balloon_hinting_stop_result: Option<Result<(), BalloonHintingCommandError>>,
+        memory_hotplug_update_count: usize,
+        last_memory_hotplug_requested_size_mib: Option<u64>,
+        memory_hotplug_update_result: Option<MemoryHotplugUpdateError>,
     }
 
     impl FakeSession {
@@ -3444,6 +3565,9 @@ mod tests {
                 balloon_hinting_start_result: None,
                 balloon_hinting_stop_count: 0,
                 balloon_hinting_stop_result: None,
+                memory_hotplug_update_count: 0,
+                last_memory_hotplug_requested_size_mib: None,
+                memory_hotplug_update_result: None,
             }
         }
 
@@ -3516,6 +3640,12 @@ mod tests {
         ) -> Self {
             let mut session = Self::new(id);
             session.balloon_hinting_stop_result = Some(result);
+            session
+        }
+
+        fn with_memory_hotplug_update_result(id: u64, result: MemoryHotplugUpdateError) -> Self {
+            let mut session = Self::new(id);
+            session.memory_hotplug_update_result = Some(result);
             session
         }
     }
@@ -3623,6 +3753,18 @@ mod tests {
             self.balloon_hinting_stop_count += 1;
             match self.balloon_hinting_stop_result.clone() {
                 Some(result) => result,
+                None => Ok(()),
+            }
+        }
+
+        fn update_memory_hotplug(
+            &mut self,
+            update: MemoryHotplugSizeUpdate,
+        ) -> Result<(), MemoryHotplugUpdateError> {
+            self.memory_hotplug_update_count += 1;
+            self.last_memory_hotplug_requested_size_mib = Some(update.requested_size_mib());
+            match self.memory_hotplug_update_result.clone() {
+                Some(err) => Err(err),
                 None => Ok(()),
             }
         }
@@ -5188,6 +5330,7 @@ mod tests {
             | VmmActionError::NetworkInterfaceUpdate(_)
             | VmmActionError::NetworkInterfaceUpdateUnsupported
             | VmmActionError::MemoryHotplugConfig(_)
+            | VmmActionError::MemoryHotplugUpdate(_)
             | VmmActionError::MemoryHotplugUnsupported
             | VmmActionError::PmemConfig(_)
             | VmmActionError::PmemUpdate(_)
@@ -6741,6 +6884,65 @@ mod tests {
             bangbang_runtime::VmmData::BalloonConfiguration(BalloonConfig::from(
                 BalloonConfigInput::new(64, false)
             ))
+        );
+    }
+
+    #[test]
+    fn runtime_memory_hotplug_update_refreshes_active_session_before_config_commit() {
+        let mut vmm = configured_vmm(FakeStarter::success(28));
+        vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("initial memory hotplug config should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let data = vmm
+            .handle_action(VmmAction::PatchMemoryHotplug(
+                memory_hotplug_size_update_input(256),
+            ))
+            .expect("runtime memory hotplug update should succeed");
+
+        assert_eq!(data, bangbang_runtime::VmmData::Empty);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.memory_hotplug_update_count, 1);
+        assert_eq!(session.last_memory_hotplug_requested_size_mib, Some(256));
+        assert_eq!(
+            vmm.handle_action(VmmAction::GetMemoryHotplug)
+                .expect("memory hotplug status should be returned"),
+            bangbang_runtime::VmmData::MemoryHotplugStatus(memory_hotplug_status(256))
+        );
+    }
+
+    #[test]
+    fn runtime_memory_hotplug_update_failure_does_not_commit_status() {
+        let expected_error = MemoryHotplugUpdateError::ActiveSessionUnavailable;
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_memory_hotplug_update_result(29, expected_error.clone()),
+        ));
+        vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("initial memory hotplug config should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::PatchMemoryHotplug(
+                memory_hotplug_size_update_input(256),
+            ))
+            .expect_err("runtime memory hotplug update should fail");
+
+        assert_eq!(err, VmmActionError::MemoryHotplugUpdate(expected_error));
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.memory_hotplug_update_count, 1);
+        assert_eq!(session.last_memory_hotplug_requested_size_mib, Some(256));
+        assert_eq!(
+            vmm.handle_action(VmmAction::GetMemoryHotplug)
+                .expect("memory hotplug status should be returned"),
+            bangbang_runtime::VmmData::MemoryHotplugStatus(memory_hotplug_status(0))
         );
     }
 
