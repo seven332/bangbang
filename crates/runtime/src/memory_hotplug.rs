@@ -4,7 +4,10 @@ use std::fmt;
 
 use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
 use crate::virtio_mmio::{
+    VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
     VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
+    VirtioMmioQueueRegisterError, VirtioMmioQueueState, VirtioMmioRegisterHandler,
+    VirtioMmioRegisterHandlerError,
 };
 
 pub const MEMORY_HOTPLUG_DEFAULT_BLOCK_SIZE_MIB: u64 = 2;
@@ -16,6 +19,8 @@ pub const VIRTIO_MEM_QUEUE_SIZES: [u16; VIRTIO_MEM_QUEUE_COUNT] = [VIRTIO_MEM_QU
 pub const VIRTIO_MEM_CONFIG_SPACE_SIZE: usize = 56;
 pub const VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE: u32 = 1;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+
+pub type VirtioMemMmioHandler = VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryHotplugConfigInput {
@@ -467,6 +472,182 @@ impl VirtioMmioDeviceConfigHandler for VirtioMemConfigSpace {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtioMemDevice {
+    active_queue: Option<VirtioMmioQueueState>,
+}
+
+impl VirtioMemDevice {
+    pub const fn new() -> Self {
+        Self { active_queue: None }
+    }
+
+    pub fn is_activated(&self) -> bool {
+        self.active_queue.is_some()
+    }
+
+    pub const fn active_queue(&self) -> Option<VirtioMmioQueueState> {
+        self.active_queue
+    }
+
+    pub fn activate_mem(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioMemDeviceActivationError> {
+        if self.active_queue.is_some() {
+            return Err(VirtioMemDeviceActivationError::AlreadyActive);
+        }
+
+        let queue_count = activation.queue_count();
+        if queue_count != VIRTIO_MEM_QUEUE_COUNT {
+            return Err(VirtioMemDeviceActivationError::QueueCountMismatch {
+                expected: VIRTIO_MEM_QUEUE_COUNT,
+                actual: queue_count,
+            });
+        }
+
+        let queue_index = 0;
+        let queue = *activation.queue(queue_index).map_err(|source| {
+            VirtioMemDeviceActivationError::QueueMetadata {
+                queue_index,
+                source,
+            }
+        })?;
+        validate_virtio_mem_queue(queue_index, queue)?;
+        self.active_queue = Some(queue);
+
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        self.active_queue = None;
+    }
+}
+
+impl VirtioMmioDeviceActivationHandler for VirtioMemDevice {
+    fn activate(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioMmioDeviceActivationError> {
+        self.activate_mem(activation).map_err(Into::into)
+    }
+
+    fn reset(&mut self) {
+        VirtioMemDevice::reset(self);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtioMemDeviceActivationError {
+    AlreadyActive,
+    QueueCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    QueueMetadata {
+        queue_index: u32,
+        source: VirtioMmioQueueRegisterError,
+    },
+    QueueMaxSizeMismatch {
+        queue_index: u32,
+        expected: u16,
+        actual: u16,
+    },
+    QueueSizeZero {
+        queue_index: u32,
+    },
+    QueueNotReady {
+        queue_index: u32,
+    },
+}
+
+impl fmt::Display for VirtioMemDeviceActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive => f.write_str("virtio-mem device is already active"),
+            Self::QueueCountMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "virtio-mem device requires {expected} queue(s), got {actual}"
+                )
+            }
+            Self::QueueMetadata {
+                queue_index,
+                source,
+            } => write!(
+                f,
+                "failed to read virtio-mem queue {queue_index} activation metadata: {source}"
+            ),
+            Self::QueueMaxSizeMismatch {
+                queue_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "virtio-mem queue {queue_index} max size must be {expected}, got {actual}"
+            ),
+            Self::QueueSizeZero { queue_index } => {
+                write!(f, "virtio-mem queue {queue_index} size must be nonzero")
+            }
+            Self::QueueNotReady { queue_index } => {
+                write!(f, "virtio-mem queue {queue_index} is not ready")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMemDeviceActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueMetadata { source, .. } => Some(source),
+            Self::AlreadyActive
+            | Self::QueueCountMismatch { .. }
+            | Self::QueueMaxSizeMismatch { .. }
+            | Self::QueueSizeZero { .. }
+            | Self::QueueNotReady { .. } => None,
+        }
+    }
+}
+
+impl From<VirtioMemDeviceActivationError> for VirtioMmioDeviceActivationError {
+    fn from(source: VirtioMemDeviceActivationError) -> Self {
+        MmioHandlerError::new(source.to_string()).into()
+    }
+}
+
+pub fn virtio_mem_mmio_handler_from_config_space(
+    config_space: VirtioMemConfigSpace,
+) -> Result<VirtioMemMmioHandler, VirtioMmioRegisterHandlerError> {
+    VirtioMmioRegisterHandler::with_device_config_and_activation(
+        VIRTIO_MEM_DEVICE_ID,
+        config_space.available_features(),
+        &VIRTIO_MEM_QUEUE_SIZES,
+        config_space,
+        VirtioMemDevice::new(),
+    )
+}
+
+fn validate_virtio_mem_queue(
+    queue_index: u32,
+    queue: VirtioMmioQueueState,
+) -> Result<(), VirtioMemDeviceActivationError> {
+    if queue.max_size() != VIRTIO_MEM_QUEUE_SIZE {
+        return Err(VirtioMemDeviceActivationError::QueueMaxSizeMismatch {
+            queue_index,
+            expected: VIRTIO_MEM_QUEUE_SIZE,
+            actual: queue.max_size(),
+        });
+    }
+    if queue.size() == 0 {
+        return Err(VirtioMemDeviceActivationError::QueueSizeZero { queue_index });
+    }
+    if !queue.ready() {
+        return Err(VirtioMemDeviceActivationError::QueueNotReady { queue_index });
+    }
+
+    Ok(())
+}
+
 const fn virtio_feature_bit(feature: u32) -> u64 {
     1_u64 << feature
 }
@@ -508,12 +689,23 @@ mod tests {
     use crate::memory::GuestAddress;
     use crate::mmio::{MmioAccess, MmioBus, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{
-        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioAccess,
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
+        VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioAccess, VirtioMmioDeviceActivation,
+        VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
         decode_virtio_mmio_access,
     };
 
     const TEST_VIRTIO_MEM_MMIO_BASE: u64 = 0x1000_0000;
     const TEST_VIRTIO_MEM_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(77);
+    const TEST_QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    const TEST_DRIVER_OK_STATUS: u32 = TEST_QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+    const TEST_QUEUE_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_QUEUE_DRIVER_RING: GuestAddress = GuestAddress::new(0x2000);
+    const TEST_QUEUE_DEVICE_RING: GuestAddress = GuestAddress::new(0x3000);
 
     #[test]
     fn validates_default_sized_config() {
@@ -775,6 +967,194 @@ mod tests {
         );
     }
 
+    #[test]
+    fn virtio_mem_mmio_handler_exposes_firecracker_shape() {
+        let config = virtio_mem_config_space();
+        let handler = mem_mmio_handler(config);
+
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::DeviceId)
+                .expect("device ID should read"),
+            VIRTIO_MEM_DEVICE_ID
+        );
+        assert_eq!(
+            handler.queue_registers().queue_count(),
+            VIRTIO_MEM_QUEUE_COUNT
+        );
+        assert_eq!(
+            handler
+                .queue_registers()
+                .selected_queue()
+                .expect("queue zero should exist")
+                .max_size(),
+            VIRTIO_MEM_QUEUE_SIZE
+        );
+
+        let features = handler.device_registers().device_features();
+        assert_ne!(features & (1_u64 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE), 0);
+        assert_ne!(features & (1_u64 << VIRTIO_FEATURE_VERSION_1), 0);
+        assert_eq!(
+            read_mem_handler_config(&handler, 0, 8)
+                .expect("config read should route through handler")
+                .as_slice(),
+            &config.block_size().to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn virtio_mem_mmio_handler_rejects_config_writes_before_driver_ok_without_mutating() {
+        let config = virtio_mem_config_space();
+        let mut handler = mem_mmio_handler(config);
+
+        assert_eq!(
+            write_mem_handler_config(&mut handler, 0, &[1, 2, 3, 4]),
+            Err(VirtioMmioRegisterHandlerError::DeviceConfigWriteNotWritable { status: 0 })
+        );
+        assert_eq!(*handler.device_config_handler(), config);
+    }
+
+    #[test]
+    fn virtio_mem_mmio_handler_rejects_config_writes_after_driver_ok_without_mutating() {
+        let config = virtio_mem_config_space();
+        let mut handler = mem_mmio_handler(config);
+
+        configure_mem_mmio_handler_queue(&mut handler);
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_DRIVER_OK_STATUS)
+            .expect("DRIVER_OK status should activate virtio-mem");
+
+        assert!(handler.is_device_activated());
+        assert!(handler.activation_handler().is_activated());
+        assert_eq!(
+            write_mem_handler_config(&mut handler, 0, &[1, 2, 3, 4]),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite { offset: 0, len: 4 })
+        );
+        assert_eq!(*handler.device_config_handler(), config);
+    }
+
+    #[test]
+    fn virtio_mem_mmio_handler_activation_records_queue_metadata_and_resets() {
+        let mut handler = mem_mmio_handler(virtio_mem_config_space());
+
+        configure_mem_mmio_handler_queue(&mut handler);
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_DRIVER_OK_STATUS)
+            .expect("DRIVER_OK status should activate virtio-mem");
+
+        let queue = handler
+            .activation_handler()
+            .active_queue()
+            .expect("active queue should be recorded");
+        assert_eq!(queue.max_size(), VIRTIO_MEM_QUEUE_SIZE);
+        assert_eq!(queue.size(), VIRTIO_MEM_QUEUE_SIZE);
+        assert!(queue.ready());
+        assert_eq!(queue.descriptor_table(), TEST_QUEUE_DESCRIPTOR_TABLE);
+        assert_eq!(queue.driver_ring(), TEST_QUEUE_DRIVER_RING);
+        assert_eq!(queue.device_ring(), TEST_QUEUE_DEVICE_RING);
+
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_INIT)
+            .expect("INIT status should reset virtio-mem activation");
+
+        assert!(!handler.is_device_activated());
+        assert!(!handler.activation_handler().is_activated());
+        assert!(handler.activation_handler().active_queue().is_none());
+    }
+
+    #[test]
+    fn virtio_mem_device_activation_rejects_duplicate_activation() {
+        let queues = configured_mem_queue(&[VIRTIO_MEM_QUEUE_SIZE], VIRTIO_MEM_QUEUE_SIZE, true);
+        let device_registers = mem_device_registers();
+        let mut device = VirtioMemDevice::new();
+
+        device
+            .activate_mem(mem_device_activation(&device_registers, &queues))
+            .expect("first virtio-mem activation should succeed");
+        let error = device
+            .activate_mem(mem_device_activation(&device_registers, &queues))
+            .expect_err("second virtio-mem activation should fail");
+
+        assert_eq!(error, VirtioMemDeviceActivationError::AlreadyActive);
+        assert_eq!(error.to_string(), "virtio-mem device is already active");
+    }
+
+    #[test]
+    fn virtio_mem_device_activation_rejects_unexpected_queue_count() {
+        let queues = VirtioMmioQueueRegisters::new(&[VIRTIO_MEM_QUEUE_SIZE, VIRTIO_MEM_QUEUE_SIZE])
+            .expect("queue table should build");
+        let device_registers = mem_device_registers();
+        let mut device = VirtioMemDevice::new();
+
+        let error = device
+            .activate_mem(mem_device_activation(&device_registers, &queues))
+            .expect_err("extra queue should fail virtio-mem activation");
+
+        assert_eq!(
+            error,
+            VirtioMemDeviceActivationError::QueueCountMismatch {
+                expected: VIRTIO_MEM_QUEUE_COUNT,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_mem_device_activation_rejects_wrong_queue_shape() {
+        let queues = configured_mem_queue(&[8], 8, true);
+        let device_registers = mem_device_registers();
+        let mut device = VirtioMemDevice::new();
+
+        let error = device
+            .activate_mem(mem_device_activation(&device_registers, &queues))
+            .expect_err("wrong queue max size should fail virtio-mem activation");
+
+        assert_eq!(
+            error,
+            VirtioMemDeviceActivationError::QueueMaxSizeMismatch {
+                queue_index: 0,
+                expected: VIRTIO_MEM_QUEUE_SIZE,
+                actual: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_mem_device_activation_rejects_zero_size_queue() {
+        let mut queues = VirtioMmioQueueRegisters::new(&[VIRTIO_MEM_QUEUE_SIZE])
+            .expect("queue table should build");
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, TEST_QUEUE_CONFIG_STATUS)
+            .expect("queue ready should write");
+        let device_registers = mem_device_registers();
+        let mut device = VirtioMemDevice::new();
+
+        let error = device
+            .activate_mem(mem_device_activation(&device_registers, &queues))
+            .expect_err("zero queue size should fail virtio-mem activation");
+
+        assert_eq!(
+            error,
+            VirtioMemDeviceActivationError::QueueSizeZero { queue_index: 0 }
+        );
+    }
+
+    #[test]
+    fn virtio_mem_device_activation_rejects_unready_queue() {
+        let queues = configured_mem_queue(&[VIRTIO_MEM_QUEUE_SIZE], VIRTIO_MEM_QUEUE_SIZE, false);
+        let device_registers = mem_device_registers();
+        let mut device = VirtioMemDevice::new();
+
+        let error = device
+            .activate_mem(mem_device_activation(&device_registers, &queues))
+            .expect_err("unready queue should fail virtio-mem activation");
+
+        assert_eq!(
+            error,
+            VirtioMemDeviceActivationError::QueueNotReady { queue_index: 0 }
+        );
+    }
+
     fn device_config_read_access(offset: u64, len: u64) -> VirtioMmioDeviceConfigAccess {
         let operation =
             MmioOperation::read(mmio_access(offset, len)).expect("read operation should build");
@@ -828,5 +1208,144 @@ mod tests {
     ) -> Result<(), VirtioMmioDeviceConfigError> {
         let data = MmioAccessBytes::new(data).expect("write bytes should be valid");
         config.write_device_config(device_config_write_access(offset, data), data)
+    }
+
+    fn virtio_mem_config_space() -> VirtioMemConfigSpace {
+        VirtioMemConfigSpace::new(0x20_0000, 0x4000_0000, 0x8000_0000)
+            .with_usable_region_size(0x8000_0000)
+    }
+
+    fn mem_mmio_handler(config_space: VirtioMemConfigSpace) -> VirtioMemMmioHandler {
+        virtio_mem_mmio_handler_from_config_space(config_space)
+            .expect("virtio-mem MMIO handler should build")
+    }
+
+    fn read_mem_handler_config(
+        handler: &VirtioMemMmioHandler,
+        offset: u64,
+        len: u64,
+    ) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
+        handler.read_access(mmio_access(offset, len))
+    }
+
+    fn write_mem_handler_config(
+        handler: &mut VirtioMemMmioHandler,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        let data = MmioAccessBytes::new(data).expect("write bytes should be valid");
+        let len = u64::try_from(data.len()).expect("test write length should fit u64");
+        handler.write_access(mmio_access(offset, len), data)
+    }
+
+    fn configure_mem_mmio_handler_queue(handler: &mut VirtioMemMmioHandler) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("ACKNOWLEDGE status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("DRIVER status should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_QUEUE_CONFIG_STATUS)
+            .expect("FEATURES_OK status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNum,
+                u32::from(VIRTIO_MEM_QUEUE_SIZE),
+            )
+            .expect("queue size should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(TEST_QUEUE_DESCRIPTOR_TABLE),
+            )
+            .expect("queue descriptor table should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(TEST_QUEUE_DRIVER_RING),
+            )
+            .expect("queue driver ring should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                guest_address_low(TEST_QUEUE_DEVICE_RING),
+            )
+            .expect("queue device ring should write");
+        handler
+            .write_register(VirtioMmioRegister::QueueReady, 1)
+            .expect("queue ready should write");
+    }
+
+    fn configured_mem_queue(
+        queue_sizes: &[u16],
+        selected_queue_size: u16,
+        ready: bool,
+    ) -> VirtioMmioQueueRegisters {
+        let mut queues =
+            VirtioMmioQueueRegisters::new(queue_sizes).expect("queue table should build");
+        configure_selected_mem_queue_mut(&mut queues, selected_queue_size, ready);
+        queues
+    }
+
+    fn configure_selected_mem_queue_mut(
+        queues: &mut VirtioMmioQueueRegisters,
+        queue_size: u16,
+        ready: bool,
+    ) {
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueNum,
+                u32::from(queue_size),
+                TEST_QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue size should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(TEST_QUEUE_DESCRIPTOR_TABLE),
+                TEST_QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue descriptor table should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(TEST_QUEUE_DRIVER_RING),
+                TEST_QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue driver ring should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                guest_address_low(TEST_QUEUE_DEVICE_RING),
+                TEST_QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue device ring should write");
+        if ready {
+            queues
+                .write_register(VirtioMmioRegister::QueueReady, 1, TEST_QUEUE_CONFIG_STATUS)
+                .expect("queue ready should write");
+        }
+    }
+
+    fn mem_device_registers() -> VirtioMmioDeviceRegisters {
+        VirtioMmioDeviceRegisters::new(
+            VIRTIO_MEM_DEVICE_ID,
+            virtio_mem_config_space().available_features(),
+        )
+    }
+
+    fn mem_device_activation<'a>(
+        device: &'a VirtioMmioDeviceRegisters,
+        queues: &'a VirtioMmioQueueRegisters,
+    ) -> VirtioMmioDeviceActivation<'a> {
+        VirtioMmioDeviceActivation::new(device, queues)
+    }
+
+    fn guest_address_low(address: GuestAddress) -> u32 {
+        u32::try_from(address.raw_value()).expect("test address should fit in queue low register")
     }
 }
