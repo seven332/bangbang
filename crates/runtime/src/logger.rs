@@ -5,6 +5,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const BOOT_TIMER_LOG_MODULE: &str = "bangbang_runtime::boot_timer";
@@ -201,6 +202,33 @@ impl fmt::Display for LoggerWriteError {
 
 impl std::error::Error for LoggerWriteError {}
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MissedLogCounter {
+    count: Arc<AtomicU64>,
+}
+
+impl MissedLogCounter {
+    pub(crate) fn record(&self) {
+        let mut current = self.count.load(Ordering::Relaxed);
+        while current != u64::MAX {
+            let next = current.saturating_add(1);
+            match self.count.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub(crate) fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BootTimerLogger {
     sink: Option<LoggerSink>,
@@ -208,9 +236,21 @@ pub struct BootTimerLogger {
     show_level: bool,
     show_log_origin: bool,
     module: Option<String>,
+    missed_log_counter: Option<MissedLogCounter>,
 }
 
 impl BootTimerLogger {
+    pub(crate) fn with_missed_log_counter(mut self, counter: MissedLogCounter) -> Self {
+        self.missed_log_counter = Some(counter);
+        self
+    }
+
+    fn record_missed_log(&self) {
+        if let Some(counter) = &self.missed_log_counter {
+            counter.record();
+        }
+    }
+
     #[track_caller]
     pub fn log_boot_time(
         &self,
@@ -231,14 +271,17 @@ impl BootTimerLogger {
             return Ok(false);
         };
 
-        sink.write_boot_timer(
+        if let Err(err) = sink.write_boot_timer(
             self.show_level,
             self.show_log_origin,
             Location::caller(),
             BOOT_TIMER_LEVEL,
             wall_time_us,
             cpu_time_us,
-        )?;
+        ) {
+            self.record_missed_log();
+            return Err(err);
+        }
         Ok(true)
     }
 }
@@ -321,6 +364,7 @@ impl LoggerState {
             show_level: self.show_level,
             show_log_origin: self.show_log_origin,
             module: self.module.clone(),
+            missed_log_counter: None,
         }
     }
 
@@ -483,7 +527,7 @@ mod tests {
 
     use super::{
         BOOT_TIMER_LOG_MODULE, LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerSink,
-        LoggerState, LoggerWriteError, MINIMAL_ACTION_LOG_MODULE,
+        LoggerState, LoggerWriteError, MINIMAL_ACTION_LOG_MODULE, MissedLogCounter,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -689,6 +733,68 @@ mod tests {
             "action=InstanceStart\nGuest-boot-time =   1000 us 1 ms,    200 CPU us 0 CPU ms\n"
         );
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn boot_timer_logger_records_missed_log_on_write_failure() {
+        let mut state = LoggerState::default();
+        state.configure_test_writer(FailingWriter);
+        let counter = MissedLogCounter::default();
+        let boot_timer_logger = state
+            .boot_timer_logger()
+            .with_missed_log_counter(counter.clone());
+
+        assert_eq!(
+            boot_timer_logger.log_boot_time(1_000, 200),
+            Err(LoggerWriteError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(counter.count(), 1);
+    }
+
+    #[test]
+    fn boot_timer_logger_does_not_record_missed_log_for_success_or_no_output() {
+        let path = unique_logger_path("boot-timer-no-miss");
+        let mut state = LoggerState::default();
+        state
+            .configure(LoggerConfigInput::new().with_log_path(&path))
+            .expect("logger should configure");
+        let counter = MissedLogCounter::default();
+
+        assert_eq!(
+            state
+                .boot_timer_logger()
+                .with_missed_log_counter(counter.clone())
+                .log_boot_time(1_000, 200),
+            Ok(true)
+        );
+        assert_eq!(counter.count(), 0);
+
+        assert_eq!(
+            LoggerState::default()
+                .boot_timer_logger()
+                .with_missed_log_counter(counter.clone())
+                .log_boot_time(1_000, 200),
+            Ok(false)
+        );
+        assert_eq!(counter.count(), 0);
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn boot_timer_logger_does_not_record_missed_log_for_filtered_output() {
+        let mut state = LoggerState::default();
+        state.configure_test_writer(FailingWriter);
+        state
+            .configure(LoggerConfigInput::new().with_module(MINIMAL_ACTION_LOG_MODULE))
+            .expect("logger should update module filter");
+        let counter = MissedLogCounter::default();
+        let boot_timer_logger = state
+            .boot_timer_logger()
+            .with_missed_log_counter(counter.clone());
+
+        assert_eq!(boot_timer_logger.log_boot_time(1_000, 200), Ok(false));
+        assert_eq!(counter.count(), 0);
     }
 
     #[test]

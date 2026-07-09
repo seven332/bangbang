@@ -14,6 +14,7 @@ use crate::block::{
 use crate::entropy::{
     VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError, VirtioRngQueueDispatch,
 };
+use crate::logger::MissedLogCounter;
 use crate::network::{
     VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkDeviceNotificationDispatch,
     VirtioNetworkDeviceNotificationError, VirtioNetworkRxQueueDispatch,
@@ -101,6 +102,7 @@ pub struct MetricsState {
     flush_count: u64,
     get_api_requests: GetApiRequestMetrics,
     logger_metrics: LoggerMetrics,
+    missed_log_counter: MissedLogCounter,
     patch_api_requests: PatchApiRequestMetrics,
     put_api_requests: PutApiRequestMetrics,
 }
@@ -317,8 +319,12 @@ impl MetricsState {
         self.get_api_requests.record_hotplug_memory_request();
     }
 
-    pub(crate) fn record_missed_log(&mut self) {
-        self.logger_metrics.record_missed_log();
+    pub(crate) fn record_missed_log(&self) {
+        self.missed_log_counter.record();
+    }
+
+    pub(crate) fn missed_log_counter(&self) -> MissedLogCounter {
+        self.missed_log_counter.clone()
     }
 
     pub fn flush_with_diagnostics(
@@ -334,7 +340,9 @@ impl MetricsState {
             diagnostics,
             deprecated_api: self.deprecated_api,
             get_api_requests: self.get_api_requests,
-            logger_metrics: self.logger_metrics,
+            logger_metrics: self
+                .logger_metrics
+                .with_missed_log_count(self.missed_log_counter.count()),
             patch_api_requests: self.patch_api_requests,
             put_api_requests: self.put_api_requests,
         };
@@ -401,8 +409,9 @@ impl LoggerMetrics {
         self.missed_log_count == 0 && self.missed_metrics_count == 0
     }
 
-    fn record_missed_log(&mut self) {
-        self.missed_log_count = self.missed_log_count.saturating_add(1);
+    const fn with_missed_log_count(mut self, missed_log_count: u64) -> Self {
+        self.missed_log_count = missed_log_count;
+        self
     }
 
     fn record_missed_metrics(&mut self) {

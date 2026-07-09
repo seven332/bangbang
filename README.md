@@ -208,8 +208,8 @@ Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported
 deprecated machine `cpu_template`, MMDS V1 config, `vsock_id`, and snapshot-load
 field forms.
-After a metrics write failure or logger action write failure, later successful
-metrics output includes the minimal Firecracker-shaped
+After a metrics write failure or logger action or boot-timer write failure,
+later successful metrics output includes the minimal Firecracker-shaped
 `logger.missed_metrics_count` and `logger.missed_log_count` counters.
 
 Configure logger output before boot:
