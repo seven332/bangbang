@@ -1683,7 +1683,8 @@ The first API implementation should model the same broad stages as Firecracker:
 | Successful empty response | `204 No Content` | Empty body. |
 | Invalid path, invalid method, invalid JSON, unknown field, invalid field, unsupported endpoint, or unsupported state | `400 Bad Request` | JSON object with `fault_message`. |
 | Startup, configuration, or VMM action failure | `400 Bad Request` | JSON object with `fault_message`; exact strings can be refined with the implementation. |
-| MMDS payload-limit failure | `400 Bad Request` | Uses the repository-wide payload limit error envelope until broader HTTP status expansion defines Firecracker's `413 Payload Too Large` behavior. |
+| HTTP API request payload-limit failure | `413 Payload Too Large` | JSON object with `fault_message`. |
+| MMDS data-store size-limit failure | `400 Bad Request` | JSON object with `fault_message`; this is a semantic data-store limit failure rather than an HTTP request-size parser failure. |
 
 Future API work should use `fault_message` consistently where Firecracker does.
 Exact message strings should be covered by golden tests once the API parser and
