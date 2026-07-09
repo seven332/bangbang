@@ -1840,6 +1840,35 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_map_rejects_empty_permissions_without_owner_mutation() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+
+        assert!(matches!(
+            mapping.map_dynamic_region(
+                dynamic_range,
+                HvfMemoryPermissions::new(false, false, false)
+            ),
+            Err(HvfGuestMemoryMappingError::EmptyPermissions)
+        ));
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+        assert!(!mapping.has_dynamic_regions());
+        assert_eq!(mapper.map_count(), 1);
+    }
+
+    #[test]
     fn dynamic_map_rejects_overlap_without_owner_mutation() {
         let page_size = page_size();
         let base_range = range(0, page_size);
