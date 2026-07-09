@@ -43,13 +43,7 @@ const CONFIG_FILE_MAX_BYTES: usize = 1024 * 1024;
 const METADATA_FILE_MAX_BYTES: usize = CONFIG_FILE_MAX_BYTES;
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
-const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
-    "describe-snapshot",
-    "enable-pci",
-    "no-seccomp",
-    "seccomp-filter",
-    "snapshot-version",
-];
+const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &["enable-pci", "no-seccomp", "seccomp-filter"];
 
 fn main() -> ExitCode {
     match run() {
@@ -73,6 +67,9 @@ fn run() -> Result<(), ProcessError> {
         Command::Version => {
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
+        }
+        Command::SnapshotVersion | Command::DescribeSnapshot => {
+            return Err(snapshot_unsupported_error());
         }
         Command::Run(config) => {
             let config = *config;
@@ -1143,6 +1140,8 @@ struct Args {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
+    DescribeSnapshot,
+    SnapshotVersion,
     Version,
     Run(Box<StartupConfig>),
 }
@@ -1364,6 +1363,8 @@ impl Args {
         let mut parent_cpu_time_us_seen = false;
         let mut show_level_seen = false;
         let mut show_log_origin_seen = false;
+        let mut describe_snapshot_seen = false;
+        let mut snapshot_version_seen = false;
         let mut start_time_cpu_us_seen = false;
         let mut start_time_us_seen = false;
         let mut index = 0;
@@ -1537,6 +1538,26 @@ impl Args {
                     show_log_origin_seen = true;
                     index += 1;
                 }
+                value_arg if is_value_arg(value_arg, "--describe-snapshot") => {
+                    if describe_snapshot_seen {
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --describe-snapshot",
+                        ));
+                    }
+                    let (value, consumed) = take_value_arg(&args, index, "--describe-snapshot")?;
+                    validate_describe_snapshot_path(&value)?;
+                    describe_snapshot_seen = true;
+                    index += consumed;
+                }
+                "--snapshot-version" => {
+                    if snapshot_version_seen {
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --snapshot-version",
+                        ));
+                    }
+                    snapshot_version_seen = true;
+                    index += 1;
+                }
                 value_arg if is_value_arg(value_arg, "--start-time-cpu-us") => {
                     if start_time_cpu_us_seen {
                         return Err(ArgsError::argument_parsing(
@@ -1590,6 +1611,18 @@ impl Args {
 
         if logger_config_seen {
             config.logger_config = Some(logger_config);
+        }
+
+        if snapshot_version_seen {
+            return Ok(Self {
+                command: Command::SnapshotVersion,
+            });
+        }
+
+        if describe_snapshot_seen {
+            return Ok(Self {
+                command: Command::DescribeSnapshot,
+            });
         }
 
         if config.no_api && config.config_file.is_none() {
@@ -1672,6 +1705,10 @@ fn help_text() -> String {
             "      --no-api          Start from --config-file without publishing an API socket\n",
             "      --show-level       Include level in minimal logger action lines\n",
             "      --show-log-origin  Include callsite origin in minimal logger action lines\n",
+            "      --snapshot-version\n",
+            "                         Recognized, but snapshot data formats are unsupported\n",
+            "      --describe-snapshot <PATH>\n",
+            "                         Recognized, but snapshot files are unsupported\n",
             "      --start-time-us <MICROS>\n",
             "                         Process start wall-clock time for future metrics\n",
             "      --start-time-cpu-us <MICROS>\n",
@@ -1754,6 +1791,10 @@ fn validate_metadata_path(metadata: &str) -> Result<(), String> {
     validate_startup_file_path(metadata, "metadata")
 }
 
+fn validate_describe_snapshot_path(snapshot_path: &str) -> Result<(), String> {
+    validate_startup_file_path(snapshot_path, "describe-snapshot")
+}
+
 fn validate_startup_file_path(path: &str, name: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err(format!("invalid --{name}: path must not be empty"));
@@ -1833,10 +1874,15 @@ fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
         ("--no-api=", "no-api"),
         ("--show-level=", "show-level"),
         ("--show-log-origin=", "show-log-origin"),
+        ("--snapshot-version=", "snapshot-version"),
         ("--version=", "version"),
     ]
     .into_iter()
     .find_map(|(prefix, name)| arg.starts_with(prefix).then_some(name))
+}
+
+fn snapshot_unsupported_error() -> ProcessError {
+    ProcessError::BadConfiguration(VmmActionError::SnapshotUnsupported.to_string())
 }
 
 #[cfg(test)]
@@ -2357,6 +2403,9 @@ mod tests {
         assert!(help.contains("--no-api"));
         assert!(help.contains("without publishing an API socket"));
         assert!(help.contains("--show-level"));
+        assert!(help.contains("--snapshot-version"));
+        assert!(help.contains("--describe-snapshot <PATH>"));
+        assert!(help.contains("snapshot data formats are unsupported"));
         assert!(help.contains("--start-time-us <MICROS>"));
         assert!(help.contains("--start-time-cpu-us <MICROS>"));
         assert!(help.contains("--parent-cpu-time-us <MICROS>"));
@@ -2399,6 +2448,29 @@ mod tests {
         let args = parse(&["-V"]).expect("short version arg should parse");
 
         assert_eq!(args.command, Command::Version);
+    }
+
+    #[test]
+    fn parse_snapshot_version_arg() {
+        let args = parse(&["--snapshot-version"]).expect("snapshot-version arg should parse");
+
+        assert_eq!(args.command, Command::SnapshotVersion);
+    }
+
+    #[test]
+    fn parse_describe_snapshot_arg() {
+        let args = parse(&["--describe-snapshot", "/tmp/snapshot.vmstate"])
+            .expect("describe-snapshot arg should parse");
+
+        assert_eq!(args.command, Command::DescribeSnapshot);
+    }
+
+    #[test]
+    fn parse_describe_snapshot_arg_with_equals_syntax() {
+        let args = parse(&["--describe-snapshot=/tmp/snapshot.vmstate"])
+            .expect("describe-snapshot equals arg should parse");
+
+        assert_eq!(args.command, Command::DescribeSnapshot);
     }
 
     #[test]
@@ -2830,6 +2902,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_describe_snapshot_value() {
+        let err =
+            parse(&["--describe-snapshot", "--id"]).expect_err("missing snapshot path should fail");
+
+        assert_eq!(err, "missing value for --describe-snapshot");
+    }
+
+    #[test]
     fn rejects_missing_observability_arg_values() {
         let err = parse(&["--log-path", "--id"]).expect_err("missing log path value should fail");
 
@@ -2940,6 +3020,23 @@ mod tests {
             .expect_err("duplicate metadata path should fail");
 
         assert_eq!(err, "duplicate argument: --metadata");
+    }
+
+    #[test]
+    fn rejects_duplicate_snapshot_inspection_args() {
+        let err = parse(&["--snapshot-version", "--snapshot-version"])
+            .expect_err("duplicate snapshot-version should fail");
+
+        assert_eq!(err, "duplicate argument: --snapshot-version");
+
+        let err = parse(&[
+            "--describe-snapshot",
+            "/tmp/one.vmstate",
+            "--describe-snapshot=/tmp/two.vmstate",
+        ])
+        .expect_err("duplicate describe-snapshot should fail");
+
+        assert_eq!(err, "duplicate argument: --describe-snapshot");
     }
 
     #[test]
@@ -3147,6 +3244,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_describe_snapshot_path() {
+        let err = parse(&["--describe-snapshot="]).expect_err("empty snapshot path should fail");
+
+        assert_eq!(err, "invalid --describe-snapshot: path must not be empty");
+    }
+
+    #[test]
     fn rejects_metadata_path_with_control_character() {
         let err = parse(&["--metadata", "/tmp/mmds\n.json"])
             .expect_err("metadata path with control character should fail");
@@ -3154,6 +3258,17 @@ mod tests {
         assert_eq!(
             err,
             "invalid --metadata: path must not contain control characters"
+        );
+    }
+
+    #[test]
+    fn rejects_describe_snapshot_path_with_control_character() {
+        let err = parse(&["--describe-snapshot", "/tmp/snapshot\n.vmstate"])
+            .expect_err("snapshot path with control character should fail");
+
+        assert_eq!(
+            err,
+            "invalid --describe-snapshot: path must not contain control characters"
         );
     }
 
@@ -3273,6 +3388,13 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --show-log-origin; use --show-log-origin"
+        );
+
+        let err = parse(&["--snapshot-version=true"]).expect_err("flag with value should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --snapshot-version; use --snapshot-version"
         );
 
         let err = parse(&["--help=true"]).expect_err("help flag with value should fail");

@@ -357,11 +357,6 @@ fn executable_maps_firecracker_fatal_signals_to_exit_codes() {
 #[test]
 fn executable_rejects_unsupported_firecracker_process_flags_before_socket_publication() {
     for (name, args, private_value) in [
-        (
-            "describe-snapshot",
-            &["--describe-snapshot", "secret-snapshot.vmstate"][..],
-            Some("secret-snapshot.vmstate"),
-        ),
         ("enable-pci", &["--enable-pci"][..], None),
         ("no-seccomp", &["--no-seccomp"][..], None),
         (
@@ -369,7 +364,6 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
             &["--seccomp-filter", "secret-seccomp.bpf"][..],
             Some("secret-seccomp.bpf"),
         ),
-        ("snapshot-version", &["--snapshot-version"][..], None),
     ] {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join(format!("{name}.socket"));
@@ -409,6 +403,51 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
         assert!(
             !socket_path.exists(),
             "unsupported --{name} must fail before publishing the API socket"
+        );
+    }
+}
+
+#[test]
+fn executable_rejects_snapshot_inspection_commands_before_socket_publication() {
+    for (name, args, private_value) in [
+        ("snapshot-version", &["--snapshot-version"][..], None),
+        (
+            "describe-snapshot",
+            &["--describe-snapshot", "secret-snapshot.vmstate"][..],
+            Some("secret-snapshot.vmstate"),
+        ),
+    ] {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join(format!("{name}.socket"));
+        let instance_id = test_dir.instance_id();
+
+        let output =
+            BangbangProcess::start_with_extra_args_expect_failure(&socket_path, &instance_id, args);
+
+        assert_bad_configuration_exit_code(&output, name);
+        assert!(
+            output
+                .stderr
+                .contains("bangbang: Snapshot and restore are not supported."),
+            "{name} should report snapshot unsupported; stderr:\n{}",
+            output.stderr
+        );
+        assert!(
+            !output.stdout.contains("status: API server listening"),
+            "{name} must not report API readiness; stdout:\n{}",
+            output.stdout
+        );
+        if let Some(private_value) = private_value {
+            assert!(
+                !output.stdout.contains(private_value) && !output.stderr.contains(private_value),
+                "{name} failure must not echo private argument value {private_value:?}; stdout:\n{}\nstderr:\n{}",
+                output.stdout,
+                output.stderr
+            );
+        }
+        assert!(
+            !socket_path.exists(),
+            "{name} must fail before publishing the API socket"
         );
     }
 }
