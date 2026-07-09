@@ -124,6 +124,32 @@ fn executable_accepts_firecracker_startup_time_args() {
 }
 
 #[test]
+fn executable_accepts_boot_timer_flag() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang =
+        BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--boot-timer"]);
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / with boot timer");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / with boot timer",
+    );
+
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config with boot timer");
+    assert!(
+        !vm_config.contains("boot_timer") && !vm_config.contains("boot-timer"),
+        "GET /vm/config should not expose process boot timer state; response:\n{vm_config}"
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_startup_metrics_path_writes_initial_metrics() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
@@ -328,20 +354,19 @@ fn executable_maps_firecracker_fatal_signals_to_exit_codes() {
 #[test]
 fn executable_rejects_unsupported_firecracker_process_flags_before_socket_publication() {
     for (name, args, private_value) in [
-        ("boot-timer", &["--boot-timer"][..], None),
         (
             "describe-snapshot",
-            &["--describe-snapshot", "secret-snapshot.vmstate"],
+            &["--describe-snapshot", "secret-snapshot.vmstate"][..],
             Some("secret-snapshot.vmstate"),
         ),
-        ("enable-pci", &["--enable-pci"], None),
-        ("no-seccomp", &["--no-seccomp"], None),
+        ("enable-pci", &["--enable-pci"][..], None),
+        ("no-seccomp", &["--no-seccomp"][..], None),
         (
             "seccomp-filter",
-            &["--seccomp-filter", "secret-seccomp.bpf"],
+            &["--seccomp-filter", "secret-seccomp.bpf"][..],
             Some("secret-seccomp.bpf"),
         ),
-        ("snapshot-version", &["--snapshot-version"], None),
+        ("snapshot-version", &["--snapshot-version"][..], None),
     ] {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join(format!("{name}.socket"));

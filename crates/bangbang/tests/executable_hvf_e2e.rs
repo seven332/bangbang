@@ -29,6 +29,7 @@ mod macos_arm64 {
     const BLOCK_WRITE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITE_OK";
     const DIRECT_ROOTFS_BLOCK_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BLOCK_OK";
     const DIRECT_ROOTFS_BOOT_OK_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BOOT_OK";
+    const BOOT_TIMER_LOG_MARKER: &[u8] = b"Guest-boot-time =";
     const DIRECT_ROOTFS_BALLOON_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.balloon-check=1";
     const DIRECT_ROOTFS_BALLOON_MARKER: &[u8] = b"BANGBANG_BALLOON_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
@@ -100,6 +101,8 @@ mod macos_arm64 {
     const GUEST_RESET_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/reboot-init";
     const DIRECT_ROOTFS_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
+    const ROOTFS_BOOT_TIMER_BOOT_ARGS: &str =
+        "console=ttyS0 reboot=k panic=1 nomodule swiotlb=noforce init=/usr/local/bin/init";
     const DIRECT_ROOTFS_ENTROPY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-read=1";
     const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
     const DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-v2-fetch=1";
@@ -1280,6 +1283,104 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang direct rootfs serial",
+        );
+    }
+
+    #[test]
+    fn signed_executable_boot_timer_guest_write_logs_boot_time() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let serial_output_path = test_dir.path().join("serial.out");
+        let logger_path = test_dir.path().join("logger.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_empty_file(&serial_output_path);
+
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--boot-timer"]);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(&machine_response, "PUT /machine-config boot timer");
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let boot_args_json = json_string(ROOTFS_BOOT_TIMER_BOOT_ARGS);
+        let boot_body = format!(
+            r#"{{
+                "kernel_image_path":{kernel_path_json},
+                "boot_args":{boot_args_json}
+            }}"#
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(&boot_response, "PUT /boot-source boot timer");
+
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let rootfs_body = format!(
+            r#"{{
+                "drive_id":"rootfs",
+                "path_on_host":{rootfs_path_json},
+                "is_root_device":true,
+                "is_read_only":true
+            }}"#
+        );
+        let rootfs_response = http_put_json(&socket_path, "/drives/rootfs", &rootfs_body);
+        assert_no_content_response(&rootfs_response, "PUT /drives/rootfs boot timer");
+
+        let serial_output_path_json = json_string(path_text(&serial_output_path));
+        let serial_body = format!(r#"{{"serial_out_path":{serial_output_path_json}}}"#);
+        let serial_response = http_put_json(&socket_path, "/serial", &serial_body);
+        assert_no_content_response(&serial_response, "PUT /serial boot timer");
+
+        let logger_path_json = json_string(path_text(&logger_path));
+        let logger_body = format!(r#"{{"log_path":{logger_path_json}}}"#);
+        let logger_response = http_put_json(&socket_path, "/logger", &logger_body);
+        assert_no_content_response(&logger_response, "PUT /logger boot timer");
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(&start_response, "PUT /actions InstanceStart boot timer");
+
+        if let Err(err) = wait_for_file_contains_marker(
+            &logger_path,
+            BOOT_TIMER_LOG_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let serial_prefix = file_prefix_lossy(&serial_output_path, 256);
+            let logger_prefix = file_prefix_lossy(&logger_path, 256);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "boot timer guest write did not produce logger output: {err}; serial prefix: {serial_prefix:?}; logger prefix: {logger_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        let logger_output = fs::read_to_string(&logger_path).unwrap_or_else(|err| {
+            panic!(
+                "boot timer logger output {} should be readable: {err}",
+                logger_path.display()
+            )
+        });
+        assert!(
+            logger_output.contains("action=InstanceStart\n"),
+            "boot timer logger output should include InstanceStart action; output:\n{logger_output}"
+        );
+        assert!(
+            logger_output.contains("Guest-boot-time ="),
+            "boot timer logger output should include Firecracker-shaped boot time; output:\n{logger_output}"
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang direct rootfs boot timer",
         );
     }
 

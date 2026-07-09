@@ -15,6 +15,9 @@ use bangbang_runtime::balloon::{
     BalloonMmioLayout, BalloonUpdateError, VirtioBalloonDeviceNotificationError,
 };
 use bangbang_runtime::block::BlockMmioLayout;
+use bangbang_runtime::boot_timer::{
+    BootTimerMmioLayout, BootTimerMmioRegistrationError, register_boot_timer_mmio,
+};
 use bangbang_runtime::entropy::{EntropyMmioLayout, VirtioRngOsEntropySource};
 use bangbang_runtime::fdt::Arm64FdtError;
 use bangbang_runtime::interrupt::{
@@ -76,6 +79,7 @@ pub struct HvfArm64BootSessionConfig {
     pub vsock_mmio_layout: VsockMmioLayout,
     pub rtc_mmio_layout: RtcMmioLayout,
     pub balloon_device: Option<HvfArm64BootBalloonDeviceConfig>,
+    pub boot_timer_device: Option<HvfArm64BootTimerDeviceConfig>,
     pub entropy_device: Option<HvfArm64BootEntropyDeviceConfig>,
     pub serial_device: Option<HvfArm64BootSerialDeviceConfig>,
 }
@@ -95,6 +99,7 @@ impl HvfArm64BootSessionConfig {
             vsock_mmio_layout,
             rtc_mmio_layout,
             balloon_device: None,
+            boot_timer_device: None,
             entropy_device: None,
             serial_device: None,
         }
@@ -113,6 +118,14 @@ impl HvfArm64BootSessionConfig {
         entropy_device: HvfArm64BootEntropyDeviceConfig,
     ) -> Self {
         self.entropy_device = Some(entropy_device);
+        self
+    }
+
+    pub const fn with_boot_timer_device(
+        mut self,
+        boot_timer_device: HvfArm64BootTimerDeviceConfig,
+    ) -> Self {
+        self.boot_timer_device = Some(boot_timer_device);
         self
     }
 
@@ -148,6 +161,17 @@ impl HvfArm64BootEntropyDeviceConfig {
         interrupt_line: GuestInterruptLine,
     ) -> RuntimeArm64BootEntropyDeviceConfig {
         RuntimeArm64BootEntropyDeviceConfig::new(self.mmio_layout, interrupt_line)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64BootTimerDeviceConfig {
+    pub mmio_layout: BootTimerMmioLayout,
+}
+
+impl HvfArm64BootTimerDeviceConfig {
+    pub const fn new(mmio_layout: BootTimerMmioLayout) -> Self {
+        Self { mmio_layout }
     }
 }
 
@@ -4122,6 +4146,9 @@ pub enum HvfArm64BootSessionError {
     AssembleResources {
         source: Arm64BootResourceError,
     },
+    RegisterBootTimerMmio {
+        source: BootTimerMmioRegistrationError,
+    },
     MapGuestMemory {
         source: HvfGuestMemoryMappingError,
     },
@@ -4181,6 +4208,9 @@ impl fmt::Display for HvfArm64BootSessionError {
             Self::AssembleResources { source } => {
                 write!(f, "failed to assemble arm64 boot resources: {source}")
             }
+            Self::RegisterBootTimerMmio { source } => {
+                write!(f, "failed to register boot timer MMIO: {source}")
+            }
             Self::MapGuestMemory { source } => {
                 write!(
                     f,
@@ -4210,6 +4240,7 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::StartEntropyRetryWakeupScheduler { source } => Some(source),
             Self::ReadMpidr { source } => Some(source),
             Self::AssembleResources { source } => Some(source),
+            Self::RegisterBootTimerMmio { source } => Some(source),
             Self::MapGuestMemory { source } => Some(source),
             Self::ConfigureBootRegisters { source } => Some(source),
             Self::BackendAlreadyInitialized | Self::UnsupportedVcpuCount { .. } => None,
@@ -4441,9 +4472,17 @@ fn prepare_arm64_boot_session_parts<'vm>(
     .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
     let Arm64BootResourceParts {
         memory,
-        mmio_dispatcher,
+        mut mmio_dispatcher,
         runtime,
     } = resources.into_parts();
+    if let Some(boot_timer) = config.boot_timer_device {
+        register_boot_timer_mmio(
+            &mut mmio_dispatcher,
+            boot_timer.mmio_layout,
+            controller.boot_timer_logger(),
+        )
+        .map_err(|source| HvfArm64BootSessionError::RegisterBootTimerMmio { source })?;
+    }
 
     backend
         .map_guest_memory_with_pmem_devices(
@@ -4661,6 +4700,7 @@ mod tests {
         VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
     };
     use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::boot_timer::BootTimerMmioLayout;
     use bangbang_runtime::entropy::{
         EntropyMmioLayout, VirtioRngEntropySource, VirtioRngEntropySourceError,
     };
@@ -4718,7 +4758,7 @@ mod tests {
         HvfArm64BootInterruptRequest, HvfArm64BootMmioDispatcherError,
         HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootPmemNotificationDispatchError,
         HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
-        HvfArm64BootSessionConfig, HvfArm64BootSessionError,
+        HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig,
         HvfArm64BootVsockNotificationDispatchError, allocate_interrupt_lines,
         collect_balloon_notification_dispatches, collect_block_notification_dispatches,
         collect_entropy_notification_dispatches, collect_network_notification_dispatches,
@@ -10280,6 +10320,26 @@ mod tests {
 
         assert_eq!(config.entropy_device, Some(entropy));
         assert!(config.serial_device.is_none());
+    }
+
+    #[test]
+    fn session_config_stores_boot_timer_device() {
+        let boot_timer = HvfArm64BootTimerDeviceConfig::new(BootTimerMmioLayout::new(
+            GuestAddress::new(0x4000_0000),
+            MmioRegionId::new(0),
+        ));
+        let config = HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            RtcMmioLayout::new(TEST_RTC_MMIO_BASE, MmioRegionId::new(3000)),
+        )
+        .with_boot_timer_device(boot_timer);
+
+        assert_eq!(config.boot_timer_device, Some(boot_timer));
+        assert_eq!(config.entropy_device, None);
+        assert_eq!(config.balloon_device, None);
     }
 
     #[test]

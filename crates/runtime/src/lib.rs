@@ -3,6 +3,7 @@
 pub mod balloon;
 pub mod block;
 pub mod boot;
+pub mod boot_timer;
 pub mod cpu;
 pub mod entropy;
 pub mod fdt;
@@ -537,6 +538,10 @@ impl VmmController {
 
     pub fn boot_source_config(&self) -> Option<&boot::BootSourceConfig> {
         self.boot_source_config.as_ref()
+    }
+
+    pub fn boot_timer_logger(&self) -> logger::BootTimerLogger {
+        self.logger_state.boot_timer_logger()
     }
 
     pub fn vm_config(&self) -> Result<VmConfiguration, mmds::MmdsStateLockError> {

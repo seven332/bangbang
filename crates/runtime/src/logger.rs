@@ -5,7 +5,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
+const BOOT_TIMER_LOG_MODULE: &str = "bangbang_runtime::boot_timer";
 const MINIMAL_ACTION_LOG_MODULE: &str = "bangbang_runtime::vmm_action";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -184,18 +186,62 @@ impl std::error::Error for LoggerConfigError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoggerWriteError {
+    LockPoisoned,
     Write(std::io::ErrorKind),
 }
 
 impl fmt::Display for LoggerWriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LockPoisoned => f.write_str("logger output lock was poisoned"),
             Self::Write(kind) => write!(f, "failed to write logger output: {kind:?}"),
         }
     }
 }
 
 impl std::error::Error for LoggerWriteError {}
+
+#[derive(Debug, Clone)]
+pub struct BootTimerLogger {
+    sink: Option<LoggerSink>,
+    level: LoggerLevel,
+    show_level: bool,
+    show_log_origin: bool,
+    module: Option<String>,
+}
+
+impl BootTimerLogger {
+    #[track_caller]
+    pub fn log_boot_time(
+        &self,
+        wall_time_us: u64,
+        cpu_time_us: u64,
+    ) -> Result<bool, LoggerWriteError> {
+        const BOOT_TIMER_LEVEL: LoggerLevel = LoggerLevel::Info;
+
+        if !self.level.allows(BOOT_TIMER_LEVEL) {
+            return Ok(false);
+        }
+
+        if !module_filter_allows(self.module.as_deref(), BOOT_TIMER_LOG_MODULE) {
+            return Ok(false);
+        }
+
+        let Some(sink) = &self.sink else {
+            return Ok(false);
+        };
+
+        sink.write_boot_timer(
+            self.show_level,
+            self.show_log_origin,
+            Location::caller(),
+            BOOT_TIMER_LEVEL,
+            wall_time_us,
+            cpu_time_us,
+        )?;
+        Ok(true)
+    }
+}
 
 #[derive(Debug)]
 pub struct LoggerState {
@@ -250,11 +296,11 @@ impl LoggerState {
             return Ok(false);
         }
 
-        if !self.module_allows(MINIMAL_ACTION_LOG_MODULE) {
+        if !module_filter_allows(self.module.as_deref(), MINIMAL_ACTION_LOG_MODULE) {
             return Ok(false);
         }
 
-        let Some(sink) = &mut self.sink else {
+        let Some(sink) = &self.sink else {
             return Ok(false);
         };
 
@@ -266,6 +312,26 @@ impl LoggerState {
             action,
         )?;
         Ok(true)
+    }
+
+    pub fn boot_timer_logger(&self) -> BootTimerLogger {
+        BootTimerLogger {
+            sink: self.sink.clone(),
+            level: self.level,
+            show_level: self.show_level,
+            show_log_origin: self.show_log_origin,
+            module: self.module.clone(),
+        }
+    }
+
+    #[track_caller]
+    pub fn log_boot_timer(
+        &mut self,
+        wall_time_us: u64,
+        cpu_time_us: u64,
+    ) -> Result<bool, LoggerWriteError> {
+        self.boot_timer_logger()
+            .log_boot_time(wall_time_us, cpu_time_us)
     }
 
     pub const fn level(&self) -> LoggerLevel {
@@ -284,12 +350,6 @@ impl LoggerState {
         self.module.as_deref()
     }
 
-    fn module_allows(&self, module_path: &str) -> bool {
-        self.module
-            .as_deref()
-            .is_none_or(|filter| module_path.starts_with(filter))
-    }
-
     #[cfg(test)]
     pub const fn is_configured(&self) -> bool {
         self.sink.is_some()
@@ -301,8 +361,9 @@ impl LoggerState {
     }
 }
 
+#[derive(Clone)]
 struct LoggerSink {
-    writer: LineWriter<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<LineWriter<Box<dyn Write + Send>>>>,
 }
 
 impl fmt::Debug for LoggerSink {
@@ -326,40 +387,90 @@ impl LoggerSink {
 
     fn from_writer(writer: impl Write + Send + 'static) -> Self {
         Self {
-            writer: LineWriter::new(Box::new(writer)),
+            writer: Arc::new(Mutex::new(LineWriter::new(Box::new(writer)))),
         }
     }
 
     fn write_action(
-        &mut self,
+        &self,
         show_level: bool,
         show_log_origin: bool,
         origin: &Location<'_>,
         level: LoggerLevel,
         action: &str,
     ) -> Result<(), LoggerWriteError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| LoggerWriteError::LockPoisoned)?;
         match (show_level, show_log_origin) {
             (true, true) => writeln!(
-                self.writer,
+                writer,
                 "level={} origin={}:{} action={action}",
                 level.as_str(),
                 origin.file(),
                 origin.line()
             ),
-            (true, false) => writeln!(self.writer, "level={} action={action}", level.as_str()),
+            (true, false) => writeln!(writer, "level={} action={action}", level.as_str()),
             (false, true) => writeln!(
-                self.writer,
+                writer,
                 "origin={}:{} action={action}",
                 origin.file(),
                 origin.line()
             ),
-            (false, false) => writeln!(self.writer, "action={action}"),
+            (false, false) => writeln!(writer, "action={action}"),
         }
         .map_err(|err| LoggerWriteError::Write(err.kind()))?;
-        self.writer
+        writer
             .flush()
             .map_err(|err| LoggerWriteError::Write(err.kind()))
     }
+
+    fn write_boot_timer(
+        &self,
+        show_level: bool,
+        show_log_origin: bool,
+        origin: &Location<'_>,
+        level: LoggerLevel,
+        wall_time_us: u64,
+        cpu_time_us: u64,
+    ) -> Result<(), LoggerWriteError> {
+        let wall_time_ms = wall_time_us / 1_000;
+        let cpu_time_ms = cpu_time_us / 1_000;
+        let message = format!(
+            "Guest-boot-time = {wall_time_us:>6} us {wall_time_ms} ms, {cpu_time_us:>6} CPU us {cpu_time_ms} CPU ms"
+        );
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| LoggerWriteError::LockPoisoned)?;
+
+        match (show_level, show_log_origin) {
+            (true, true) => writeln!(
+                writer,
+                "level={} origin={}:{} {message}",
+                level.as_str(),
+                origin.file(),
+                origin.line()
+            ),
+            (true, false) => writeln!(writer, "level={} {message}", level.as_str()),
+            (false, true) => writeln!(
+                writer,
+                "origin={}:{} {message}",
+                origin.file(),
+                origin.line()
+            ),
+            (false, false) => writeln!(writer, "{message}"),
+        }
+        .map_err(|err| LoggerWriteError::Write(err.kind()))?;
+        writer
+            .flush()
+            .map_err(|err| LoggerWriteError::Write(err.kind()))
+    }
+}
+
+fn module_filter_allows(filter: Option<&str>, module_path: &str) -> bool {
+    filter.is_none_or(|filter| module_path.starts_with(filter))
 }
 
 #[cfg(test)]
@@ -371,8 +482,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerSink, LoggerState,
-        LoggerWriteError, MINIMAL_ACTION_LOG_MODULE,
+        BOOT_TIMER_LOG_MODULE, LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerSink,
+        LoggerState, LoggerWriteError, MINIMAL_ACTION_LOG_MODULE,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -543,6 +654,44 @@ mod tests {
     }
 
     #[test]
+    fn log_boot_timer_writes_firecracker_shaped_line() {
+        let path = unique_logger_path("boot-timer");
+        let mut state = LoggerState::default();
+        state
+            .configure(LoggerConfigInput::new().with_log_path(&path))
+            .expect("logger should configure");
+
+        assert_eq!(state.log_boot_timer(7_123, 1_456), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            "Guest-boot-time =   7123 us 7 ms,   1456 CPU us 1 CPU ms\n"
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn boot_timer_logger_snapshot_shares_sink_with_action_logs() {
+        let path = unique_logger_path("boot-timer-shared");
+        let mut state = LoggerState::default();
+        state
+            .configure(LoggerConfigInput::new().with_log_path(&path))
+            .expect("logger should configure");
+        let boot_timer_logger = state.boot_timer_logger();
+
+        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+        assert_eq!(boot_timer_logger.log_boot_time(1_000, 200), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            "action=InstanceStart\nGuest-boot-time =   1000 us 1 ms,    200 CPU us 0 CPU ms\n"
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
     fn log_action_includes_level_when_configured() {
         let path = unique_logger_path("actions-with-level");
         let mut state = LoggerState::default();
@@ -654,6 +803,33 @@ mod tests {
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(output, "action=InstanceStart\naction=FlushMetrics\n");
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_boot_timer_respects_module_filter() {
+        let path = unique_logger_path("boot-timer-module-filter");
+        let mut state = LoggerState::default();
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_module(MINIMAL_ACTION_LOG_MODULE),
+            )
+            .expect("logger should configure");
+
+        assert_eq!(state.log_boot_timer(1, 1), Ok(false));
+
+        state
+            .configure(LoggerConfigInput::new().with_module(BOOT_TIMER_LOG_MODULE))
+            .expect("logger should update module filter");
+        assert_eq!(state.log_boot_timer(1, 1), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            "Guest-boot-time =      1 us 0 ms,      1 CPU us 0 CPU ms\n"
+        );
         fs::remove_file(path).expect("fixture should clean up");
     }
 
