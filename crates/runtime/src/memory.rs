@@ -193,6 +193,80 @@ impl GuestMemory {
         Ok(Self { regions })
     }
 
+    /// Allocate and add one process-owned guest memory region.
+    ///
+    /// This only updates the backend-neutral memory owner. Hypervisor backends
+    /// must still map the added range before exposing it to a running guest.
+    pub fn insert_region(
+        &mut self,
+        range: GuestMemoryRange,
+    ) -> Result<(), GuestMemoryAllocationError> {
+        let page_size = host_page_size()?;
+        let mut mapper = SystemAnonymousMapper;
+
+        self.insert_region_with_mapper(range, page_size, &mut mapper)
+    }
+
+    fn insert_region_with_mapper(
+        &mut self,
+        range: GuestMemoryRange,
+        page_size: u64,
+        mapper: &mut impl AnonymousMapper,
+    ) -> Result<(), GuestMemoryAllocationError> {
+        let insert_index = self.validate_insert_region(range, page_size)?;
+        self.regions.try_reserve_exact(1).map_err(|source| {
+            GuestMemoryAllocationError::RegionMetadataAllocationFailed { source }
+        })?;
+
+        let region = allocate_region_with_mapper(range, page_size, mapper)?;
+        self.regions.insert(insert_index, region);
+        Ok(())
+    }
+
+    fn validate_insert_region(
+        &self,
+        range: GuestMemoryRange,
+        page_size: u64,
+    ) -> Result<usize, GuestMemoryAllocationError> {
+        validate_allocation_range(range, page_size)?;
+
+        for (index, region) in self.regions.iter().enumerate() {
+            let existing_range = region.range();
+            if existing_range.overlaps(range) {
+                return Err(GuestMemoryAllocationError::InvalidLayout(
+                    overlapping_ranges_error(existing_range, range),
+                ));
+            }
+
+            if range.start() < existing_range.start() {
+                return Ok(index);
+            }
+        }
+
+        Ok(self.regions.len())
+    }
+
+    /// Remove and drop one exactly matching process-owned guest memory region.
+    ///
+    /// This only updates the backend-neutral memory owner. Hypervisor backends
+    /// must unmap the range before removing memory that may be visible to a
+    /// running guest.
+    pub fn remove_region(
+        &mut self,
+        range: GuestMemoryRange,
+    ) -> Result<(), GuestMemoryRegionRemovalError> {
+        let Some(index) = self
+            .regions
+            .iter()
+            .position(|region| region.range() == range)
+        else {
+            return Err(GuestMemoryRegionRemovalError::MissingRange { range });
+        };
+
+        self.regions.remove(index);
+        Ok(())
+    }
+
     pub fn regions(&self) -> &[GuestMemoryRegion] {
         &self.regions
     }
@@ -411,6 +485,24 @@ impl From<GuestMemoryError> for GuestMemoryAllocationError {
         Self::InvalidLayout(source)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestMemoryRegionRemovalError {
+    /// No owned region exactly matches the requested guest range.
+    MissingRange { range: GuestMemoryRange },
+}
+
+impl fmt::Display for GuestMemoryRegionRemovalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRange { range } => {
+                write!(f, "guest memory region {range} is not mapped")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GuestMemoryRegionRemovalError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestMemoryAccessError {
@@ -741,6 +833,33 @@ fn allocation_host_size(range: GuestMemoryRange) -> Result<usize, GuestMemoryAll
     usize::try_from(range.size()).map_err(|_| GuestMemoryAllocationError::SizeTooLarge { range })
 }
 
+fn allocate_region_with_mapper(
+    range: GuestMemoryRange,
+    page_size: u64,
+    mapper: &mut impl AnonymousMapper,
+) -> Result<GuestMemoryRegion, GuestMemoryAllocationError> {
+    let host_size = validate_allocation_range(range, page_size)?;
+
+    Ok(GuestMemoryRegion {
+        range,
+        mapping: mapper.map(host_size)?,
+    })
+}
+
+fn overlapping_ranges_error(first: GuestMemoryRange, second: GuestMemoryRange) -> GuestMemoryError {
+    if first.start() <= second.start() {
+        GuestMemoryError::OverlappingRange {
+            previous: first,
+            next: second,
+        }
+    } else {
+        GuestMemoryError::OverlappingRange {
+            previous: second,
+            next: first,
+        }
+    }
+}
+
 fn host_page_size() -> Result<u64, GuestMemoryAllocationError> {
     // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and does not
     // require process-local invariants from Rust.
@@ -909,6 +1028,14 @@ mod tests {
             GuestMemoryLayout::new(ranges).expect("guest memory layout should be valid for test");
 
         GuestMemory::allocate(&layout).expect("guest memory allocation should succeed")
+    }
+
+    fn memory_ranges(memory: &GuestMemory) -> Vec<GuestMemoryRange> {
+        memory
+            .regions()
+            .iter()
+            .map(|region| region.range())
+            .collect()
     }
 
     #[test]
@@ -1508,6 +1635,248 @@ mod tests {
             .expect("guest memory read should cross adjacent ranges");
 
         assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn guest_memory_insert_region_preserves_sorted_order() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(page_size * 2, page_size)]);
+
+        memory
+            .insert_region(range(0, page_size))
+            .expect("inserting before existing region should succeed");
+        memory
+            .insert_region(range(page_size, page_size))
+            .expect("inserting between existing regions should succeed");
+        memory
+            .insert_region(range(page_size * 3, page_size))
+            .expect("inserting after existing regions should succeed");
+
+        assert_eq!(
+            memory_ranges(&memory),
+            vec![
+                range(0, page_size),
+                range(page_size, page_size),
+                range(page_size * 2, page_size),
+                range(page_size * 3, page_size)
+            ]
+        );
+        assert_eq!(memory.total_size(), page_size * 4);
+    }
+
+    #[test]
+    fn guest_memory_insert_region_rejects_overlap_without_mutation() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let original_range = range(page_size, page_size * 2);
+        let overlapping_before = range(0, page_size * 2);
+        let overlapping_after = range(page_size * 2, page_size);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = CountingMapper {
+            maps: 0,
+            drop_count: Arc::clone(&drop_count),
+        };
+        let mut memory = GuestMemory::allocate_with_mapper(
+            &GuestMemoryLayout::new(vec![original_range]).expect("layout should be valid"),
+            page_size,
+            &mut mapper,
+        )
+        .expect("guest memory should allocate");
+
+        let err = memory
+            .insert_region_with_mapper(overlapping_before, page_size, &mut mapper)
+            .expect_err("overlapping insert before existing range should fail");
+
+        assert!(matches!(
+            err,
+            GuestMemoryAllocationError::InvalidLayout(GuestMemoryError::OverlappingRange {
+                previous,
+                next,
+            }) if previous == overlapping_before && next == original_range
+        ));
+
+        let err = memory
+            .insert_region_with_mapper(overlapping_after, page_size, &mut mapper)
+            .expect_err("overlapping insert after existing range should fail");
+
+        assert!(matches!(
+            err,
+            GuestMemoryAllocationError::InvalidLayout(GuestMemoryError::OverlappingRange {
+                previous,
+                next,
+            }) if previous == original_range && next == overlapping_after
+        ));
+        assert_eq!(memory_ranges(&memory), vec![original_range]);
+        assert_eq!(mapper.maps, 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn guest_memory_insert_region_rejects_unaligned_range_without_allocation() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let unaligned_range = range(page_size * 2, page_size - 1);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = CountingMapper {
+            maps: 0,
+            drop_count: Arc::clone(&drop_count),
+        };
+        let mut memory = GuestMemory::allocate_with_mapper(
+            &GuestMemoryLayout::new(vec![range(0, page_size)]).expect("layout should be valid"),
+            page_size,
+            &mut mapper,
+        )
+        .expect("guest memory should allocate");
+
+        let err = memory
+            .insert_region_with_mapper(unaligned_range, page_size, &mut mapper)
+            .expect_err("unaligned insert should fail");
+
+        assert!(matches!(
+            err,
+            GuestMemoryAllocationError::InvalidLayout(GuestMemoryError::UnalignedRange {
+                range,
+                alignment,
+            }) if range == unaligned_range && alignment == page_size
+        ));
+        assert_eq!(memory_ranges(&memory), vec![range(0, page_size)]);
+        assert_eq!(mapper.maps, 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn guest_memory_insert_region_access_spans_dynamic_adjacent_ranges() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(0, page_size)]);
+        let source = [0x33, 0x44];
+        let address = GuestAddress::new(page_size - 1);
+        let mut destination = [0; 2];
+
+        memory
+            .insert_region(range(page_size, page_size))
+            .expect("dynamic adjacent insert should succeed");
+        memory
+            .write_slice(&source, address)
+            .expect("write should cross dynamic adjacent range");
+        memory
+            .read_slice(&mut destination, address)
+            .expect("read should cross dynamic adjacent range");
+
+        assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn guest_memory_remove_region_drops_exact_range() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let removed_range = range(page_size, page_size);
+        let remaining_range = range(0, page_size);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = CountingMapper {
+            maps: 0,
+            drop_count: Arc::clone(&drop_count),
+        };
+        let mut memory = GuestMemory::allocate_with_mapper(
+            &GuestMemoryLayout::new(vec![remaining_range, removed_range])
+                .expect("layout should be valid"),
+            page_size,
+            &mut mapper,
+        )
+        .expect("guest memory should allocate");
+
+        memory
+            .remove_region(removed_range)
+            .expect("exact region removal should succeed");
+
+        assert_eq!(memory_ranges(&memory), vec![remaining_range]);
+        assert_eq!(memory.total_size(), page_size);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn guest_memory_remove_region_allows_empty_memory_and_reinsert() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let original_range = range(0, page_size);
+        let reinserted_range = range(page_size, page_size);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = CountingMapper {
+            maps: 0,
+            drop_count: Arc::clone(&drop_count),
+        };
+        let mut memory = GuestMemory::allocate_with_mapper(
+            &GuestMemoryLayout::new(vec![original_range]).expect("layout should be valid"),
+            page_size,
+            &mut mapper,
+        )
+        .expect("guest memory should allocate");
+
+        memory
+            .remove_region(original_range)
+            .expect("removing the only region should succeed");
+        memory
+            .insert_region_with_mapper(reinserted_range, page_size, &mut mapper)
+            .expect("reinserting into empty guest memory should succeed");
+
+        assert_eq!(memory_ranges(&memory), vec![reinserted_range]);
+        assert_eq!(memory.total_size(), page_size);
+        assert_eq!(mapper.maps, 2);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn guest_memory_remove_region_rejects_missing_range_without_mutation() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let existing_range = range(0, page_size);
+        let missing_range = range(page_size, page_size);
+        let mut memory = allocate_memory(vec![existing_range]);
+
+        assert_eq!(
+            memory.remove_region(missing_range),
+            Err(super::GuestMemoryRegionRemovalError::MissingRange {
+                range: missing_range
+            })
+        );
+        assert_eq!(
+            super::GuestMemoryRegionRemovalError::MissingRange {
+                range: missing_range
+            }
+            .to_string(),
+            format!("guest memory region {missing_range} is not mapped")
+        );
+        assert_eq!(memory_ranges(&memory), vec![existing_range]);
+    }
+
+    #[test]
+    fn guest_memory_insert_region_allocation_failure_does_not_mutate() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let existing_range = range(0, page_size);
+        let inserted_range = range(page_size, page_size);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut initial_mapper = CountingMapper {
+            maps: 0,
+            drop_count: Arc::clone(&drop_count),
+        };
+        let mut memory = GuestMemory::allocate_with_mapper(
+            &GuestMemoryLayout::new(vec![existing_range]).expect("layout should be valid"),
+            page_size,
+            &mut initial_mapper,
+        )
+        .expect("guest memory should allocate");
+        let mut failing_mapper = FailingMapper {
+            maps: 0,
+            fail_on: 1,
+            drop_count: Arc::clone(&drop_count),
+        };
+
+        let err = memory
+            .insert_region_with_mapper(inserted_range, page_size, &mut failing_mapper)
+            .expect_err("insert allocation failure should fail");
+
+        assert!(matches!(
+            err,
+            GuestMemoryAllocationError::AnonymousMmapFailed { size, .. }
+                if size == usize::try_from(page_size).expect("page size should fit usize")
+        ));
+        assert_eq!(memory_ranges(&memory), vec![existing_range]);
+        assert_eq!(failing_mapper.maps, 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
