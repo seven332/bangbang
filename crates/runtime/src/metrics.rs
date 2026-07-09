@@ -105,6 +105,7 @@ pub struct MetricsState {
     sink: Option<MetricsSink>,
     flush_count: u64,
     get_api_requests: GetApiRequestMetrics,
+    latencies_us: LatencyMetrics,
     logger_metrics: LoggerMetrics,
     missed_log_counter: MissedLogCounter,
     patch_api_requests: PatchApiRequestMetrics,
@@ -129,6 +130,14 @@ impl MetricsState {
 
     pub(crate) fn record_deprecated_api_call(&mut self) {
         self.deprecated_api.record_deprecated_http_api_call();
+    }
+
+    pub(crate) fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
+        self.latencies_us.record_pause_vm(duration_us);
+    }
+
+    pub(crate) fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
+        self.latencies_us.record_resume_vm(duration_us);
     }
 
     pub(crate) fn record_put_actions_request(&mut self) {
@@ -344,6 +353,7 @@ impl MetricsState {
             diagnostics,
             deprecated_api: self.deprecated_api,
             get_api_requests: self.get_api_requests,
+            latencies_us: self.latencies_us,
             logger_metrics: self
                 .logger_metrics
                 .with_missed_log_count(self.missed_log_counter.count()),
@@ -428,6 +438,34 @@ impl LoggerMetrics {
 
     const fn missed_metrics_count(self) -> u64 {
         self.missed_metrics_count
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LatencyMetrics {
+    pause_vm: Option<u64>,
+    resume_vm: Option<u64>,
+}
+
+impl LatencyMetrics {
+    const fn is_empty(self) -> bool {
+        self.pause_vm.is_none() && self.resume_vm.is_none()
+    }
+
+    fn record_pause_vm(&mut self, duration_us: u64) {
+        self.pause_vm = Some(duration_us);
+    }
+
+    fn record_resume_vm(&mut self, duration_us: u64) {
+        self.resume_vm = Some(duration_us);
+    }
+
+    const fn pause_vm(self) -> Option<u64> {
+        self.pause_vm
+    }
+
+    const fn resume_vm(self) -> Option<u64> {
+        self.resume_vm
     }
 }
 
@@ -3659,6 +3697,7 @@ struct MinimalMetricsSnapshot<'a> {
     diagnostics: &'a MetricsDiagnostics,
     deprecated_api: DeprecatedApiMetrics,
     get_api_requests: GetApiRequestMetrics,
+    latencies_us: LatencyMetrics,
     logger_metrics: LoggerMetrics,
     patch_api_requests: PatchApiRequestMetrics,
     put_api_requests: PutApiRequestMetrics,
@@ -3997,6 +4036,25 @@ fn signal_metrics_json_object(
     signals
 }
 
+fn latency_metrics_json_object(
+    metrics: LatencyMetrics,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut latencies = serde_json::Map::new();
+    if let Some(value) = metrics.pause_vm() {
+        latencies.insert(
+            "pause_vm".to_string(),
+            serde_json::Value::Number(value.into()),
+        );
+    }
+    if let Some(value) = metrics.resume_vm() {
+        latencies.insert(
+            "resume_vm".to_string(),
+            serde_json::Value::Number(value.into()),
+        );
+    }
+    latencies
+}
+
 fn latency_aggregate_metrics_json_object(
     metrics: VirtioBlockLatencyAggregate,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -4044,6 +4102,7 @@ impl MetricsSink {
             diagnostics,
             deprecated_api,
             get_api_requests,
+            latencies_us,
             logger_metrics,
             patch_api_requests,
             put_api_requests,
@@ -4245,6 +4304,12 @@ impl MetricsSink {
                 );
             }
             root.insert("logger".to_string(), serde_json::Value::Object(logger));
+        }
+        if !latencies_us.is_empty() {
+            root.insert(
+                "latencies_us".to_string(),
+                serde_json::Value::Object(latency_metrics_json_object(latencies_us)),
+            );
         }
         if let Some(serial_output_metrics) = diagnostics.serial_output_metrics()
             && !serial_output_metrics.is_empty()
@@ -6050,6 +6115,27 @@ mod tests {
         assert_eq!(
             output,
             "{\"deprecated_api\":{\"deprecated_http_api_calls\":2},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_pause_resume_latency_metrics_when_recorded() {
+        let path = unique_metrics_path("latencies-us");
+        let mut state = MetricsState::default();
+
+        state.record_pause_vm_latency_us(0);
+        state.record_resume_vm_latency_us(42);
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush(), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"latencies_us\":{\"pause_vm\":0,\"resume_vm\":42},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

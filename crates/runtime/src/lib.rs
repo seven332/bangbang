@@ -937,6 +937,14 @@ impl VmmController {
         self.metrics_state.record_deprecated_api_call();
     }
 
+    pub fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
+        self.metrics_state.record_pause_vm_latency_us(duration_us);
+    }
+
+    pub fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
+        self.metrics_state.record_resume_vm_latency_us(duration_us);
+    }
+
     pub fn record_patch_drive_request(&mut self) {
         self.metrics_state.record_patch_drive_request();
     }
