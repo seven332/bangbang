@@ -112,6 +112,60 @@ impl HvfBackend {
             .memory_mut()
     }
 
+    /// Insert one owned guest memory region and map it into the active HVF VM.
+    ///
+    /// This keeps the process-owned `GuestMemory` region and the HVF mapping in
+    /// one failure-atomic backend operation. It does not update virtio-mem
+    /// plugged-block state or Firecracker-facing memory hotplug status.
+    pub fn map_dynamic_guest_memory_region(
+        &mut self,
+        range: GuestMemoryRange,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        if !Self::is_supported_target() {
+            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        }
+
+        self.map_dynamic_guest_memory_region_with_configured_mapper(range, permissions)
+    }
+
+    fn map_dynamic_guest_memory_region_with_configured_mapper(
+        &mut self,
+        range: GuestMemoryRange,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.guest_memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+            ))?
+            .map_dynamic_region(range, permissions)
+    }
+
+    /// Unmap one dynamically mapped guest memory region and drop its owner.
+    ///
+    /// Only regions added through `map_dynamic_guest_memory_region` may be
+    /// removed this way. Startup DRAM and host-backed mappings remain owned by
+    /// the full guest-memory unmap path.
+    pub fn unmap_dynamic_guest_memory_region(
+        &mut self,
+        range: GuestMemoryRange,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.unmap_dynamic_guest_memory_region_with_configured_mapper(range)
+    }
+
+    fn unmap_dynamic_guest_memory_region_with_configured_mapper(
+        &mut self,
+        range: GuestMemoryRange,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.guest_memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+            ))?
+            .unmap_dynamic_region(range)
+    }
+
     pub(crate) fn flush_mapped_pmem_shadows(&self) -> Result<(), HvfGuestMemoryMappingError> {
         self.guest_memory
             .as_ref()
@@ -999,6 +1053,93 @@ mod tests {
             memory_size
         );
         assert_eq!(mapper.map_count(), 1);
+    }
+
+    #[test]
+    fn dynamic_guest_memory_mapping_requires_active_mapping() {
+        let page_size = page_size();
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper);
+        backend.vm_created = true;
+        let dynamic_range = range(page_size, page_size);
+
+        assert!(matches!(
+            backend.map_dynamic_guest_memory_region_with_configured_mapper(
+                dynamic_range,
+                HvfMemoryPermissions::GUEST_RAM
+            ),
+            Err(crate::memory::HvfGuestMemoryMappingError::InvalidState(
+                super::GUEST_MEMORY_NOT_MAPPED_MESSAGE
+            ))
+        ));
+        assert!(matches!(
+            backend.unmap_dynamic_guest_memory_region_with_configured_mapper(dynamic_range),
+            Err(crate::memory::HvfGuestMemoryMappingError::InvalidState(
+                super::GUEST_MEMORY_NOT_MAPPED_MESSAGE
+            ))
+        ));
+    }
+
+    #[test]
+    fn dynamic_guest_memory_mapping_keeps_backend_instances_independent() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let first_mapper = Arc::new(RecordingMapper::default());
+        let second_mapper = Arc::new(RecordingMapper::default());
+        let mut first = HvfBackend::new_with_memory_mapper(first_mapper.clone());
+        let mut second = HvfBackend::new_with_memory_mapper(second_mapper.clone());
+        first.vm_created = true;
+        second.vm_created = true;
+
+        first
+            .map_guest_memory_with_configured_mapper(
+                memory_for_ranges(vec![base_range]),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("first backend initial memory should map");
+        second
+            .map_guest_memory_with_configured_mapper(
+                memory_for_ranges(vec![base_range]),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("second backend initial memory should map");
+
+        first
+            .map_dynamic_guest_memory_region_with_configured_mapper(
+                dynamic_range,
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("first backend dynamic range should map");
+        second
+            .map_dynamic_guest_memory_region_with_configured_mapper(
+                dynamic_range,
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("second backend dynamic range should map independently");
+
+        first
+            .unmap_dynamic_guest_memory_region_with_configured_mapper(dynamic_range)
+            .expect("first backend dynamic range should unmap");
+
+        assert_eq!(
+            first
+                .mapped_guest_memory()
+                .expect("first backend memory should remain mapped")
+                .total_size(),
+            page_size
+        );
+        assert_eq!(
+            second
+                .mapped_guest_memory()
+                .expect("second backend memory should remain mapped")
+                .total_size(),
+            page_size * 2
+        );
+        assert_eq!(first_mapper.map_count(), 2);
+        assert_eq!(second_mapper.map_count(), 2);
+        assert_eq!(first_mapper.unmap_count(), 1);
+        assert_eq!(second_mapper.unmap_count(), 0);
     }
 
     #[test]

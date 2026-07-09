@@ -8,7 +8,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use bangbang_runtime::BackendError;
-use bangbang_runtime::memory::{GuestMemory, GuestMemoryRange, GuestMemoryRegion};
+use bangbang_runtime::memory::{
+    GuestMemory, GuestMemoryAllocationError, GuestMemoryRange, GuestMemoryRegion,
+    GuestMemoryRegionRemovalError,
+};
 
 const HOST_MEMORY_WRITEBACK_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -93,6 +96,29 @@ pub enum HvfGuestMemoryMappingError {
         host_size: usize,
         expected_size: usize,
     },
+    DynamicRegionAllocationFailed {
+        range: GuestMemoryRange,
+        source: GuestMemoryAllocationError,
+    },
+    DynamicRegionMapFailed {
+        range: GuestMemoryRange,
+        source: BackendError,
+        owner_cleanup: Option<GuestMemoryRegionRemovalError>,
+    },
+    DynamicRegionOverlapsMapped {
+        existing: GuestMemoryRange,
+        requested: GuestMemoryRange,
+    },
+    DynamicRegionMissing {
+        range: GuestMemoryRange,
+    },
+    DynamicRegionOwnerMissing {
+        range: GuestMemoryRange,
+    },
+    DynamicRegionRemovalFailed {
+        range: GuestMemoryRange,
+        source: GuestMemoryRegionRemovalError,
+    },
     HostMapping {
         label: String,
         range: GuestMemoryRange,
@@ -163,6 +189,53 @@ impl fmt::Display for HvfGuestMemoryMappingError {
                 write!(
                     f,
                     "host mapping for guest memory range {range} has size {host_size}, expected {expected_size}"
+                )
+            }
+            Self::DynamicRegionAllocationFailed { range, source } => {
+                write!(
+                    f,
+                    "failed to allocate dynamic guest memory region {range}: {source}"
+                )
+            }
+            Self::DynamicRegionMapFailed {
+                range,
+                source,
+                owner_cleanup,
+            } => {
+                if let Some(owner_cleanup) = owner_cleanup {
+                    write!(
+                        f,
+                        "failed to map dynamic guest memory region {range}: {source}; also failed to remove the inserted owner: {owner_cleanup}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "failed to map dynamic guest memory region {range}: {source}"
+                    )
+                }
+            }
+            Self::DynamicRegionOverlapsMapped {
+                existing,
+                requested,
+            } => {
+                write!(
+                    f,
+                    "dynamic guest memory region {requested} overlaps mapped range {existing}"
+                )
+            }
+            Self::DynamicRegionMissing { range } => {
+                write!(f, "dynamic guest memory region {range} is not mapped")
+            }
+            Self::DynamicRegionOwnerMissing { range } => {
+                write!(
+                    f,
+                    "dynamic guest memory region {range} is missing from the guest memory owner"
+                )
+            }
+            Self::DynamicRegionRemovalFailed { range, source } => {
+                write!(
+                    f,
+                    "failed to remove dynamic guest memory region {range} from owner: {source}"
                 )
             }
             Self::HostMapping {
@@ -241,7 +314,11 @@ impl fmt::Display for HvfGuestMemoryMappingError {
 impl std::error::Error for HvfGuestMemoryMappingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Backend(source) | Self::MapFailed { source, .. } => Some(source),
+            Self::Backend(source)
+            | Self::MapFailed { source, .. }
+            | Self::DynamicRegionMapFailed { source, .. } => Some(source),
+            Self::DynamicRegionAllocationFailed { source, .. } => Some(source),
+            Self::DynamicRegionRemovalFailed { source, .. } => Some(source),
             Self::HostMapping { source, .. } => Some(source),
             Self::FlushFailed { failures } => failures
                 .first()
@@ -259,7 +336,10 @@ impl std::error::Error for HvfGuestMemoryMappingError {
             | Self::UnalignedHostAddress { .. }
             | Self::NullHostAddress { .. }
             | Self::UnalignedHostSize { .. }
-            | Self::HostSizeMismatch { .. } => None,
+            | Self::HostSizeMismatch { .. }
+            | Self::DynamicRegionOverlapsMapped { .. }
+            | Self::DynamicRegionMissing { .. }
+            | Self::DynamicRegionOwnerMissing { .. } => None,
         }
     }
 }
@@ -314,6 +394,7 @@ pub(crate) struct HvfGuestMemoryMapping {
     host_memory_should_flush: bool,
     host_memory_flushed: bool,
     mapped_regions: Vec<HvfMappedGuestMemoryRegion>,
+    dynamic_regions: Vec<GuestMemoryRange>,
     mapper: Arc<dyn HvfMemoryMapper>,
 }
 
@@ -339,6 +420,7 @@ impl HvfGuestMemoryMapping {
             host_memory_should_flush: false,
             host_memory_flushed: false,
             mapped_regions: Vec::new(),
+            dynamic_regions: Vec::new(),
             mapper,
         };
 
@@ -369,6 +451,11 @@ impl HvfGuestMemoryMapping {
 
     pub(crate) fn has_mapped_regions(&self) -> bool {
         !self.mapped_regions.is_empty()
+    }
+
+    #[cfg(test)]
+    fn has_dynamic_regions(&self) -> bool {
+        !self.dynamic_regions.is_empty()
     }
 
     pub(crate) fn memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
@@ -406,7 +493,133 @@ impl HvfGuestMemoryMapping {
     // succeeds following an earlier unmap failure.
     pub(crate) fn release_after_vm_destroy(mut self) {
         self.mapped_regions.clear();
+        self.dynamic_regions.clear();
         self.host_memory_should_flush = false;
+    }
+
+    pub(crate) fn map_dynamic_region(
+        &mut self,
+        range: GuestMemoryRange,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        if permissions.is_empty() {
+            return Err(HvfGuestMemoryMappingError::EmptyPermissions);
+        }
+
+        let page_size = host_page_size()?;
+        let insert_index = self.validate_dynamic_map_range(range)?;
+        self.mapped_regions.try_reserve_exact(1).map_err(|source| {
+            HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source }
+        })?;
+        self.dynamic_regions
+            .try_reserve_exact(1)
+            .map_err(
+                |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
+            )?;
+
+        let memory = self
+            .memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory owner is missing",
+            ))?;
+        memory.insert_region(range).map_err(|source| {
+            HvfGuestMemoryMappingError::DynamicRegionAllocationFailed { range, source }
+        })?;
+
+        let request = match dynamic_region_map_request(memory, range, page_size) {
+            Ok(request) => request,
+            Err(source) => {
+                Self::remove_dynamic_owner_after_failed_map(memory, range)?;
+                return Err(source);
+            }
+        };
+        let mapped_region = request.mapped_region();
+
+        if let Err(source) = self.mapper.map_region(request, permissions) {
+            let owner_cleanup = memory.remove_region(range).err();
+            return Err(HvfGuestMemoryMappingError::DynamicRegionMapFailed {
+                range,
+                source,
+                owner_cleanup,
+            });
+        }
+
+        self.mapped_regions.insert(insert_index, mapped_region);
+        self.dynamic_regions.push(range);
+        Ok(())
+    }
+
+    pub(crate) fn unmap_dynamic_region(
+        &mut self,
+        range: GuestMemoryRange,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let dynamic_index = self
+            .dynamic_regions
+            .iter()
+            .position(|dynamic_range| *dynamic_range == range)
+            .ok_or(HvfGuestMemoryMappingError::DynamicRegionMissing { range })?;
+        let mapped_index = self
+            .mapped_regions
+            .iter()
+            .position(|mapped_region| mapped_region.range == range)
+            .ok_or(HvfGuestMemoryMappingError::DynamicRegionMissing { range })?;
+        let memory = self
+            .memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory owner is missing",
+            ))?;
+        if !guest_memory_contains_region(memory, range) {
+            return Err(HvfGuestMemoryMappingError::DynamicRegionOwnerMissing { range });
+        }
+
+        let mapped_region = self
+            .mapped_regions
+            .get(mapped_index)
+            .copied()
+            .ok_or(HvfGuestMemoryMappingError::DynamicRegionMissing { range })?;
+        if let Err(source) = self.mapper.unmap_region(mapped_region) {
+            return Err(HvfGuestMemoryMappingError::UnmapFailed {
+                failures: vec![HvfGuestMemoryUnmapFailure { range, source }],
+            });
+        }
+
+        self.mapped_regions.remove(mapped_index);
+        self.dynamic_regions.remove(dynamic_index);
+        memory.remove_region(range).map_err(|source| {
+            HvfGuestMemoryMappingError::DynamicRegionRemovalFailed { range, source }
+        })
+    }
+
+    fn validate_dynamic_map_range(
+        &self,
+        range: GuestMemoryRange,
+    ) -> Result<usize, HvfGuestMemoryMappingError> {
+        for (index, mapped_region) in self.mapped_regions.iter().enumerate() {
+            let existing = mapped_region.range;
+            if existing.overlaps(range) {
+                return Err(HvfGuestMemoryMappingError::DynamicRegionOverlapsMapped {
+                    existing,
+                    requested: range,
+                });
+            }
+
+            if range.start() < existing.start() {
+                return Ok(index);
+            }
+        }
+
+        Ok(self.mapped_regions.len())
+    }
+
+    fn remove_dynamic_owner_after_failed_map(
+        memory: &mut GuestMemory,
+        range: GuestMemoryRange,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        memory.remove_region(range).map_err(|source| {
+            HvfGuestMemoryMappingError::DynamicRegionRemovalFailed { range, source }
+        })
     }
 
     fn map_all(
@@ -919,6 +1132,27 @@ fn validated_region_map_request(
     )
 }
 
+fn dynamic_region_map_request(
+    memory: &GuestMemory,
+    range: GuestMemoryRange,
+    page_size: u64,
+) -> Result<HvfMemoryMapRequest, HvfGuestMemoryMappingError> {
+    let region = memory
+        .regions()
+        .iter()
+        .find(|region| region.range() == range)
+        .ok_or(HvfGuestMemoryMappingError::DynamicRegionOwnerMissing { range })?;
+
+    validated_region_map_request(region, page_size)
+}
+
+fn guest_memory_contains_region(memory: &GuestMemory, range: GuestMemoryRange) -> bool {
+    memory
+        .regions()
+        .iter()
+        .any(|region| region.range() == range)
+}
+
 fn validate_map_request(
     range: GuestMemoryRange,
     host_address: usize,
@@ -1018,6 +1252,14 @@ mod tests {
             GuestMemoryLayout::new(ranges).expect("guest memory layout should be valid for test");
 
         GuestMemory::allocate(&layout).expect("guest memory allocation should succeed")
+    }
+
+    fn memory_ranges(memory: &GuestMemory) -> Vec<GuestMemoryRange> {
+        memory
+            .regions()
+            .iter()
+            .map(|region| region.range())
+            .collect()
     }
 
     fn page_size() -> u64 {
@@ -1530,6 +1772,246 @@ mod tests {
 
         assert!(!mapping.has_mapped_regions());
         assert_eq!(mapper.unmap_count(), 4);
+    }
+
+    #[test]
+    fn dynamic_map_adds_owned_memory_and_hvf_mapping() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+
+        mapping
+            .map_dynamic_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("dynamic range should map");
+        mapping
+            .memory_mut()
+            .expect("guest memory owner should exist")
+            .write_slice(&[0xab], dynamic_range.start())
+            .expect("dynamic range should be writable");
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range, dynamic_range]
+        );
+        assert_eq!(mapping.mapped_regions.len(), 2);
+        assert_eq!(mapping.dynamic_regions, vec![dynamic_range]);
+        let maps = mapper.maps();
+        let mut mapped = maps.iter().map(|(request, _)| request.range);
+        assert_eq!(mapped.next(), Some(base_range));
+        assert_eq!(mapped.next(), Some(dynamic_range));
+        assert_eq!(mapped.next(), None);
+    }
+
+    #[test]
+    fn dynamic_map_rejects_overlap_without_owner_mutation() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let host_range = range(page_size * 8, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let host_memory = memory_for_ranges(vec![host_range]);
+        let host_mappings = vec![HvfHostMemoryMapping::new(
+            "pmem device `pmem0`",
+            host_memory,
+            HvfMemoryPermissions::READ,
+        )];
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper.clone(),
+        )
+        .expect("initial guest and host memory should map");
+
+        let err = mapping
+            .map_dynamic_region(base_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect_err("duplicate dynamic range should fail");
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::DynamicRegionOverlapsMapped {
+                existing,
+                requested,
+            } if existing == base_range && requested == base_range
+        ));
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+        assert_eq!(mapper.map_count(), 2);
+
+        let err = mapping
+            .map_dynamic_region(host_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect_err("overlap with host-backed mapping should fail");
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::DynamicRegionOverlapsMapped {
+                existing,
+                requested,
+            } if existing == host_range && requested == host_range
+        ));
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+        assert_eq!(mapper.map_count(), 2);
+        assert!(!mapping.has_dynamic_regions());
+    }
+
+    #[test]
+    fn dynamic_map_failure_rolls_back_owner() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::new(Some(2), false));
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+
+        let err = mapping
+            .map_dynamic_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect_err("injected dynamic map failure should fail");
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::DynamicRegionMapFailed {
+                range,
+                owner_cleanup: None,
+                ..
+            } if range == dynamic_range
+        ));
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+        assert_eq!(mapping.mapped_regions.len(), 1);
+        assert!(!mapping.has_dynamic_regions());
+        assert_eq!(mapper.map_count(), 2);
+        assert_eq!(mapper.unmap_count(), 0);
+    }
+
+    #[test]
+    fn dynamic_unmap_removes_hvf_mapping_before_owner() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+        mapping
+            .map_dynamic_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("dynamic range should map");
+
+        mapping
+            .unmap_dynamic_region(dynamic_range)
+            .expect("dynamic range should unmap and remove owner");
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+        assert_eq!(mapping.mapped_regions.len(), 1);
+        assert!(!mapping.has_dynamic_regions());
+        let unmaps = mapper.unmaps();
+        assert_eq!(
+            unmaps.first().map(|mapped_region| mapped_region.range),
+            Some(dynamic_range)
+        );
+    }
+
+    #[test]
+    fn dynamic_unmap_rejects_missing_or_static_range() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let missing_range = range(page_size, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+
+        assert!(matches!(
+            mapping.unmap_dynamic_region(base_range),
+            Err(HvfGuestMemoryMappingError::DynamicRegionMissing { range })
+                if range == base_range
+        ));
+        assert!(matches!(
+            mapping.unmap_dynamic_region(missing_range),
+            Err(HvfGuestMemoryMappingError::DynamicRegionMissing { range })
+                if range == missing_range
+        ));
+        assert_eq!(mapper.unmap_count(), 0);
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+    }
+
+    #[test]
+    fn dynamic_unmap_failure_keeps_state_for_retry() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+        mapping
+            .map_dynamic_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("dynamic range should map");
+
+        mapper.set_fail_unmap(true);
+        let err = mapping
+            .unmap_dynamic_region(dynamic_range)
+            .expect_err("failed dynamic unmap should be retained");
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::UnmapFailed { failures }
+                if failures.len() == 1 && failures[0].range() == dynamic_range
+        ));
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range, dynamic_range]
+        );
+        assert_eq!(mapping.dynamic_regions, vec![dynamic_range]);
+
+        mapper.set_fail_unmap(false);
+        mapping
+            .unmap_dynamic_region(dynamic_range)
+            .expect("dynamic unmap retry should succeed");
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+        assert!(!mapping.has_dynamic_regions());
+        assert_eq!(mapper.unmap_count(), 2);
     }
 
     #[test]
