@@ -160,8 +160,10 @@ exits on handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or
 | `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. In API-enabled mode, the API socket is published only after successful startup. Malformed files, oversized files, duplicate object keys, unknown sections, unsupported sections, or invalid sections fail before socket publication or no-api readiness. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
+| `--snapshot-version` | recognized unsupported before startup | Firecracker prints the supported snapshot data-format version and exits. bangbang has no supported snapshot format yet, so this command fails before API socket publication or HVF startup with the bad-configuration exit status and `Snapshot and restore are not supported.` |
+| `--describe-snapshot <PATH>` | recognized unsupported before startup | Firecracker reads a snapshot state file and prints its data-format version. bangbang validates the argument shape but does not open or parse the path yet, then fails before API socket publication or HVF startup with the bad-configuration exit status and `Snapshot and restore are not supported.` Real snapshot data-format inspection remains deferred to #543. |
 | `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. Runtime control, reboot-in-place, and remaining runtime error exit-code parity remain deferred. |
-| seccomp, snapshot, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
+| seccomp and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
 Startup timing arguments are intentionally not exposed in `GET /vm/config` or
 logs because they are process observability data, not guest configuration. When
@@ -223,7 +225,8 @@ Unicode alphanumeric characters.
 
 Supported value-taking startup arguments accept both Firecracker-style
 `--arg value` and `--arg=value` forms. Value-less flags, such as `--no-api`,
-`--show-level`, and `--show-log-origin`, reject attached values.
+`--show-level`, `--show-log-origin`, and `--snapshot-version`, reject attached
+values.
 
 `--config-file` currently accepts the supported Firecracker-shaped sections
 `machine-config`, `boot-source`, `drives`, `network-interfaces`,
