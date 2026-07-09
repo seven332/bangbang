@@ -2905,6 +2905,64 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mem_handler_rejects_inactive_queue_notifications() {
+        let mut memory = request_memory();
+        let mut handler = mem_mmio_handler(virtio_mem_config_space());
+
+        advance_mem_mmio_handler_to_features_ok(&mut handler);
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_DRIVER_OK_STATUS)
+            .expect_err("DRIVER_OK before queue ready should fail activation");
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should record after failed DRIVER_OK");
+
+        let error = handler
+            .dispatch_mem_queue_notifications(&mut memory)
+            .expect_err("inactive virtio-mem queue should reject notification dispatch");
+
+        assert!(matches!(
+            error,
+            VirtioMemDeviceNotificationError::Inactive { .. }
+        ));
+        assert_eq!(error.drained_notifications(), [0]);
+        assert!(error.completed_dispatch().is_none());
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status should read"),
+            0
+        );
+        assert!(handler.pending_queue_notifications().is_empty());
+        assert!(!handler.activation_handler().is_activated());
+    }
+
+    #[test]
+    fn virtio_mem_device_notification_dispatch_rejects_unsupported_queue_without_dispatch() {
+        let mut memory = request_memory();
+        let mut device = VirtioMemDevice::new();
+
+        let error = device
+            .dispatch_drained_queue_notifications(
+                &mut memory,
+                virtio_mem_config_space(),
+                vec![0, 1],
+            )
+            .expect_err("unsupported queue should prevent notification dispatch");
+
+        match error {
+            VirtioMemDeviceNotificationError::UnsupportedQueue {
+                drained_notifications,
+                queue_index,
+            } => {
+                assert_eq!(drained_notifications, vec![0, 1]);
+                assert_eq!(queue_index, 1);
+            }
+            other => panic!("expected unsupported queue error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn virtio_mem_mmio_handler_rejects_config_writes_before_driver_ok_without_mutating() {
         let config = virtio_mem_config_space();
         let mut handler = mem_mmio_handler(config);
