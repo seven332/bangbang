@@ -15,6 +15,8 @@ mod api_server;
 #[cfg(target_os = "macos")]
 pub mod host_network;
 mod periodic_metrics;
+#[cfg(test)]
+mod test_support;
 mod vmm;
 
 use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
@@ -1908,8 +1910,10 @@ mod tests {
     use bangbang_runtime::network::{NetworkInterfaceConfigError, NetworkInterfaceConfigInput};
     use bangbang_runtime::pmem::{PmemConfigError, PmemConfigInput};
     use bangbang_runtime::serial::SerialRateLimiterConfig;
+    use bangbang_runtime::startup::Arm64BootResources;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
 
+    use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
         ApiRequestMetricParseFailure, GetApiRequest, InstanceStartExecutor, PatchApiRequest,
         ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, PutApiRequest,
@@ -1933,6 +1937,29 @@ mod tests {
             _controller: &bangbang_runtime::VmmController,
         ) -> Result<Self::Session, BackendError> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct BootResourceAssemblingTestStarter;
+
+    impl InstanceStartExecutor for BootResourceAssemblingTestStarter {
+        type Session = ();
+
+        fn start(
+            &mut self,
+            controller: &bangbang_runtime::VmmController,
+        ) -> Result<Self::Session, BackendError> {
+            Arm64BootResources::assemble_from_controller(
+                controller,
+                minimal_arm64_boot_resource_config(),
+            )
+            .map(|_| ())
+            .map_err(|source| {
+                BackendError::Hypervisor(format!(
+                    "failed to assemble arm64 boot resources: {source}"
+                ))
+            })
         }
     }
 
@@ -4512,6 +4539,56 @@ mod tests {
         ));
         assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
         assert!(!vmm.has_started_session());
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_boot_source_payload_failure_does_not_start_or_leak_path() {
+        let config_path = unique_config_path("boot-source-payload");
+        let kernel_path = unique_config_path("private-kernel").with_extension("vmlinux");
+        let kernel_path_text = kernel_path
+            .to_str()
+            .expect("test kernel path should be UTF-8");
+        let kernel_path_json =
+            serde_json::to_string(kernel_path_text).expect("kernel path should encode");
+        let config = format!(
+            r#"{{
+                "machine-config": {{"vcpu_count": 1, "mem_size_mib": 1}},
+                "boot-source": {{"kernel_image_path": {kernel_path_json}}}
+            }}"#
+        );
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            BootResourceAssemblingTestStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("missing boot-source payload should fail startup");
+        let err = err.to_string();
+
+        assert!(
+            err.contains(
+                "config-file error: failed to apply config-file action: failed to start microVM: hypervisor error: failed to assemble arm64 boot resources: failed to load boot source: failed to open kernel image"
+            ),
+            "config-file startup error should describe redacted boot-source load failure; error: {err}"
+        );
+        assert!(
+            !err.contains(kernel_path_text),
+            "config-file startup error must not echo private kernel path; error: {err}"
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert!(
+            !kernel_path.exists(),
+            "missing payload test fixture should remain absent"
+        );
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }

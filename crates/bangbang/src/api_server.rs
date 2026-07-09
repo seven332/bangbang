@@ -1898,8 +1898,10 @@ mod tests {
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
+    use bangbang_runtime::startup::Arm64BootResources;
     use bangbang_runtime::{BackendError, VmmActionError};
 
+    use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
         InstanceStartExecutor, ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm,
     };
@@ -1911,6 +1913,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestInstanceStarter {
         result: Result<TestSession, BackendError>,
+        assemble_boot_resources: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -2156,18 +2159,21 @@ mod tests {
         const fn success() -> Self {
             Self {
                 result: Ok(TestSession::without_boot_run_loop_status()),
+                assemble_boot_resources: false,
             }
         }
 
         const fn success_with_boot_run_loop_status(status: BootRunLoopMetricStatus) -> Self {
             Self {
                 result: Ok(TestSession::with_boot_run_loop_status(status)),
+                assemble_boot_resources: false,
             }
         }
 
         fn success_with_process_exit_signal(signal: TestProcessExitSignal) -> Self {
             Self {
                 result: Ok(TestSession::with_process_exit_signal(signal)),
+                assemble_boot_resources: false,
             }
         }
 
@@ -2178,12 +2184,21 @@ mod tests {
                 result: Ok(TestSession::with_memory_hotplug_status_plugged_size_mib(
                     plugged_size_mib,
                 )),
+                assemble_boot_resources: false,
             }
         }
 
         const fn failure() -> Self {
             Self {
                 result: Err(BackendError::InvalidState("test startup failed")),
+                assemble_boot_resources: false,
+            }
+        }
+
+        const fn boot_resource_assembler() -> Self {
+            Self {
+                result: Ok(TestSession::without_boot_run_loop_status()),
+                assemble_boot_resources: true,
             }
         }
     }
@@ -2193,8 +2208,21 @@ mod tests {
 
         fn start(
             &mut self,
-            _controller: &bangbang_runtime::VmmController,
+            controller: &bangbang_runtime::VmmController,
         ) -> Result<Self::Session, BackendError> {
+            if self.assemble_boot_resources {
+                return Arm64BootResources::assemble_from_controller(
+                    controller,
+                    minimal_arm64_boot_resource_config(),
+                )
+                .map(|_| TestSession::without_boot_run_loop_status())
+                .map_err(|source| {
+                    BackendError::Hypervisor(format!(
+                        "failed to assemble arm64 boot resources: {source}"
+                    ))
+                });
+            }
+
             self.result.clone()
         }
     }
@@ -3554,6 +3582,61 @@ mod tests {
             Path::new("/tmp/original-vmlinux")
         );
         assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn returns_redacted_fault_for_boot_source_payload_start_failure() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::boot_resource_assembler());
+        let machine_response = request_over_socket(
+            &mut vmm,
+            "pfm",
+            &request_with_body(
+                "PUT",
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":1}"#,
+            ),
+        );
+        assert!(machine_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let kernel_path = unique_socket_path("pk").with_extension("vmlinux");
+        let kernel_path_text = kernel_path
+            .to_str()
+            .expect("test kernel path should be UTF-8");
+        let kernel_path_json =
+            serde_json::to_string(kernel_path_text).expect("kernel path should encode");
+        let boot_body = format!(r#"{{"kernel_image_path":{kernel_path_json}}}"#);
+        let boot_response = request_over_socket(
+            &mut vmm,
+            "pfb",
+            &request_with_body("PUT", "/boot-source", &boot_body),
+        );
+        assert!(boot_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let response = put_action_over_socket(&mut vmm, "pfs", "InstanceStart");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(
+                r#"{"fault_message":"failed to start microVM: hypervisor error: failed to assemble arm64 boot resources: failed to load boot source: failed to open kernel image"#
+            ),
+            "InstanceStart response should describe redacted boot-source load failure; response:\n{response}"
+        );
+        assert!(
+            !response.contains(kernel_path_text),
+            "InstanceStart response must not echo private kernel path; response:\n{response}"
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+        assert!(!vmm.has_started_session());
+        let instance_info_response =
+            request_over_socket(&mut vmm, "pfi", "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(instance_info_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(instance_info_response.contains(r#""state":"Not started""#));
+        assert!(
+            !kernel_path.exists(),
+            "missing payload test fixture should remain absent"
+        );
     }
 
     #[test]

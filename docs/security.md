@@ -111,7 +111,9 @@ Host paths configured through the API are untrusted input. The current behavior
 is resource-specific:
 
 - `/boot-source` stores kernel and optional initrd paths during configuration.
-  Files are opened later during `InstanceStart`.
+  Files are opened later during `InstanceStart` with read-only nonblocking
+  access. Startup rejects inaccessible, non-regular, or empty payload files,
+  and API-facing startup errors must not echo the configured path.
 - `/drives/{drive_id}` stores block backing paths during configuration. Backing
   files are opened later during `InstanceStart`. Runtime
   `PATCH /drives/{drive_id}` opens a replacement backing for an existing active
