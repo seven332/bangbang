@@ -367,6 +367,15 @@ fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, Config
         )?);
     }
 
+    if let Some(memory_hotplug) = object.get("memory-hotplug") {
+        requests.push(config_section_request(
+            "memory-hotplug",
+            "PUT",
+            "/hotplug/memory".to_string(),
+            memory_hotplug,
+        )?);
+    }
+
     if let Some(balloon) = object.get("balloon") {
         requests.push(config_section_request(
             "balloon",
@@ -539,11 +548,8 @@ fn validate_config_file_sections(
     for section in object.keys() {
         match section.as_str() {
             "balloon" | "boot-source" | "cpu-config" | "drives" | "logger" | "machine-config"
-            | "metrics" | "mmds-config" | "network-interfaces" | "pmem" | "serial" | "vsock"
-            | "entropy" => {}
-            "memory-hotplug" => {
-                return Err(ConfigFileError::UnsupportedSection(section.clone()));
-            }
+            | "memory-hotplug" | "metrics" | "mmds-config" | "network-interfaces" | "pmem"
+            | "serial" | "vsock" | "entropy" => {}
             _ => return Err(ConfigFileError::UnknownSection(section.clone())),
         }
     }
@@ -822,7 +828,6 @@ enum ConfigFileError {
     Malformed,
     MissingSection(&'static str),
     UnknownSection(String),
-    UnsupportedSection(String),
     MalformedSection {
         section: &'static str,
     },
@@ -850,9 +855,6 @@ impl fmt::Display for ConfigFileError {
                 write!(f, "config file is missing required section: {section}")
             }
             Self::UnknownSection(section) => write!(f, "unknown config-file section: {section}"),
-            Self::UnsupportedSection(section) => {
-                write!(f, "unsupported config-file section: {section}")
-            }
             Self::MalformedSection { section } => {
                 write!(f, "malformed config-file section: {section}")
             }
@@ -1854,6 +1856,7 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
+    use bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput;
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics};
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::network::{NetworkInterfaceConfigError, NetworkInterfaceConfigInput};
@@ -3605,11 +3608,11 @@ mod tests {
     }
 
     #[test]
-    fn config_file_rejects_duplicate_top_level_recognized_unsupported_section() {
+    fn config_file_rejects_duplicate_top_level_memory_hotplug_section() {
         let err = super::config_file_actions_from_str(
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"memory-hotplug":{},"memory-hotplug":{}}"#,
         )
-        .expect_err("duplicate top-level recognized unsupported section should fail");
+        .expect_err("duplicate top-level memory-hotplug section should fail");
 
         assert_eq!(err, super::ConfigFileError::Malformed);
     }
@@ -3687,6 +3690,22 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn config_file_accepts_memory_hotplug_section() {
+        let actions = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"memory-hotplug":{"total_size_mib":1024,"block_size_mib":2,"slot_size_mib":128}}"#,
+        )
+        .expect("memory-hotplug config section should parse");
+
+        assert_eq!(
+            actions,
+            [
+                VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
+                VmmAction::PutMemoryHotplug(MemoryHotplugConfigInput::new(1024, 2, 128)),
+            ]
+        );
     }
 
     #[test]
@@ -3842,6 +3861,67 @@ mod tests {
                 "{config}"
             );
         }
+    }
+
+    #[test]
+    fn config_file_rejects_malformed_memory_hotplug_section() {
+        for config in [
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"memory-hotplug":"bad"}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"memory-hotplug":{"block_size_mib":2,"slot_size_mib":128}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"memory-hotplug":{"total_size_mib":1024,"block_size_mib":2,"slot_size_mib":128,"unknown":true}}"#,
+        ] {
+            let err = super::config_file_actions_from_str(config)
+                .expect_err("malformed memory-hotplug section should fail");
+
+            assert_eq!(
+                err,
+                super::ConfigFileError::Request {
+                    section: "memory-hotplug",
+                    source: super::RequestError::MalformedRequest
+                },
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_file_memory_hotplug_fails_before_starting() {
+        let config_path = unique_config_path("memory-hotplug");
+        let config = r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "memory-hotplug":{"total_size_mib":1024,"block_size_mib":2,"slot_size_mib":128}
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("memory-hotplug should block startup until virtio-mem exists");
+
+        assert!(matches!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                bangbang_runtime::VmmActionError::MemoryHotplugUnsupported
+            ))
+        ));
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert!(config.memory_hotplug_config().is_some());
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
     }
 
     #[test]

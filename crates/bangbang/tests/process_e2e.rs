@@ -643,27 +643,34 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         "GET /vm/config after rejected PUT /pmem/pmem0 empty path",
     );
 
-    for (path, body, fault_message, private_values) in [(
+    let unconfigured_memory_hotplug_get_response = http_get(&socket_path, "/hotplug/memory");
+    assert_bad_request_response(
+        &unconfigured_memory_hotplug_get_response,
+        "GET /hotplug/memory before PUT",
+    );
+    assert_response_contains(
+        &unconfigured_memory_hotplug_get_response,
+        r#"{"fault_message":"Memory hotplug is not supported."}"#,
+        "GET /hotplug/memory before PUT",
+    );
+
+    let memory_hotplug_put_response = http_put_json(
+        &socket_path,
         "/hotplug/memory",
         r#"{"total_size_mib":2048}"#,
-        "Memory hotplug is not supported.",
-        &[] as &[&str],
-    )] {
-        let response = http_put_json(&socket_path, path, body);
+    );
+    assert_no_content_response(&memory_hotplug_put_response, "PUT /hotplug/memory");
 
-        assert_bad_request_response(&response, path);
-        assert_response_contains(
-            &response,
-            &format!(r#"{{"fault_message":"{fault_message}"}}"#),
-            path,
-        );
-        for private_value in private_values {
-            assert!(
-                !response.contains(private_value),
-                "{path} must not echo private device path {private_value:?}; response:\n{response}"
-            );
-        }
-    }
+    let memory_hotplug_vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(
+        &memory_hotplug_vm_config,
+        "GET /vm/config after PUT /hotplug/memory",
+    );
+    assert_response_contains(
+        &memory_hotplug_vm_config,
+        r#""memory-hotplug":{"block_size_mib":2,"slot_size_mib":128,"total_size_mib":2048}"#,
+        "GET /vm/config after PUT /hotplug/memory",
+    );
 
     let entropy_response = http_put_json(&socket_path, "/entropy", "{}");
     assert_no_content_response(&entropy_response, "PUT /entropy");
@@ -693,10 +700,10 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
     );
 
     let memory_hotplug_get_response = http_get(&socket_path, "/hotplug/memory");
-    assert_bad_request_response(&memory_hotplug_get_response, "GET /hotplug/memory");
+    assert_ok_response(&memory_hotplug_get_response, "GET /hotplug/memory");
     assert_response_contains(
         &memory_hotplug_get_response,
-        r#"{"fault_message":"The requested operation is not supported in Not started state: GetMemoryHotplug"}"#,
+        r#"{"block_size_mib":2,"plugged_size_mib":0,"requested_size_mib":0,"slot_size_mib":128,"total_size_mib":2048}"#,
         "GET /hotplug/memory",
     );
 

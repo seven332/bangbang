@@ -201,6 +201,7 @@ pub enum VmmData {
     BalloonConfiguration(balloon::BalloonConfig),
     BalloonStatistics(balloon::BalloonStats),
     BalloonHintingStatus(balloon::BalloonHintingStatus),
+    MemoryHotplugStatus(memory_hotplug::MemoryHotplugStatus),
     MmdsValue(serde_json::Value),
     VmConfiguration(VmConfiguration),
 }
@@ -214,6 +215,7 @@ pub struct VmConfiguration {
     mmds_config: Option<mmds::MmdsConfig>,
     vsock_config: Option<vsock::VsockConfig>,
     entropy_config: Option<entropy::EntropyConfig>,
+    memory_hotplug_config: Option<memory_hotplug::MemoryHotplugConfig>,
     balloon_config: Option<balloon::BalloonConfig>,
     pmem_configs: Vec<pmem::PmemConfig>,
 }
@@ -236,9 +238,18 @@ impl VmConfiguration {
             mmds_config,
             vsock_config,
             entropy_config,
+            memory_hotplug_config: None,
             balloon_config: None,
             pmem_configs: Vec::new(),
         }
+    }
+
+    pub const fn with_memory_hotplug_config(
+        mut self,
+        memory_hotplug_config: Option<memory_hotplug::MemoryHotplugConfig>,
+    ) -> Self {
+        self.memory_hotplug_config = memory_hotplug_config;
+        self
     }
 
     pub const fn with_balloon_config(
@@ -280,6 +291,10 @@ impl VmConfiguration {
 
     pub const fn entropy_config(&self) -> Option<entropy::EntropyConfig> {
         self.entropy_config
+    }
+
+    pub const fn memory_hotplug_config(&self) -> Option<memory_hotplug::MemoryHotplugConfig> {
+        self.memory_hotplug_config
     }
 
     pub const fn balloon_config(&self) -> Option<balloon::BalloonConfig> {
@@ -440,6 +455,7 @@ pub struct VmmController {
     network_interface_configs: network::NetworkInterfaceConfigs,
     vsock_config: Option<vsock::VsockConfig>,
     entropy_config: Option<entropy::EntropyConfig>,
+    memory_hotplug_config: Option<memory_hotplug::MemoryHotplugConfig>,
     balloon_config: Option<balloon::BalloonConfig>,
     pmem_configs: pmem::PmemConfigs,
     serial_config: serial::SerialConfig,
@@ -481,6 +497,7 @@ impl VmmController {
             network_interface_configs: network::NetworkInterfaceConfigs::new(),
             vsock_config: None,
             entropy_config: None,
+            memory_hotplug_config: None,
             balloon_config: None,
             pmem_configs: pmem::PmemConfigs::new(),
             serial_config: serial::SerialConfig::default(),
@@ -510,6 +527,10 @@ impl VmmController {
 
     pub const fn entropy_config(&self) -> Option<entropy::EntropyConfig> {
         self.entropy_config
+    }
+
+    pub const fn memory_hotplug_config(&self) -> Option<memory_hotplug::MemoryHotplugConfig> {
+        self.memory_hotplug_config
     }
 
     pub const fn balloon_config(&self) -> Option<balloon::BalloonConfig> {
@@ -556,6 +577,7 @@ impl VmmController {
             self.vsock_config.clone(),
             self.entropy_config,
         )
+        .with_memory_hotplug_config(self.memory_hotplug_config)
         .with_balloon_config(self.balloon_config)
         .with_pmem_configs(self.pmem_configs.as_slice().to_vec()))
     }
@@ -693,6 +715,10 @@ impl VmmController {
 
         if self.boot_source_config.is_none() {
             return Err(VmmActionError::MissingBootSource);
+        }
+
+        if self.memory_hotplug_config.is_some() {
+            return Err(VmmActionError::MemoryHotplugUnsupported);
         }
 
         Ok(())
@@ -1058,13 +1084,20 @@ impl VmmController {
                         state: self.instance_info.state,
                     });
                 }
-                config
-                    .validate()
-                    .map_err(VmmActionError::MemoryHotplugConfig)?;
 
-                Err(VmmActionError::MemoryHotplugUnsupported)
+                self.memory_hotplug_config = Some(
+                    config
+                        .try_into()
+                        .map_err(VmmActionError::MemoryHotplugConfig)?,
+                );
+                Ok(VmmData::Empty)
             }
-            VmmAction::GetMemoryHotplug | VmmAction::PatchMemoryHotplug(_) => {
+            VmmAction::GetMemoryHotplug => self
+                .memory_hotplug_config
+                .map(memory_hotplug::MemoryHotplugConfig::initial_status)
+                .map(VmmData::MemoryHotplugStatus)
+                .ok_or(VmmActionError::MemoryHotplugUnsupported),
+            VmmAction::PatchMemoryHotplug(_) => {
                 if self.instance_info.state == InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
                         action: action_name,
@@ -1412,7 +1445,8 @@ mod tests {
             MachineConfigInput, MachineConfigPatchInput,
         },
         memory_hotplug::{
-            MemoryHotplugConfigError, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
+            MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugConfigInput,
+            MemoryHotplugSizeUpdateInput,
         },
         metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics},
         mmds::{
@@ -1476,6 +1510,11 @@ mod tests {
 
     const fn memory_hotplug_config_input() -> MemoryHotplugConfigInput {
         MemoryHotplugConfigInput::new(1024, 2, 128)
+    }
+
+    fn memory_hotplug_config() -> MemoryHotplugConfig {
+        MemoryHotplugConfig::try_from(memory_hotplug_config_input())
+            .expect("test memory hotplug config should be valid")
     }
 
     const fn memory_hotplug_size_update_input() -> MemoryHotplugSizeUpdateInput {
@@ -1671,6 +1710,7 @@ mod tests {
         assert_eq!(config.mmds_config(), None);
         assert_eq!(config.vsock_config(), None);
         assert_eq!(config.entropy_config(), None);
+        assert_eq!(config.memory_hotplug_config(), None);
         assert_eq!(config.balloon_config(), None);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_none());
@@ -1678,6 +1718,7 @@ mod tests {
         assert!(controller.network_interface_configs().is_empty());
         assert!(controller.vsock_config().is_none());
         assert_eq!(controller.entropy_config(), None);
+        assert_eq!(controller.memory_hotplug_config(), None);
         assert_eq!(controller.balloon_config(), None);
         assert_eq!(controller.serial_config().serial_out_path(), None);
     }
@@ -1722,6 +1763,9 @@ mod tests {
         controller
             .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
             .expect("entropy config should be stored");
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("memory hotplug config should be stored");
         controller
             .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
             .expect("balloon config should be stored");
@@ -1786,6 +1830,10 @@ mod tests {
         assert_eq!(vsock.uds_path(), Path::new("./v.sock"));
         assert_eq!(config.entropy_config(), Some(EntropyConfig::new()));
         assert_eq!(
+            config.memory_hotplug_config(),
+            Some(memory_hotplug_config())
+        );
+        assert_eq!(
             config.balloon_config(),
             Some(BalloonConfig::from(balloon_input(64, true)))
         );
@@ -1822,6 +1870,7 @@ mod tests {
         assert_eq!(config.mmds_config(), None);
         assert_eq!(config.vsock_config(), None);
         assert_eq!(config.entropy_config(), None);
+        assert_eq!(config.memory_hotplug_config(), None);
         assert_eq!(config.balloon_config(), None);
         assert!(config.pmem_configs().is_empty());
     }
@@ -2648,29 +2697,90 @@ mod tests {
     }
 
     #[test]
-    fn put_memory_hotplug_reaches_memory_hotplug_fault_before_start_without_mutating() {
+    fn put_memory_hotplug_stores_and_replaces_before_start() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
             .expect("boot source config should be stored");
 
-        let err = controller
-            .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
-            .expect_err("memory hotplug should remain unsupported");
+        assert_eq!(
+            controller
+                .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+                .expect("memory hotplug config should be stored"),
+            VmmData::Empty
+        );
+        assert_eq!(
+            controller.memory_hotplug_config(),
+            Some(memory_hotplug_config())
+        );
 
-        assert_eq!(err, VmmActionError::MemoryHotplugUnsupported);
+        let replacement = MemoryHotplugConfigInput::new(2048, 4, 256);
+        let expected_replacement =
+            MemoryHotplugConfig::try_from(replacement).expect("replacement should be valid");
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(replacement))
+            .expect("replacement memory hotplug config should be stored");
+
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_some());
+        assert_eq!(
+            controller.memory_hotplug_config(),
+            Some(expected_replacement)
+        );
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
     }
 
     #[test]
-    fn put_memory_hotplug_validates_config_before_unsupported_fault_without_mutating() {
+    fn get_memory_hotplug_returns_initial_status() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
             .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("memory hotplug config should be stored");
+
+        let data = controller
+            .handle_action(VmmAction::GetMemoryHotplug)
+            .expect("configured memory hotplug status should be returned");
+
+        assert_eq!(
+            data,
+            VmmData::MemoryHotplugStatus(memory_hotplug_config().initial_status())
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+    }
+
+    #[test]
+    fn get_memory_hotplug_without_config_returns_memory_hotplug_fault() {
+        for state in [
+            InstanceState::NotStarted,
+            InstanceState::Running,
+            InstanceState::Paused,
+        ] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::GetMemoryHotplug)
+                .expect_err("unconfigured memory hotplug should fail");
+
+            assert_eq!(err, VmmActionError::MemoryHotplugUnsupported);
+            assert_eq!(controller.instance_info().state, state);
+            assert_eq!(controller.memory_hotplug_config(), None);
+        }
+    }
+
+    #[test]
+    fn put_memory_hotplug_validates_config_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("initial memory hotplug config should be stored");
 
         let err = controller
             .handle_action(VmmAction::PutMemoryHotplug(MemoryHotplugConfigInput::new(
@@ -2684,6 +2794,10 @@ mod tests {
         );
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_some());
+        assert_eq!(
+            controller.memory_hotplug_config(),
+            Some(memory_hotplug_config())
+        );
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
     }
@@ -2695,6 +2809,9 @@ mod tests {
             controller
                 .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
                 .expect("boot source config should be stored");
+            controller
+                .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+                .expect("initial memory hotplug config should be stored");
             controller.instance_info.state = state;
 
             let err = controller
@@ -2712,34 +2829,71 @@ mod tests {
             );
             assert_eq!(controller.instance_info().state, state);
             assert!(controller.boot_source_config().is_some());
+            assert_eq!(
+                controller.memory_hotplug_config(),
+                Some(memory_hotplug_config())
+            );
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
         }
     }
 
     #[test]
-    fn postboot_memory_hotplug_actions_reject_not_started_without_mutating() {
-        for action in [
-            VmmAction::GetMemoryHotplug,
-            VmmAction::PatchMemoryHotplug(memory_hotplug_size_update_input()),
-        ] {
+    fn patch_memory_hotplug_rejects_not_started_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("memory hotplug config should be stored");
+
+        let action = VmmAction::PatchMemoryHotplug(memory_hotplug_size_update_input());
+        let err = controller
+            .handle_action(action.clone())
+            .expect_err("memory hotplug update should be post-boot-only");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: action.name(),
+                state: InstanceState::NotStarted,
+            }
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(
+            controller.memory_hotplug_config(),
+            Some(memory_hotplug_config())
+        );
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn patch_memory_hotplug_reaches_memory_hotplug_fault_after_start_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
             let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
             controller
                 .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
                 .expect("boot source config should be stored");
+            controller
+                .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+                .expect("memory hotplug config should be stored");
+            controller.instance_info.state = state;
 
             let err = controller
-                .handle_action(action.clone())
-                .expect_err("memory hotplug action should be post-boot-only");
+                .handle_action(VmmAction::PatchMemoryHotplug(
+                    memory_hotplug_size_update_input(),
+                ))
+                .expect_err("memory hotplug update should remain unsupported");
 
+            assert_eq!(err, VmmActionError::MemoryHotplugUnsupported);
+            assert_eq!(controller.instance_info().state, state);
             assert_eq!(
-                err,
-                VmmActionError::UnsupportedState {
-                    action: action.name(),
-                    state: InstanceState::NotStarted,
-                }
+                controller.memory_hotplug_config(),
+                Some(memory_hotplug_config())
             );
-            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
             assert!(controller.boot_source_config().is_some());
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
@@ -2747,29 +2901,25 @@ mod tests {
     }
 
     #[test]
-    fn postboot_memory_hotplug_actions_reach_memory_hotplug_fault_after_start_without_mutating() {
-        for state in [InstanceState::Running, InstanceState::Paused] {
-            for action in [
-                VmmAction::GetMemoryHotplug,
-                VmmAction::PatchMemoryHotplug(memory_hotplug_size_update_input()),
-            ] {
-                let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
-                controller
-                    .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
-                    .expect("boot source config should be stored");
-                controller.instance_info.state = state;
+    fn instance_start_rejects_configured_memory_hotplug_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("memory hotplug config should be stored");
 
-                let err = controller
-                    .handle_action(action)
-                    .expect_err("memory hotplug should remain unsupported");
+        let err = controller
+            .commit_instance_start()
+            .expect_err("memory hotplug should require later virtio-mem startup work");
 
-                assert_eq!(err, VmmActionError::MemoryHotplugUnsupported);
-                assert_eq!(controller.instance_info().state, state);
-                assert!(controller.boot_source_config().is_some());
-                assert!(controller.drive_configs().is_empty());
-                assert!(controller.network_interface_configs().is_empty());
-            }
-        }
+        assert_eq!(err, VmmActionError::MemoryHotplugUnsupported);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(
+            controller.memory_hotplug_config(),
+            Some(memory_hotplug_config())
+        );
     }
 
     #[test]
