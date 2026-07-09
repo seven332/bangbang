@@ -1324,7 +1324,7 @@ impl VirtioMemRequest {
         if let Some(mutation) = prepared.mutation {
             match mutation
                 .to_executable_mutation(config_space, plugged_blocks)
-                .and_then(|mutation| mutation_executor.apply(&mutation))
+                .and_then(|mutation| mutation_executor.apply(mutation))
             {
                 Ok(applied) => {
                     applied_mutation = Some(applied);
@@ -1460,8 +1460,8 @@ impl VirtioMemRequestExecution {
         self.mutation
     }
 
-    fn applied_mutation(&self) -> Option<&VirtioMemAppliedMutation> {
-        self.applied_mutation.as_ref()
+    fn into_applied_mutation(self) -> Option<VirtioMemAppliedMutation> {
+        self.applied_mutation
     }
 }
 
@@ -1542,7 +1542,7 @@ pub enum VirtioMemMutationKind {
     UnplugAll(Vec<GuestMemoryRange>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct VirtioMemAppliedMutation {
     mutation: VirtioMemMutation,
 }
@@ -1560,7 +1560,7 @@ impl VirtioMemAppliedMutation {
 pub trait VirtioMemMutationExecutor {
     fn apply(
         &mut self,
-        mutation: &VirtioMemMutation,
+        mutation: VirtioMemMutation,
     ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError>;
 
     fn rollback(
@@ -1575,9 +1575,9 @@ pub struct NoopVirtioMemMutationExecutor;
 impl VirtioMemMutationExecutor for NoopVirtioMemMutationExecutor {
     fn apply(
         &mut self,
-        mutation: &VirtioMemMutation,
+        mutation: VirtioMemMutation,
     ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError> {
-        Ok(VirtioMemAppliedMutation::new(mutation.clone()))
+        Ok(VirtioMemAppliedMutation::new(mutation))
     }
 
     fn rollback(
@@ -1880,7 +1880,7 @@ impl VirtioMemQueue {
                             execution.completion(),
                             VirtioMemQueueDispatchOutcome::from_execution(&execution),
                             execution.mutation(),
-                            execution.applied_mutation().cloned(),
+                            execution.into_applied_mutation(),
                         )
                     }
                     Err(source) => (
@@ -4974,12 +4974,12 @@ mod tests {
     impl VirtioMemMutationExecutor for RecordingMutationExecutor {
         fn apply(
             &mut self,
-            mutation: &VirtioMemMutation,
+            mutation: VirtioMemMutation,
         ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError> {
             self.apply_calls.push(mutation.clone());
             match self.apply_results.pop_front() {
                 Some(Err(source)) => Err(source),
-                Some(Ok(())) | None => Ok(VirtioMemAppliedMutation::new(mutation.clone())),
+                Some(Ok(())) | None => Ok(VirtioMemAppliedMutation::new(mutation)),
             }
         }
 
