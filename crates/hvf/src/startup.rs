@@ -24,6 +24,7 @@ use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+use bangbang_runtime::memory_hotplug::VirtioMemMmioLayout;
 use bangbang_runtime::metrics::{
     SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
     SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
@@ -41,6 +42,7 @@ use bangbang_runtime::startup::{
     Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
+    Arm64BootMemoryHotplugDeviceConfig as RuntimeArm64BootMemoryHotplugDeviceConfig,
     Arm64BootNetworkNotificationDispatch, Arm64BootNetworkNotificationDispatchError,
     Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
     Arm64BootPmemNotificationDispatch, Arm64BootPmemNotificationDispatchError,
@@ -82,6 +84,7 @@ pub struct HvfArm64BootSessionConfig {
     pub balloon_device: Option<HvfArm64BootBalloonDeviceConfig>,
     pub boot_timer_device: Option<HvfArm64BootTimerDeviceConfig>,
     pub entropy_device: Option<HvfArm64BootEntropyDeviceConfig>,
+    pub memory_hotplug_device: Option<HvfArm64BootMemoryHotplugDeviceConfig>,
     pub serial_device: Option<HvfArm64BootSerialDeviceConfig>,
 }
 
@@ -102,6 +105,7 @@ impl HvfArm64BootSessionConfig {
             balloon_device: None,
             boot_timer_device: None,
             entropy_device: None,
+            memory_hotplug_device: None,
             serial_device: None,
         }
     }
@@ -119,6 +123,14 @@ impl HvfArm64BootSessionConfig {
         entropy_device: HvfArm64BootEntropyDeviceConfig,
     ) -> Self {
         self.entropy_device = Some(entropy_device);
+        self
+    }
+
+    pub const fn with_memory_hotplug_device(
+        mut self,
+        memory_hotplug_device: HvfArm64BootMemoryHotplugDeviceConfig,
+    ) -> Self {
+        self.memory_hotplug_device = Some(memory_hotplug_device);
         self
     }
 
@@ -162,6 +174,24 @@ impl HvfArm64BootEntropyDeviceConfig {
         interrupt_line: GuestInterruptLine,
     ) -> RuntimeArm64BootEntropyDeviceConfig {
         RuntimeArm64BootEntropyDeviceConfig::new(self.mmio_layout, interrupt_line)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64BootMemoryHotplugDeviceConfig {
+    pub mmio_layout: VirtioMemMmioLayout,
+}
+
+impl HvfArm64BootMemoryHotplugDeviceConfig {
+    pub const fn new(mmio_layout: VirtioMemMmioLayout) -> Self {
+        Self { mmio_layout }
+    }
+
+    const fn into_runtime(
+        self,
+        interrupt_line: GuestInterruptLine,
+    ) -> RuntimeArm64BootMemoryHotplugDeviceConfig {
+        RuntimeArm64BootMemoryHotplugDeviceConfig::new(self.mmio_layout, interrupt_line)
     }
 }
 
@@ -232,6 +262,7 @@ pub struct HvfArm64BootSession<'vm> {
     vsock_interrupt_line: Option<GuestInterruptLine>,
     balloon_interrupt_line: Option<GuestInterruptLine>,
     entropy_interrupt_line: Option<GuestInterruptLine>,
+    memory_hotplug_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
     boot_registers: HvfArm64BootRegisters,
 }
@@ -263,6 +294,7 @@ pub struct OwnedHvfArm64BootSession {
     vsock_interrupt_line: Option<GuestInterruptLine>,
     balloon_interrupt_line: Option<GuestInterruptLine>,
     entropy_interrupt_line: Option<GuestInterruptLine>,
+    memory_hotplug_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
     boot_registers: HvfArm64BootRegisters,
 }
@@ -855,6 +887,10 @@ impl HvfArm64BootSession<'_> {
         self.entropy_interrupt_line
     }
 
+    pub const fn memory_hotplug_interrupt_line(&self) -> Option<GuestInterruptLine> {
+        self.memory_hotplug_interrupt_line
+    }
+
     pub const fn serial_interrupt_line(&self) -> Option<GuestInterruptLine> {
         self.serial_interrupt_line
     }
@@ -1207,6 +1243,7 @@ impl OwnedHvfArm64BootSession {
             vsock_interrupt_line: prepared.vsock_interrupt_line,
             balloon_interrupt_line: prepared.balloon_interrupt_line,
             entropy_interrupt_line: prepared.entropy_interrupt_line,
+            memory_hotplug_interrupt_line: prepared.memory_hotplug_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
             boot_registers: prepared.boot_registers,
         })
@@ -1309,6 +1346,10 @@ impl OwnedHvfArm64BootSession {
 
     pub const fn entropy_interrupt_line(&self) -> Option<GuestInterruptLine> {
         self.entropy_interrupt_line
+    }
+
+    pub const fn memory_hotplug_interrupt_line(&self) -> Option<GuestInterruptLine> {
+        self.memory_hotplug_interrupt_line
     }
 
     pub const fn serial_interrupt_line(&self) -> Option<GuestInterruptLine> {
@@ -4320,6 +4361,7 @@ pub enum HvfArm64BootInterruptLinePurpose {
     VsockDevice,
     BalloonDevice,
     EntropyDevice,
+    MemoryHotplugDevice,
     SerialDevice,
 }
 
@@ -4332,6 +4374,7 @@ impl fmt::Display for HvfArm64BootInterruptLinePurpose {
             Self::VsockDevice => f.write_str("vsock device"),
             Self::BalloonDevice => f.write_str("balloon device"),
             Self::EntropyDevice => f.write_str("entropy device"),
+            Self::MemoryHotplugDevice => f.write_str("memory hotplug device"),
             Self::SerialDevice => f.write_str("serial device"),
         }
     }
@@ -4390,6 +4433,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     vsock_interrupt_line: Option<GuestInterruptLine>,
     balloon_interrupt_line: Option<GuestInterruptLine>,
     entropy_interrupt_line: Option<GuestInterruptLine>,
+    memory_hotplug_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
     boot_registers: HvfArm64BootRegisters,
 }
@@ -4402,6 +4446,7 @@ struct HvfArm64BootInterruptLines {
     vsock: Option<GuestInterruptLine>,
     balloon: Option<GuestInterruptLine>,
     entropy: Option<GuestInterruptLine>,
+    memory_hotplug: Option<GuestInterruptLine>,
     serial: Option<GuestInterruptLine>,
 }
 
@@ -4413,6 +4458,7 @@ struct HvfArm64BootInterruptRequest {
     vsock_configured: bool,
     balloon_configured: bool,
     entropy_configured: bool,
+    memory_hotplug_configured: bool,
     serial_configured: bool,
 }
 
@@ -4460,6 +4506,7 @@ impl HvfBackend {
             vsock_interrupt_line: prepared.vsock_interrupt_line,
             balloon_interrupt_line: prepared.balloon_interrupt_line,
             entropy_interrupt_line: prepared.entropy_interrupt_line,
+            memory_hotplug_interrupt_line: prepared.memory_hotplug_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
             boot_registers: prepared.boot_registers,
         })
@@ -4491,6 +4538,8 @@ fn prepare_arm64_boot_session_parts<'vm>(
             balloon_configured: controller.balloon_config().is_some()
                 && config.balloon_device.is_some(),
             entropy_configured: config.entropy_device.is_some(),
+            memory_hotplug_configured: controller.memory_hotplug_config().is_some()
+                && config.memory_hotplug_device.is_some(),
             serial_configured: config.serial_device.is_some(),
         },
     )?;
@@ -4509,6 +4558,10 @@ fn prepare_arm64_boot_session_parts<'vm>(
         .entropy_device
         .zip(interrupt_lines.entropy)
         .map(|(entropy, interrupt_line)| entropy.into_runtime(interrupt_line));
+    let runtime_memory_hotplug = config
+        .memory_hotplug_device
+        .zip(interrupt_lines.memory_hotplug)
+        .map(|(memory_hotplug, interrupt_line)| memory_hotplug.into_runtime(interrupt_line));
     let resources = Arm64BootResources::assemble_from_controller(
         controller,
         Arm64BootResourceConfig {
@@ -4532,6 +4585,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
                     BalloonMmioLayout::new(GuestAddress::new(0), MmioRegionId::new(0))
                 }),
             balloon_interrupt_line: interrupt_lines.balloon,
+            memory_hotplug_device: runtime_memory_hotplug,
             entropy_device: runtime_entropy,
         },
     )
@@ -4626,6 +4680,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         vsock_interrupt_line: interrupt_lines.vsock,
         balloon_interrupt_line: interrupt_lines.balloon,
         entropy_interrupt_line: interrupt_lines.entropy,
+        memory_hotplug_interrupt_line: interrupt_lines.memory_hotplug,
         serial_interrupt_line: interrupt_lines.serial,
         boot_registers,
     })
@@ -4724,6 +4779,17 @@ fn allocate_interrupt_lines(
         None
     };
 
+    let memory_hotplug = if request.memory_hotplug_configured {
+        Some(allocator.allocate().map_err(|source| {
+            HvfArm64BootSessionError::AllocateInterruptLine {
+                purpose: HvfArm64BootInterruptLinePurpose::MemoryHotplugDevice,
+                source,
+            }
+        })?)
+    } else {
+        None
+    };
+
     let serial = if request.serial_configured {
         Some(allocator.allocate().map_err(|source| {
             HvfArm64BootSessionError::AllocateInterruptLine {
@@ -4742,6 +4808,7 @@ fn allocate_interrupt_lines(
         vsock,
         balloon,
         entropy,
+        memory_hotplug,
         serial,
     })
 }
@@ -4780,6 +4847,7 @@ mod tests {
     };
     use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::memory_hotplug::VirtioMemMmioLayout;
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive, EntropyDeviceMetrics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
@@ -4829,10 +4897,11 @@ mod tests {
         HvfArm64BootBalloonDeviceConfig, HvfArm64BootBalloonNotificationDispatchError,
         HvfArm64BootBlockNotificationDispatchError, HvfArm64BootEntropyDeviceConfig,
         HvfArm64BootEntropyNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
-        HvfArm64BootInterruptRequest, HvfArm64BootMmioDispatcherError,
-        HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootPmemNotificationDispatchError,
-        HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
-        HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig,
+        HvfArm64BootInterruptRequest, HvfArm64BootMemoryHotplugDeviceConfig,
+        HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatchError,
+        HvfArm64BootPmemNotificationDispatchError, HvfArm64BootRunLoopOutcome,
+        HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig,
         HvfArm64BootVsockNotificationDispatchError, allocate_interrupt_lines,
         collect_balloon_notification_dispatches, collect_block_notification_dispatches,
         collect_entropy_notification_dispatches, collect_network_notification_dispatches,
@@ -5954,6 +6023,7 @@ mod tests {
                 MmioRegionId::new(110),
             ),
             balloon_interrupt_line: None,
+            memory_hotplug_device: None,
             entropy_device: None,
         }
     }
@@ -10797,6 +10867,26 @@ mod tests {
     }
 
     #[test]
+    fn session_config_stores_memory_hotplug_device() {
+        let memory_hotplug = HvfArm64BootMemoryHotplugDeviceConfig::new(VirtioMemMmioLayout::new(
+            GuestAddress::new(0x4000_9000),
+            MmioRegionId::new(5000),
+        ));
+        let config = HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            RtcMmioLayout::new(TEST_RTC_MMIO_BASE, MmioRegionId::new(3000)),
+        )
+        .with_memory_hotplug_device(memory_hotplug);
+
+        assert_eq!(config.memory_hotplug_device, Some(memory_hotplug));
+        assert_eq!(config.entropy_device, None);
+        assert_eq!(config.balloon_device, None);
+    }
+
+    #[test]
     fn session_config_stores_boot_timer_device() {
         let boot_timer = HvfArm64BootTimerDeviceConfig::new(BootTimerMmioLayout::new(
             GuestAddress::new(0x4000_0000),
@@ -10853,9 +10943,9 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_lines_allocate_blocks_before_pmem_network_vsock_balloon_entropy_and_serial() {
+    fn interrupt_lines_allocate_memory_hotplug_before_serial() {
         let lines = allocate_interrupt_lines(
-            &gic_with_spi_range(32, 10),
+            &gic_with_spi_range(32, 11),
             HvfArm64BootInterruptRequest {
                 block_device_count: 2,
                 pmem_device_count: 2,
@@ -10863,6 +10953,7 @@ mod tests {
                 vsock_configured: true,
                 balloon_configured: true,
                 entropy_configured: true,
+                memory_hotplug_configured: true,
                 serial_configured: true,
             },
         )
@@ -10874,7 +10965,8 @@ mod tests {
         assert_eq!(lines.vsock.map(|line| line.raw_value()), Some(38));
         assert_eq!(lines.balloon.map(|line| line.raw_value()), Some(39));
         assert_eq!(lines.entropy.map(|line| line.raw_value()), Some(40));
-        assert_eq!(lines.serial.map(|line| line.raw_value()), Some(41));
+        assert_eq!(lines.memory_hotplug.map(|line| line.raw_value()), Some(41));
+        assert_eq!(lines.serial.map(|line| line.raw_value()), Some(42));
     }
 
     #[test]
@@ -10895,6 +10987,7 @@ mod tests {
         assert_eq!(lines.vsock, None);
         assert_eq!(lines.balloon, None);
         assert_eq!(lines.entropy, None);
+        assert_eq!(lines.memory_hotplug, None);
         assert_eq!(lines.serial, None);
     }
 
