@@ -213,6 +213,18 @@ impl MemoryHotplugStatus {
         }
     }
 
+    pub fn try_from_plugged_size_bytes(
+        config: MemoryHotplugConfig,
+        plugged_size: u64,
+        requested_size_mib: u64,
+    ) -> Result<Self, MemoryHotplugStatusError> {
+        if !plugged_size.is_multiple_of(MIB) {
+            return Err(MemoryHotplugStatusError::PluggedSizeNotMibAligned { plugged_size });
+        }
+
+        Ok(Self::new(config, plugged_size / MIB, requested_size_mib))
+    }
+
     pub const fn total_size_mib(self) -> u64 {
         self.config.total_size_mib()
     }
@@ -315,6 +327,48 @@ impl fmt::Display for MemoryHotplugConfigError {
 }
 
 impl std::error::Error for MemoryHotplugConfigError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryHotplugStatusError {
+    ActiveSessionUnavailable,
+    ActiveSessionCommand { message: String },
+    HandlerLookup(MmioHandlerLookupError),
+    PluggedSizeNotMibAligned { plugged_size: u64 },
+}
+
+impl fmt::Display for MemoryHotplugStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active memory hotplug device session is unavailable")
+            }
+            Self::ActiveSessionCommand { message } => {
+                write!(
+                    f,
+                    "active memory hotplug device status query failed: {message}"
+                )
+            }
+            Self::HandlerLookup(err) => write!(f, "{err}"),
+            Self::PluggedSizeNotMibAligned { plugged_size } => {
+                write!(
+                    f,
+                    "active memory hotplug plugged size ({plugged_size} bytes) is not MiB aligned"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MemoryHotplugStatusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup(err) => Some(err),
+            Self::ActiveSessionUnavailable
+            | Self::ActiveSessionCommand { .. }
+            | Self::PluggedSizeNotMibAligned { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemoryHotplugUpdateError {
@@ -2903,6 +2957,16 @@ mod tests {
         let input = MemoryHotplugSizeUpdateInput::new(256);
 
         assert_eq!(input.requested_size_mib(), 256);
+    }
+
+    #[test]
+    fn memory_hotplug_status_rejects_non_mib_aligned_plugged_bytes() {
+        assert_eq!(
+            MemoryHotplugStatus::try_from_plugged_size_bytes(memory_hotplug_config(), MIB + 1, 256),
+            Err(MemoryHotplugStatusError::PluggedSizeNotMibAligned {
+                plugged_size: MIB + 1,
+            })
+        );
     }
 
     #[test]

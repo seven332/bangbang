@@ -34,7 +34,8 @@ use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::memory_hotplug::{
-    MemoryHotplugConfigInput, MemoryHotplugSizeUpdate, MemoryHotplugSizeUpdateInput,
+    MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdate,
+    MemoryHotplugSizeUpdateInput, MemoryHotplugStatus, MemoryHotplugStatusError,
     MemoryHotplugUpdateError, VirtioMemMmioLayout,
 };
 use bangbang_runtime::metrics::{
@@ -163,6 +164,14 @@ pub(crate) trait ProcessSessionDiagnostics {
         _update: MemoryHotplugSizeUpdate,
     ) -> Result<(), MemoryHotplugUpdateError> {
         Err(MemoryHotplugUpdateError::ActiveSessionUnavailable)
+    }
+
+    fn memory_hotplug_status(
+        &mut self,
+        _config: MemoryHotplugConfig,
+        _requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        Err(MemoryHotplugStatusError::ActiveSessionUnavailable)
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -962,6 +971,7 @@ where
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::PatchBalloonStats(input) => self.update_balloon_statistics(input),
             VmmAction::PatchMemoryHotplug(input) => self.update_memory_hotplug(input),
+            VmmAction::GetMemoryHotplug => self.memory_hotplug_status(),
             VmmAction::GetBalloonStats => self.balloon_stats(),
             VmmAction::GetBalloonHintingStatus => self.balloon_hinting_status(),
             VmmAction::PatchBalloonHintingStart(input) => self.start_balloon_hinting(input),
@@ -1155,6 +1165,32 @@ where
         self.controller.commit_memory_hotplug_size_update(update);
 
         Ok(VmmData::Empty)
+    }
+
+    fn memory_hotplug_status(&mut self) -> Result<VmmData, VmmActionError> {
+        if self.controller.instance_info().state == bangbang_runtime::InstanceState::NotStarted {
+            return self.controller.handle_action(VmmAction::GetMemoryHotplug);
+        }
+
+        let config = self
+            .controller
+            .memory_hotplug_config()
+            .ok_or(VmmActionError::MemoryHotplugUnsupported)?;
+        let requested_size_mib = self
+            .controller
+            .memory_hotplug_status()
+            .ok_or(VmmActionError::MemoryHotplugUnsupported)?
+            .requested_size_mib();
+        let Some(session) = self.started_session.as_mut() else {
+            return Err(VmmActionError::MemoryHotplugStatus(
+                MemoryHotplugStatusError::ActiveSessionUnavailable,
+            ));
+        };
+        let status = session
+            .memory_hotplug_status(config, requested_size_mib)
+            .map_err(VmmActionError::MemoryHotplugStatus)?;
+
+        Ok(VmmData::MemoryHotplugStatus(status))
     }
 
     fn balloon_stats(&mut self) -> Result<VmmData, VmmActionError> {
@@ -1988,6 +2024,14 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         Err(MemoryHotplugUpdateError::ActiveSessionUnavailable)
     }
 
+    fn memory_hotplug_status(
+        &mut self,
+        _config: MemoryHotplugConfig,
+        _requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        Err(MemoryHotplugStatusError::ActiveSessionUnavailable)
+    }
+
     fn run_loop_with_network_packet_io<P>(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -2064,6 +2108,14 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         OwnedHvfArm64BootSession::update_memory_hotplug_requested_size_and_signal_interrupt(
             self, update,
         )
+    }
+
+    fn memory_hotplug_status(
+        &mut self,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        OwnedHvfArm64BootSession::memory_hotplug_status(self, config, requested_size_mib)
     }
 
     fn run_loop_with_network_packet_io<P>(
@@ -2167,6 +2219,14 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         Err(MemoryHotplugUpdateError::ActiveSessionUnavailable)
     }
 
+    fn memory_hotplug_status(
+        &mut self,
+        _config: MemoryHotplugConfig,
+        _requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        Err(MemoryHotplugStatusError::ActiveSessionUnavailable)
+    }
+
     fn run_loop(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -2242,6 +2302,14 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         )
     }
 
+    fn memory_hotplug_status(
+        &mut self,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        OwnedHvfArm64BootSession::memory_hotplug_status(self, config, requested_size_mib)
+    }
+
     fn run_loop(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -2313,6 +2381,15 @@ where
         update: MemoryHotplugSizeUpdate,
     ) -> Result<(), MemoryHotplugUpdateError> {
         self.session.update_memory_hotplug(update)
+    }
+
+    fn memory_hotplug_status(
+        &mut self,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        self.session
+            .memory_hotplug_status(config, requested_size_mib)
     }
 
     fn run_loop(
@@ -2576,6 +2653,20 @@ where
     match err {
         BootRunLoopCommandError::Command { source } => source,
         other => MemoryHotplugUpdateError::ActiveSessionCommand {
+            message: other.to_string(),
+        },
+    }
+}
+
+fn memory_hotplug_status_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, MemoryHotplugStatusError>,
+) -> MemoryHotplugStatusError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        other => MemoryHotplugStatusError::ActiveSessionCommand {
             message: other.to_string(),
         },
     }
@@ -3142,6 +3233,22 @@ where
             .map_err(memory_hotplug_update_error_from_boot_run_loop_command)
     }
 
+    fn memory_hotplug_status(
+        &mut self,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(MemoryHotplugStatusError::ActiveSessionUnavailable);
+        }
+
+        self.run_command(move |session| session.memory_hotplug_status(config, requested_size_mib))
+            .map_err(memory_hotplug_status_error_from_boot_run_loop_command)
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         if self.balloon_device_updater.is_none() {
             return Err(BalloonUpdateError::ActiveSessionUnavailable);
@@ -3324,7 +3431,8 @@ mod tests {
     use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdate,
-        MemoryHotplugSizeUpdateInput, MemoryHotplugStatus, MemoryHotplugUpdateError,
+        MemoryHotplugSizeUpdateInput, MemoryHotplugStatus, MemoryHotplugStatusError,
+        MemoryHotplugUpdateError,
     };
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
@@ -3440,7 +3548,18 @@ mod tests {
     }
 
     fn memory_hotplug_status(requested_size_mib: u64) -> MemoryHotplugStatus {
-        MemoryHotplugStatus::new(memory_hotplug_config(), 0, requested_size_mib)
+        memory_hotplug_status_with_plugged(0, requested_size_mib)
+    }
+
+    fn memory_hotplug_status_with_plugged(
+        plugged_size_mib: u64,
+        requested_size_mib: u64,
+    ) -> MemoryHotplugStatus {
+        MemoryHotplugStatus::new(
+            memory_hotplug_config(),
+            plugged_size_mib,
+            requested_size_mib,
+        )
     }
 
     fn block_device_updater_fixture(
@@ -3532,6 +3651,9 @@ mod tests {
         memory_hotplug_update_count: usize,
         last_memory_hotplug_requested_size_mib: Option<u64>,
         memory_hotplug_update_result: Option<MemoryHotplugUpdateError>,
+        memory_hotplug_status_count: usize,
+        last_memory_hotplug_status_requested_size_mib: Option<u64>,
+        memory_hotplug_status_result: Option<Result<MemoryHotplugStatus, MemoryHotplugStatusError>>,
     }
 
     impl FakeSession {
@@ -3568,6 +3690,9 @@ mod tests {
                 memory_hotplug_update_count: 0,
                 last_memory_hotplug_requested_size_mib: None,
                 memory_hotplug_update_result: None,
+                memory_hotplug_status_count: 0,
+                last_memory_hotplug_status_requested_size_mib: None,
+                memory_hotplug_status_result: None,
             }
         }
 
@@ -3646,6 +3771,15 @@ mod tests {
         fn with_memory_hotplug_update_result(id: u64, result: MemoryHotplugUpdateError) -> Self {
             let mut session = Self::new(id);
             session.memory_hotplug_update_result = Some(result);
+            session
+        }
+
+        fn with_memory_hotplug_status_result(
+            id: u64,
+            result: Result<MemoryHotplugStatus, MemoryHotplugStatusError>,
+        ) -> Self {
+            let mut session = Self::new(id);
+            session.memory_hotplug_status_result = Some(result);
             session
         }
     }
@@ -3766,6 +3900,19 @@ mod tests {
             match self.memory_hotplug_update_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
+            }
+        }
+
+        fn memory_hotplug_status(
+            &mut self,
+            config: MemoryHotplugConfig,
+            requested_size_mib: u64,
+        ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+            self.memory_hotplug_status_count += 1;
+            self.last_memory_hotplug_status_requested_size_mib = Some(requested_size_mib);
+            match self.memory_hotplug_status_result.clone() {
+                Some(result) => result,
+                None => Ok(MemoryHotplugStatus::new(config, 0, requested_size_mib)),
             }
         }
     }
@@ -4074,6 +4221,8 @@ mod tests {
         vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
         entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
         memory_hotplug_updates: Arc<Mutex<Vec<u64>>>,
+        memory_hotplug_status_requests: Arc<Mutex<Vec<u64>>>,
+        memory_hotplug_status_plugged_size_mib: u64,
         wait_for_stop: bool,
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
@@ -4101,6 +4250,8 @@ mod tests {
                 vsock_device_metrics: None,
                 entropy_device_metrics: None,
                 memory_hotplug_updates: Arc::default(),
+                memory_hotplug_status_requests: Arc::default(),
+                memory_hotplug_status_plugged_size_mib: 0,
                 wait_for_stop: true,
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
@@ -4113,6 +4264,18 @@ mod tests {
 
         fn memory_hotplug_updates(&self) -> Arc<Mutex<Vec<u64>>> {
             Arc::clone(&self.memory_hotplug_updates)
+        }
+
+        fn memory_hotplug_status_requests(&self) -> Arc<Mutex<Vec<u64>>> {
+            Arc::clone(&self.memory_hotplug_status_requests)
+        }
+
+        const fn with_memory_hotplug_status_plugged_size_mib(
+            mut self,
+            plugged_size_mib: u64,
+        ) -> Self {
+            self.memory_hotplug_status_plugged_size_mib = plugged_size_mib;
+            self
         }
 
         fn with_outcomes(
@@ -4234,6 +4397,22 @@ mod tests {
                 .expect("fake memory hotplug updates should lock")
                 .push(update.requested_size_mib());
             Ok(())
+        }
+
+        fn memory_hotplug_status(
+            &mut self,
+            config: MemoryHotplugConfig,
+            requested_size_mib: u64,
+        ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+            self.memory_hotplug_status_requests
+                .lock()
+                .expect("fake memory hotplug status requests should lock")
+                .push(requested_size_mib);
+            Ok(MemoryHotplugStatus::new(
+                config,
+                self.memory_hotplug_status_plugged_size_mib,
+                requested_size_mib,
+            ))
         }
 
         fn run_loop(
@@ -5347,6 +5526,7 @@ mod tests {
             | VmmActionError::NetworkInterfaceUpdate(_)
             | VmmActionError::NetworkInterfaceUpdateUnsupported
             | VmmActionError::MemoryHotplugConfig(_)
+            | VmmActionError::MemoryHotplugStatus(_)
             | VmmActionError::MemoryHotplugUpdate(_)
             | VmmActionError::MemoryHotplugUnsupported
             | VmmActionError::PmemConfig(_)
@@ -5871,6 +6051,96 @@ mod tests {
                 .lock()
                 .expect("fake memory hotplug updates should lock"),
             [128]
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_queries_memory_hotplug_status_on_worker_after_wakeup() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_memory_hotplug_status_plugged_size_mib(384)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+        let status_requests = session.memory_hotplug_status_requests();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(24).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            24
+        );
+        let status = supervisor
+            .memory_hotplug_status(memory_hotplug_config(), 512)
+            .expect("memory hotplug status should run on worker");
+
+        assert_eq!(status, memory_hotplug_status_with_plugged(384, 512));
+        assert_eq!(control.request_wakeup_count(), 1);
+        assert_eq!(
+            *status_requests
+                .lock()
+                .expect("fake memory hotplug status requests should lock"),
+            [512]
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_queries_memory_hotplug_status_while_paused() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_memory_hotplug_status_plugged_size_mib(128)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let status_requests = session.memory_hotplug_status_requests();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(25).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            25
+        );
+        supervisor.pause().expect("supervisor should pause");
+
+        let status = supervisor
+            .memory_hotplug_status(memory_hotplug_config(), 256)
+            .expect("paused worker should still query memory hotplug status");
+
+        assert_eq!(status, memory_hotplug_status_with_plugged(128, 256));
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert_eq!(
+            max_steps_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(
+            *status_requests
+                .lock()
+                .expect("fake memory hotplug status requests should lock"),
+            [256]
         );
 
         drop(supervisor);
@@ -6998,7 +7268,12 @@ mod tests {
 
     #[test]
     fn runtime_memory_hotplug_update_refreshes_active_session_before_config_commit() {
-        let mut vmm = configured_vmm(FakeStarter::success(28));
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_memory_hotplug_status_result(
+                28,
+                Ok(memory_hotplug_status_with_plugged(128, 256)),
+            ),
+        ));
         vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
             .expect("initial memory hotplug config should configure");
         vmm.handle_action(VmmAction::InstanceStart)
@@ -7020,7 +7295,18 @@ mod tests {
         assert_eq!(
             vmm.handle_action(VmmAction::GetMemoryHotplug)
                 .expect("memory hotplug status should be returned"),
-            bangbang_runtime::VmmData::MemoryHotplugStatus(memory_hotplug_status(256))
+            bangbang_runtime::VmmData::MemoryHotplugStatus(memory_hotplug_status_with_plugged(
+                128, 256
+            ))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.memory_hotplug_status_count, 1);
+        assert_eq!(
+            session.last_memory_hotplug_status_requested_size_mib,
+            Some(256)
         );
     }
 
@@ -7052,6 +7338,33 @@ mod tests {
             vmm.handle_action(VmmAction::GetMemoryHotplug)
                 .expect("memory hotplug status should be returned"),
             bangbang_runtime::VmmData::MemoryHotplugStatus(memory_hotplug_status(0))
+        );
+    }
+
+    #[test]
+    fn runtime_memory_hotplug_status_failure_returns_status_fault() {
+        let expected_error = MemoryHotplugStatusError::ActiveSessionUnavailable;
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_memory_hotplug_status_result(30, Err(expected_error.clone())),
+        ));
+        vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("initial memory hotplug config should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::GetMemoryHotplug)
+            .expect_err("active memory hotplug status query should fail");
+
+        assert_eq!(err, VmmActionError::MemoryHotplugStatus(expected_error));
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.memory_hotplug_status_count, 1);
+        assert_eq!(
+            session.last_memory_hotplug_status_requested_size_mib,
+            Some(0)
         );
     }
 
