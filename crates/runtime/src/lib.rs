@@ -541,7 +541,9 @@ impl VmmController {
     }
 
     pub fn boot_timer_logger(&self) -> logger::BootTimerLogger {
-        self.logger_state.boot_timer_logger()
+        self.logger_state
+            .boot_timer_logger()
+            .with_missed_log_counter(self.metrics_state.missed_log_counter())
     }
 
     pub fn vm_config(&self) -> Result<VmConfiguration, mmds::MmdsStateLockError> {
@@ -3754,6 +3756,82 @@ mod tests {
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn boot_timer_logger_write_failure_reports_missed_log_count_in_metrics() {
+        let metrics_path = unique_metrics_path("boot-timer-missed-log");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                &metrics_path,
+            )))
+            .expect("metrics config should be stored");
+        controller.logger_state.configure_test_writer(FailingWriter);
+        let boot_timer_logger = controller.boot_timer_logger();
+
+        let err = boot_timer_logger
+            .log_boot_time(1_000, 200)
+            .expect_err("boot timer logger write should fail");
+
+        assert_eq!(err, LoggerWriteError::Write(ErrorKind::BrokenPipe));
+        assert_eq!(
+            controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn boot_timer_logger_missed_log_count_is_per_controller() {
+        let first_metrics_path = unique_metrics_path("boot-timer-first-controller");
+        let second_metrics_path = unique_metrics_path("boot-timer-second-controller");
+        let mut first = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let mut second = VmmController::new("demo-2", "0.1.0", "bangbang");
+        first
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                &first_metrics_path,
+            )))
+            .expect("first metrics config should be stored");
+        second
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                &second_metrics_path,
+            )))
+            .expect("second metrics config should be stored");
+        first.logger_state.configure_test_writer(FailingWriter);
+        let first_boot_timer_logger = first.boot_timer_logger();
+
+        assert_eq!(
+            first_boot_timer_logger.log_boot_time(1_000, 200),
+            Err(LoggerWriteError::Write(ErrorKind::BrokenPipe))
+        );
+
+        assert_eq!(
+            first.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(true)
+        );
+        assert_eq!(
+            second.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_to_string(&first_metrics_path)
+                .expect("first metrics output should be readable"),
+            "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&second_metrics_path)
+                .expect("second metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(first_metrics_path).expect("first metrics fixture should clean up");
+        fs::remove_file(second_metrics_path).expect("second metrics fixture should clean up");
     }
 
     #[test]
