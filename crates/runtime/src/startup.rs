@@ -40,7 +40,8 @@ use crate::memory::{
     GuestMemory, GuestMemoryAllocationError, GuestMemoryError, GuestMemoryLayout, aarch64,
 };
 use crate::memory_hotplug::{
-    PreparedVirtioMemDevice, VirtioMemMmioDeviceRegistration, VirtioMemMmioLayout,
+    PreparedVirtioMemDevice, VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError,
+    VirtioMemMmioDeviceRegistration, VirtioMemMmioHandler, VirtioMemMmioLayout,
     VirtioMemMmioRegistrationError, VirtioMemPrepareError,
 };
 use crate::mmio::{
@@ -931,6 +932,132 @@ impl std::error::Error for Arm64BootBalloonNotificationDispatchError {
 }
 
 #[derive(Debug)]
+pub struct Arm64BootMemoryHotplugNotificationDispatches {
+    devices: Vec<Arm64BootMemoryHotplugNotificationDispatch>,
+}
+
+impl Arm64BootMemoryHotplugNotificationDispatches {
+    fn new(devices: Vec<Arm64BootMemoryHotplugNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[Arm64BootMemoryHotplugNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn into_vec(self) -> Vec<Arm64BootMemoryHotplugNotificationDispatch> {
+        self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.devices
+            .iter()
+            .any(Arm64BootMemoryHotplugNotificationDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub struct Arm64BootMemoryHotplugNotificationDispatch {
+    device: Arm64BootMemoryHotplugDevice,
+    outcome: Arm64BootMemoryHotplugNotificationOutcome,
+}
+
+impl Arm64BootMemoryHotplugNotificationDispatch {
+    fn new(
+        device: Arm64BootMemoryHotplugDevice,
+        outcome: Arm64BootMemoryHotplugNotificationOutcome,
+    ) -> Self {
+        Self { device, outcome }
+    }
+
+    pub const fn device(&self) -> &Arm64BootMemoryHotplugDevice {
+        &self.device
+    }
+
+    pub const fn outcome(&self) -> &Arm64BootMemoryHotplugNotificationOutcome {
+        &self.outcome
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.outcome.needs_queue_interrupt()
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootMemoryHotplugNotificationOutcome {
+    Dispatched(VirtioMemDeviceNotificationDispatch),
+    DispatchFailed(VirtioMemDeviceNotificationError),
+    HandlerLookupFailed(MmioHandlerLookupError),
+}
+
+impl Arm64BootMemoryHotplugNotificationOutcome {
+    pub fn needs_queue_interrupt(&self) -> bool {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
+            Self::DispatchFailed(source) => source
+                .completed_dispatch()
+                .is_some_and(crate::memory_hotplug::VirtioMemQueueDispatch::needs_queue_interrupt),
+            Self::HandlerLookupFailed(_) => false,
+        }
+    }
+
+    pub const fn dispatched(&self) -> Option<&VirtioMemDeviceNotificationDispatch> {
+        match self {
+            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn dispatch_error(&self) -> Option<&VirtioMemDeviceNotificationError> {
+        match self {
+            Self::DispatchFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn handler_lookup_error(&self) -> Option<&MmioHandlerLookupError> {
+        match self {
+            Self::HandlerLookupFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::DispatchFailed(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootMemoryHotplugNotificationDispatchError {
+    ResultAllocation { source: TryReserveError },
+}
+
+impl fmt::Display for Arm64BootMemoryHotplugNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResultAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate memory-hotplug notification results: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootMemoryHotplugNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Arm64BootEntropyNotificationDispatches {
     devices: Vec<Arm64BootEntropyNotificationDispatch>,
 }
@@ -1452,6 +1579,45 @@ impl Arm64BootRuntimeResources {
         }
 
         Ok(Arm64BootBalloonNotificationDispatches::new(devices))
+    }
+
+    pub fn dispatch_memory_hotplug_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Result<
+        Arm64BootMemoryHotplugNotificationDispatches,
+        Arm64BootMemoryHotplugNotificationDispatchError,
+    > {
+        let mut devices = Vec::new();
+        let device_count = if self.memory_hotplug_device.is_some() {
+            1
+        } else {
+            0
+        };
+        devices.try_reserve_exact(device_count).map_err(|source| {
+            Arm64BootMemoryHotplugNotificationDispatchError::ResultAllocation { source }
+        })?;
+
+        if let Some(device) = self.memory_hotplug_device.clone() {
+            let region_id = device.registration.region_id();
+            let outcome = match mmio_dispatcher.handler_mut::<VirtioMemMmioHandler>(region_id) {
+                Ok(handler) => match handler.dispatch_mem_queue_notifications(memory) {
+                    Ok(dispatch) => Arm64BootMemoryHotplugNotificationOutcome::Dispatched(dispatch),
+                    Err(source) => {
+                        Arm64BootMemoryHotplugNotificationOutcome::DispatchFailed(source)
+                    }
+                },
+                Err(source) => {
+                    Arm64BootMemoryHotplugNotificationOutcome::HandlerLookupFailed(source)
+                }
+            };
+            devices.push(Arm64BootMemoryHotplugNotificationDispatch::new(
+                device, outcome,
+            ));
+        }
+
+        Ok(Arm64BootMemoryHotplugNotificationDispatches::new(devices))
     }
 
     pub fn trigger_balloon_statistics_update(
@@ -2835,8 +3001,8 @@ mod tests {
     use crate::machine::{MachineConfig, MachineConfigInput};
     use crate::memory::{GuestAddress, aarch64};
     use crate::memory_hotplug::{
-        MemoryHotplugConfigInput, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VirtioMemMmioHandler,
-        VirtioMemMmioLayout,
+        MemoryHotplugConfigInput, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE,
+        VIRTIO_MEM_RESPONSE_SIZE, VirtioMemMmioHandler, VirtioMemMmioLayout,
     };
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBusError, MmioDispatchOutcome, MmioDispatcher,
@@ -3306,6 +3472,32 @@ mod tests {
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
     }
 
+    fn boot_runtime_with_memory_hotplug(
+        kernel_name: &str,
+    ) -> (
+        crate::memory::GuestMemory,
+        super::Arm64BootRuntimeResources,
+        MmioDispatcher,
+    ) {
+        let kernel = temp_file(kernel_name, &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_memory_hotplug(&mut controller);
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                memory_hotplug_device: Some(super::Arm64BootMemoryHotplugDeviceConfig::new(
+                    VirtioMemMmioLayout::new(TEST_MEMORY_HOTPLUG_MMIO_BASE, MmioRegionId::new(120)),
+                    line(36),
+                )),
+                ..valid_config(&[])
+            },
+        )
+        .expect("boot resources should assemble with memory-hotplug device");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
     fn valid_gic() -> Arm64FdtGic {
         Arm64FdtGic {
             distributor: Arm64FdtRegion {
@@ -3584,6 +3776,133 @@ mod tests {
             ),
             MmioDispatchOutcome::Write => panic!("read operation should not produce write outcome"),
         }
+    }
+
+    fn write_boot_memory_hotplug_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        let address = runtime
+            .memory_hotplug_device
+            .as_ref()
+            .expect("memory-hotplug device should be configured")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("memory-hotplug MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        mmio_dispatcher
+            .dispatch(
+                MmioOperation::write(access, data).expect("u32 write operation should be valid"),
+            )
+            .expect("memory-hotplug MMIO write should dispatch");
+    }
+
+    fn read_boot_memory_hotplug_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime
+            .memory_hotplug_device
+            .as_ref()
+            .expect("memory-hotplug device should be configured")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("memory-hotplug MMIO access should resolve");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read operation should be valid"))
+            .expect("memory-hotplug MMIO read should dispatch");
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not produce write outcome"),
+        }
+    }
+
+    fn configure_boot_memory_hotplug_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_ring: GuestAddress,
+    ) {
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(TEST_DESCRIPTOR_TABLE),
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(TEST_AVAILABLE_RING),
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueReady,
+            1,
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn notify_boot_memory_hotplug_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNotify,
+            0,
+        );
     }
 
     fn configure_boot_block_queue(
@@ -4310,6 +4629,73 @@ mod tests {
             ),
         );
         write_available_heads_at(memory, TEST_BALLOON_STATS_AVAILABLE_RING, &[0]);
+    }
+
+    fn write_queued_memory_hotplug_state_request(memory: &mut crate::memory::GuestMemory) {
+        let mut request = Vec::new();
+        request.extend_from_slice(&3u16.to_le_bytes());
+        request.extend_from_slice(&[0; 6]);
+        request.extend_from_slice(&VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value().to_le_bytes());
+        request.extend_from_slice(&1u16.to_le_bytes());
+        request.extend_from_slice(&[0; 6]);
+        assert_eq!(request.len(), VIRTIO_MEM_REQUEST_SIZE);
+        memory
+            .write_slice(&request, HEADER_ADDR)
+            .expect("virtio-mem request should write");
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(
+                HEADER_ADDR,
+                u32::try_from(VIRTIO_MEM_REQUEST_SIZE).expect("request size should fit"),
+                Some(1),
+            ),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(
+                DATA_ADDR,
+                u32::try_from(VIRTIO_MEM_RESPONSE_SIZE).expect("response size should fit"),
+                None,
+            ),
+        );
+        write_available_heads(memory, &[0]);
+    }
+
+    fn read_boot_memory_hotplug_response(memory: &crate::memory::GuestMemory) -> (u16, u16) {
+        let bytes = read_guest_bytes(memory, DATA_ADDR, VIRTIO_MEM_RESPONSE_SIZE);
+        (
+            u16::from_le_bytes([bytes[0], bytes[1]]),
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+        )
+    }
+
+    fn read_boot_memory_hotplug_used_index(memory: &crate::memory::GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_USED_RING
+                .checked_add(2)
+                .expect("memory-hotplug used idx address should not overflow"),
+        )
+    }
+
+    fn read_boot_memory_hotplug_used_element(
+        memory: &crate::memory::GuestMemory,
+        ring_index: u16,
+    ) -> (u32, u32) {
+        let element = TEST_USED_RING
+            .checked_add(4 + u64::from(ring_index) * 8)
+            .expect("memory-hotplug used element address should not overflow");
+        (
+            read_guest_u32(memory, element),
+            read_guest_u32(
+                memory,
+                element
+                    .checked_add(4)
+                    .expect("memory-hotplug used len address should not overflow"),
+            ),
+        )
     }
 
     fn read_boot_entropy_used_index(memory: &crate::memory::GuestMemory) -> u16 {
@@ -6517,6 +6903,27 @@ mod tests {
     }
 
     #[test]
+    fn boot_runtime_memory_hotplug_notification_dispatch_accepts_empty_device() {
+        let kernel = temp_file("kernel-empty-memory-hotplug-dispatch", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+
+        let dispatches = runtime
+            .dispatch_memory_hotplug_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("empty memory-hotplug dispatch result should allocate");
+
+        assert!(dispatches.is_empty());
+        assert_eq!(dispatches.len(), 0);
+        assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
     fn boot_runtime_balloon_notification_dispatch_without_pending_notification_is_noop() {
         let (mut memory, mut runtime, mut mmio_dispatcher) =
             boot_runtime_with_balloon("kernel-balloon-noop-dispatch");
@@ -6550,6 +6957,87 @@ mod tests {
                 VirtioMmioRegister::InterruptStatus,
             ),
             0
+        );
+    }
+
+    #[test]
+    fn boot_runtime_memory_hotplug_notification_dispatch_without_pending_notification_is_noop() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_memory_hotplug("kernel-memory-hotplug-noop-dispatch");
+        configure_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher, TEST_USED_RING);
+
+        let dispatches = runtime
+            .dispatch_memory_hotplug_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("memory-hotplug dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(
+            device_dispatch.device().registration.region_id(),
+            MmioRegionId::new(120)
+        );
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(36));
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("no pending memory-hotplug notification should dispatch as no-op");
+        assert!(dispatch.drained_notifications().is_empty());
+        assert!(dispatch.queue_dispatch().is_none());
+        assert!(!device_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_memory_hotplug_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn boot_runtime_memory_hotplug_notification_dispatch_executes_queued_request() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_memory_hotplug("kernel-memory-hotplug-request-dispatch");
+        configure_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher, TEST_USED_RING);
+        write_queued_memory_hotplug_state_request(&mut memory);
+        notify_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher);
+
+        let dispatches = runtime
+            .dispatch_memory_hotplug_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("memory-hotplug dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("queued memory-hotplug notification should dispatch");
+        assert_eq!(dispatch.drained_notifications(), [0]);
+        let queue = dispatch
+            .queue_dispatch()
+            .expect("queue dispatch summary should be present");
+        assert_eq!(queue.processed_requests(), 1);
+        assert_eq!(queue.policy_errors(), 1);
+        assert!(queue.needs_queue_interrupt());
+        assert!(device_dispatch.needs_queue_interrupt());
+        assert_eq!(read_boot_memory_hotplug_response(&memory), (3, 0));
+        assert_eq!(read_boot_memory_hotplug_used_index(&memory), 1);
+        assert_eq!(
+            read_boot_memory_hotplug_used_element(&memory, 0),
+            (
+                0,
+                u32::try_from(VIRTIO_MEM_RESPONSE_SIZE).expect("response size should fit")
+            ),
+        );
+        assert_eq!(
+            read_boot_memory_hotplug_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            1
         );
     }
 

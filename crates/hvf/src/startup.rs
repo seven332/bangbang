@@ -43,11 +43,12 @@ use bangbang_runtime::startup::{
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
     Arm64BootMemoryHotplugDeviceConfig as RuntimeArm64BootMemoryHotplugDeviceConfig,
-    Arm64BootNetworkNotificationDispatch, Arm64BootNetworkNotificationDispatchError,
-    Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
-    Arm64BootPmemNotificationDispatch, Arm64BootPmemNotificationDispatchError,
-    Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
-    Arm64BootResourceParts, Arm64BootResources,
+    Arm64BootMemoryHotplugNotificationDispatch, Arm64BootMemoryHotplugNotificationDispatchError,
+    Arm64BootMemoryHotplugNotificationDispatches, Arm64BootNetworkNotificationDispatch,
+    Arm64BootNetworkNotificationDispatchError, Arm64BootNetworkNotificationDispatches,
+    Arm64BootNetworkPacketIoProvider, Arm64BootPmemNotificationDispatch,
+    Arm64BootPmemNotificationDispatchError, Arm64BootPmemNotificationDispatches,
+    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResourceParts, Arm64BootResources,
     Arm64BootRtcDeviceConfig as RuntimeArm64BootRtcDeviceConfig, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
@@ -604,6 +605,10 @@ pub enum HvfArm64BootRunLoopError {
         steps_completed: usize,
         source: Box<HvfArm64BootBalloonNotificationDispatchError>,
     },
+    DispatchMemoryHotplugNotifications {
+        steps_completed: usize,
+        source: Box<HvfArm64BootMemoryHotplugNotificationDispatchError>,
+    },
     DispatchEntropyNotifications {
         steps_completed: usize,
         source: Box<HvfArm64BootEntropyNotificationDispatchError>,
@@ -673,6 +678,13 @@ impl fmt::Display for HvfArm64BootRunLoopError {
                 f,
                 "failed to dispatch HVF boot-session balloon notifications after {steps_completed} completed steps: {source}"
             ),
+            Self::DispatchMemoryHotplugNotifications {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to dispatch HVF boot-session memory-hotplug notifications after {steps_completed} completed steps: {source}"
+            ),
             Self::DispatchEntropyNotifications {
                 steps_completed,
                 source,
@@ -702,6 +714,7 @@ impl std::error::Error for HvfArm64BootRunLoopError {
             Self::DispatchNetworkNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchVsockNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchBalloonNotifications { source, .. } => Some(source.as_ref()),
+            Self::DispatchMemoryHotplugNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchEntropyNotifications { source, .. } => Some(source.as_ref()),
             Self::HandleVirtualTimer { source, .. } => Some(source.as_ref()),
         }
@@ -1140,6 +1153,31 @@ impl HvfArm64BootSession<'_> {
             Err(_) => self.balloon_device_metrics.record_event_failure(),
         }
         result
+    }
+
+    pub fn dispatch_memory_hotplug_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootMemoryHotplugNotificationDispatches,
+        HvfArm64BootMemoryHotplugNotificationDispatchError,
+    > {
+        let dispatches = {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let mut mmio_dispatcher =
+                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                    HvfArm64BootMemoryHotplugNotificationDispatchError::MmioDispatcher { source }
+                })?;
+
+            dispatch_memory_hotplug_runtime_notifications(
+                memory,
+                &mut self.runtime_resources,
+                &mut mmio_dispatcher,
+            )?
+        };
+
+        collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic)
     }
 
     pub fn trigger_balloon_statistics_update_and_signal_interrupts(
@@ -1590,6 +1628,31 @@ impl OwnedHvfArm64BootSession {
         result
     }
 
+    pub fn dispatch_memory_hotplug_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootMemoryHotplugNotificationDispatches,
+        HvfArm64BootMemoryHotplugNotificationDispatchError,
+    > {
+        let dispatches = {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let mut mmio_dispatcher =
+                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                    HvfArm64BootMemoryHotplugNotificationDispatchError::MmioDispatcher { source }
+                })?;
+
+            dispatch_memory_hotplug_runtime_notifications(
+                memory,
+                &mut self.runtime_resources,
+                &mut mmio_dispatcher,
+            )?
+        };
+
+        collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic)
+    }
+
     pub fn trigger_balloon_statistics_update_and_signal_interrupts(
         &mut self,
     ) -> Result<(), BalloonUpdateError> {
@@ -1736,6 +1799,15 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
         self.dispatch_balloon_queue_notifications_and_signal_interrupts()
     }
 
+    fn dispatch_run_loop_memory_hotplug_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootMemoryHotplugNotificationDispatches,
+        HvfArm64BootMemoryHotplugNotificationDispatchError,
+    > {
+        self.dispatch_memory_hotplug_queue_notifications_and_signal_interrupts()
+    }
+
     fn dispatch_run_loop_entropy_notifications(
         &mut self,
     ) -> Result<
@@ -1862,6 +1934,16 @@ where
     > {
         self.session
             .dispatch_balloon_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_memory_hotplug_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootMemoryHotplugNotificationDispatches,
+        HvfArm64BootMemoryHotplugNotificationDispatchError,
+    > {
+        self.session
+            .dispatch_memory_hotplug_queue_notifications_and_signal_interrupts()
     }
 
     fn dispatch_run_loop_entropy_notifications(
@@ -2203,6 +2285,65 @@ impl HvfArm64BootBalloonNotificationDispatch {
 }
 
 #[derive(Debug)]
+pub struct HvfArm64BootMemoryHotplugNotificationDispatches {
+    devices: Vec<HvfArm64BootMemoryHotplugNotificationDispatch>,
+}
+
+impl HvfArm64BootMemoryHotplugNotificationDispatches {
+    fn new(devices: Vec<HvfArm64BootMemoryHotplugNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[HvfArm64BootMemoryHotplugNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn has_signal_failure(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|device| device.signal_error().is_some())
+    }
+}
+
+#[derive(Debug)]
+pub struct HvfArm64BootMemoryHotplugNotificationDispatch {
+    dispatch: Arm64BootMemoryHotplugNotificationDispatch,
+    signal_error: Option<DeviceInterruptTriggerError>,
+}
+
+impl HvfArm64BootMemoryHotplugNotificationDispatch {
+    fn new(
+        dispatch: Arm64BootMemoryHotplugNotificationDispatch,
+        signal_error: Option<DeviceInterruptTriggerError>,
+    ) -> Self {
+        Self {
+            dispatch,
+            signal_error,
+        }
+    }
+
+    pub const fn dispatch(&self) -> &Arm64BootMemoryHotplugNotificationDispatch {
+        &self.dispatch
+    }
+
+    pub const fn signal_error(&self) -> Option<&DeviceInterruptTriggerError> {
+        self.signal_error.as_ref()
+    }
+
+    pub fn queue_interrupt_signaled(&self) -> bool {
+        self.dispatch.needs_queue_interrupt() && self.signal_error.is_none()
+    }
+}
+
+#[derive(Debug)]
 pub struct HvfArm64BootEntropyNotificationDispatches {
     devices: Vec<HvfArm64BootEntropyNotificationDispatch>,
     rate_limiter_retry_after: Option<Duration>,
@@ -2367,6 +2508,25 @@ pub enum HvfArm64BootBalloonNotificationDispatchError {
     },
     DispatchNotifications {
         source: Arm64BootBalloonNotificationDispatchError,
+    },
+    CreateSignalSink {
+        source: HvfGicSpiSignalError,
+    },
+    ResultAllocation {
+        source: TryReserveError,
+    },
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootMemoryHotplugNotificationDispatchError {
+    MapGuestMemory {
+        source: HvfGuestMemoryMappingError,
+    },
+    MmioDispatcher {
+        source: HvfArm64BootMmioDispatcherError,
+    },
+    DispatchNotifications {
+        source: Arm64BootMemoryHotplugNotificationDispatchError,
     },
     CreateSignalSink {
         source: HvfGicSpiSignalError,
@@ -2543,6 +2703,43 @@ impl fmt::Display for HvfArm64BootBalloonNotificationDispatchError {
     }
 }
 
+impl fmt::Display for HvfArm64BootMemoryHotplugNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MapGuestMemory { source } => {
+                write!(
+                    f,
+                    "failed to borrow HVF boot-session guest memory for memory-hotplug notifications: {source}"
+                )
+            }
+            Self::MmioDispatcher { source } => {
+                write!(
+                    f,
+                    "failed to lock HVF boot-session MMIO dispatcher: {source}"
+                )
+            }
+            Self::DispatchNotifications { source } => {
+                write!(
+                    f,
+                    "failed to dispatch boot memory-hotplug queue notifications: {source}"
+                )
+            }
+            Self::CreateSignalSink { source } => {
+                write!(
+                    f,
+                    "failed to create HVF boot memory-hotplug interrupt signaler: {source}"
+                )
+            }
+            Self::ResultAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate HVF boot memory-hotplug notification results: {source}"
+                )
+            }
+        }
+    }
+}
+
 impl fmt::Display for HvfArm64BootEntropyNotificationDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2617,6 +2814,18 @@ impl std::error::Error for HvfArm64BootVsockNotificationDispatchError {
 }
 
 impl std::error::Error for HvfArm64BootBalloonNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapGuestMemory { source } => Some(source),
+            Self::MmioDispatcher { source } => Some(source),
+            Self::DispatchNotifications { source } => Some(source),
+            Self::CreateSignalSink { source } => Some(source),
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootMemoryHotplugNotificationDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MapGuestMemory { source } => Some(source),
@@ -2809,6 +3018,13 @@ trait BootSessionRunLoopSession {
         HvfArm64BootBalloonNotificationDispatchError,
     >;
 
+    fn dispatch_run_loop_memory_hotplug_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootMemoryHotplugNotificationDispatches,
+        HvfArm64BootMemoryHotplugNotificationDispatchError,
+    >;
+
     fn dispatch_run_loop_entropy_notifications(
         &mut self,
     ) -> Result<
@@ -2907,6 +3123,15 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
         HvfArm64BootBalloonNotificationDispatchError,
     > {
         self.dispatch_balloon_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_memory_hotplug_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootMemoryHotplugNotificationDispatches,
+        HvfArm64BootMemoryHotplugNotificationDispatchError,
+    > {
+        self.dispatch_memory_hotplug_queue_notifications_and_signal_interrupts()
     }
 
     fn dispatch_run_loop_entropy_notifications(
@@ -3197,6 +3422,17 @@ fn run_boot_session_loop_with_observer(
                             source: Box::new(source),
                         },
                     )?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                session
+                    .dispatch_run_loop_memory_hotplug_notifications()
+                    .map_err(|source| {
+                        HvfArm64BootRunLoopError::DispatchMemoryHotplugNotifications {
+                            steps_completed: steps,
+                            source: Box::new(source),
+                        }
+                    })?;
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
@@ -3531,6 +3767,33 @@ fn collect_balloon_notification_dispatches(
     Ok(HvfArm64BootBalloonNotificationDispatches::new(devices))
 }
 
+fn collect_memory_hotplug_notification_dispatches(
+    dispatches: Arm64BootMemoryHotplugNotificationDispatches,
+) -> Result<
+    HvfArm64BootMemoryHotplugNotificationDispatches,
+    HvfArm64BootMemoryHotplugNotificationDispatchError,
+> {
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(
+            |source| HvfArm64BootMemoryHotplugNotificationDispatchError::ResultAllocation {
+                source,
+            },
+        )?;
+
+    for dispatch in runtime_dispatches {
+        devices.push(HvfArm64BootMemoryHotplugNotificationDispatch::new(
+            dispatch, None,
+        ));
+    }
+
+    Ok(HvfArm64BootMemoryHotplugNotificationDispatches::new(
+        devices,
+    ))
+}
+
 fn collect_entropy_notification_dispatches(
     dispatches: Arm64BootEntropyNotificationDispatches,
 ) -> Result<HvfArm64BootEntropyNotificationDispatches, HvfArm64BootEntropyNotificationDispatchError>
@@ -3654,6 +3917,21 @@ fn dispatch_balloon_runtime_notifications(
         .map_err(
             |source| HvfArm64BootBalloonNotificationDispatchError::DispatchNotifications { source },
         )
+}
+
+fn dispatch_memory_hotplug_runtime_notifications(
+    memory: &mut GuestMemory,
+    runtime_resources: &mut Arm64BootRuntimeResources,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<
+    Arm64BootMemoryHotplugNotificationDispatches,
+    HvfArm64BootMemoryHotplugNotificationDispatchError,
+> {
+    runtime_resources
+        .dispatch_memory_hotplug_queue_notifications(memory, mmio_dispatcher)
+        .map_err(|source| {
+            HvfArm64BootMemoryHotplugNotificationDispatchError::DispatchNotifications { source }
+        })
 }
 
 fn balloon_update_error_from_display(source: impl fmt::Display) -> BalloonUpdateError {
@@ -4074,6 +4352,24 @@ fn collect_or_signal_balloon_queue_interrupts(
     signal_balloon_queue_interrupts(dispatches, &signaler)
 }
 
+fn collect_or_signal_memory_hotplug_queue_interrupts(
+    dispatches: Arm64BootMemoryHotplugNotificationDispatches,
+    gic: &HvfGicMetadata,
+) -> Result<
+    HvfArm64BootMemoryHotplugNotificationDispatches,
+    HvfArm64BootMemoryHotplugNotificationDispatchError,
+> {
+    if !dispatches.needs_queue_interrupt() {
+        return collect_memory_hotplug_notification_dispatches(dispatches);
+    }
+
+    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+        HvfArm64BootMemoryHotplugNotificationDispatchError::CreateSignalSink { source }
+    })?;
+
+    signal_memory_hotplug_queue_interrupts(dispatches, &signaler)
+}
+
 fn collect_or_signal_entropy_queue_interrupts(
     dispatches: Arm64BootEntropyNotificationDispatches,
     gic: &HvfGicMetadata,
@@ -4171,6 +4467,40 @@ fn signal_balloon_queue_interrupts(
     }
 
     Ok(HvfArm64BootBalloonNotificationDispatches::new(devices))
+}
+
+fn signal_memory_hotplug_queue_interrupts(
+    dispatches: Arm64BootMemoryHotplugNotificationDispatches,
+    signaler: &dyn InterruptSink,
+) -> Result<
+    HvfArm64BootMemoryHotplugNotificationDispatches,
+    HvfArm64BootMemoryHotplugNotificationDispatchError,
+> {
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(
+            |source| HvfArm64BootMemoryHotplugNotificationDispatchError::ResultAllocation {
+                source,
+            },
+        )?;
+
+    for dispatch in runtime_dispatches {
+        let signal_error = if dispatch.needs_queue_interrupt() {
+            signal_queue_interrupt(dispatch.device().fdt_device.interrupt_line, signaler).err()
+        } else {
+            None
+        };
+        devices.push(HvfArm64BootMemoryHotplugNotificationDispatch::new(
+            dispatch,
+            signal_error,
+        ));
+    }
+
+    Ok(HvfArm64BootMemoryHotplugNotificationDispatches::new(
+        devices,
+    ))
 }
 
 fn signal_entropy_queue_interrupts(
@@ -4847,7 +5177,10 @@ mod tests {
     };
     use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory};
-    use bangbang_runtime::memory_hotplug::VirtioMemMmioLayout;
+    use bangbang_runtime::memory_hotplug::{
+        MemoryHotplugConfigInput, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE,
+        VIRTIO_MEM_RESPONSE_SIZE, VirtioMemMmioLayout,
+    };
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive, EntropyDeviceMetrics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
@@ -4875,6 +5208,7 @@ mod tests {
         Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatches,
         Arm64BootEntropyDeviceConfig, Arm64BootEntropyNotificationDispatches,
         Arm64BootEntropySource, Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
+        Arm64BootMemoryHotplugDeviceConfig, Arm64BootMemoryHotplugNotificationDispatches,
         Arm64BootNetworkNotificationDispatches, Arm64BootNetworkNotificationOutcome,
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
         Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
@@ -4898,19 +5232,20 @@ mod tests {
         HvfArm64BootBlockNotificationDispatchError, HvfArm64BootEntropyDeviceConfig,
         HvfArm64BootEntropyNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
         HvfArm64BootInterruptRequest, HvfArm64BootMemoryHotplugDeviceConfig,
-        HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatchError,
-        HvfArm64BootPmemNotificationDispatchError, HvfArm64BootRunLoopOutcome,
-        HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-        HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig,
+        HvfArm64BootMemoryHotplugNotificationDispatchError, HvfArm64BootMmioDispatcherError,
+        HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootPmemNotificationDispatchError,
+        HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
+        HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig,
         HvfArm64BootVsockNotificationDispatchError, allocate_interrupt_lines,
         collect_balloon_notification_dispatches, collect_block_notification_dispatches,
-        collect_entropy_notification_dispatches, collect_network_notification_dispatches,
-        collect_vsock_notification_dispatches,
+        collect_entropy_notification_dispatches, collect_memory_hotplug_notification_dispatches,
+        collect_network_notification_dispatches, collect_vsock_notification_dispatches,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
         record_entropy_dispatch_metrics, record_pmem_dispatch_metrics, run_boot_session_loop,
         run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
-        signal_entropy_queue_interrupts, signal_network_queue_interrupts,
-        signal_pmem_queue_interrupts, signal_vsock_queue_interrupts, validate_single_vcpu,
+        signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
+        signal_network_queue_interrupts, signal_pmem_queue_interrupts,
+        signal_vsock_queue_interrupts, validate_single_vcpu,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -4988,6 +5323,7 @@ mod tests {
     const TEST_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
     const TEST_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
     const TEST_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
+    const TEST_MEMORY_HOTPLUG_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_a000);
 
     struct TempFile {
         path: PathBuf,
@@ -5315,6 +5651,12 @@ mod tests {
                 HvfArm64BootBalloonNotificationDispatchError,
             >,
         >,
+        memory_hotplug_dispatch_results: VecDeque<
+            Result<
+                super::HvfArm64BootMemoryHotplugNotificationDispatches,
+                HvfArm64BootMemoryHotplugNotificationDispatchError,
+            >,
+        >,
         entropy_dispatch_results: VecDeque<
             Result<
                 super::HvfArm64BootEntropyNotificationDispatches,
@@ -5329,6 +5671,7 @@ mod tests {
         request_stop_on_network_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_vsock_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_balloon_dispatch: Option<HvfArm64BootRunLoopStopToken>,
+        request_stop_on_memory_hotplug_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_entropy_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_timer: Option<HvfArm64BootRunLoopStopToken>,
         control_wakeup_requested: bool,
@@ -5349,6 +5692,7 @@ mod tests {
                 network_dispatch_results: VecDeque::new(),
                 vsock_dispatch_results: VecDeque::new(),
                 balloon_dispatch_results: VecDeque::new(),
+                memory_hotplug_dispatch_results: VecDeque::new(),
                 entropy_dispatch_results: VecDeque::new(),
                 timer_results: VecDeque::new(),
                 events: Vec::new(),
@@ -5358,6 +5702,7 @@ mod tests {
                 request_stop_on_network_dispatch: None,
                 request_stop_on_vsock_dispatch: None,
                 request_stop_on_balloon_dispatch: None,
+                request_stop_on_memory_hotplug_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
                 control_wakeup_requested: false,
@@ -5378,6 +5723,7 @@ mod tests {
                 network_dispatch_results: VecDeque::new(),
                 vsock_dispatch_results: VecDeque::new(),
                 balloon_dispatch_results: VecDeque::new(),
+                memory_hotplug_dispatch_results: VecDeque::new(),
                 entropy_dispatch_results: VecDeque::new(),
                 timer_results: VecDeque::new(),
                 events: Vec::new(),
@@ -5387,6 +5733,7 @@ mod tests {
                 request_stop_on_network_dispatch: None,
                 request_stop_on_vsock_dispatch: None,
                 request_stop_on_balloon_dispatch: None,
+                request_stop_on_memory_hotplug_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
                 control_wakeup_requested: false,
@@ -5447,6 +5794,13 @@ mod tests {
             self.balloon_dispatch_results.push_back(Err(source));
         }
 
+        fn push_memory_hotplug_dispatch_error(
+            &mut self,
+            source: HvfArm64BootMemoryHotplugNotificationDispatchError,
+        ) {
+            self.memory_hotplug_dispatch_results.push_back(Err(source));
+        }
+
         fn push_entropy_dispatch_error(
             &mut self,
             source: HvfArm64BootEntropyNotificationDispatchError,
@@ -5480,6 +5834,13 @@ mod tests {
 
         fn request_stop_on_balloon_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
             self.request_stop_on_balloon_dispatch = Some(stop_token);
+        }
+
+        fn request_stop_on_memory_hotplug_dispatch(
+            &mut self,
+            stop_token: HvfArm64BootRunLoopStopToken,
+        ) {
+            self.request_stop_on_memory_hotplug_dispatch = Some(stop_token);
         }
 
         fn request_stop_on_entropy_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
@@ -5665,6 +6026,26 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| {
                     Ok(super::HvfArm64BootBalloonNotificationDispatches::new(
+                        Vec::new(),
+                    ))
+                })
+        }
+
+        fn dispatch_run_loop_memory_hotplug_notifications(
+            &mut self,
+        ) -> Result<
+            super::HvfArm64BootMemoryHotplugNotificationDispatches,
+            HvfArm64BootMemoryHotplugNotificationDispatchError,
+        > {
+            self.events.push("memory-hotplug-dispatch");
+            if let Some(stop_token) = self.request_stop_on_memory_hotplug_dispatch.take() {
+                stop_token.request_stop();
+            }
+
+            self.memory_hotplug_dispatch_results
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(super::HvfArm64BootMemoryHotplugNotificationDispatches::new(
                         Vec::new(),
                     ))
                 })
@@ -5973,6 +6354,14 @@ mod tests {
             .expect("balloon config should be stored");
     }
 
+    fn add_memory_hotplug(controller: &mut bangbang_runtime::VmmController) {
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(MemoryHotplugConfigInput::new(
+                1024, 2, 128,
+            )))
+            .expect("memory-hotplug config should be stored");
+    }
+
     fn add_pmem(controller: &mut bangbang_runtime::VmmController, id: &str, path: &Path) {
         controller
             .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
@@ -6184,6 +6573,27 @@ mod tests {
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
     }
 
+    fn boot_runtime_with_memory_hotplug() -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher)
+    {
+        let kernel = temp_file("kernel-with-memory-hotplug", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_memory_hotplug(&mut controller);
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                memory_hotplug_device: Some(Arm64BootMemoryHotplugDeviceConfig::new(
+                    VirtioMemMmioLayout::new(TEST_MEMORY_HOTPLUG_MMIO_BASE, MmioRegionId::new(120)),
+                    line(32),
+                )),
+                ..valid_boot_resource_config(&[])
+            },
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
     fn boot_runtime_with_balloon_stats() -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher)
     {
         let kernel = temp_file("kernel-with-balloon-stats", &arm64_image());
@@ -6293,6 +6703,16 @@ mod tests {
         runtime
             .dispatch_balloon_queue_notifications(memory, mmio_dispatcher)
             .expect("balloon notification dispatch result should allocate")
+    }
+
+    fn dispatch_boot_memory_hotplug_notifications(
+        memory: &mut GuestMemory,
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Arm64BootMemoryHotplugNotificationDispatches {
+        runtime
+            .dispatch_memory_hotplug_queue_notifications(memory, mmio_dispatcher)
+            .expect("memory-hotplug notification dispatch result should allocate")
     }
 
     fn dispatch_boot_entropy_notifications(
@@ -6558,6 +6978,61 @@ mod tests {
         let outcome = mmio_dispatcher
             .dispatch(MmioOperation::read(access).expect("u32 read should be valid"))
             .expect("balloon MMIO read should dispatch");
+
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not return write outcome"),
+        }
+    }
+
+    fn write_boot_memory_hotplug_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        let address = runtime
+            .memory_hotplug_device
+            .as_ref()
+            .expect("memory-hotplug device should exist")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("memory-hotplug MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::write(access, data).expect("u32 write should be valid"))
+            .expect("memory-hotplug MMIO write should dispatch");
+
+        assert_eq!(outcome, MmioDispatchOutcome::Write);
+    }
+
+    fn read_boot_memory_hotplug_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime
+            .memory_hotplug_device
+            .as_ref()
+            .expect("memory-hotplug device should exist")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("memory-hotplug MMIO access should resolve");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read should be valid"))
+            .expect("memory-hotplug MMIO read should dispatch");
 
         match outcome {
             MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
@@ -7143,6 +7618,78 @@ mod tests {
         );
     }
 
+    fn configure_boot_memory_hotplug_queue(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(TEST_DESCRIPTOR_TABLE),
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(TEST_AVAILABLE_RING),
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(TEST_USED_RING),
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueReady,
+            1,
+        );
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn notify_boot_memory_hotplug_queue(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_memory_hotplug_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNotify,
+            0,
+        );
+    }
+
     fn network_queue_addresses(queue_index: u32) -> (GuestAddress, GuestAddress, GuestAddress) {
         match queue_index {
             0 => (
@@ -7354,6 +7901,38 @@ mod tests {
             TestDescriptor::readable(TEST_BALLOON_PFN_PAYLOAD, 4, None),
         );
         write_balloon_deflate_available_heads(memory, &[0]);
+    }
+
+    fn write_queued_memory_hotplug_state_request(memory: &mut GuestMemory) {
+        let mut request = Vec::new();
+        request.extend_from_slice(&3u16.to_le_bytes());
+        request.extend_from_slice(&[0; 6]);
+        request.extend_from_slice(&VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value().to_le_bytes());
+        request.extend_from_slice(&1u16.to_le_bytes());
+        request.extend_from_slice(&[0; 6]);
+        assert_eq!(request.len(), VIRTIO_MEM_REQUEST_SIZE);
+        memory
+            .write_slice(&request, HEADER_ADDR)
+            .expect("virtio-mem request should write");
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(
+                HEADER_ADDR,
+                u32::try_from(VIRTIO_MEM_REQUEST_SIZE).expect("request size should fit"),
+                Some(1),
+            ),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(
+                DATA_ADDR,
+                u32::try_from(VIRTIO_MEM_RESPONSE_SIZE).expect("response size should fit"),
+                None,
+            ),
+        );
+        write_available_heads(memory, &[0]);
     }
 
     fn write_request_header(
@@ -7578,6 +8157,15 @@ mod tests {
             TEST_USED_RING
                 .checked_add(2)
                 .expect("entropy used idx address should not overflow"),
+        )
+    }
+
+    fn read_memory_hotplug_used_index(memory: &GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_USED_RING
+                .checked_add(2)
+                .expect("memory-hotplug used idx address should not overflow"),
         )
     }
 
@@ -9355,6 +9943,22 @@ mod tests {
     }
 
     #[test]
+    fn memory_hotplug_notification_signal_dispatch_accepts_empty_device() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_without_drives();
+        let dispatches = dispatch_boot_memory_hotplug_notifications(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+        );
+        let result = collect_memory_hotplug_notification_dispatches(dispatches)
+            .expect("empty memory-hotplug dispatch result should collect");
+
+        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
+        assert!(!result.has_signal_failure());
+    }
+
+    #[test]
     fn balloon_notification_signal_dispatch_skips_noop_device() {
         let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_balloon();
         let dispatches =
@@ -9455,6 +10059,50 @@ mod tests {
             DeviceInterruptKind::Queue.status().bits()
         );
         assert_eq!(read_balloon_inflate_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn memory_hotplug_notification_signal_dispatch_signals_queued_request() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_memory_hotplug();
+        configure_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher);
+        write_queued_memory_hotplug_state_request(&mut memory);
+        notify_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher);
+        let dispatches = dispatch_boot_memory_hotplug_notifications(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+        );
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_memory_hotplug_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued memory-hotplug dispatch should collect");
+
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        let dispatch = device
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("memory-hotplug notification should dispatch");
+        let queue = dispatch
+            .queue_dispatch()
+            .expect("memory-hotplug queue dispatch should be present");
+        assert_eq!(queue.processed_requests(), 1);
+        assert_eq!(queue.policy_errors(), 1);
+        assert!(queue.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_memory_hotplug_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_memory_hotplug_used_index(&memory), 1);
     }
 
     #[test]
@@ -9714,6 +10362,7 @@ mod tests {
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
+                "memory-hotplug-dispatch",
                 "entropy-dispatch",
                 "run",
                 "dispatch",
@@ -9721,6 +10370,7 @@ mod tests {
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
+                "memory-hotplug-dispatch",
                 "entropy-dispatch",
             ]
         );
@@ -9844,6 +10494,7 @@ mod tests {
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
+                "memory-hotplug-dispatch",
                 "entropy-dispatch",
             ]
         );
@@ -9968,7 +10619,32 @@ mod tests {
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
+                "memory-hotplug-dispatch",
                 "entropy-dispatch",
+            ]
+        );
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_stop_after_memory_hotplug_dispatch_before_step_limit() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.request_stop_on_memory_hotplug_dispatch(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after memory-hotplug dispatch should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(
+            session.events,
+            [
+                "run",
+                "dispatch",
+                "pmem-dispatch",
+                "network-dispatch",
+                "vsock-dispatch",
+                "balloon-dispatch",
+                "memory-hotplug-dispatch",
             ]
         );
     }
@@ -10175,6 +10851,7 @@ mod tests {
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
+                "memory-hotplug-dispatch",
                 "entropy-dispatch"
             ]
         );
@@ -10281,6 +10958,7 @@ mod tests {
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
+                "memory-hotplug-dispatch",
                 "entropy-dispatch"
             ]
         );
@@ -10515,6 +11193,46 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_preserves_memory_hotplug_notification_error_after_mmio_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.push_memory_hotplug_dispatch_error(
+            HvfArm64BootMemoryHotplugNotificationDispatchError::MmioDispatcher {
+                source: HvfArm64BootMmioDispatcherError::Busy,
+            },
+        );
+
+        let err = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect_err("memory-hotplug notification error should stop loop");
+
+        match err {
+            super::HvfArm64BootRunLoopError::DispatchMemoryHotplugNotifications {
+                steps_completed,
+                source,
+            } => {
+                assert_eq!(steps_completed, 1);
+                assert_eq!(
+                    source.to_string(),
+                    "failed to lock HVF boot-session MMIO dispatcher: HVF boot-session MMIO dispatcher lock is busy"
+                );
+            }
+            other => panic!("expected memory-hotplug notification error, got {other:?}"),
+        }
+        assert_eq!(
+            session.events,
+            [
+                "run",
+                "dispatch",
+                "pmem-dispatch",
+                "network-dispatch",
+                "vsock-dispatch",
+                "balloon-dispatch",
+                "memory-hotplug-dispatch",
+            ]
+        );
+    }
+
+    #[test]
     fn boot_session_run_loop_preserves_vsock_notification_error_after_non_mmio_step() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
@@ -10578,6 +11296,7 @@ mod tests {
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
+                "memory-hotplug-dispatch",
                 "entropy-dispatch",
             ]
         );
@@ -10783,6 +11502,34 @@ mod tests {
         );
 
         let err = HvfArm64BootVsockNotificationDispatchError::MmioDispatcher {
+            source: HvfArm64BootMmioDispatcherError::Busy,
+        };
+        assert_eq!(
+            err.to_string(),
+            "failed to lock HVF boot-session MMIO dispatcher: HVF boot-session MMIO dispatcher lock is busy"
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("HVF boot-session MMIO dispatcher lock is busy".to_string())
+        );
+    }
+
+    #[test]
+    fn displays_memory_hotplug_notification_dispatch_errors() {
+        let err = HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory {
+            source: crate::memory::HvfGuestMemoryMappingError::InvalidState("mapping missing"),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "failed to borrow HVF boot-session guest memory for memory-hotplug notifications: invalid guest memory mapping state: mapping missing"
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("invalid guest memory mapping state: mapping missing".to_string())
+        );
+
+        let err = HvfArm64BootMemoryHotplugNotificationDispatchError::MmioDispatcher {
             source: HvfArm64BootMmioDispatcherError::Busy,
         };
         assert_eq!(
