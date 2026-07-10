@@ -2601,6 +2601,17 @@ mod macos_arm64 {
     }
 
     #[test]
+    fn signed_executable_serves_metadata_file_mmds_v2_to_direct_rootfs_guest() {
+        run_direct_rootfs_mmds_guest_fetch_test(DirectRootfsMmdsFetchCase {
+            request_context: "metadata-file MMDS v2 guest fetch",
+            mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#,
+            boot_args: DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS,
+            success_marker: DIRECT_ROOTFS_MMDS_V2_MARKER,
+            content_source: DirectRootfsMmdsContentSource::MetadataFile,
+        });
+    }
+
+    #[test]
     fn signed_executable_serves_metadata_file_mmds_to_no_api_direct_rootfs_guest() {
         run_direct_rootfs_no_api_mmds_guest_fetch_test(DirectRootfsNoApiMmdsFetchCase {
             request_context: "no-api metadata-file MMDS guest fetch",
