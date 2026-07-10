@@ -26,6 +26,53 @@ pub struct HvfArm64BootRegisters {
     pub fdt_address: GuestAddress,
 }
 
+/// One ARM interrupt level exposed by Hypervisor.framework.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfInterruptType {
+    /// Normal interrupt request.
+    Irq,
+    /// Fast interrupt request.
+    Fiq,
+}
+
+impl HvfInterruptType {
+    pub(crate) const fn raw(self) -> crate::ffi::HvInterruptType {
+        match self {
+            Self::Irq => crate::ffi::HV_INTERRUPT_TYPE_IRQ,
+            Self::Fiq => crate::ffi::HV_INTERRUPT_TYPE_FIQ,
+        }
+    }
+}
+
+/// Detached CPU-level IRQ/FIQ pending state captured from one arm64 vCPU.
+///
+/// Hypervisor.framework clears these injection levels after a vCPU run
+/// returns. This value is not GIC/device state or a serialized snapshot schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuPendingInterruptState {
+    irq_pending: bool,
+    fiq_pending: bool,
+}
+
+impl HvfArm64VcpuPendingInterruptState {
+    pub(crate) const fn new(irq_pending: bool, fiq_pending: bool) -> Self {
+        Self {
+            irq_pending,
+            fiq_pending,
+        }
+    }
+
+    /// Return whether the CPU IRQ level was pending.
+    pub const fn irq_pending(self) -> bool {
+        self.irq_pending
+    }
+
+    /// Return whether the CPU FIQ level was pending.
+    pub const fn fiq_pending(self) -> bool {
+        self.fiq_pending
+    }
+}
+
 /// Detached general-register state captured from one arm64 vCPU.
 ///
 /// This is the first read-only architectural subset for later snapshot
@@ -347,6 +394,21 @@ impl HvfVcpuOwner {
         crate::ffi::set_reg(self.handle()?.vcpu, register.raw(), value)
     }
 
+    pub(crate) fn get_pending_interrupt(
+        &self,
+        interrupt_type: HvfInterruptType,
+    ) -> Result<bool, BackendError> {
+        crate::ffi::get_pending_interrupt(self.handle()?.vcpu, interrupt_type.raw())
+    }
+
+    pub(crate) fn set_pending_interrupt(
+        &mut self,
+        interrupt_type: HvfInterruptType,
+        pending: bool,
+    ) -> Result<(), BackendError> {
+        crate::ffi::set_pending_interrupt(self.handle()?.vcpu, interrupt_type.raw(), pending)
+    }
+
     pub(crate) fn configure_arm64_boot_registers(
         &mut self,
         registers: HvfArm64BootRegisters,
@@ -509,6 +571,25 @@ impl<'vm> HvfVcpu<'vm> {
         self.owner.set_register(register, value)
     }
 
+    /// Read one CPU-level pending interrupt injection on this current-thread vCPU.
+    pub fn get_pending_interrupt(
+        &self,
+        interrupt_type: HvfInterruptType,
+    ) -> Result<bool, BackendError> {
+        self.owner.get_pending_interrupt(interrupt_type)
+    }
+
+    /// Set one CPU-level pending interrupt injection on this current-thread vCPU.
+    ///
+    /// Hypervisor.framework clears this level after the next vCPU run returns.
+    pub fn set_pending_interrupt(
+        &mut self,
+        interrupt_type: HvfInterruptType,
+        pending: bool,
+    ) -> Result<(), BackendError> {
+        self.owner.set_pending_interrupt(interrupt_type, pending)
+    }
+
     /// Configure the primary arm64 Linux boot-register state on this current-thread vCPU.
     pub fn configure_arm64_boot_registers(
         &mut self,
@@ -636,6 +717,18 @@ pub(crate) fn capture_arm64_vcpu_core_system_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_pending_interrupt_state_with(
+    mut get_pending_interrupt: impl FnMut(HvfInterruptType) -> Result<bool, BackendError>,
+) -> Result<HvfArm64VcpuPendingInterruptState, BackendError> {
+    let irq_pending = get_pending_interrupt(HvfInterruptType::Irq)?;
+    let fiq_pending = get_pending_interrupt(HvfInterruptType::Fiq)?;
+
+    Ok(HvfArm64VcpuPendingInterruptState::new(
+        irq_pending,
+        fiq_pending,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_simd_fp_state_with<R: ?Sized>(
     reader: &mut R,
     mut get_simd_fp_register: impl FnMut(&mut R, HvfSimdFpRegister) -> Result<[u8; 16], BackendError>,
@@ -685,10 +778,11 @@ mod tests {
     use bangbang_runtime::memory::GuestAddress;
 
     use super::{
-        ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfRegister,
-        HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
+        ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfInterruptType,
+        HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
         NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_core_system_register_state_with,
-        capture_arm64_vcpu_general_register_state_with, capture_arm64_vcpu_simd_fp_state_with,
+        capture_arm64_vcpu_general_register_state_with,
+        capture_arm64_vcpu_pending_interrupt_state_with, capture_arm64_vcpu_simd_fp_state_with,
         capture_arm64_vcpu_virtual_timer_state_with, configure_arm64_boot_registers_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
@@ -843,6 +937,14 @@ mod tests {
         );
         assert_eq!(
             vcpu.set_register(HvfRegister::X0, 0),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.get_pending_interrupt(HvfInterruptType::Irq),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.set_pending_interrupt(HvfInterruptType::Fiq, true),
             Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
         );
         assert_eq!(
@@ -1019,6 +1121,70 @@ mod tests {
             state.spsr_el1(),
             0x1_0000 + u64::from(HvfSystemRegister::SPSR_EL1.raw())
         );
+    }
+
+    #[test]
+    fn captures_arm64_pending_interrupt_state_in_irq_then_fiq_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_pending_interrupt_state_with(|interrupt_type| {
+            reads.push(interrupt_type);
+            Ok(interrupt_type == HvfInterruptType::Irq)
+        })
+        .expect("pending-interrupt capture should succeed");
+
+        assert_eq!(reads, [HvfInterruptType::Irq, HvfInterruptType::Fiq]);
+        assert!(state.irq_pending());
+        assert!(!state.fiq_pending());
+        assert_eq!(
+            HvfInterruptType::Irq.raw(),
+            crate::ffi::HV_INTERRUPT_TYPE_IRQ
+        );
+        assert_eq!(
+            HvfInterruptType::Fiq.raw(),
+            crate::ffi::HV_INTERRUPT_TYPE_FIQ
+        );
+    }
+
+    #[test]
+    fn arm64_pending_interrupt_capture_stops_after_each_error_and_can_retry() {
+        for failed_type in [HvfInterruptType::Irq, HvfInterruptType::Fiq] {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let get_pending_interrupt = |interrupt_type| {
+                reads.borrow_mut().push(interrupt_type);
+                if interrupt_type == failed_type && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake pending interrupt read failed",
+                    ))
+                } else {
+                    Ok(interrupt_type == HvfInterruptType::Fiq)
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_pending_interrupt_state_with(&get_pending_interrupt),
+                Err(BackendError::InvalidState(
+                    "fake pending interrupt read failed"
+                ))
+            );
+            let expected_reads = if failed_type == HvfInterruptType::Irq {
+                vec![HvfInterruptType::Irq]
+            } else {
+                vec![HvfInterruptType::Irq, HvfInterruptType::Fiq]
+            };
+            assert_eq!(*reads.borrow(), expected_reads);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_pending_interrupt_state_with(&get_pending_interrupt)
+                .expect("pending-interrupt capture retry should succeed");
+            assert!(!state.irq_pending());
+            assert!(state.fiq_pending());
+            assert_eq!(
+                *reads.borrow(),
+                [HvfInterruptType::Irq, HvfInterruptType::Fiq]
+            );
+        }
     }
 
     #[test]

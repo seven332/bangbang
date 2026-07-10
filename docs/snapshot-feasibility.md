@@ -34,7 +34,7 @@ ownership on separate threads:
 | --- | --- |
 | Process owner | `ProcessVmm` owns the VMM controller, startup executor, and active `BootRunLoopSupervisor` handle. It serves API requests and commits public instance-state transitions, but it does not own the live boot session after startup. |
 | Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy state, and block and entropy retry schedulers. Device-update commands execute here. |
-| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes HVF operations through commands and can return immutable X0-X30, PC, and CPSR values; raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values; raw baseline Q0-Q31, FPCR, and FPSR values; or raw virtual-timer mask, offset, control, and CVAL values through dedicated owner-thread commands. The snapshot barrier invokes none of these captures, and the remaining architectural inventory is not implemented. |
+| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes HVF operations through commands and can return immutable X0-X30, PC, and CPSR values; raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values; raw baseline Q0-Q31, FPCR, and FPSR values; raw virtual-timer mask, offset, control, and CVAL values; or CPU-level IRQ/FIQ pending values through dedicated owner-thread commands. The snapshot barrier invokes none of these captures, and the remaining architectural inventory is not implemented. |
 | Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. The snapshot barrier can temporarily quiesce the block and entropy schedulers. The vmnet interface, vsock listener, retained streams, and their host/kernel buffers remain open for the lifetime of the boot session. A transient vsock polling thread is joined at the end of each vCPU run step. |
 
 A successful public pause has a narrower boundary than a snapshot needs:
@@ -69,7 +69,7 @@ The HVF crate now has a narrower runner-local building block: one command reads
 X0-X30, PC, and CPSR in architectural order on the owning thread and returns a
 detached immutable value only after every read succeeds. Dedicated command-owned
 admission excludes runs, MMIO completion, boot setup, metadata, virtual-timer,
-GIC PPI, cancellation, and shutdown until capture finishes, including when the
+interrupt operations, cancellation, and shutdown until capture finishes, including when the
 caller abandons its response. This command is not called by the public pause or
 snapshot-create paths and is not complete restorable vCPU state.
 
@@ -99,10 +99,20 @@ and its command-owned admission remains active when the caller drops its
 response. The offset is the host-time-relative HVF value in
 `CNTVCT_EL0 = mach_absolute_time() - offset`; the control register's ISTATUS bit
 is derived and may change as virtual time advances. This narrow subset omits
-pending interrupts and GIC state and does not define a portable offset
+GIC state and does not define a portable offset
 adjustment or control-restore policy. Borrowed and owned boot sessions delegate
 this capture, but the supervisor lease and public snapshot paths do not invoke
 it.
+
+A separate interrupt command captures the CPU-level IRQ then FIQ pending
+injection values and publishes one immutable value only after both owner-thread
+reads succeed. Individual IRQ/FIQ get/set commands and validated GIC PPI
+set/clear commands share one generalized interrupt-operation admission domain,
+while CPU levels and GIC state remain distinct models. HVF clears the CPU
+pending levels after a vCPU run returns, so their setters are per-run injection
+primitives rather than durable restore. Both boot-session forms delegate the
+aggregate capture; the supervisor lease and public snapshot paths do not invoke
+it, and full GIC/device state, persistence, and restore remain deferred.
 
 Paused snapshot create now exercises the first lease-based ownership
 foundation. A separate admission cell atomically reserves snapshot preparation
@@ -163,7 +173,7 @@ some of the required state:
   SME, pending-interrupt, virtual-timer mask, and virtual-timer offset get/set
   operations.
 - vCPU lifecycle and register APIs are thread-affine. bangbang also routes
-  virtual-timer access through the owning runner thread as its serialization
+  virtual-timer and pending-interrupt access through the owning runner thread as its serialization
   policy, so a future capture bundle has one explicit vCPU command boundary
   after the VM is quiesced.
 - macOS 15 GIC APIs expose GICv3 distributor, redistributor, ICC, ICH, ICV, MSI,
@@ -278,9 +288,9 @@ tested:
 - Guest-memory file model: bangbang needs explicit ownership, layout, copy or
   mapping rules, and failure behavior for memory snapshot files.
 - HVF vCPU state capture: X0-X30, PC, and CPSR; raw SP_EL0, SP_EL1, ELR_EL1,
-  and SPSR_EL1; baseline Q0-Q31, FPCR, and FPSR; and raw virtual-timer mask,
-  offset, control, and CVAL values have owner-thread capture subsets. Remaining
-  system registers, SVE/SME, pending-interrupt, and other optional architecture
+  and SPSR_EL1; baseline Q0-Q31, FPCR, and FPSR; raw virtual-timer mask,
+  offset, control, and CVAL values; and CPU-level IRQ/FIQ pending values have
+  owner-thread capture subsets. Remaining system registers, SVE/SME, and other optional architecture
   state still need a full inventory; the raw timer offset needs an explicit
   restore-time adjustment policy; the derived ISTATUS observation is not a
   control-restore contract; and every captured field still needs a restore path
@@ -312,7 +322,8 @@ API behavior until all of its prerequisites exist.
 | Runner general-register capture (first subset implemented) | #1164 adds a typed immutable X0-X30, PC, and CPSR value plus one serialized owner-thread command with command-owned failure-atomic admission. Borrowed and owned HVF boot sessions expose it, but the snapshot lease does not invoke it. Core system and baseline SIMD/FP state are tracked separately; broader system registers, SVE/SME, timer, interrupt state, restore, and multi-vCPU coordination remain deferred. | Deterministic runner command/conflict/failure tests and signed HVF known boot-register capture. |
 | Runner core system-register capture (raw subset implemented) | #1170 adds a typed immutable raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 value plus one owner-thread command. It shares failure-atomic admission with general-register capture, and both boot-session forms expose it without involving the snapshot lease. Broader system state, validation, restore, orchestration, and snapshot schema remain deferred. | Deterministic four-field order, all read-failure points and retry, bidirectional conflicts, abandonment, channel, unwind, panic, and shutdown tests plus signed guest-written known-value capture. |
 | Runner SIMD/FP capture (baseline subset implemented) | #1172 adds typed immutable Q0-Q31, FPCR, and FPSR state plus a getter-only 16-byte-aligned HVF FFI seam. Its owner-thread command shares failure-atomic core-register admission with the general and core-system commands, and both boot-session forms expose it without involving the snapshot lease. Streaming SVE/SME state, restore, orchestration, and snapshot schema remain deferred. | ABI layout tests; deterministic 34-field order, every failure point and retry, three-way conflicts, abandonment, channel, unwind, panic, and shutdown tests; and signed known Q0/Q31/FPCR/FPSR capture. |
-| Runner virtual-timer capture (raw subset implemented) | #1166 adds typed immutable mask/offset state and #1168 extends it with raw control/CVAL values. Timer-specific owner-thread get/set commands and one serialized four-field capture share the same admission domain. Both boot-session forms expose capture, but the snapshot lease does not invoke it. Pending interrupt and GIC state, restore-time offset/control policy, orchestration, and restore remain deferred. | Deterministic four-field order, conflict, abandon, channel, panic, and retry tests plus signed known-value capture that safely restores the original stable values and writable control bits. |
+| Runner virtual-timer capture (raw subset implemented) | #1166 adds typed immutable mask/offset state and #1168 extends it with raw control/CVAL values. Timer-specific owner-thread get/set commands and one serialized four-field capture share the same admission domain. Both boot-session forms expose capture, but the snapshot lease does not invoke it. CPU pending levels are captured separately; GIC state, restore-time offset/control policy, orchestration, and restore remain deferred. | Deterministic four-field order, conflict, abandon, channel, panic, and retry tests plus signed known-value capture that safely restores the original stable values and writable control bits. |
+| Runner pending-interrupt capture (CPU-level subset implemented) | #1174 adds typed IRQ/FIQ owner-thread get/set commands and one failure-atomic IRQ-then-FIQ capture. CPU pending levels and validated GIC PPI mutations share generalized interrupt-operation admission but remain distinct state models. Both boot-session forms expose capture; HVF clear-after-run behavior, full GIC/device state, persistence, orchestration, and restore remain outside this slice. | Raw enum mapping, deterministic order, both failure points and retry, bidirectional conflicts, abandonment, channel, panic, shutdown, and signed `(true, false)`, `(false, true)`, and cleared capture. |
 | GIC and device state | Inventory GIC ownership and add stable state models for each implemented MMIO device. | Per-device round-trip unit tests and signed HVF interrupt-state coverage. |
 | Full guest-memory capture | Define immutable capture ownership, full-memory file layout, error cleanup, and path-redaction behavior before considering diff snapshots. | Memory/file unit tests, process failure tests, and signed full-capture coverage. |
 | External resource policy | Define disk, vmnet, and vsock metadata, buffering boundary, disconnect/reconnect behavior, and restore overrides. | Resource-policy unit/process tests and focused signed network/vsock coverage. |

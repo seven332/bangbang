@@ -1613,6 +1613,10 @@ PPI INTIDs before writing `GICR_ISPENDR0` or `GICR_ICPENDR0` through
 `hv_gic_set_redistributor_reg` on the vCPU-owning thread. HVF timer INTIDs are
 converted to FDT PPI cells for the runtime timer node, and MSI/ITS metadata is
 intentionally absent until a later device path needs it.
+Separately, typed owner-thread HVF commands get or set CPU-level IRQ/FIQ pending
+injection levels. Those levels are not GIC state and HVF clears them after a
+vCPU run returns, so setting them is a per-run injection primitive rather than
+durable restore.
 
 This still is not public guest startup. bangbang can now write an internal FDT
 payload, create an internal single-vCPU HVF arm64 boot session, read the primary
@@ -1632,15 +1636,16 @@ resolved MMIO access after a run has started, and another command starts one
 vCPU run, resolves a resulting MMIO exit, and dispatches or completes it through
 a caller-provided shared dispatcher. The virtual-timer commands expose HVF's
 explicit mask bit after `HV_EXIT_REASON_VTIMER_ACTIVATED`, its raw
-host-time-relative offset, and raw `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` values; GIC PPI
+host-time-relative offset, and raw `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` values; CPU
+IRQ/FIQ commands expose pending injection levels; and GIC PPI
 pending commands can set or clear a validated timer PPI bit on the runner
 thread. The internal boot-session
 run-loop now handles virtual timer exits by asserting the EL1 virtual timer PPI
 through that runner-thread command. Full timer delivery policy, including how to
 detect EOI/deactivation and unmask the HVF virtual timer, remains future work.
 These commands reject overlapping metadata reads, runs, boot-register setup,
-MMIO dispatches, core-register capture, virtual-timer operations, or GIC PPI
-pending operations. The general-register capture command returns only after
+MMIO dispatches, core-register capture, virtual-timer operations, or generalized
+interrupt operations. The general-register capture command returns only after
 X0-X30, PC, and CPSR have all been read. A second command reads raw `SP_EL0`,
 `SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. A third reads all 16 bytes of
 Q0-Q31 in ascending order, then raw FPCR and FPSR. The three commands share one
@@ -1655,11 +1660,16 @@ until all four reads finish even if the caller abandons its response. Both
 boot-session forms expose that immutable subset. The raw offset follows HVF's
 `CNTVCT_EL0 = mach_absolute_time() - offset` relation, while control ISTATUS is
 derived and may change as virtual time advances. This capture does not include
-pending interrupts or GIC state and does not define portable offset adjustment
+GIC state and does not define portable offset adjustment
 or control-restore policy. The core system-register and baseline SIMD/FP subsets
 are raw and read-only and likewise have no restore validation, snapshot schema,
 or Firecracker on-disk compatibility. The process snapshot barrier invokes none
 of these captures.
+A separate failure-atomic command reads CPU IRQ then FIQ pending levels and is
+available through both boot-session forms. It shares generalized interrupt
+admission with individual IRQ/FIQ operations and GIC PPI mutation, but its
+two-field value does not represent distributor, redistributor, CPU-interface,
+or device interrupt state. It has no persistence or restore contract.
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared
 MMIO dispatcher, so a

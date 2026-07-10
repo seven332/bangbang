@@ -531,6 +531,64 @@ fn captures_runner_arm64_virtual_timer_state() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_runner_arm64_pending_interrupt_state() {
+    use bangbang_hvf::{HvfBackend, HvfInterruptType};
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+
+        runner
+            .set_pending_interrupt(HvfInterruptType::Irq, true)
+            .expect("runner IRQ pending level should be set");
+        runner
+            .set_pending_interrupt(HvfInterruptType::Fiq, false)
+            .expect("runner FIQ pending level should be cleared");
+        let irq_only = runner
+            .capture_arm64_pending_interrupt_state()
+            .expect("IRQ-only pending state should be captured");
+        assert!(irq_only.irq_pending());
+        assert!(!irq_only.fiq_pending());
+
+        runner
+            .set_pending_interrupt(HvfInterruptType::Irq, false)
+            .expect("runner IRQ pending level should be cleared");
+        runner
+            .set_pending_interrupt(HvfInterruptType::Fiq, true)
+            .expect("runner FIQ pending level should be set");
+        let fiq_only = runner
+            .capture_arm64_pending_interrupt_state()
+            .expect("FIQ-only pending state should be captured");
+        assert!(!fiq_only.irq_pending());
+        assert!(fiq_only.fiq_pending());
+
+        runner
+            .set_pending_interrupt(HvfInterruptType::Irq, false)
+            .expect("runner IRQ pending level should remain cleared");
+        runner
+            .set_pending_interrupt(HvfInterruptType::Fiq, false)
+            .expect("runner FIQ pending level should be cleared");
+        let cleared = runner
+            .capture_arm64_pending_interrupt_state()
+            .expect("cleared pending state should be captured");
+        assert!(!cleared.irq_pending());
+        assert!(!cleared.fiq_pending());
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn sets_and_clears_runner_gic_ppi_pending() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;
@@ -753,6 +811,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .capture_arm64_virtual_timer_state()
         .expect("internal session should capture virtual-timer state");
+    session
+        .capture_arm64_pending_interrupt_state()
+        .expect("internal session should capture pending-interrupt state");
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();
@@ -881,6 +942,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_virtual_timer_state()
         .expect("owned session should capture virtual-timer state");
+    session
+        .capture_arm64_pending_interrupt_state()
+        .expect("owned session should capture pending-interrupt state");
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();

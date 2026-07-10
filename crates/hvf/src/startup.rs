@@ -72,7 +72,7 @@ use crate::runner::{
 };
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuSimdFpState, HvfArm64VcpuVirtualTimerState,
+    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState, HvfArm64VcpuVirtualTimerState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1210,6 +1210,16 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_virtual_timer_state()
     }
 
+    /// Capture CPU-level IRQ/FIQ pending state on the primary vCPU owner thread.
+    ///
+    /// HVF clears these per-run injection levels after a vCPU run returns.
+    /// This subset excludes GIC/device state and snapshot restore policy.
+    pub fn capture_arm64_pending_interrupt_state(
+        &self,
+    ) -> Result<HvfArm64VcpuPendingInterruptState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_pending_interrupt_state()
+    }
+
     /// Run the boot session's primary vCPU once with runner-thread MMIO handling.
     ///
     /// This is runner-loop plumbing. It does not dispatch boot block or
@@ -1799,6 +1809,16 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuVirtualTimerState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_virtual_timer_state()
+    }
+
+    /// Capture CPU-level IRQ/FIQ pending state on the primary vCPU owner thread.
+    ///
+    /// HVF clears these per-run injection levels after a vCPU run returns.
+    /// This subset excludes GIC/device state and snapshot restore policy.
+    pub fn capture_arm64_pending_interrupt_state(
+        &self,
+    ) -> Result<HvfArm64VcpuPendingInterruptState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_pending_interrupt_state()
     }
 
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
