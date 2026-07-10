@@ -2,6 +2,12 @@
 static HVF_LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static NEXT_HVF_TEST_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VTIMER_WRITABLE_CONTROL_MASK: u64 = 0b11;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VTIMER_TEST_OFFSET: u64 = 0x1234_5678_9abc_def0;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VTIMER_TEST_COMPARE_VALUE: u64 = 0xfedc_ba98_7654_3210;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn test_rtc_mmio_layout() -> bangbang_runtime::rtc::RtcMmioLayout {
@@ -53,9 +59,9 @@ fn creates_and_destroys_hvf_vcpu() {
             .expect("vCPU vtimer mask should be set");
         vcpu.set_system_register(HvfSystemRegister::CNTV_CTL_EL0, 0)
             .expect("vCPU vtimer should be disabled");
-        vcpu.set_vtimer_offset(0x1234_5678_9abc_def0)
+        vcpu.set_vtimer_offset(VTIMER_TEST_OFFSET)
             .expect("vCPU vtimer offset should be set");
-        vcpu.set_system_register(HvfSystemRegister::CNTV_CVAL_EL0, 0xfedc_ba98_7654_3210)
+        vcpu.set_system_register(HvfSystemRegister::CNTV_CVAL_EL0, VTIMER_TEST_COMPARE_VALUE)
             .expect("vCPU vtimer compare value should be set");
         assert!(
             vcpu.get_vtimer_mask()
@@ -64,18 +70,18 @@ fn creates_and_destroys_hvf_vcpu() {
         assert_eq!(
             vcpu.get_vtimer_offset()
                 .expect("vCPU vtimer offset should be read"),
-            0x1234_5678_9abc_def0
+            VTIMER_TEST_OFFSET
         );
         assert_eq!(
             vcpu.get_system_register(HvfSystemRegister::CNTV_CTL_EL0)
                 .expect("vCPU vtimer control should be read")
-                & 0b11,
+                & VTIMER_WRITABLE_CONTROL_MASK,
             0
         );
         assert_eq!(
             vcpu.get_system_register(HvfSystemRegister::CNTV_CVAL_EL0)
                 .expect("vCPU vtimer compare value should be read"),
-            0xfedc_ba98_7654_3210
+            VTIMER_TEST_COMPARE_VALUE
         );
         vcpu.set_vtimer_offset(original_vtimer_offset)
             .expect("original vCPU vtimer offset should be restored");
@@ -86,7 +92,7 @@ fn creates_and_destroys_hvf_vcpu() {
         .expect("original vCPU vtimer compare value should be restored");
         vcpu.set_system_register(
             HvfSystemRegister::CNTV_CTL_EL0,
-            original_vtimer_control & 0b11,
+            original_vtimer_control & VTIMER_WRITABLE_CONTROL_MASK,
         )
         .expect("original vCPU vtimer control should be restored");
         vcpu.set_vtimer_mask(original_vtimer_mask)
@@ -309,19 +315,19 @@ fn captures_runner_arm64_virtual_timer_state() {
             .set_vtimer_control(0)
             .expect("runner vtimer should be disabled");
         runner
-            .set_vtimer_offset(0x1234_5678_9abc_def0)
+            .set_vtimer_offset(VTIMER_TEST_OFFSET)
             .expect("runner vtimer offset should be set");
         runner
-            .set_vtimer_compare_value(0xfedc_ba98_7654_3210)
+            .set_vtimer_compare_value(VTIMER_TEST_COMPARE_VALUE)
             .expect("runner vtimer compare value should be set");
 
         let captured = runner
             .capture_arm64_virtual_timer_state()
             .expect("runner vtimer state should be captured");
         assert!(captured.masked());
-        assert_eq!(captured.offset(), 0x1234_5678_9abc_def0);
-        assert_eq!(captured.control() & 0b11, 0);
-        assert_eq!(captured.compare_value(), 0xfedc_ba98_7654_3210);
+        assert_eq!(captured.offset(), VTIMER_TEST_OFFSET);
+        assert_eq!(captured.control() & VTIMER_WRITABLE_CONTROL_MASK, 0);
+        assert_eq!(captured.compare_value(), VTIMER_TEST_COMPARE_VALUE);
 
         runner
             .set_vtimer_offset(original.offset())
@@ -330,7 +336,7 @@ fn captures_runner_arm64_virtual_timer_state() {
             .set_vtimer_compare_value(original.compare_value())
             .expect("original runner vtimer compare value should be restored");
         runner
-            .set_vtimer_control(original.control() & 0b11)
+            .set_vtimer_control(original.control() & VTIMER_WRITABLE_CONTROL_MASK)
             .expect("original runner vtimer control should be restored");
         runner
             .set_vtimer_mask(original.masked())
@@ -341,7 +347,10 @@ fn captures_runner_arm64_virtual_timer_state() {
             .expect("restored runner vtimer state should be captured");
         assert_eq!(restored.masked(), original.masked());
         assert_eq!(restored.offset(), original.offset());
-        assert_eq!(restored.control() & 0b11, original.control() & 0b11);
+        assert_eq!(
+            restored.control() & VTIMER_WRITABLE_CONTROL_MASK,
+            original.control() & VTIMER_WRITABLE_CONTROL_MASK
+        );
         assert_eq!(restored.compare_value(), original.compare_value());
 
         runner.shutdown().expect("runner should shut down");

@@ -48,11 +48,11 @@ backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
-virtual-timer mask/offset/control/CVAL boundary, a bounded internal boot-session run-loop
-pump, owned internal boot-session handle, process-level owned startup-session
-wiring with optional serial capture and boot run-loop supervision across bounded
-step windows with retained internal worker status, process-owned virtio-net
-packet-I/O provider selection with no-op fallback and vmnet-backed startup for
+virtual-timer mask/offset/control/CVAL boundary, a bounded internal boot-session
+run-loop pump, owned internal boot-session handle, process-level owned
+startup-session wiring with optional serial capture and boot run-loop supervision
+across bounded step windows with retained internal worker status, process-owned
+virtio-net packet-I/O provider selection with no-op fallback and vmnet-backed startup for
 configured interfaces, an internal vmnet virtio-net packet I/O provider keyed by
 configured interface ID, boot block, virtio-net, and virtio-vsock queue
 interrupt signaling,
@@ -1626,12 +1626,13 @@ reads and boot-register setup on the vCPU-owning thread, rejects duplicate setup
 setup during shutdown, setup while a run is in flight, and setup after a run has
 started. If setup fails after partially writing registers, the runner rejects
 guest runs until setup is retried successfully. The runner also exposes explicit
-single-exit MMIO commands and virtual-timer mask, offset, control, and CVAL commands that run on
-the vCPU-owning thread. One command dispatches an already resolved MMIO access after
-a run has started, and another command starts one vCPU run, resolves a resulting
-MMIO exit, and dispatches or completes it through a caller-provided shared
-dispatcher. The virtual-timer commands expose HVF's explicit mask bit after
-`HV_EXIT_REASON_VTIMER_ACTIVATED`, its raw host-time-relative offset, and raw
+single-exit MMIO commands and virtual-timer mask, offset, control, and CVAL
+commands that run on the vCPU-owning thread. One command dispatches an already
+resolved MMIO access after a run has started, and another command starts one
+vCPU run, resolves a resulting MMIO exit, and dispatches or completes it through
+a caller-provided shared dispatcher. The virtual-timer commands expose HVF's
+explicit mask bit after `HV_EXIT_REASON_VTIMER_ACTIVATED`, its raw
+host-time-relative offset, and raw
 `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` values; GIC PPI
 pending commands can set or clear a
 validated timer PPI bit on the runner thread. The internal boot-session
