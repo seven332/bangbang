@@ -771,6 +771,7 @@ mod macos_arm64 {
                 r#"{"balloon_count":4,"balloon_fails":4,"drive_count":2,"drive_fails":0,"hotplug_memory_count":0,"hotplug_memory_fails":0,"machine_cfg_count":0,"machine_cfg_fails":0,"mmds_count":1,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0}"#,
             ),
         );
+        assert_vm_state_latency_metrics_output(&metrics_path);
         assert_block_update_metrics_output(&metrics_path);
         assert_startup_time_metrics_output(&metrics_path);
         assert_sigpipe_signal_metrics_output(&metrics_path);
@@ -3892,6 +3893,41 @@ mod macos_arm64 {
         assert!(
             !output.contains(r#""boot_run_loop_status":"failed""#),
             "metrics output should not report failed boot run-loop status; output:\n{output}"
+        );
+    }
+
+    fn assert_vm_state_latency_metrics_output(path: &Path) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "metrics output {} should be readable for VM state latency metrics: {err}",
+                path.display()
+            )
+        });
+
+        let mut found_vm_state_latencies = false;
+        for line in output.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!("metrics output line should be valid JSON: {err}; line:\n{line}")
+            });
+            let Some(latencies) = value.get("latencies_us") else {
+                continue;
+            };
+            if latencies
+                .get("pause_vm")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+                && latencies
+                    .get("resume_vm")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+            {
+                found_vm_state_latencies = true;
+            }
+        }
+
+        assert!(
+            found_vm_state_latencies,
+            "metrics output should include numeric pause/resume VM state latencies; output:\n{output}"
         );
     }
 
