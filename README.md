@@ -10,6 +10,7 @@ and test rules:
 
 - [Firecracker Compatibility Scope](docs/firecracker-compatibility.md)
 - [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md)
+- [Snapshot Feasibility](docs/snapshot-feasibility.md)
 - [macOS Host Security Model](docs/security.md)
 - [Testing Guide](docs/testing.md)
 - [Pull Request Review Guidelines](docs/review-guidelines.md)
