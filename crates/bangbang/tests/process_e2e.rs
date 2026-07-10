@@ -2939,16 +2939,16 @@ fn executable_fails_when_api_socket_path_exists_without_removing_it() {
 
 #[test]
 fn concurrent_executables_keep_api_resources_isolated() {
-    let first_dir = TestDir::new();
-    let second_dir = TestDir::new();
-    let first_socket_path = first_dir.path().join("api.socket");
-    let second_socket_path = second_dir.path().join("api.socket");
-    let first_metadata_path = first_dir.path().join("metadata.json");
-    let second_metadata_path = second_dir.path().join("metadata.json");
-    let first_metrics_path = first_dir.path().join("startup.metrics");
-    let second_metrics_path = second_dir.path().join("startup.metrics");
-    let first_instance_id = first_dir.instance_id();
-    let second_instance_id = second_dir.instance_id();
+    let test_dir = TestDir::new();
+    let first_socket_path = test_dir.path().join("first-api.socket");
+    let second_socket_path = test_dir.path().join("second-api.socket");
+    let first_metadata_path = test_dir.path().join("first-metadata.json");
+    let second_metadata_path = test_dir.path().join("second-metadata.json");
+    let first_metrics_path = test_dir.path().join("first-startup.metrics");
+    let second_metrics_path = test_dir.path().join("second-startup.metrics");
+    let instance_id = test_dir.instance_id();
+    let first_instance_id = format!("{instance_id}-first");
+    let second_instance_id = format!("{instance_id}-second");
     fs::write(
         &first_metadata_path,
         r#"{"latest":{"meta-data":{"ami-id":"ami-first"},"user-data":"first-user-data"}}"#,
