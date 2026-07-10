@@ -61,26 +61,44 @@ pub(crate) fn http_raw(socket_path: &Path, request: &[u8]) -> String {
 }
 
 fn http_raw_with_io_timeout(socket_path: &Path, request: &[u8], io_timeout: Duration) -> String {
-    let mut stream = UnixStream::connect(socket_path)
-        .unwrap_or_else(|err| panic!("client should connect to {}: {err}", socket_path.display()));
+    let request_line = http_request_line(request);
+    let mut stream = UnixStream::connect(socket_path).unwrap_or_else(|err| {
+        panic!(
+            "client should connect to {} for {request_line}: {err}",
+            socket_path.display()
+        )
+    });
     stream
         .set_read_timeout(Some(io_timeout))
-        .unwrap_or_else(|err| panic!("client should set read timeout {io_timeout:?}: {err}"));
+        .unwrap_or_else(|err| {
+            panic!("client should set read timeout {io_timeout:?} for {request_line}: {err}")
+        });
     stream
         .set_write_timeout(Some(io_timeout))
-        .unwrap_or_else(|err| panic!("client should set write timeout {io_timeout:?}: {err}"));
+        .unwrap_or_else(|err| {
+            panic!("client should set write timeout {io_timeout:?} for {request_line}: {err}")
+        });
     stream.write_all(request).unwrap_or_else(|err| {
         panic!(
-            "client should write {} request bytes within {io_timeout:?}: {err}",
+            "client should write {} request bytes for {request_line} within {io_timeout:?}: {err}",
             request.len()
         )
     });
 
     let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .unwrap_or_else(|err| panic!("client should read response within {io_timeout:?}: {err}"));
+    stream.read_to_string(&mut response).unwrap_or_else(|err| {
+        panic!("client should read response for {request_line} within {io_timeout:?}: {err}")
+    });
     response
+}
+
+fn http_request_line(request: &[u8]) -> String {
+    let line = request
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or(request);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    String::from_utf8_lossy(line).into_owned()
 }
 
 fn http_request(socket_path: &Path, method: &str, path: &str, body: Option<&str>) -> String {
