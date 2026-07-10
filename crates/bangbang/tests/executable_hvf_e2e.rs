@@ -3938,10 +3938,43 @@ mod macos_arm64 {
             panic!("logger output {} should be readable: {err}", path.display())
         });
 
+        assert_logger_output_lines(&output);
+    }
+
+    fn assert_logger_output_lines(output: &str) {
+        let mut action_lines = Vec::new();
+        for line in output.lines() {
+            if line.starts_with("action=") {
+                action_lines.push(line);
+                continue;
+            }
+
+            assert!(
+                is_api_request_logger_line(line),
+                "logger output line should be an action record or API request record; output:\n{output}\nline: {line}"
+            );
+        }
+
+        const EXPECTED_ACTION_LINES: &[&str] = &["action=InstanceStart", "action=FlushMetrics"];
         assert_eq!(
-            output, "action=InstanceStart\naction=FlushMetrics\n",
+            action_lines.as_slice(),
+            EXPECTED_ACTION_LINES,
             "logger output should include the expected action records"
         );
+    }
+
+    fn is_api_request_logger_line(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("The API server received a ") else {
+            return false;
+        };
+        let Some((method, path)) = rest.split_once(" request on \"") else {
+            return false;
+        };
+        let Some(path) = path.strip_suffix("\".") else {
+            return false;
+        };
+
+        !method.is_empty() && path.starts_with('/')
     }
 
     fn assert_no_api_logger_output(path: &Path) {
@@ -3953,6 +3986,28 @@ mod macos_arm64 {
             output, "action=InstanceStart\n",
             "no-api logger output should include only the startup action record"
         );
+    }
+
+    #[test]
+    fn logger_output_accepts_action_records_with_api_request_lines() {
+        assert_logger_output_lines(
+            "The API server received a Get request on \"/\".\n\
+             action=InstanceStart\n\
+             The API server received a Put request on \"/actions\".\n\
+             action=FlushMetrics\n",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "logger output line should be an action record")]
+    fn logger_output_rejects_unexpected_non_action_line() {
+        assert_logger_output_lines("action=InstanceStart\nunexpected\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "logger output should include the expected action records")]
+    fn logger_output_rejects_missing_action_record() {
+        assert_logger_output_lines("The API server received a Get request on \"/\".\n");
     }
 
     fn wait_for_file_prefix_marker(
