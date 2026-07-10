@@ -87,7 +87,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented validation path | Keep real HVF tests in signed targets and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
-| vmnet networking | Deferred feasible macOS work | Treat live connectivity, host policy, and cleanup as open design work until a public vmnet integration proof exists. |
+| vmnet networking | Implemented boundary with operator-owned host policy | Keep supported `host_dev_name` forms, startup validation, MMDS-only behavior, entitlement requirements, and non-goals documented when network behavior changes. |
 | macOS sandboxing | Deferred feasible macOS work | Do not claim production containment until a sandbox profile and resource policy are designed and tested. |
 | Launcher or resource broker | Deferred feasible macOS work | Keep host-path and shared-resource isolation as operator responsibility until a separate broker owns privileged preparation and cleanup. |
 
@@ -113,6 +113,39 @@ This document intentionally does not define a sandbox profile, broker protocol,
 privilege-dropping flow, or new public API. PRs that add host resource types
 should state which current boundary protects the resource and whether a future
 launcher, broker, or sandbox profile would need to own it.
+
+## vmnet Host Policy Boundary
+
+bangbang's current live vmnet boundary is a direct macOS vmnet interface owned
+by the VMM process. Network interface configuration stores the Firecracker
+`host_dev_name` value before boot without opening host networking resources.
+During `InstanceStart`, startup accepts only these vmnet-shaped names:
+
+- `vmnet:host`, mapped to macOS vmnet host mode.
+- `vmnet:shared`, mapped to macOS vmnet shared mode.
+- `vmnet:bridged:<interface>`, mapped to macOS vmnet bridged mode. The
+  interface suffix must be nonempty and must not contain NUL bytes or ASCII
+  control characters.
+
+Unsupported names fail before the VM reaches `Running`. When every configured
+network interface is selected by MMDS config, startup still validates the same
+vmnet-shaped names but can use process-local MMDS-only packet I/O without
+opening vmnet resources. Otherwise, startup opens vmnet resources for the
+configured interfaces and retains stop-on-drop cleanup ownership inside the
+process.
+
+The vmnet path requires the host to satisfy macOS vmnet authorization,
+entitlement, and code-signing requirements. That requirement allows the process
+to call vmnet APIs; it is not a guest containment boundary. Operators remain
+responsible for host firewalling, routing, NAT exposure, bridged-interface
+selection, and avoiding unintended sharing across multiple `bangbang`
+processes. Use unique interface configurations and host resources for separate
+VMs unless sharing is intentional and externally coordinated.
+
+The current boundary does not implement packet filtering, production network
+isolation, a sandbox profile, a launcher/resource broker, runtime network
+hotplug, configured network rate limiting, or full Firecracker public packet
+movement parity.
 
 ## API Socket Handling
 
@@ -521,8 +554,9 @@ The current scaffold does not implement:
   that limit before selecting packet I/O, opens vmnet resources only for
   non-MMDS-only startup when configured interfaces use the supported names,
   keeps no-network startup on a no-op TX sink plus empty RX source, and still
-  lacks a macOS sandbox, host resource broker, connectivity policy, and live
-  vmnet integration proof. The current
+  lacks a macOS sandbox, host resource broker, production connectivity policy,
+  and full public vmnet packet-movement proof beyond the documented
+  operator-owned vmnet boundary. The current
   vsock API path validates and stores `guest_cid` plus `uds_path` before boot.
   The runtime crate has an internal virtio-vsock prepared resource, MMIO
   registration helper, config-space, packet header model, TX descriptor packet

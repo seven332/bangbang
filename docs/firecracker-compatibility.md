@@ -1086,6 +1086,8 @@ control characters. Startup does not verify that the named macOS interface
 exists before building cleanup-owning packet I/O for each configured interface.
 Other nonempty names are still accepted before boot but fail startup before
 `Running` is committed.
+The operator-owned live vmnet host policy boundary is documented in
+[`docs/security.md`](security.md#vmnet-host-policy-boundary).
 
 ## Internal Vsock Configuration
 
