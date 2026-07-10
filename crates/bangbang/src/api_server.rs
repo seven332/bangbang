@@ -2128,6 +2128,10 @@ mod tests {
             Ok(())
         }
 
+        fn run_snapshot_create_barrier(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
         fn update_block_device(
             &mut self,
             _config: &DriveConfig,

@@ -139,6 +139,10 @@ pub(crate) trait ProcessSessionDiagnostics {
         Err(BackendError::InvalidState("active session unavailable"))
     }
 
+    fn run_snapshot_create_barrier(&mut self) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState("active session unavailable"))
+    }
+
     fn update_block_device(
         &mut self,
         _config: &DriveConfig,
@@ -984,6 +988,7 @@ where
             VmmAction::InstanceStart => self.start_instance(),
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
+            VmmAction::CreateSnapshot => self.create_snapshot(),
             VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::PatchBalloonStats(input) => self.update_balloon_statistics(input),
@@ -1132,6 +1137,20 @@ where
 
         session.resume().map_err(VmmActionError::Lifecycle)?;
         self.controller.resume_instance()
+    }
+
+    fn create_snapshot(&mut self) -> Result<VmmData, VmmActionError> {
+        self.controller.preflight_create_snapshot()?;
+        let Some(session) = self.started_session.as_mut() else {
+            return Err(VmmActionError::Lifecycle(BackendError::InvalidState(
+                "active session unavailable",
+            )));
+        };
+
+        session
+            .run_snapshot_create_barrier()
+            .map_err(VmmActionError::Lifecycle)?;
+        self.controller.handle_action(VmmAction::CreateSnapshot)
     }
 
     fn update_block_device(&mut self, input: DriveUpdateInput) -> Result<VmmData, VmmActionError> {
@@ -2717,11 +2736,235 @@ impl BootRunLoopPauseGate {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum BootRunLoopCommandAdmissionState {
+    #[default]
+    Ordinary,
+    SnapshotPreparing,
+    SnapshotLeased,
+    SnapshotReleasing,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootRunLoopCommandSubmissionError {
+    SnapshotQuiescenceActive,
+    AdmissionClosed,
+    QueueFull,
+    QueueClosed,
+}
+
+#[derive(Debug, Default)]
+struct BootRunLoopCommandAdmission {
+    state: Mutex<BootRunLoopCommandAdmissionState>,
+    changed: Condvar,
+}
+
+impl BootRunLoopCommandAdmission {
+    fn try_send_ordinary<S>(
+        &self,
+        sender: &mpsc::SyncSender<BootRunLoopCommand<S>>,
+        command: BootRunLoopCommand<S>,
+    ) -> Result<(), BootRunLoopCommandSubmissionError>
+    where
+        S: BootRunLoopSession,
+    {
+        // Keep this guard through the nonblocking send. That makes admission
+        // order match FIFO order relative to a snapshot reservation.
+        let state = self.lock_state();
+        match *state {
+            BootRunLoopCommandAdmissionState::Ordinary => {}
+            BootRunLoopCommandAdmissionState::SnapshotPreparing
+            | BootRunLoopCommandAdmissionState::SnapshotLeased
+            | BootRunLoopCommandAdmissionState::SnapshotReleasing => {
+                return Err(BootRunLoopCommandSubmissionError::SnapshotQuiescenceActive);
+            }
+            BootRunLoopCommandAdmissionState::Shutdown => {
+                return Err(BootRunLoopCommandSubmissionError::AdmissionClosed);
+            }
+        }
+
+        match sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(BootRunLoopCommandSubmissionError::QueueFull),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(BootRunLoopCommandSubmissionError::QueueClosed)
+            }
+        }
+    }
+
+    fn try_send_snapshot<S>(
+        &self,
+        sender: &mpsc::SyncSender<BootRunLoopCommand<S>>,
+        command: BootRunLoopCommand<S>,
+    ) -> Result<(), BootRunLoopCommandSubmissionError>
+    where
+        S: BootRunLoopSession,
+    {
+        // Reserve and enqueue under the same lock so an ordinary command can
+        // never pass admission and then enter the queue behind this command.
+        let mut state = self.lock_state();
+        match *state {
+            BootRunLoopCommandAdmissionState::Ordinary => {
+                *state = BootRunLoopCommandAdmissionState::SnapshotPreparing;
+                self.changed.notify_all();
+            }
+            BootRunLoopCommandAdmissionState::SnapshotPreparing
+            | BootRunLoopCommandAdmissionState::SnapshotLeased
+            | BootRunLoopCommandAdmissionState::SnapshotReleasing => {
+                return Err(BootRunLoopCommandSubmissionError::SnapshotQuiescenceActive);
+            }
+            BootRunLoopCommandAdmissionState::Shutdown => {
+                return Err(BootRunLoopCommandSubmissionError::AdmissionClosed);
+            }
+        }
+
+        match sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                *state = BootRunLoopCommandAdmissionState::Ordinary;
+                self.changed.notify_all();
+                Err(BootRunLoopCommandSubmissionError::QueueFull)
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                *state = BootRunLoopCommandAdmissionState::Ordinary;
+                self.changed.notify_all();
+                Err(BootRunLoopCommandSubmissionError::QueueClosed)
+            }
+        }
+    }
+
+    fn mark_snapshot_leased(&self) -> bool {
+        let mut state = self.lock_state();
+        if !matches!(*state, BootRunLoopCommandAdmissionState::SnapshotPreparing) {
+            return false;
+        }
+
+        *state = BootRunLoopCommandAdmissionState::SnapshotLeased;
+        self.changed.notify_all();
+        true
+    }
+
+    fn release_snapshot(&self) -> bool {
+        let should_finish = {
+            let mut state = self.lock_state();
+            if !matches!(*state, BootRunLoopCommandAdmissionState::SnapshotLeased) {
+                false
+            } else {
+                *state = BootRunLoopCommandAdmissionState::SnapshotReleasing;
+                self.changed.notify_all();
+                true
+            }
+        };
+
+        if should_finish {
+            self.finish_snapshot_release()
+        } else {
+            false
+        }
+    }
+
+    fn cancel_snapshot_preparation(&self) {
+        let should_finish = {
+            let mut state = self.lock_state();
+            if !matches!(*state, BootRunLoopCommandAdmissionState::SnapshotPreparing) {
+                false
+            } else {
+                *state = BootRunLoopCommandAdmissionState::SnapshotReleasing;
+                self.changed.notify_all();
+                true
+            }
+        };
+
+        if should_finish {
+            self.finish_snapshot_release();
+        }
+    }
+
+    // Reacquire for the final transition so an out-of-band shutdown that wins
+    // after release begins remains authoritative instead of being overwritten.
+    fn finish_snapshot_release(&self) -> bool {
+        let mut state = self.lock_state();
+        if matches!(*state, BootRunLoopCommandAdmissionState::SnapshotReleasing) {
+            *state = BootRunLoopCommandAdmissionState::Ordinary;
+            self.changed.notify_all();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn shutdown(&self) {
+        *self.lock_state() = BootRunLoopCommandAdmissionState::Shutdown;
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> BootRunLoopCommandAdmissionState {
+        *self.lock_state()
+    }
+
+    #[cfg(test)]
+    fn wait_for_state(&self, expected: BootRunLoopCommandAdmissionState) {
+        let mut state = self.lock_state();
+        while *state != expected {
+            state = match self.changed.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, BootRunLoopCommandAdmissionState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+struct BootRunLoopSnapshotQuiescenceGuard {
+    admission: Arc<BootRunLoopCommandAdmission>,
+    active: bool,
+}
+
+impl BootRunLoopSnapshotQuiescenceGuard {
+    fn acquire(admission: Arc<BootRunLoopCommandAdmission>) -> Option<Self> {
+        admission.mark_snapshot_leased().then_some(Self {
+            admission,
+            active: true,
+        })
+    }
+
+    fn release(mut self) -> bool {
+        self.release_inner()
+    }
+
+    fn release_inner(&mut self) -> bool {
+        if self.active {
+            let released = self.admission.release_snapshot();
+            self.active = false;
+            released
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for BootRunLoopSnapshotQuiescenceGuard {
+    fn drop(&mut self) {
+        let _ = self.release_inner();
+    }
+}
+
 type BootRunLoopCommand<S> = Box<dyn FnOnce(&mut S) + Send + 'static>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BootRunLoopCommandError<C, E> {
     WorkerNotRunning,
+    WorkerNotPaused,
+    SnapshotQuiescenceActive,
+    AdmissionClosed,
     QueueFull,
     QueueClosed,
     Wakeup { source: C },
@@ -2737,6 +2980,11 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WorkerNotRunning => f.write_str("boot run loop worker is not running"),
+            Self::WorkerNotPaused => f.write_str("boot run loop worker is not paused"),
+            Self::SnapshotQuiescenceActive => {
+                f.write_str("boot run loop snapshot quiescence is active")
+            }
+            Self::AdmissionClosed => f.write_str("boot run loop command admission is closed"),
             Self::QueueFull => f.write_str("boot run loop command queue is full"),
             Self::QueueClosed => f.write_str("boot run loop command queue is closed"),
             Self::Wakeup { source } => {
@@ -2745,6 +2993,21 @@ where
             Self::ResponseClosed => f.write_str("boot run loop command response closed"),
             Self::Command { source } => write!(f, "boot run loop command failed: {source}"),
         }
+    }
+}
+
+fn boot_run_loop_command_error_from_submission<C, E>(
+    err: BootRunLoopCommandSubmissionError,
+) -> BootRunLoopCommandError<C, E> {
+    match err {
+        BootRunLoopCommandSubmissionError::SnapshotQuiescenceActive => {
+            BootRunLoopCommandError::SnapshotQuiescenceActive
+        }
+        BootRunLoopCommandSubmissionError::AdmissionClosed => {
+            BootRunLoopCommandError::AdmissionClosed
+        }
+        BootRunLoopCommandSubmissionError::QueueFull => BootRunLoopCommandError::QueueFull,
+        BootRunLoopCommandSubmissionError::QueueClosed => BootRunLoopCommandError::QueueClosed,
     }
 }
 
@@ -2854,7 +3117,14 @@ where
 {
     match err {
         BootRunLoopCommandError::Command { source } => source,
+        BootRunLoopCommandError::WorkerNotPaused => {
+            BackendError::InvalidState("boot run loop worker is not paused")
+        }
+        BootRunLoopCommandError::SnapshotQuiescenceActive => {
+            BackendError::InvalidState("boot run loop snapshot quiescence is active")
+        }
         BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::AdmissionClosed
         | BootRunLoopCommandError::QueueClosed
         | BootRunLoopCommandError::ResponseClosed => {
             BackendError::InvalidState("boot run loop worker is not running")
@@ -2876,6 +3146,30 @@ where
     control: S::Control,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     pause_gate: Arc<BootRunLoopPauseGate>,
+    admission: Arc<BootRunLoopCommandAdmission>,
+}
+
+enum BootRunLoopSnapshotCommandResponse<R, E> {
+    Complete(Result<R, E>),
+    WorkerNotPaused,
+    AdmissionInvalidated,
+}
+
+fn boot_run_loop_snapshot_response_into_result<C, R, E>(
+    response: BootRunLoopSnapshotCommandResponse<R, E>,
+) -> Result<R, BootRunLoopCommandError<C, E>> {
+    match response {
+        BootRunLoopSnapshotCommandResponse::Complete(Ok(result)) => Ok(result),
+        BootRunLoopSnapshotCommandResponse::Complete(Err(source)) => {
+            Err(BootRunLoopCommandError::Command { source })
+        }
+        BootRunLoopSnapshotCommandResponse::WorkerNotPaused => {
+            Err(BootRunLoopCommandError::WorkerNotPaused)
+        }
+        BootRunLoopSnapshotCommandResponse::AdmissionInvalidated => {
+            Err(BootRunLoopCommandError::AdmissionClosed)
+        }
+    }
 }
 
 impl<S> Clone for BootRunLoopCommandHandle<S>
@@ -2888,6 +3182,7 @@ where
             control: self.control.clone(),
             status: Arc::clone(&self.status),
             pause_gate: Arc::clone(&self.pause_gate),
+            admission: Arc::clone(&self.admission),
         }
     }
 }
@@ -2913,12 +3208,14 @@ where
         control: S::Control,
         status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
         pause_gate: Arc<BootRunLoopPauseGate>,
+        admission: Arc<BootRunLoopCommandAdmission>,
     ) -> Self {
         Self {
             sender,
             control,
             status,
             pause_gate,
+            admission,
         }
     }
 
@@ -2942,13 +3239,9 @@ where
             let _ = response_sender.send(command(session));
         });
 
-        match self.sender.try_send(queued_command) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => return Err(BootRunLoopCommandError::QueueFull),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                return Err(BootRunLoopCommandError::QueueClosed);
-            }
-        }
+        self.admission
+            .try_send_ordinary(&self.sender, queued_command)
+            .map_err(boot_run_loop_command_error_from_submission)?;
         self.pause_gate.notify_command_available();
 
         match response_receiver.try_recv() {
@@ -2968,6 +3261,74 @@ where
                 Ok(()) => Err(BootRunLoopCommandError::ResponseClosed),
                 Err(source) => Err(BootRunLoopCommandError::Wakeup { source }),
             },
+        }
+    }
+
+    fn run_snapshot_quiesced<R, E>(
+        &self,
+        command: impl FnOnce(&mut S) -> Result<R, E> + Send + 'static,
+    ) -> Result<R, BootRunLoopCommandError<<S::Control as BootRunLoopControl>::Error, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        // Caller and worker both observe status before taking admission. Keep
+        // that lock order aligned with pause, resume, and shutdown paths.
+        if !matches!(self.status.snapshot(), BootRunLoopWorkerStatus::Paused) {
+            return Err(BootRunLoopCommandError::WorkerNotPaused);
+        }
+
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        let status = Arc::clone(&self.status);
+        let admission = Arc::clone(&self.admission);
+        let queued_command: BootRunLoopCommand<S> = Box::new(move |session| {
+            if !matches!(status.snapshot(), BootRunLoopWorkerStatus::Paused) {
+                admission.cancel_snapshot_preparation();
+                let _ = response_sender.send(BootRunLoopSnapshotCommandResponse::WorkerNotPaused);
+                return;
+            }
+
+            let Some(guard) = BootRunLoopSnapshotQuiescenceGuard::acquire(Arc::clone(&admission))
+            else {
+                admission.cancel_snapshot_preparation();
+                let _ =
+                    response_sender.send(BootRunLoopSnapshotCommandResponse::AdmissionInvalidated);
+                return;
+            };
+
+            let result = command(session);
+            let response = if guard.release() {
+                BootRunLoopSnapshotCommandResponse::Complete(result)
+            } else {
+                BootRunLoopSnapshotCommandResponse::AdmissionInvalidated
+            };
+            let _ = response_sender.send(response);
+        });
+
+        self.admission
+            .try_send_snapshot(&self.sender, queued_command)
+            .map_err(boot_run_loop_command_error_from_submission)?;
+        self.pause_gate.notify_command_available();
+
+        match response_receiver.try_recv() {
+            Ok(response) => return boot_run_loop_snapshot_response_into_result(response),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.admission.cancel_snapshot_preparation();
+                return Err(BootRunLoopCommandError::ResponseClosed);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        let wakeup_result = self.control.request_wakeup();
+        match response_receiver.recv() {
+            Ok(response) => boot_run_loop_snapshot_response_into_result(response),
+            Err(_) => {
+                self.admission.cancel_snapshot_preparation();
+                match wakeup_result {
+                    Ok(()) => Err(BootRunLoopCommandError::ResponseClosed),
+                    Err(source) => Err(BootRunLoopCommandError::Wakeup { source }),
+                }
+            }
         }
     }
 }
@@ -3005,6 +3366,7 @@ where
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     pause_gate: Arc<BootRunLoopPauseGate>,
+    admission: Arc<BootRunLoopCommandAdmission>,
     terminal_wakeup_reader: UnixStream,
     session_release_sender: Option<mpsc::Sender<()>>,
     worker: Option<JoinHandle<()>>,
@@ -3043,12 +3405,14 @@ where
         let worker_status = Arc::clone(&status);
         let pause_gate = Arc::new(BootRunLoopPauseGate::default());
         let worker_pause_gate = Arc::clone(&pause_gate);
+        let admission = Arc::new(BootRunLoopCommandAdmission::default());
         let (command_sender, command_receiver) = mpsc::sync_channel(command_queue_capacity);
         let command_handle = BootRunLoopCommandHandle::new(
             command_sender,
             control.clone(),
             Arc::clone(&status),
             Arc::clone(&pause_gate),
+            Arc::clone(&admission),
         );
         let (terminal_wakeup_reader, mut terminal_wakeup_writer) =
             UnixStream::pair().map_err(|err| {
@@ -3129,6 +3493,7 @@ where
             command_handle,
             status,
             pause_gate,
+            admission,
             terminal_wakeup_reader,
             session_release_sender: Some(session_release_sender),
             worker: Some(worker),
@@ -3149,6 +3514,27 @@ where
         E: Send + 'static,
     {
         self.command_handle.run(command)
+    }
+
+    fn run_snapshot_quiesced<R, E>(
+        &self,
+        command: impl FnOnce(&mut S) -> Result<R, E> + Send + 'static,
+    ) -> Result<R, BootRunLoopCommandError<<S::Control as BootRunLoopControl>::Error, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.command_handle.run_snapshot_quiesced(command)
+    }
+
+    #[cfg(test)]
+    fn admission_state(&self) -> BootRunLoopCommandAdmissionState {
+        self.admission.snapshot()
+    }
+
+    #[cfg(test)]
+    fn wait_for_admission_state(&self, expected: BootRunLoopCommandAdmissionState) {
+        self.admission.wait_for_state(expected);
     }
 
     fn status(&self) -> BootRunLoopWorkerStatus<S::Outcome> {
@@ -3223,6 +3609,7 @@ where
 
         let was_paused = matches!(self.status(), BootRunLoopWorkerStatus::Paused);
         let stop_requested = self.control.request_stop().is_ok();
+        self.admission.shutdown();
         self.pause_gate.shutdown();
         drop(self.session_release_sender.take());
 
@@ -3281,6 +3668,11 @@ where
 
     fn resume(&mut self) -> Result<(), BackendError> {
         BootRunLoopSupervisor::resume(self)
+    }
+
+    fn run_snapshot_create_barrier(&mut self) -> Result<(), BackendError> {
+        self.run_snapshot_quiesced(|_| Ok::<_, BackendError>(()))
+            .map_err(lifecycle_error_from_boot_run_loop_command)
     }
 
     fn update_block_device(
@@ -3613,7 +4005,9 @@ mod tests {
     };
 
     use super::{
-        BootRunLoopBlockDeviceUpdater, BootRunLoopControl, BootRunLoopSession,
+        BootRunLoopBlockDeviceUpdater, BootRunLoopCommandAdmission,
+        BootRunLoopCommandAdmissionState, BootRunLoopCommandError,
+        BootRunLoopCommandSubmissionError, BootRunLoopControl, BootRunLoopSession,
         BootRunLoopSupervisor, BootRunLoopWorkerStatus, DEFAULT_BALLOON_MMIO_BASE,
         DEFAULT_BALLOON_MMIO_REGION_ID, DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID,
         DEFAULT_BOOT_TIMER_MMIO_BASE, DEFAULT_BOOT_TIMER_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE,
@@ -3768,6 +4162,8 @@ mod tests {
         pause_result: Option<BackendError>,
         resume_count: usize,
         resume_result: Option<BackendError>,
+        snapshot_create_barrier_count: usize,
+        snapshot_create_barrier_result: Option<BackendError>,
         block_update_count: usize,
         last_block_update: Option<String>,
         last_block_update_refresh_backing: Option<bool>,
@@ -3808,6 +4204,8 @@ mod tests {
                 pause_result: None,
                 resume_count: 0,
                 resume_result: None,
+                snapshot_create_barrier_count: 0,
+                snapshot_create_barrier_result: None,
                 block_update_count: 0,
                 last_block_update: None,
                 last_block_update_refresh_backing: None,
@@ -3855,6 +4253,12 @@ mod tests {
         fn with_resume_result(id: u64, result: BackendError) -> Self {
             let mut session = Self::new(id);
             session.resume_result = Some(result);
+            session
+        }
+
+        fn with_snapshot_create_barrier_result(id: u64, result: BackendError) -> Self {
+            let mut session = Self::new(id);
+            session.snapshot_create_barrier_result = Some(result);
             session
         }
 
@@ -3940,6 +4344,14 @@ mod tests {
         fn resume(&mut self) -> Result<(), BackendError> {
             self.resume_count += 1;
             match self.resume_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn run_snapshot_create_barrier(&mut self) -> Result<(), BackendError> {
+            self.snapshot_create_barrier_count += 1;
+            match self.snapshot_create_barrier_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
             }
@@ -6309,6 +6721,540 @@ mod tests {
     }
 
     #[test]
+    fn boot_run_loop_supervisor_snapshot_scope_rejects_ordinary_commands_until_release() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let memory_update = memory_hotplug_config()
+            .validate_size_update(memory_hotplug_size_update_input(256))
+            .expect("memory hotplug update should validate");
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let memory_updates = session.memory_hotplug_updates();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(20).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            20
+        );
+        supervisor.pause().expect("supervisor should pause");
+        let snapshot_handle = supervisor.command_handle();
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let snapshot_caller = scope.spawn(move || {
+                snapshot_handle.run_snapshot_quiesced(move |_| {
+                    entered_sender
+                        .send(())
+                        .expect("test should observe leased worker command");
+                    release_receiver
+                        .recv()
+                        .expect("test should release leased worker command");
+                    Ok::<_, FakeRunLoopCommandError>(())
+                })
+            });
+
+            entered_receiver
+                .recv()
+                .expect("snapshot command should enter lease scope");
+            supervisor.wait_for_admission_state(BootRunLoopCommandAdmissionState::SnapshotLeased);
+            assert_eq!(
+                supervisor.admission_state(),
+                BootRunLoopCommandAdmissionState::SnapshotLeased
+            );
+            assert_eq!(
+                supervisor.metrics_diagnostics().boot_run_loop_status(),
+                Some(BootRunLoopMetricStatus::Paused)
+            );
+            assert_eq!(
+                supervisor.process_exit_status(),
+                super::ProcessSessionExitStatus::Running
+            );
+
+            let command_error = supervisor
+                .run_command(|_| Ok::<_, FakeRunLoopCommandError>(()))
+                .expect_err("ordinary command should reject during snapshot scope");
+            assert_eq!(
+                command_error,
+                BootRunLoopCommandError::SnapshotQuiescenceActive
+            );
+            assert_eq!(
+                supervisor
+                    .resume()
+                    .expect_err("resume should reject during snapshot scope"),
+                BackendError::InvalidState("boot run loop snapshot quiescence is active")
+            );
+            assert_eq!(
+                supervisor
+                    .update_memory_hotplug(memory_update)
+                    .expect_err("memory mutation should reject during snapshot scope"),
+                MemoryHotplugUpdateError::ActiveSessionCommand {
+                    message: "boot run loop snapshot quiescence is active".to_string(),
+                }
+            );
+            assert!(
+                memory_updates
+                    .lock()
+                    .expect("memory hotplug updates should lock")
+                    .is_empty()
+            );
+
+            release_sender
+                .send(())
+                .expect("snapshot scope should release");
+            snapshot_caller
+                .join()
+                .expect("snapshot caller should not panic")
+                .expect("snapshot scope should succeed");
+        });
+
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        supervisor
+            .run_command(|_| Ok::<_, FakeRunLoopCommandError>(()))
+            .expect("ordinary command should run after snapshot release");
+
+        drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_snapshot_scope_follows_earlier_fifo_command() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(20).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            20
+        );
+        supervisor.pause().expect("supervisor should pause");
+        let ordinary_handle = supervisor.command_handle();
+        let snapshot_handle = supervisor.command_handle();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let ordinary_order = Arc::clone(&order);
+        let snapshot_order = Arc::clone(&order);
+        let (ordinary_entered_sender, ordinary_entered_receiver) = mpsc::channel();
+        let (ordinary_release_sender, ordinary_release_receiver) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let ordinary_caller = scope.spawn(move || {
+                ordinary_handle.run(move |_| {
+                    ordinary_order
+                        .lock()
+                        .expect("command order should lock")
+                        .push("ordinary");
+                    ordinary_entered_sender
+                        .send(())
+                        .expect("test should observe ordinary command");
+                    ordinary_release_receiver
+                        .recv()
+                        .expect("test should release ordinary command");
+                    Ok::<_, FakeRunLoopCommandError>(())
+                })
+            });
+            ordinary_entered_receiver
+                .recv()
+                .expect("ordinary command should enter first");
+
+            let snapshot_caller = scope.spawn(move || {
+                snapshot_handle.run_snapshot_quiesced(move |_| {
+                    snapshot_order
+                        .lock()
+                        .expect("command order should lock")
+                        .push("snapshot");
+                    Ok::<_, FakeRunLoopCommandError>(())
+                })
+            });
+            supervisor
+                .wait_for_admission_state(BootRunLoopCommandAdmissionState::SnapshotPreparing);
+
+            assert_eq!(
+                supervisor
+                    .run_command(|_| Ok::<_, FakeRunLoopCommandError>(()))
+                    .expect_err("later ordinary command should reject before enqueue"),
+                BootRunLoopCommandError::SnapshotQuiescenceActive
+            );
+            ordinary_release_sender
+                .send(())
+                .expect("ordinary command should release");
+            ordinary_caller
+                .join()
+                .expect("ordinary caller should not panic")
+                .expect("ordinary command should succeed");
+            snapshot_caller
+                .join()
+                .expect("snapshot caller should not panic")
+                .expect("snapshot command should succeed");
+        });
+
+        assert_eq!(
+            *order.lock().expect("command order should lock"),
+            ["ordinary", "snapshot"]
+        );
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+
+        drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_resume_queued_before_snapshot_wins_fifo_order() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                ])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(20).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            20
+        );
+        supervisor.pause().expect("supervisor should pause");
+        let blocking_handle = supervisor.command_handle();
+        let snapshot_handle = supervisor.command_handle();
+        let (blocking_entered_sender, blocking_entered_receiver) = mpsc::channel();
+        let (blocking_release_sender, blocking_release_receiver) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let blocking_caller = scope.spawn(move || {
+                blocking_handle.run(move |_| {
+                    blocking_entered_sender
+                        .send(())
+                        .expect("test should observe blocking command");
+                    blocking_release_receiver
+                        .recv()
+                        .expect("test should release blocking command");
+                    Ok::<_, FakeRunLoopCommandError>(())
+                })
+            });
+            blocking_entered_receiver
+                .recv()
+                .expect("blocking command should enter first");
+
+            let wakeup_count_before_resume = control.request_wakeup_count();
+            let resume_caller = scope.spawn(|| supervisor.resume());
+            control.wait_for_request_wakeup_count(wakeup_count_before_resume + 1);
+
+            let snapshot_caller = scope.spawn(move || {
+                snapshot_handle.run_snapshot_quiesced(|_| Ok::<_, FakeRunLoopCommandError>(()))
+            });
+            supervisor
+                .wait_for_admission_state(BootRunLoopCommandAdmissionState::SnapshotPreparing);
+            blocking_release_sender
+                .send(())
+                .expect("blocking command should release");
+
+            blocking_caller
+                .join()
+                .expect("blocking caller should not panic")
+                .expect("blocking command should succeed");
+            resume_caller
+                .join()
+                .expect("resume caller should not panic")
+                .expect("earlier resume should succeed");
+            assert_eq!(
+                snapshot_caller
+                    .join()
+                    .expect("snapshot caller should not panic")
+                    .expect_err("snapshot should revalidate worker pause after resume"),
+                BootRunLoopCommandError::WorkerNotPaused
+            );
+        });
+
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+
+        drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_snapshot_error_releases_admission_once() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(20).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            20
+        );
+        supervisor.pause().expect("supervisor should pause");
+
+        assert_eq!(
+            supervisor
+                .run_snapshot_quiesced(|_| Err::<(), _>(FakeRunLoopCommandError))
+                .expect_err("snapshot operation should preserve its domain error"),
+            BootRunLoopCommandError::Command {
+                source: FakeRunLoopCommandError,
+            }
+        );
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        assert!(!supervisor.admission.release_snapshot());
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        supervisor
+            .run_command(|_| Ok::<_, FakeRunLoopCommandError>(()))
+            .expect("ordinary command should run after snapshot operation error");
+
+        drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_snapshot_queue_failure_restores_admission() {
+        let admission = BootRunLoopCommandAdmission::default();
+        let (sender, _receiver) = mpsc::sync_channel(0);
+
+        let error = admission
+            .try_send_snapshot::<FakeRunLoopSession>(
+                &sender,
+                Box::new(|_| panic!("zero-capacity command should not execute")),
+            )
+            .expect_err("zero-capacity queue should reject snapshot command");
+
+        assert_eq!(error, BootRunLoopCommandSubmissionError::QueueFull);
+        assert_eq!(
+            admission.snapshot(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let error = admission
+            .try_send_snapshot::<FakeRunLoopSession>(
+                &sender,
+                Box::new(|_| panic!("disconnected command should not execute")),
+            )
+            .expect_err("disconnected queue should reject snapshot command");
+
+        assert_eq!(error, BootRunLoopCommandSubmissionError::QueueClosed);
+        assert_eq!(
+            admission.snapshot(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+    }
+
+    #[test]
+    fn boot_run_loop_snapshot_terminal_response_closure_cancels_preparing_admission() {
+        let control = FakeRunLoopControl::default();
+        let status = Arc::new(super::BootRunLoopWorkerStatusCell::new());
+        status.record(BootRunLoopWorkerStatus::<FakeRunLoopOutcome>::Paused);
+        let pause_gate = Arc::new(super::BootRunLoopPauseGate::default());
+        let admission = Arc::new(BootRunLoopCommandAdmission::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let handle = super::BootRunLoopCommandHandle::<FakeRunLoopSession>::new(
+            sender,
+            control,
+            Arc::clone(&status),
+            pause_gate,
+            Arc::clone(&admission),
+        );
+        let terminal_status = Arc::clone(&status);
+        let receiver_thread = std::thread::spawn(move || {
+            let command = receiver
+                .recv()
+                .expect("test command should reach fake receiver");
+            terminal_status.record(BootRunLoopWorkerStatus::Exited(
+                FakeRunLoopOutcome::Terminal,
+            ));
+            drop(command);
+        });
+
+        let error = handle
+            .run_snapshot_quiesced(|_| Ok::<_, FakeRunLoopCommandError>(()))
+            .expect_err("dropped worker command should close response");
+
+        receiver_thread
+            .join()
+            .expect("fake receiver should not panic");
+        assert_eq!(error, BootRunLoopCommandError::ResponseClosed);
+        assert_eq!(
+            admission.snapshot(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        assert_eq!(
+            status.snapshot(),
+            BootRunLoopWorkerStatus::Exited(FakeRunLoopOutcome::Terminal)
+        );
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_shutdown_invalidates_active_snapshot_scope() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(20).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            20
+        );
+        supervisor.pause().expect("supervisor should pause");
+        let snapshot_handle = supervisor.command_handle();
+        let ordinary_handle = supervisor.command_handle();
+        let admission = Arc::clone(&supervisor.admission);
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let snapshot_caller = scope.spawn(move || {
+                snapshot_handle.run_snapshot_quiesced(move |_| {
+                    entered_sender
+                        .send(())
+                        .expect("test should observe leased worker command");
+                    release_receiver
+                        .recv()
+                        .expect("test should release leased worker command");
+                    Ok::<_, FakeRunLoopCommandError>(())
+                })
+            });
+            entered_receiver
+                .recv()
+                .expect("snapshot command should enter lease scope");
+            admission.wait_for_state(BootRunLoopCommandAdmissionState::SnapshotLeased);
+
+            let shutdown_caller = scope.spawn(move || drop(supervisor));
+            admission.wait_for_state(BootRunLoopCommandAdmissionState::Shutdown);
+            assert_eq!(
+                admission.snapshot(),
+                BootRunLoopCommandAdmissionState::Shutdown
+            );
+            assert_eq!(
+                ordinary_handle
+                    .run(|_| Ok::<_, FakeRunLoopCommandError>(()))
+                    .expect_err("shutdown admission should reject normal commands"),
+                BootRunLoopCommandError::AdmissionClosed
+            );
+            release_sender
+                .send(())
+                .expect("snapshot operation should finish after invalidation");
+            assert_eq!(
+                snapshot_caller
+                    .join()
+                    .expect("snapshot caller should not panic")
+                    .expect_err("shutdown should invalidate snapshot acknowledgement"),
+                BootRunLoopCommandError::AdmissionClosed
+            );
+            shutdown_caller
+                .join()
+                .expect("supervisor shutdown should not panic");
+        });
+
+        assert_eq!(
+            admission.snapshot(),
+            BootRunLoopCommandAdmissionState::Shutdown
+        );
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_snapshot_unwind_releases_admission() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(20).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            20
+        );
+        supervisor.pause().expect("supervisor should pause");
+
+        let error = supervisor
+            .run_snapshot_quiesced::<(), FakeRunLoopCommandError>(|_| {
+                panic!("fake snapshot operation panic")
+            })
+            .expect_err("worker panic should close snapshot response");
+
+        assert_eq!(error, BootRunLoopCommandError::ResponseClosed);
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        assert!(matches!(
+            supervisor
+                .run_command(|_| Ok::<_, FakeRunLoopCommandError>(()))
+                .expect_err("panicked worker should close its command receiver"),
+            BootRunLoopCommandError::QueueClosed | BootRunLoopCommandError::ResponseClosed
+        ));
+
+        drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn boot_run_loop_supervisor_queries_memory_hotplug_status_on_worker_after_wakeup() {
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
@@ -7449,6 +8395,81 @@ mod tests {
             .expect("started session should remain available");
         assert_eq!(session.pause_count, 1);
         assert_eq!(session.resume_count, 0);
+    }
+
+    #[test]
+    fn runtime_snapshot_create_preflight_rejects_without_session_barrier() {
+        let mut not_started = configured_vmm(FakeStarter::success(13));
+        assert_eq!(
+            not_started.handle_action(VmmAction::CreateSnapshot),
+            Err(VmmActionError::UnsupportedState {
+                action: VmmAction::CreateSnapshot.name(),
+                state: InstanceState::NotStarted,
+            })
+        );
+        assert!(!not_started.has_started_session());
+
+        let mut running = configured_vmm(FakeStarter::success(14));
+        running
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        assert_eq!(
+            running.handle_action(VmmAction::CreateSnapshot),
+            Err(VmmActionError::UnsupportedState {
+                action: VmmAction::CreateSnapshot.name(),
+                state: InstanceState::Running,
+            })
+        );
+        let session = running
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.snapshot_create_barrier_count, 0);
+    }
+
+    #[test]
+    fn runtime_snapshot_create_runs_session_barrier_before_unsupported_fault() {
+        let mut vmm = configured_vmm(FakeStarter::success(16));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+
+        let err = vmm
+            .handle_action(VmmAction::CreateSnapshot)
+            .expect_err("snapshot create should remain unsupported");
+
+        assert_eq!(err, VmmActionError::SnapshotUnsupported);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.snapshot_create_barrier_count, 1);
+    }
+
+    #[test]
+    fn runtime_snapshot_create_barrier_failure_keeps_paused_state() {
+        let source = BackendError::Hypervisor("snapshot barrier failed".to_string());
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_snapshot_create_barrier_result(17, source.clone()),
+        ));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+
+        let err = vmm
+            .handle_action(VmmAction::CreateSnapshot)
+            .expect_err("snapshot barrier should fail before unsupported fault");
+
+        assert_eq!(err, VmmActionError::Lifecycle(source));
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.snapshot_create_barrier_count, 1);
     }
 
     #[test]

@@ -17,6 +17,9 @@ commands, but does not create, load, read, write, or inspect snapshot files.
   running, then return the snapshot-specific unsupported fault only after state
   policy reaches a paused instance. Load requests return the snapshot-specific
   unsupported fault before startup and state-policy faults after startup.
+- For a process-owned paused instance, create now crosses a scoped supervisor
+  command-admission barrier before returning that unsupported fault. The
+  lease-owned operation is intentionally a bounded no-op and creates no files.
 - `--snapshot-version` and `--describe-snapshot <PATH>` are recognized as
   first-class CLI commands, but fail before API socket publication or HVF
   startup because bangbang has no supported snapshot data format.
@@ -61,6 +64,20 @@ this is not a frozen runtime boundary. In particular:
 The current pause path does not capture vCPU, GIC, device, or guest-memory state
 and does not transfer ownership of any live resource.
 
+Paused snapshot create now exercises the first supervisor-only ownership
+foundation. A separate admission cell atomically reserves snapshot preparation
+and submits an exclusive FIFO command. Commands admitted earlier execute first;
+later ordinary commands, device updates, memory-hotplug mutations, and resume
+reject before enqueue. The boot worker revalidates `Paused`, enters the scoped
+lease for one bounded no-op, and restores ordinary admission before
+`SnapshotUnsupported` is returned. Operation errors, queue/response closure,
+unwind, and repeated release restore admission when recoverable. Shutdown
+invalidates it through the existing out-of-band stop and pause-gate path.
+
+This barrier does not change ordinary paused behavior outside its short scope
+and does not quiesce retry schedulers, periodic work, vmnet, vsock, vCPU state,
+devices, or guest memory. It is therefore not a snapshot-ready acknowledgement.
+
 ## Firecracker Requirements
 
 Firecracker snapshots are more than a control-plane endpoint. A compatible
@@ -104,9 +121,10 @@ platform-limited feature.
 
 ## Target Snapshot-Ready Ownership
 
-The target design adds an internal, exclusive quiescence lease on top of the
-public `Paused` state. This is a prerequisite contract, not implemented runtime
-behavior or a new Firecracker-facing instance state.
+The target design builds a full internal, exclusive quiescence lease on top of
+the public `Paused` state. Its supervisor command-admission foundation is
+implemented, but the complete prerequisite contract is not. None of its phases
+is a new Firecracker-facing instance state.
 
 The process owner requests preparation through the supervisor but does not take
 the live session from its worker. The boot worker acquires, owns, and releases
@@ -121,12 +139,13 @@ threads also need an admission boundary.
 | Internal phase | Required behavior |
 | --- | --- |
 | Ordinary `Paused` | Today's pause acknowledgement has completed. Paused commands and the mutations listed above can still occur. |
-| Preparing | The boot worker has exclusive ownership of lease acquisition. It drains earlier commands, closes admission to later mutations, and coordinates auxiliary quiescence. The public controller remains `Paused`. |
-| Snapshot-ready | All in-process quiescence invariants have been acknowledged. The lease remains held for state capture, and the public controller remains `Paused`. |
-| Releasing | Capture has completed, failed, or been canceled. The boot worker restores ordinary paused command and scheduler policy exactly once before acknowledging release. |
+| Supervisor preparing | Implemented for the scoped create barrier. Admission reservation and nonblocking FIFO submission share one lock, so earlier commands precede the barrier and later ordinary commands reject. The public controller remains `Paused`. |
+| Supervisor leased | Implemented only for one scoped boot-worker operation after worker-side pause revalidation. It closes ordinary supervisor command admission but does not establish the remaining snapshot-ready invariants. |
+| Snapshot-ready | Future phase after every in-process quiescence invariant below has been acknowledged. The lease remains held for state capture, and the public controller remains `Paused`. |
+| Supervisor releasing | Implemented for scoped success, operation error, response closure, unwind, and shutdown invalidation. Recoverable release restores ordinary paused admission exactly once. |
 
-Preparation may acknowledge snapshot readiness only when all of these
-invariants hold:
+The implemented supervisor barrier does not acknowledge snapshot readiness. A
+later preparation path may do so only when all of these invariants hold:
 
 - no vCPU run or MMIO completion is in flight, no new run can start, and the
   runner accepts only lease-authorized capture operations;
@@ -195,9 +214,9 @@ remain separate design decisions.
 Snapshot support should land only after these prerequisites are designed and
 tested:
 
-- Snapshot-ready pause ownership: implement the exclusive quiescence lease and
-  invariants above without racing the HVF runner, paused commands, auxiliary
-  wakeups, or terminal teardown.
+- Snapshot-ready pause ownership: extend the implemented supervisor admission
+  foundation to satisfy every invariant above without racing the HVF runner,
+  process-owner mutations, auxiliary wakeups, or terminal teardown.
 - Guest-memory file model: bangbang needs explicit ownership, layout, copy or
   mapping rules, and failure behavior for memory snapshot files.
 - HVF vCPU state capture: all required general, system, SIMD/FP, timer, pending
@@ -225,7 +244,7 @@ API behavior until all of its prerequisites exist.
 
 | Slice | Scope | Minimum validation |
 | --- | --- | --- |
-| Supervisor lease and admission | Add preparing, ready, and releasing ownership; drain earlier commands; reject or defer later mutations; keep shutdown cancellation independent of the command queue; cover failure, terminal, resume, and shutdown races. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
+| Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned no-op, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence | Add acknowledged pause/resume and bounded cancellation to block, entropy, periodic, and other wakeup schedulers. | Deterministic scheduler unit tests and signed HVF cancellation/lifecycle coverage. |
 | Runner capture boundary | Add a typed runner command for the first vCPU architectural-state inventory without exposing raw HVF ownership. | Runner command/conflict unit tests and signed HVF get/set round trips. |
 | GIC and device state | Inventory GIC ownership and add stable state models for each implemented MMIO device. | Per-device round-trip unit tests and signed HVF interrupt-state coverage. |
