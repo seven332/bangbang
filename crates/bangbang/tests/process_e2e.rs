@@ -3041,10 +3041,27 @@ fn concurrent_executables_keep_api_resources_isolated() {
         "second bangbang",
     );
 
-    let first_output = first_bangbang.terminate();
-    let second_output = second_bangbang.terminate();
-    assert_clean_shutdown(first_output, &first_socket_path, "first bangbang");
-    assert_clean_shutdown(second_output, &second_socket_path, "second bangbang");
+    assert_clean_shutdown(
+        first_bangbang.terminate(),
+        &first_socket_path,
+        "first bangbang",
+    );
+    assert!(
+        second_socket_path.exists(),
+        "first bangbang shutdown should not remove the second API socket"
+    );
+    assert_instance_info_matches(
+        &second_socket_path,
+        &second_instance_id,
+        &first_instance_id,
+        "second bangbang after first shutdown",
+    );
+
+    assert_clean_shutdown(
+        second_bangbang.terminate(),
+        &second_socket_path,
+        "second bangbang",
+    );
 }
 
 fn write_rejected_drive_socket_config(
