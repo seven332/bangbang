@@ -618,7 +618,9 @@ until a concrete macOS/HVF limitation is proven; unknown HVF feasibility should
 not be reported as a platform limit by default. The first supported subset also
 needs an explicit snapshot format decision: Firecracker file-format
 compatibility, a bangbang-native format behind Firecracker-shaped API requests,
-or a documented unsupported boundary.
+or a documented unsupported boundary. The current feasibility boundary and
+follow-up split are documented in
+[Snapshot Feasibility](snapshot-feasibility.md).
 
 `GET /vm/config` returns the accumulated supported VM configuration subset
 without side effects. It includes the stored/default `machine-config`, includes

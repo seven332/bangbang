@@ -171,7 +171,8 @@ is resource-specific:
   snapshot paths, memory backend paths, restored guest memory, restored vCPU
   state, and restored device state as untrusted input, preserve path redaction,
   and prevent one process from cleaning up or overwriting another process's
-  snapshot resources.
+  snapshot resources. The current implementation boundary is documented in
+  [Snapshot Feasibility](snapshot-feasibility.md).
 - `/vsock` stores the configured Unix socket path during configuration. Startup
   can attach a guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the
