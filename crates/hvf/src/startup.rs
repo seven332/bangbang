@@ -72,7 +72,7 @@ use crate::runner::{
 };
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuVirtualTimerState,
+    HvfArm64VcpuSimdFpState, HvfArm64VcpuVirtualTimerState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1187,6 +1187,17 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_core_system_register_state()
     }
 
+    /// Capture raw Q0-Q31, FPCR, and FPSR values on the primary vCPU owner
+    /// thread.
+    ///
+    /// This baseline SIMD/FP view omits SVE/SME state, restore policy, and the
+    /// wider snapshot inventory.
+    pub fn capture_arm64_simd_fp_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSimdFpState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_simd_fp_state()
+    }
+
     /// Capture raw virtual-timer mask, offset, control, and compare state on the
     /// primary vCPU owner thread.
     ///
@@ -1765,6 +1776,17 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuCoreSystemRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_core_system_register_state()
+    }
+
+    /// Capture raw Q0-Q31, FPCR, and FPSR values on the primary vCPU owner
+    /// thread.
+    ///
+    /// This baseline SIMD/FP view omits SVE/SME state, restore policy, and the
+    /// wider snapshot inventory.
+    pub fn capture_arm64_simd_fp_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSimdFpState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_simd_fp_state()
     }
 
     /// Capture raw virtual-timer mask, offset, control, and compare state on the

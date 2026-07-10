@@ -28,6 +28,27 @@ const CORE_SYSTEM_REGISTER_GUEST_CODE: [u32; 9] = [
     0xd518_4000, // msr SPSR_EL1, x0
     0xd400_0002, // hvc #0
 ];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SIMD_FP_TEST_Q0: [u8; 16] = [0x12; 16];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SIMD_FP_TEST_Q31: [u8; 16] = [0x34; 16];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SIMD_FP_TEST_FPCR: u64 = 0x0100_0000;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SIMD_FP_TEST_FPSR: u64 = 0x1f;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SIMD_FP_REGISTER_GUEST_CODE: [u32; 10] = [
+    0xd2a0_0600, // mov x0, #0x300000
+    0xd518_1040, // msr CPACR_EL1, x0
+    0xd503_3fdf, // isb
+    0x4f00_e640, // movi v0.16b, #0x12
+    0x4f01_e69f, // movi v31.16b, #0x34
+    0xd2a0_2000, // mov x0, #0x1000000
+    0xd51b_4400, // msr FPCR, x0
+    0xd280_03e0, // mov x0, #0x1f
+    0xd51b_4420, // msr FPSR, x0
+    0xd400_0002, // hvc #0
+];
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn test_rtc_mmio_layout() -> bangbang_runtime::rtc::RtcMmioLayout {
@@ -290,6 +311,71 @@ fn captures_guest_written_arm64_core_system_registers_on_runner_thread() {
         assert_eq!(state.sp_el1(), CORE_SYSTEM_TEST_SP_EL1);
         assert_eq!(state.elr_el1(), CORE_SYSTEM_TEST_ELR_EL1);
         assert_eq!(state.spsr_el1(), CORE_SYSTEM_TEST_SPSR_EL1);
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn captures_guest_written_arm64_simd_fp_state_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_code = SIMD_FP_REGISTER_GUEST_CODE
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("SIMD/FP guest code should be written");
+
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_entry,
+            })
+            .expect("guest code boot registers should be configured");
+
+        let HvfVcpuExit::Exception(exit) = runner
+            .run_once()
+            .expect("guest SIMD/FP writer should exit through HVC")
+        else {
+            panic!("guest SIMD/FP writer should produce an exception exit");
+        };
+        assert_eq!(
+            exit.decode_hvc()
+                .expect("guest SIMD/FP writer exit should decode as HVC")
+                .immediate(),
+            0
+        );
+
+        let state = runner
+            .capture_arm64_simd_fp_state()
+            .expect("SIMD/FP state should be captured");
+        assert_eq!(state.q_register(0), Some(SIMD_FP_TEST_Q0));
+        assert_eq!(state.q_register(31), Some(SIMD_FP_TEST_Q31));
+        assert_eq!(state.fpcr(), SIMD_FP_TEST_FPCR);
+        assert_eq!(state.fpsr(), SIMD_FP_TEST_FPSR);
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -662,6 +748,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .capture_arm64_core_system_register_state()
         .expect("internal session should capture core system-register state");
     session
+        .capture_arm64_simd_fp_state()
+        .expect("internal session should capture SIMD/FP state");
+    session
         .capture_arm64_virtual_timer_state()
         .expect("internal session should capture virtual-timer state");
     let run_cancel_handle = session.run_cancel_handle();
@@ -786,6 +875,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_core_system_register_state()
         .expect("owned session should capture core system-register state");
+    session
+        .capture_arm64_simd_fp_state()
+        .expect("owned session should capture SIMD/FP state");
     session
         .capture_arm64_virtual_timer_state()
         .expect("owned session should capture virtual-timer state");

@@ -1642,20 +1642,24 @@ These commands reject overlapping metadata reads, runs, boot-register setup,
 MMIO dispatches, core-register capture, virtual-timer operations, or GIC PPI
 pending operations. The general-register capture command returns only after
 X0-X30, PC, and CPSR have all been read. A second command reads raw `SP_EL0`,
-`SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. The two commands share one
+`SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. A third reads all 16 bytes of
+Q0-Q31 in ascending order, then raw FPCR and FPSR. The three commands share one
 command-owned core-register admission domain, publish no partial state after a
-read failure, and are both exposed by borrowed and owned HVF boot sessions for
-later lease-owned orchestration. A separate command reads the virtual-timer
-mask, raw offset, control, and CVAL in that order,
+read failure, and are exposed by borrowed and owned HVF boot sessions for later
+lease-owned orchestration. The SIMD getter uses an explicitly 16-byte-aligned
+HVF output value; in streaming SVE mode, its Q values alias only the low 128
+bits of Z registers and are not complete SVE/SME state. A separate command
+reads the virtual-timer mask, raw offset, control, and CVAL in that order,
 publishes no partial state if any read fails, and keeps command-owned admission
 until all four reads finish even if the caller abandons its response. Both
 boot-session forms expose that immutable subset. The raw offset follows HVF's
 `CNTVCT_EL0 = mach_absolute_time() - offset` relation, while control ISTATUS is
 derived and may change as virtual time advances. This capture does not include
 pending interrupts or GIC state and does not define portable offset adjustment
-or control-restore policy. The core system-register subset is raw and read-only
-and likewise has no restore validation, snapshot schema, or Firecracker on-disk
-compatibility. The process snapshot barrier invokes none of these captures.
+or control-restore policy. The core system-register and baseline SIMD/FP subsets
+are raw and read-only and likewise have no restore validation, snapshot schema,
+or Firecracker on-disk compatibility. The process snapshot barrier invokes none
+of these captures.
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared
 MMIO dispatcher, so a
@@ -1982,10 +1986,12 @@ macOS design work instead of direct implementation:
   the first run, can capture a detached X0-X30, PC, and CPSR subset through one
   owner-thread command, and can capture a separate raw SP_EL0, SP_EL1, ELR_EL1,
   and SPSR_EL1 subset through another command in the same core-register
-  admission domain. It also gets and sets the HVF virtual-timer mask, raw
-  offset, raw control, and raw CVAL on that owning thread and can capture those
-  fields through one serialized command. None of these subsets is a complete
-  or portable restore model. The
+  admission domain. A third command captures baseline Q0-Q31, FPCR, and FPSR
+  state under that admission, retaining every 128-bit Q value; streaming
+  SVE/SME state remains outside the subset. It also gets and sets the HVF
+  virtual-timer mask, raw offset, raw control, and raw CVAL on that owning
+  thread and can capture those fields through one serialized command. None of
+  these subsets is a complete or portable restore model. The
   runner explicitly dispatches one resolved MMIO access through a shared runtime
   dispatcher on the owning thread, runs once and handles a resulting
   MMIO exit through that dispatcher, supports one cancellable

@@ -108,6 +108,49 @@ impl HvfArm64VcpuCoreSystemRegisterState {
     }
 }
 
+/// Detached raw baseline SIMD/floating-point state captured from one arm64 vCPU.
+///
+/// This value contains Q0-Q31, FPCR, and FPSR. Each Q register is preserved as
+/// 16 uninterpreted bytes. In streaming SVE mode, Hypervisor.framework aliases
+/// these Q values to the low 128 bits of the corresponding Z registers, so this
+/// is not complete SVE/SME or restorable vCPU state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64VcpuSimdFpState {
+    q_registers: [[u8; 16]; 32],
+    fpcr: u64,
+    fpsr: u64,
+}
+
+impl HvfArm64VcpuSimdFpState {
+    pub(crate) const fn new(q_registers: [[u8; 16]; 32], fpcr: u64, fpsr: u64) -> Self {
+        Self {
+            q_registers,
+            fpcr,
+            fpsr,
+        }
+    }
+
+    /// Return all raw Q0-Q31 values in architectural order.
+    pub const fn q_registers(&self) -> &[[u8; 16]; 32] {
+        &self.q_registers
+    }
+
+    /// Return one raw Q-register value, or `None` when `index` is outside 0..=31.
+    pub fn q_register(&self, index: usize) -> Option<[u8; 16]> {
+        self.q_registers.get(index).copied()
+    }
+
+    /// Return the raw `FPCR` value.
+    pub const fn fpcr(&self) -> u64 {
+        self.fpcr
+    }
+
+    /// Return the raw `FPSR` value.
+    pub const fn fpsr(&self) -> u64 {
+        self.fpsr
+    }
+}
+
 /// Detached raw virtual-timer state captured from one arm64 vCPU.
 ///
 /// The offset is the Hypervisor.framework value used in its
@@ -167,11 +210,33 @@ impl HvfRegister {
     pub const X2: Self = Self(crate::ffi::HV_REG_X2);
     pub const X3: Self = Self(crate::ffi::HV_REG_X3);
     pub const PC: Self = Self(crate::ffi::HV_REG_PC);
+    pub const FPCR: Self = Self(crate::ffi::HV_REG_FPCR);
+    pub const FPSR: Self = Self(crate::ffi::HV_REG_FPSR);
     pub const CPSR: Self = Self(crate::ffi::HV_REG_CPSR);
 
     pub(crate) const fn general_purpose(value: u8) -> Option<Self> {
         if value <= 30 {
             Some(Self(crate::ffi::HV_REG_X0 + value as u32))
+        } else {
+            None
+        }
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HvfSimdFpRegister(u32);
+
+impl HvfSimdFpRegister {
+    /// Return the typed Q-register identifier for `index` in 0..=31.
+    pub const fn q(index: u8) -> Option<Self> {
+        if (index as crate::ffi::HvSimdFpReg) <= crate::ffi::HV_SIMD_FP_REG_Q31 {
+            Some(Self(
+                crate::ffi::HV_SIMD_FP_REG_Q0 + index as crate::ffi::HvSimdFpReg,
+            ))
         } else {
             None
         }
@@ -265,6 +330,13 @@ impl HvfVcpuOwner {
 
     pub(crate) fn get_register(&self, register: HvfRegister) -> Result<u64, BackendError> {
         crate::ffi::get_reg(self.handle()?.vcpu, register.raw())
+    }
+
+    pub(crate) fn get_simd_fp_register(
+        &self,
+        register: HvfSimdFpRegister,
+    ) -> Result<[u8; 16], BackendError> {
+        crate::ffi::get_simd_fp_reg(self.handle()?.vcpu, register.raw())
     }
 
     pub(crate) fn set_register(
@@ -425,6 +497,14 @@ impl<'vm> HvfVcpu<'vm> {
         self.owner.get_register(register)
     }
 
+    /// Read one raw 128-bit Q-register value from this current-thread vCPU.
+    pub fn get_simd_fp_register(
+        &self,
+        register: HvfSimdFpRegister,
+    ) -> Result<[u8; 16], BackendError> {
+        self.owner.get_simd_fp_register(register)
+    }
+
     pub fn set_register(&mut self, register: HvfRegister, value: u64) -> Result<(), BackendError> {
         self.owner.set_register(register, value)
     }
@@ -556,6 +636,23 @@ pub(crate) fn capture_arm64_vcpu_core_system_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_simd_fp_state_with<R: ?Sized>(
+    reader: &mut R,
+    mut get_simd_fp_register: impl FnMut(&mut R, HvfSimdFpRegister) -> Result<[u8; 16], BackendError>,
+    mut get_register: impl FnMut(&mut R, HvfRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuSimdFpState, BackendError> {
+    let mut q_registers = [[0; 16]; 32];
+    for (index, value) in (0_u8..32).zip(&mut q_registers) {
+        let register =
+            HvfSimdFpRegister(crate::ffi::HV_SIMD_FP_REG_Q0 + crate::ffi::HvSimdFpReg::from(index));
+        *value = get_simd_fp_register(reader, register)?;
+    }
+    let fpcr = get_register(reader, HvfRegister::FPCR)?;
+    let fpsr = get_register(reader, HvfRegister::FPSR)?;
+
+    Ok(HvfArm64VcpuSimdFpState::new(q_registers, fpcr, fpsr))
+}
+
 #[cfg(test)]
 pub(crate) fn capture_arm64_vcpu_virtual_timer_state_with(
     get_mask: impl FnOnce() -> Result<bool, BackendError>,
@@ -589,12 +686,36 @@ mod tests {
 
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfRegister,
-        HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
-        capture_arm64_vcpu_core_system_register_state_with,
-        capture_arm64_vcpu_general_register_state_with,
+        HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
+        NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_core_system_register_state_with,
+        capture_arm64_vcpu_general_register_state_with, capture_arm64_vcpu_simd_fp_state_with,
         capture_arm64_vcpu_virtual_timer_state_with, configure_arm64_boot_registers_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimdFpRead {
+        Q(HvfSimdFpRegister),
+        Scalar(HvfRegister),
+    }
+
+    fn simd_fp_q_value(register: HvfSimdFpRegister) -> [u8; 16] {
+        std::array::from_fn(|index| (register.raw() as u8) ^ (index as u8).wrapping_mul(17))
+    }
+
+    fn expected_simd_fp_reads() -> Vec<SimdFpRead> {
+        (0_u8..32)
+            .map(|index| {
+                SimdFpRead::Q(
+                    HvfSimdFpRegister::q(index).expect("Q0-Q31 should map to SIMD registers"),
+                )
+            })
+            .chain([
+                SimdFpRead::Scalar(HvfRegister::FPCR),
+                SimdFpRead::Scalar(HvfRegister::FPSR),
+            ])
+            .collect()
+    }
 
     fn fake_vcpu_owner(exit: *mut crate::ffi::HvVcpuExit, exit_available: bool) -> HvfVcpuOwner {
         HvfVcpuOwner {
@@ -722,6 +843,12 @@ mod tests {
         );
         assert_eq!(
             vcpu.set_register(HvfRegister::X0, 0),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.get_simd_fp_register(
+                HvfSimdFpRegister::q(0).expect("Q0 should map to a SIMD register")
+            ),
             Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
         );
         assert_eq!(
@@ -940,6 +1067,101 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_simd_fp_state_in_documented_order() {
+        let reads = RefCell::new(Vec::new());
+        let mut reader = ();
+
+        let state = capture_arm64_vcpu_simd_fp_state_with(
+            &mut reader,
+            |_, register| {
+                reads.borrow_mut().push(SimdFpRead::Q(register));
+                Ok(simd_fp_q_value(register))
+            },
+            |_, register| {
+                reads.borrow_mut().push(SimdFpRead::Scalar(register));
+                Ok(0x3_0000 + u64::from(register.raw()))
+            },
+        )
+        .expect("SIMD/FP capture should succeed");
+
+        assert_eq!(*reads.borrow(), expected_simd_fp_reads());
+        for index in 0_u8..32 {
+            let register =
+                HvfSimdFpRegister::q(index).expect("Q0-Q31 should map to SIMD registers");
+            assert_eq!(
+                state.q_register(usize::from(index)),
+                Some(simd_fp_q_value(register))
+            );
+        }
+        assert_eq!(state.q_registers().len(), 32);
+        assert_eq!(state.q_register(32), None);
+        assert_eq!(state.fpcr(), 0x3_0000 + u64::from(HvfRegister::FPCR.raw()));
+        assert_eq!(state.fpsr(), 0x3_0000 + u64::from(HvfRegister::FPSR.raw()));
+    }
+
+    #[test]
+    fn arm64_simd_fp_capture_stops_after_each_error_and_can_retry() {
+        let expected_reads = expected_simd_fp_reads();
+
+        for failed_index in 0..expected_reads.len() {
+            let fail_next = Cell::new(true);
+            let read_index = Cell::new(0);
+            let reads = RefCell::new(Vec::new());
+            let mut reader = ();
+            let record_read = |read| {
+                reads.borrow_mut().push(read);
+                let index = read_index.get();
+                read_index.set(index + 1);
+                if index == failed_index && fail_next.replace(false) {
+                    Err(BackendError::InvalidState("fake SIMD/FP read failed"))
+                } else {
+                    Ok(())
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_simd_fp_state_with(
+                    &mut reader,
+                    |_, register| {
+                        record_read(SimdFpRead::Q(register))?;
+                        Ok(simd_fp_q_value(register))
+                    },
+                    |_, register| {
+                        record_read(SimdFpRead::Scalar(register))?;
+                        Ok(u64::from(register.raw()))
+                    },
+                ),
+                Err(BackendError::InvalidState("fake SIMD/FP read failed"))
+            );
+            assert_eq!(*reads.borrow(), expected_reads[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            read_index.set(0);
+            let state = capture_arm64_vcpu_simd_fp_state_with(
+                &mut reader,
+                |_, register| {
+                    record_read(SimdFpRead::Q(register))?;
+                    Ok(simd_fp_q_value(register))
+                },
+                |_, register| {
+                    record_read(SimdFpRead::Scalar(register))?;
+                    Ok(u64::from(register.raw()))
+                },
+            )
+            .expect("SIMD/FP capture retry should succeed");
+            assert_eq!(
+                state.q_register(31),
+                Some(simd_fp_q_value(
+                    HvfSimdFpRegister::q(31).expect("Q31 should map to a SIMD register")
+                ))
+            );
+            assert_eq!(state.fpcr(), u64::from(HvfRegister::FPCR.raw()));
+            assert_eq!(state.fpsr(), u64::from(HvfRegister::FPSR.raw()));
+            assert_eq!(*reads.borrow(), expected_reads);
+        }
+    }
+
+    #[test]
     fn captures_arm64_virtual_timer_state_in_documented_order() {
         let reads = RefCell::new(Vec::new());
 
@@ -1054,5 +1276,18 @@ mod tests {
         );
         assert_eq!(HvfRegister::general_purpose(31), None);
         assert_ne!(crate::ffi::HV_REG_X0 + 30, HvfRegister::PC.raw());
+    }
+
+    #[test]
+    fn simd_fp_register_mapping_accepts_only_q0_through_q31() {
+        assert_eq!(
+            HvfSimdFpRegister::q(0).map(HvfSimdFpRegister::raw),
+            Some(crate::ffi::HV_SIMD_FP_REG_Q0)
+        );
+        assert_eq!(
+            HvfSimdFpRegister::q(31).map(HvfSimdFpRegister::raw),
+            Some(crate::ffi::HV_SIMD_FP_REG_Q31)
+        );
+        assert_eq!(HvfSimdFpRegister::q(32), None);
     }
 }

@@ -238,10 +238,11 @@ is resource-specific:
   process's snapshot resources. The current implementation boundary is
   documented in [Snapshot Feasibility](snapshot-feasibility.md).
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
-  SPSR_EL1 values, and raw virtual-timer mask, offset, control, and CVAL values
-  are sensitive guest/VMM execution state. Current internal capture commands
-  keep these values in process memory and do not
-  write them to logs, metrics, error strings, or persistence. The raw timer
+  SPSR_EL1 values, raw Q0-Q31/FPCR/FPSR values, and raw virtual-timer mask,
+  offset, control, and CVAL values are sensitive guest/VMM execution state.
+  SIMD/FP bytes can contain guest application or cryptographic working data.
+  Current internal capture commands keep these values in process memory and do
+  not write them to logs, metrics, error strings, or persistence. The raw timer
   offset is tied to HVF's host-time relation, and the control ISTATUS bit is a
   time-sensitive observation rather than writable configuration. These values
   must not be treated as portable or trusted restore data without explicit
