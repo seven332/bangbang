@@ -24,6 +24,8 @@ pub(crate) const HV_REG_CPSR: HvReg = 34;
 pub(crate) const HV_SYS_REG_MPIDR_EL1: HvSysReg = 0xc005;
 pub(crate) const HV_SYS_REG_SPSR_EL1: HvSysReg = 0xc200;
 pub(crate) const HV_SYS_REG_ELR_EL1: HvSysReg = 0xc201;
+pub(crate) const HV_SYS_REG_CNTV_CTL_EL0: HvSysReg = 0xdf19;
+pub(crate) const HV_SYS_REG_CNTV_CVAL_EL0: HvSysReg = 0xdf1a;
 pub(crate) const HV_SYS_REG_SP_EL1: HvSysReg = 0xe208;
 
 #[repr(C)]

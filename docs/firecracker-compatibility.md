@@ -48,14 +48,14 @@ backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
-virtual-timer-mask control boundary, a bounded internal boot-session run-loop
-pump, owned internal boot-session handle, process-level owned startup-session
-wiring with optional serial capture and boot run-loop supervision across bounded
-step windows with retained internal worker status, process-owned virtio-net
-packet-I/O provider selection with no-op fallback and vmnet-backed startup for
-configured interfaces, an internal vmnet virtio-net packet I/O provider keyed by
-configured interface ID, boot block, virtio-net, and virtio-vsock queue
-interrupt signaling,
+virtual-timer mask/offset/control/CVAL boundary, a bounded internal boot-session
+run-loop pump, owned internal boot-session handle, process-level owned
+startup-session wiring with optional serial capture and boot run-loop supervision
+across bounded step windows with retained internal worker status, process-owned
+virtio-net packet-I/O provider selection with no-op fallback and vmnet-backed
+startup for configured interfaces, an internal vmnet virtio-net packet I/O
+provider keyed by configured interface ID, boot block, virtio-net, and
+virtio-vsock queue interrupt signaling,
 virtual timer PPI assertion, per-controller metrics and logger output state, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, drive update, network-interface configuration, vsock configuration, machine-configuration, metrics, logger, serial, and actions bodies, public guest
@@ -1626,14 +1626,15 @@ reads and boot-register setup on the vCPU-owning thread, rejects duplicate setup
 setup during shutdown, setup while a run is in flight, and setup after a run has
 started. If setup fails after partially writing registers, the runner rejects
 guest runs until setup is retried successfully. The runner also exposes explicit
-single-exit MMIO commands and virtual-timer mask and offset commands that run on
-the vCPU-owning thread. One command dispatches an already resolved MMIO access after
-a run has started, and another command starts one vCPU run, resolves a resulting
-MMIO exit, and dispatches or completes it through a caller-provided shared
-dispatcher. The virtual-timer commands expose HVF's explicit mask bit after
-`HV_EXIT_REASON_VTIMER_ACTIVATED` and its raw host-time-relative offset; GIC PPI
-pending commands can set or clear a
-validated timer PPI bit on the runner thread. The internal boot-session
+single-exit MMIO commands and virtual-timer mask, offset, control, and CVAL
+commands that run on the vCPU-owning thread. One command dispatches an already
+resolved MMIO access after a run has started, and another command starts one
+vCPU run, resolves a resulting MMIO exit, and dispatches or completes it through
+a caller-provided shared dispatcher. The virtual-timer commands expose HVF's
+explicit mask bit after `HV_EXIT_REASON_VTIMER_ACTIVATED`, its raw
+host-time-relative offset, and raw `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` values; GIC PPI
+pending commands can set or clear a validated timer PPI bit on the runner
+thread. The internal boot-session
 run-loop now handles virtual timer exits by asserting the EL1 virtual timer PPI
 through that runner-thread command. Full timer delivery policy, including how to
 detect EOI/deactivation and unmask the HVF virtual timer, remains future work.
@@ -1642,13 +1643,14 @@ MMIO dispatches, general-register capture, virtual-timer operations, or
 GIC PPI pending operations. The general-register capture command returns only
 after X0-X30, PC, and CPSR have all been read, and both borrowed and owned HVF
 boot sessions expose it for later lease-owned orchestration. A separate command
-reads the virtual-timer mask followed by the raw offset, publishes no partial
-state if either read fails, and keeps command-owned admission until both reads
-finish even if the caller abandons its response. Both boot-session forms expose
-that immutable pair. The raw offset follows HVF's
-`CNTVCT_EL0 = mach_absolute_time() - offset` relation; this capture does not
-include compare/control registers, pending interrupts, GIC state, or a portable
-restore-time adjustment policy. The process snapshot barrier invokes neither
+reads the virtual-timer mask, raw offset, control, and CVAL in that order,
+publishes no partial state if any read fails, and keeps command-owned admission
+until all four reads finish even if the caller abandons its response. Both
+boot-session forms expose that immutable subset. The raw offset follows HVF's
+`CNTVCT_EL0 = mach_absolute_time() - offset` relation, while control ISTATUS is
+derived and may change as virtual time advances. This capture does not include
+pending interrupts or GIC state and does not define portable offset adjustment
+or control-restore policy. The process snapshot barrier invokes neither
 capture.
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared
@@ -1974,9 +1976,10 @@ macOS design work instead of direct implementation:
   Linux boot-register setup. The current runner skeleton creates a vCPU on a
   dedicated thread, applies that boot-register setup on the owning thread before
   the first run, can capture a detached X0-X30, PC, and CPSR subset through one
-  owner-thread command, gets and sets the HVF virtual-timer mask and raw offset
-  on that owning thread, and can capture that timer pair through one serialized
-  command. The timer pair is not a complete or portable restore model. The
+  owner-thread command, gets and sets the HVF virtual-timer mask, raw offset,
+  raw control, and raw CVAL on that owning thread, and can capture those fields
+  through one serialized command. The timer subset is not a complete or
+  portable restore model. The
   runner explicitly dispatches one resolved MMIO access through a shared runtime
   dispatcher on the owning thread, runs once and handles a resulting
   MMIO exit through that dispatcher, supports one cancellable
