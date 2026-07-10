@@ -768,7 +768,13 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
             PatchApiRequest::drive(drive_update_input_from_request(config.as_ref())),
         )),
         ApiRequest::PatchVmState(update) => {
-            handle_empty(vmm.handle_action(vm_state_action_from_request(update.as_ref())))
+            let state = update.state();
+            let started = Instant::now();
+            let result = vmm.handle_action(vm_state_action_from_request(update.as_ref()));
+            if result.is_ok() {
+                record_vm_state_latency(state, duration_as_micros_u64(started.elapsed()), vmm);
+            }
+            handle_empty(result)
         }
         ApiRequest::PutNetworkInterface(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::network(network_interface_config_input_from_request(config.as_ref())),
@@ -894,6 +900,21 @@ fn vm_state_action_from_request(update: &VmStateUpdateRequest) -> VmmAction {
         VmStateUpdate::Paused => VmmAction::Pause,
         VmStateUpdate::Resumed => VmmAction::Resume,
     }
+}
+
+fn record_vm_state_latency(
+    state: VmStateUpdate,
+    duration_us: u64,
+    vmm: &mut impl VmmRequestHandler,
+) {
+    match state {
+        VmStateUpdate::Paused => vmm.record_pause_vm_latency_us(duration_us),
+        VmStateUpdate::Resumed => vmm.record_resume_vm_latency_us(duration_us),
+    }
+}
+
+fn duration_as_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn hot_unplug_action_from_request(request: &HotUnplugDeviceRequest) -> VmmAction {
@@ -2435,6 +2456,14 @@ mod tests {
 
         fn record_deprecated_api_call(&mut self) {
             self.inner.record_deprecated_api_call();
+        }
+
+        fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
+            self.inner.record_pause_vm_latency_us(duration_us);
+        }
+
+        fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
+            self.inner.record_resume_vm_latency_us(duration_us);
         }
 
         fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
@@ -6980,6 +7009,131 @@ mod tests {
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running
         );
+    }
+
+    #[test]
+    fn configured_metrics_records_successful_vm_state_update_latencies() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("vm-state-latencies").with_extension("metrics");
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PUT", "/metrics", &metrics_body).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body(
+                    "PUT",
+                    "/boot-source",
+                    r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#,
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "vmls", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let pause_response = request_over_socket(
+            &mut vmm,
+            "vmlp",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#),
+        );
+        assert!(pause_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let resume_response = request_over_socket(
+            &mut vmm,
+            "vmlr",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        );
+        assert!(resume_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let flush_response = put_action_over_socket(&mut vmm, "vmlf", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let metrics = read_metrics_json(&metrics_path);
+        let latencies = metrics
+            .get("latencies_us")
+            .expect("vm-state latency metrics should be present");
+        assert!(
+            latencies
+                .get("pause_vm")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "pause_vm latency should be present"
+        );
+        assert!(
+            latencies
+                .get("resume_vm")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "resume_vm latency should be present"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_omits_failed_vm_state_update_latencies() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path =
+            unique_socket_path("vm-state-latencies-failed").with_extension("metrics");
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PUT", "/metrics", &metrics_body).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let not_started_pause_response = request_over_socket(
+            &mut vmm,
+            "vmlfp",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#),
+        );
+        assert!(not_started_pause_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        let malformed_response = request_over_socket(
+            &mut vmm,
+            "vmlfm",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Running"}"#),
+        );
+        assert!(malformed_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body(
+                    "PUT",
+                    "/boot-source",
+                    r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#,
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "vmlfs", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let running_resume_response = request_over_socket(
+            &mut vmm,
+            "vmlfr",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        );
+        assert!(running_resume_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        let flush_response = put_action_over_socket(&mut vmm, "vmlff", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let metrics = read_metrics_json(&metrics_path);
+        assert!(
+            metrics.get("latencies_us").is_none(),
+            "failed vm-state updates must not emit latency metrics"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]

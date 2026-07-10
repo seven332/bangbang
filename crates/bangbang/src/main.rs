@@ -2141,6 +2141,14 @@ mod tests {
             self.inner.record_deprecated_api_call();
         }
 
+        fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
+            self.inner.record_pause_vm_latency_us(duration_us);
+        }
+
+        fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
+            self.inner.record_resume_vm_latency_us(duration_us);
+        }
+
         fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
             let result = self.inner.handle_periodic_metrics_flush();
             self.process_exit_trigger
