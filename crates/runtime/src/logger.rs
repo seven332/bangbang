@@ -606,6 +606,15 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct PanickingDisplay;
+
+    impl std::fmt::Display for PanickingDisplay {
+        fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("suppressed logger output should not format the API request path");
+        }
+    }
+
     #[test]
     fn missed_log_counter_saturates_at_u64_max() {
         let counter = MissedLogCounter::default();
@@ -829,6 +838,38 @@ mod tests {
         assert_eq!(
             output,
             "The API server received a Get request on \"/version\".\n"
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_api_request_does_not_format_path_when_output_is_suppressed() {
+        let path = unique_logger_path("api-request-suppressed");
+        let mut state = LoggerState::default();
+
+        assert_eq!(state.log_api_request("Get", PanickingDisplay), Ok(false));
+
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_level(LoggerLevel::Warn),
+            )
+            .expect("logger should configure");
+        assert_eq!(state.log_api_request("Get", PanickingDisplay), Ok(false));
+
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_level(LoggerLevel::Info)
+                    .with_module(MINIMAL_ACTION_LOG_MODULE),
+            )
+            .expect("logger should update filters");
+        assert_eq!(state.log_api_request("Get", PanickingDisplay), Ok(false));
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("logger output should be readable"),
+            ""
         );
         fs::remove_file(path).expect("fixture should clean up");
     }
