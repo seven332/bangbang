@@ -476,7 +476,7 @@ impl LoggerSink {
             show_log_origin,
             origin,
             level,
-            &format!("action={action}"),
+            format_args!("action={action}"),
         )
     }
 
@@ -494,7 +494,7 @@ impl LoggerSink {
             show_log_origin,
             origin,
             level,
-            &format!("The API server received a {method} request on \"{path}\"."),
+            format_args!("The API server received a {method} request on \"{path}\"."),
         )
     }
 
@@ -509,10 +509,15 @@ impl LoggerSink {
     ) -> Result<(), LoggerWriteError> {
         let wall_time_ms = wall_time_us / 1_000;
         let cpu_time_ms = cpu_time_us / 1_000;
-        let message = format!(
+        self.write_message(
+            show_level,
+            show_log_origin,
+            origin,
+            level,
+            format_args!(
             "Guest-boot-time = {wall_time_us:>6} us {wall_time_ms} ms, {cpu_time_us:>6} CPU us {cpu_time_ms} CPU ms"
-        );
-        self.write_message(show_level, show_log_origin, origin, level, &message)
+            ),
+        )
     }
 
     fn write_message(
@@ -521,7 +526,7 @@ impl LoggerSink {
         show_log_origin: bool,
         origin: &Location<'_>,
         level: LoggerLevel,
-        message: &str,
+        message: fmt::Arguments<'_>,
     ) -> Result<(), LoggerWriteError> {
         let mut writer = self
             .writer
