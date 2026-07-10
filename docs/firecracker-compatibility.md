@@ -186,10 +186,10 @@ Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for explicit non-null machine
 `cpu_template`, MMDS V1 config, deprecated `vsock_id`, and snapshot-load
 `mem_file_path` or `enable_diff_snapshots: true` request forms. Parser failures,
-including malformed bodies and path/body ID mismatches, for the PUT and PATCH
-endpoints above with matching Firecracker-shaped request metric fields are
-counted in the same count/fail counters when the endpoint is identifiable from
-the request line.
+including empty body-required mutating requests, malformed bodies, and path/body
+ID mismatches, for the PUT and PATCH endpoints above with matching
+Firecracker-shaped request metric fields are counted in the same count/fail
+counters when the endpoint is identifiable from the request line.
 Direct config-file and startup initialization paths are not API requests and
 are not included in these counters. `PATCH /vm` remains outside
 `patch_api_requests` because Firecracker does not expose a matching
@@ -442,7 +442,7 @@ compatibility targets.
 | `PATCH` | `/vm` | partial; runtime pause/resume implemented | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state. After startup, `Paused` transitions a `Running` instance to `Paused` only after the process-owned boot worker stops entering new bounded run-loop windows, and `Resumed` transitions it back to `Running` only after the worker accepts resume. Repeated pause/resume requests fail as unsupported-state errors without mutating VM state. Full multi-vCPU pause coordination, HVF vCPU state capture, snapshot-ready paused ownership, and reboot-in-place remain deferred. |
 | `PATCH` | `/drives/{drive_id}` | supported target; runtime backing refresh and rate-limiter update implemented | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Empty or all-null rate limiter objects are treated as unconfigured/no-op updates. Pre-boot requests fail as post-boot-only operations. Runtime requests for an existing active drive open replacement backing only when `path_on_host` is present, refresh the matching virtio-block MMIO handler, update the active per-device limiter when a configured limiter bucket is present, update stored configuration after handler success, and leave the old backing and stored config intact on failure. When a limiter throttles a block queue descriptor, runtime dispatch exposes a backend-neutral retry delay and active HVF block queues schedule a per-session retry wakeup without completing the descriptor. Full Firecracker timerfd/eventfd shared event-source parity remains deferred. |
 | `PATCH` | `/network-interfaces/{iface_id}` | no-op subset implemented | Returns unsupported-state before startup, validates the target interface after startup, and accepts omitted, `null`, empty, or all-null `rx_rate_limiter` and `tx_rate_limiter` objects as runtime no-ops. Configured rate limiters are rejected, and real network-interface mutation and hotplug behavior need dedicated device designs. |
-| `DELETE` | `/drives/{drive_id}`, `/pmem/{id}`, `/network-interfaces/{iface_id}` | recognized; VMM-routed unsupported | Firecracker routes bodyless hot-unplug requests in `parsed_request.rs`, but they are not in the `v1.16.0` swagger surface. bangbang parses bodyless hot-unplug requests into one VMM action, returns the normal post-boot-only unsupported-state fault before startup, and returns the matching device-specific unsupported fault after startup. Body-bearing `DELETE` requests fail first as malformed request shape before hot-unplug routing. Real hot-unplug behavior remains deferred. |
+| `DELETE` | `/drives/{drive_id}`, `/pmem/{id}`, `/network-interfaces/{iface_id}` | recognized; VMM-routed unsupported | Firecracker routes bodyless hot-unplug requests in `parsed_request.rs`, but they are not in the `v1.16.0` swagger surface. bangbang parses bodyless hot-unplug requests into one VMM action, returns the normal post-boot-only unsupported-state fault before startup, and returns the matching device-specific unsupported fault after startup. Body-bearing `DELETE` requests fail first with the Firecracker-shaped `Empty Delete request.` fault before hot-unplug routing. Real hot-unplug behavior remains deferred. |
 
 ## Initial Field Handling Policy
 

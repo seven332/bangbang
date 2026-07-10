@@ -63,6 +63,9 @@ pub enum ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     BalloonUnsupported,
+    EmptyDeleteRequest,
+    EmptyPatchRequest,
+    EmptyPutRequest,
     GetRequestBody,
     InvalidPathMethod,
     MismatchedDriveId,
@@ -79,6 +82,9 @@ impl RequestError {
     pub fn fault_message(&self) -> &'static str {
         match self {
             Self::BalloonUnsupported => "Balloon device is not supported.",
+            Self::EmptyDeleteRequest => "Empty Delete request.",
+            Self::EmptyPatchRequest => "Empty PATCH request.",
+            Self::EmptyPutRequest => "Empty PUT request.",
             Self::GetRequestBody => "GET request cannot have a body.",
             Self::InvalidPathMethod => "Invalid request method and/or path.",
             Self::MismatchedDriveId => "path drive_id must match body drive_id.",
@@ -2574,7 +2580,13 @@ pub fn parse_request_with_limit(
         return Err(RequestError::GetRequestBody);
     }
     if method == "DELETE" && request_body.has_content() {
-        return Err(RequestError::MalformedRequest);
+        return Err(RequestError::EmptyDeleteRequest);
+    }
+    if method == "PUT" && body.is_empty() && put_request_path_requires_body(path) {
+        return Err(RequestError::EmptyPutRequest);
+    }
+    if method == "PATCH" && body.is_empty() && patch_request_path_requires_body(path) {
+        return Err(RequestError::EmptyPatchRequest);
     }
 
     if let Some(request) = balloon_request_without_body_parsing(method, path) {
@@ -2723,6 +2735,45 @@ fn balloon_request_without_body_parsing(method: &str, path: &str) -> Option<ApiR
         ("PATCH", "/balloon/hinting/stop") => Some(ApiRequest::PatchBalloonHintingStop),
         _ => None,
     }
+}
+
+fn put_request_path_requires_body(path: &str) -> bool {
+    drive_path_id(path).is_some()
+        || network_interface_path_id(path).is_some()
+        || pmem_path_id(path).is_some()
+        || matches!(
+            path,
+            "/actions"
+                | "/balloon"
+                | "/boot-source"
+                | "/cpu-config"
+                | "/entropy"
+                | "/hotplug/memory"
+                | "/logger"
+                | "/machine-config"
+                | "/metrics"
+                | "/mmds"
+                | "/mmds/config"
+                | "/serial"
+                | "/snapshot/create"
+                | "/snapshot/load"
+                | "/vsock"
+        )
+}
+
+fn patch_request_path_requires_body(path: &str) -> bool {
+    drive_path_id(path).is_some()
+        || network_interface_path_id(path).is_some()
+        || pmem_path_id(path).is_some()
+        || matches!(
+            path,
+            "/balloon"
+                | "/balloon/statistics"
+                | "/hotplug/memory"
+                | "/machine-config"
+                | "/mmds"
+                | "/vm"
+        )
 }
 
 fn drive_path_id(path: &str) -> Option<&str> {
@@ -3796,6 +3847,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_mutating_request_fault_messages_are_firecracker_shaped() {
+        for (err, message) in [
+            (RequestError::EmptyPutRequest, "Empty PUT request."),
+            (RequestError::EmptyPatchRequest, "Empty PATCH request."),
+            (RequestError::EmptyDeleteRequest, "Empty Delete request."),
+        ] {
+            assert_eq!(err.fault_message(), message);
+        }
+    }
+
+    #[test]
+    fn empty_mutating_request_detection_does_not_create_routes() {
+        for request in [
+            request_without_body("PUT", "/unknown"),
+            request_without_body("PATCH", "/unknown"),
+        ] {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod)
+            );
+        }
+    }
+
+    #[test]
     fn identifies_put_api_request_metric_endpoints_from_request_head() {
         for (path, endpoint) in [
             ("/actions", ApiRequestMetricPutEndpoint::Actions),
@@ -4088,7 +4163,7 @@ mod tests {
     fn rejects_put_actions_empty_body() {
         let request = request_with_body("PUT", "/actions", "");
 
-        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        assert_eq!(parse_request(&request), Err(RequestError::EmptyPutRequest));
     }
 
     #[test]
@@ -4201,7 +4276,7 @@ mod tests {
     fn rejects_put_boot_source_empty_body() {
         let request = request_with_body("PUT", "/boot-source", "");
 
-        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        assert_eq!(parse_request(&request), Err(RequestError::EmptyPutRequest));
     }
 
     #[test]
@@ -4330,7 +4405,7 @@ mod tests {
     fn rejects_put_logger_empty_body() {
         let request = request_with_body("PUT", "/logger", "");
 
-        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        assert_eq!(parse_request(&request), Err(RequestError::EmptyPutRequest));
     }
 
     #[test]
@@ -4822,7 +4897,7 @@ mod tests {
     fn rejects_put_metrics_empty_body() {
         let request = request_with_body("PUT", "/metrics", "");
 
-        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        assert_eq!(parse_request(&request), Err(RequestError::EmptyPutRequest));
     }
 
     #[test]
@@ -4966,11 +5041,20 @@ mod tests {
 
     #[test]
     fn rejects_put_or_patch_mmds_without_object_body() {
+        for (method, expected) in [
+            ("PUT", RequestError::EmptyPutRequest),
+            ("PATCH", RequestError::EmptyPatchRequest),
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body(method, "/mmds", "")),
+                Err(expected),
+                "{method}"
+            );
+        }
+
         for (method, body) in [
-            ("PUT", ""),
             ("PUT", "[]"),
             ("PUT", "null"),
-            ("PATCH", ""),
             ("PATCH", r#""metadata""#),
             ("PATCH", "42"),
         ] {
@@ -5138,7 +5222,7 @@ mod tests {
     fn rejects_put_vsock_empty_body() {
         let request = request_with_body("PUT", "/vsock", "");
 
-        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        assert_eq!(parse_request(&request), Err(RequestError::EmptyPutRequest));
     }
 
     #[test]
@@ -5396,7 +5480,7 @@ mod tests {
     fn rejects_put_drive_with_empty_body() {
         let request = b"PUT /drives/rootfs HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
 
-        assert_eq!(parse_request(request), Err(RequestError::MalformedRequest));
+        assert_eq!(parse_request(request), Err(RequestError::EmptyPutRequest));
     }
 
     #[test]
@@ -5766,7 +5850,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_request(&request),
-                Err(RequestError::MalformedRequest),
+                Err(RequestError::EmptyDeleteRequest),
                 "{route}"
             );
         }
@@ -6055,7 +6139,7 @@ mod tests {
     fn rejects_put_network_interface_with_empty_body() {
         let request = b"PUT /network-interfaces/eth0 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
 
-        assert_eq!(parse_request(request), Err(RequestError::MalformedRequest));
+        assert_eq!(parse_request(request), Err(RequestError::EmptyPutRequest));
     }
 
     #[test]
@@ -6156,9 +6240,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_network_interface_patch_before_vmm_dispatch() {
+        assert_eq!(
+            parse_request(&request_with_body("PATCH", "/network-interfaces/eth0", "")),
+            Err(RequestError::EmptyPatchRequest)
+        );
+
         for body in [
             "not-json",
-            "",
             "{}",
             r#"{"iface_id":"eth0","unknown":true}"#,
             r#"{"iface_id":"eth0","rx_rate_limiter":"unsupported"}"#,
@@ -6329,9 +6417,13 @@ mod tests {
 
     #[test]
     fn rejects_malformed_cpu_config_bodies() {
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/cpu-config", "")),
+            Err(RequestError::EmptyPutRequest)
+        );
+
         for body in [
             "not-json",
-            "",
             "[]",
             "null",
             r#"{"unknown":[]}"#,
@@ -6454,9 +6546,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_entropy_config_before_unsupported() {
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/entropy", "")),
+            Err(RequestError::EmptyPutRequest)
+        );
+
         for body in [
             "not-json",
-            "",
             r#"{"unknown":true}"#,
             r#"{"rate_limiter":"unsupported"}"#,
             r#"{"rate_limiter":{"bad":{"size":1,"refill_time":1}}}"#,
@@ -6640,9 +6736,24 @@ mod tests {
 
     #[test]
     fn rejects_invalid_balloon_body_methods_before_unsupported() {
+        for (method, path, expected) in [
+            ("PUT", "/balloon", RequestError::EmptyPutRequest),
+            ("PATCH", "/balloon", RequestError::EmptyPatchRequest),
+            (
+                "PATCH",
+                "/balloon/statistics",
+                RequestError::EmptyPatchRequest,
+            ),
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body(method, path, "")),
+                Err(expected),
+                "{method} {path}"
+            );
+        }
+
         for (method, path, body) in [
             ("PUT", "/balloon", "not-json"),
-            ("PUT", "/balloon", ""),
             ("PUT", "/balloon", "null"),
             ("PUT", "/balloon", "[]"),
             ("PUT", "/balloon", "{}"),
@@ -6684,7 +6795,6 @@ mod tests {
                 r#"{"amount_mib":64,"deflate_on_oom":true,"unknown":true}"#,
             ),
             ("PATCH", "/balloon", "not-json"),
-            ("PATCH", "/balloon", ""),
             ("PATCH", "/balloon", "null"),
             ("PATCH", "/balloon", "[]"),
             ("PATCH", "/balloon", "{}"),
@@ -6693,7 +6803,6 @@ mod tests {
             ("PATCH", "/balloon", r#"{"amount_mib":4294967296}"#),
             ("PATCH", "/balloon", r#"{"amount_mib":32,"unknown":true}"#),
             ("PATCH", "/balloon/statistics", "not-json"),
-            ("PATCH", "/balloon/statistics", ""),
             ("PATCH", "/balloon/statistics", "null"),
             ("PATCH", "/balloon/statistics", "[]"),
             ("PATCH", "/balloon/statistics", "{}"),
@@ -6867,9 +6976,19 @@ mod tests {
 
     #[test]
     fn rejects_invalid_memory_hotplug_body_methods_before_vmm_dispatch() {
+        for (method, expected) in [
+            ("PUT", RequestError::EmptyPutRequest),
+            ("PATCH", RequestError::EmptyPatchRequest),
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body(method, "/hotplug/memory", "")),
+                Err(expected),
+                "{method}"
+            );
+        }
+
         for (method, body) in [
             ("PUT", "not-json"),
-            ("PUT", ""),
             ("PUT", "{}"),
             ("PUT", r#"{"size_mib":128}"#),
             ("PUT", r#"{"total_size_mib":-1}"#),
@@ -6877,7 +6996,6 @@ mod tests {
             ("PUT", r#"{"total_size_mib":2048,"block_size_mib":null}"#),
             ("PUT", r#"{"total_size_mib":2048,"slot_size_mib":null}"#),
             ("PATCH", "not-json"),
-            ("PATCH", ""),
             ("PATCH", "{}"),
             ("PATCH", r#"{"size_mib":256}"#),
             ("PATCH", r#"{"requested_size_mib":-1}"#),
@@ -7062,9 +7180,19 @@ mod tests {
 
     #[test]
     fn rejects_invalid_pmem_body_methods_before_unsupported() {
+        for (method, expected) in [
+            ("PUT", RequestError::EmptyPutRequest),
+            ("PATCH", RequestError::EmptyPatchRequest),
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body(method, "/pmem/pmem0", "")),
+                Err(expected),
+                "{method}"
+            );
+        }
+
         for (method, body) in [
             ("PUT", "not-json"),
-            ("PUT", ""),
             ("PUT", "{}"),
             ("PUT", r#"{"id":"pmem0"}"#),
             ("PUT", r#"{"id":3,"path_on_host":"/tmp/pmem.img"}"#),
@@ -7094,7 +7222,6 @@ mod tests {
                 r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","rate_limiter":{"ops":null,"ops":null}}"#,
             ),
             ("PATCH", "not-json"),
-            ("PATCH", ""),
             ("PATCH", "{}"),
             ("PATCH", r#"{"id":3}"#),
             ("PATCH", r#"{"id":"pmem0","unknown":true}"#),
@@ -7304,7 +7431,7 @@ mod tests {
         );
         assert_eq!(
             parse_request(empty_body),
-            Err(RequestError::MalformedRequest)
+            Err(RequestError::EmptyPutRequest)
         );
     }
 
@@ -7351,9 +7478,13 @@ mod tests {
 
     #[test]
     fn rejects_malformed_vm_state_update_bodies() {
+        assert_eq!(
+            parse_request(&request_with_body("PATCH", "/vm", "")),
+            Err(RequestError::EmptyPatchRequest)
+        );
+
         for body in [
             "not-json",
-            "",
             "{}",
             r#"{"state":null}"#,
             r#"{"state":"Running"}"#,
@@ -7394,9 +7525,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_snapshot_create_before_unsupported() {
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/snapshot/create", "")),
+            Err(RequestError::EmptyPutRequest)
+        );
+
         for body in [
             "not-json",
-            "",
             "null",
             "[]",
             "{}",
@@ -7460,9 +7595,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_snapshot_load_before_unsupported() {
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/snapshot/load", "")),
+            Err(RequestError::EmptyPutRequest)
+        );
+
         for body in [
             "not-json",
-            "",
             "null",
             "[]",
             "{}",
