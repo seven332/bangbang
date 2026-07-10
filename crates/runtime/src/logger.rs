@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const BOOT_TIMER_LOG_MODULE: &str = "bangbang_runtime::boot_timer";
+const API_REQUEST_LOG_MODULE: &str = "bangbang_runtime::api_server";
 const MINIMAL_ACTION_LOG_MODULE: &str = "bangbang_runtime::vmm_action";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -357,6 +358,37 @@ impl LoggerState {
         Ok(true)
     }
 
+    #[track_caller]
+    pub fn log_api_request(
+        &mut self,
+        method: &str,
+        path: impl fmt::Display,
+    ) -> Result<bool, LoggerWriteError> {
+        const API_REQUEST_LEVEL: LoggerLevel = LoggerLevel::Info;
+
+        if !self.level.allows(API_REQUEST_LEVEL) {
+            return Ok(false);
+        }
+
+        if !module_filter_allows(self.module.as_deref(), API_REQUEST_LOG_MODULE) {
+            return Ok(false);
+        }
+
+        let Some(sink) = &self.sink else {
+            return Ok(false);
+        };
+
+        sink.write_api_request(
+            self.show_level,
+            self.show_log_origin,
+            Location::caller(),
+            API_REQUEST_LEVEL,
+            method,
+            path,
+        )?;
+        Ok(true)
+    }
+
     pub fn boot_timer_logger(&self) -> BootTimerLogger {
         BootTimerLogger {
             sink: self.sink.clone(),
@@ -443,31 +475,31 @@ impl LoggerSink {
         level: LoggerLevel,
         action: &str,
     ) -> Result<(), LoggerWriteError> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| LoggerWriteError::LockPoisoned)?;
-        match (show_level, show_log_origin) {
-            (true, true) => writeln!(
-                writer,
-                "level={} origin={}:{} action={action}",
-                level.as_str(),
-                origin.file(),
-                origin.line()
-            ),
-            (true, false) => writeln!(writer, "level={} action={action}", level.as_str()),
-            (false, true) => writeln!(
-                writer,
-                "origin={}:{} action={action}",
-                origin.file(),
-                origin.line()
-            ),
-            (false, false) => writeln!(writer, "action={action}"),
-        }
-        .map_err(|err| LoggerWriteError::Write(err.kind()))?;
-        writer
-            .flush()
-            .map_err(|err| LoggerWriteError::Write(err.kind()))
+        self.write_message(
+            show_level,
+            show_log_origin,
+            origin,
+            level,
+            format_args!("action={action}"),
+        )
+    }
+
+    fn write_api_request(
+        &self,
+        show_level: bool,
+        show_log_origin: bool,
+        origin: &Location<'_>,
+        level: LoggerLevel,
+        method: &str,
+        path: impl fmt::Display,
+    ) -> Result<(), LoggerWriteError> {
+        self.write_message(
+            show_level,
+            show_log_origin,
+            origin,
+            level,
+            format_args!("The API server received a {method} request on \"{path}\"."),
+        )
     }
 
     fn write_boot_timer(
@@ -481,9 +513,25 @@ impl LoggerSink {
     ) -> Result<(), LoggerWriteError> {
         let wall_time_ms = wall_time_us / 1_000;
         let cpu_time_ms = cpu_time_us / 1_000;
-        let message = format!(
+        self.write_message(
+            show_level,
+            show_log_origin,
+            origin,
+            level,
+            format_args!(
             "Guest-boot-time = {wall_time_us:>6} us {wall_time_ms} ms, {cpu_time_us:>6} CPU us {cpu_time_ms} CPU ms"
-        );
+            ),
+        )
+    }
+
+    fn write_message(
+        &self,
+        show_level: bool,
+        show_log_origin: bool,
+        origin: &Location<'_>,
+        level: LoggerLevel,
+        message: fmt::Arguments<'_>,
+    ) -> Result<(), LoggerWriteError> {
         let mut writer = self
             .writer
             .lock()
@@ -526,8 +574,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BOOT_TIMER_LOG_MODULE, LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerSink,
-        LoggerState, LoggerWriteError, MINIMAL_ACTION_LOG_MODULE, MissedLogCounter,
+        API_REQUEST_LOG_MODULE, BOOT_TIMER_LOG_MODULE, LoggerConfigError, LoggerConfigInput,
+        LoggerLevel, LoggerSink, LoggerState, LoggerWriteError, MINIMAL_ACTION_LOG_MODULE,
+        MissedLogCounter,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -554,6 +603,15 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanickingDisplay;
+
+    impl std::fmt::Display for PanickingDisplay {
+        fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("suppressed logger output should not format the API request path");
         }
     }
 
@@ -706,6 +764,132 @@ mod tests {
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(output, "action=InstanceStart\naction=FlushMetrics\n");
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_api_request_writes_firecracker_shaped_line() {
+        let path = unique_logger_path("api-request");
+        let mut state = LoggerState::default();
+        state
+            .configure(LoggerConfigInput::new().with_log_path(&path))
+            .expect("logger should configure");
+
+        assert_eq!(state.log_api_request("Put", "/mmds"), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            "The API server received a Put request on \"/mmds\".\n"
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_api_request_respects_level_filter() {
+        let path = unique_logger_path("filtered-api-request");
+        let mut state = LoggerState::default();
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_level(LoggerLevel::Warn),
+            )
+            .expect("logger should configure");
+
+        assert_eq!(state.log_api_request("Get", "/version"), Ok(false));
+        assert_eq!(
+            fs::read_to_string(&path).expect("logger output should be readable"),
+            ""
+        );
+
+        state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Info))
+            .expect("logger should update level");
+        assert_eq!(state.log_api_request("Get", "/version"), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            "The API server received a Get request on \"/version\".\n"
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_api_request_respects_module_filter() {
+        let path = unique_logger_path("api-request-module-filter");
+        let mut state = LoggerState::default();
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_module(MINIMAL_ACTION_LOG_MODULE),
+            )
+            .expect("logger should configure");
+
+        assert_eq!(state.log_api_request("Get", "/version"), Ok(false));
+
+        state
+            .configure(LoggerConfigInput::new().with_module(API_REQUEST_LOG_MODULE))
+            .expect("logger should update module filter");
+        assert_eq!(state.log_api_request("Get", "/version"), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            "The API server received a Get request on \"/version\".\n"
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_api_request_does_not_format_path_when_output_is_suppressed() {
+        let path = unique_logger_path("api-request-suppressed");
+        let mut state = LoggerState::default();
+
+        assert_eq!(state.log_api_request("Get", PanickingDisplay), Ok(false));
+
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_level(LoggerLevel::Warn),
+            )
+            .expect("logger should configure");
+        assert_eq!(state.log_api_request("Get", PanickingDisplay), Ok(false));
+
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_level(LoggerLevel::Info)
+                    .with_module(MINIMAL_ACTION_LOG_MODULE),
+            )
+            .expect("logger should update filters");
+        assert_eq!(state.log_api_request("Get", PanickingDisplay), Ok(false));
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("logger output should be readable"),
+            ""
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_api_request_reports_write_errors_without_path_details() {
+        let mut state = LoggerState {
+            sink: Some(LoggerSink::from_writer(FailingWriter)),
+            level: LoggerLevel::Info,
+            show_level: false,
+            show_log_origin: false,
+            module: None,
+        };
+
+        let err = state
+            .log_api_request("Patch", "/mmds")
+            .expect_err("failing writer should report logger write error");
+
+        assert_eq!(err, LoggerWriteError::Write(ErrorKind::BrokenPipe));
+        assert_eq!(err.to_string(), "failed to write logger output: BrokenPipe");
     }
 
     #[test]

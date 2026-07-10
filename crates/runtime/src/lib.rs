@@ -821,6 +821,18 @@ impl VmmController {
         Ok(())
     }
 
+    #[track_caller]
+    pub fn log_api_request(
+        &mut self,
+        method: &str,
+        path: impl fmt::Display,
+    ) -> Result<bool, VmmActionError> {
+        self.logger_state
+            .log_api_request(method, path)
+            .inspect_err(|_| self.metrics_state.record_missed_log())
+            .map_err(VmmActionError::LoggerWrite)
+    }
+
     pub fn record_put_actions_request(&mut self) {
         self.metrics_state.record_put_actions_request();
     }
@@ -4343,6 +4355,37 @@ mod tests {
             .expect_err("boot timer logger write should fail");
 
         assert_eq!(err, LoggerWriteError::Write(ErrorKind::BrokenPipe));
+        assert_eq!(
+            controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn api_request_logger_write_failure_reports_missed_log_count_in_metrics() {
+        let metrics_path = unique_metrics_path("api-request-missed-log");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                &metrics_path,
+            )))
+            .expect("metrics config should be stored");
+        controller.logger_state.configure_test_writer(FailingWriter);
+
+        let err = controller
+            .log_api_request("Put", "/mmds")
+            .expect_err("API request logger write should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::LoggerWrite(LoggerWriteError::Write(ErrorKind::BrokenPipe))
+        );
         assert_eq!(
             controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)

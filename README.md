@@ -60,8 +60,9 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
   `51200` bytes.
 - `--log-path <PATH>`, `--level <LEVEL>`, `--module <MODULE>`,
   `--show-level`, and `--show-log-origin` configure the same per-process
-  logger state as `PUT /logger` before the API socket is served. The current
-  minimal action logs use module path `bangbang_runtime::vmm_action`.
+  logger state as `PUT /logger` before the API socket is served. Current
+  minimal logger events use module paths `bangbang_runtime::api_server`,
+  `bangbang_runtime::vmm_action`, and `bangbang_runtime::boot_timer`.
 - `--no-api` requires `--config-file <PATH>`, starts from that configuration
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
 - `--help`, `-h`, `--version`, and `-V` are supported.
@@ -214,8 +215,9 @@ Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported
 deprecated machine `cpu_template`, MMDS V1 config, `vsock_id`, and snapshot-load
 field forms.
-After a metrics write failure, logger action write failure, or boot-timer logger
-write failure, later successful metrics output includes the minimal
+After a metrics write failure, API request logger write failure, action logger
+write failure, or boot-timer logger write failure, later successful metrics
+output includes the minimal
 Firecracker-shaped `logger.missed_metrics_count` and `logger.missed_log_count`
 counters.
 
@@ -228,12 +230,14 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"log_path":"/tmp/bangbang.log","level":"Info","module":"bangbang_runtime","show_level":true,"show_log_origin":true}'
 ```
 
-Configured logger output records minimal successful `InstanceStart` and
+Configured logger output records minimal successfully parsed API request
+method/path lines without request bodies, plus successful `InstanceStart` and
 `FlushMetrics` action events. `show_level` adds `level=Info`, and
-`show_log_origin` adds the runtime action callsite as `origin=<file>:<line>`.
-`module` filters these minimal action logs by prefix against
-`bangbang_runtime::vmm_action`. When `--boot-timer` is enabled, boot-time log
-events use module path `bangbang_runtime::boot_timer`.
+`show_log_origin` adds the callsite as `origin=<file>:<line>`.
+`module` filters these minimal logger events by prefix against
+`bangbang_runtime::api_server`, `bangbang_runtime::vmm_action`, or
+`bangbang_runtime::boot_timer`. When `--boot-timer` is enabled, boot-time log
+events use the boot-timer module path.
 Full internal log routing remains deferred.
 
 Submit an `InstanceStart` action:
