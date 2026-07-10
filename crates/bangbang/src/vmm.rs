@@ -815,7 +815,11 @@ pub(crate) trait VmmRequestHandler {
     fn record_deprecated_api_call(&mut self);
 
     #[track_caller]
-    fn log_api_request(&mut self, method: &str, path: &str) -> Result<bool, VmmActionError>;
+    fn log_api_request(
+        &mut self,
+        method: &str,
+        path: impl fmt::Display,
+    ) -> Result<bool, VmmActionError>;
 
     fn record_pause_vm_latency_us(&mut self, duration_us: u64);
 
@@ -1046,7 +1050,11 @@ where
     }
 
     #[track_caller]
-    fn log_api_request(&mut self, method: &str, path: &str) -> Result<bool, VmmActionError> {
+    fn log_api_request(
+        &mut self,
+        method: &str,
+        path: impl fmt::Display,
+    ) -> Result<bool, VmmActionError> {
         self.controller.log_api_request(method, path)
     }
 
@@ -1474,7 +1482,11 @@ where
     }
 
     #[track_caller]
-    fn log_api_request(&mut self, method: &str, path: &str) -> Result<bool, VmmActionError> {
+    fn log_api_request(
+        &mut self,
+        method: &str,
+        path: impl fmt::Display,
+    ) -> Result<bool, VmmActionError> {
         ProcessVmm::log_api_request(self, method, path)
     }
 

@@ -359,7 +359,11 @@ impl LoggerState {
     }
 
     #[track_caller]
-    pub fn log_api_request(&mut self, method: &str, path: &str) -> Result<bool, LoggerWriteError> {
+    pub fn log_api_request(
+        &mut self,
+        method: &str,
+        path: impl fmt::Display,
+    ) -> Result<bool, LoggerWriteError> {
         const API_REQUEST_LEVEL: LoggerLevel = LoggerLevel::Info;
 
         if !self.level.allows(API_REQUEST_LEVEL) {
@@ -487,7 +491,7 @@ impl LoggerSink {
         origin: &Location<'_>,
         level: LoggerLevel,
         method: &str,
-        path: &str,
+        path: impl fmt::Display,
     ) -> Result<(), LoggerWriteError> {
         self.write_message(
             show_level,

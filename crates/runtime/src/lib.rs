@@ -822,7 +822,11 @@ impl VmmController {
     }
 
     #[track_caller]
-    pub fn log_api_request(&mut self, method: &str, path: &str) -> Result<bool, VmmActionError> {
+    pub fn log_api_request(
+        &mut self,
+        method: &str,
+        path: impl fmt::Display,
+    ) -> Result<bool, VmmActionError> {
         self.logger_state
             .log_api_request(method, path)
             .inspect_err(|_| self.metrics_state.record_missed_log())

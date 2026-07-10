@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{Read, Write};
@@ -615,13 +614,10 @@ fn handle_request_bytes_with_limit(
     http_api_max_payload_size: usize,
 ) -> HttpResponse {
     match parse_request_with_limit(bytes, http_api_max_payload_size) {
-        Ok(request) => {
-            let (method, path) = api_request_log_method_path(&request);
-            match vmm.log_api_request(method, path.as_ref()) {
-                Ok(_) => handle_api_request(request, vmm),
-                Err(err) => handle_empty(Err(err)),
-            }
-        }
+        Ok(request) => match log_api_request(&request, vmm) {
+            Ok(_) => handle_api_request(request, vmm),
+            Err(err) => handle_empty(Err(err)),
+        },
         Err(err) => {
             if err == RequestError::SendCtrlAltDelUnsupported {
                 record_unsupported_put_action_request(bytes, vmm);
@@ -637,78 +633,81 @@ fn handle_request_bytes_with_limit(
     }
 }
 
-fn api_request_log_method_path(request: &ApiRequest) -> (&'static str, Cow<'static, str>) {
+fn log_api_request(
+    request: &ApiRequest,
+    vmm: &mut impl VmmRequestHandler,
+) -> Result<bool, VmmActionError> {
     match request {
-        ApiRequest::GetInstanceInfo => ("Get", Cow::Borrowed("/")),
-        ApiRequest::GetBalloon => ("Get", Cow::Borrowed("/balloon")),
-        ApiRequest::GetBalloonStats => ("Get", Cow::Borrowed("/balloon/statistics")),
-        ApiRequest::GetBalloonHintingStatus => ("Get", Cow::Borrowed("/balloon/hinting/status")),
-        ApiRequest::GetMemoryHotplug => ("Get", Cow::Borrowed("/hotplug/memory")),
-        ApiRequest::GetMachineConfig => ("Get", Cow::Borrowed("/machine-config")),
-        ApiRequest::GetMmds => ("Get", Cow::Borrowed("/mmds")),
-        ApiRequest::GetVmConfig => ("Get", Cow::Borrowed("/vm/config")),
-        ApiRequest::GetVersion => ("Get", Cow::Borrowed("/version")),
-        ApiRequest::PutAction(_) => ("Put", Cow::Borrowed("/actions")),
-        ApiRequest::PutBalloon(_) => ("Put", Cow::Borrowed("/balloon")),
-        ApiRequest::PutBootSource(_) => ("Put", Cow::Borrowed("/boot-source")),
-        ApiRequest::PutCpuConfig(_) => ("Put", Cow::Borrowed("/cpu-config")),
-        ApiRequest::PutDrive(config) => (
-            "Put",
-            Cow::Owned(format!("/drives/{}", config.path_drive_id())),
-        ),
-        ApiRequest::PutEntropy(_) => ("Put", Cow::Borrowed("/entropy")),
-        ApiRequest::PutMemoryHotplug(_) => ("Put", Cow::Borrowed("/hotplug/memory")),
-        ApiRequest::PatchBalloon(_) => ("Patch", Cow::Borrowed("/balloon")),
-        ApiRequest::PatchBalloonStats(_) => ("Patch", Cow::Borrowed("/balloon/statistics")),
-        ApiRequest::PatchBalloonHintingStart(_) => {
-            ("Patch", Cow::Borrowed("/balloon/hinting/start"))
+        ApiRequest::GetInstanceInfo => vmm.log_api_request("Get", "/"),
+        ApiRequest::GetBalloon => vmm.log_api_request("Get", "/balloon"),
+        ApiRequest::GetBalloonStats => vmm.log_api_request("Get", "/balloon/statistics"),
+        ApiRequest::GetBalloonHintingStatus => {
+            vmm.log_api_request("Get", "/balloon/hinting/status")
         }
-        ApiRequest::PatchBalloonHintingStop => ("Patch", Cow::Borrowed("/balloon/hinting/stop")),
-        ApiRequest::PatchMemoryHotplug(_) => ("Patch", Cow::Borrowed("/hotplug/memory")),
-        ApiRequest::PatchDrive(config) => (
-            "Patch",
-            Cow::Owned(format!("/drives/{}", config.path_drive_id())),
-        ),
-        ApiRequest::PatchVmState(_) => ("Patch", Cow::Borrowed("/vm")),
-        ApiRequest::PutLogger(_) => ("Put", Cow::Borrowed("/logger")),
-        ApiRequest::PutMachineConfig(_) => ("Put", Cow::Borrowed("/machine-config")),
-        ApiRequest::PatchMachineConfig(_) => ("Patch", Cow::Borrowed("/machine-config")),
-        ApiRequest::PutMetrics(_) => ("Put", Cow::Borrowed("/metrics")),
-        ApiRequest::PutMmds(_) => ("Put", Cow::Borrowed("/mmds")),
-        ApiRequest::PutMmdsConfig(_) => ("Put", Cow::Borrowed("/mmds/config")),
-        ApiRequest::PutNetworkInterface(config) => (
+        ApiRequest::GetMemoryHotplug => vmm.log_api_request("Get", "/hotplug/memory"),
+        ApiRequest::GetMachineConfig => vmm.log_api_request("Get", "/machine-config"),
+        ApiRequest::GetMmds => vmm.log_api_request("Get", "/mmds"),
+        ApiRequest::GetVmConfig => vmm.log_api_request("Get", "/vm/config"),
+        ApiRequest::GetVersion => vmm.log_api_request("Get", "/version"),
+        ApiRequest::PutAction(_) => vmm.log_api_request("Put", "/actions"),
+        ApiRequest::PutBalloon(_) => vmm.log_api_request("Put", "/balloon"),
+        ApiRequest::PutBootSource(_) => vmm.log_api_request("Put", "/boot-source"),
+        ApiRequest::PutCpuConfig(_) => vmm.log_api_request("Put", "/cpu-config"),
+        ApiRequest::PutDrive(config) => {
+            vmm.log_api_request("Put", format_args!("/drives/{}", config.path_drive_id()))
+        }
+        ApiRequest::PutEntropy(_) => vmm.log_api_request("Put", "/entropy"),
+        ApiRequest::PutMemoryHotplug(_) => vmm.log_api_request("Put", "/hotplug/memory"),
+        ApiRequest::PatchBalloon(_) => vmm.log_api_request("Patch", "/balloon"),
+        ApiRequest::PatchBalloonStats(_) => vmm.log_api_request("Patch", "/balloon/statistics"),
+        ApiRequest::PatchBalloonHintingStart(_) => {
+            vmm.log_api_request("Patch", "/balloon/hinting/start")
+        }
+        ApiRequest::PatchBalloonHintingStop => {
+            vmm.log_api_request("Patch", "/balloon/hinting/stop")
+        }
+        ApiRequest::PatchMemoryHotplug(_) => vmm.log_api_request("Patch", "/hotplug/memory"),
+        ApiRequest::PatchDrive(config) => {
+            vmm.log_api_request("Patch", format_args!("/drives/{}", config.path_drive_id()))
+        }
+        ApiRequest::PatchVmState(_) => vmm.log_api_request("Patch", "/vm"),
+        ApiRequest::PutLogger(_) => vmm.log_api_request("Put", "/logger"),
+        ApiRequest::PutMachineConfig(_) => vmm.log_api_request("Put", "/machine-config"),
+        ApiRequest::PatchMachineConfig(_) => vmm.log_api_request("Patch", "/machine-config"),
+        ApiRequest::PutMetrics(_) => vmm.log_api_request("Put", "/metrics"),
+        ApiRequest::PutMmds(_) => vmm.log_api_request("Put", "/mmds"),
+        ApiRequest::PutMmdsConfig(_) => vmm.log_api_request("Put", "/mmds/config"),
+        ApiRequest::PutNetworkInterface(config) => vmm.log_api_request(
             "Put",
-            Cow::Owned(format!("/network-interfaces/{}", config.path_iface_id())),
+            format_args!("/network-interfaces/{}", config.path_iface_id()),
         ),
-        ApiRequest::PatchNetworkInterface(config) => (
+        ApiRequest::PatchNetworkInterface(config) => vmm.log_api_request(
             "Patch",
-            Cow::Owned(format!("/network-interfaces/{}", config.path_iface_id())),
+            format_args!("/network-interfaces/{}", config.path_iface_id()),
         ),
         ApiRequest::HotUnplugDevice(request) => match request.kind() {
             ApiHotUnplugDeviceKind::Drive => {
-                ("Delete", Cow::Owned(format!("/drives/{}", request.id())))
+                vmm.log_api_request("Delete", format_args!("/drives/{}", request.id()))
             }
-            ApiHotUnplugDeviceKind::NetworkInterface => (
+            ApiHotUnplugDeviceKind::NetworkInterface => vmm.log_api_request(
                 "Delete",
-                Cow::Owned(format!("/network-interfaces/{}", request.id())),
+                format_args!("/network-interfaces/{}", request.id()),
             ),
             ApiHotUnplugDeviceKind::Pmem => {
-                ("Delete", Cow::Owned(format!("/pmem/{}", request.id())))
+                vmm.log_api_request("Delete", format_args!("/pmem/{}", request.id()))
             }
         },
-        ApiRequest::PutPmem(config) => (
-            "Put",
-            Cow::Owned(format!("/pmem/{}", config.path_pmem_id())),
-        ),
-        ApiRequest::PatchPmem(config) => (
-            "Patch",
-            Cow::Owned(format!("/pmem/{}", config.path_pmem_id())),
-        ),
-        ApiRequest::PutSerial(_) => ("Put", Cow::Borrowed("/serial")),
-        ApiRequest::PutSnapshotCreate(_) => ("Put", Cow::Borrowed("/snapshot/create")),
-        ApiRequest::PutSnapshotLoad(_) => ("Put", Cow::Borrowed("/snapshot/load")),
-        ApiRequest::PutVsock(_) => ("Put", Cow::Borrowed("/vsock")),
-        ApiRequest::PatchMmds(_) => ("Patch", Cow::Borrowed("/mmds")),
+        ApiRequest::PutPmem(config) => {
+            vmm.log_api_request("Put", format_args!("/pmem/{}", config.path_pmem_id()))
+        }
+        ApiRequest::PatchPmem(config) => {
+            vmm.log_api_request("Patch", format_args!("/pmem/{}", config.path_pmem_id()))
+        }
+        ApiRequest::PutSerial(_) => vmm.log_api_request("Put", "/serial"),
+        ApiRequest::PutSnapshotCreate(_) => vmm.log_api_request("Put", "/snapshot/create"),
+        ApiRequest::PutSnapshotLoad(_) => vmm.log_api_request("Put", "/snapshot/load"),
+        ApiRequest::PutVsock(_) => vmm.log_api_request("Put", "/vsock"),
+        ApiRequest::PatchMmds(_) => vmm.log_api_request("Patch", "/mmds"),
     }
 }
 
@@ -2591,7 +2590,11 @@ mod tests {
         }
 
         #[track_caller]
-        fn log_api_request(&mut self, method: &str, path: &str) -> Result<bool, VmmActionError> {
+        fn log_api_request(
+            &mut self,
+            method: &str,
+            path: impl std::fmt::Display,
+        ) -> Result<bool, VmmActionError> {
             self.inner.log_api_request(method, path)
         }
 
