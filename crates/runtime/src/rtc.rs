@@ -4,6 +4,7 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::memory::GuestAddress;
+use crate::metrics::SharedRtcDeviceMetrics;
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError, MmioRegionId,
 };
@@ -60,9 +61,10 @@ impl RtcTimeSource for SystemRtcTimeSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Pl031RtcDevice<T = SystemRtcTimeSource> {
     time_source: T,
+    metrics: SharedRtcDeviceMetrics,
     load_value: u32,
     load_source_seconds: u32,
     match_value: u32,
@@ -74,13 +76,22 @@ impl Pl031RtcDevice<SystemRtcTimeSource> {
     pub fn system() -> Self {
         Self::new(SystemRtcTimeSource)
     }
+
+    pub fn system_with_metrics(metrics: SharedRtcDeviceMetrics) -> Self {
+        Self::new_with_metrics(SystemRtcTimeSource, metrics)
+    }
 }
 
 impl<T: RtcTimeSource> Pl031RtcDevice<T> {
     pub fn new(time_source: T) -> Self {
+        Self::new_with_metrics(time_source, SharedRtcDeviceMetrics::default())
+    }
+
+    pub fn new_with_metrics(time_source: T, metrics: SharedRtcDeviceMetrics) -> Self {
         let now = rtc_seconds_u32(time_source.unix_time_seconds());
         Self {
             time_source,
+            metrics,
             load_value: now,
             load_source_seconds: now,
             match_value: 0,
@@ -95,6 +106,10 @@ impl<T: RtcTimeSource> Pl031RtcDevice<T> {
 
     pub fn time_source_mut(&mut self) -> &mut T {
         &mut self.time_source
+    }
+
+    pub fn shared_metrics(&self) -> SharedRtcDeviceMetrics {
+        self.metrics.clone()
     }
 
     pub fn read_register(&self, offset: u64) -> Result<u32, Pl031RtcError> {
@@ -165,14 +180,32 @@ impl<T: RtcTimeSource> Pl031RtcDevice<T> {
 
 impl<T: RtcTimeSource> MmioHandler for Pl031RtcDevice<T> {
     fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
-        self.read_access(access).map_err(MmioHandlerError::from)
+        self.read_access(access).map_err(|err| {
+            self.metrics.record_read_error();
+            MmioHandlerError::from(err)
+        })
     }
 
     fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError> {
-        self.write_access(access, data)
-            .map_err(MmioHandlerError::from)
+        self.write_access(access, data).map_err(|err| {
+            self.metrics.record_write_error();
+            MmioHandlerError::from(err)
+        })
     }
 }
+
+impl<T: PartialEq> PartialEq for Pl031RtcDevice<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.time_source == other.time_source
+            && self.load_value == other.load_value
+            && self.load_source_seconds == other.load_source_seconds
+            && self.match_value == other.match_value
+            && self.control == other.control
+            && self.interrupt_mask == other.interrupt_mask
+    }
+}
+
+impl<T: Eq> Eq for Pl031RtcDevice<T> {}
 
 impl<T: RtcTimeSource> Pl031RtcDevice<T> {
     fn read_access(&self, access: MmioAccess) -> Result<MmioAccessBytes, Pl031RtcError> {
@@ -303,6 +336,7 @@ mod tests {
         RTC_RAW_INTERRUPT_STATUS_REGISTER_OFFSET, RtcTimeSource,
     };
     use crate::memory::GuestAddress;
+    use crate::metrics::RtcDeviceMetrics;
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioDispatcher, MmioHandler, MmioRegionId};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,5 +542,57 @@ mod tests {
             .expect_err("short write data should fail");
 
         assert!(err.to_string().contains("write requires 4 data bytes"));
+    }
+
+    #[test]
+    fn successful_mmio_accesses_do_not_record_errors() {
+        let mut device = Pl031RtcDevice::new(FixedRtcTimeSource::new(100));
+        let metrics = device.shared_metrics();
+
+        assert_eq!(read(&mut device, RTC_DATA_REGISTER_OFFSET), 100);
+        write(&mut device, RTC_MATCH_REGISTER_OFFSET, 123);
+
+        assert_eq!(metrics.snapshot(), RtcDeviceMetrics::default());
+    }
+
+    #[test]
+    fn read_errors_record_missed_read_and_error_counts() {
+        let mut device = Pl031RtcDevice::new(FixedRtcTimeSource::new(100));
+        let metrics = device.shared_metrics();
+
+        let _ = device
+            .read(access(RTC_DATA_REGISTER_OFFSET, 1))
+            .expect_err("byte read should fail");
+        let _ = device
+            .read(access(0x020, 4))
+            .expect_err("invalid register read should fail");
+
+        assert_eq!(
+            metrics.snapshot(),
+            RtcDeviceMetrics::default()
+                .with_error_count(2)
+                .with_missed_read_count(2)
+        );
+    }
+
+    #[test]
+    fn write_errors_record_missed_write_and_error_counts() {
+        let mut device = Pl031RtcDevice::new(FixedRtcTimeSource::new(100));
+        let metrics = device.shared_metrics();
+        let short_data = MmioAccessBytes::new(&[1, 2]).expect("test bytes should be valid");
+
+        let _ = device
+            .write(access(RTC_DATA_REGISTER_OFFSET, 4), bytes(123))
+            .expect_err("read-only register write should fail");
+        let _ = device
+            .write(access(RTC_MATCH_REGISTER_OFFSET, 4), short_data)
+            .expect_err("short write data should fail");
+
+        assert_eq!(
+            metrics.snapshot(),
+            RtcDeviceMetrics::default()
+                .with_error_count(2)
+                .with_missed_write_count(2)
+        );
     }
 }

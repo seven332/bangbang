@@ -41,8 +41,8 @@ use bangbang_runtime::memory_hotplug::{
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
     SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedSignalMetrics,
-    SharedVsockDeviceMetrics,
+    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
+    SharedSignalMetrics, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -2033,6 +2033,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -2115,6 +2119,10 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         Some(OwnedHvfArm64BootSession::shared_entropy_device_metrics(
             self,
         ))
+    }
+
+    fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
+        OwnedHvfArm64BootSession::shared_rtc_device_metrics(self)
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2228,6 +2236,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -2307,6 +2319,10 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         Some(OwnedHvfArm64BootSession::shared_entropy_device_metrics(
             self,
         ))
+    }
+
+    fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
+        OwnedHvfArm64BootSession::shared_rtc_device_metrics(self)
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2390,6 +2406,10 @@ where
 
     fn shared_entropy_device_metrics(&self) -> Option<SharedEntropyDeviceMetrics> {
         self.session.shared_entropy_device_metrics()
+    }
+
+    fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
+        self.session.shared_rtc_device_metrics()
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2888,6 +2908,7 @@ where
     network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
     vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
     entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
+    rtc_device_metrics: Option<SharedRtcDeviceMetrics>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     pause_gate: Arc<BootRunLoopPauseGate>,
@@ -2922,6 +2943,7 @@ where
         let network_interface_metrics = session.shared_network_interface_metrics();
         let vsock_device_metrics = session.shared_vsock_device_metrics();
         let entropy_device_metrics = session.shared_entropy_device_metrics();
+        let rtc_device_metrics = session.shared_rtc_device_metrics();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         let worker_status = Arc::clone(&status);
@@ -3008,6 +3030,7 @@ where
             network_interface_metrics,
             vsock_device_metrics,
             entropy_device_metrics,
+            rtc_device_metrics,
             command_handle,
             status,
             pause_gate,
@@ -3144,6 +3167,9 @@ where
         }
         if let Some(metrics) = &self.entropy_device_metrics {
             diagnostics = diagnostics.with_entropy_device_metrics(metrics.snapshot());
+        }
+        if let Some(metrics) = &self.rtc_device_metrics {
+            diagnostics = diagnostics.with_rtc_device_metrics(metrics.snapshot());
         }
         if let Some(metrics) = &self.balloon_device_metrics {
             diagnostics = diagnostics.with_balloon_device_metrics(metrics.snapshot());
@@ -3458,10 +3484,10 @@ mod tests {
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigInput, MetricsDiagnostics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
-        PmemDeviceMetricsByDevice, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
-        SharedEntropyDeviceMetrics, SharedNetworkInterfaceMetricsRegistry,
-        SharedPmemDeviceMetricsRegistry, SharedSignalMetrics, SharedVsockDeviceMetrics,
-        VsockDeviceMetrics,
+        PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
+        SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
@@ -4240,6 +4266,7 @@ mod tests {
         network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
         vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
         entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
+        rtc_device_metrics: Option<SharedRtcDeviceMetrics>,
         memory_hotplug_updates: Arc<Mutex<Vec<u64>>>,
         memory_hotplug_status_requests: Arc<Mutex<Vec<u64>>>,
         memory_hotplug_status_plugged_size_mib: u64,
@@ -4269,6 +4296,7 @@ mod tests {
                 network_interface_metrics: None,
                 vsock_device_metrics: None,
                 entropy_device_metrics: None,
+                rtc_device_metrics: None,
                 memory_hotplug_updates: Arc::default(),
                 memory_hotplug_status_requests: Arc::default(),
                 memory_hotplug_status_plugged_size_mib: 0,
@@ -4344,6 +4372,11 @@ mod tests {
             self
         }
 
+        fn with_rtc_device_metrics(mut self, metrics: SharedRtcDeviceMetrics) -> Self {
+            self.rtc_device_metrics = Some(metrics);
+            self
+        }
+
         const fn with_wait_for_stop(mut self, wait_for_stop: bool) -> Self {
             self.wait_for_stop = wait_for_stop;
             self
@@ -4406,6 +4439,10 @@ mod tests {
 
         fn shared_entropy_device_metrics(&self) -> Option<SharedEntropyDeviceMetrics> {
             self.entropy_device_metrics.clone()
+        }
+
+        fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
+            self.rtc_device_metrics.clone()
         }
 
         fn update_memory_hotplug(
@@ -5854,6 +5891,45 @@ mod tests {
                 EntropyDeviceMetrics::default()
                     .with_entropy_event_fails(2)
                     .with_host_rng_fails(1)
+            )
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_reports_rtc_device_metrics() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedRtcDeviceMetrics::default();
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_rtc_device_metrics(metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        metrics.record_read_error();
+        metrics.record_write_error();
+
+        assert_eq!(
+            supervisor.metrics_diagnostics().rtc_device_metrics(),
+            Some(
+                RtcDeviceMetrics::default()
+                    .with_error_count(2)
+                    .with_missed_read_count(1)
+                    .with_missed_write_count(1)
             )
         );
 

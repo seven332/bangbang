@@ -3149,6 +3149,98 @@ struct SharedEntropyDeviceMetricsInner {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RtcDeviceMetrics {
+    error_count: u64,
+    missed_read_count: u64,
+    missed_write_count: u64,
+}
+
+impl RtcDeviceMetrics {
+    pub const fn new(error_count: u64, missed_read_count: u64, missed_write_count: u64) -> Self {
+        Self {
+            error_count,
+            missed_read_count,
+            missed_write_count,
+        }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.error_count == 0 && self.missed_read_count == 0 && self.missed_write_count == 0
+    }
+
+    pub const fn error_count(self) -> u64 {
+        self.error_count
+    }
+
+    pub const fn missed_read_count(self) -> u64 {
+        self.missed_read_count
+    }
+
+    pub const fn missed_write_count(self) -> u64 {
+        self.missed_write_count
+    }
+
+    pub const fn with_error_count(mut self, error_count: u64) -> Self {
+        self.error_count = error_count;
+        self
+    }
+
+    pub const fn with_missed_read_count(mut self, missed_read_count: u64) -> Self {
+        self.missed_read_count = missed_read_count;
+        self
+    }
+
+    pub const fn with_missed_write_count(mut self, missed_write_count: u64) -> Self {
+        self.missed_write_count = missed_write_count;
+        self
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            error_count: self.error_count.saturating_add(other.error_count),
+            missed_read_count: self
+                .missed_read_count
+                .saturating_add(other.missed_read_count),
+            missed_write_count: self
+                .missed_write_count
+                .saturating_add(other.missed_write_count),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedRtcDeviceMetrics {
+    inner: Arc<SharedRtcDeviceMetricsInner>,
+}
+
+impl SharedRtcDeviceMetrics {
+    pub fn record_read_error(&self) {
+        record_atomic_metric(&self.inner.missed_read_count, 1);
+        record_atomic_metric(&self.inner.error_count, 1);
+    }
+
+    pub fn record_write_error(&self) {
+        record_atomic_metric(&self.inner.missed_write_count, 1);
+        record_atomic_metric(&self.inner.error_count, 1);
+    }
+
+    pub fn snapshot(&self) -> RtcDeviceMetrics {
+        RtcDeviceMetrics::new(
+            self.inner.error_count.load(Ordering::Relaxed),
+            self.inner.missed_read_count.load(Ordering::Relaxed),
+            self.inner.missed_write_count.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedRtcDeviceMetricsInner {
+    error_count: AtomicU64,
+    missed_read_count: AtomicU64,
+    missed_write_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BalloonDeviceMetrics {
     activate_fails: u64,
     inflate_count: u64,
@@ -3388,6 +3480,7 @@ pub struct MetricsDiagnostics {
     network_interface_metrics_by_interface: Option<NetworkInterfaceMetricsByInterface>,
     vsock_device_metrics: Option<VsockDeviceMetrics>,
     entropy_device_metrics: Option<EntropyDeviceMetrics>,
+    rtc_device_metrics: Option<RtcDeviceMetrics>,
     balloon_device_metrics: Option<BalloonDeviceMetrics>,
     boot_run_loop_status: Option<BootRunLoopMetricStatus>,
     start_time_us: Option<u64>,
@@ -3408,6 +3501,7 @@ impl MetricsDiagnostics {
             network_interface_metrics_by_interface: None,
             vsock_device_metrics: None,
             entropy_device_metrics: None,
+            rtc_device_metrics: None,
             balloon_device_metrics: None,
             boot_run_loop_status: None,
             start_time_us: None,
@@ -3470,6 +3564,11 @@ impl MetricsDiagnostics {
         entropy_device_metrics: EntropyDeviceMetrics,
     ) -> Self {
         self.entropy_device_metrics = Some(entropy_device_metrics);
+        self
+    }
+
+    pub fn with_rtc_device_metrics(mut self, rtc_device_metrics: RtcDeviceMetrics) -> Self {
+        self.rtc_device_metrics = Some(rtc_device_metrics);
         self
     }
 
@@ -3564,6 +3663,12 @@ impl MetricsDiagnostics {
                 None => metrics,
             });
         }
+        if let Some(metrics) = other.rtc_device_metrics {
+            self.rtc_device_metrics = Some(match self.rtc_device_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
         if let Some(metrics) = other.balloon_device_metrics {
             self.balloon_device_metrics = Some(match self.balloon_device_metrics {
                 Some(existing) => existing.merged_with(metrics),
@@ -3627,6 +3732,10 @@ impl MetricsDiagnostics {
 
     pub fn entropy_device_metrics(&self) -> Option<EntropyDeviceMetrics> {
         self.entropy_device_metrics
+    }
+
+    pub fn rtc_device_metrics(&self) -> Option<RtcDeviceMetrics> {
+        self.rtc_device_metrics
     }
 
     pub fn balloon_device_metrics(&self) -> Option<BalloonDeviceMetrics> {
@@ -3987,6 +4096,25 @@ fn entropy_device_metrics_json_object(
     entropy
 }
 
+fn rtc_device_metrics_json_object(
+    metrics: RtcDeviceMetrics,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut rtc = serde_json::Map::new();
+    rtc.insert(
+        "error_count".to_string(),
+        serde_json::Value::Number(metrics.error_count().into()),
+    );
+    rtc.insert(
+        "missed_read_count".to_string(),
+        serde_json::Value::Number(metrics.missed_read_count().into()),
+    );
+    rtc.insert(
+        "missed_write_count".to_string(),
+        serde_json::Value::Number(metrics.missed_write_count().into()),
+    );
+    rtc
+}
+
 fn serial_output_metrics_json_object(
     metrics: SerialOutputMetrics,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -4226,6 +4354,14 @@ impl MetricsSink {
                 serde_json::Value::Object(entropy_device_metrics_json_object(
                     entropy_device_metrics,
                 )),
+            );
+        }
+        if let Some(rtc_device_metrics) = diagnostics.rtc_device_metrics()
+            && !rtc_device_metrics.is_empty()
+        {
+            root.insert(
+                "rtc".to_string(),
+                serde_json::Value::Object(rtc_device_metrics_json_object(rtc_device_metrics)),
             );
         }
         if let Some(balloon_device_metrics) = diagnostics.balloon_device_metrics()
@@ -4530,11 +4666,11 @@ mod tests {
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
         MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
-        PmemDeviceMetricsByDevice, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
         SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
-        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedSignalMetrics,
-        SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
+        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
+        SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::serial::SerialOutputMetrics;
@@ -5728,6 +5864,97 @@ mod tests {
                     .with_host_rng_fails(u64::MAX)
                     .with_entropy_rate_limiter_throttled(u64::MAX)
                     .with_rate_limiter_event_count(u64::MAX)
+            )
+        );
+    }
+
+    #[test]
+    fn writes_rtc_device_metrics_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new().with_rtc_device_metrics(
+            RtcDeviceMetrics::default()
+                .with_error_count(3)
+                .with_missed_read_count(1)
+                .with_missed_write_count(2),
+        );
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"rtc":{"error_count":3,"missed_read_count":1,"missed_write_count":2},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_empty_rtc_device_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_rtc_device_metrics(RtcDeviceMetrics::default());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn shared_rtc_device_metrics_snapshot_is_per_instance() {
+        let first = SharedRtcDeviceMetrics::default();
+        let second = SharedRtcDeviceMetrics::default();
+
+        first.record_read_error();
+        first.record_write_error();
+
+        assert_eq!(
+            first.snapshot(),
+            RtcDeviceMetrics::default()
+                .with_error_count(2)
+                .with_missed_read_count(1)
+                .with_missed_write_count(1)
+        );
+        assert_eq!(second.snapshot(), RtcDeviceMetrics::default());
+    }
+
+    #[test]
+    fn rtc_metric_increment_saturates() {
+        let metrics = SharedRtcDeviceMetrics::default();
+        metrics
+            .inner
+            .error_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        metrics.record_read_error();
+        metrics.record_write_error();
+
+        assert_eq!(metrics.snapshot().error_count(), u64::MAX);
+    }
+
+    #[test]
+    fn rtc_diagnostics_merge_saturates() {
+        let base = MetricsDiagnostics::new().with_rtc_device_metrics(
+            RtcDeviceMetrics::default()
+                .with_error_count(u64::MAX - 1)
+                .with_missed_read_count(u64::MAX - 2)
+                .with_missed_write_count(u64::MAX - 3),
+        );
+        let additional = MetricsDiagnostics::new().with_rtc_device_metrics(
+            RtcDeviceMetrics::default()
+                .with_error_count(2)
+                .with_missed_read_count(3)
+                .with_missed_write_count(4),
+        );
+
+        assert_eq!(
+            base.merged_with(additional).rtc_device_metrics(),
+            Some(
+                RtcDeviceMetrics::default()
+                    .with_error_count(u64::MAX)
+                    .with_missed_read_count(u64::MAX)
+                    .with_missed_write_count(u64::MAX)
             )
         );
     }

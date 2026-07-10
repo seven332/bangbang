@@ -46,6 +46,7 @@ use crate::memory_hotplug::{
     VirtioMemMmioLayout, VirtioMemMmioRegistrationError, VirtioMemMutationExecutor,
     VirtioMemPrepareError,
 };
+use crate::metrics::SharedRtcDeviceMetrics;
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
     MmioRegionId,
@@ -1328,11 +1329,20 @@ pub struct Arm64BootEntropyDevice {
     pub fdt_device: Arm64FdtVirtioMmioDevice,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Arm64BootRtcDevice {
     pub region: MmioRegion,
     pub fdt_device: Arm64FdtRtcDevice,
+    pub metrics: SharedRtcDeviceMetrics,
 }
+
+impl PartialEq for Arm64BootRtcDevice {
+    fn eq(&self, other: &Self) -> bool {
+        self.region == other.region && self.fdt_device == other.fdt_device
+    }
+}
+
+impl Eq for Arm64BootRtcDevice {}
 
 #[derive(Debug, Clone)]
 pub struct Arm64BootSerialDevice {
@@ -2934,8 +2944,12 @@ fn register_rtc_mmio(
             }),
         })?;
 
+    let metrics = SharedRtcDeviceMetrics::default();
     dispatcher
-        .register_handler(region_id, Pl031RtcDevice::system())
+        .register_handler(
+            region_id,
+            Pl031RtcDevice::system_with_metrics(metrics.clone()),
+        )
         .map_err(|source| Arm64BootResourceError::RegisterRtcMmio {
             source: Box::new(Arm64BootRtcMmioRegistrationError::RegisterHandler {
                 region_id,
@@ -2950,7 +2964,11 @@ fn register_rtc_mmio(
         },
     };
 
-    Ok(Arm64BootRtcDevice { region, fdt_device })
+    Ok(Arm64BootRtcDevice {
+        region,
+        fdt_device,
+        metrics,
+    })
 }
 
 fn register_serial_mmio(
