@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,30 +42,76 @@ pub(crate) fn http_json(socket_path: &Path, method: &str, path: &str, body: &str
     http_request(socket_path, method, path, Some(body))
 }
 
+pub(crate) fn http_json_with_io_timeout(
+    socket_path: &Path,
+    method: &str,
+    path: &str,
+    body: &str,
+    io_timeout: Duration,
+) -> String {
+    http_request_with_io_timeout(socket_path, method, path, Some(body), io_timeout)
+}
+
 #[allow(
     dead_code,
     reason = "shared integration-test support is compiled once per test target"
 )]
 pub(crate) fn http_raw(socket_path: &Path, request: &[u8]) -> String {
-    let mut stream = UnixStream::connect(socket_path).expect("client should connect");
+    http_raw_with_io_timeout(socket_path, request, HTTP_IO_TIMEOUT)
+}
+
+fn http_raw_with_io_timeout(socket_path: &Path, request: &[u8], io_timeout: Duration) -> String {
+    let request_line = http_request_line(request);
+    let mut stream = UnixStream::connect(socket_path).unwrap_or_else(|err| {
+        panic!(
+            "client should connect to {} for {request_line}: {err}",
+            socket_path.display()
+        )
+    });
     stream
-        .set_read_timeout(Some(HTTP_IO_TIMEOUT))
-        .expect("client should set read timeout");
+        .set_read_timeout(Some(io_timeout))
+        .unwrap_or_else(|err| {
+            panic!("client should set read timeout {io_timeout:?} for {request_line}: {err}")
+        });
     stream
-        .set_write_timeout(Some(HTTP_IO_TIMEOUT))
-        .expect("client should set write timeout");
-    stream
-        .write_all(request)
-        .expect("client should write request");
+        .set_write_timeout(Some(io_timeout))
+        .unwrap_or_else(|err| {
+            panic!("client should set write timeout {io_timeout:?} for {request_line}: {err}")
+        });
+    stream.write_all(request).unwrap_or_else(|err| {
+        panic!(
+            "client should write {} request bytes for {request_line} within {io_timeout:?}: {err}",
+            request.len()
+        )
+    });
 
     let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .expect("client should read response");
+    stream.read_to_string(&mut response).unwrap_or_else(|err| {
+        panic!("client should read response for {request_line} within {io_timeout:?}: {err}")
+    });
     response
 }
 
+fn http_request_line(request: &[u8]) -> String {
+    let line = request
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or(request);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    String::from_utf8_lossy(line).into_owned()
+}
+
 fn http_request(socket_path: &Path, method: &str, path: &str, body: Option<&str>) -> String {
+    http_request_with_io_timeout(socket_path, method, path, body, HTTP_IO_TIMEOUT)
+}
+
+fn http_request_with_io_timeout(
+    socket_path: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    io_timeout: Duration,
+) -> String {
     let mut request =
         format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
     if let Some(body) = body {
@@ -77,7 +123,7 @@ fn http_request(socket_path: &Path, method: &str, path: &str, body: Option<&str>
         request.push_str("\r\n");
     }
 
-    http_raw(socket_path, request.as_bytes())
+    http_raw_with_io_timeout(socket_path, request.as_bytes(), io_timeout)
 }
 
 pub(crate) fn path_text(path: &Path) -> &str {
@@ -530,5 +576,55 @@ fn force_kill(pid: u32) {
         && err.raw_os_error() != Some(libc::ESRCH)
     {
         panic!("failed to force-kill bangbang child {pid}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_json_with_io_timeout_reads_response_from_unix_socket() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let listener =
+            UnixListener::bind(&socket_path).expect("test API socket should be bindable");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("server should accept client");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 64];
+
+            while !request.ends_with(b"\r\n\r\n{}") {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("server should read request bytes");
+                assert_ne!(read, 0, "client should send request before closing");
+                request.extend_from_slice(&buffer[..read]);
+                assert!(
+                    request.len() <= 512,
+                    "helper request should stay bounded: {} bytes",
+                    request.len()
+                );
+            }
+
+            let request = String::from_utf8(request).expect("request should be UTF-8");
+            assert!(request.starts_with("PATCH /hotplug/memory HTTP/1.1\r\n"));
+            assert!(request.contains("Connection: close\r\n"));
+            assert!(request.contains("Content-Length: 2\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .expect("server should write response");
+        });
+
+        let response = http_json_with_io_timeout(
+            &socket_path,
+            "PATCH",
+            "/hotplug/memory",
+            "{}",
+            Duration::from_secs(1),
+        );
+
+        assert_no_content_response(&response, "fake PATCH /hotplug/memory");
+        server.join().expect("server thread should join");
     }
 }
