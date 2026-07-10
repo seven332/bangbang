@@ -32,6 +32,8 @@ pub(crate) fn minimal_arm64_boot_resource_config() -> Arm64BootResourceConfig<'s
         timer: Arm64FdtTimerInterrupts::firecracker_default(),
         rtc_device: None,
         serial_device: None,
+        vmgenid_interrupt_line: GuestInterruptLine::new(127)
+            .expect("test VMGenID interrupt line should be valid"),
         block_mmio_layout: BlockMmioLayout::new(
             GuestAddress::new(0x1000_0000),
             MmioRegionId::new(1000),

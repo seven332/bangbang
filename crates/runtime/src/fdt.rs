@@ -1731,16 +1731,45 @@ fn validate_vmgenid_region_does_not_overlap_memory(
     region: Arm64FdtRegion,
     vmgenid_range: GuestMemoryRange,
 ) -> Result<(), Arm64FdtError> {
-    for memory_range in layout.ranges().iter().copied() {
-        if vmgenid_range.overlaps(memory_range) {
+    for (range_index, memory_range) in layout.ranges().iter().copied().enumerate() {
+        let advertised_range = advertised_memory_range(range_index, memory_range)?;
+        if vmgenid_range.overlaps(advertised_range) {
             return Err(Arm64FdtError::VmGenIdRegionOverlapsMemory {
                 region,
-                memory_range,
+                memory_range: advertised_range,
             });
         }
     }
 
     Ok(())
+}
+
+fn advertised_memory_range(
+    range_index: usize,
+    memory_range: GuestMemoryRange,
+) -> Result<GuestMemoryRange, Arm64FdtError> {
+    if range_index != 0 {
+        return Ok(memory_range);
+    }
+
+    let start = memory_range
+        .start()
+        .checked_add(aarch64::SYSTEM_MEM_SIZE)
+        .ok_or(Arm64FdtError::InvalidLayout {
+            source: GuestMemoryError::AddressOverflow {
+                start: memory_range.start(),
+                size: aarch64::SYSTEM_MEM_SIZE,
+            },
+        })?;
+    let size = memory_range
+        .size()
+        .checked_sub(aarch64::SYSTEM_MEM_SIZE)
+        .ok_or(Arm64FdtError::NoGuestMemoryAfterSystemArea {
+            first_range: memory_range,
+            system_size: aarch64::SYSTEM_MEM_SIZE,
+        })?;
+
+    GuestMemoryRange::new(start, size).map_err(|source| Arm64FdtError::InvalidLayout { source })
 }
 
 fn validate_vmgenid_region_does_not_overlap_gic(
@@ -3006,7 +3035,11 @@ mod tests {
     #[test]
     fn rejects_vmgenid_region_overlapping_guest_memory() {
         let layout = test_layout(TEST_MEMORY_SIZE);
-        let vmgenid = vmgenid_device(aarch64::DRAM_MEM_START, ARM64_FDT_VMGENID_SIZE, 32);
+        let vmgenid = vmgenid_device(
+            aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE,
+            ARM64_FDT_VMGENID_SIZE,
+            32,
+        );
         let config = test_config_with_vmgenid_device(
             &layout,
             Arm64FdtBootInfo {
@@ -3022,8 +3055,40 @@ mod tests {
             err,
             Arm64FdtError::VmGenIdRegionOverlapsMemory {
                 region: vmgenid.region,
-                memory_range: layout.ranges()[0],
+                memory_range: GuestMemoryRange::new(
+                    GuestAddress::new(aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE),
+                    TEST_MEMORY_SIZE - aarch64::SYSTEM_MEM_SIZE,
+                )
+                .expect("advertised memory range should be valid"),
             }
+        );
+    }
+
+    #[test]
+    fn accepts_vmgenid_region_inside_reserved_system_memory() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmgenid = vmgenid_device(
+            aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE - ARM64_FDT_VMGENID_SIZE,
+            ARM64_FDT_VMGENID_SIZE,
+            32,
+        );
+        let config = test_config_with_vmgenid_device(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            vmgenid,
+        );
+
+        let bytes =
+            build_test_arm64_fdt(&config).expect("system-memory VMGenID should be accepted");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let vmgenid_node = required_node(&tree, "/vmgenid");
+
+        assert_eq!(
+            prop_u64_cells(vmgenid_node, "reg"),
+            vec![vmgenid.region.base, ARM64_FDT_VMGENID_SIZE]
         );
     }
 
