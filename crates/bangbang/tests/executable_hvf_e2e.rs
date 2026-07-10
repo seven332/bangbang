@@ -20,7 +20,7 @@ mod macos_arm64 {
     use crate::support::{
         BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
         assert_no_content_response, assert_ok_response, assert_response_contains, http_get,
-        http_json, http_no_body, http_put_json, json_string, path_text,
+        http_json, http_json_with_io_timeout, http_no_body, http_put_json, json_string, path_text,
     };
 
     const BANGBANG_GUEST_KERNEL_PATH_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
@@ -1713,11 +1713,12 @@ mod macos_arm64 {
             );
         }
 
-        let memory_hotplug_update = http_json(
+        let memory_hotplug_update = http_json_with_io_timeout(
             &socket_path,
             "PATCH",
             "/hotplug/memory",
             r#"{"requested_size_mib":128}"#,
+            GUEST_EXECUTION_TIMEOUT,
         );
         assert_no_content_response(
             &memory_hotplug_update,
