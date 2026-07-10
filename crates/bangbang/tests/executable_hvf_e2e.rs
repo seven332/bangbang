@@ -1351,6 +1351,89 @@ mod macos_arm64 {
     }
 
     #[test]
+    fn signed_executable_clears_serial_output_before_start() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let serial_output_path = test_dir.path().join("cleared-serial.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(
+            &machine_response,
+            "PUT /machine-config serial clear before start",
+        );
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let initrd_path_json = json_string(path_text(&initrd_path));
+        let boot_args_json = json_string(GUEST_BOOT_ARGS);
+        let boot_body = format!(
+            r#"{{
+                "kernel_image_path":{kernel_path_json},
+                "initrd_path":{initrd_path_json},
+                "boot_args":{boot_args_json}
+            }}"#
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(&boot_response, "PUT /boot-source serial clear before start");
+
+        let serial_output_path_json = json_string(path_text(&serial_output_path));
+        let serial_body = format!(r#"{{"serial_out_path":{serial_output_path_json}}}"#);
+        let serial_response = http_put_json(&socket_path, "/serial", &serial_body);
+        assert_no_content_response(&serial_response, "PUT /serial before clear");
+        assert!(
+            !serial_output_path.exists(),
+            "PUT /serial should store the candidate path without creating it before startup"
+        );
+
+        let serial_clear_response = http_put_json(&socket_path, "/serial", "{}");
+        assert_no_content_response(&serial_clear_response, "PUT /serial clear");
+        assert!(
+            !serial_output_path.exists(),
+            "PUT /serial clear must not create the candidate path before startup"
+        );
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(
+            &start_response,
+            "PUT /actions InstanceStart after serial clear",
+        );
+
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(
+            &running_instance_info,
+            "GET / after InstanceStart with cleared serial output",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after InstanceStart with cleared serial output",
+        );
+        assert!(
+            !serial_output_path.exists(),
+            "InstanceStart must not open or create a cleared serial output path at {}",
+            serial_output_path.display()
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang cleared serial output",
+        );
+    }
+
+    #[test]
     fn signed_executable_boot_timer_guest_write_logs_boot_time() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
