@@ -1352,9 +1352,20 @@ mod macos_arm64 {
 
     #[test]
     fn signed_executable_clears_serial_output_before_start() {
+        run_signed_executable_serial_clear_before_start("empty-object", "{}");
+    }
+
+    #[test]
+    fn signed_executable_clears_serial_output_with_null_before_start() {
+        run_signed_executable_serial_clear_before_start("null-path", r#"{"serial_out_path":null}"#);
+    }
+
+    fn run_signed_executable_serial_clear_before_start(case_name: &str, serial_clear_body: &str) {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
-        let serial_output_path = test_dir.path().join("cleared-serial.out");
+        let serial_output_path = test_dir
+            .path()
+            .join(format!("cleared-serial-{case_name}.out"));
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -1368,7 +1379,7 @@ mod macos_arm64 {
         );
         assert_no_content_response(
             &machine_response,
-            "PUT /machine-config serial clear before start",
+            &format!("PUT /machine-config serial clear before start {case_name}"),
         );
 
         let kernel_path_json = json_string(path_text(&kernel_path));
@@ -1382,19 +1393,28 @@ mod macos_arm64 {
             }}"#
         );
         let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
-        assert_no_content_response(&boot_response, "PUT /boot-source serial clear before start");
+        assert_no_content_response(
+            &boot_response,
+            &format!("PUT /boot-source serial clear before start {case_name}"),
+        );
 
         let serial_output_path_json = json_string(path_text(&serial_output_path));
         let serial_body = format!(r#"{{"serial_out_path":{serial_output_path_json}}}"#);
         let serial_response = http_put_json(&socket_path, "/serial", &serial_body);
-        assert_no_content_response(&serial_response, "PUT /serial before clear");
+        assert_no_content_response(
+            &serial_response,
+            &format!("PUT /serial before clear {case_name}"),
+        );
         assert!(
             !serial_output_path.exists(),
             "PUT /serial should store the candidate path without creating it before startup"
         );
 
-        let serial_clear_response = http_put_json(&socket_path, "/serial", "{}");
-        assert_no_content_response(&serial_clear_response, "PUT /serial clear");
+        let serial_clear_response = http_put_json(&socket_path, "/serial", serial_clear_body);
+        assert_no_content_response(
+            &serial_clear_response,
+            &format!("PUT /serial clear {case_name}"),
+        );
         assert!(
             !serial_output_path.exists(),
             "PUT /serial clear must not create the candidate path before startup"
@@ -1407,18 +1427,18 @@ mod macos_arm64 {
         );
         assert_no_content_response(
             &start_response,
-            "PUT /actions InstanceStart after serial clear",
+            &format!("PUT /actions InstanceStart after serial clear {case_name}"),
         );
 
         let running_instance_info = http_get(&socket_path, "/");
         assert_ok_response(
             &running_instance_info,
-            "GET / after InstanceStart with cleared serial output",
+            &format!("GET / after InstanceStart with cleared serial output {case_name}"),
         );
         assert_response_contains(
             &running_instance_info,
             r#""state":"Running""#,
-            "GET / after InstanceStart with cleared serial output",
+            &format!("GET / after InstanceStart with cleared serial output {case_name}"),
         );
         assert!(
             !serial_output_path.exists(),
@@ -1429,7 +1449,7 @@ mod macos_arm64 {
         assert_clean_shutdown(
             bangbang.terminate(),
             &socket_path,
-            "bangbang cleared serial output",
+            &format!("bangbang cleared serial output {case_name}"),
         );
     }
 
