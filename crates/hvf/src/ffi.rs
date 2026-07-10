@@ -5,6 +5,7 @@ pub(crate) type HvVcpu = u64;
 pub(crate) type HvExitReason = u32;
 pub(crate) type HvMemoryFlags = u64;
 pub(crate) type HvReg = u32;
+pub(crate) type HvSimdFpReg = u32;
 pub(crate) type HvSysReg = u16;
 
 pub(crate) const HV_MEMORY_READ: HvMemoryFlags = 1 << 0;
@@ -20,7 +21,11 @@ pub(crate) const HV_REG_X1: HvReg = 1;
 pub(crate) const HV_REG_X2: HvReg = 2;
 pub(crate) const HV_REG_X3: HvReg = 3;
 pub(crate) const HV_REG_PC: HvReg = 31;
+pub(crate) const HV_REG_FPCR: HvReg = 32;
+pub(crate) const HV_REG_FPSR: HvReg = 33;
 pub(crate) const HV_REG_CPSR: HvReg = 34;
+pub(crate) const HV_SIMD_FP_REG_Q0: HvSimdFpReg = 0;
+pub(crate) const HV_SIMD_FP_REG_Q31: HvSimdFpReg = 31;
 pub(crate) const HV_SYS_REG_MPIDR_EL1: HvSysReg = 0xc005;
 pub(crate) const HV_SYS_REG_SPSR_EL1: HvSysReg = 0xc200;
 pub(crate) const HV_SYS_REG_ELR_EL1: HvSysReg = 0xc201;
@@ -28,6 +33,20 @@ pub(crate) const HV_SYS_REG_SP_EL0: HvSysReg = 0xc208;
 pub(crate) const HV_SYS_REG_CNTV_CTL_EL0: HvSysReg = 0xdf19;
 pub(crate) const HV_SYS_REG_CNTV_CVAL_EL0: HvSysReg = 0xdf1a;
 pub(crate) const HV_SYS_REG_SP_EL1: HvSysReg = 0xe208;
+
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HvSimdFpValue([u8; 16]);
+
+impl HvSimdFpValue {
+    const fn zeroed() -> Self {
+        Self([0; 16])
+    }
+
+    const fn into_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +95,9 @@ mod imp {
 
     use bangbang_runtime::BackendError;
 
-    use super::{CreatedVcpu, HvMemoryFlags, HvReg, HvSysReg, HvVcpu, HvVcpuExit};
+    use super::{
+        CreatedVcpu, HvMemoryFlags, HvReg, HvSimdFpReg, HvSimdFpValue, HvSysReg, HvVcpu, HvVcpuExit,
+    };
 
     pub type HvReturn = i32;
     pub type HvVmConfig = *mut c_void;
@@ -114,6 +135,11 @@ mod imp {
         pub fn hv_vcpu_destroy(vcpu: HvVcpu) -> HvReturn;
         pub fn hv_vcpu_get_reg(vcpu: HvVcpu, reg: HvReg, value: *mut u64) -> HvReturn;
         pub fn hv_vcpu_set_reg(vcpu: HvVcpu, reg: HvReg, value: u64) -> HvReturn;
+        pub fn hv_vcpu_get_simd_fp_reg(
+            vcpu: HvVcpu,
+            reg: HvSimdFpReg,
+            value: *mut HvSimdFpValue,
+        ) -> HvReturn;
         pub fn hv_vcpu_get_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: *mut u64) -> HvReturn;
         pub fn hv_vcpu_set_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: u64) -> HvReturn;
         pub fn hv_vcpu_get_vtimer_mask(vcpu: HvVcpu, vtimer_is_masked: *mut bool) -> HvReturn;
@@ -299,6 +325,21 @@ mod imp {
         unsafe { check(hv_vcpu_set_reg(vcpu, reg, value), "hv_vcpu_set_reg") }
     }
 
+    pub fn get_simd_fp_reg(vcpu: HvVcpu, reg: HvSimdFpReg) -> Result<[u8; 16], BackendError> {
+        let mut value = HvSimdFpValue::zeroed();
+
+        // SAFETY: The caller owns this current-thread vCPU handle, and `value` is a valid,
+        // 16-byte-aligned out-pointer for the duration of the call.
+        unsafe {
+            check(
+                hv_vcpu_get_simd_fp_reg(vcpu, reg, &mut value),
+                "hv_vcpu_get_simd_fp_reg",
+            )?
+        };
+
+        Ok(value.into_bytes())
+    }
+
     pub fn get_sys_reg(vcpu: HvVcpu, reg: HvSysReg) -> Result<u64, BackendError> {
         let mut value = 0;
 
@@ -414,7 +455,10 @@ mod imp {
 
     use bangbang_runtime::BackendError;
 
-    use super::{CreatedVcpu, HvMemoryFlags, HvReg, HvSysReg, HvVcpu, UNSUPPORTED_TARGET_MESSAGE};
+    use super::{
+        CreatedVcpu, HvMemoryFlags, HvReg, HvSimdFpReg, HvSysReg, HvVcpu,
+        UNSUPPORTED_TARGET_MESSAGE,
+    };
 
     pub fn create_vm() -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
@@ -461,6 +505,10 @@ mod imp {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 
+    pub fn get_simd_fp_reg(_: HvVcpu, _: HvSimdFpReg) -> Result<[u8; 16], BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
     pub fn get_sys_reg(_: HvVcpu, _: HvSysReg) -> Result<u64, BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
@@ -492,7 +540,17 @@ pub(crate) use imp::*;
 mod tests {
     use std::mem::{align_of, offset_of, size_of};
 
-    use super::{HvVcpuExit, HvVcpuExitException};
+    use super::{
+        HV_SIMD_FP_REG_Q0, HV_SIMD_FP_REG_Q31, HvSimdFpValue, HvVcpuExit, HvVcpuExitException,
+    };
+
+    #[test]
+    fn simd_fp_value_layout_matches_hvf_sdk() {
+        assert_eq!(size_of::<HvSimdFpValue>(), 16);
+        assert_eq!(align_of::<HvSimdFpValue>(), 16);
+        assert_eq!(HV_SIMD_FP_REG_Q0, 0);
+        assert_eq!(HV_SIMD_FP_REG_Q31, 31);
+    }
 
     #[test]
     fn vcpu_exit_layout_matches_hvf_sdk() {
