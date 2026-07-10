@@ -1367,17 +1367,18 @@ PVTime until an HVF-specific capability and guest ABI design exists; for now it
 is platform-limited and deferred.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are
-not part of the minimal RTC device. The backend-neutral arm64 FDT builder can
-now emit a caller-supplied VMGenID node using Firecracker's DeviceTree shape:
-node name `vmgenid`, `compatible = "microsoft,vmgenid"`, a 16-byte `reg`
-region, and `interrupts = [SPI, line - 32, edge-rising]`. Direct FDT
-configuration validates that the VMGenID region is exactly 16 bytes, does not
-overflow, does not overlap guest RAM, GIC, RTC, serial, or virtio-mmio ranges,
-and that the interrupt line is an SPI INTID. This is still not guest-visible
-startup support: bangbang does not yet allocate the region during boot
-preparation, write generation IDs, signal VMGenID interrupts, persist VMGenID
-state, or perform snapshot/restore generation-counter updates. VMClock and full
-VMGenID restore behavior remain deferred to the snapshot work tracked by #543.
+not part of the minimal RTC device. The backend-neutral arm64 FDT builder emits
+Firecracker's VMGenID DeviceTree shape: node name `vmgenid`, compatible string
+`microsoft,vmgenid`, a 16-byte `reg` region, and `interrupts = [SPI, line - 32,
+edge-rising]`. Direct FDT configuration validates that the VMGenID region is
+exactly 16 bytes, does not overflow, does not overlap GIC, RTC, serial,
+virtio-mmio ranges, or RAM advertised through the FDT `/memory` node, and that
+the interrupt line is an SPI INTID. During startup, bangbang places the initial
+VMGenID buffer at the end of the reserved arm64 system-memory area, writes a
+non-zero 16-byte generation ID from host randomness, and passes the same region
+and an allocated SPI interrupt line to the FDT. Restore-time generation-ID
+updates, VMGenID interrupt signaling after restore, VMGenID state persistence,
+and VMClock remain deferred to later snapshot/time-device work tracked by #543.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest

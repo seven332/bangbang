@@ -269,6 +269,7 @@ pub struct HvfArm64BootSession<'vm> {
     entropy_interrupt_line: Option<GuestInterruptLine>,
     memory_hotplug_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
+    vmgenid_interrupt_line: GuestInterruptLine,
     boot_registers: HvfArm64BootRegisters,
 }
 
@@ -301,6 +302,7 @@ pub struct OwnedHvfArm64BootSession {
     entropy_interrupt_line: Option<GuestInterruptLine>,
     memory_hotplug_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
+    vmgenid_interrupt_line: GuestInterruptLine,
     boot_registers: HvfArm64BootRegisters,
 }
 
@@ -919,6 +921,10 @@ impl HvfArm64BootSession<'_> {
         self.serial_interrupt_line
     }
 
+    pub const fn vmgenid_interrupt_line(&self) -> GuestInterruptLine {
+        self.vmgenid_interrupt_line
+    }
+
     pub const fn boot_registers(&self) -> HvfArm64BootRegisters {
         self.boot_registers
     }
@@ -1323,6 +1329,7 @@ impl OwnedHvfArm64BootSession {
             entropy_interrupt_line: prepared.entropy_interrupt_line,
             memory_hotplug_interrupt_line: prepared.memory_hotplug_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
+            vmgenid_interrupt_line: prepared.vmgenid_interrupt_line,
             boot_registers: prepared.boot_registers,
         })
     }
@@ -1439,6 +1446,10 @@ impl OwnedHvfArm64BootSession {
 
     pub const fn serial_interrupt_line(&self) -> Option<GuestInterruptLine> {
         self.serial_interrupt_line
+    }
+
+    pub const fn vmgenid_interrupt_line(&self) -> GuestInterruptLine {
+        self.vmgenid_interrupt_line
     }
 
     pub const fn boot_registers(&self) -> HvfArm64BootRegisters {
@@ -4827,6 +4838,7 @@ pub enum HvfArm64BootInterruptLinePurpose {
     EntropyDevice,
     MemoryHotplugDevice,
     SerialDevice,
+    VmGenIdDevice,
 }
 
 impl fmt::Display for HvfArm64BootInterruptLinePurpose {
@@ -4840,6 +4852,7 @@ impl fmt::Display for HvfArm64BootInterruptLinePurpose {
             Self::EntropyDevice => f.write_str("entropy device"),
             Self::MemoryHotplugDevice => f.write_str("memory hotplug device"),
             Self::SerialDevice => f.write_str("serial device"),
+            Self::VmGenIdDevice => f.write_str("VMGenID device"),
         }
     }
 }
@@ -4899,6 +4912,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     entropy_interrupt_line: Option<GuestInterruptLine>,
     memory_hotplug_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
+    vmgenid_interrupt_line: GuestInterruptLine,
     boot_registers: HvfArm64BootRegisters,
 }
 
@@ -4912,6 +4926,7 @@ struct HvfArm64BootInterruptLines {
     entropy: Option<GuestInterruptLine>,
     memory_hotplug: Option<GuestInterruptLine>,
     serial: Option<GuestInterruptLine>,
+    vmgenid: GuestInterruptLine,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -4972,6 +4987,7 @@ impl HvfBackend {
             entropy_interrupt_line: prepared.entropy_interrupt_line,
             memory_hotplug_interrupt_line: prepared.memory_hotplug_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
+            vmgenid_interrupt_line: prepared.vmgenid_interrupt_line,
             boot_registers: prepared.boot_registers,
         })
     }
@@ -5034,6 +5050,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
             timer,
             rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),
             serial_device: runtime_serial,
+            vmgenid_interrupt_line: interrupt_lines.vmgenid,
             block_mmio_layout: config.block_mmio_layout,
             block_interrupt_lines: &interrupt_lines.block,
             pmem_mmio_layout: config.pmem_mmio_layout,
@@ -5146,6 +5163,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         entropy_interrupt_line: interrupt_lines.entropy,
         memory_hotplug_interrupt_line: interrupt_lines.memory_hotplug,
         serial_interrupt_line: interrupt_lines.serial,
+        vmgenid_interrupt_line: interrupt_lines.vmgenid,
         boot_registers,
     })
 }
@@ -5265,6 +5283,14 @@ fn allocate_interrupt_lines(
         None
     };
 
+    let vmgenid =
+        allocator
+            .allocate()
+            .map_err(|source| HvfArm64BootSessionError::AllocateInterruptLine {
+                purpose: HvfArm64BootInterruptLinePurpose::VmGenIdDevice,
+                source,
+            })?;
+
     Ok(HvfArm64BootInterruptLines {
         block,
         pmem,
@@ -5274,6 +5300,7 @@ fn allocate_interrupt_lines(
         entropy,
         memory_hotplug,
         serial,
+        vmgenid,
     })
 }
 
@@ -6559,6 +6586,7 @@ mod tests {
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
             rtc_device: None,
             serial_device: None,
+            vmgenid_interrupt_line: line(127),
             block_mmio_layout: BlockMmioLayout::new(TEST_BLOCK_MMIO_BASE, MmioRegionId::new(1)),
             block_interrupt_lines: block_lines,
             pmem_mmio_layout: PmemMmioLayout::new(TEST_PMEM_MMIO_BASE, MmioRegionId::new(25)),
@@ -11963,9 +11991,9 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_lines_allocate_memory_hotplug_before_serial() {
+    fn interrupt_lines_allocate_vmgenid_after_serial() {
         let lines = allocate_interrupt_lines(
-            &gic_with_spi_range(32, 11),
+            &gic_with_spi_range(32, 12),
             HvfArm64BootInterruptRequest {
                 block_device_count: 2,
                 pmem_device_count: 2,
@@ -11987,12 +12015,13 @@ mod tests {
         assert_eq!(lines.entropy.map(|line| line.raw_value()), Some(40));
         assert_eq!(lines.memory_hotplug.map(|line| line.raw_value()), Some(41));
         assert_eq!(lines.serial.map(|line| line.raw_value()), Some(42));
+        assert_eq!(lines.vmgenid.raw_value(), 43);
     }
 
     #[test]
     fn interrupt_lines_allocate_none_for_absent_serial() {
         let lines = allocate_interrupt_lines(
-            &gic_with_spi_range(40, 3),
+            &gic_with_spi_range(40, 4),
             HvfArm64BootInterruptRequest {
                 block_device_count: 2,
                 network_device_count: 1,
@@ -12009,6 +12038,27 @@ mod tests {
         assert_eq!(lines.entropy, None);
         assert_eq!(lines.memory_hotplug, None);
         assert_eq!(lines.serial, None);
+        assert_eq!(lines.vmgenid.raw_value(), 43);
+    }
+
+    #[test]
+    fn interrupt_lines_report_vmgenid_exhaustion_with_purpose() {
+        let err = allocate_interrupt_lines(
+            &gic_with_spi_range(32, 1),
+            HvfArm64BootInterruptRequest {
+                block_device_count: 1,
+                ..HvfArm64BootInterruptRequest::default()
+            },
+        )
+        .expect_err("VMGenID allocation should exhaust range after block");
+
+        assert!(matches!(
+            err,
+            HvfArm64BootSessionError::AllocateInterruptLine {
+                purpose: HvfArm64BootInterruptLinePurpose::VmGenIdDevice,
+                ..
+            }
+        ));
     }
 
     #[test]

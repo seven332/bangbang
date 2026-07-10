@@ -30,14 +30,15 @@ use crate::entropy::{
     VirtioRngOsEntropySource,
 };
 use crate::fdt::{
-    Arm64FdtBootInfo, Arm64FdtConfig, Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite,
-    Arm64FdtRegion, Arm64FdtRtcDevice, Arm64FdtSerialDevice, Arm64FdtTimerInterrupts,
-    Arm64FdtVirtioMmioDevice, write_arm64_fdt,
+    ARM64_FDT_VMGENID_SIZE, Arm64FdtBootInfo, Arm64FdtConfig, Arm64FdtError, Arm64FdtGic,
+    Arm64FdtGuestMemoryWrite, Arm64FdtRegion, Arm64FdtRtcDevice, Arm64FdtSerialDevice,
+    Arm64FdtTimerInterrupts, Arm64FdtVirtioMmioDevice, Arm64FdtVmGenIdDevice, write_arm64_fdt,
 };
 use crate::interrupt::GuestInterruptLine;
 use crate::machine::MachineConfig;
 use crate::memory::{
-    GuestMemory, GuestMemoryAllocationError, GuestMemoryError, GuestMemoryLayout, aarch64,
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError,
+    GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64,
 };
 use crate::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
@@ -71,6 +72,11 @@ use crate::vsock::{
 };
 
 const MIB: u64 = 1024 * 1024;
+pub const ARM64_BOOT_VMGENID_SIZE: usize = ARM64_FDT_VMGENID_SIZE as usize;
+const ARM64_BOOT_VMGENID_ALIGNMENT: u64 = 8;
+const ARM64_BOOT_VMGENID_ADDRESS: GuestAddress = GuestAddress::new(
+    aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE - ARM64_FDT_VMGENID_SIZE,
+);
 
 #[derive(Debug, Clone)]
 pub struct Arm64BootResourceConfig<'a> {
@@ -79,6 +85,7 @@ pub struct Arm64BootResourceConfig<'a> {
     pub timer: Arm64FdtTimerInterrupts,
     pub rtc_device: Option<Arm64BootRtcDeviceConfig>,
     pub serial_device: Option<Arm64BootSerialDeviceConfig>,
+    pub vmgenid_interrupt_line: GuestInterruptLine,
     pub block_mmio_layout: BlockMmioLayout,
     pub block_interrupt_lines: &'a [GuestInterruptLine],
     pub pmem_mmio_layout: PmemMmioLayout,
@@ -168,6 +175,7 @@ pub struct Arm64BootResources {
     pub mmio_dispatcher: MmioDispatcher,
     pub rtc_device: Option<Arm64BootRtcDevice>,
     pub serial_device: Option<Arm64BootSerialDevice>,
+    pub vmgenid_device: Arm64BootVmGenIdDevice,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
     pub pmem_mmio_devices: Vec<Arm64BootPmemDevice>,
@@ -193,6 +201,7 @@ pub struct Arm64BootRuntimeResources {
     pub fdt: Arm64FdtGuestMemoryWrite,
     pub rtc_device: Option<Arm64BootRtcDevice>,
     pub serial_device: Option<Arm64BootSerialDevice>,
+    pub vmgenid_device: Arm64BootVmGenIdDevice,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
     pub pmem_mmio_devices: Vec<Arm64BootPmemDevice>,
@@ -207,6 +216,13 @@ pub struct Arm64BootRuntimeResources {
 pub enum Arm64BootVsockWakeupFdsError {
     HandlerLookup { source: MmioHandlerLookupError },
     ResultAllocation { source: TryReserveError },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64BootVmGenIdDevice {
+    pub range: GuestMemoryRange,
+    pub generation_id: [u8; ARM64_BOOT_VMGENID_SIZE],
+    pub fdt_device: Arm64FdtVmGenIdDevice,
 }
 
 impl fmt::Display for Arm64BootVsockWakeupFdsError {
@@ -2007,6 +2023,13 @@ pub enum Arm64BootResourceError {
     RegisterSerialMmio {
         source: Box<Arm64BootSerialMmioRegistrationError>,
     },
+    VmGenIdRegion {
+        source: GuestMemoryError,
+    },
+    VmGenIdRandom,
+    VmGenIdGuestMemoryWrite {
+        source: GuestMemoryAccessError,
+    },
     BlockInterruptLineCount {
         devices: usize,
         lines: usize,
@@ -2131,6 +2154,16 @@ impl fmt::Display for Arm64BootResourceError {
             Self::RegisterSerialMmio { source } => {
                 write!(f, "failed to register serial MMIO device: {source}")
             }
+            Self::VmGenIdRegion { source } => {
+                write!(f, "failed to prepare VMGenID guest memory range: {source}")
+            }
+            Self::VmGenIdRandom => f.write_str("failed to generate VMGenID generation ID"),
+            Self::VmGenIdGuestMemoryWrite { source } => {
+                write!(
+                    f,
+                    "failed to write VMGenID generation ID into guest memory: {source}"
+                )
+            }
             Self::BlockInterruptLineCount { devices, lines } => write!(
                 f,
                 "block MMIO device count {devices} does not match interrupt line count {lines}"
@@ -2206,6 +2239,8 @@ impl std::error::Error for Arm64BootResourceError {
             Self::RegisterEntropyMmio { source } => Some(source.as_ref()),
             Self::RegisterRtcMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
+            Self::VmGenIdRegion { source } => Some(source),
+            Self::VmGenIdGuestMemoryWrite { source } => Some(source),
             Self::BlockDeviceMetadataAllocation { source } => Some(source),
             Self::PmemDeviceMetadataAllocation { source } => Some(source),
             Self::NetworkDeviceMetadataAllocation { source } => Some(source),
@@ -2217,6 +2252,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::MissingBootSource
             | Self::MemorySizeOverflow { .. }
             | Self::MemorySizeExceedsArchitecturalMaximum { .. }
+            | Self::VmGenIdRandom
             | Self::BlockInterruptLineCount { .. }
             | Self::PmemInterruptLineCount { .. }
             | Self::NetworkInterruptLineCount { .. }
@@ -2320,6 +2356,7 @@ impl Arm64BootResources {
             timer,
             rtc_device,
             serial_device,
+            vmgenid_interrupt_line,
             block_mmio_layout,
             block_interrupt_lines,
             pmem_mmio_layout,
@@ -2529,6 +2566,7 @@ impl Arm64BootResources {
             .transpose()?;
         let rtc_fdt_device = rtc_device.as_ref().map(|device| device.fdt_device);
         let serial_fdt_device = serial_device.as_ref().map(|device| device.fdt_device);
+        let vmgenid_device = create_initial_vmgenid_device(&mut memory, vmgenid_interrupt_line)?;
         let fdt = write_arm64_fdt(
             &Arm64FdtConfig {
                 layout: &layout,
@@ -2538,7 +2576,7 @@ impl Arm64BootResources {
                 timer,
                 rtc_device: rtc_fdt_device,
                 serial_device: serial_fdt_device,
-                vmgenid_device: None,
+                vmgenid_device: Some(vmgenid_device.fdt_device),
                 virtio_mmio_devices: &fdt_devices,
             },
             &mut memory,
@@ -2554,6 +2592,7 @@ impl Arm64BootResources {
             mmio_dispatcher,
             rtc_device,
             serial_device,
+            vmgenid_device,
             block_devices,
             pmem_devices,
             pmem_mmio_devices,
@@ -2576,6 +2615,7 @@ impl Arm64BootResources {
                 fdt: self.fdt,
                 rtc_device: self.rtc_device,
                 serial_device: self.serial_device,
+                vmgenid_device: self.vmgenid_device,
                 block_devices: self.block_devices,
                 pmem_devices: self.pmem_devices,
                 pmem_mmio_devices: self.pmem_mmio_devices,
@@ -2615,6 +2655,49 @@ fn boot_source_from_config(config: &BootSourceConfig) -> BootSource {
         source = source.with_boot_args(boot_args.to_string());
     }
     source
+}
+
+fn create_initial_vmgenid_device(
+    memory: &mut GuestMemory,
+    interrupt_line: GuestInterruptLine,
+) -> Result<Arm64BootVmGenIdDevice, Arm64BootResourceError> {
+    let range = initial_vmgenid_range()?;
+    let mut generation_id = [0; ARM64_BOOT_VMGENID_SIZE];
+    getrandom::fill(&mut generation_id).map_err(|_| Arm64BootResourceError::VmGenIdRandom)?;
+    ensure_nonzero_vmgenid_generation_id(&mut generation_id);
+    memory
+        .write_slice(&generation_id, range.start())
+        .map_err(|source| Arm64BootResourceError::VmGenIdGuestMemoryWrite { source })?;
+    let fdt_device = Arm64FdtVmGenIdDevice {
+        region: Arm64FdtRegion {
+            base: range.start().raw_value(),
+            size: range.size(),
+        },
+        interrupt_line,
+    };
+
+    Ok(Arm64BootVmGenIdDevice {
+        range,
+        generation_id,
+        fdt_device,
+    })
+}
+
+fn initial_vmgenid_range() -> Result<GuestMemoryRange, Arm64BootResourceError> {
+    let range = GuestMemoryRange::new(ARM64_BOOT_VMGENID_ADDRESS, ARM64_FDT_VMGENID_SIZE)
+        .map_err(|source| Arm64BootResourceError::VmGenIdRegion { source })?;
+    range
+        .validate_alignment(ARM64_BOOT_VMGENID_ALIGNMENT)
+        .map_err(|source| Arm64BootResourceError::VmGenIdRegion { source })?;
+    Ok(range)
+}
+
+fn ensure_nonzero_vmgenid_generation_id(generation_id: &mut [u8; ARM64_BOOT_VMGENID_SIZE]) {
+    if generation_id.iter().all(|byte| *byte == 0)
+        && let Some(first_byte) = generation_id.first_mut()
+    {
+        *first_byte = 1;
+    }
 }
 
 fn append_root_drive_command_line(
@@ -3027,16 +3110,18 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    use device_tree::DeviceTree;
+    use device_tree::{DeviceTree, Node};
 
     use super::{
-        Arm64BootEntropySource, Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
+        ARM64_BOOT_VMGENID_ADDRESS, ARM64_BOOT_VMGENID_SIZE, Arm64BootEntropySource,
+        Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
         Arm64BootNetworkNotificationOutcome, Arm64BootNetworkPacketIo,
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig,
         Arm64BootResourceError, Arm64BootResources, Arm64BootRtcDeviceConfig,
         Arm64BootRtcMmioRegistrationError, Arm64BootSerialDeviceConfig,
         Arm64BootSerialMmioRegistrationError, MIB, arm64_boot_network_device_metadata,
         balloon_hinting_status_for_device, balloon_stats_for_device, block_device_metadata,
+        ensure_nonzero_vmgenid_generation_id, initial_vmgenid_range,
         start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
         update_balloon_config_for_device, update_balloon_statistics_for_device,
         update_block_device_for_devices_with_opened,
@@ -3066,10 +3151,12 @@ mod tests {
         VirtioRngEntropySource, VirtioRngEntropySourceError, VirtioRngMmioHandler,
         VirtioRngOsEntropySource,
     };
-    use crate::fdt::{Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
+    use crate::fdt::{
+        ARM64_FDT_VMGENID_SIZE, Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts,
+    };
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::{MachineConfig, MachineConfigInput};
-    use crate::memory::{GuestAddress, aarch64};
+    use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange, aarch64};
     use crate::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
         VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
@@ -3407,6 +3494,7 @@ mod tests {
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
             rtc_device: None,
             serial_device: None,
+            vmgenid_interrupt_line: line(127),
             block_mmio_layout: crate::block::BlockMmioLayout::new(
                 TEST_BLOCK_MMIO_BASE,
                 MmioRegionId::new(1),
@@ -5613,6 +5701,26 @@ mod tests {
         DeviceTree::load(&bytes).expect("assembled FDT should parse")
     }
 
+    fn prop_u32_cells(node: &Node, name: &str) -> Vec<u32> {
+        node.prop_raw(name)
+            .expect("property should exist")
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
+    }
+
+    fn prop_u64_cells(node: &Node, name: &str) -> Vec<u64> {
+        node.prop_raw(name)
+            .expect("property should exist")
+            .chunks_exact(8)
+            .map(|chunk| {
+                u64::from_be_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])
+            })
+            .collect()
+    }
+
     fn fdt_bootargs(resources: &Arm64BootResources) -> String {
         read_fdt(resources)
             .find("/chosen")
@@ -5658,6 +5766,127 @@ mod tests {
         assert!(read_fdt(&resources).find("/virtio_mmio@40006000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40007000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40008000").is_none());
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_initial_vmgenid() {
+        let kernel = temp_file("kernel-with-vmgenid", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+
+        let device = resources.vmgenid_device;
+        assert_eq!(device.range.start(), ARM64_BOOT_VMGENID_ADDRESS);
+        assert_eq!(device.range.size(), ARM64_FDT_VMGENID_SIZE);
+        assert_eq!(
+            device.range.end_exclusive().raw_value(),
+            aarch64::kernel_load_address().raw_value()
+        );
+        assert_eq!(
+            device.fdt_device.region.base,
+            ARM64_BOOT_VMGENID_ADDRESS.raw_value()
+        );
+        assert_eq!(device.fdt_device.region.size, ARM64_FDT_VMGENID_SIZE);
+        assert_eq!(device.fdt_device.interrupt_line, line(127));
+        assert!(device.generation_id.iter().any(|byte| *byte != 0));
+        assert_eq!(
+            read_guest_bytes(
+                &resources.memory,
+                device.range.start(),
+                ARM64_BOOT_VMGENID_SIZE
+            ),
+            device.generation_id.to_vec()
+        );
+
+        let tree = read_fdt(&resources);
+        let memory = tree
+            .find("/memory@ram")
+            .expect("memory node should be in assembled FDT");
+        assert_eq!(
+            prop_u64_cells(memory, "reg"),
+            vec![
+                aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE,
+                TEST_MEMORY_MIB * MIB - aarch64::SYSTEM_MEM_SIZE,
+            ]
+        );
+        let vmgenid = tree
+            .find("/vmgenid")
+            .expect("VMGenID node should be in assembled FDT");
+        assert_eq!(vmgenid.prop_str("compatible").unwrap(), "microsoft,vmgenid");
+        assert_eq!(
+            prop_u64_cells(vmgenid, "reg"),
+            vec![
+                ARM64_BOOT_VMGENID_ADDRESS.raw_value(),
+                ARM64_FDT_VMGENID_SIZE
+            ]
+        );
+        assert_eq!(prop_u32_cells(vmgenid, "interrupts"), vec![0, 95, 1]);
+        assert!(!vmgenid.has_prop("interrupt-parent"));
+    }
+
+    #[test]
+    fn vmgenid_range_matches_firecracker_system_memory_last_match() {
+        let range = initial_vmgenid_range().expect("VMGenID range should be valid");
+
+        assert_eq!(range.start(), ARM64_BOOT_VMGENID_ADDRESS);
+        assert_eq!(range.size(), ARM64_FDT_VMGENID_SIZE);
+        assert_eq!(
+            range.end_exclusive().raw_value(),
+            aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE
+        );
+        assert_eq!(
+            range.start().raw_value() % super::ARM64_BOOT_VMGENID_ALIGNMENT,
+            0
+        );
+    }
+
+    #[test]
+    fn vmgenid_zero_generation_id_is_normalized() {
+        let mut generation_id = [0; ARM64_BOOT_VMGENID_SIZE];
+
+        ensure_nonzero_vmgenid_generation_id(&mut generation_id);
+
+        assert!(generation_id.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn vmgenid_guest_memory_write_failure_fails_startup_resource_creation() {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), aarch64::SYSTEM_MEM_SIZE)
+                .expect("test range should be valid"),
+        ])
+        .expect("test layout should be valid");
+        let mut memory = GuestMemory::allocate(&layout).expect("test memory should allocate");
+
+        let err = super::create_initial_vmgenid_device(&mut memory, line(127))
+            .expect_err("unmapped VMGenID range should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::VmGenIdGuestMemoryWrite { .. }
+        ));
+    }
+
+    #[test]
+    fn non_spi_vmgenid_interrupt_line_fails_during_fdt_write() {
+        let kernel = temp_file("kernel-vmgenid-non-spi", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let config = Arm64BootResourceConfig {
+            vmgenid_interrupt_line: line(31),
+            ..valid_config(&[])
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("non-SPI VMGenID interrupt should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::Fdt {
+                source: Arm64FdtError::InvalidVmGenIdInterrupt { .. }
+            }
+        ));
     }
 
     #[test]
