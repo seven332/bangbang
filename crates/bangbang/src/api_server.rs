@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{Read, Write};
@@ -616,7 +617,7 @@ fn handle_request_bytes_with_limit(
     match parse_request_with_limit(bytes, http_api_max_payload_size) {
         Ok(request) => {
             let (method, path) = api_request_log_method_path(&request);
-            match vmm.log_api_request(method, &path) {
+            match vmm.log_api_request(method, path.as_ref()) {
                 Ok(_) => handle_api_request(request, vmm),
                 Err(err) => handle_empty(Err(err)),
             }
@@ -636,59 +637,78 @@ fn handle_request_bytes_with_limit(
     }
 }
 
-fn api_request_log_method_path(request: &ApiRequest) -> (&'static str, String) {
+fn api_request_log_method_path(request: &ApiRequest) -> (&'static str, Cow<'static, str>) {
     match request {
-        ApiRequest::GetInstanceInfo => ("Get", "/".to_string()),
-        ApiRequest::GetBalloon => ("Get", "/balloon".to_string()),
-        ApiRequest::GetBalloonStats => ("Get", "/balloon/statistics".to_string()),
-        ApiRequest::GetBalloonHintingStatus => ("Get", "/balloon/hinting/status".to_string()),
-        ApiRequest::GetMemoryHotplug => ("Get", "/hotplug/memory".to_string()),
-        ApiRequest::GetMachineConfig => ("Get", "/machine-config".to_string()),
-        ApiRequest::GetMmds => ("Get", "/mmds".to_string()),
-        ApiRequest::GetVmConfig => ("Get", "/vm/config".to_string()),
-        ApiRequest::GetVersion => ("Get", "/version".to_string()),
-        ApiRequest::PutAction(_) => ("Put", "/actions".to_string()),
-        ApiRequest::PutBalloon(_) => ("Put", "/balloon".to_string()),
-        ApiRequest::PutBootSource(_) => ("Put", "/boot-source".to_string()),
-        ApiRequest::PutCpuConfig(_) => ("Put", "/cpu-config".to_string()),
-        ApiRequest::PutDrive(config) => ("Put", format!("/drives/{}", config.path_drive_id())),
-        ApiRequest::PutEntropy(_) => ("Put", "/entropy".to_string()),
-        ApiRequest::PutMemoryHotplug(_) => ("Put", "/hotplug/memory".to_string()),
-        ApiRequest::PatchBalloon(_) => ("Patch", "/balloon".to_string()),
-        ApiRequest::PatchBalloonStats(_) => ("Patch", "/balloon/statistics".to_string()),
-        ApiRequest::PatchBalloonHintingStart(_) => ("Patch", "/balloon/hinting/start".to_string()),
-        ApiRequest::PatchBalloonHintingStop => ("Patch", "/balloon/hinting/stop".to_string()),
-        ApiRequest::PatchMemoryHotplug(_) => ("Patch", "/hotplug/memory".to_string()),
-        ApiRequest::PatchDrive(config) => ("Patch", format!("/drives/{}", config.path_drive_id())),
-        ApiRequest::PatchVmState(_) => ("Patch", "/vm".to_string()),
-        ApiRequest::PutLogger(_) => ("Put", "/logger".to_string()),
-        ApiRequest::PutMachineConfig(_) => ("Put", "/machine-config".to_string()),
-        ApiRequest::PatchMachineConfig(_) => ("Patch", "/machine-config".to_string()),
-        ApiRequest::PutMetrics(_) => ("Put", "/metrics".to_string()),
-        ApiRequest::PutMmds(_) => ("Put", "/mmds".to_string()),
-        ApiRequest::PutMmdsConfig(_) => ("Put", "/mmds/config".to_string()),
+        ApiRequest::GetInstanceInfo => ("Get", Cow::Borrowed("/")),
+        ApiRequest::GetBalloon => ("Get", Cow::Borrowed("/balloon")),
+        ApiRequest::GetBalloonStats => ("Get", Cow::Borrowed("/balloon/statistics")),
+        ApiRequest::GetBalloonHintingStatus => ("Get", Cow::Borrowed("/balloon/hinting/status")),
+        ApiRequest::GetMemoryHotplug => ("Get", Cow::Borrowed("/hotplug/memory")),
+        ApiRequest::GetMachineConfig => ("Get", Cow::Borrowed("/machine-config")),
+        ApiRequest::GetMmds => ("Get", Cow::Borrowed("/mmds")),
+        ApiRequest::GetVmConfig => ("Get", Cow::Borrowed("/vm/config")),
+        ApiRequest::GetVersion => ("Get", Cow::Borrowed("/version")),
+        ApiRequest::PutAction(_) => ("Put", Cow::Borrowed("/actions")),
+        ApiRequest::PutBalloon(_) => ("Put", Cow::Borrowed("/balloon")),
+        ApiRequest::PutBootSource(_) => ("Put", Cow::Borrowed("/boot-source")),
+        ApiRequest::PutCpuConfig(_) => ("Put", Cow::Borrowed("/cpu-config")),
+        ApiRequest::PutDrive(config) => (
+            "Put",
+            Cow::Owned(format!("/drives/{}", config.path_drive_id())),
+        ),
+        ApiRequest::PutEntropy(_) => ("Put", Cow::Borrowed("/entropy")),
+        ApiRequest::PutMemoryHotplug(_) => ("Put", Cow::Borrowed("/hotplug/memory")),
+        ApiRequest::PatchBalloon(_) => ("Patch", Cow::Borrowed("/balloon")),
+        ApiRequest::PatchBalloonStats(_) => ("Patch", Cow::Borrowed("/balloon/statistics")),
+        ApiRequest::PatchBalloonHintingStart(_) => {
+            ("Patch", Cow::Borrowed("/balloon/hinting/start"))
+        }
+        ApiRequest::PatchBalloonHintingStop => ("Patch", Cow::Borrowed("/balloon/hinting/stop")),
+        ApiRequest::PatchMemoryHotplug(_) => ("Patch", Cow::Borrowed("/hotplug/memory")),
+        ApiRequest::PatchDrive(config) => (
+            "Patch",
+            Cow::Owned(format!("/drives/{}", config.path_drive_id())),
+        ),
+        ApiRequest::PatchVmState(_) => ("Patch", Cow::Borrowed("/vm")),
+        ApiRequest::PutLogger(_) => ("Put", Cow::Borrowed("/logger")),
+        ApiRequest::PutMachineConfig(_) => ("Put", Cow::Borrowed("/machine-config")),
+        ApiRequest::PatchMachineConfig(_) => ("Patch", Cow::Borrowed("/machine-config")),
+        ApiRequest::PutMetrics(_) => ("Put", Cow::Borrowed("/metrics")),
+        ApiRequest::PutMmds(_) => ("Put", Cow::Borrowed("/mmds")),
+        ApiRequest::PutMmdsConfig(_) => ("Put", Cow::Borrowed("/mmds/config")),
         ApiRequest::PutNetworkInterface(config) => (
             "Put",
-            format!("/network-interfaces/{}", config.path_iface_id()),
+            Cow::Owned(format!("/network-interfaces/{}", config.path_iface_id())),
         ),
         ApiRequest::PatchNetworkInterface(config) => (
             "Patch",
-            format!("/network-interfaces/{}", config.path_iface_id()),
+            Cow::Owned(format!("/network-interfaces/{}", config.path_iface_id())),
         ),
         ApiRequest::HotUnplugDevice(request) => match request.kind() {
-            ApiHotUnplugDeviceKind::Drive => ("Delete", format!("/drives/{}", request.id())),
-            ApiHotUnplugDeviceKind::NetworkInterface => {
-                ("Delete", format!("/network-interfaces/{}", request.id()))
+            ApiHotUnplugDeviceKind::Drive => {
+                ("Delete", Cow::Owned(format!("/drives/{}", request.id())))
             }
-            ApiHotUnplugDeviceKind::Pmem => ("Delete", format!("/pmem/{}", request.id())),
+            ApiHotUnplugDeviceKind::NetworkInterface => (
+                "Delete",
+                Cow::Owned(format!("/network-interfaces/{}", request.id())),
+            ),
+            ApiHotUnplugDeviceKind::Pmem => {
+                ("Delete", Cow::Owned(format!("/pmem/{}", request.id())))
+            }
         },
-        ApiRequest::PutPmem(config) => ("Put", format!("/pmem/{}", config.path_pmem_id())),
-        ApiRequest::PatchPmem(config) => ("Patch", format!("/pmem/{}", config.path_pmem_id())),
-        ApiRequest::PutSerial(_) => ("Put", "/serial".to_string()),
-        ApiRequest::PutSnapshotCreate(_) => ("Put", "/snapshot/create".to_string()),
-        ApiRequest::PutSnapshotLoad(_) => ("Put", "/snapshot/load".to_string()),
-        ApiRequest::PutVsock(_) => ("Put", "/vsock".to_string()),
-        ApiRequest::PatchMmds(_) => ("Patch", "/mmds".to_string()),
+        ApiRequest::PutPmem(config) => (
+            "Put",
+            Cow::Owned(format!("/pmem/{}", config.path_pmem_id())),
+        ),
+        ApiRequest::PatchPmem(config) => (
+            "Patch",
+            Cow::Owned(format!("/pmem/{}", config.path_pmem_id())),
+        ),
+        ApiRequest::PutSerial(_) => ("Put", Cow::Borrowed("/serial")),
+        ApiRequest::PutSnapshotCreate(_) => ("Put", Cow::Borrowed("/snapshot/create")),
+        ApiRequest::PutSnapshotLoad(_) => ("Put", Cow::Borrowed("/snapshot/load")),
+        ApiRequest::PutVsock(_) => ("Put", Cow::Borrowed("/vsock")),
+        ApiRequest::PatchMmds(_) => ("Patch", Cow::Borrowed("/mmds")),
     }
 }
 
