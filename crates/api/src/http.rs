@@ -3871,6 +3871,20 @@ mod tests {
     }
 
     #[test]
+    fn body_required_mutating_requests_without_body_use_empty_faults() {
+        for (method, path, expected) in [
+            ("PUT", "/actions", RequestError::EmptyPutRequest),
+            ("PATCH", "/vm", RequestError::EmptyPatchRequest),
+        ] {
+            assert_eq!(
+                parse_request(&request_without_body(method, path)),
+                Err(expected),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
     fn identifies_put_api_request_metric_endpoints_from_request_head() {
         for (path, endpoint) in [
             ("/actions", ApiRequestMetricPutEndpoint::Actions),
