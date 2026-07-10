@@ -1864,6 +1864,21 @@ fn executable_configures_vm_before_start() {
         "GET / after failed PATCH /vm resumed",
     );
 
+    let malformed_vm_state_response =
+        http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Running"}"#);
+    assert_bad_request_response(&malformed_vm_state_response, "PATCH /vm running");
+    assert_response_contains(
+        &malformed_vm_state_response,
+        r#"{"fault_message":"Malformed HTTP request."}"#,
+        "PATCH /vm running",
+    );
+    let instance_info_after_malformed_vm_state = http_get(&socket_path, "/");
+    assert_response_contains(
+        &instance_info_after_malformed_vm_state,
+        r#""state":"Not started""#,
+        "GET / after malformed PATCH /vm running",
+    );
+
     let flush_metrics_response = http_put_json(
         &socket_path,
         "/actions",
