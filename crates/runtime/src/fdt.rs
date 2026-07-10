@@ -1214,27 +1214,9 @@ fn validate_memory_ranges(layout: &GuestMemoryLayout) -> Result<(), Arm64FdtErro
 fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtError> {
     let mut cells = Vec::with_capacity(memory_reg_cell_count(layout)?);
     for (range_index, range) in layout.ranges().iter().copied().enumerate() {
-        if range_index == 0 {
-            let start = range.start().checked_add(aarch64::SYSTEM_MEM_SIZE).ok_or(
-                Arm64FdtError::InvalidLayout {
-                    source: GuestMemoryError::AddressOverflow {
-                        start: range.start(),
-                        size: aarch64::SYSTEM_MEM_SIZE,
-                    },
-                },
-            )?;
-            cells.push(start.raw_value());
-            let size = range.size().checked_sub(aarch64::SYSTEM_MEM_SIZE).ok_or(
-                Arm64FdtError::NoGuestMemoryAfterSystemArea {
-                    first_range: range,
-                    system_size: aarch64::SYSTEM_MEM_SIZE,
-                },
-            )?;
-            cells.push(size);
-        } else {
-            cells.push(range.start().raw_value());
-            cells.push(range.size());
-        }
+        let advertised_range = advertised_memory_range(range_index, range)?;
+        cells.push(advertised_range.start().raw_value());
+        cells.push(advertised_range.size());
     }
 
     Ok(cells)
