@@ -328,7 +328,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v27.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v28.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -373,11 +373,16 @@ When the boot args include `bangbang.vmgenid-check=1`, the same init script
 checks Linux device-tree evidence for `/vmgenid`, verifies the
 `microsoft,vmgenid` compatible string and 16-byte `reg` property tuple, and
 writes `BANGBANG_VMGENID_GUEST_CHECK_OK`.
-Startup VMClock coverage is currently unit-level: runtime tests verify the
-Firecracker-shaped `amazon,vmclock` FDT node, the non-overlapping page-aligned
-reserved backing page, and the minimal initialized ABI fields, while HVF unit
-tests verify deterministic SPI allocation. Do not treat this as signed guest
-VMClock restore or generation-counter coverage.
+When the boot args include `bangbang.vmclock-check=1`, the same init script
+checks Linux device-tree evidence for a Firecracker-shaped `amazon,vmclock`
+`ptp@...` node, verifies its 16-byte `reg` property tuple, checks that the
+guest-visible region size is 4 KiB, and writes
+`BANGBANG_VMCLOCK_GUEST_CHECK_OK`.
+Startup VMClock restore and interrupt coverage is still intentionally limited:
+runtime tests verify the initialized ABI fields, HVF unit tests verify
+deterministic SPI allocation, and signed executable coverage proves only guest
+visibility at startup. Do not treat this as signed guest VMClock restore or
+generation-counter coverage.
 When the boot args include `bangbang.block-writeback-flush=1`, the same init
 script opens `/dev/vdb`, writes a deterministic pre-flush marker, calls `fsync`
 on that block-device file descriptor, and writes

@@ -1385,10 +1385,13 @@ serial, virtio-mmio, VMGenID, or FDT-advertised RAM ranges, and that the
 interrupt line is an SPI INTID. During startup, bangbang places the VMClock
 page at the end of the reserved arm64 system-memory area, writes the minimal
 Firecracker VMClock ABI fields for guest discovery, and leaves unsupported time
-fields zeroed. Restore-time generation-ID and VMClock generation-counter
-updates, VMGenID/VMClock interrupt signaling after restore, VMGenID state
-persistence, and VMClock restore semantics remain deferred to later
-snapshot/time-device work tracked by #543.
+fields zeroed. Signed executable direct-rootfs coverage checks that Linux
+observes the startup `amazon,vmclock` `ptp@...` device-tree node with a 16-byte
+`reg` property tuple and 4 KiB region size through the public `bangbang` startup
+path. Restore-time generation-ID and VMClock generation-counter updates,
+VMGenID/VMClock interrupt signaling after restore, VMGenID state persistence,
+and VMClock restore semantics remain deferred to later snapshot/time-device
+work tracked by #543.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
