@@ -45,6 +45,7 @@ const CONFIG_FILE_MAX_BYTES: usize = 1024 * 1024;
 const METADATA_FILE_MAX_BYTES: usize = CONFIG_FILE_MAX_BYTES;
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
+const FIRECRACKER_DEFAULT_NOFILE_LIMIT: RawFd = 2048;
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &["enable-pci", "no-seccomp", "seccomp-filter"];
 
 fn main() -> ExitCode {
@@ -75,6 +76,7 @@ fn run() -> Result<(), ProcessError> {
         }
         Command::Run(config) => {
             let config = *config;
+            preallocate_fdtable().map_err(ProcessError::FdTablePreallocation)?;
             let effective_mmds_size_limit = config.effective_mmds_size_limit();
             let StartupConfig {
                 api_sock,
@@ -708,6 +710,108 @@ where
     Args::parse_os(args).map_err(ProcessError::from)
 }
 
+fn preallocate_fdtable() -> Result<(), FdTablePreallocationError> {
+    let mut ops = SystemFdTablePreallocationOps;
+    preallocate_fdtable_with(&mut ops).map(|_| ())
+}
+
+fn preallocate_fdtable_with(
+    ops: &mut impl FdTablePreallocationOps,
+) -> Result<bool, FdTablePreallocationError> {
+    let Ok(soft_limit) = ops.soft_limit() else {
+        return Ok(false);
+    };
+    let Some(min_fd) = fdtable_preallocation_min_fd(soft_limit) else {
+        return Ok(false);
+    };
+    let Ok(fd) = ops.duplicate_at_or_above(libc::STDIN_FILENO, min_fd) else {
+        return Ok(false);
+    };
+
+    ops.close(fd).map_err(FdTablePreallocationError::Close)?;
+    Ok(true)
+}
+
+fn fdtable_preallocation_min_fd(soft_limit: libc::rlim_t) -> Option<RawFd> {
+    let limit = if soft_limit == libc::RLIM_INFINITY {
+        FIRECRACKER_DEFAULT_NOFILE_LIMIT
+    } else {
+        RawFd::try_from(soft_limit).unwrap_or(FIRECRACKER_DEFAULT_NOFILE_LIMIT)
+    };
+
+    (limit > libc::STDERR_FILENO + 1).then_some(limit - 1)
+}
+
+trait FdTablePreallocationOps {
+    fn soft_limit(&mut self) -> Result<libc::rlim_t, std::io::ErrorKind>;
+
+    fn duplicate_at_or_above(
+        &mut self,
+        source_fd: RawFd,
+        min_fd: RawFd,
+    ) -> Result<RawFd, std::io::ErrorKind>;
+
+    fn close(&mut self, fd: RawFd) -> Result<(), std::io::ErrorKind>;
+}
+
+#[derive(Debug)]
+struct SystemFdTablePreallocationOps;
+
+impl FdTablePreallocationOps for SystemFdTablePreallocationOps {
+    fn soft_limit(&mut self) -> Result<libc::rlim_t, std::io::ErrorKind> {
+        let mut limit = MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `limit` points to writable memory for one `rlimit` value.
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error().kind());
+        }
+
+        // SAFETY: `getrlimit` succeeded and initialized `limit`.
+        Ok(unsafe { limit.assume_init() }.rlim_cur)
+    }
+
+    fn duplicate_at_or_above(
+        &mut self,
+        source_fd: RawFd,
+        min_fd: RawFd,
+    ) -> Result<RawFd, std::io::ErrorKind> {
+        // SAFETY: `fcntl` validates `source_fd` and `min_fd`. `F_DUPFD_CLOEXEC`
+        // allocates a new descriptor and does not overwrite existing ones.
+        let fd = unsafe { libc::fcntl(source_fd, libc::F_DUPFD_CLOEXEC, min_fd) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().kind());
+        }
+
+        Ok(fd)
+    }
+
+    fn close(&mut self, fd: RawFd) -> Result<(), std::io::ErrorKind> {
+        // SAFETY: `fd` was returned by `duplicate_at_or_above` on this path.
+        if unsafe { libc::close(fd) } < 0 {
+            return Err(std::io::Error::last_os_error().kind());
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FdTablePreallocationError {
+    Close(std::io::ErrorKind),
+}
+
+impl fmt::Display for FdTablePreallocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Close(kind) => {
+                write!(f, "failed to close preallocated file descriptor: {kind:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FdTablePreallocationError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessExitCode {
     ProcessFailure = 1,
@@ -738,6 +842,7 @@ enum ProcessError {
     ArgumentParsing(String),
     BadConfiguration(String),
     ConfigFile(ConfigFileError),
+    FdTablePreallocation(FdTablePreallocationError),
     Metadata(MetadataFileError),
     PeriodicBalloonStatisticsUpdate(VmmActionError),
     PeriodicMetricsFlush(VmmActionError),
@@ -755,6 +860,7 @@ impl ProcessError {
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
             Self::BadConfiguration(_) => ProcessExitCode::BadConfiguration,
             Self::ConfigFile(_) => ProcessExitCode::BadConfiguration,
+            Self::FdTablePreallocation(_) => ProcessExitCode::ProcessFailure,
             Self::Metadata(_) => ProcessExitCode::BadConfiguration,
             Self::PeriodicBalloonStatisticsUpdate(_) => ProcessExitCode::ProcessFailure,
             Self::PeriodicMetricsFlush(_) => ProcessExitCode::ProcessFailure,
@@ -774,6 +880,9 @@ impl fmt::Display for ProcessError {
             Self::ArgumentParsing(message) => f.write_str(message),
             Self::BadConfiguration(message) => f.write_str(message),
             Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
+            Self::FdTablePreallocation(err) => {
+                write!(f, "file descriptor table preallocation failed: {err}")
+            }
             Self::Metadata(err) => write!(f, "metadata error: {err}"),
             Self::PeriodicBalloonStatisticsUpdate(err) => {
                 write!(
@@ -1891,7 +2000,7 @@ fn snapshot_unsupported_error() -> ProcessError {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
@@ -1960,6 +2069,67 @@ mod tests {
                     "failed to assemble arm64 boot resources: {source}"
                 ))
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeFdTablePreallocationOps {
+        soft_limit: Result<libc::rlim_t, ErrorKind>,
+        duplicate_result: Result<RawFd, ErrorKind>,
+        close_result: Result<(), ErrorKind>,
+        duplicate_calls: Vec<(RawFd, RawFd)>,
+        close_calls: Vec<RawFd>,
+    }
+
+    impl FakeFdTablePreallocationOps {
+        fn with_soft_limit(soft_limit: libc::rlim_t) -> Self {
+            Self {
+                soft_limit: Ok(soft_limit),
+                duplicate_result: Ok(99),
+                close_result: Ok(()),
+                duplicate_calls: Vec::new(),
+                close_calls: Vec::new(),
+            }
+        }
+
+        fn with_soft_limit_error(kind: ErrorKind) -> Self {
+            Self {
+                soft_limit: Err(kind),
+                duplicate_result: Ok(99),
+                close_result: Ok(()),
+                duplicate_calls: Vec::new(),
+                close_calls: Vec::new(),
+            }
+        }
+
+        fn with_duplicate_error(mut self, kind: ErrorKind) -> Self {
+            self.duplicate_result = Err(kind);
+            self
+        }
+
+        fn with_close_error(mut self, kind: ErrorKind) -> Self {
+            self.close_result = Err(kind);
+            self
+        }
+    }
+
+    impl super::FdTablePreallocationOps for FakeFdTablePreallocationOps {
+        fn soft_limit(&mut self) -> Result<libc::rlim_t, ErrorKind> {
+            self.soft_limit
+        }
+
+        fn duplicate_at_or_above(
+            &mut self,
+            source_fd: RawFd,
+            min_fd: RawFd,
+        ) -> Result<RawFd, ErrorKind> {
+            self.duplicate_calls.push((source_fd, min_fd));
+            self.duplicate_result
+        }
+
+        fn close(&mut self, fd: RawFd) -> Result<(), ErrorKind> {
+            self.close_calls.push(fd);
+            self.close_result
         }
     }
 
@@ -2277,6 +2447,9 @@ mod tests {
     #[test]
     fn runtime_process_errors_stay_on_process_failure_exit_code() {
         for err in [
+            ProcessError::FdTablePreallocation(super::FdTablePreallocationError::Close(
+                ErrorKind::BrokenPipe,
+            )),
             ProcessError::PeriodicBalloonStatisticsUpdate(VmmActionError::BalloonUnsupported),
             ProcessError::PeriodicMetricsFlush(VmmActionError::EntropyUnsupported),
             ProcessError::ProcessExitNotification(std::io::ErrorKind::BrokenPipe),
@@ -2288,6 +2461,18 @@ mod tests {
         ] {
             assert_eq!(err.exit_code(), ProcessExitCode::ProcessFailure, "{err}");
         }
+    }
+
+    #[test]
+    fn fdtable_preallocation_error_display_includes_context() {
+        let err = ProcessError::FdTablePreallocation(super::FdTablePreallocationError::Close(
+            ErrorKind::BrokenPipe,
+        ));
+
+        assert_eq!(
+            err.to_string(),
+            "file descriptor table preallocation failed: failed to close preallocated file descriptor: BrokenPipe"
+        );
     }
 
     #[test]
@@ -2375,6 +2560,99 @@ mod tests {
             ProcessError::BadConfiguration("invalid --level: logger level is invalid".to_string())
         );
         assert_eq!(err.exit_code(), ProcessExitCode::BadConfiguration);
+    }
+
+    #[test]
+    fn fdtable_preallocation_min_fd_uses_firecracker_default_for_infinity() {
+        assert_eq!(
+            super::fdtable_preallocation_min_fd(libc::RLIM_INFINITY),
+            Some(2047)
+        );
+    }
+
+    #[test]
+    fn fdtable_preallocation_min_fd_uses_soft_limit() {
+        assert_eq!(super::fdtable_preallocation_min_fd(4), Some(3));
+        assert_eq!(super::fdtable_preallocation_min_fd(16), Some(15));
+        assert_eq!(super::fdtable_preallocation_min_fd(3), None);
+        assert_eq!(super::fdtable_preallocation_min_fd(0), None);
+    }
+
+    #[test]
+    fn fdtable_preallocation_min_fd_falls_back_when_limit_exceeds_raw_fd() {
+        let overflowing_limit = (RawFd::MAX as libc::rlim_t).saturating_add(2);
+        if overflowing_limit != libc::RLIM_INFINITY {
+            assert_eq!(
+                super::fdtable_preallocation_min_fd(overflowing_limit),
+                Some(2047)
+            );
+        }
+    }
+
+    #[test]
+    fn fdtable_preallocation_duplicates_and_closes_high_fd() {
+        let mut ops = FakeFdTablePreallocationOps::with_soft_limit(16);
+
+        let preallocated =
+            super::preallocate_fdtable_with(&mut ops).expect("preallocation should succeed");
+
+        assert!(preallocated);
+        assert_eq!(ops.duplicate_calls, [(libc::STDIN_FILENO, 15)]);
+        assert_eq!(ops.close_calls, [99]);
+    }
+
+    #[test]
+    fn fdtable_preallocation_skips_small_limits_without_duplication() {
+        let mut ops = FakeFdTablePreallocationOps::with_soft_limit(3);
+
+        let preallocated =
+            super::preallocate_fdtable_with(&mut ops).expect("small limit should not fail");
+
+        assert!(!preallocated);
+        assert!(ops.duplicate_calls.is_empty());
+        assert!(ops.close_calls.is_empty());
+    }
+
+    #[test]
+    fn fdtable_preallocation_getrlimit_failure_is_non_fatal() {
+        let mut ops =
+            FakeFdTablePreallocationOps::with_soft_limit_error(ErrorKind::PermissionDenied);
+
+        let preallocated =
+            super::preallocate_fdtable_with(&mut ops).expect("getrlimit failure should not fail");
+
+        assert!(!preallocated);
+        assert!(ops.duplicate_calls.is_empty());
+        assert!(ops.close_calls.is_empty());
+    }
+
+    #[test]
+    fn fdtable_preallocation_duplicate_failure_is_non_fatal_without_close() {
+        let mut ops =
+            FakeFdTablePreallocationOps::with_soft_limit(16).with_duplicate_error(ErrorKind::Other);
+
+        let preallocated =
+            super::preallocate_fdtable_with(&mut ops).expect("dup failure should not fail");
+
+        assert!(!preallocated);
+        assert_eq!(ops.duplicate_calls, [(libc::STDIN_FILENO, 15)]);
+        assert!(ops.close_calls.is_empty());
+    }
+
+    #[test]
+    fn fdtable_preallocation_close_failure_is_fatal() {
+        let mut ops = FakeFdTablePreallocationOps::with_soft_limit(16)
+            .with_close_error(ErrorKind::BrokenPipe);
+
+        let err =
+            super::preallocate_fdtable_with(&mut ops).expect_err("close failure should be fatal");
+
+        assert_eq!(
+            err,
+            super::FdTablePreallocationError::Close(ErrorKind::BrokenPipe)
+        );
+        assert_eq!(ops.duplicate_calls, [(libc::STDIN_FILENO, 15)]);
+        assert_eq!(ops.close_calls, [99]);
     }
 
     #[test]

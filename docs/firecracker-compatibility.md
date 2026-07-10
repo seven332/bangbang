@@ -165,6 +165,12 @@ exits on handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or
 | `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. Runtime control, reboot-in-place, and remaining runtime error exit-code parity remain deferred. |
 | seccomp and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
+Normal startup also performs best-effort fd-table preallocation from
+`RLIMIT_NOFILE` before opening configured resources. bangbang uses
+non-clobbering descriptor duplication for this Firecracker-style startup guard,
+so inherited high-numbered descriptors are not overwritten. Early commands such
+as help, version, and snapshot inspection skip this setup.
+
 Startup timing arguments are intentionally not exposed in `GET /vm/config` or
 logs because they are process observability data, not guest configuration. When
 metrics are configured, startup, explicit `FlushMetrics`, and periodic runtime
