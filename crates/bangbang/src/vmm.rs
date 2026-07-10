@@ -818,6 +818,12 @@ pub(crate) trait VmmRequestHandler {
 
     fn record_resume_vm_latency_us(&mut self, duration_us: u64);
 
+    fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64);
+
+    fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64);
+
+    fn record_load_snapshot_latency_us(&mut self, duration_us: u64);
+
     fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
         Ok(false)
     }
@@ -1042,6 +1048,20 @@ where
 
     fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
         self.controller.record_resume_vm_latency_us(duration_us);
+    }
+
+    fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        self.controller
+            .record_full_create_snapshot_latency_us(duration_us);
+    }
+
+    fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        self.controller
+            .record_diff_create_snapshot_latency_us(duration_us);
+    }
+
+    fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
+        self.controller.record_load_snapshot_latency_us(duration_us);
     }
 
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
@@ -1451,6 +1471,18 @@ where
 
     fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
         ProcessVmm::record_resume_vm_latency_us(self, duration_us);
+    }
+
+    fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        ProcessVmm::record_full_create_snapshot_latency_us(self, duration_us);
+    }
+
+    fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        ProcessVmm::record_diff_create_snapshot_latency_us(self, duration_us);
+    }
+
+    fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
+        ProcessVmm::record_load_snapshot_latency_us(self, duration_us);
     }
 
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
