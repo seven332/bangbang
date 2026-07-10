@@ -111,6 +111,86 @@ fn executable_prints_version_and_exits_before_socket_publication() {
 }
 
 #[test]
+fn executable_help_precedence_ignores_later_unknown_args() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("help-precedence.socket");
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::run_with_extra_args_expect_successful_exit(
+        &socket_path,
+        &instance_id,
+        &["--help", "--unknown"],
+    );
+
+    assert_eq!(output.stderr, "", "help precedence should not write stderr");
+    assert!(
+        output.stdout.contains("Usage:\n  bangbang [OPTIONS]"),
+        "help precedence should print usage; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("Current scope:"),
+        "help precedence should still print help scope; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("--unknown") && !output.stderr.contains("--unknown"),
+        "help precedence must not report the later unknown argument; stdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening")
+            && !output.stdout.contains("status: VM running without API"),
+        "help precedence must exit before startup readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !socket_path.exists(),
+        "help precedence must not publish the API socket"
+    );
+}
+
+#[test]
+fn executable_version_precedence_ignores_later_unknown_args() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("version-precedence.socket");
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::run_with_extra_args_expect_successful_exit(
+        &socket_path,
+        &instance_id,
+        &["--version", "--unknown"],
+    );
+
+    assert_eq!(
+        output.stdout,
+        format!("bangbang {BANGBANG_VERSION}\n"),
+        "version precedence should report the package version"
+    );
+    assert_eq!(
+        output.stderr, "",
+        "version precedence should not write stderr"
+    );
+    assert!(
+        !output.stdout.contains("--unknown") && !output.stderr.contains("--unknown"),
+        "version precedence must not report the later unknown argument; stdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening")
+            && !output.stdout.contains("status: VM running without API"),
+        "version precedence must exit before startup readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !socket_path.exists(),
+        "version precedence must not publish the API socket"
+    );
+}
+
+#[test]
 fn executable_serves_api_and_shuts_down_cleanly() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
