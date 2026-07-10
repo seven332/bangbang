@@ -329,6 +329,45 @@ mod macos_arm64 {
             "GET / after rejected duplicate PATCH /vm Resumed",
         );
 
+        for (request_context, path, expected_fault, private_id) in [
+            (
+                "DELETE /drives/private_hot_unplug_drive after InstanceStart",
+                "/drives/private_hot_unplug_drive",
+                r#"{"fault_message":"Drive updates are not supported."}"#,
+                "private_hot_unplug_drive",
+            ),
+            (
+                "DELETE /network-interfaces/private_hot_unplug_iface after InstanceStart",
+                "/network-interfaces/private_hot_unplug_iface",
+                r#"{"fault_message":"Network interface updates are not supported."}"#,
+                "private_hot_unplug_iface",
+            ),
+            (
+                "DELETE /pmem/private_hot_unplug_pmem after InstanceStart",
+                "/pmem/private_hot_unplug_pmem",
+                r#"{"fault_message":"Pmem device is not supported."}"#,
+                "private_hot_unplug_pmem",
+            ),
+        ] {
+            let hot_unplug_response = http_no_body(&socket_path, "DELETE", path);
+            assert_bad_request_response(&hot_unplug_response, request_context);
+            assert_response_contains(&hot_unplug_response, expected_fault, request_context);
+            assert!(
+                !hot_unplug_response.contains(private_id),
+                "{request_context} response must not echo private hot-unplug id {private_id:?}; response:\n{hot_unplug_response}"
+            );
+        }
+        let running_after_hot_unplug = http_get(&socket_path, "/");
+        assert_ok_response(
+            &running_after_hot_unplug,
+            "GET / after rejected hot-unplug requests",
+        );
+        assert_response_contains(
+            &running_after_hot_unplug,
+            r#""state":"Running""#,
+            "GET / after rejected hot-unplug requests",
+        );
+
         let replacement_kernel_path = test_dir.path().join("replacement-vmlinux");
         let replacement_kernel_path_json = json_string(path_text(&replacement_kernel_path));
         let boot_update_body = format!(r#"{{"kernel_image_path":{replacement_kernel_path_json}}}"#);
@@ -764,7 +803,7 @@ mod macos_arm64 {
         assert_metrics_output(
             &metrics_path,
             Some(
-                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":8,"machine_cfg_count":0,"mmds_count":2,"vmm_version_count":0}"#,
+                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":9,"machine_cfg_count":0,"mmds_count":2,"vmm_version_count":0}"#,
             ),
             r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":3,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
             Some(
