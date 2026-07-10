@@ -94,6 +94,12 @@ period.
 For HVF and FFI code, cover resource creation and destruction, platform gating,
 error translation, unsupported exits or registers, cancellation, and cleanup
 after partial setup failure.
+For owner-thread aggregate captures, also cover exact field order, every read
+failure and retry, forward and reverse admission conflicts, caller abandonment,
+closed command and response channels, queued-command destruction, panic, and
+shutdown. Pending-interrupt signed tests must set known asymmetric IRQ/FIQ
+values without an intervening run, then clear both levels; a run would let HVF
+clear the injection levels and invalidate the round trip.
 
 ## Stability Rules
 

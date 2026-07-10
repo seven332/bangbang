@@ -24,6 +24,12 @@ crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
 ```
 
+The HVF runner currently exposes owner-thread capture building blocks for
+general registers, a raw core system-register subset, baseline SIMD/FP state,
+raw virtual-timer state, and CPU-level IRQ/FIQ pending injection levels. These
+are internal snapshot-feasibility primitives only: public snapshot create/load,
+restore, a persistent schema, and complete GIC/device state remain unsupported.
+
 ## Process CLI
 
 Run the VMM process skeleton and API server:

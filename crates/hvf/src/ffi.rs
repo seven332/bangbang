@@ -3,6 +3,7 @@ pub(crate) const UNSUPPORTED_TARGET_MESSAGE: &str =
 
 pub(crate) type HvVcpu = u64;
 pub(crate) type HvExitReason = u32;
+pub(crate) type HvInterruptType = u32;
 pub(crate) type HvMemoryFlags = u64;
 pub(crate) type HvReg = u32;
 pub(crate) type HvSimdFpReg = u32;
@@ -16,6 +17,8 @@ pub(crate) const HV_EXIT_REASON_CANCELED: HvExitReason = 0;
 pub(crate) const HV_EXIT_REASON_EXCEPTION: HvExitReason = 1;
 pub(crate) const HV_EXIT_REASON_VTIMER_ACTIVATED: HvExitReason = 2;
 pub(crate) const HV_EXIT_REASON_UNKNOWN: HvExitReason = 3;
+pub(crate) const HV_INTERRUPT_TYPE_IRQ: HvInterruptType = 0;
+pub(crate) const HV_INTERRUPT_TYPE_FIQ: HvInterruptType = 1;
 pub(crate) const HV_REG_X0: HvReg = 0;
 pub(crate) const HV_REG_X1: HvReg = 1;
 pub(crate) const HV_REG_X2: HvReg = 2;
@@ -96,7 +99,8 @@ mod imp {
     use bangbang_runtime::BackendError;
 
     use super::{
-        CreatedVcpu, HvMemoryFlags, HvReg, HvSimdFpReg, HvSimdFpValue, HvSysReg, HvVcpu, HvVcpuExit,
+        CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSimdFpValue, HvSysReg,
+        HvVcpu, HvVcpuExit,
     };
 
     pub type HvReturn = i32;
@@ -133,6 +137,16 @@ mod imp {
             config: HvVcpuConfig,
         ) -> HvReturn;
         pub fn hv_vcpu_destroy(vcpu: HvVcpu) -> HvReturn;
+        pub fn hv_vcpu_get_pending_interrupt(
+            vcpu: HvVcpu,
+            interrupt_type: HvInterruptType,
+            pending: *mut bool,
+        ) -> HvReturn;
+        pub fn hv_vcpu_set_pending_interrupt(
+            vcpu: HvVcpu,
+            interrupt_type: HvInterruptType,
+            pending: bool,
+        ) -> HvReturn;
         pub fn hv_vcpu_get_reg(vcpu: HvVcpu, reg: HvReg, value: *mut u64) -> HvReturn;
         pub fn hv_vcpu_set_reg(vcpu: HvVcpu, reg: HvReg, value: u64) -> HvReturn;
         pub fn hv_vcpu_get_simd_fp_reg(
@@ -325,6 +339,38 @@ mod imp {
         unsafe { check(hv_vcpu_set_reg(vcpu, reg, value), "hv_vcpu_set_reg") }
     }
 
+    pub fn get_pending_interrupt(
+        vcpu: HvVcpu,
+        interrupt_type: HvInterruptType,
+    ) -> Result<bool, BackendError> {
+        let mut pending = false;
+
+        // SAFETY: The caller owns this current-thread vCPU handle, and `pending` is a valid
+        // out-pointer for the duration of the call.
+        unsafe {
+            check(
+                hv_vcpu_get_pending_interrupt(vcpu, interrupt_type, &mut pending),
+                "hv_vcpu_get_pending_interrupt",
+            )?;
+        }
+
+        Ok(pending)
+    }
+
+    pub fn set_pending_interrupt(
+        vcpu: HvVcpu,
+        interrupt_type: HvInterruptType,
+        pending: bool,
+    ) -> Result<(), BackendError> {
+        // SAFETY: The caller owns this current-thread vCPU handle.
+        unsafe {
+            check(
+                hv_vcpu_set_pending_interrupt(vcpu, interrupt_type, pending),
+                "hv_vcpu_set_pending_interrupt",
+            )
+        }
+    }
+
     pub fn get_simd_fp_reg(vcpu: HvVcpu, reg: HvSimdFpReg) -> Result<[u8; 16], BackendError> {
         let mut value = HvSimdFpValue::zeroed();
 
@@ -456,7 +502,7 @@ mod imp {
     use bangbang_runtime::BackendError;
 
     use super::{
-        CreatedVcpu, HvMemoryFlags, HvReg, HvSimdFpReg, HvSysReg, HvVcpu,
+        CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSysReg, HvVcpu,
         UNSUPPORTED_TARGET_MESSAGE,
     };
 
@@ -505,6 +551,18 @@ mod imp {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 
+    pub fn get_pending_interrupt(_: HvVcpu, _: HvInterruptType) -> Result<bool, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn set_pending_interrupt(
+        _: HvVcpu,
+        _: HvInterruptType,
+        _: bool,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
     pub fn get_simd_fp_reg(_: HvVcpu, _: HvSimdFpReg) -> Result<[u8; 16], BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
@@ -541,7 +599,8 @@ mod tests {
     use std::mem::{align_of, offset_of, size_of};
 
     use super::{
-        HV_SIMD_FP_REG_Q0, HV_SIMD_FP_REG_Q31, HvSimdFpValue, HvVcpuExit, HvVcpuExitException,
+        HV_INTERRUPT_TYPE_FIQ, HV_INTERRUPT_TYPE_IRQ, HV_SIMD_FP_REG_Q0, HV_SIMD_FP_REG_Q31,
+        HvSimdFpValue, HvVcpuExit, HvVcpuExitException,
     };
 
     #[test]
@@ -550,6 +609,12 @@ mod tests {
         assert_eq!(align_of::<HvSimdFpValue>(), 16);
         assert_eq!(HV_SIMD_FP_REG_Q0, 0);
         assert_eq!(HV_SIMD_FP_REG_Q31, 31);
+    }
+
+    #[test]
+    fn interrupt_type_values_match_hvf_sdk() {
+        assert_eq!(HV_INTERRUPT_TYPE_IRQ, 0);
+        assert_eq!(HV_INTERRUPT_TYPE_FIQ, 1);
     }
 
     #[test]
