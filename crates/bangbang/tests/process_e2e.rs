@@ -1819,6 +1819,46 @@ fn executable_configures_observability_without_vm_config() {
 }
 
 #[test]
+fn executable_logs_api_request_methods_and_paths_without_bodies() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let logger_path = test_dir.path().join("logger.out");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let logger_path_json = json_string(path_text(&logger_path));
+    let logger_body = format!(
+        r#"{{
+            "log_path":{logger_path_json},
+            "level":"Info",
+            "module":"bangbang_runtime::api_server"
+        }}"#
+    );
+    let logger_response = http_put_json(&socket_path, "/logger", &logger_body);
+    assert_no_content_response(&logger_response, "PUT /logger");
+
+    let version_response = http_get(&socket_path, "/version");
+    assert_ok_response(&version_response, "GET /version after logger config");
+
+    let private_value = "private-process-logger-secret";
+    let mmds_body = format!(r#"{{"latest":{{"meta-data":{{"secret":"{private_value}"}}}}}}"#);
+    let mmds_response = http_put_json(&socket_path, "/mmds", &mmds_body);
+    assert_no_content_response(&mmds_response, "PUT /mmds after logger config");
+
+    let logger_output = fs::read_to_string(&logger_path).expect("logger output should be readable");
+    assert_eq!(
+        logger_output,
+        "The API server received a Get request on \"/version\".\nThe API server received a Put request on \"/mmds\".\n"
+    );
+    assert!(
+        !logger_output.contains(private_value),
+        "logger output must not include API request body values; output:\n{logger_output}"
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_configures_writeback_drive_cache_type() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
