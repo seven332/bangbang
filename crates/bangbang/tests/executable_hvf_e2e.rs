@@ -278,6 +278,25 @@ mod macos_arm64 {
             "GET / after PATCH /vm Paused",
         );
 
+        let duplicate_pause_response =
+            http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        assert_bad_request_response(&duplicate_pause_response, "PATCH /vm Paused while paused");
+        assert_response_contains(
+            &duplicate_pause_response,
+            r#"{"fault_message":"The requested operation is not supported in Paused state: Pause"}"#,
+            "PATCH /vm Paused while paused",
+        );
+        let paused_after_duplicate_pause = http_get(&socket_path, "/");
+        assert_ok_response(
+            &paused_after_duplicate_pause,
+            "GET / after rejected duplicate PATCH /vm Paused",
+        );
+        assert_response_contains(
+            &paused_after_duplicate_pause,
+            r#""state":"Paused""#,
+            "GET / after rejected duplicate PATCH /vm Paused",
+        );
+
         let resume_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
         assert_no_content_response(&resume_response, "PATCH /vm Resumed after pause");
         let resumed_instance_info = http_get(&socket_path, "/");
@@ -745,7 +764,7 @@ mod macos_arm64 {
         assert_metrics_output(
             &metrics_path,
             Some(
-                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":7,"machine_cfg_count":0,"mmds_count":2,"vmm_version_count":0}"#,
+                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":8,"machine_cfg_count":0,"mmds_count":2,"vmm_version_count":0}"#,
             ),
             r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":3,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
             Some(
