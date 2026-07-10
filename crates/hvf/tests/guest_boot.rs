@@ -21,6 +21,8 @@ const ROOTFS_READ_MARKER: &[u8] = b"BANGBANG_ROOTFS_READ_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const DIRECT_ROOTFS_BOOT_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VMGENID_GUEST_CHECK_MARKER: &[u8] = b"BANGBANG_VMGENID_GUEST_CHECK_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
@@ -297,6 +299,45 @@ fn boots_firecracker_kernel_from_ext4_rootfs() {
         "direct rootfs boot should not rely on the tiny initrd: {}",
         String::from_utf8_lossy(cmdline)
     );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_exposes_vmgenid_to_guest() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let boot_args = format!("{DIRECT_ROOTFS_BOOT_ARGS} bangbang.vmgenid-check=1");
+    let observation = run_guest_boot_without_initrd_until_marker(
+        "guest-vmgenid-check",
+        DIRECT_ROOTFS_BOOT_MARKER,
+        &boot_args,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("guest ext4 rootfs drive should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        DIRECT_ROOTFS_BOOT_MARKER,
+        "direct rootfs boot marker",
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, VMGENID_GUEST_CHECK_MARKER),
+        "direct rootfs boot should expose VMGenID to Linux\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    let cmdline = guest_cmdline_capture(&observation);
+    assert_guest_cmdline_contains_arg(cmdline, b"bangbang.vmgenid-check=1");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
