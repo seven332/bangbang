@@ -26,7 +26,7 @@ create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
 exit dispatch/completion through runtime handlers, explicit runner-thread MMIO
 handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, HVF SPI interrupt-line allocation and signaling, minimal internal
-arm64 FDT generation with optional RTC, serial, and virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
+arm64 FDT generation with optional RTC, serial, VMGenID, and virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership and
 controlled mapped-memory access for allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal TX-only serial MMIO output
@@ -1280,7 +1280,7 @@ block notification dispatch.
 The runtime crate can build a minimal Firecracker-shaped arm64 FDT using the
 same `vm-fdt` writer crate that Firecracker uses. The generated tree currently
 contains root properties, CPU data, memory, chosen, timer, PSCI, GIC nodes, and
-optional RTC, serial, and sorted virtio-mmio device nodes from caller-supplied
+optional RTC, serial, VMGenID, and sorted virtio-mmio device nodes from caller-supplied
 descriptors. The optional RTC node uses Firecracker's aarch64 PL031 shape with
 `compatible = "arm,pl031", "arm,primecell"`, `reg`, `clocks`, and
 `clock-names = "apb_pclk"`, and intentionally omits `interrupts` because the
@@ -1367,13 +1367,17 @@ PVTime until an HVF-specific capability and guest ABI design exists; for now it
 is platform-limited and deferred.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are
-not part of the minimal RTC device. Firecracker exposes them as guest memory
-regions with interrupt notification and updates them around snapshot restore.
-bangbang should implement them only after guest-memory placement, FDT metadata,
-interrupt signaling, persistence, and snapshot/restore semantics are designed.
-Until snapshot support is implemented, VMGenID/VMClock restore notifications and
-generation-counter updates remain deferred to the snapshot work tracked by
-#543.
+not part of the minimal RTC device. The backend-neutral arm64 FDT builder can
+now emit a caller-supplied VMGenID node using Firecracker's DeviceTree shape:
+node name `vmgenid`, `compatible = "microsoft,vmgenid"`, a 16-byte `reg`
+region, and `interrupts = [SPI, line - 32, edge-rising]`. Direct FDT
+configuration validates that the VMGenID region is exactly 16 bytes, does not
+overflow, does not overlap guest RAM, GIC, RTC, serial, or virtio-mmio ranges,
+and that the interrupt line is an SPI INTID. This is still not guest-visible
+startup support: bangbang does not yet allocate the region during boot
+preparation, write generation IDs, signal VMGenID interrupts, persist VMGenID
+state, or perform snapshot/restore generation-counter updates. VMClock and full
+VMGenID restore behavior remain deferred to the snapshot work tracked by #543.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest

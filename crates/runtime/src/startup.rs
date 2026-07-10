@@ -2538,6 +2538,7 @@ impl Arm64BootResources {
                 timer,
                 rtc_device: rtc_fdt_device,
                 serial_device: serial_fdt_device,
+                vmgenid_device: None,
                 virtio_mmio_devices: &fdt_devices,
             },
             &mut memory,
