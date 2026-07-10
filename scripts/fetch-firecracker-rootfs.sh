@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v26"
+direct_boot_variant="direct-boot-v27"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -690,6 +690,50 @@ check_rtc_marker() {
       write_vdb_marker BANGBANG_RTC_GUEST_CHECK_FAIL
       ;;
   esac
+}
+
+check_vmgenid_marker() {
+  vmgenid_path=
+  for candidate in /proc/device-tree/vmgenid /sys/firmware/devicetree/base/vmgenid; do
+    if [ -d "$candidate" ]; then
+      vmgenid_path=$candidate
+      break
+    fi
+  done
+
+  if [ -z "$vmgenid_path" ]; then
+    emit_line BANGBANG_VMGENID_GUEST_CHECK_FAIL_NO_NODE
+    write_vdb_marker BANGBANG_VMGENID_GUEST_CHECK_FAIL
+    return
+  fi
+
+  if [ ! -r "$vmgenid_path/compatible" ]; then
+    emit_line BANGBANG_VMGENID_GUEST_CHECK_FAIL_NO_COMPATIBLE
+    write_vdb_marker BANGBANG_VMGENID_GUEST_CHECK_FAIL
+    return
+  fi
+
+  if ! grep -q 'microsoft,vmgenid' "$vmgenid_path/compatible" 2>/dev/null; then
+    emit_line BANGBANG_VMGENID_GUEST_CHECK_FAIL_COMPATIBLE
+    write_vdb_marker BANGBANG_VMGENID_GUEST_CHECK_FAIL
+    return
+  fi
+
+  if [ ! -r "$vmgenid_path/reg" ]; then
+    emit_line BANGBANG_VMGENID_GUEST_CHECK_FAIL_NO_REG
+    write_vdb_marker BANGBANG_VMGENID_GUEST_CHECK_FAIL
+    return
+  fi
+
+  set -- $(wc -c < "$vmgenid_path/reg" 2>/dev/null || printf '0')
+  if [ "${1:-0}" != 16 ]; then
+    emit_line BANGBANG_VMGENID_GUEST_CHECK_FAIL_REG_SIZE
+    write_vdb_marker BANGBANG_VMGENID_GUEST_CHECK_FAIL
+    return
+  fi
+
+  emit_line BANGBANG_VMGENID_GUEST_CHECK_OK
+  write_vdb_marker BANGBANG_VMGENID_GUEST_CHECK_OK
 }
 
 flush_writeback_block_marker() {
@@ -1301,6 +1345,8 @@ elif cmdline_has bangbang.memory-hotplug-check=1; then
   check_memory_hotplug_marker
 elif cmdline_has bangbang.rtc-check=1; then
   check_rtc_marker
+elif cmdline_has bangbang.vmgenid-check=1; then
+  check_vmgenid_marker
 elif cmdline_has bangbang.block-writeback-flush=1; then
   flush_writeback_block_marker
 elif cmdline_has bangbang.pmem-read-flush=1; then
