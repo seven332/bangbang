@@ -52,10 +52,10 @@ virtual-timer mask/offset/control/CVAL boundary, a bounded internal boot-session
 run-loop pump, owned internal boot-session handle, process-level owned
 startup-session wiring with optional serial capture and boot run-loop supervision
 across bounded step windows with retained internal worker status, process-owned
-virtio-net packet-I/O provider selection with no-op fallback and vmnet-backed startup for
-configured interfaces, an internal vmnet virtio-net packet I/O provider keyed by
-configured interface ID, boot block, virtio-net, and virtio-vsock queue
-interrupt signaling,
+virtio-net packet-I/O provider selection with no-op fallback and vmnet-backed
+startup for configured interfaces, an internal vmnet virtio-net packet I/O
+provider keyed by configured interface ID, boot block, virtio-net, and
+virtio-vsock queue interrupt signaling,
 virtual timer PPI assertion, per-controller metrics and logger output state, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, drive update, network-interface configuration, vsock configuration, machine-configuration, metrics, logger, serial, and actions bodies, public guest
@@ -1632,10 +1632,9 @@ resolved MMIO access after a run has started, and another command starts one
 vCPU run, resolves a resulting MMIO exit, and dispatches or completes it through
 a caller-provided shared dispatcher. The virtual-timer commands expose HVF's
 explicit mask bit after `HV_EXIT_REASON_VTIMER_ACTIVATED`, its raw
-host-time-relative offset, and raw
-`CNTV_CTL_EL0`/`CNTV_CVAL_EL0` values; GIC PPI
-pending commands can set or clear a
-validated timer PPI bit on the runner thread. The internal boot-session
+host-time-relative offset, and raw `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` values; GIC PPI
+pending commands can set or clear a validated timer PPI bit on the runner
+thread. The internal boot-session
 run-loop now handles virtual timer exits by asserting the EL1 virtual timer PPI
 through that runner-thread command. Full timer delivery policy, including how to
 detect EOI/deactivation and unmask the HVF virtual timer, remains future work.
