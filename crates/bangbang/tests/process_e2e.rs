@@ -10,7 +10,7 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, symlink};
 
 use support::{
     BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
@@ -3345,6 +3345,51 @@ fn executable_fails_when_api_socket_path_exists_without_removing_it() {
         (original_metadata.dev(), original_metadata.ino()),
         "failed startup must not replace the existing API socket path"
     );
+}
+
+#[test]
+fn executable_fails_when_api_socket_path_is_broken_symlink_without_removing_it() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let missing_target_path = test_dir.path().join("missing-api.socket");
+    let instance_id = test_dir.instance_id();
+    symlink(&missing_target_path, &socket_path).expect("fixture symlink should be created");
+
+    let output = BangbangProcess::start_expect_failure(&socket_path, &instance_id);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "broken symlink API socket path should fail with process failure; stdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("API server error: API socket path already exists"),
+        "stderr should explain the API socket bind failure; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "failed startup must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        fs::symlink_metadata(&socket_path)
+            .expect("broken symlink should remain")
+            .file_type()
+            .is_symlink(),
+        "failed startup must leave the broken symlink at the API socket path"
+    );
+    assert_eq!(
+        fs::read_link(&socket_path).expect("broken symlink target should remain readable"),
+        missing_target_path,
+        "failed startup must not retarget the existing API socket symlink"
+    );
+
+    fs::remove_file(socket_path).expect("fixture symlink should clean up");
 }
 
 #[test]
