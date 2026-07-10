@@ -34,6 +34,83 @@ const SIGILL_EXIT_CODE: i32 = 157;
 const MULTI_VCPU_STARTUP_ERROR: &str = "HVF arm64 boot session supports exactly 1 vCPU, got 2";
 
 #[test]
+fn executable_prints_help_and_exits_before_socket_publication() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("help.socket");
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::run_with_extra_args_expect_successful_exit(
+        &socket_path,
+        &instance_id,
+        &["--help"],
+    );
+
+    assert_eq!(output.stderr, "", "help should not write stderr");
+    assert!(
+        output.stdout.contains("Usage:\n  bangbang [OPTIONS]"),
+        "help should print usage; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("--api-sock <PATH>"),
+        "help should list API socket option; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output
+            .stdout
+            .contains("Logger level: Off, Trace, Debug, Info, Warn, Warning, or Error"),
+        "help should list accepted logger levels; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("Current scope:"),
+        "help should describe current public scope; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening")
+            && !output.stdout.contains("status: VM running without API"),
+        "help must exit before startup readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !socket_path.exists(),
+        "help must not publish the API socket"
+    );
+}
+
+#[test]
+fn executable_prints_version_and_exits_before_socket_publication() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("version.socket");
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::run_with_extra_args_expect_successful_exit(
+        &socket_path,
+        &instance_id,
+        &["--version"],
+    );
+
+    assert_eq!(
+        output.stdout,
+        format!("bangbang {BANGBANG_VERSION}\n"),
+        "version should report the package version"
+    );
+    assert_eq!(output.stderr, "", "version should not write stderr");
+    assert!(
+        !output.stdout.contains("status: API server listening")
+            && !output.stdout.contains("status: VM running without API"),
+        "version must exit before startup readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !socket_path.exists(),
+        "version must not publish the API socket"
+    );
+}
+
+#[test]
 fn executable_serves_api_and_shuts_down_cleanly() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");

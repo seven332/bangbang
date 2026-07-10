@@ -287,12 +287,38 @@ impl BangbangProcess {
         process.wait_for_startup_failure()
     }
 
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn run_with_extra_args_expect_successful_exit(
+        socket_path: &Path,
+        instance_id: &str,
+        extra_args: &[&str],
+    ) -> CompletedProcess {
+        let mut process = Self::spawn_with_extra_args(socket_path, instance_id, extra_args);
+        let output = process.wait_for_startup_exit("successful early exit");
+        assert!(
+            output.status.success(),
+            "bangbang should exit successfully before startup readiness; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            output.stdout,
+            output.stderr
+        );
+
+        output
+    }
+
     fn wait_for_startup_failure(&mut self) -> CompletedProcess {
+        self.wait_for_startup_exit("startup failure")
+    }
+
+    fn wait_for_startup_exit(&mut self, expected_exit: &str) -> CompletedProcess {
         match self.ready.recv_timeout(STARTUP_TIMEOUT) {
             Ok(()) => {
                 let output = self.force_stop_and_collect();
                 panic!(
-                    "bangbang reported startup readiness but startup failure was expected; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "bangbang reported startup readiness but {expected_exit} was expected; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                     self.binary_path.display(),
                     output.status,
                     output.stdout,
@@ -307,7 +333,7 @@ impl BangbangProcess {
             Err(RecvTimeoutError::Timeout) => {
                 let output = self.force_stop_and_collect();
                 panic!(
-                    "bangbang did not fail before timeout; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "bangbang did not exit for {expected_exit} before timeout; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                     self.binary_path.display(),
                     output.status,
                     output.stdout,
