@@ -2938,6 +2938,62 @@ fn executable_fails_when_api_socket_path_exists_without_removing_it() {
 }
 
 #[test]
+fn executable_live_api_socket_conflict_does_not_interrupt_owner() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let owner_instance_id = format!("{instance_id}-owner");
+    let conflicting_instance_id = format!("{instance_id}-conflict");
+    let owner = BangbangProcess::start(&socket_path, &owner_instance_id);
+
+    assert_instance_info_matches(
+        &socket_path,
+        &owner_instance_id,
+        &conflicting_instance_id,
+        "owner bangbang before bind conflict",
+    );
+    let original_metadata =
+        fs::symlink_metadata(&socket_path).expect("owner API socket metadata should be readable");
+
+    let output = BangbangProcess::start_expect_failure(&socket_path, &conflicting_instance_id);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "conflicting API socket path should fail with process failure; stdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("API server error: API socket path already exists"),
+        "stderr should explain the live API socket bind failure; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "failed conflicting startup must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    let current_metadata =
+        fs::symlink_metadata(&socket_path).expect("owner API socket should remain readable");
+    assert_eq!(
+        (current_metadata.dev(), current_metadata.ino()),
+        (original_metadata.dev(), original_metadata.ino()),
+        "failed conflicting startup must not replace the owner API socket"
+    );
+    assert_instance_info_matches(
+        &socket_path,
+        &owner_instance_id,
+        &conflicting_instance_id,
+        "owner bangbang after bind conflict",
+    );
+
+    assert_clean_shutdown(owner.terminate(), &socket_path, "owner bangbang");
+}
+
+#[test]
 fn concurrent_executables_keep_api_resources_isolated() {
     let test_dir = TestDir::new();
     let first_socket_path = test_dir.path().join("first-api.socket");
