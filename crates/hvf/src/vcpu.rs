@@ -26,6 +26,42 @@ pub struct HvfArm64BootRegisters {
     pub fdt_address: GuestAddress,
 }
 
+/// Detached general-register state captured from one arm64 vCPU.
+///
+/// This is the first read-only architectural subset for later snapshot
+/// orchestration. It does not include system, SIMD/FP, timer, interrupt, or
+/// device state and is not a serialized snapshot schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64VcpuGeneralRegisterState {
+    general_purpose_registers: [u64; 31],
+    pc: u64,
+    cpsr: u64,
+}
+
+impl HvfArm64VcpuGeneralRegisterState {
+    /// Return the captured X0 through X30 values in architectural order.
+    pub const fn general_purpose_registers(&self) -> &[u64; 31] {
+        &self.general_purpose_registers
+    }
+
+    /// Return one captured X register, or `None` when `index` is outside X0-X30.
+    pub fn general_purpose_register(&self, index: u8) -> Option<u64> {
+        self.general_purpose_registers
+            .get(usize::from(index))
+            .copied()
+    }
+
+    /// Return the captured program counter.
+    pub const fn pc(&self) -> u64 {
+        self.pc
+    }
+
+    /// Return the captured CPSR/PSTATE value.
+    pub const fn cpsr(&self) -> u64 {
+        self.cpsr
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HvfRegister(u32);
 
@@ -369,8 +405,30 @@ fn configure_arm64_boot_registers_with(
     Ok(())
 }
 
+pub(crate) fn capture_arm64_vcpu_general_register_state_with(
+    mut get_register: impl FnMut(HvfRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuGeneralRegisterState, BackendError> {
+    let mut general_purpose_registers = [0; 31];
+    for (index, value) in (0_u8..31).zip(&mut general_purpose_registers) {
+        let register = HvfRegister::general_purpose(index).ok_or(BackendError::InvalidState(
+            "arm64 general register index is outside X0-X30",
+        ))?;
+        *value = get_register(register)?;
+    }
+
+    let pc = get_register(HvfRegister::PC)?;
+    let cpsr = get_register(HvfRegister::CPSR)?;
+
+    Ok(HvfArm64VcpuGeneralRegisterState {
+        general_purpose_registers,
+        pc,
+        cpsr,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::marker::PhantomData;
     use std::mem::ManuallyDrop;
     use std::ptr;
@@ -382,7 +440,7 @@ mod tests {
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfRegister,
         HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
-        configure_arm64_boot_registers_with,
+        capture_arm64_vcpu_general_register_state_with, configure_arm64_boot_registers_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
@@ -583,6 +641,60 @@ mod tests {
                 (HvfRegister::X0, 0x8fe0_0000),
             ]
         );
+    }
+
+    #[test]
+    fn captures_arm64_general_register_state_in_architectural_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_general_register_state_with(|register| {
+            reads.push(register);
+            Ok(0x1000 + u64::from(register.raw()))
+        })
+        .expect("general-register capture should succeed");
+
+        let expected_reads = (0_u8..31)
+            .map(|index| {
+                HvfRegister::general_purpose(index).expect("X0-X30 should map to registers")
+            })
+            .chain([HvfRegister::PC, HvfRegister::CPSR])
+            .collect::<Vec<_>>();
+        assert_eq!(reads, expected_reads);
+        assert_eq!(state.general_purpose_registers().len(), 31);
+        assert_eq!(state.general_purpose_register(0), Some(0x1000));
+        assert_eq!(state.general_purpose_register(30), Some(0x101e));
+        assert_eq!(state.general_purpose_register(31), None);
+        assert_eq!(state.pc(), 0x1000 + u64::from(HvfRegister::PC.raw()));
+        assert_eq!(state.cpsr(), 0x1000 + u64::from(HvfRegister::CPSR.raw()));
+    }
+
+    #[test]
+    fn arm64_general_register_capture_stops_after_read_error_and_can_retry() {
+        let fail_next_x2 = Cell::new(true);
+        let reads = RefCell::new(Vec::new());
+        let read_register = |register: HvfRegister| {
+            reads.borrow_mut().push(register);
+            if register == HvfRegister::X2 && fail_next_x2.replace(false) {
+                Err(BackendError::InvalidState("fake register read failed"))
+            } else {
+                Ok(u64::from(register.raw()))
+            }
+        };
+
+        assert_eq!(
+            capture_arm64_vcpu_general_register_state_with(&read_register),
+            Err(BackendError::InvalidState("fake register read failed"))
+        );
+        assert_eq!(
+            *reads.borrow(),
+            vec![HvfRegister::X0, HvfRegister::X1, HvfRegister::X2]
+        );
+
+        reads.borrow_mut().clear();
+        let state = capture_arm64_vcpu_general_register_state_with(&read_register)
+            .expect("general-register capture retry should succeed");
+        assert_eq!(state.general_purpose_register(2), Some(2));
+        assert_eq!(reads.borrow().len(), 33);
     }
 
     #[test]

@@ -43,5 +43,6 @@ pub use startup::{
     HvfArm64BootVsockNotificationDispatches, OwnedHvfArm64BootSession,
 };
 pub use vcpu::{
-    ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpu,
+    ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfArm64VcpuGeneralRegisterState, HvfRegister,
+    HvfSystemRegister, HvfVcpu,
 };
