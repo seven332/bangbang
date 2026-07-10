@@ -32,6 +32,7 @@ pub use startup::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootBlockNotificationDispatch,
     HvfArm64BootBlockNotificationDispatchError, HvfArm64BootBlockNotificationDispatches,
     HvfArm64BootEntropyDeviceConfig, HvfArm64BootInterruptLinePurpose,
+    HvfArm64BootLimiterRetryWakeupQuiescenceError, HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
     HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootMmioDispatcherError,
     HvfArm64BootNetworkNotificationDispatch, HvfArm64BootNetworkNotificationDispatchError,
     HvfArm64BootNetworkNotificationDispatches, HvfArm64BootRunLoopControl,
