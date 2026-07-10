@@ -5037,6 +5037,45 @@ mod tests {
     }
 
     #[test]
+    fn drive_configs_preserve_root_slot_when_replacing_root_as_non_root() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive config should be stored");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                "/tmp/data.ext4",
+                false,
+            ))
+            .expect("data drive config should be stored");
+
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs-data.ext4",
+                false,
+            ))
+            .expect("replacement non-root drive config should be stored");
+
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+        assert_eq!(
+            configs.as_slice()[0].path_on_host(),
+            PathBuf::from("/tmp/rootfs-data.ext4")
+        );
+        assert!(!configs.as_slice()[0].is_root_device());
+        assert_eq!(configs.as_slice()[1].drive_id(), "data");
+    }
+
+    #[test]
     fn drive_configs_move_existing_drive_to_front_when_promoted_to_root() {
         let mut configs = DriveConfigs::new();
         configs
