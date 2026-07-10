@@ -263,11 +263,13 @@ is resource-specific:
   can append minimal host observability lines to this sink while the VM is
   running.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
-  present and keeps a per-process logger sink. Successful `InstanceStart` and
-  `FlushMetrics` can append minimal action-event lines to that sink when the
-  configured level allows `Info` and the optional module prefix matches the
-  current minimal action log module. Logger startup CLI flags use the same sink
-  and host-path error redaction rules before the API socket is served.
+  present and keeps a per-process logger sink. Successfully parsed API requests
+  can append method/path lines before dispatch, and successful `InstanceStart`
+  and `FlushMetrics` can append minimal action-event lines when the configured
+  level allows `Info` and the optional module prefix matches the event module.
+  API request log lines intentionally omit request bodies, including MMDS
+  payloads. Logger startup CLI flags use the same sink and host-path error
+  redaction rules before the API socket is served.
 - `scripts/run-integration-tests.sh` creates temporary files for signed
   integration tests and removes them when the wrapper exits normally. Its
   generated guest initrd is cached under `.tmp/guest-artifacts` by default.
@@ -372,10 +374,11 @@ busy-wait.
 
 Metrics and logger outputs are host observability state, not guest
 configuration, and are intentionally omitted from `GET /vm/config`. Current
-logger action events are host VMM events only and do not expose guest serial
-output. Current explicit and periodic metrics lines can expose selected API
-request counters, startup timing fields, logger and serial counters, a terse
-boot run-loop status summary, and minimal device counters such as block
+logger API request and action events are host VMM events only; they can expose
+API method/path metadata but not request bodies or guest serial output. Current
+explicit and periodic metrics lines can expose selected API request counters,
+startup timing fields, logger and serial counters, a terse boot run-loop status
+summary, and minimal device counters such as block
 queue/update/throttling activity, virtio-pmem queue activity, virtio-net packet
 counters, and virtio-vsock queue, packet, byte, and connection cleanup counters,
 plus virtio-rng request, byte, host-randomness failure, and event-failure
