@@ -2881,6 +2881,8 @@ impl BootRunLoopCommandAdmission {
         }
     }
 
+    // Reacquire for the final transition so an out-of-band shutdown that wins
+    // after release begins remains authoritative instead of being overwritten.
     fn finish_snapshot_release(&self) -> bool {
         let mut state = self.lock_state();
         if matches!(*state, BootRunLoopCommandAdmissionState::SnapshotReleasing) {
