@@ -220,7 +220,14 @@ mod macos_arm64 {
         assert_no_content_response(&metrics_response, "PUT /metrics");
 
         let logger_path_json = json_string(path_text(&logger_path));
-        let logger_body = format!(r#"{{"log_path":{logger_path_json}}}"#);
+        let logger_body = format!(
+            r#"{{
+                "log_path":{logger_path_json},
+                "level":"Info",
+                "show_level":true,
+                "show_log_origin":true
+            }}"#
+        );
         let logger_response = http_put_json(&socket_path, "/logger", &logger_body);
         assert_no_content_response(&logger_response, "PUT /logger");
 
@@ -731,7 +738,7 @@ mod macos_arm64 {
             "rejected metrics update must not write later metrics output to replacement path {}",
             replacement_metrics_path.display()
         );
-        assert_logger_output(&logger_path);
+        assert_logger_output(&logger_path, LoggerPrefixExpectation::LevelOrigin);
         assert!(
             !replacement_logger_path.exists(),
             "rejected logger update must not write later action records to replacement output path {}",
@@ -991,7 +998,7 @@ mod macos_arm64 {
             r#"{"actions_count":2,"actions_fails":1,"balloon_count":0,"balloon_fails":0,"boot_source_count":0,"boot_source_fails":0,"cpu_cfg_count":0,"cpu_cfg_fails":0,"drive_count":0,"drive_fails":0,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":0,"logger_fails":0,"machine_cfg_count":1,"machine_cfg_fails":1,"metrics_count":0,"metrics_fails":0,"mmds_count":0,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0,"serial_count":0,"serial_fails":0,"vsock_count":0,"vsock_fails":0}"#,
             None,
         );
-        assert_logger_output(&logger_path);
+        assert_logger_output(&logger_path, LoggerPrefixExpectation::None);
 
         if let Err(err) =
             wait_for_file_prefix_marker(&backing_path, BLOCK_WRITE_MARKER, GUEST_EXECUTION_TIMEOUT)
@@ -3933,25 +3940,32 @@ mod macos_arm64 {
         );
     }
 
-    fn assert_logger_output(path: &Path) {
+    #[derive(Clone, Copy)]
+    enum LoggerPrefixExpectation {
+        None,
+        LevelOrigin,
+    }
+
+    fn assert_logger_output(path: &Path, prefix: LoggerPrefixExpectation) {
         let output = fs::read_to_string(path).unwrap_or_else(|err| {
             panic!("logger output {} should be readable: {err}", path.display())
         });
 
-        assert_logger_output_lines(&output);
+        assert_logger_output_lines(&output, prefix);
     }
 
-    fn assert_logger_output_lines(output: &str) {
+    fn assert_logger_output_lines(output: &str, prefix: LoggerPrefixExpectation) {
         let mut action_lines = Vec::new();
         let mut saw_api_request_line = false;
         for line in output.lines() {
-            if line.starts_with("action=") {
-                action_lines.push(line);
+            let record = logger_record_without_prefix(line, prefix, output);
+            if record.starts_with("action=") {
+                action_lines.push(record);
                 continue;
             }
 
             assert!(
-                is_api_request_logger_line(line),
+                is_api_request_logger_line(record),
                 "logger output line should be an action record or API request record; output:\n{output}\nline: {line}"
             );
             saw_api_request_line = true;
@@ -3967,6 +3981,42 @@ mod macos_arm64 {
             saw_api_request_line,
             "logger output should include at least one API request record; output:\n{output}"
         );
+    }
+
+    fn logger_record_without_prefix<'a>(
+        line: &'a str,
+        prefix: LoggerPrefixExpectation,
+        output: &str,
+    ) -> &'a str {
+        match prefix {
+            LoggerPrefixExpectation::None => line,
+            LoggerPrefixExpectation::LevelOrigin => {
+                let Some(rest) = line.strip_prefix("level=Info origin=") else {
+                    panic!(
+                        "logger output line should include level and origin prefix; output:\n{output}\nline: {line}"
+                    );
+                };
+                let Some((origin, record)) = rest.split_once(' ') else {
+                    panic!(
+                        "logger output line should include origin and record body; output:\n{output}\nline: {line}"
+                    );
+                };
+                let Some((file, line_number)) = origin.rsplit_once(':') else {
+                    panic!(
+                        "logger output origin should include file and line; output:\n{output}\nline: {line}"
+                    );
+                };
+                assert!(
+                    !file.is_empty(),
+                    "logger output origin file should not be empty; output:\n{output}\nline: {line}"
+                );
+                assert!(
+                    line_number.parse::<u32>().is_ok(),
+                    "logger output origin line should be numeric; output:\n{output}\nline: {line}"
+                );
+                record
+            }
+        }
     }
 
     fn is_api_request_logger_line(line: &str) -> bool {
@@ -4001,25 +4051,68 @@ mod macos_arm64 {
              action=InstanceStart\n\
              The API server received a Put request on \"/actions\".\n\
              action=FlushMetrics\n",
+            LoggerPrefixExpectation::None,
+        );
+    }
+
+    #[test]
+    fn logger_output_accepts_level_origin_prefixed_records() {
+        assert_logger_output_lines(
+            "level=Info origin=crates/runtime/src/logger.rs:1 The API server received a Get request on \"/\".\n\
+             level=Info origin=crates/runtime/src/logger.rs:2 action=InstanceStart\n\
+             level=Info origin=crates/runtime/src/logger.rs:3 The API server received a Put request on \"/actions\".\n\
+             level=Info origin=crates/runtime/src/logger.rs:4 action=FlushMetrics\n",
+            LoggerPrefixExpectation::LevelOrigin,
         );
     }
 
     #[test]
     #[should_panic(expected = "logger output line should be an action record")]
     fn logger_output_rejects_unexpected_non_action_line() {
-        assert_logger_output_lines("action=InstanceStart\nunexpected\n");
+        assert_logger_output_lines(
+            "action=InstanceStart\nunexpected\n",
+            LoggerPrefixExpectation::None,
+        );
     }
 
     #[test]
     #[should_panic(expected = "logger output should include the expected action records")]
     fn logger_output_rejects_missing_action_record() {
-        assert_logger_output_lines("The API server received a Get request on \"/\".\n");
+        assert_logger_output_lines(
+            "The API server received a Get request on \"/\".\n",
+            LoggerPrefixExpectation::None,
+        );
     }
 
     #[test]
     #[should_panic(expected = "logger output should include at least one API request record")]
     fn logger_output_rejects_missing_api_request_record() {
-        assert_logger_output_lines("action=InstanceStart\naction=FlushMetrics\n");
+        assert_logger_output_lines(
+            "action=InstanceStart\naction=FlushMetrics\n",
+            LoggerPrefixExpectation::None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "logger output line should include level and origin prefix")]
+    fn logger_output_rejects_missing_required_prefix() {
+        assert_logger_output_lines(
+            "The API server received a Get request on \"/\".\n\
+             action=InstanceStart\n\
+             action=FlushMetrics\n",
+            LoggerPrefixExpectation::LevelOrigin,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "logger output origin line should be numeric")]
+    fn logger_output_rejects_malformed_origin_line() {
+        assert_logger_output_lines(
+            "level=Info origin=crates/runtime/src/logger.rs:not-a-line The API server received a Get request on \"/\".\n\
+             level=Info origin=crates/runtime/src/logger.rs:2 action=InstanceStart\n\
+             level=Info origin=crates/runtime/src/logger.rs:3 action=FlushMetrics\n",
+            LoggerPrefixExpectation::LevelOrigin,
+        );
     }
 
     fn wait_for_file_prefix_marker(
