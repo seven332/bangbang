@@ -1807,7 +1807,7 @@ fn help_text() -> String {
             "      --id <ID>          MicroVM unique identifier [default: {}]\n",
             "                         Accepts 1-64 bytes, ASCII alphanumeric or '-'\n",
             "      --log-path <PATH>  Logger output file or FIFO path\n",
-            "      --level <LEVEL>    Logger level: Off, Trace, Debug, Info, Warn, or Error\n",
+            "      --level <LEVEL>    Logger level: Off, Trace, Debug, Info, Warn, Warning, or Error\n",
             "      --metrics-path <PATH>  Metrics output file or FIFO path\n",
             "      --mmds-size-limit <BYTES>\n",
             "                         MMDS data store size; defaults to HTTP API limit\n",
@@ -2732,6 +2732,7 @@ mod tests {
         assert!(help.contains("PATCH /vm supports Paused and Resumed"));
         assert!(help.contains("PUT /cpu-config accepts empty CPU config as no-op"));
         assert!(help.contains("--log-path <PATH>"));
+        assert!(help.contains("Logger level: Off, Trace, Debug, Info, Warn, Warning, or Error"));
         assert!(help.contains("--metrics-path <PATH>"));
         assert!(help.contains("--http-api-max-payload-size <BYTES>"));
         assert!(help.contains("Maximum HTTP API request body size"));
