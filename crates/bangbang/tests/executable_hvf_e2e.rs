@@ -3943,6 +3943,7 @@ mod macos_arm64 {
 
     fn assert_logger_output_lines(output: &str) {
         let mut action_lines = Vec::new();
+        let mut saw_api_request_line = false;
         for line in output.lines() {
             if line.starts_with("action=") {
                 action_lines.push(line);
@@ -3953,6 +3954,7 @@ mod macos_arm64 {
                 is_api_request_logger_line(line),
                 "logger output line should be an action record or API request record; output:\n{output}\nline: {line}"
             );
+            saw_api_request_line = true;
         }
 
         const EXPECTED_ACTION_LINES: &[&str] = &["action=InstanceStart", "action=FlushMetrics"];
@@ -3960,6 +3962,10 @@ mod macos_arm64 {
             action_lines.as_slice(),
             EXPECTED_ACTION_LINES,
             "logger output should include the expected action records"
+        );
+        assert!(
+            saw_api_request_line,
+            "logger output should include at least one API request record; output:\n{output}"
         );
     }
 
@@ -4008,6 +4014,12 @@ mod macos_arm64 {
     #[should_panic(expected = "logger output should include the expected action records")]
     fn logger_output_rejects_missing_action_record() {
         assert_logger_output_lines("The API server received a Get request on \"/\".\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "logger output should include at least one API request record")]
+    fn logger_output_rejects_missing_api_request_record() {
+        assert_logger_output_lines("action=InstanceStart\naction=FlushMetrics\n");
     }
 
     fn wait_for_file_prefix_marker(
