@@ -4929,6 +4929,30 @@ mod tests {
     }
 
     #[test]
+    fn config_file_empty_array_cpu_config_starts_instance() {
+        let config_path = unique_config_path("empty-array-cpu-config");
+        fs::write(
+            &config_path,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{"kvm_capabilities":[],"reg_modifiers":[],"vcpu_features":[]}}"#,
+        )
+        .expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("empty array cpu-config should not block config-file startup");
+
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
     fn config_file_serial_rate_limiter_starts_instance() {
         let config_path = unique_config_path("serial-rate-limiter");
         fs::write(

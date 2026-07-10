@@ -1821,6 +1821,22 @@ fn executable_configures_vm_before_start() {
     let cpu_config_response = http_put_json(&socket_path, "/cpu-config", "{}");
     assert_no_content_response(&cpu_config_response, "PUT /cpu-config empty");
 
+    let empty_array_cpu_config_response = http_put_json(
+        &socket_path,
+        "/cpu-config",
+        r#"{"kvm_capabilities":[],"reg_modifiers":[],"vcpu_features":[]}"#,
+    );
+    assert_no_content_response(
+        &empty_array_cpu_config_response,
+        "PUT /cpu-config empty arrays",
+    );
+    let instance_info_after_empty_array_cpu_config = http_get(&socket_path, "/");
+    assert_response_contains(
+        &instance_info_after_empty_array_cpu_config,
+        r#""state":"Not started""#,
+        "GET / after empty array PUT /cpu-config",
+    );
+
     let custom_cpu_config_response =
         http_put_json(&socket_path, "/cpu-config", r#"{"kvm_capabilities":["1"]}"#);
     assert_bad_request_response(&custom_cpu_config_response, "PUT /cpu-config custom");
