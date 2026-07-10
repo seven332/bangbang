@@ -811,6 +811,17 @@ impl VmmController {
         Ok(VmmData::Empty)
     }
 
+    pub fn preflight_create_snapshot(&self) -> Result<(), VmmActionError> {
+        if self.instance_info.state != InstanceState::Paused {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::CreateSnapshot.name(),
+                state: self.instance_info.state,
+            });
+        }
+
+        Ok(())
+    }
+
     #[track_caller]
     fn log_action(&mut self, action: &str) -> Result<(), VmmActionError> {
         if let Err(err) = self.logger_state.log_action(action) {
@@ -1087,13 +1098,7 @@ impl VmmController {
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
             VmmAction::CreateSnapshot => {
-                if self.instance_info.state != InstanceState::Paused {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
+                self.preflight_create_snapshot()?;
                 Err(VmmActionError::SnapshotUnsupported)
             }
             VmmAction::LoadSnapshot => {
@@ -2252,6 +2257,29 @@ mod tests {
         assert_eq!(err, VmmActionError::SnapshotUnsupported);
         assert_eq!(controller.instance_info().state, InstanceState::Paused);
         assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
+    fn create_snapshot_preflight_matches_controller_state_policy() {
+        for state in [InstanceState::NotStarted, InstanceState::Running] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller.instance_info.state = state;
+
+            assert_eq!(
+                controller.preflight_create_snapshot(),
+                Err(VmmActionError::UnsupportedState {
+                    action: VmmAction::CreateSnapshot.name(),
+                    state,
+                })
+            );
+            assert_eq!(controller.instance_info().state, state);
+        }
+
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller.instance_info.state = InstanceState::Paused;
+
+        assert_eq!(controller.preflight_create_snapshot(), Ok(()));
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
     }
 
     #[test]
