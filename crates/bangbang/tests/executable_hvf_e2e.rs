@@ -113,6 +113,8 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_ENTROPY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-read=1";
     const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
     const DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-v2-fetch=1";
+    const DIRECT_ROOTFS_MMDS_CONTENT: &str =
+        r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_GUEST_VALUE"}}"#;
     const DIRECT_ROOTFS_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-connect=1";
     const DIRECT_ROOTFS_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
     const DIRECT_ROOTFS_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
@@ -120,11 +122,18 @@ mod macos_arm64 {
     const GUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[derive(Clone, Copy)]
+    enum DirectRootfsMmdsContentSource {
+        ApiRequest,
+        MetadataFile,
+    }
+
+    #[derive(Clone, Copy)]
     struct DirectRootfsMmdsFetchCase<'a> {
         request_context: &'a str,
         mmds_config_body: &'a str,
         boot_args: &'a str,
         success_marker: &'a [u8],
+        content_source: DirectRootfsMmdsContentSource,
     }
 
     #[test]
@@ -2568,6 +2577,18 @@ mod macos_arm64 {
             mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
             boot_args: DIRECT_ROOTFS_MMDS_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_MARKER,
+            content_source: DirectRootfsMmdsContentSource::ApiRequest,
+        });
+    }
+
+    #[test]
+    fn signed_executable_serves_metadata_file_mmds_to_direct_rootfs_guest() {
+        run_direct_rootfs_mmds_guest_fetch_test(DirectRootfsMmdsFetchCase {
+            request_context: "metadata-file MMDS guest fetch",
+            mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
+            boot_args: DIRECT_ROOTFS_MMDS_BOOT_ARGS,
+            success_marker: DIRECT_ROOTFS_MMDS_MARKER,
+            content_source: DirectRootfsMmdsContentSource::MetadataFile,
         });
     }
 
@@ -2578,6 +2599,7 @@ mod macos_arm64 {
             mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#,
             boot_args: DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_V2_MARKER,
+            content_source: DirectRootfsMmdsContentSource::ApiRequest,
         });
     }
 
@@ -3459,13 +3481,27 @@ mod macos_arm64 {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let data_backing_path = test_dir.path().join("data.img");
+        let metadata_path = test_dir.path().join("metadata.json");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
         let instance_id = test_dir.instance_id();
 
         create_zeroed_block_backing(&data_backing_path);
 
-        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+        let mut bangbang = match case.content_source {
+            DirectRootfsMmdsContentSource::ApiRequest => {
+                BangbangProcess::start(&socket_path, &instance_id)
+            }
+            DirectRootfsMmdsContentSource::MetadataFile => {
+                fs::write(&metadata_path, DIRECT_ROOTFS_MMDS_CONTENT)
+                    .expect("metadata file should be written");
+                BangbangProcess::start_with_extra_args(
+                    &socket_path,
+                    &instance_id,
+                    &["--metadata", path_text(&metadata_path)],
+                )
+            }
+        };
 
         let machine_response = http_put_json(
             &socket_path,
@@ -3488,13 +3524,11 @@ mod macos_arm64 {
         let mmds_config_context = format!("PUT /mmds/config {}", case.request_context);
         assert_no_content_response(&mmds_config_response, &mmds_config_context);
 
-        let mmds_response = http_put_json(
-            &socket_path,
-            "/mmds",
-            r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_GUEST_VALUE"}}"#,
-        );
-        let mmds_context = format!("PUT /mmds {}", case.request_context);
-        assert_no_content_response(&mmds_response, &mmds_context);
+        if let DirectRootfsMmdsContentSource::ApiRequest = case.content_source {
+            let mmds_response = http_put_json(&socket_path, "/mmds", DIRECT_ROOTFS_MMDS_CONTENT);
+            let mmds_context = format!("PUT /mmds {}", case.request_context);
+            assert_no_content_response(&mmds_response, &mmds_context);
+        }
 
         let kernel_path_json = json_string(path_text(&kernel_path));
         let boot_args_json = json_string(case.boot_args);
