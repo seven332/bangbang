@@ -87,7 +87,7 @@ tested:
   restored device state must be treated as untrusted input and must preserve the
   existing host-path redaction policy.
 
-## Follow-Up Work
+## Implementation Split
 
 Future implementation should be split into issue-sized areas instead of one
 large snapshot PR:
