@@ -115,6 +115,8 @@ mod imp {
         pub fn hv_vcpu_set_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: u64) -> HvReturn;
         pub fn hv_vcpu_get_vtimer_mask(vcpu: HvVcpu, vtimer_is_masked: *mut bool) -> HvReturn;
         pub fn hv_vcpu_set_vtimer_mask(vcpu: HvVcpu, vtimer_is_masked: bool) -> HvReturn;
+        pub fn hv_vcpu_get_vtimer_offset(vcpu: HvVcpu, vtimer_offset: *mut u64) -> HvReturn;
+        pub fn hv_vcpu_set_vtimer_offset(vcpu: HvVcpu, vtimer_offset: u64) -> HvReturn;
         pub fn hv_vcpu_run(vcpu: HvVcpu) -> HvReturn;
         pub fn hv_vcpus_exit(vcpus: *mut HvVcpu, vcpu_count: u32) -> HvReturn;
     }
@@ -339,6 +341,31 @@ mod imp {
         }
     }
 
+    pub fn get_vtimer_offset(vcpu: HvVcpu) -> Result<u64, BackendError> {
+        let mut value = 0;
+
+        // SAFETY: The caller owns this current-thread vCPU handle, and `value` is a valid
+        // out-pointer for the duration of the call.
+        unsafe {
+            check(
+                hv_vcpu_get_vtimer_offset(vcpu, &mut value),
+                "hv_vcpu_get_vtimer_offset",
+            )?
+        };
+
+        Ok(value)
+    }
+
+    pub fn set_vtimer_offset(vcpu: HvVcpu, offset: u64) -> Result<(), BackendError> {
+        // SAFETY: The caller owns this current-thread vCPU handle.
+        unsafe {
+            check(
+                hv_vcpu_set_vtimer_offset(vcpu, offset),
+                "hv_vcpu_set_vtimer_offset",
+            )
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{HV_BAD_ARGUMENT, HV_DENIED, HV_UNSUPPORTED, check};
@@ -444,6 +471,14 @@ mod imp {
     }
 
     pub fn set_vtimer_mask(_: HvVcpu, _: bool) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_vtimer_offset(_: HvVcpu) -> Result<u64, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn set_vtimer_offset(_: HvVcpu, _: u64) -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 }

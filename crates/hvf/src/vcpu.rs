@@ -62,6 +62,34 @@ impl HvfArm64VcpuGeneralRegisterState {
     }
 }
 
+/// Detached raw virtual-timer state captured from one arm64 vCPU.
+///
+/// The offset is the Hypervisor.framework value used in its
+/// `CNTVCT_EL0 = mach_absolute_time() - offset` relation. This pair does not
+/// include timer compare/control registers, pending interrupts, GIC state, or a
+/// portable snapshot-time adjustment policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuVirtualTimerState {
+    masked: bool,
+    offset: u64,
+}
+
+impl HvfArm64VcpuVirtualTimerState {
+    pub(crate) const fn new(masked: bool, offset: u64) -> Self {
+        Self { masked, offset }
+    }
+
+    /// Return whether Hypervisor.framework virtual-timer exits are masked.
+    pub const fn masked(self) -> bool {
+        self.masked
+    }
+
+    /// Return the raw Hypervisor.framework virtual-timer offset.
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HvfRegister(u32);
 
@@ -233,6 +261,14 @@ impl HvfVcpuOwner {
         crate::ffi::set_vtimer_mask(self.handle()?.vcpu, masked)
     }
 
+    pub(crate) fn get_vtimer_offset(&self) -> Result<u64, BackendError> {
+        crate::ffi::get_vtimer_offset(self.handle()?.vcpu)
+    }
+
+    pub(crate) fn set_vtimer_offset(&mut self, offset: u64) -> Result<(), BackendError> {
+        crate::ffi::set_vtimer_offset(self.handle()?.vcpu, offset)
+    }
+
     pub(crate) fn set_gic_ppi_pending(
         &mut self,
         writer: &HvfGicPpiPendingWriter,
@@ -377,6 +413,16 @@ impl<'vm> HvfVcpu<'vm> {
     pub fn set_vtimer_mask(&mut self, masked: bool) -> Result<(), BackendError> {
         self.owner.set_vtimer_mask(masked)
     }
+
+    /// Read the raw HVF virtual-timer offset for this current-thread vCPU.
+    pub fn get_vtimer_offset(&self) -> Result<u64, BackendError> {
+        self.owner.get_vtimer_offset()
+    }
+
+    /// Set the raw HVF virtual-timer offset for this current-thread vCPU.
+    pub fn set_vtimer_offset(&mut self, offset: u64) -> Result<(), BackendError> {
+        self.owner.set_vtimer_offset(offset)
+    }
 }
 
 impl fmt::Debug for HvfVcpu<'_> {
@@ -427,6 +473,17 @@ pub(crate) fn capture_arm64_vcpu_general_register_state_with(
 }
 
 #[cfg(test)]
+pub(crate) fn capture_arm64_vcpu_virtual_timer_state_with(
+    get_mask: impl FnOnce() -> Result<bool, BackendError>,
+    get_offset: impl FnOnce() -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuVirtualTimerState, BackendError> {
+    let masked = get_mask()?;
+    let offset = get_offset()?;
+
+    Ok(HvfArm64VcpuVirtualTimerState::new(masked, offset))
+}
+
+#[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::marker::PhantomData;
@@ -440,7 +497,8 @@ mod tests {
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfRegister,
         HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
-        capture_arm64_vcpu_general_register_state_with, configure_arm64_boot_registers_with,
+        capture_arm64_vcpu_general_register_state_with,
+        capture_arm64_vcpu_virtual_timer_state_with, configure_arm64_boot_registers_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
@@ -592,6 +650,14 @@ mod tests {
             vcpu.set_vtimer_mask(false),
             Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
         );
+        assert_eq!(
+            vcpu.get_vtimer_offset(),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.set_vtimer_offset(0),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
     }
 
     #[test]
@@ -695,6 +761,58 @@ mod tests {
             .expect("general-register capture retry should succeed");
         assert_eq!(state.general_purpose_register(2), Some(2));
         assert_eq!(reads.borrow().len(), 33);
+    }
+
+    #[test]
+    fn captures_arm64_virtual_timer_state_in_mask_then_offset_order() {
+        let reads = RefCell::new(Vec::new());
+
+        let state = capture_arm64_vcpu_virtual_timer_state_with(
+            || {
+                reads.borrow_mut().push("mask");
+                Ok(true)
+            },
+            || {
+                reads.borrow_mut().push("offset");
+                Ok(0x1234_5678_9abc_def0)
+            },
+        )
+        .expect("virtual-timer capture should succeed");
+
+        assert_eq!(*reads.borrow(), ["mask", "offset"]);
+        assert!(state.masked());
+        assert_eq!(state.offset(), 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn arm64_virtual_timer_capture_returns_no_state_after_either_read_error() {
+        let offset_called = Cell::new(false);
+        assert_eq!(
+            capture_arm64_vcpu_virtual_timer_state_with(
+                || Err(BackendError::InvalidState("fake mask read failed")),
+                || {
+                    offset_called.set(true);
+                    Ok(1)
+                },
+            ),
+            Err(BackendError::InvalidState("fake mask read failed"))
+        );
+        assert!(!offset_called.get());
+
+        assert_eq!(
+            capture_arm64_vcpu_virtual_timer_state_with(
+                || Ok(false),
+                || Err(BackendError::InvalidState("fake offset read failed")),
+            ),
+            Err(BackendError::InvalidState("fake offset read failed"))
+        );
+        assert_eq!(
+            capture_arm64_vcpu_virtual_timer_state_with(|| Ok(false), || Ok(7)),
+            Ok(super::HvfArm64VcpuVirtualTimerState {
+                masked: false,
+                offset: 7,
+            })
+        );
     }
 
     #[test]

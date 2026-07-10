@@ -1626,22 +1626,30 @@ reads and boot-register setup on the vCPU-owning thread, rejects duplicate setup
 setup during shutdown, setup while a run is in flight, and setup after a run has
 started. If setup fails after partially writing registers, the runner rejects
 guest runs until setup is retried successfully. The runner also exposes explicit
-single-exit MMIO commands and virtual timer mask commands that run on the
-vCPU-owning thread. One command dispatches an already resolved MMIO access after
+single-exit MMIO commands and virtual-timer mask and offset commands that run on
+the vCPU-owning thread. One command dispatches an already resolved MMIO access after
 a run has started, and another command starts one vCPU run, resolves a resulting
 MMIO exit, and dispatches or completes it through a caller-provided shared
-dispatcher. The virtual timer mask commands expose HVF's explicit mask bit after
-`HV_EXIT_REASON_VTIMER_ACTIVATED`; GIC PPI pending commands can set or clear a
+dispatcher. The virtual-timer commands expose HVF's explicit mask bit after
+`HV_EXIT_REASON_VTIMER_ACTIVATED` and its raw host-time-relative offset; GIC PPI
+pending commands can set or clear a
 validated timer PPI bit on the runner thread. The internal boot-session
 run-loop now handles virtual timer exits by asserting the EL1 virtual timer PPI
 through that runner-thread command. Full timer delivery policy, including how to
 detect EOI/deactivation and unmask the HVF virtual timer, remains future work.
 These commands reject overlapping metadata reads, runs, boot-register setup,
-MMIO dispatches, general-register capture, virtual timer mask operations, or
+MMIO dispatches, general-register capture, virtual-timer operations, or
 GIC PPI pending operations. The general-register capture command returns only
 after X0-X30, PC, and CPSR have all been read, and both borrowed and owned HVF
-boot sessions expose it for later lease-owned orchestration. The process
-snapshot barrier does not invoke it.
+boot sessions expose it for later lease-owned orchestration. A separate command
+reads the virtual-timer mask followed by the raw offset, publishes no partial
+state if either read fails, and keeps command-owned admission until both reads
+finish even if the caller abandons its response. Both boot-session forms expose
+that immutable pair. The raw offset follows HVF's
+`CNTVCT_EL0 = mach_absolute_time() - offset` relation; this capture does not
+include compare/control registers, pending interrupts, GIC state, or a portable
+restore-time adjustment policy. The process snapshot barrier invokes neither
+capture.
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared
 MMIO dispatcher, so a
@@ -1966,9 +1974,10 @@ macOS design work instead of direct implementation:
   Linux boot-register setup. The current runner skeleton creates a vCPU on a
   dedicated thread, applies that boot-register setup on the owning thread before
   the first run, can capture a detached X0-X30, PC, and CPSR subset through one
-  owner-thread command, gets and sets the HVF virtual timer mask on that owning
-  thread,
-  explicitly dispatches one resolved MMIO access through a shared runtime
+  owner-thread command, gets and sets the HVF virtual-timer mask and raw offset
+  on that owning thread, and can capture that timer pair through one serialized
+  command. The timer pair is not a complete or portable restore model. The
+  runner explicitly dispatches one resolved MMIO access through a shared runtime
   dispatcher on the owning thread, runs once and handles a resulting
   MMIO exit through that dispatcher, supports one cancellable
   `hv_vcpu_run` step at a time, exposes a cancellation-only handle for that run

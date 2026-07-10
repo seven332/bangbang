@@ -37,19 +37,29 @@ fn creates_and_destroys_hvf_vcpu() {
                 .expect("vCPU register should be read"),
             0x1234
         );
+        let original_vtimer_mask = vcpu
+            .get_vtimer_mask()
+            .expect("original vCPU vtimer mask should be read");
+        let original_vtimer_offset = vcpu
+            .get_vtimer_offset()
+            .expect("original vCPU vtimer offset should be read");
         vcpu.set_vtimer_mask(true)
             .expect("vCPU vtimer mask should be set");
+        vcpu.set_vtimer_offset(0x1234_5678_9abc_def0)
+            .expect("vCPU vtimer offset should be set");
         assert!(
             vcpu.get_vtimer_mask()
                 .expect("vCPU vtimer mask should be read")
         );
-        vcpu.set_vtimer_mask(false)
-            .expect("vCPU vtimer mask should be cleared");
-        assert!(
-            !vcpu
-                .get_vtimer_mask()
-                .expect("vCPU vtimer mask should be read")
+        assert_eq!(
+            vcpu.get_vtimer_offset()
+                .expect("vCPU vtimer offset should be read"),
+            0x1234_5678_9abc_def0
         );
+        vcpu.set_vtimer_offset(original_vtimer_offset)
+            .expect("original vCPU vtimer offset should be restored");
+        vcpu.set_vtimer_mask(original_vtimer_mask)
+            .expect("original vCPU vtimer mask should be restored");
         vcpu.destroy().expect("vCPU should be destroyed");
         vcpu.destroy()
             .expect("destroyed vCPU should remain destroyed");
@@ -231,21 +241,31 @@ fn cancels_runner_before_first_run() {
         let runner = backend
             .start_vcpu_runner()
             .expect("vCPU runner should start");
+        let original_vtimer_state = runner
+            .capture_arm64_virtual_timer_state()
+            .expect("original runner vtimer state should be captured");
         runner
             .set_vtimer_mask(true)
             .expect("runner vtimer mask should be set");
-        assert!(
-            runner
-                .get_vtimer_mask()
-                .expect("runner vtimer mask should be read")
-        );
         runner
-            .set_vtimer_mask(false)
-            .expect("runner vtimer mask should be cleared");
-        assert!(
-            !runner
-                .get_vtimer_mask()
-                .expect("runner vtimer mask should be read")
+            .set_vtimer_offset(0x1234_5678_9abc_def0)
+            .expect("runner vtimer offset should be set");
+        let captured_vtimer_state = runner
+            .capture_arm64_virtual_timer_state()
+            .expect("runner vtimer state should be captured");
+        assert!(captured_vtimer_state.masked());
+        assert_eq!(captured_vtimer_state.offset(), 0x1234_5678_9abc_def0);
+        runner
+            .set_vtimer_offset(original_vtimer_state.offset())
+            .expect("original runner vtimer offset should be restored");
+        runner
+            .set_vtimer_mask(original_vtimer_state.masked())
+            .expect("original runner vtimer mask should be restored");
+        assert_eq!(
+            runner
+                .capture_arm64_virtual_timer_state()
+                .expect("restored runner vtimer state should be captured"),
+            original_vtimer_state
         );
         runner.cancel().expect("runner should accept cancellation");
         assert_eq!(
@@ -472,6 +492,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         session.boot_registers().kernel_entry.raw_value()
     );
     assert_eq!(register_state.cpsr(), ARM64_LINUX_BOOT_CPSR);
+    session
+        .capture_arm64_virtual_timer_state()
+        .expect("internal session should capture virtual-timer state");
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();
@@ -591,6 +614,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
         session.boot_registers().kernel_entry.raw_value()
     );
     assert_eq!(register_state.cpsr(), ARM64_LINUX_BOOT_CPSR);
+    session
+        .capture_arm64_virtual_timer_state()
+        .expect("owned session should capture virtual-timer state");
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();
