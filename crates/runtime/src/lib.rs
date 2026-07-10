@@ -1035,11 +1035,20 @@ impl VmmController {
                 Ok(VmmData::InstanceInformation(self.instance_info.clone()))
             }
             VmmAction::GetMachineConfig => Ok(VmmData::MachineConfiguration(self.machine_config)),
-            VmmAction::GetMmds => self
-                .mmds_state
-                .with(mmds::MmdsState::get_data_or_null)
-                .map(VmmData::MmdsValue)
-                .map_err(VmmActionError::MmdsState),
+            VmmAction::GetMmds => {
+                let value = if self.instance_info.state == InstanceState::NotStarted {
+                    self.mmds_state
+                        .with(mmds::MmdsState::get_data_or_null)
+                        .map_err(VmmActionError::MmdsState)?
+                } else {
+                    self.mmds_state
+                        .with(mmds::MmdsState::get_data)
+                        .map_err(VmmActionError::MmdsState)?
+                        .map_err(VmmActionError::MmdsDataStore)?
+                };
+
+                Ok(VmmData::MmdsValue(value))
+            }
             VmmAction::GetVmConfig => self
                 .vm_config()
                 .map(VmmData::VmConfiguration)
@@ -3419,6 +3428,52 @@ mod tests {
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
         assert_eq!(controller.vsock_config(), None);
+    }
+
+    #[test]
+    fn get_mmds_requires_initialized_data_store_after_start() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source should configure");
+        controller
+            .start_instance_with(|_| Ok(()))
+            .expect("startup should succeed");
+
+        let err = controller
+            .handle_action(VmmAction::GetMmds)
+            .expect_err("runtime uninitialized MMDS read should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::MmdsDataStore(MmdsDataStoreError::NotInitialized)
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert_eq!(
+            controller.mmds_state.with(MmdsState::get_data),
+            Ok(Err(MmdsDataStoreError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn get_mmds_returns_initialized_data_after_start() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let value = serde_json::json!({"latest": {"meta-data": {"ami-id": "ami-123"}}});
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source should configure");
+        controller
+            .handle_action(VmmAction::PutMmds(MmdsContentInput::new(value.clone())))
+            .expect("MMDS data should configure");
+        controller
+            .start_instance_with(|_| Ok(()))
+            .expect("startup should succeed");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(value))
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
     }
 
     #[test]
