@@ -2040,6 +2040,11 @@ mod tests {
 
     struct PanicOnRunVcpu;
 
+    struct BlockingPanicOnRunVcpu {
+        entered_run_sender: mpsc::Sender<()>,
+        release_run_receiver: mpsc::Receiver<()>,
+    }
+
     struct ConfigureRecordingVcpu {
         configured_sender: mpsc::Sender<HvfArm64BootRegisters>,
     }
@@ -2273,6 +2278,41 @@ mod tests {
 
         fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
             panic!("fake run panic");
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingPanicOnRunVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            self.entered_run_sender
+                .send(())
+                .expect("fake blocking panic entry receiver should remain open");
+            self.release_run_receiver
+                .recv()
+                .expect("fake blocking panic release sender should remain open");
+            panic!("fake blocking run panic");
         }
 
         fn dispatch_mmio_access(
@@ -4410,6 +4450,56 @@ mod tests {
                 super::COMMAND_CHANNEL_CLOSED_MESSAGE
             ))
         );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .vtimer_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_arm64_virtual_timer_capture_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (capture_response_sender, capture_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_virtual_timer_capture(capture_response_sender)
+            .expect("virtual-timer capture should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .vtimer_operation_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(capture_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
         assert!(
             !runner
                 .state
