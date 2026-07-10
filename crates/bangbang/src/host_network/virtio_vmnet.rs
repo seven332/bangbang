@@ -201,13 +201,20 @@ impl MmdsPacketDetour {
             classified.sequence_number(),
             classified.payload(),
         );
-        if let Some(request) = self.record_rx_accepted_error_result(appended_request)? {
-            self.queue_response(
-                request.response_context,
-                request.payload.len(),
-                &request.payload,
-            )?;
-            return Ok(true);
+        match self.record_rx_accepted_error_result(appended_request)? {
+            MmdsRequestBufferAppend::Complete(request) => {
+                self.queue_response(
+                    request.response_context,
+                    request.payload.len(),
+                    &request.payload,
+                )?;
+                return Ok(true);
+            }
+            MmdsRequestBufferAppend::Buffered => {
+                self.record_rx_count();
+                return Ok(true);
+            }
+            MmdsRequestBufferAppend::NotFound => {}
         }
 
         if mmds_http_request_is_complete(classified.payload()) {
@@ -347,19 +354,21 @@ impl MmdsRequestBuffers {
         key: MmdsRequestBufferKey,
         sequence_number: u32,
         payload: &[u8],
-    ) -> Result<Option<MmdsBufferedRequest>, MmdsRequestBufferError> {
+    ) -> Result<MmdsRequestBufferAppend, MmdsRequestBufferError> {
         let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
-            return Ok(None);
+            return Ok(MmdsRequestBufferAppend::NotFound);
         };
 
         let mut entry = self.entries.swap_remove(index);
         entry.append_payload(sequence_number, payload, self.request_len_limit)?;
         if entry.is_complete() {
-            return Ok(Some(entry.into_buffered_request()));
+            return Ok(MmdsRequestBufferAppend::Complete(
+                entry.into_buffered_request(),
+            ));
         }
 
         self.entries.push(entry);
-        Ok(None)
+        Ok(MmdsRequestBufferAppend::Buffered)
     }
 
     fn start_request(
@@ -405,6 +414,13 @@ impl MmdsRequestBuffers {
         });
         Ok(())
     }
+}
+
+#[derive(Debug)]
+enum MmdsRequestBufferAppend {
+    NotFound,
+    Buffered,
+    Complete(MmdsBufferedRequest),
 }
 
 #[derive(Debug)]
@@ -3853,6 +3869,57 @@ mod tests {
             .lock()
             .expect("test state lock should succeed");
         assert_eq!(state.backend.write_calls, 0);
+    }
+
+    #[test]
+    fn tx_sink_buffers_three_part_mmds_get_until_request_header_complete() {
+        let first_payload = b"GET /meta-";
+        let second_payload = b"data/host";
+        let third_payload = b"name HTTP/1.1\r\n\r\n";
+        let first_sequence_number = 0x1000;
+        let second_sequence_number = first_sequence_number
+            + u32::try_from(first_payload.len()).expect("test payload length should fit u32");
+        let third_sequence_number = second_sequence_number
+            + u32::try_from(second_payload.len()).expect("test payload length should fit u32");
+        let first_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, first_sequence_number, first_payload);
+        let second_packet = mmds_tcp_packet_from_source(
+            TEST_SOURCE_TCP_PORT,
+            second_sequence_number,
+            second_payload,
+        );
+        let third_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, third_sequence_number, third_payload);
+        let mut memory = tx_memory();
+        let metrics = SharedMmdsMetrics::default();
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour_and_metrics(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+            metrics.clone(),
+        );
+
+        for packet in [&first_packet, &second_packet, &third_packet] {
+            let frame = tx_frame(&mut memory, &[(packet, PAYLOAD_ADDRESS)]);
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("MMDS split GET fragment should detour");
+        }
+
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            mmds_response_body(&responses[0]),
+            b"The MMDS data store is not initialized."
+        );
+        assert_eq!(
+            metrics.snapshot(),
+            MmdsMetrics::default().with_rx_accepted(3).with_rx_count(3)
+        );
     }
 
     #[test]
