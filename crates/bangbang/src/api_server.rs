@@ -6202,7 +6202,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_stateful_faults_for_running_snapshot_endpoints() {
+    fn returns_stateful_faults_for_runtime_snapshot_endpoints() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
         let boot_request = format!(
@@ -6224,7 +6224,7 @@ mod tests {
                     "/snapshot/create",
                     r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
                 ),
-                "Snapshot and restore are not supported.",
+                "The requested operation is not supported in Running state: CreateSnapshot",
             ),
             (
                 "snap-ld-run",
@@ -6254,6 +6254,44 @@ mod tests {
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running
+        );
+
+        let pause_response = request_over_socket(
+            &mut vmm,
+            "snap-pause",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#),
+        );
+        assert!(
+            pause_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "pause before snapshot create should succeed: {pause_response}"
+        );
+
+        let paused_create_response = request_over_socket(
+            &mut vmm,
+            "snap-cr-paused",
+            &request_with_body(
+                "PUT",
+                "/snapshot/create",
+                r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+            ),
+        );
+        assert!(
+            paused_create_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "paused snapshot create should still be unsupported: {paused_create_response}"
+        );
+        assert!(
+            paused_create_response
+                .contains(r#"{"fault_message":"Snapshot and restore are not supported."}"#),
+            "paused snapshot create should reach snapshot unsupported fault: {paused_create_response}"
+        );
+        assert!(
+            !paused_create_response.contains("vmstate")
+                && !paused_create_response.contains("memory"),
+            "paused snapshot create must not echo snapshot paths: {paused_create_response}"
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Paused
         );
     }
 

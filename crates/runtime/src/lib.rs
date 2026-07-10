@@ -1060,7 +1060,7 @@ impl VmmController {
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
             VmmAction::CreateSnapshot => {
-                if self.instance_info.state == InstanceState::NotStarted {
+                if self.instance_info.state != InstanceState::Paused {
                     return Err(VmmActionError::UnsupportedState {
                         action: action_name,
                         state: self.instance_info.state,
@@ -2174,7 +2174,7 @@ mod tests {
 
         let err = controller
             .handle_action(VmmAction::CreateSnapshot)
-            .expect_err("snapshot create should be post-boot-only");
+            .expect_err("snapshot create should require paused state");
 
         assert_eq!(
             err,
@@ -2188,22 +2188,43 @@ mod tests {
     }
 
     #[test]
-    fn create_snapshot_after_start_reaches_snapshot_fault_without_mutating() {
-        for state in [InstanceState::Running, InstanceState::Paused] {
-            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
-            controller
-                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
-                .expect("boot source config should be stored");
-            controller.instance_info.state = state;
+    fn create_snapshot_rejects_running_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller.instance_info.state = InstanceState::Running;
 
-            let err = controller
-                .handle_action(VmmAction::CreateSnapshot)
-                .expect_err("snapshot create should remain unsupported");
+        let err = controller
+            .handle_action(VmmAction::CreateSnapshot)
+            .expect_err("snapshot create should require paused state");
 
-            assert_eq!(err, VmmActionError::SnapshotUnsupported);
-            assert_eq!(controller.instance_info().state, state);
-            assert!(controller.boot_source_config().is_some());
-        }
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::CreateSnapshot.name(),
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
+    fn create_snapshot_reaches_snapshot_fault_in_paused_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller.instance_info.state = InstanceState::Paused;
+
+        let err = controller
+            .handle_action(VmmAction::CreateSnapshot)
+            .expect_err("snapshot create should remain unsupported");
+
+        assert_eq!(err, VmmActionError::SnapshotUnsupported);
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert!(controller.boot_source_config().is_some());
     }
 
     #[test]
