@@ -11,10 +11,12 @@ commands, but does not create, load, read, write, or inspect snapshot files.
 
 - `PUT /snapshot/create` and `PUT /snapshot/load` parse request bodies before
   reaching VMM action policy.
-- Valid create requests are post-boot-only and valid load requests are
+- Valid create requests are paused-state-only and valid load requests are
   pre-boot-only.
-- Both actions currently return the snapshot-specific unsupported fault after
-  state policy succeeds.
+- Create requests currently return state-policy faults before startup and while
+  running, then return the snapshot-specific unsupported fault only after state
+  policy reaches a paused instance. Load requests return the snapshot-specific
+  unsupported fault before startup and state-policy faults after startup.
 - `--snapshot-version` and `--describe-snapshot <PATH>` are recognized as
   first-class CLI commands, but fail before API socket publication or HVF
   startup because bangbang has no supported snapshot data format.
