@@ -2182,6 +2182,76 @@ fn executable_configures_writeback_drive_cache_type() {
 }
 
 #[test]
+fn executable_replaces_drive_without_reordering() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let rootfs_path_json = json_string(path_text(&test_dir.path().join("rootfs.ext4")));
+    let data1_path_json = json_string(path_text(&test_dir.path().join("data1.ext4")));
+    let data2_path_json = json_string(path_text(&test_dir.path().join("data2.ext4")));
+    let replaced_data1_path_json =
+        json_string(path_text(&test_dir.path().join("data1-replaced.ext4")));
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let put_drive = |drive_id: &str, path_json: &str, is_root_device: bool| {
+        let body = format!(
+            r#"{{
+                "drive_id":"{drive_id}",
+                "path_on_host":{path_json},
+                "is_root_device":{is_root_device}
+            }}"#
+        );
+        let path = format!("/drives/{drive_id}");
+        let request_name = format!("PUT {path}");
+        let response = http_put_json(&socket_path, &path, &body);
+        assert_no_content_response(&response, &request_name);
+    };
+
+    put_drive("rootfs", &rootfs_path_json, true);
+    put_drive("data1", &data1_path_json, false);
+    put_drive("data2", &data2_path_json, false);
+    put_drive("data1", &replaced_data1_path_json, false);
+
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config after replacing drive");
+    assert_eq!(
+        vm_config.matches(r#""drive_id":"#).count(),
+        3,
+        "drive replacement must not add a duplicate drive; response:\n{vm_config}"
+    );
+    assert_eq!(
+        vm_config.matches(r#""drive_id":"data1""#).count(),
+        1,
+        "drive replacement must keep one data1 drive; response:\n{vm_config}"
+    );
+    assert_response_contains(
+        &vm_config,
+        &format!(r#""path_on_host":{replaced_data1_path_json}"#),
+        "GET /vm/config after replacing drive",
+    );
+    assert!(
+        !vm_config.contains(&format!(r#""path_on_host":{data1_path_json}"#)),
+        "drive replacement must remove original data1 path; response:\n{vm_config}"
+    );
+
+    let rootfs_index = vm_config
+        .find(r#""drive_id":"rootfs""#)
+        .expect("vm config should include rootfs drive");
+    let data1_index = vm_config
+        .find(r#""drive_id":"data1""#)
+        .expect("vm config should include data1 drive");
+    let data2_index = vm_config
+        .find(r#""drive_id":"data2""#)
+        .expect("vm config should include data2 drive");
+    assert!(
+        rootfs_index < data1_index && data1_index < data2_index,
+        "drive replacement must preserve ordering as rootfs, data1, data2; response:\n{vm_config}"
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_rejects_invalid_drive_configs_without_mutating() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
