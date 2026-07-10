@@ -614,7 +614,13 @@ fn handle_request_bytes_with_limit(
     http_api_max_payload_size: usize,
 ) -> HttpResponse {
     match parse_request_with_limit(bytes, http_api_max_payload_size) {
-        Ok(request) => handle_api_request(request, vmm),
+        Ok(request) => {
+            let (method, path) = api_request_log_method_path(&request);
+            match vmm.log_api_request(method, &path) {
+                Ok(_) => handle_api_request(request, vmm),
+                Err(err) => handle_empty(Err(err)),
+            }
+        }
         Err(err) => {
             if err == RequestError::SendCtrlAltDelUnsupported {
                 record_unsupported_put_action_request(bytes, vmm);
@@ -627,6 +633,62 @@ fn handle_request_bytes_with_limit(
                 HttpResponse::fault(err.fault_message())
             }
         }
+    }
+}
+
+fn api_request_log_method_path(request: &ApiRequest) -> (&'static str, String) {
+    match request {
+        ApiRequest::GetInstanceInfo => ("Get", "/".to_string()),
+        ApiRequest::GetBalloon => ("Get", "/balloon".to_string()),
+        ApiRequest::GetBalloonStats => ("Get", "/balloon/statistics".to_string()),
+        ApiRequest::GetBalloonHintingStatus => ("Get", "/balloon/hinting/status".to_string()),
+        ApiRequest::GetMemoryHotplug => ("Get", "/hotplug/memory".to_string()),
+        ApiRequest::GetMachineConfig => ("Get", "/machine-config".to_string()),
+        ApiRequest::GetMmds => ("Get", "/mmds".to_string()),
+        ApiRequest::GetVmConfig => ("Get", "/vm/config".to_string()),
+        ApiRequest::GetVersion => ("Get", "/version".to_string()),
+        ApiRequest::PutAction(_) => ("Put", "/actions".to_string()),
+        ApiRequest::PutBalloon(_) => ("Put", "/balloon".to_string()),
+        ApiRequest::PutBootSource(_) => ("Put", "/boot-source".to_string()),
+        ApiRequest::PutCpuConfig(_) => ("Put", "/cpu-config".to_string()),
+        ApiRequest::PutDrive(config) => ("Put", format!("/drives/{}", config.path_drive_id())),
+        ApiRequest::PutEntropy(_) => ("Put", "/entropy".to_string()),
+        ApiRequest::PutMemoryHotplug(_) => ("Put", "/hotplug/memory".to_string()),
+        ApiRequest::PatchBalloon(_) => ("Patch", "/balloon".to_string()),
+        ApiRequest::PatchBalloonStats(_) => ("Patch", "/balloon/statistics".to_string()),
+        ApiRequest::PatchBalloonHintingStart(_) => ("Patch", "/balloon/hinting/start".to_string()),
+        ApiRequest::PatchBalloonHintingStop => ("Patch", "/balloon/hinting/stop".to_string()),
+        ApiRequest::PatchMemoryHotplug(_) => ("Patch", "/hotplug/memory".to_string()),
+        ApiRequest::PatchDrive(config) => ("Patch", format!("/drives/{}", config.path_drive_id())),
+        ApiRequest::PatchVmState(_) => ("Patch", "/vm".to_string()),
+        ApiRequest::PutLogger(_) => ("Put", "/logger".to_string()),
+        ApiRequest::PutMachineConfig(_) => ("Put", "/machine-config".to_string()),
+        ApiRequest::PatchMachineConfig(_) => ("Patch", "/machine-config".to_string()),
+        ApiRequest::PutMetrics(_) => ("Put", "/metrics".to_string()),
+        ApiRequest::PutMmds(_) => ("Put", "/mmds".to_string()),
+        ApiRequest::PutMmdsConfig(_) => ("Put", "/mmds/config".to_string()),
+        ApiRequest::PutNetworkInterface(config) => (
+            "Put",
+            format!("/network-interfaces/{}", config.path_iface_id()),
+        ),
+        ApiRequest::PatchNetworkInterface(config) => (
+            "Patch",
+            format!("/network-interfaces/{}", config.path_iface_id()),
+        ),
+        ApiRequest::HotUnplugDevice(request) => match request.kind() {
+            ApiHotUnplugDeviceKind::Drive => ("Delete", format!("/drives/{}", request.id())),
+            ApiHotUnplugDeviceKind::NetworkInterface => {
+                ("Delete", format!("/network-interfaces/{}", request.id()))
+            }
+            ApiHotUnplugDeviceKind::Pmem => ("Delete", format!("/pmem/{}", request.id())),
+        },
+        ApiRequest::PutPmem(config) => ("Put", format!("/pmem/{}", config.path_pmem_id())),
+        ApiRequest::PatchPmem(config) => ("Patch", format!("/pmem/{}", config.path_pmem_id())),
+        ApiRequest::PutSerial(_) => ("Put", "/serial".to_string()),
+        ApiRequest::PutSnapshotCreate(_) => ("Put", "/snapshot/create".to_string()),
+        ApiRequest::PutSnapshotLoad(_) => ("Put", "/snapshot/load".to_string()),
+        ApiRequest::PutVsock(_) => ("Put", "/vsock".to_string()),
+        ApiRequest::PatchMmds(_) => ("Patch", "/mmds".to_string()),
     }
 }
 
@@ -2508,6 +2570,11 @@ mod tests {
             self.inner.record_deprecated_api_call();
         }
 
+        #[track_caller]
+        fn log_api_request(&mut self, method: &str, path: &str) -> Result<bool, VmmActionError> {
+            self.inner.log_api_request(method, path)
+        }
+
         fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
             self.inner.record_pause_vm_latency_us(duration_us);
         }
@@ -4046,7 +4113,10 @@ mod tests {
 
         let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
         let mut lines = output.lines();
+        assert_api_request_log_with_origin(lines.next(), "Put", "/boot-source");
+        assert_api_request_log_with_origin(lines.next(), "Put", "/actions");
         assert_action_log_with_origin(lines.next(), "InstanceStart");
+        assert_api_request_log_with_origin(lines.next(), "Put", "/actions");
         assert_action_log_with_origin(lines.next(), "FlushMetrics");
         assert_eq!(lines.next(), None);
 
@@ -4061,7 +4131,7 @@ mod tests {
             r#"{{
                 "log_path": "{}",
                 "level": "Info",
-                "module": "api_server"
+                "module": "bangbang_runtime::api_server"
             }}"#,
             logger_path.to_string_lossy()
         );
@@ -4090,10 +4160,96 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(&logger_path).expect("logger output should be readable"),
-            ""
+            "The API server received a Put request on \"/boot-source\".\nThe API server received a Put request on \"/actions\".\nThe API server received a Put request on \"/actions\".\n"
         );
 
         fs::remove_file(logger_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn configured_logger_records_api_request_method_paths_without_bodies() {
+        let mut vmm = test_controller();
+        let logger_path = unique_socket_path("logger-api-requests").with_extension("log");
+        let logger_body = format!(
+            r#"{{
+                "log_path": "{}",
+                "level": "Info",
+                "module": "bangbang_runtime::api_server"
+            }}"#,
+            logger_path.to_string_lossy()
+        );
+        let logger_request = format!(
+            "PUT /logger HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{logger_body}",
+            logger_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(logger_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let get_response = request_over_socket(
+            &mut vmm,
+            "api-log-get",
+            "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(get_response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let put_mmds_body = r#"{"latest":{"meta-data":{"secret":"private-mmds-secret"}}}"#;
+        let put_mmds_response = request_over_socket(
+            &mut vmm,
+            "api-log-put",
+            &request_with_body("PUT", "/mmds", put_mmds_body),
+        );
+        assert!(put_mmds_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let patch_mmds_body = r#"{"latest":{"meta-data":{"secret":"updated-secret"}}}"#;
+        let patch_mmds_response = request_over_socket(
+            &mut vmm,
+            "api-log-patch",
+            &request_with_body("PATCH", "/mmds", patch_mmds_body),
+        );
+        assert!(patch_mmds_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            "The API server received a Get request on \"/version\".\nThe API server received a Put request on \"/mmds\".\nThe API server received a Patch request on \"/mmds\".\n"
+        );
+        assert!(
+            !output.contains("private-mmds-secret"),
+            "logger output must not include MMDS PUT body: {output}"
+        );
+        assert!(
+            !output.contains("updated-secret"),
+            "logger output must not include MMDS PATCH body: {output}"
+        );
+
+        fs::remove_file(logger_path).expect("fixture should clean up");
+    }
+
+    fn assert_api_request_log_with_origin(line: Option<&str>, method: &str, path: &str) {
+        let line = line.expect("logger output should include API request line");
+        assert!(line.starts_with("level=Info origin="));
+        let suffix = format!(" The API server received a {method} request on \"{path}\".");
+        assert!(line.ends_with(&suffix));
+
+        let origin = line
+            .strip_prefix("level=Info origin=")
+            .expect("logger output should include origin prefix")
+            .strip_suffix(&suffix)
+            .expect("logger output should include API request suffix");
+        let (file, line_number) = origin
+            .rsplit_once(':')
+            .expect("logger origin should include file and line");
+
+        assert!(
+            file.ends_with("api_server.rs"),
+            "unexpected origin file: {file}"
+        );
+        assert!(
+            line_number.parse::<u32>().is_ok(),
+            "unexpected origin line: {line_number}"
+        );
     }
 
     fn assert_action_log_with_origin(line: Option<&str>, action: &str) {
@@ -4164,11 +4320,11 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&startup_logger_path)
                 .expect("startup logger output should be readable"),
-            ""
+            "level=Info The API server received a Put request on \"/logger\".\n"
         );
         assert_eq!(
             fs::read_to_string(&api_logger_path).expect("api logger output should be readable"),
-            "action=InstanceStart\n"
+            "The API server received a Put request on \"/boot-source\".\nThe API server received a Put request on \"/actions\".\naction=InstanceStart\n"
         );
 
         fs::remove_file(startup_logger_path).expect("startup fixture should clean up");

@@ -821,6 +821,14 @@ impl VmmController {
         Ok(())
     }
 
+    #[track_caller]
+    pub fn log_api_request(&mut self, method: &str, path: &str) -> Result<bool, VmmActionError> {
+        self.logger_state
+            .log_api_request(method, path)
+            .inspect_err(|_| self.metrics_state.record_missed_log())
+            .map_err(VmmActionError::LoggerWrite)
+    }
+
     pub fn record_put_actions_request(&mut self) {
         self.metrics_state.record_put_actions_request();
     }

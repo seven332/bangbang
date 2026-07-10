@@ -2311,6 +2311,11 @@ mod tests {
             self.inner.record_deprecated_api_call();
         }
 
+        #[track_caller]
+        fn log_api_request(&mut self, method: &str, path: &str) -> Result<bool, VmmActionError> {
+            self.inner.log_api_request(method, path)
+        }
+
         fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
             self.inner.record_pause_vm_latency_us(duration_us);
         }
