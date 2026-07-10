@@ -405,17 +405,36 @@ fn executable_maps_firecracker_fatal_signals_to_exit_codes() {
 
 #[test]
 fn executable_rejects_unsupported_firecracker_process_flags_before_socket_publication() {
-    for (name, args, private_value) in [
-        ("enable-pci", &["--enable-pci"][..], None),
-        ("no-seccomp", &["--no-seccomp"][..], None),
+    for (case_name, expected_name, args, private_value) in [
+        ("enable-pci", "enable-pci", &["--enable-pci"][..], None),
         (
+            "enable-pci-attached",
+            "enable-pci",
+            &["--enable-pci=secret-enable-pci-value"][..],
+            Some("secret-enable-pci-value"),
+        ),
+        ("no-seccomp", "no-seccomp", &["--no-seccomp"][..], None),
+        (
+            "no-seccomp-attached",
+            "no-seccomp",
+            &["--no-seccomp=secret-no-seccomp-value"][..],
+            Some("secret-no-seccomp-value"),
+        ),
+        (
+            "seccomp-filter",
             "seccomp-filter",
             &["--seccomp-filter", "secret-seccomp.bpf"][..],
             Some("secret-seccomp.bpf"),
         ),
+        (
+            "seccomp-filter-attached",
+            "seccomp-filter",
+            &["--seccomp-filter=secret-seccomp.bpf"][..],
+            Some("secret-seccomp.bpf"),
+        ),
     ] {
         let test_dir = TestDir::new();
-        let socket_path = test_dir.path().join(format!("{name}.socket"));
+        let socket_path = test_dir.path().join(format!("{case_name}.socket"));
         let instance_id = test_dir.instance_id();
 
         let output =
@@ -424,34 +443,34 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
         assert_eq!(
             output.status.code(),
             Some(ARGUMENT_PARSING_EXIT_CODE),
-            "unsupported --{name} should fail with the argument parsing exit code; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+            "unsupported {case_name} should fail with the argument parsing exit code; status: {:?}\nstdout:\n{}\nstderr:\n{}",
             output.status,
             output.stdout,
             output.stderr
         );
         assert!(
             output.stderr.contains(&format!(
-                "bangbang: unsupported Firecracker argument: --{name}"
+                "bangbang: unsupported Firecracker argument: --{expected_name}"
             )),
-            "unsupported --{name} should report a Firecracker argument rejection; stderr:\n{}",
+            "unsupported {case_name} should report a Firecracker argument rejection; stderr:\n{}",
             output.stderr
         );
         assert!(
             !output.stdout.contains("status: API server listening"),
-            "unsupported --{name} must not report API readiness; stdout:\n{}",
+            "unsupported {case_name} must not report API readiness; stdout:\n{}",
             output.stdout
         );
         if let Some(private_value) = private_value {
             assert!(
                 !output.stdout.contains(private_value) && !output.stderr.contains(private_value),
-                "unsupported --{name} failure must not echo private argument value {private_value:?}; stdout:\n{}\nstderr:\n{}",
+                "unsupported {case_name} failure must not echo private argument value {private_value:?}; stdout:\n{}\nstderr:\n{}",
                 output.stdout,
                 output.stderr
             );
         }
         assert!(
             !socket_path.exists(),
-            "unsupported --{name} must fail before publishing the API socket"
+            "unsupported {case_name} must fail before publishing the API socket"
         );
     }
 }
