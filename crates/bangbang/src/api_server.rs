@@ -2817,6 +2817,58 @@ mod tests {
     }
 
     #[test]
+    fn replaced_drive_preserves_vm_config_order() {
+        let mut vmm = test_controller();
+
+        for (drive_id, path_on_host, is_root_device) in [
+            ("rootfs", "/tmp/rootfs.ext4", true),
+            ("data1", "/tmp/data1.ext4", false),
+            ("data2", "/tmp/data2.ext4", false),
+            ("data1", "/tmp/data1-replaced.ext4", false),
+        ] {
+            let body = format!(
+                r#"{{"drive_id":"{drive_id}","path_on_host":"{path_on_host}","is_root_device":{is_root_device}}}"#
+            );
+            let response = handle_request_bytes(
+                request_with_body("PUT", &format!("/drives/{drive_id}"), &body).as_bytes(),
+                &mut vmm,
+            );
+            assert_eq!(response.status(), bangbang_api::http::StatusCode::NoContent);
+        }
+
+        let response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::Ok);
+
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("vm config should be JSON");
+        let drives = body
+            .get("drives")
+            .and_then(serde_json::Value::as_array)
+            .expect("vm config should include drives array");
+        let drive_ids = drives
+            .iter()
+            .map(|drive| {
+                drive
+                    .get("drive_id")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("drive should include drive_id")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(drive_ids.as_slice(), &["rootfs", "data1", "data2"]);
+        assert_eq!(
+            drives
+                .get(1)
+                .and_then(|drive| drive.get("path_on_host"))
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/data1-replaced.ext4")
+        );
+    }
+
+    #[test]
     fn dispatches_mmds_requests_to_runtime_store() {
         let mut vmm = test_controller();
 
