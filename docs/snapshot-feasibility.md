@@ -140,7 +140,10 @@ invariants hold:
 - periodic work is stopped and each retry scheduler has acknowledged quiescence,
   with no deadline thread able to publish another wakeup token;
 - no VMM thread is reading or writing vmnet packets or vsock streams, and the
-  transient vsock poller has joined; and
+  transient vsock poller has joined;
+- lease acquisition and capture are bounded or observe an out-of-band stop
+  token, so shutdown does not depend on queueing a command behind lease-owned
+  work or on the synchronous API requester making progress; and
 - shutdown and terminal status are checked before readiness is returned, so a
   stale successful acknowledgement cannot outlive the session.
 
@@ -177,9 +180,11 @@ remain separate design decisions.
   It must first cancel or finish capture and receive the exactly-once lease
   release acknowledgement, then use the existing paused-to-running transition.
 - Process shutdown takes precedence over preparation and capture. It cancels
-  lease work, prevents a later readiness acknowledgement, and leaves the
-  existing session owner responsible for stopping schedulers, shutting down the
-  runner, destroying the VM, and joining the worker exactly once.
+  lease work through an out-of-band control path, rather than queueing behind
+  that work or relying on a blocked API requester. It prevents a later readiness
+  acknowledgement and leaves the existing session owner responsible for
+  stopping schedulers, shutting down the runner, destroying the VM, and joining
+  the worker exactly once.
 - A guest terminal outcome or worker failure that wins the race before pause or
   readiness acknowledgement invalidates the request. The process owner must not
   commit a stale state transition, and existing terminal process behavior
@@ -220,7 +225,7 @@ API behavior until all of its prerequisites exist.
 
 | Slice | Scope | Minimum validation |
 | --- | --- | --- |
-| Supervisor lease and admission | Add preparing, ready, and releasing ownership; drain earlier commands; reject or defer later mutations; cover failure, terminal, resume, and shutdown races. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
+| Supervisor lease and admission | Add preparing, ready, and releasing ownership; drain earlier commands; reject or defer later mutations; keep shutdown cancellation independent of the command queue; cover failure, terminal, resume, and shutdown races. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence | Add acknowledged pause/resume and bounded cancellation to block, entropy, periodic, and other wakeup schedulers. | Deterministic scheduler unit tests and signed HVF cancellation/lifecycle coverage. |
 | Runner capture boundary | Add a typed runner command for the first vCPU architectural-state inventory without exposing raw HVF ownership. | Runner command/conflict unit tests and signed HVF get/set round trips. |
 | GIC and device state | Inventory GIC ownership and add stable state models for each implemented MMIO device. | Per-device round-trip unit tests and signed HVF interrupt-state coverage. |
