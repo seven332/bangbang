@@ -1836,6 +1836,20 @@ fn executable_configures_vm_before_start() {
         "GET / after custom PUT /cpu-config",
     );
 
+    let malformed_cpu_config_response = http_put_json(&socket_path, "/cpu-config", "not-json");
+    assert_bad_request_response(&malformed_cpu_config_response, "PUT /cpu-config malformed");
+    assert_response_contains(
+        &malformed_cpu_config_response,
+        r#"{"fault_message":"Malformed HTTP request."}"#,
+        "PUT /cpu-config malformed",
+    );
+    let instance_info_after_malformed_cpu_config = http_get(&socket_path, "/");
+    assert_response_contains(
+        &instance_info_after_malformed_cpu_config,
+        r#""state":"Not started""#,
+        "GET / after malformed PUT /cpu-config",
+    );
+
     let vm_state_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#);
     assert_bad_request_response(&vm_state_response, "PATCH /vm");
     assert_response_contains(
