@@ -34,7 +34,7 @@ ownership on separate threads:
 | --- | --- |
 | Process owner | `ProcessVmm` owns the VMM controller, startup executor, and active `BootRunLoopSupervisor` handle. It serves API requests and commits public instance-state transitions, but it does not own the live boot session after startup. |
 | Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy state, and block and entropy retry schedulers. Device-update commands execute here. |
-| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes thread-affine HVF operations through commands and can return an immutable X0-X30, PC, and CPSR subset through one owner-thread command. The snapshot barrier does not invoke it, and the remaining architectural inventory is not implemented. |
+| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes HVF operations through commands and can return immutable X0-X30, PC, and CPSR values or a raw virtual-timer mask/offset pair through dedicated owner-thread commands. The snapshot barrier invokes neither capture, and the remaining architectural inventory is not implemented. |
 | Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. The snapshot barrier can temporarily quiesce the block and entropy schedulers. The vmnet interface, vsock listener, retained streams, and their host/kernel buffers remain open for the lifetime of the boot session. A transient vsock polling thread is joined at the end of each vCPU run step. |
 
 A successful public pause has a narrower boundary than a snapshot needs:
@@ -72,6 +72,17 @@ admission excludes runs, MMIO completion, boot setup, metadata, virtual-timer,
 GIC PPI, cancellation, and shutdown until capture finishes, including when the
 caller abandons its response. This command is not called by the public pause or
 snapshot-create paths and is not complete restorable vCPU state.
+
+A separate runner-local command captures the HVF virtual-timer mask followed by
+its raw offset and publishes the immutable pair only after both reads succeed.
+It shares one serialized virtual-timer admission domain with individual mask and
+offset reads/writes, and its command-owned admission remains active when the
+caller drops its response. The offset is the host-time-relative HVF value in
+`CNTVCT_EL0 = mach_absolute_time() - offset`; this narrow pair omits timer
+compare/control registers, pending interrupts, and GIC state, and does not
+define a portable restore-time adjustment policy. Borrowed and owned boot
+sessions delegate this capture, but the supervisor lease and public snapshot
+paths do not invoke it.
 
 Paused snapshot create now exercises the first lease-based ownership
 foundation. A separate admission cell atomically reserves snapshot preparation
@@ -131,8 +142,10 @@ some of the required state:
 - Apple Silicon vCPU APIs expose general register, system register, SIMD/FP,
   SME, pending-interrupt, virtual-timer mask, and virtual-timer offset get/set
   operations.
-- vCPU lifecycle and register APIs are thread-affine, so state capture must run
-  on the owning runner thread after the VM is quiesced.
+- vCPU lifecycle and register APIs are thread-affine. bangbang also routes
+  virtual-timer access through the owning runner thread as its serialization
+  policy, so a future capture bundle has one explicit vCPU command boundary
+  after the VM is quiesced.
 - macOS 15 GIC APIs expose GICv3 distributor, redistributor, ICC, ICH, ICV, MSI,
   and SPI state access and interrupt injection primitives.
 
@@ -244,10 +257,12 @@ tested:
   process-owner mutations, auxiliary wakeups, or terminal teardown.
 - Guest-memory file model: bangbang needs explicit ownership, layout, copy or
   mapping rules, and failure behavior for memory snapshot files.
-- HVF vCPU state capture: the first X0-X30, PC, and CPSR owner-thread capture
-  subset is available, but system, SIMD/FP, timer, pending-interrupt, and other
-  optional architecture state still needs a full inventory, and every captured
-  field still needs a restore path on the owning thread.
+- HVF vCPU state capture: X0-X30, PC, and CPSR plus the raw virtual-timer
+  mask/offset pair have owner-thread capture subsets. System, SIMD/FP,
+  timer compare/control, pending-interrupt, and other optional architecture
+  state still need a full inventory; the raw timer offset needs an explicit
+  restore-time adjustment policy; and every captured field still needs a
+  restore path on the owning thread.
 - Interrupt-controller state: GIC distributor, redistributor, and CPU interface
   state must have a versioned restore plan before interrupt delivery can be
   considered compatible.
@@ -272,7 +287,8 @@ API behavior until all of its prerequisites exist.
 | --- | --- | --- |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence (block and entropy implemented) | #1162 adds acknowledged RAII quiescence for the existing block and entropy limiter retry schedulers, waits for in-flight publication, preserves absolute deadlines, drains and defers pending tokens, and keeps stop terminal. Periodic work and any later wakeup scheduler remain deferred. | Deterministic scheduler concurrency tests and supervisor lease-order tests; signed lifecycle coverage remains follow-up work. |
-| Runner capture boundary (first subset implemented) | #1164 adds a typed immutable X0-X30, PC, and CPSR value plus one serialized owner-thread command with command-owned failure-atomic admission. Borrowed and owned HVF boot sessions expose it, but the snapshot lease does not invoke it. System registers, SIMD/FP, full timer and interrupt state, restore, and multi-vCPU coordination remain deferred. | Deterministic runner command/conflict/failure tests and signed HVF known boot-register capture. |
+| Runner general-register capture (first subset implemented) | #1164 adds a typed immutable X0-X30, PC, and CPSR value plus one serialized owner-thread command with command-owned failure-atomic admission. Borrowed and owned HVF boot sessions expose it, but the snapshot lease does not invoke it. System registers, SIMD/FP, timer, interrupt state, restore, and multi-vCPU coordination remain deferred. | Deterministic runner command/conflict/failure tests and signed HVF known boot-register capture. |
+| Runner virtual-timer capture (raw subset implemented) | #1166 adds typed immutable mask/offset state, owner-thread get/set commands, and a serialized pair-capture command sharing one virtual-timer admission domain. Both boot-session forms expose capture, but the snapshot lease does not invoke it. Compare/control registers, pending interrupt and GIC state, restore-time offset adjustment, orchestration, and restore remain deferred. | Deterministic order, conflict, abandon, channel, panic, and retry tests plus signed known-pair capture that restores the original values. |
 | GIC and device state | Inventory GIC ownership and add stable state models for each implemented MMIO device. | Per-device round-trip unit tests and signed HVF interrupt-state coverage. |
 | Full guest-memory capture | Define immutable capture ownership, full-memory file layout, error cleanup, and path-redaction behavior before considering diff snapshots. | Memory/file unit tests, process failure tests, and signed full-capture coverage. |
 | External resource policy | Define disk, vmnet, and vsock metadata, buffering boundary, disconnect/reconnect behavior, and restore overrides. | Resource-policy unit/process tests and focused signed network/vsock coverage. |
