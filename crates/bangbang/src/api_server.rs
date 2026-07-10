@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
+use bangbang_api::HTTP_MAX_REQUEST_HEAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, ApiRequestMetricEndpoint, ApiRequestMetricPatchEndpoint,
     ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse,
@@ -1841,19 +1842,18 @@ fn read_request_until_with_limit(
     let mut chunk = [0; READ_CHUNK_SIZE];
 
     loop {
-        match request_total_len_with_limit(&request, http_api_max_payload_size) {
+        let remaining = match request_total_len_with_limit(&request, http_api_max_payload_size) {
             Ok(Some(total_len)) if request.len() >= total_len => {
                 request.truncate(total_len);
                 return Ok(RequestRead::Complete(request));
             }
-            Ok(Some(_)) | Ok(None) => {}
+            Ok(Some(total_len)) => total_len.saturating_sub(request.len()),
+            Ok(None) => HTTP_MAX_REQUEST_HEAD_SIZE.saturating_sub(request.len()),
             Err(RequestError::PayloadTooLarge) => return Ok(RequestRead::TooLarge),
             Err(_) => return Ok(RequestRead::Complete(request)),
-        }
-
-        let remaining = http_api_max_payload_size.saturating_sub(request.len());
+        };
         if remaining == 0 {
-            return Ok(RequestRead::TooLarge);
+            return Ok(RequestRead::Complete(request));
         }
 
         let read_len = chunk.len().min(remaining);
@@ -4753,12 +4753,8 @@ mod tests {
 
         let oversized_boot_request = request_with_body("PUT", "/boot-source", "{}");
         assert_eq!(
-            handle_request_bytes_with_limit(
-                oversized_boot_request.as_bytes(),
-                &mut vmm,
-                oversized_boot_request.len() - 1,
-            )
-            .status(),
+            handle_request_bytes_with_limit(oversized_boot_request.as_bytes(), &mut vmm, 1)
+                .status(),
             bangbang_api::http::StatusCode::PayloadTooLarge
         );
 
@@ -8631,6 +8627,64 @@ mod tests {
     }
 
     #[test]
+    fn accepts_request_head_above_configured_payload_limit() {
+        let path = unique_socket_path("head-ok");
+        let server = ApiServer::bind_with_max_payload_size(&path, 1).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let padding = "a".repeat(64);
+        let request = format!(
+            "GET /version HTTP/1.1\r\nHost: localhost\r\nX-Fill: {padding}\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(request.len() > 1);
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains(r#"{"firecracker_version":"#));
+    }
+
+    #[test]
+    fn returns_fault_for_request_head_at_head_limit() {
+        let path = unique_socket_path("head-limit");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let mut request = b"GET /version HTTP/1.1\r\nX-Fill: ".to_vec();
+        request.resize(HTTP_MAX_REQUEST_HEAD_SIZE, b'a');
+        let client_handle = thread::spawn(move || {
+            client
+                .write_all(&request)
+                .expect("client should write request");
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("client should read response");
+            response
+        });
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let response = client_handle
+            .join()
+            .expect("client thread should not panic");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(r#"{"fault_message":"Malformed HTTP request."}"#));
+    }
+
+    #[test]
     fn parse_time_payload_limit_failure_returns_413() {
         let request = format!(
             "GET /version HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
@@ -8659,8 +8713,8 @@ mod tests {
             body.len()
         );
         assert!(request.len() > HTTP_MAX_PAYLOAD_SIZE);
-        let server = ApiServer::bind_with_max_payload_size(&path, request.len())
-            .expect("server should bind");
+        let server =
+            ApiServer::bind_with_max_payload_size(&path, body.len()).expect("server should bind");
         let mut client = UnixStream::connect(&path).expect("client should connect");
         let client_handle = thread::spawn(move || {
             client

@@ -1694,7 +1694,7 @@ fn help_text() -> String {
             "      --config-file <PATH>\n",
             "                         Firecracker-shaped config file for API-enabled startup\n",
             "      --http-api-max-payload-size <BYTES>\n",
-            "                         Maximum HTTP API request size [default: {}]\n",
+            "                         Maximum HTTP API request body size [default: {}]\n",
             "      --id <ID>          MicroVM unique identifier [default: {}]\n",
             "                         Accepts 1-64 bytes, ASCII alphanumeric or '-'\n",
             "      --log-path <PATH>  Logger output file or FIFO path\n",
@@ -2433,6 +2433,7 @@ mod tests {
         assert!(help.contains("--log-path <PATH>"));
         assert!(help.contains("--metrics-path <PATH>"));
         assert!(help.contains("--http-api-max-payload-size <BYTES>"));
+        assert!(help.contains("Maximum HTTP API request body size"));
         assert!(help.contains("--mmds-size-limit <BYTES>"));
         assert!(help.contains("--metadata <PATH>"));
         assert!(help.contains("--no-api"));

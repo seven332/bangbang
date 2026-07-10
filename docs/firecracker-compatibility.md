@@ -143,7 +143,7 @@ exits on handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
 | `--api-sock <PATH>` | binds the API Unix socket | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
-| `--http-api-max-payload-size <BYTES>` | configures the maximum accepted HTTP API request size | Defaults to Firecracker's `51200` byte limit. The configured value applies to API socket reads and final request parsing. Zero, malformed, and duplicate values are rejected during argument parsing. |
+| `--http-api-max-payload-size <BYTES>` | configures the maximum accepted HTTP API request body size | Defaults to Firecracker's `51200` byte limit. The configured value applies to the HTTP body declared by `Content-Length`; request-head bytes are bounded separately by bangbang's parser safety cap. Zero, malformed, and duplicate values are rejected during argument parsing. |
 | `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. |
 | `--start-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output include `api_server.process_startup_time_us` as the sampled monotonic clock minus this value, saturating at zero for future timestamps. |
 | `--start-time-cpu-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output include `api_server.process_startup_time_cpu_us` as the sampled process CPU clock minus this value, saturating at zero for future timestamps before adding optional parent CPU time. |
@@ -1738,7 +1738,9 @@ shape.
 
 The initial API implementation uses Firecracker's default `51200` byte HTTP
 request payload limit unless `--http-api-max-payload-size <BYTES>` configures a
-different per-process API socket request limit.
+different per-process API socket body limit. The configured value applies to the
+body declared by `Content-Length`, not to the request line and headers; bangbang
+keeps request-head bytes bounded by a separate parser safety cap.
 The MMDS data store uses the effective `--mmds-size-limit <BYTES>` value as its
 serialized JSON limit. When that argument is omitted, the limit follows the
 effective HTTP API payload limit like Firecracker; with default HTTP settings
