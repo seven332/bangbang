@@ -3631,6 +3631,33 @@ mod tests {
     }
 
     #[test]
+    fn put_mmds_after_failed_preboot_patch_initializes_runtime_data_store() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let value = serde_json::json!({"latest": {"meta-data": {"ami-id": "ami-123"}}});
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source should configure");
+        assert_eq!(
+            controller.handle_action(VmmAction::PatchMmds(mmds_content_input())),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::NotInitialized
+            ))
+        );
+        controller
+            .start_instance_with(|_| Ok(()))
+            .expect("startup should succeed");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMmds(MmdsContentInput::new(value.clone()))),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(value))
+        );
+    }
+
+    #[test]
     fn patch_mmds_data_store_applies_json_merge_patch() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         let original = serde_json::json!({

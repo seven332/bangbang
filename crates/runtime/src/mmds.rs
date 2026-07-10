@@ -1700,11 +1700,12 @@ impl MmdsState {
         self.config.as_ref()
     }
 
-    pub const fn data_store_present(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) const fn data_store_present(&self) -> bool {
         self.data_store_present
     }
 
-    pub fn ensure_data_store_present(&mut self) {
+    pub(crate) fn ensure_data_store_present(&mut self) {
         self.data_store_present = true;
     }
 
@@ -1730,12 +1731,12 @@ impl MmdsState {
         self.value.as_ref().cloned().unwrap_or(Value::Null)
     }
 
-    pub fn get_or_create_data_store_value(&mut self) -> Value {
+    pub(crate) fn get_or_create_data_store_value(&mut self) -> Value {
         self.ensure_data_store_present();
         self.get_data_or_null()
     }
 
-    pub fn get_existing_data_store_value(&self) -> Result<Value, MmdsDataStoreError> {
+    pub(crate) fn get_existing_data_store_value(&self) -> Result<Value, MmdsDataStoreError> {
         if !self.data_store_present {
             return Err(MmdsDataStoreError::NotInitialized);
         }
@@ -1844,7 +1845,7 @@ impl MmdsState {
         Ok(())
     }
 
-    pub fn put_existing_data_store(
+    pub(crate) fn put_existing_data_store(
         &mut self,
         input: MmdsContentInput,
     ) -> Result<(), MmdsDataStoreError> {
@@ -1868,7 +1869,7 @@ impl MmdsState {
         Ok(())
     }
 
-    pub fn patch_existing_data_store(
+    pub(crate) fn patch_existing_data_store(
         &mut self,
         input: MmdsContentInput,
     ) -> Result<(), MmdsDataStoreError> {
