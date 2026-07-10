@@ -3102,6 +3102,109 @@ mod tests {
     }
 
     #[test]
+    fn get_mmds_after_preboot_get_returns_null_after_start() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let preboot_get_response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+        assert_eq!(
+            preboot_get_response.status(),
+            bangbang_api::http::StatusCode::Ok
+        );
+        assert_eq!(preboot_get_response.body(), "null");
+
+        let boot_request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "mmds-preget-a", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::Ok);
+        assert_eq!(response.body(), "null");
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+    }
+
+    #[test]
+    fn put_mmds_after_start_without_data_store_returns_fault() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "put-mmds-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let body = r#"{"latest":{"meta-data":{"ami-id":"ami-123"}}}"#;
+        let request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"The MMDS data store is not initialized."}"#
+        );
+    }
+
+    #[test]
+    fn put_mmds_after_preboot_get_succeeds_after_start() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let preboot_get_response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+        assert_eq!(
+            preboot_get_response.status(),
+            bangbang_api::http::StatusCode::Ok
+        );
+
+        let boot_request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "mmds-preget-b", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let body = r#"{"latest":{"meta-data":{"ami-id":"ami-123"}}}"#;
+        let request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let get_response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+        assert_eq!(get_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert_eq!(get_response.body(), body);
+    }
+
+    #[test]
     fn machine_config_faults_do_not_mutate_vmm_state() {
         let mut vmm = test_controller();
         let body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
