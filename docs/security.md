@@ -10,6 +10,11 @@ bangbang currently follows Firecracker's one-process-per-microVM model. One
 `bangbang` process owns one API socket, one VMM controller, one HVF-backed
 startup path, and the host resources configured for that microVM.
 
+Normal startup uses non-clobbering fd-table preallocation as a Firecracker-style
+performance guard. Failing to read the descriptor limit or duplicate a
+descriptor is non-fatal; failing to close a successfully duplicated descriptor is
+fatal. The setup does not overwrite inherited high-numbered descriptors.
+
 The current trusted boundary is the host user account and the local filesystem
 permissions around configured host paths. API clients, API request bodies,
 guest-provided MMIO data, guest memory, and configured host paths must be treated
