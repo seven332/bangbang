@@ -351,9 +351,10 @@ boot run-loop status summary, and minimal device counters such as block
 queue/update/throttling activity, virtio-pmem queue activity, virtio-net packet
 counters, and virtio-vsock queue, packet, byte, and connection cleanup counters,
 plus virtio-rng request, byte, host-randomness failure, and event-failure
-counters. Serial, vsock, block, pmem, and entropy metrics are counters only and
-must not expose Unix socket paths, guest payload bytes, host stream data, worker
-error strings, host paths, guest serial bytes, randomness bytes, host
+counters, plus PL031 RTC invalid read/write and error counters. Serial, vsock,
+block, pmem, entropy, and RTC metrics are counters only and must not expose Unix
+socket paths, guest payload bytes, host stream data, worker error strings, host
+paths, guest serial bytes, randomness bytes, host
 entropy-source details, guest descriptors, guest memory addresses, or unexpected
 guest data.
 Future full logging and metrics support must preserve those redaction

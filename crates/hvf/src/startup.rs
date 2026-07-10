@@ -30,7 +30,7 @@ use bangbang_runtime::memory_hotplug::{
 };
 use bangbang_runtime::metrics::{
     SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
+    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
     SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
@@ -854,6 +854,13 @@ impl HvfArm64BootSession<'_> {
         self.entropy_device_metrics.clone()
     }
 
+    pub fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
+        self.runtime_resources
+            .rtc_device
+            .as_ref()
+            .map(|device| device.metrics.clone())
+    }
+
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
     ///
     /// The dispatcher is local to this boot session. It is shared only so
@@ -1367,6 +1374,13 @@ impl OwnedHvfArm64BootSession {
 
     pub fn shared_entropy_device_metrics(&self) -> SharedEntropyDeviceMetrics {
         self.entropy_device_metrics.clone()
+    }
+
+    pub fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
+        self.runtime_resources
+            .rtc_device
+            .as_ref()
+            .map(|device| device.metrics.clone())
     }
 
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
