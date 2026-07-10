@@ -1984,7 +1984,9 @@ macOS design work instead of direct implementation:
 - Snapshot and device behavior may differ when backed by HVF.
 
 The initial compatibility scope should document these differences without
-pretending they are solved.
+pretending they are solved. See [macOS Host Security Model](security.md) for the
+current host isolation boundary and the deferred macOS sandbox, launcher, and
+resource-broker design options.
 
 ## Validation Expectations
 
