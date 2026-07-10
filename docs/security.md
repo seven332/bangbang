@@ -228,12 +228,15 @@ is resource-specific:
   include random bytes, descriptor contents, host RNG errors, or host paths.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
-  create snapshot state or memory files. Future snapshot support must treat
-  snapshot paths, memory backend paths, restored guest memory, restored vCPU
-  state, and restored device state as untrusted input, preserve path redaction,
-  and prevent one process from cleaning up or overwriting another process's
-  snapshot resources. The current implementation boundary is documented in
-  [Snapshot Feasibility](snapshot-feasibility.md).
+  create snapshot state or memory files. A paused create temporarily closes
+  ordinary boot-worker command admission and acknowledges quiescence from its
+  process-local block and entropy limiter retry schedulers; it does not freeze
+  other host resources or expose limiter state. Future snapshot support must
+  treat snapshot paths, memory backend paths, restored guest memory, restored
+  vCPU state, and restored device state as untrusted input, preserve path
+  redaction, and prevent one process from cleaning up or overwriting another
+  process's snapshot resources. The current implementation boundary is
+  documented in [Snapshot Feasibility](snapshot-feasibility.md).
 - `/vsock` stores the configured Unix socket path during configuration. Startup
   can attach a guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the

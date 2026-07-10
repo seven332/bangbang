@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use bangbang_hvf::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
-    HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError,
-    HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
-    HvfArm64BootSessionConfig, HvfArm64BootTimerDeviceConfig, HvfVcpuRunnerError,
-    OwnedHvfArm64BootSession,
+    HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugDeviceConfig,
+    HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
+    HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+    HvfArm64BootTimerDeviceConfig, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -2093,12 +2093,27 @@ impl VirtioNetworkRxPacketSource for EmptyProcessNetworkRxPacketSource {
     fn consume_packet(&mut self) {}
 }
 
+fn quiesce_hvf_snapshot_auxiliary_work(
+    session: &OwnedHvfArm64BootSession,
+) -> Result<HvfArm64BootLimiterRetryWakeupQuiescenceGuard, BackendError> {
+    session.quiesce_limiter_retry_wakeups().map_err(|err| {
+        BackendError::Hypervisor(format!(
+            "failed to quiesce HVF limiter retry wakeups: {err}"
+        ))
+    })
+}
+
 pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
     type Control: BootRunLoopControl;
     type Error: fmt::Display + Send + 'static;
     type Outcome: Clone + fmt::Debug + Send + 'static;
+    type SnapshotAuxiliaryQuiescenceGuard: Send + 'static;
 
     fn run_loop_control(&self) -> Self::Control;
+
+    fn quiesce_snapshot_auxiliary_work(
+        &self,
+    ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError>;
 
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
         None
@@ -2171,9 +2186,16 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
     type Control = HvfArm64BootRunLoopControl;
     type Error = HvfArm64BootRunLoopError;
     type Outcome = HvfArm64BootRunLoopOutcome;
+    type SnapshotAuxiliaryQuiescenceGuard = HvfArm64BootLimiterRetryWakeupQuiescenceGuard;
 
     fn run_loop_control(&self) -> Self::Control {
         OwnedHvfArm64BootSession::run_loop_control(self)
+    }
+
+    fn quiesce_snapshot_auxiliary_work(
+        &self,
+    ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError> {
+        quiesce_hvf_snapshot_auxiliary_work(self)
     }
 
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
@@ -2300,8 +2322,13 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
     type Control: BootRunLoopControl;
     type Error: fmt::Display + Send + 'static;
     type Outcome: Clone + fmt::Debug + Send + 'static;
+    type SnapshotAuxiliaryQuiescenceGuard: Send + 'static;
 
     fn run_loop_control(&self) -> Self::Control;
+
+    fn quiesce_snapshot_auxiliary_work(
+        &self,
+    ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError>;
 
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
         None
@@ -2375,9 +2402,16 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
     type Control = HvfArm64BootRunLoopControl;
     type Error = HvfArm64BootRunLoopError;
     type Outcome = HvfArm64BootRunLoopOutcome;
+    type SnapshotAuxiliaryQuiescenceGuard = HvfArm64BootLimiterRetryWakeupQuiescenceGuard;
 
     fn run_loop_control(&self) -> Self::Control {
         OwnedHvfArm64BootSession::run_loop_control(self)
+    }
+
+    fn quiesce_snapshot_auxiliary_work(
+        &self,
+    ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError> {
+        quiesce_hvf_snapshot_auxiliary_work(self)
     }
 
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
@@ -2478,9 +2512,16 @@ where
     type Control = S::Control;
     type Error = S::Error;
     type Outcome = S::Outcome;
+    type SnapshotAuxiliaryQuiescenceGuard = S::SnapshotAuxiliaryQuiescenceGuard;
 
     fn run_loop_control(&self) -> Self::Control {
         self.session.run_loop_control()
+    }
+
+    fn quiesce_snapshot_auxiliary_work(
+        &self,
+    ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError> {
+        self.session.quiesce_snapshot_auxiliary_work()
     }
 
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
@@ -3671,8 +3712,11 @@ where
     }
 
     fn run_snapshot_create_barrier(&mut self) -> Result<(), BackendError> {
-        self.run_snapshot_quiesced(|_| Ok::<_, BackendError>(()))
-            .map_err(lifecycle_error_from_boot_run_loop_command)
+        self.run_snapshot_quiesced(|session| {
+            let _auxiliary_quiescence = session.quiesce_snapshot_auxiliary_work()?;
+            Ok::<_, BackendError>(())
+        })
+        .map_err(lifecycle_error_from_boot_run_loop_command)
     }
 
     fn update_block_device(
@@ -4763,6 +4807,39 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FakeSnapshotAuxiliaryQuiescenceState {
+        acquire_count: AtomicU64,
+        drop_count: AtomicU64,
+        acquire_error: Mutex<Option<BackendError>>,
+        drop_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    }
+
+    #[derive(Debug)]
+    struct FakeSnapshotAuxiliaryQuiescenceGuard {
+        state: Arc<FakeSnapshotAuxiliaryQuiescenceState>,
+    }
+
+    impl Drop for FakeSnapshotAuxiliaryQuiescenceGuard {
+        fn drop(&mut self) {
+            self.state.drop_count.fetch_add(1, Ordering::SeqCst);
+            let drop_gate = self
+                .state
+                .drop_gate
+                .lock()
+                .expect("fake auxiliary quiescence drop gate should lock")
+                .take();
+            if let Some((entered_sender, release_receiver)) = drop_gate {
+                entered_sender
+                    .send(())
+                    .expect("test should observe auxiliary quiescence guard drop");
+                release_receiver
+                    .recv()
+                    .expect("test should release auxiliary quiescence guard drop");
+            }
+        }
+    }
+
     struct FakeRunLoopSession {
         control: FakeRunLoopControl,
         drop_count: Arc<AtomicU64>,
@@ -4784,6 +4861,7 @@ mod tests {
         wait_for_stop: bool,
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
+        snapshot_auxiliary_quiescence: Arc<FakeSnapshotAuxiliaryQuiescenceState>,
     }
 
     impl FakeRunLoopSession {
@@ -4815,6 +4893,7 @@ mod tests {
                 wait_for_stop: true,
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
+                snapshot_auxiliary_quiescence: Arc::default(),
             }
         }
 
@@ -4828,6 +4907,33 @@ mod tests {
 
         fn memory_hotplug_status_requests(&self) -> Arc<Mutex<Vec<u64>>> {
             Arc::clone(&self.memory_hotplug_status_requests)
+        }
+
+        fn snapshot_auxiliary_quiescence(&self) -> Arc<FakeSnapshotAuxiliaryQuiescenceState> {
+            Arc::clone(&self.snapshot_auxiliary_quiescence)
+        }
+
+        fn with_snapshot_auxiliary_drop_gate(
+            self,
+            entered_sender: mpsc::Sender<()>,
+            release_receiver: mpsc::Receiver<()>,
+        ) -> Self {
+            *self
+                .snapshot_auxiliary_quiescence
+                .drop_gate
+                .lock()
+                .expect("fake auxiliary quiescence drop gate should lock") =
+                Some((entered_sender, release_receiver));
+            self
+        }
+
+        fn with_snapshot_auxiliary_error(self, source: BackendError) -> Self {
+            *self
+                .snapshot_auxiliary_quiescence
+                .acquire_error
+                .lock()
+                .expect("fake auxiliary quiescence error should lock") = Some(source);
+            self
         }
 
         const fn with_memory_hotplug_status_plugged_size_mib(
@@ -4923,9 +5029,30 @@ mod tests {
         type Control = FakeRunLoopControl;
         type Error = FakeRunLoopError;
         type Outcome = FakeRunLoopOutcome;
+        type SnapshotAuxiliaryQuiescenceGuard = FakeSnapshotAuxiliaryQuiescenceGuard;
 
         fn run_loop_control(&self) -> Self::Control {
             self.control.clone()
+        }
+
+        fn quiesce_snapshot_auxiliary_work(
+            &self,
+        ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError> {
+            self.snapshot_auxiliary_quiescence
+                .acquire_count
+                .fetch_add(1, Ordering::SeqCst);
+            if let Some(source) = self
+                .snapshot_auxiliary_quiescence
+                .acquire_error
+                .lock()
+                .expect("fake auxiliary quiescence error should lock")
+                .clone()
+            {
+                return Err(source);
+            }
+            Ok(FakeSnapshotAuxiliaryQuiescenceGuard {
+                state: Arc::clone(&self.snapshot_auxiliary_quiescence),
+            })
         }
 
         fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
@@ -5045,9 +5172,16 @@ mod tests {
         type Control = FakeRunLoopControl;
         type Error = FakeRunLoopError;
         type Outcome = FakeRunLoopOutcome;
+        type SnapshotAuxiliaryQuiescenceGuard = ();
 
         fn run_loop_control(&self) -> Self::Control {
             self.control.clone()
+        }
+
+        fn quiesce_snapshot_auxiliary_work(
+            &self,
+        ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError> {
+            Ok(())
         }
 
         fn run_loop_with_network_packet_io<P>(
@@ -6823,6 +6957,132 @@ mod tests {
         supervisor
             .run_command(|_| Ok::<_, FakeRunLoopCommandError>(()))
             .expect("ordinary command should run after snapshot release");
+
+        drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_snapshot_barrier_drops_auxiliary_quiescence_before_lease_release() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let (auxiliary_drop_entered_sender, auxiliary_drop_entered_receiver) = mpsc::channel();
+        let (auxiliary_drop_release_sender, auxiliary_drop_release_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_snapshot_auxiliary_drop_gate(
+                    auxiliary_drop_entered_sender,
+                    auxiliary_drop_release_receiver,
+                );
+        let auxiliary_quiescence = session.snapshot_auxiliary_quiescence();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(20).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            20
+        );
+        supervisor.pause().expect("supervisor should pause");
+        let admission = Arc::clone(&supervisor.admission);
+        let command_handle = supervisor.command_handle();
+
+        std::thread::scope(|scope| {
+            let supervisor_ref = &mut supervisor;
+            let barrier_caller = scope.spawn(move || {
+                ProcessSessionDiagnostics::run_snapshot_create_barrier(supervisor_ref)
+            });
+
+            auxiliary_drop_entered_receiver
+                .recv()
+                .expect("auxiliary quiescence guard should begin dropping");
+            admission.wait_for_state(BootRunLoopCommandAdmissionState::SnapshotLeased);
+            assert_eq!(
+                admission.snapshot(),
+                BootRunLoopCommandAdmissionState::SnapshotLeased
+            );
+            assert_eq!(auxiliary_quiescence.acquire_count.load(Ordering::SeqCst), 1);
+            assert_eq!(auxiliary_quiescence.drop_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                command_handle
+                    .run(|_| Ok::<_, FakeRunLoopCommandError>(()))
+                    .expect_err("ordinary command should reject until auxiliary guard drops"),
+                BootRunLoopCommandError::SnapshotQuiescenceActive
+            );
+
+            auxiliary_drop_release_sender
+                .send(())
+                .expect("test should release auxiliary quiescence guard drop");
+            barrier_caller
+                .join()
+                .expect("snapshot barrier caller should not panic")
+                .expect("snapshot barrier should succeed");
+        });
+
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_snapshot_barrier_recovers_after_auxiliary_quiescence_failure() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let source = BackendError::Hypervisor("auxiliary quiescence failed".to_string());
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_snapshot_auxiliary_error(source.clone());
+        let auxiliary_quiescence = session.snapshot_auxiliary_quiescence();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(20).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            20
+        );
+        supervisor.pause().expect("supervisor should pause");
+
+        let err = ProcessSessionDiagnostics::run_snapshot_create_barrier(&mut supervisor)
+            .expect_err("auxiliary quiescence failure should fail the barrier");
+
+        assert_eq!(err, source);
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        assert_eq!(auxiliary_quiescence.acquire_count.load(Ordering::SeqCst), 1);
+        assert_eq!(auxiliary_quiescence.drop_count.load(Ordering::SeqCst), 0);
+
+        *auxiliary_quiescence
+            .acquire_error
+            .lock()
+            .expect("fake auxiliary quiescence error should lock") = None;
+        ProcessSessionDiagnostics::run_snapshot_create_barrier(&mut supervisor)
+            .expect("barrier should recover after auxiliary quiescence succeeds");
+        assert_eq!(auxiliary_quiescence.acquire_count.load(Ordering::SeqCst), 2);
+        assert_eq!(auxiliary_quiescence.drop_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
 
         drop(supervisor);
         assert_eq!(control.request_stop_count(), 1);

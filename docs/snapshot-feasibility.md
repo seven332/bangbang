@@ -19,7 +19,8 @@ commands, but does not create, load, read, write, or inspect snapshot files.
   unsupported fault before startup and state-policy faults after startup.
 - For a process-owned paused instance, create now crosses a scoped supervisor
   command-admission barrier before returning that unsupported fault. The
-  lease-owned operation is intentionally a bounded no-op and creates no files.
+  lease-owned operation acknowledges quiescence from the block and entropy
+  limiter retry schedulers, immediately releases them, and creates no files.
 - `--snapshot-version` and `--describe-snapshot <PATH>` are recognized as
   first-class CLI commands, but fail before API socket publication or HVF
   startup because bangbang has no supported snapshot data format.
@@ -34,7 +35,7 @@ ownership on separate threads:
 | Process owner | `ProcessVmm` owns the VMM controller, startup executor, and active `BootRunLoopSupervisor` handle. It serves API requests and commits public instance-state transitions, but it does not own the live boot session after startup. |
 | Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy state, and block and entropy retry schedulers. Device-update commands execute here. |
 | vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes thread-affine HVF operations through commands, but it has no architectural-state capture command today. |
-| Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation. The vmnet interface, vsock listener, retained streams, and their host/kernel buffers remain open for the lifetime of the boot session. A transient vsock polling thread is joined at the end of each vCPU run step. |
+| Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. The snapshot barrier can temporarily quiesce the block and entropy schedulers. The vmnet interface, vsock listener, retained streams, and their host/kernel buffers remain open for the lifetime of the boot session. A transient vsock polling thread is joined at the end of each vCPU run step. |
 
 A successful public pause has a narrower boundary than a snapshot needs:
 
@@ -64,19 +65,33 @@ this is not a frozen runtime boundary. In particular:
 The current pause path does not capture vCPU, GIC, device, or guest-memory state
 and does not transfer ownership of any live resource.
 
-Paused snapshot create now exercises the first supervisor-only ownership
+Paused snapshot create now exercises the first lease-based ownership
 foundation. A separate admission cell atomically reserves snapshot preparation
 and submits an exclusive FIFO command. Commands admitted earlier execute first;
 later ordinary commands, device updates, memory-hotplug mutations, and resume
 reject before enqueue. The boot worker revalidates `Paused`, enters the scoped
-lease for one bounded no-op, and restores ordinary admission before
-`SnapshotUnsupported` is returned. Operation errors, queue/response closure,
-unwind, and repeated release restore admission when recoverable. Shutdown
-invalidates it through the existing out-of-band stop and pause-gate path.
+lease, and acquires acknowledged quiescence guards from both limiter retry
+schedulers. Acquisition waits for an already-started wakeup publication and
+vCPU-cancel attempt to finish. Only after both schedulers acknowledge does the
+worker drain any pending block or entropy retry token into deferred work. While
+the guards are held, neither scheduler can publish another token or cancel
+attempt. The guards are dropped before the supervisor lease releases, and
+ordinary admission is restored before `SnapshotUnsupported` is returned.
+Operation errors, queue/response closure, unwind, and repeated release restore
+admission when recoverable. Shutdown invalidates it through the existing
+out-of-band stop and pause-gate path.
+
+Limiter deadlines remain absolute while quiesced. A due deadline or drained
+token is republished asynchronously after guard release, duplicate immediate
+work is coalesced, and a distinct future deadline is retained. Canceling a
+scheduled retry clears both its deadline and deferred publication. Scheduler
+stop is terminal and cannot be undone by a late guard drop.
 
 This barrier does not change ordinary paused behavior outside its short scope
-and does not quiesce retry schedulers, periodic work, vmnet, vsock, vCPU state,
-devices, or guest memory. It is therefore not a snapshot-ready acknowledgement.
+and does not quiesce periodic work, vmnet, vsock, other future auxiliary work,
+vCPU state, devices, or guest memory. Block and entropy retry wakeups are the
+only acknowledged auxiliary subset. It is therefore not a snapshot-ready
+acknowledgement.
 
 ## Firecracker Requirements
 
@@ -140,7 +155,7 @@ threads also need an admission boundary.
 | --- | --- |
 | Ordinary `Paused` | Today's pause acknowledgement has completed. Paused commands and the mutations listed above can still occur. |
 | Supervisor preparing | Implemented for the scoped create barrier. Admission reservation and nonblocking FIFO submission share one lock, so earlier commands precede the barrier and later ordinary commands reject. The public controller remains `Paused`. |
-| Supervisor leased | Implemented only for one scoped boot-worker operation after worker-side pause revalidation. It closes ordinary supervisor command admission but does not establish the remaining snapshot-ready invariants. |
+| Supervisor leased | Implemented for one scoped boot-worker operation after worker-side pause revalidation. It closes ordinary supervisor command admission and acknowledges block and entropy limiter retry quiescence, but does not establish the remaining snapshot-ready invariants. |
 | Snapshot-ready | Future phase after every in-process quiescence invariant below has been acknowledged. The lease remains held for state capture, and the public controller remains `Paused`. |
 | Supervisor releasing | Implemented for scoped success, operation error, response closure, unwind, and shutdown invalidation. Recoverable release restores ordinary paused admission exactly once. |
 
@@ -157,7 +172,9 @@ later preparation path may do so only when all of these invariants hold:
   changes, are rejected or deferred; future work must classify genuinely
   read-only requests separately;
 - periodic work is stopped and each retry scheduler has acknowledged quiescence,
-  with no deadline thread able to publish another wakeup token;
+  with no deadline thread able to publish another wakeup token; the current
+  barrier satisfies this only for the block and entropy limiter retry
+  schedulers while their guards are held;
 - no VMM thread is reading or writing vmnet packets or vsock streams, and the
   transient vsock poller has joined;
 - lease acquisition and capture are bounded or observe an out-of-band stop
@@ -244,8 +261,8 @@ API behavior until all of its prerequisites exist.
 
 | Slice | Scope | Minimum validation |
 | --- | --- | --- |
-| Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned no-op, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
-| Auxiliary quiescence | Add acknowledged pause/resume and bounded cancellation to block, entropy, periodic, and other wakeup schedulers. | Deterministic scheduler unit tests and signed HVF cancellation/lifecycle coverage. |
+| Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
+| Auxiliary quiescence (block and entropy implemented) | #1162 adds acknowledged RAII quiescence for the existing block and entropy limiter retry schedulers, waits for in-flight publication, preserves absolute deadlines, drains and defers pending tokens, and keeps stop terminal. Periodic work and any later wakeup scheduler remain deferred. | Deterministic scheduler concurrency tests and supervisor lease-order tests; signed lifecycle coverage remains follow-up work. |
 | Runner capture boundary | Add a typed runner command for the first vCPU architectural-state inventory without exposing raw HVF ownership. | Runner command/conflict unit tests and signed HVF get/set round trips. |
 | GIC and device state | Inventory GIC ownership and add stable state models for each implemented MMIO device. | Per-device round-trip unit tests and signed HVF interrupt-state coverage. |
 | Full guest-memory capture | Define immutable capture ownership, full-memory file layout, error cleanup, and path-redaction behavior before considering diff snapshots. | Memory/file unit tests, process failure tests, and signed full-capture coverage. |
