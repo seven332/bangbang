@@ -1374,11 +1374,21 @@ edge-rising]`. Direct FDT configuration validates that the VMGenID region is
 exactly 16 bytes, does not overflow, does not overlap GIC, RTC, serial,
 virtio-mmio ranges, or RAM advertised through the FDT `/memory` node, and that
 the interrupt line is an SPI INTID. During startup, bangbang places the initial
-VMGenID buffer at the end of the reserved arm64 system-memory area, writes a
-non-zero 16-byte generation ID from host randomness, and passes the same region
-and an allocated SPI interrupt line to the FDT. Restore-time generation-ID
-updates, VMGenID interrupt signaling after restore, VMGenID state persistence,
-and VMClock remain deferred to later snapshot/time-device work tracked by #543.
+VMGenID buffer immediately before the reserved VMClock page, writes a non-zero
+16-byte generation ID from host randomness, and passes the same region and an
+allocated SPI interrupt line to the FDT. The same builder also emits
+Firecracker's startup VMClock DeviceTree shape: node name `ptp@{guest_address}`,
+compatible string `amazon,vmclock`, a 4 KiB `reg` region, and `interrupts =
+[SPI, line - 32, edge-rising]`. Direct FDT configuration validates that the
+VMClock page is exactly 4 KiB, does not overflow, does not overlap GIC, RTC,
+serial, virtio-mmio, VMGenID, or FDT-advertised RAM ranges, and that the
+interrupt line is an SPI INTID. During startup, bangbang places the VMClock
+page at the end of the reserved arm64 system-memory area, writes the minimal
+Firecracker VMClock ABI fields for guest discovery, and leaves unsupported time
+fields zeroed. Restore-time generation-ID and VMClock generation-counter
+updates, VMGenID/VMClock interrupt signaling after restore, VMGenID state
+persistence, and VMClock restore semantics remain deferred to later
+snapshot/time-device work tracked by #543.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest

@@ -373,6 +373,11 @@ When the boot args include `bangbang.vmgenid-check=1`, the same init script
 checks Linux device-tree evidence for `/vmgenid`, verifies the
 `microsoft,vmgenid` compatible string and 16-byte `reg` property tuple, and
 writes `BANGBANG_VMGENID_GUEST_CHECK_OK`.
+Startup VMClock coverage is currently unit-level: runtime tests verify the
+Firecracker-shaped `amazon,vmclock` FDT node, the non-overlapping page-aligned
+reserved backing page, and the minimal initialized ABI fields, while HVF unit
+tests verify deterministic SPI allocation. Do not treat this as signed guest
+VMClock restore or generation-counter coverage.
 When the boot args include `bangbang.block-writeback-flush=1`, the same init
 script opens `/dev/vdb`, writes a deterministic pre-flush marker, calls `fsync`
 on that block-device file descriptor, and writes
@@ -419,9 +424,9 @@ connection exchange through the signed executable, including narrow
 multi-payload stream cases and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, that RTC alarm
-interrupts, VMGenID restore signaling, or broader RTC-adjacent time/identity
-behavior is supported, or that full block, balloon, memory-hotplug, pmem, and
-vsock runtime behavior is complete.
+interrupts, VMGenID/VMClock restore signaling, VMClock guest e2e observation,
+or broader RTC-adjacent time/identity behavior is supported, or that full
+block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.

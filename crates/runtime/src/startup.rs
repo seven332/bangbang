@@ -30,9 +30,10 @@ use crate::entropy::{
     VirtioRngOsEntropySource,
 };
 use crate::fdt::{
-    ARM64_FDT_VMGENID_SIZE, Arm64FdtBootInfo, Arm64FdtConfig, Arm64FdtError, Arm64FdtGic,
-    Arm64FdtGuestMemoryWrite, Arm64FdtRegion, Arm64FdtRtcDevice, Arm64FdtSerialDevice,
-    Arm64FdtTimerInterrupts, Arm64FdtVirtioMmioDevice, Arm64FdtVmGenIdDevice, write_arm64_fdt,
+    ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtBootInfo, Arm64FdtConfig,
+    Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite, Arm64FdtRegion, Arm64FdtRtcDevice,
+    Arm64FdtSerialDevice, Arm64FdtTimerInterrupts, Arm64FdtVirtioMmioDevice, Arm64FdtVmClockDevice,
+    Arm64FdtVmGenIdDevice, write_arm64_fdt,
 };
 use crate::interrupt::GuestInterruptLine;
 use crate::machine::MachineConfig;
@@ -74,8 +75,24 @@ use crate::vsock::{
 const MIB: u64 = 1024 * 1024;
 pub const ARM64_BOOT_VMGENID_SIZE: usize = ARM64_FDT_VMGENID_SIZE as usize;
 const ARM64_BOOT_VMGENID_ALIGNMENT: u64 = 8;
+pub const ARM64_BOOT_VMCLOCK_SIZE: usize = ARM64_FDT_VMCLOCK_SIZE as usize;
+const ARM64_BOOT_VMCLOCK_ALIGNMENT: u64 = ARM64_FDT_VMCLOCK_SIZE;
+const ARM64_BOOT_VMCLOCK_ABI_SIZE: usize = 112;
+const ARM64_BOOT_VMCLOCK_MAGIC: u32 = 1_263_289_174;
+const ARM64_BOOT_VMCLOCK_VERSION: u16 = 1;
+const ARM64_BOOT_VMCLOCK_COUNTER_INVALID: u8 = 255;
+const ARM64_BOOT_VMCLOCK_STATUS_UNKNOWN: u8 = 0;
+const ARM64_BOOT_VMCLOCK_FLAG_VM_GEN_COUNTER_PRESENT: u64 = 256;
+const ARM64_BOOT_VMCLOCK_FLAG_NOTIFICATION_PRESENT: u64 = 512;
+const ARM64_BOOT_VMCLOCK_FLAGS: u64 =
+    ARM64_BOOT_VMCLOCK_FLAG_VM_GEN_COUNTER_PRESENT | ARM64_BOOT_VMCLOCK_FLAG_NOTIFICATION_PRESENT;
 const ARM64_BOOT_VMGENID_ADDRESS: GuestAddress = GuestAddress::new(
-    aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE - ARM64_FDT_VMGENID_SIZE,
+    aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE
+        - ARM64_FDT_VMCLOCK_SIZE
+        - ARM64_FDT_VMGENID_SIZE,
+);
+const ARM64_BOOT_VMCLOCK_ADDRESS: GuestAddress = GuestAddress::new(
+    aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE - ARM64_FDT_VMCLOCK_SIZE,
 );
 
 #[derive(Debug, Clone)]
@@ -86,6 +103,7 @@ pub struct Arm64BootResourceConfig<'a> {
     pub rtc_device: Option<Arm64BootRtcDeviceConfig>,
     pub serial_device: Option<Arm64BootSerialDeviceConfig>,
     pub vmgenid_interrupt_line: GuestInterruptLine,
+    pub vmclock_interrupt_line: GuestInterruptLine,
     pub block_mmio_layout: BlockMmioLayout,
     pub block_interrupt_lines: &'a [GuestInterruptLine],
     pub pmem_mmio_layout: PmemMmioLayout,
@@ -176,6 +194,7 @@ pub struct Arm64BootResources {
     pub rtc_device: Option<Arm64BootRtcDevice>,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub vmgenid_device: Arm64BootVmGenIdDevice,
+    pub vmclock_device: Arm64BootVmClockDevice,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
     pub pmem_mmio_devices: Vec<Arm64BootPmemDevice>,
@@ -202,6 +221,7 @@ pub struct Arm64BootRuntimeResources {
     pub rtc_device: Option<Arm64BootRtcDevice>,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub vmgenid_device: Arm64BootVmGenIdDevice,
+    pub vmclock_device: Arm64BootVmClockDevice,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
     pub pmem_mmio_devices: Vec<Arm64BootPmemDevice>,
@@ -223,6 +243,12 @@ pub struct Arm64BootVmGenIdDevice {
     pub range: GuestMemoryRange,
     pub generation_id: [u8; ARM64_BOOT_VMGENID_SIZE],
     pub fdt_device: Arm64FdtVmGenIdDevice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64BootVmClockDevice {
+    pub range: GuestMemoryRange,
+    pub fdt_device: Arm64FdtVmClockDevice,
 }
 
 impl fmt::Display for Arm64BootVsockWakeupFdsError {
@@ -2030,6 +2056,12 @@ pub enum Arm64BootResourceError {
     VmGenIdGuestMemoryWrite {
         source: GuestMemoryAccessError,
     },
+    VmClockRegion {
+        source: GuestMemoryError,
+    },
+    VmClockGuestMemoryWrite {
+        source: GuestMemoryAccessError,
+    },
     BlockInterruptLineCount {
         devices: usize,
         lines: usize,
@@ -2164,6 +2196,15 @@ impl fmt::Display for Arm64BootResourceError {
                     "failed to write VMGenID generation ID into guest memory: {source}"
                 )
             }
+            Self::VmClockRegion { source } => {
+                write!(f, "failed to prepare VMClock guest memory range: {source}")
+            }
+            Self::VmClockGuestMemoryWrite { source } => {
+                write!(
+                    f,
+                    "failed to write VMClock backing page into guest memory: {source}"
+                )
+            }
             Self::BlockInterruptLineCount { devices, lines } => write!(
                 f,
                 "block MMIO device count {devices} does not match interrupt line count {lines}"
@@ -2241,6 +2282,8 @@ impl std::error::Error for Arm64BootResourceError {
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
             Self::VmGenIdRegion { source } => Some(source),
             Self::VmGenIdGuestMemoryWrite { source } => Some(source),
+            Self::VmClockRegion { source } => Some(source),
+            Self::VmClockGuestMemoryWrite { source } => Some(source),
             Self::BlockDeviceMetadataAllocation { source } => Some(source),
             Self::PmemDeviceMetadataAllocation { source } => Some(source),
             Self::NetworkDeviceMetadataAllocation { source } => Some(source),
@@ -2357,6 +2400,7 @@ impl Arm64BootResources {
             rtc_device,
             serial_device,
             vmgenid_interrupt_line,
+            vmclock_interrupt_line,
             block_mmio_layout,
             block_interrupt_lines,
             pmem_mmio_layout,
@@ -2567,6 +2611,7 @@ impl Arm64BootResources {
         let rtc_fdt_device = rtc_device.as_ref().map(|device| device.fdt_device);
         let serial_fdt_device = serial_device.as_ref().map(|device| device.fdt_device);
         let vmgenid_device = create_initial_vmgenid_device(&mut memory, vmgenid_interrupt_line)?;
+        let vmclock_device = create_initial_vmclock_device(&mut memory, vmclock_interrupt_line)?;
         let fdt = write_arm64_fdt(
             &Arm64FdtConfig {
                 layout: &layout,
@@ -2577,6 +2622,7 @@ impl Arm64BootResources {
                 rtc_device: rtc_fdt_device,
                 serial_device: serial_fdt_device,
                 vmgenid_device: Some(vmgenid_device.fdt_device),
+                vmclock_device: Some(vmclock_device.fdt_device),
                 virtio_mmio_devices: &fdt_devices,
             },
             &mut memory,
@@ -2593,6 +2639,7 @@ impl Arm64BootResources {
             rtc_device,
             serial_device,
             vmgenid_device,
+            vmclock_device,
             block_devices,
             pmem_devices,
             pmem_mmio_devices,
@@ -2616,6 +2663,7 @@ impl Arm64BootResources {
                 rtc_device: self.rtc_device,
                 serial_device: self.serial_device,
                 vmgenid_device: self.vmgenid_device,
+                vmclock_device: self.vmclock_device,
                 block_devices: self.block_devices,
                 pmem_devices: self.pmem_devices,
                 pmem_mmio_devices: self.pmem_mmio_devices,
@@ -2683,6 +2731,26 @@ fn create_initial_vmgenid_device(
     })
 }
 
+fn create_initial_vmclock_device(
+    memory: &mut GuestMemory,
+    interrupt_line: GuestInterruptLine,
+) -> Result<Arm64BootVmClockDevice, Arm64BootResourceError> {
+    let range = initial_vmclock_range()?;
+    let backing_page = initial_vmclock_backing_page();
+    memory
+        .write_slice(&backing_page, range.start())
+        .map_err(|source| Arm64BootResourceError::VmClockGuestMemoryWrite { source })?;
+    let fdt_device = Arm64FdtVmClockDevice {
+        region: Arm64FdtRegion {
+            base: range.start().raw_value(),
+            size: range.size(),
+        },
+        interrupt_line,
+    };
+
+    Ok(Arm64BootVmClockDevice { range, fdt_device })
+}
+
 fn initial_vmgenid_range() -> Result<GuestMemoryRange, Arm64BootResourceError> {
     let range = GuestMemoryRange::new(ARM64_BOOT_VMGENID_ADDRESS, ARM64_FDT_VMGENID_SIZE)
         .map_err(|source| Arm64BootResourceError::VmGenIdRegion { source })?;
@@ -2692,12 +2760,43 @@ fn initial_vmgenid_range() -> Result<GuestMemoryRange, Arm64BootResourceError> {
     Ok(range)
 }
 
+fn initial_vmclock_range() -> Result<GuestMemoryRange, Arm64BootResourceError> {
+    let range = GuestMemoryRange::new(ARM64_BOOT_VMCLOCK_ADDRESS, ARM64_FDT_VMCLOCK_SIZE)
+        .map_err(|source| Arm64BootResourceError::VmClockRegion { source })?;
+    range
+        .validate_alignment(ARM64_BOOT_VMCLOCK_ALIGNMENT)
+        .map_err(|source| Arm64BootResourceError::VmClockRegion { source })?;
+    Ok(range)
+}
+
 fn ensure_nonzero_vmgenid_generation_id(generation_id: &mut [u8; ARM64_BOOT_VMGENID_SIZE]) {
     if generation_id.iter().all(|byte| *byte == 0)
         && let Some(first_byte) = generation_id.first_mut()
     {
         *first_byte = 1;
     }
+}
+
+fn initial_vmclock_backing_page() -> Vec<u8> {
+    let mut bytes = initial_vmclock_abi_bytes();
+    bytes.resize(ARM64_BOOT_VMCLOCK_SIZE, 0);
+    bytes
+}
+
+fn initial_vmclock_abi_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ARM64_BOOT_VMCLOCK_ABI_SIZE);
+    bytes.extend_from_slice(&ARM64_BOOT_VMCLOCK_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&(ARM64_FDT_VMCLOCK_SIZE as u32).to_le_bytes());
+    bytes.extend_from_slice(&ARM64_BOOT_VMCLOCK_VERSION.to_le_bytes());
+    bytes.push(ARM64_BOOT_VMCLOCK_COUNTER_INVALID);
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&ARM64_BOOT_VMCLOCK_FLAGS.to_le_bytes());
+    bytes.extend_from_slice(&[0; 2]);
+    bytes.push(ARM64_BOOT_VMCLOCK_STATUS_UNKNOWN);
+    bytes.resize(ARM64_BOOT_VMCLOCK_ABI_SIZE, 0);
+    bytes
 }
 
 fn append_root_drive_command_line(
@@ -3113,16 +3212,16 @@ mod tests {
     use device_tree::{DeviceTree, Node};
 
     use super::{
-        ARM64_BOOT_VMGENID_ADDRESS, ARM64_BOOT_VMGENID_SIZE, Arm64BootEntropySource,
-        Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
-        Arm64BootNetworkNotificationOutcome, Arm64BootNetworkPacketIo,
-        Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig,
-        Arm64BootResourceError, Arm64BootResources, Arm64BootRtcDeviceConfig,
-        Arm64BootRtcMmioRegistrationError, Arm64BootSerialDeviceConfig,
+        ARM64_BOOT_VMCLOCK_ADDRESS, ARM64_BOOT_VMCLOCK_SIZE, ARM64_BOOT_VMGENID_ADDRESS,
+        ARM64_BOOT_VMGENID_SIZE, Arm64BootEntropySource, Arm64BootEntropySourceError,
+        Arm64BootEntropySourceProvider, Arm64BootNetworkNotificationOutcome,
+        Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
+        Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources,
+        Arm64BootRtcDeviceConfig, Arm64BootRtcMmioRegistrationError, Arm64BootSerialDeviceConfig,
         Arm64BootSerialMmioRegistrationError, MIB, arm64_boot_network_device_metadata,
         balloon_hinting_status_for_device, balloon_stats_for_device, block_device_metadata,
-        ensure_nonzero_vmgenid_generation_id, initial_vmgenid_range,
-        start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
+        ensure_nonzero_vmgenid_generation_id, initial_vmclock_abi_bytes, initial_vmclock_range,
+        initial_vmgenid_range, start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
         update_balloon_config_for_device, update_balloon_statistics_for_device,
         update_block_device_for_devices_with_opened,
     };
@@ -3152,7 +3251,8 @@ mod tests {
         VirtioRngOsEntropySource,
     };
     use crate::fdt::{
-        ARM64_FDT_VMGENID_SIZE, Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts,
+        ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtError, Arm64FdtGic, Arm64FdtRegion,
+        Arm64FdtTimerInterrupts,
     };
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::{MachineConfig, MachineConfigInput};
@@ -3495,6 +3595,7 @@ mod tests {
             rtc_device: None,
             serial_device: None,
             vmgenid_interrupt_line: line(127),
+            vmclock_interrupt_line: line(126),
             block_mmio_layout: crate::block::BlockMmioLayout::new(
                 TEST_BLOCK_MMIO_BASE,
                 MmioRegionId::new(1),
@@ -5782,7 +5883,7 @@ mod tests {
         assert_eq!(device.range.size(), ARM64_FDT_VMGENID_SIZE);
         assert_eq!(
             device.range.end_exclusive().raw_value(),
-            aarch64::kernel_load_address().raw_value()
+            ARM64_BOOT_VMCLOCK_ADDRESS.raw_value()
         );
         assert_eq!(
             device.fdt_device.region.base,
@@ -5827,19 +5928,112 @@ mod tests {
     }
 
     #[test]
-    fn vmgenid_range_matches_firecracker_system_memory_last_match() {
+    fn assembles_boot_resources_with_initial_vmclock() {
+        let kernel = temp_file("kernel-with-vmclock", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+
+        let device = resources.vmclock_device;
+        assert_eq!(device.range.start(), ARM64_BOOT_VMCLOCK_ADDRESS);
+        assert_eq!(device.range.size(), ARM64_FDT_VMCLOCK_SIZE);
+        assert_eq!(
+            device.range.end_exclusive().raw_value(),
+            aarch64::kernel_load_address().raw_value()
+        );
+        assert_eq!(
+            device.fdt_device.region.base,
+            ARM64_BOOT_VMCLOCK_ADDRESS.raw_value()
+        );
+        assert_eq!(device.fdt_device.region.size, ARM64_FDT_VMCLOCK_SIZE);
+        assert_eq!(device.fdt_device.interrupt_line, line(126));
+
+        let page = read_guest_bytes(
+            &resources.memory,
+            device.range.start(),
+            ARM64_BOOT_VMCLOCK_SIZE,
+        );
+        let abi = initial_vmclock_abi_bytes();
+        assert!(page.starts_with(&abi));
+        assert!(page.iter().skip(abi.len()).all(|byte| *byte == 0));
+
+        let tree = read_fdt(&resources);
+        let vmclock_path = format!("/ptp@{}", ARM64_BOOT_VMCLOCK_ADDRESS.raw_value());
+        let vmclock = tree
+            .find(&vmclock_path)
+            .expect("VMClock node should be in assembled FDT");
+        assert_eq!(vmclock.prop_str("compatible").unwrap(), "amazon,vmclock");
+        assert_eq!(
+            prop_u64_cells(vmclock, "reg"),
+            vec![
+                ARM64_BOOT_VMCLOCK_ADDRESS.raw_value(),
+                ARM64_FDT_VMCLOCK_SIZE
+            ]
+        );
+        assert_eq!(prop_u32_cells(vmclock, "interrupts"), vec![0, 94, 1]);
+        assert!(!vmclock.has_prop("interrupt-parent"));
+    }
+
+    #[test]
+    fn vmgenid_range_matches_reserved_system_memory_before_vmclock() {
         let range = initial_vmgenid_range().expect("VMGenID range should be valid");
 
         assert_eq!(range.start(), ARM64_BOOT_VMGENID_ADDRESS);
         assert_eq!(range.size(), ARM64_FDT_VMGENID_SIZE);
         assert_eq!(
             range.end_exclusive().raw_value(),
-            aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE
+            ARM64_BOOT_VMCLOCK_ADDRESS.raw_value()
         );
         assert_eq!(
             range.start().raw_value() % super::ARM64_BOOT_VMGENID_ALIGNMENT,
             0
         );
+    }
+
+    #[test]
+    fn vmclock_range_matches_reserved_system_memory_last_page() {
+        let range = initial_vmclock_range().expect("VMClock range should be valid");
+
+        assert_eq!(range.start(), ARM64_BOOT_VMCLOCK_ADDRESS);
+        assert_eq!(range.size(), ARM64_FDT_VMCLOCK_SIZE);
+        assert_eq!(
+            range.end_exclusive().raw_value(),
+            aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE
+        );
+        assert_eq!(
+            range.start().raw_value() % super::ARM64_BOOT_VMCLOCK_ALIGNMENT,
+            0
+        );
+    }
+
+    #[test]
+    fn vmclock_abi_uses_firecracker_startup_defaults() {
+        let abi = initial_vmclock_abi_bytes();
+
+        assert_eq!(abi.len(), super::ARM64_BOOT_VMCLOCK_ABI_SIZE);
+        assert_eq!(
+            u32::from_le_bytes(abi[0..4].try_into().unwrap()),
+            super::ARM64_BOOT_VMCLOCK_MAGIC
+        );
+        assert_eq!(
+            u32::from_le_bytes(abi[4..8].try_into().unwrap()),
+            ARM64_FDT_VMCLOCK_SIZE as u32
+        );
+        assert_eq!(
+            u16::from_le_bytes(abi[8..10].try_into().unwrap()),
+            super::ARM64_BOOT_VMCLOCK_VERSION
+        );
+        assert_eq!(abi[10], super::ARM64_BOOT_VMCLOCK_COUNTER_INVALID);
+        assert_eq!(u32::from_le_bytes(abi[12..16].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(abi[16..24].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(abi[24..32].try_into().unwrap()),
+            super::ARM64_BOOT_VMCLOCK_FLAGS
+        );
+        assert_eq!(abi[34], super::ARM64_BOOT_VMCLOCK_STATUS_UNKNOWN);
+        assert!(abi[35..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -5866,6 +6060,24 @@ mod tests {
         assert!(matches!(
             err,
             Arm64BootResourceError::VmGenIdGuestMemoryWrite { .. }
+        ));
+    }
+
+    #[test]
+    fn vmclock_guest_memory_write_failure_fails_startup_resource_creation() {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), aarch64::SYSTEM_MEM_SIZE)
+                .expect("test range should be valid"),
+        ])
+        .expect("test layout should be valid");
+        let mut memory = GuestMemory::allocate(&layout).expect("test memory should allocate");
+
+        let err = super::create_initial_vmclock_device(&mut memory, line(126))
+            .expect_err("unmapped VMClock range should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::VmClockGuestMemoryWrite { .. }
         ));
     }
 
@@ -6294,6 +6506,26 @@ mod tests {
             err,
             Arm64BootResourceError::RootDriveCommandLine {
                 source: BootCommandLineError::TooLarge { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn non_spi_vmclock_interrupt_line_fails_during_fdt_write() {
+        let kernel = temp_file("kernel-vmclock-non-spi", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let config = Arm64BootResourceConfig {
+            vmclock_interrupt_line: line(31),
+            ..valid_config(&[])
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("non-SPI VMClock interrupt should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::Fdt {
+                source: Arm64FdtError::InvalidVmClockInterrupt { .. }
             }
         ));
     }
