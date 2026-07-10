@@ -3946,7 +3946,8 @@ mod macos_arm64 {
             &instance_id,
             &["--config-file", path_text(&config_path)],
         );
-        let output = bangbang.wait_for_exit();
+        let output = bangbang
+            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "API-enabled guest SYSTEM_OFF");
 
         assert!(
             output.status.success(),
@@ -3987,7 +3988,8 @@ mod macos_arm64 {
             "guest shutdown no-api startup must not publish an API socket"
         );
 
-        let output = bangbang.wait_for_exit();
+        let output =
+            bangbang.wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "no-api guest SYSTEM_OFF");
 
         assert!(
             output.status.success(),
@@ -4023,7 +4025,8 @@ mod macos_arm64 {
             &instance_id,
             &["--config-file", path_text(&config_path)],
         );
-        let output = bangbang.wait_for_exit();
+        let output = bangbang
+            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "API-enabled guest SYSTEM_RESET");
 
         assert!(
             output.status.success(),
@@ -4064,7 +4067,8 @@ mod macos_arm64 {
             "guest reset no-api startup must not publish an API socket"
         );
 
-        let output = bangbang.wait_for_exit();
+        let output = bangbang
+            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "no-api guest SYSTEM_RESET");
 
         assert!(
             output.status.success(),

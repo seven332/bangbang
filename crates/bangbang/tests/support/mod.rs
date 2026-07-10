@@ -402,11 +402,26 @@ impl BangbangProcess {
         dead_code,
         reason = "shared integration-test support is compiled once per test target"
     )]
-    pub(crate) fn wait_for_exit(mut self) -> CompletedProcess {
-        let child = self.child.take().expect("child should still be owned");
-        let status = wait_for_child_exit(child, SHUTDOWN_TIMEOUT);
+    pub(crate) fn wait_for_exit(self) -> CompletedProcess {
+        self.wait_for_exit_with_timeout(SHUTDOWN_TIMEOUT, "process exit")
+    }
 
-        self.collect_output(status)
+    pub(crate) fn wait_for_exit_with_timeout(
+        mut self,
+        timeout: Duration,
+        context: &str,
+    ) -> CompletedProcess {
+        let child = self.child.take().expect("child should still be owned");
+        let exit = wait_for_child_exit_result(child, timeout);
+        let timed_out = exit.timed_out;
+        let output = self.collect_output(exit.status);
+        assert!(
+            !timed_out,
+            "bangbang did not exit for {context} within {timeout:?}; status after SIGKILL: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status, output.stdout, output.stderr
+        );
+
+        output
     }
 
     #[allow(
@@ -560,6 +575,18 @@ impl OutputReader {
 }
 
 fn wait_for_child_exit(child: Child, timeout: Duration) -> ExitStatus {
+    let exit = wait_for_child_exit_result(child, timeout);
+    let _timed_out = exit.timed_out;
+    exit.status
+}
+
+#[derive(Debug)]
+struct ChildExitResult {
+    status: ExitStatus,
+    timed_out: bool,
+}
+
+fn wait_for_child_exit_result(child: Child, timeout: Duration) -> ChildExitResult {
     let pid = child.id();
     let (status_sender, status_receiver) = mpsc::channel();
     let waiter = thread::spawn(move || {
@@ -568,20 +595,26 @@ fn wait_for_child_exit(child: Child, timeout: Duration) -> ExitStatus {
         let _ = status_sender.send(status);
     });
 
-    let status = match status_receiver.recv_timeout(timeout) {
-        Ok(status) => status.expect("child wait should succeed"),
+    let exit = match status_receiver.recv_timeout(timeout) {
+        Ok(status) => ChildExitResult {
+            status: status.expect("child wait should succeed"),
+            timed_out: false,
+        },
         Err(RecvTimeoutError::Timeout) => {
             force_kill(pid);
-            status_receiver
-                .recv_timeout(timeout)
-                .expect("child should exit after SIGKILL")
-                .expect("child wait after SIGKILL should succeed")
+            ChildExitResult {
+                status: status_receiver
+                    .recv_timeout(SHUTDOWN_TIMEOUT)
+                    .expect("child should exit after SIGKILL")
+                    .expect("child wait after SIGKILL should succeed"),
+                timed_out: true,
+            }
         }
         Err(RecvTimeoutError::Disconnected) => panic!("child wait thread disconnected"),
     };
     waiter.join().expect("child wait thread should join");
 
-    status
+    exit
 }
 
 fn send_signal(pid: u32, signal: i32) -> std::io::Result<()> {
