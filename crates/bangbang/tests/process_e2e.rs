@@ -300,8 +300,18 @@ fn executable_rejects_empty_mutating_api_requests_without_stopping() {
             r#"{"fault_message":"Empty PUT request."}"#,
         ),
         (
+            "bodyless PUT /unknown",
+            http_no_body(&socket_path, "PUT", "/unknown"),
+            r#"{"fault_message":"Empty PUT request."}"#,
+        ),
+        (
             "empty PATCH /vm",
             http_json(&socket_path, "PATCH", "/vm", ""),
+            r#"{"fault_message":"Empty PATCH request."}"#,
+        ),
+        (
+            "bodyless PATCH /unknown",
+            http_no_body(&socket_path, "PATCH", "/unknown"),
             r#"{"fault_message":"Empty PATCH request."}"#,
         ),
         (

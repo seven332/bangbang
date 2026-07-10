@@ -2582,10 +2582,10 @@ pub fn parse_request_with_limit(
     if method == "DELETE" && request_body.has_content() {
         return Err(RequestError::EmptyDeleteRequest);
     }
-    if method == "PUT" && body.is_empty() && put_request_path_requires_body(path) {
+    if method == "PUT" && body.is_empty() {
         return Err(RequestError::EmptyPutRequest);
     }
-    if method == "PATCH" && body.is_empty() && patch_request_path_requires_body(path) {
+    if method == "PATCH" && body.is_empty() && !patch_request_path_accepts_empty_body(path) {
         return Err(RequestError::EmptyPatchRequest);
     }
 
@@ -2737,43 +2737,8 @@ fn balloon_request_without_body_parsing(method: &str, path: &str) -> Option<ApiR
     }
 }
 
-fn put_request_path_requires_body(path: &str) -> bool {
-    drive_path_id(path).is_some()
-        || network_interface_path_id(path).is_some()
-        || pmem_path_id(path).is_some()
-        || matches!(
-            path,
-            "/actions"
-                | "/balloon"
-                | "/boot-source"
-                | "/cpu-config"
-                | "/entropy"
-                | "/hotplug/memory"
-                | "/logger"
-                | "/machine-config"
-                | "/metrics"
-                | "/mmds"
-                | "/mmds/config"
-                | "/serial"
-                | "/snapshot/create"
-                | "/snapshot/load"
-                | "/vsock"
-        )
-}
-
-fn patch_request_path_requires_body(path: &str) -> bool {
-    drive_path_id(path).is_some()
-        || network_interface_path_id(path).is_some()
-        || pmem_path_id(path).is_some()
-        || matches!(
-            path,
-            "/balloon"
-                | "/balloon/statistics"
-                | "/hotplug/memory"
-                | "/machine-config"
-                | "/mmds"
-                | "/vm"
-        )
+fn patch_request_path_accepts_empty_body(path: &str) -> bool {
+    matches!(path, "/balloon/hinting/start" | "/balloon/hinting/stop")
 }
 
 fn drive_path_id(path: &str) -> Option<&str> {
@@ -3858,14 +3823,26 @@ mod tests {
     }
 
     #[test]
-    fn empty_mutating_request_detection_does_not_create_routes() {
-        for request in [
-            request_without_body("PUT", "/unknown"),
-            request_without_body("PATCH", "/unknown"),
+    fn bodyless_unknown_put_or_patch_uses_empty_faults() {
+        for (method, expected) in [
+            ("PUT", RequestError::EmptyPutRequest),
+            ("PATCH", RequestError::EmptyPatchRequest),
         ] {
             assert_eq!(
-                parse_request(&request),
-                Err(RequestError::InvalidPathMethod)
+                parse_request(&request_without_body(method, "/unknown")),
+                Err(expected),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonempty_unknown_put_or_patch_stays_invalid_path_method() {
+        for method in ["PUT", "PATCH"] {
+            assert_eq!(
+                parse_request(&request_with_body(method, "/unknown", "{}")),
+                Err(RequestError::InvalidPathMethod),
+                "{method}"
             );
         }
     }
@@ -6361,10 +6338,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_method() {
-        let request = b"PUT /version HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    fn bodyless_unsupported_put_or_patch_method_uses_empty_faults() {
+        for (method, expected) in [
+            ("PUT", RequestError::EmptyPutRequest),
+            ("PATCH", RequestError::EmptyPatchRequest),
+        ] {
+            assert_eq!(
+                parse_request(&request_without_body(method, "/version")),
+                Err(expected),
+                "{method}"
+            );
+        }
+    }
 
-        assert_eq!(parse_request(request), Err(RequestError::InvalidPathMethod));
+    #[test]
+    fn nonempty_unsupported_put_or_patch_method_stays_invalid_path_method() {
+        for method in ["PUT", "PATCH"] {
+            assert_eq!(
+                parse_request(&request_with_body(method, "/version", "{}")),
+                Err(RequestError::InvalidPathMethod),
+                "{method}"
+            );
+        }
     }
 
     #[test]
