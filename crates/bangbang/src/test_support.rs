@@ -34,6 +34,8 @@ pub(crate) fn minimal_arm64_boot_resource_config() -> Arm64BootResourceConfig<'s
         serial_device: None,
         vmgenid_interrupt_line: GuestInterruptLine::new(127)
             .expect("test VMGenID interrupt line should be valid"),
+        vmclock_interrupt_line: GuestInterruptLine::new(126)
+            .expect("test VMClock interrupt line should be valid"),
         block_mmio_layout: BlockMmioLayout::new(
             GuestAddress::new(0x1000_0000),
             MmioRegionId::new(1000),

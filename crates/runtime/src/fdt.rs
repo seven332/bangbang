@@ -27,6 +27,8 @@ const SERIAL_COMPATIBILITY: &str = "ns16550a";
 const SERIAL_NODE_PREFIX: &str = "uart";
 const VMGENID_NODE_NAME: &str = "vmgenid";
 const VMGENID_COMPATIBILITY: &str = "microsoft,vmgenid";
+const VMCLOCK_NODE_PREFIX: &str = "ptp";
+const VMCLOCK_COMPATIBILITY: &str = "amazon,vmclock";
 const APB_PCLK_NODE_NAME: &str = "apb-pclk";
 const APB_PCLK_CLOCK_NAME: &str = "apb_pclk";
 const APB_PCLK_CLOCK_OUTPUT_NAME: &str = "clk24mhz";
@@ -47,6 +49,7 @@ pub const ARM64_FDT_NON_SECURE_PHYSICAL_TIMER_PPI: u32 = 14;
 pub const ARM64_FDT_VIRTUAL_TIMER_PPI: u32 = 11;
 pub const ARM64_FDT_HYPERVISOR_TIMER_PPI: u32 = 10;
 pub const ARM64_FDT_VMGENID_SIZE: u64 = 16;
+pub const ARM64_FDT_VMCLOCK_SIZE: u64 = 0x1000;
 const LINUX_PCI_PROBE_ONLY: u32 = 1;
 const ARM64_FDT_RNG_SEED_SIZE: usize = 64;
 
@@ -75,6 +78,7 @@ pub struct Arm64FdtConfig<'a> {
     pub rtc_device: Option<Arm64FdtRtcDevice>,
     pub serial_device: Option<Arm64FdtSerialDevice>,
     pub vmgenid_device: Option<Arm64FdtVmGenIdDevice>,
+    pub vmclock_device: Option<Arm64FdtVmClockDevice>,
     pub virtio_mmio_devices: &'a [Arm64FdtVirtioMmioDevice],
 }
 
@@ -133,6 +137,12 @@ pub struct Arm64FdtRtcDevice {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arm64FdtVmGenIdDevice {
+    pub region: Arm64FdtRegion,
+    pub interrupt_line: GuestInterruptLine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64FdtVmClockDevice {
     pub region: Arm64FdtRegion,
     pub interrupt_line: GuestInterruptLine,
 }
@@ -394,6 +404,42 @@ pub enum Arm64FdtError {
         serial_region: Arm64FdtRegion,
     },
     InvalidVmGenIdInterrupt {
+        line: GuestInterruptLine,
+    },
+    InvalidVmClockRegion {
+        region: Arm64FdtRegion,
+        source: GuestMemoryError,
+    },
+    InvalidVmClockSize {
+        size: u64,
+        expected: u64,
+    },
+    VmClockRegionOverlapsMemory {
+        region: Arm64FdtRegion,
+        memory_range: GuestMemoryRange,
+    },
+    VmClockRegionOverlapsGic {
+        region: Arm64FdtRegion,
+        gic: &'static str,
+    },
+    VmClockRegionOverlapsVirtioMmio {
+        region: Arm64FdtRegion,
+        virtio_mmio_index: usize,
+        virtio_mmio_region: Arm64FdtRegion,
+    },
+    VmClockRegionOverlapsRtc {
+        region: Arm64FdtRegion,
+        rtc_region: Arm64FdtRegion,
+    },
+    VmClockRegionOverlapsSerial {
+        region: Arm64FdtRegion,
+        serial_region: Arm64FdtRegion,
+    },
+    VmClockRegionOverlapsVmGenId {
+        region: Arm64FdtRegion,
+        vmgenid_region: Arm64FdtRegion,
+    },
+    InvalidVmClockInterrupt {
         line: GuestInterruptLine,
     },
     CreateFdt {
@@ -665,6 +711,62 @@ impl fmt::Display for Arm64FdtError {
                 f,
                 "arm64 FDT VMGenID interrupt line {line} must be an SPI INTID at least {FIRST_SPI_INTID}"
             ),
+            Self::InvalidVmClockRegion { region, source } => write!(
+                f,
+                "invalid arm64 FDT VMClock region base=0x{:x}, size={}: {source}",
+                region.base, region.size
+            ),
+            Self::InvalidVmClockSize { size, expected } => write!(
+                f,
+                "arm64 FDT VMClock region size must be {expected} bytes, got {size}"
+            ),
+            Self::VmClockRegionOverlapsMemory {
+                region,
+                memory_range,
+            } => write!(
+                f,
+                "arm64 FDT VMClock region base=0x{:x}, size={} overlaps guest memory range {memory_range}",
+                region.base, region.size
+            ),
+            Self::VmClockRegionOverlapsGic { region, gic } => write!(
+                f,
+                "arm64 FDT VMClock region base=0x{:x}, size={} overlaps GIC {gic} region",
+                region.base, region.size
+            ),
+            Self::VmClockRegionOverlapsVirtioMmio {
+                region,
+                virtio_mmio_index,
+                virtio_mmio_region,
+            } => write!(
+                f,
+                "arm64 FDT VMClock region base=0x{:x}, size={} overlaps virtio-mmio device {virtio_mmio_index} region base=0x{:x}, size={}",
+                region.base, region.size, virtio_mmio_region.base, virtio_mmio_region.size
+            ),
+            Self::VmClockRegionOverlapsRtc { region, rtc_region } => write!(
+                f,
+                "arm64 FDT VMClock region base=0x{:x}, size={} overlaps RTC region base=0x{:x}, size={}",
+                region.base, region.size, rtc_region.base, rtc_region.size
+            ),
+            Self::VmClockRegionOverlapsSerial {
+                region,
+                serial_region,
+            } => write!(
+                f,
+                "arm64 FDT VMClock region base=0x{:x}, size={} overlaps serial region base=0x{:x}, size={}",
+                region.base, region.size, serial_region.base, serial_region.size
+            ),
+            Self::VmClockRegionOverlapsVmGenId {
+                region,
+                vmgenid_region,
+            } => write!(
+                f,
+                "arm64 FDT VMClock region base=0x{:x}, size={} overlaps VMGenID region base=0x{:x}, size={}",
+                region.base, region.size, vmgenid_region.base, vmgenid_region.size
+            ),
+            Self::InvalidVmClockInterrupt { line } => write!(
+                f,
+                "arm64 FDT VMClock interrupt line {line} must be an SPI INTID at least {FIRST_SPI_INTID}"
+            ),
             Self::CreateFdt { source } => write!(f, "failed to create arm64 FDT: {source}"),
             Self::FdtTooLarge { size, max_size } => {
                 write!(
@@ -693,6 +795,7 @@ impl std::error::Error for Arm64FdtError {
             Self::InvalidSerialRegion { source, .. } => Some(source),
             Self::InvalidRtcRegion { source, .. } => Some(source),
             Self::InvalidVmGenIdRegion { source, .. } => Some(source),
+            Self::InvalidVmClockRegion { source, .. } => Some(source),
             Self::RngSeed { source } => Some(source),
             Self::CreateFdt { source } => Some(source),
             Self::GuestMemoryWrite { source } => Some(source),
@@ -730,6 +833,14 @@ impl std::error::Error for Arm64FdtError {
             | Self::VmGenIdRegionOverlapsRtc { .. }
             | Self::VmGenIdRegionOverlapsSerial { .. }
             | Self::InvalidVmGenIdInterrupt { .. }
+            | Self::InvalidVmClockSize { .. }
+            | Self::VmClockRegionOverlapsMemory { .. }
+            | Self::VmClockRegionOverlapsGic { .. }
+            | Self::VmClockRegionOverlapsVirtioMmio { .. }
+            | Self::VmClockRegionOverlapsRtc { .. }
+            | Self::VmClockRegionOverlapsSerial { .. }
+            | Self::VmClockRegionOverlapsVmGenId { .. }
+            | Self::InvalidVmClockInterrupt { .. }
             | Self::RtcRegionOverlapsMemory { .. }
             | Self::RtcRegionOverlapsGic { .. }
             | Self::RtcRegionOverlapsVirtioMmio { .. }
@@ -752,6 +863,7 @@ struct ValidatedArm64FdtConfig {
     rtc_device: Option<ValidatedArm64FdtRtcDevice>,
     serial_device: Option<ValidatedArm64FdtSerialDevice>,
     vmgenid_device: Option<ValidatedArm64FdtVmGenIdDevice>,
+    vmclock_device: Option<ValidatedArm64FdtVmClockDevice>,
     virtio_mmio_devices: Vec<ValidatedArm64FdtVirtioMmioDevice>,
 }
 
@@ -770,6 +882,13 @@ struct ValidatedArm64FdtSerialDevice {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ValidatedArm64FdtVmGenIdDevice {
+    region: Arm64FdtRegion,
+    range: GuestMemoryRange,
+    interrupt_cell: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatedArm64FdtVmClockDevice {
     region: Arm64FdtRegion,
     interrupt_cell: u32,
 }
@@ -824,6 +943,9 @@ where
     }
     if let Some(vmgenid_device) = validated.vmgenid_device {
         create_vmgenid_node(&mut fdt, vmgenid_device)?;
+    }
+    if let Some(vmclock_device) = validated.vmclock_device {
+        create_vmclock_node(&mut fdt, vmclock_device)?;
     }
     create_virtio_mmio_nodes(&mut fdt, &validated.virtio_mmio_devices)?;
 
@@ -903,6 +1025,20 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<ValidatedArm64FdtConfi
             )
         })
         .transpose()?;
+    let vmclock_device = config
+        .vmclock_device
+        .map(|device| {
+            validate_vmclock_device(
+                config.layout,
+                config.gic,
+                device,
+                &virtio_mmio_devices,
+                rtc_device.as_ref(),
+                serial_device.as_ref(),
+                vmgenid_device.as_ref(),
+            )
+        })
+        .transpose()?;
     if let Some(initrd) = config.boot.initrd {
         validate_initrd(config.layout, initrd)?;
     }
@@ -912,6 +1048,7 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<ValidatedArm64FdtConfi
         rtc_device,
         serial_device,
         vmgenid_device,
+        vmclock_device,
         virtio_mmio_devices,
     })
 }
@@ -1145,6 +1282,25 @@ fn create_vmgenid_node(
         ],
     )?;
     fdt.end_node(vmgenid)?;
+    Ok(())
+}
+
+fn create_vmclock_node(
+    fdt: &mut FdtWriter,
+    device: ValidatedArm64FdtVmClockDevice,
+) -> Result<(), Arm64FdtError> {
+    let vmclock = fdt.begin_node(&format!("{VMCLOCK_NODE_PREFIX}@{}", device.region.base))?;
+    fdt.property_string("compatible", VMCLOCK_COMPATIBILITY)?;
+    fdt.property_array_u64("reg", &[device.region.base, device.region.size])?;
+    fdt.property_array_u32(
+        "interrupts",
+        &[
+            GIC_FDT_IRQ_TYPE_SPI,
+            device.interrupt_cell,
+            IRQ_TYPE_EDGE_RISING,
+        ],
+    )?;
+    fdt.end_node(vmclock)?;
     Ok(())
 }
 
@@ -1691,6 +1847,7 @@ fn validate_vmgenid_device(
 
     Ok(ValidatedArm64FdtVmGenIdDevice {
         region: device.region,
+        range,
         interrupt_cell: vmgenid_interrupt_cell(device.interrupt_line)?,
     })
 }
@@ -1838,6 +1995,167 @@ fn vmgenid_interrupt_cell(line: GuestInterruptLine) -> Result<u32, Arm64FdtError
     line.raw_value()
         .checked_sub(FIRST_SPI_INTID)
         .ok_or(Arm64FdtError::InvalidVmGenIdInterrupt { line })
+}
+
+fn validate_vmclock_device(
+    layout: &GuestMemoryLayout,
+    gic: Arm64FdtGic,
+    device: Arm64FdtVmClockDevice,
+    virtio_mmio_devices: &[ValidatedArm64FdtVirtioMmioDevice],
+    rtc_device: Option<&ValidatedArm64FdtRtcDevice>,
+    serial_device: Option<&ValidatedArm64FdtSerialDevice>,
+    vmgenid_device: Option<&ValidatedArm64FdtVmGenIdDevice>,
+) -> Result<ValidatedArm64FdtVmClockDevice, Arm64FdtError> {
+    let range = validate_vmclock_region(device.region)?;
+    validate_vmclock_region_does_not_overlap_memory(layout, device.region, range)?;
+    validate_vmclock_region_does_not_overlap_gic(device.region, range, gic)?;
+    validate_vmclock_region_does_not_overlap_virtio_mmio(
+        device.region,
+        range,
+        virtio_mmio_devices,
+    )?;
+    validate_vmclock_region_does_not_overlap_rtc(device.region, range, rtc_device)?;
+    validate_vmclock_region_does_not_overlap_serial(device.region, range, serial_device)?;
+    validate_vmclock_region_does_not_overlap_vmgenid(device.region, range, vmgenid_device)?;
+
+    Ok(ValidatedArm64FdtVmClockDevice {
+        region: device.region,
+        interrupt_cell: vmclock_interrupt_cell(device.interrupt_line)?,
+    })
+}
+
+fn validate_vmclock_region(region: Arm64FdtRegion) -> Result<GuestMemoryRange, Arm64FdtError> {
+    let range = GuestMemoryRange::new(GuestAddress::new(region.base), region.size)
+        .map_err(|source| Arm64FdtError::InvalidVmClockRegion { region, source })?;
+    if region.size != ARM64_FDT_VMCLOCK_SIZE {
+        return Err(Arm64FdtError::InvalidVmClockSize {
+            size: region.size,
+            expected: ARM64_FDT_VMCLOCK_SIZE,
+        });
+    }
+
+    Ok(range)
+}
+
+fn validate_vmclock_region_does_not_overlap_memory(
+    layout: &GuestMemoryLayout,
+    region: Arm64FdtRegion,
+    vmclock_range: GuestMemoryRange,
+) -> Result<(), Arm64FdtError> {
+    for (range_index, memory_range) in layout.ranges().iter().copied().enumerate() {
+        let advertised_range = advertised_memory_range(range_index, memory_range)?;
+        if vmclock_range.overlaps(advertised_range) {
+            return Err(Arm64FdtError::VmClockRegionOverlapsMemory {
+                region,
+                memory_range: advertised_range,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_vmclock_region_does_not_overlap_gic(
+    region: Arm64FdtRegion,
+    vmclock_range: GuestMemoryRange,
+    gic: Arm64FdtGic,
+) -> Result<(), Arm64FdtError> {
+    let gic_ranges = [
+        (
+            "distributor",
+            validate_gic_region("distributor", gic.distributor)?,
+        ),
+        (
+            "redistributor",
+            validate_gic_region("redistributor", gic.redistributor)?,
+        ),
+    ];
+
+    for (gic_name, gic_range) in gic_ranges {
+        if vmclock_range.overlaps(gic_range) {
+            return Err(Arm64FdtError::VmClockRegionOverlapsGic {
+                region,
+                gic: gic_name,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_vmclock_region_does_not_overlap_virtio_mmio(
+    region: Arm64FdtRegion,
+    vmclock_range: GuestMemoryRange,
+    virtio_mmio_devices: &[ValidatedArm64FdtVirtioMmioDevice],
+) -> Result<(), Arm64FdtError> {
+    for device in virtio_mmio_devices {
+        if vmclock_range.overlaps(device.range) {
+            return Err(Arm64FdtError::VmClockRegionOverlapsVirtioMmio {
+                region,
+                virtio_mmio_index: device.index,
+                virtio_mmio_region: device.region,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_vmclock_region_does_not_overlap_rtc(
+    region: Arm64FdtRegion,
+    vmclock_range: GuestMemoryRange,
+    rtc_device: Option<&ValidatedArm64FdtRtcDevice>,
+) -> Result<(), Arm64FdtError> {
+    if let Some(rtc) = rtc_device
+        && vmclock_range.overlaps(rtc.range)
+    {
+        return Err(Arm64FdtError::VmClockRegionOverlapsRtc {
+            region,
+            rtc_region: rtc.region,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_vmclock_region_does_not_overlap_serial(
+    region: Arm64FdtRegion,
+    vmclock_range: GuestMemoryRange,
+    serial_device: Option<&ValidatedArm64FdtSerialDevice>,
+) -> Result<(), Arm64FdtError> {
+    if let Some(serial) = serial_device
+        && vmclock_range.overlaps(serial.range)
+    {
+        return Err(Arm64FdtError::VmClockRegionOverlapsSerial {
+            region,
+            serial_region: serial.region,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_vmclock_region_does_not_overlap_vmgenid(
+    region: Arm64FdtRegion,
+    vmclock_range: GuestMemoryRange,
+    vmgenid_device: Option<&ValidatedArm64FdtVmGenIdDevice>,
+) -> Result<(), Arm64FdtError> {
+    if let Some(vmgenid) = vmgenid_device
+        && vmclock_range.overlaps(vmgenid.range)
+    {
+        return Err(Arm64FdtError::VmClockRegionOverlapsVmGenId {
+            region,
+            vmgenid_region: vmgenid.region,
+        });
+    }
+
+    Ok(())
+}
+
+fn vmclock_interrupt_cell(line: GuestInterruptLine) -> Result<u32, Arm64FdtError> {
+    line.raw_value()
+        .checked_sub(FIRST_SPI_INTID)
+        .ok_or(Arm64FdtError::InvalidVmClockInterrupt { line })
 }
 
 fn validate_virtio_mmio_devices(
@@ -3276,6 +3594,468 @@ mod tests {
     }
 
     #[test]
+    fn vmclock_node_uses_firecracker_shape() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmclock = vmclock_device(0x4000_3000, ARM64_FDT_VMCLOCK_SIZE, 32);
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let vmclock_path = format!("/ptp@{}", vmclock.region.base);
+        let vmclock_node = required_node(&tree, &vmclock_path);
+
+        assert!(tree.find("/apb-pclk").is_none());
+        assert_eq!(
+            vmclock_node.prop_str("compatible").unwrap(),
+            VMCLOCK_COMPATIBILITY
+        );
+        assert_eq!(
+            prop_u64_cells(vmclock_node, "reg"),
+            vec![0x4000_3000, ARM64_FDT_VMCLOCK_SIZE]
+        );
+        assert_eq!(prop_u32_cells(vmclock_node, "interrupts"), vec![0, 0, 1]);
+        assert!(!vmclock_node.has_prop("interrupt-parent"));
+        assert_eq!(tree.root.prop_u32("interrupt-parent").unwrap(), GIC_PHANDLE);
+    }
+
+    #[test]
+    fn vmclock_node_is_ordered_after_vmgenid_before_sorted_virtio_mmio_nodes() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let rtc = rtc_device(0x4000_1000, 0x1000);
+        let serial = serial_device(0x4000_2000, 0x1000, 33);
+        let vmgenid = vmgenid_device(0x4000_3000, ARM64_FDT_VMGENID_SIZE, 34);
+        let vmclock = vmclock_device(0x4000_4000, ARM64_FDT_VMCLOCK_SIZE, 35);
+        let devices = [
+            virtio_mmio_device(0x4000_6000, 0x1000, 36),
+            virtio_mmio_device(0x4000_5000, 0x1000, 37),
+        ];
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            Some(vmgenid),
+            Some(rtc),
+            Some(serial),
+            &devices,
+        );
+
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let root_children: Vec<&str> = tree
+            .root
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+
+        assert_eq!(
+            root_children,
+            [
+                "cpus",
+                "memory@ram",
+                "chosen",
+                "intc",
+                "timer",
+                "apb-pclk",
+                "psci",
+                "rtc@40001000",
+                "uart@40002000",
+                "vmgenid",
+                "ptp@1073758208",
+                "virtio_mmio@40005000",
+                "virtio_mmio@40006000",
+            ]
+        );
+        let vmclock_node = required_node(&tree, "/ptp@1073758208");
+        let first_virtio = required_node(&tree, "/virtio_mmio@40005000");
+        let second_virtio = required_node(&tree, "/virtio_mmio@40006000");
+        assert_eq!(prop_u32_cells(vmclock_node, "interrupts"), vec![0, 3, 1]);
+        assert_eq!(prop_u32_cells(first_virtio, "interrupts"), vec![0, 5, 1]);
+        assert_eq!(prop_u32_cells(second_virtio, "interrupts"), vec![0, 4, 1]);
+    }
+
+    #[test]
+    fn rejects_invalid_vmclock_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmclock = vmclock_device(0x4000_3000, 0, 32);
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        let err = build_test_arm64_fdt(&config).expect_err("empty VMClock region should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidVmClockRegion {
+                region: vmclock.region,
+                source: GuestMemoryError::EmptyRange {
+                    start: GuestAddress::new(0x4000_3000),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_vmclock_region_with_non_firecracker_size() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmclock = vmclock_device(0x4000_3000, ARM64_FDT_VMCLOCK_SIZE + 1, 32);
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        let err = build_test_arm64_fdt(&config).expect_err("oversized VMClock region should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidVmClockSize {
+                size: ARM64_FDT_VMCLOCK_SIZE + 1,
+                expected: ARM64_FDT_VMCLOCK_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_overflowing_vmclock_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmclock = vmclock_device(u64::MAX, 1, 32);
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        let err =
+            build_test_arm64_fdt(&config).expect_err("overflowing VMClock region should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidVmClockRegion {
+                region: vmclock.region,
+                source: GuestMemoryError::AddressOverflow {
+                    start: GuestAddress::new(u64::MAX),
+                    size: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_vmclock_region_overlapping_guest_memory() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmclock = vmclock_device(
+            aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE,
+            ARM64_FDT_VMCLOCK_SIZE,
+            32,
+        );
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        let err = build_test_arm64_fdt(&config).expect_err("RAM-overlapping VMClock should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VmClockRegionOverlapsMemory {
+                region: vmclock.region,
+                memory_range: GuestMemoryRange::new(
+                    GuestAddress::new(aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE),
+                    TEST_MEMORY_SIZE - aarch64::SYSTEM_MEM_SIZE,
+                )
+                .expect("advertised memory range should be valid"),
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_vmclock_region_inside_reserved_system_memory() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmclock = vmclock_device(
+            aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE - ARM64_FDT_VMCLOCK_SIZE,
+            ARM64_FDT_VMCLOCK_SIZE,
+            32,
+        );
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        let bytes =
+            build_test_arm64_fdt(&config).expect("system-memory VMClock should be accepted");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let vmclock_path = format!("/ptp@{}", vmclock.region.base);
+        let vmclock_node = required_node(&tree, &vmclock_path);
+
+        assert_eq!(
+            prop_u64_cells(vmclock_node, "reg"),
+            vec![vmclock.region.base, ARM64_FDT_VMCLOCK_SIZE]
+        );
+    }
+
+    #[test]
+    fn rejects_vmclock_region_overlapping_gic() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmclock = vmclock_device(0x3fff_0000, ARM64_FDT_VMCLOCK_SIZE, 32);
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        let err = build_test_arm64_fdt(&config).expect_err("GIC-overlapping VMClock should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VmClockRegionOverlapsGic {
+                region: vmclock.region,
+                gic: "distributor",
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_vmclock_region_overlapping_virtio_mmio_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmclock = vmclock_device(0x4000_2000, ARM64_FDT_VMCLOCK_SIZE, 32);
+        let devices = [virtio_mmio_device(0x4000_1000, 0x2000, 33)];
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            None,
+            &devices,
+        );
+
+        let err =
+            build_test_arm64_fdt(&config).expect_err("virtio-overlapping VMClock should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VmClockRegionOverlapsVirtioMmio {
+                region: vmclock.region,
+                virtio_mmio_index: 0,
+                virtio_mmio_region: devices[0].region,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_vmclock_region_overlapping_rtc_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let rtc = rtc_device(0x4000_1000, 0x2000);
+        let vmclock = vmclock_device(0x4000_2000, ARM64_FDT_VMCLOCK_SIZE, 32);
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            Some(rtc),
+            None,
+            &[],
+        );
+
+        let err = build_test_arm64_fdt(&config).expect_err("RTC-overlapping VMClock should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VmClockRegionOverlapsRtc {
+                region: vmclock.region,
+                rtc_region: rtc.region,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_vmclock_region_overlapping_serial_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(0x4000_1000, 0x2000, 33);
+        let vmclock = vmclock_device(0x4000_2000, ARM64_FDT_VMCLOCK_SIZE, 32);
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            Some(serial),
+            &[],
+        );
+
+        let err =
+            build_test_arm64_fdt(&config).expect_err("serial-overlapping VMClock should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VmClockRegionOverlapsSerial {
+                region: vmclock.region,
+                serial_region: serial.region,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_vmclock_region_overlapping_vmgenid_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmgenid = vmgenid_device(0x4000_0ff0, ARM64_FDT_VMGENID_SIZE, 32);
+        let vmclock = vmclock_device(0x4000_0000, ARM64_FDT_VMCLOCK_SIZE, 33);
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            Some(vmgenid),
+            None,
+            None,
+            &[],
+        );
+
+        let err =
+            build_test_arm64_fdt(&config).expect_err("VMGenID-overlapping VMClock should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VmClockRegionOverlapsVmGenId {
+                region: vmclock.region,
+                vmgenid_region: vmgenid.region,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_vmclock_region_adjacent_to_vmgenid_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmgenid = vmgenid_device(0x4000_0000, ARM64_FDT_VMGENID_SIZE, 32);
+        let vmclock = vmclock_device(
+            0x4000_0000 + ARM64_FDT_VMGENID_SIZE,
+            ARM64_FDT_VMCLOCK_SIZE,
+            33,
+        );
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            Some(vmgenid),
+            None,
+            None,
+            &[],
+        );
+
+        let bytes = build_test_arm64_fdt(&config).expect("adjacent regions should be accepted");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let vmclock_path = format!("/ptp@{}", vmclock.region.base);
+        let vmclock_node = required_node(&tree, &vmclock_path);
+
+        assert_eq!(
+            prop_u64_cells(vmclock_node, "reg"),
+            vec![vmclock.region.base, ARM64_FDT_VMCLOCK_SIZE]
+        );
+    }
+
+    #[test]
+    fn rejects_non_spi_vmclock_interrupt_line() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let vmclock = vmclock_device(0x4000_3000, ARM64_FDT_VMCLOCK_SIZE, 31);
+        let config = test_config_with_vmclock_and_optional_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(vmclock),
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        let err = build_test_arm64_fdt(&config).expect_err("non-SPI VMClock interrupt should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidVmClockInterrupt {
+                line: vmclock.interrupt_line,
+            }
+        );
+    }
+
+    #[test]
     fn virtio_mmio_node_uses_firecracker_shape() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let devices = [virtio_mmio_device(0x4000_1000, 0x1000, 32)];
@@ -4631,6 +5411,7 @@ mod tests {
             rtc_device,
             serial_device,
             vmgenid_device: None,
+            vmclock_device: None,
             virtio_mmio_devices,
         }
     }
@@ -4645,6 +5426,28 @@ mod tests {
     ) -> Arm64FdtConfig<'a> {
         Arm64FdtConfig {
             vmgenid_device,
+            ..test_config_with_optional_devices(
+                layout,
+                boot,
+                rtc_device,
+                serial_device,
+                virtio_mmio_devices,
+            )
+        }
+    }
+
+    fn test_config_with_vmclock_and_optional_devices<'a>(
+        layout: &'a GuestMemoryLayout,
+        boot: Arm64FdtBootInfo<'a>,
+        vmclock_device: Option<Arm64FdtVmClockDevice>,
+        vmgenid_device: Option<Arm64FdtVmGenIdDevice>,
+        rtc_device: Option<Arm64FdtRtcDevice>,
+        serial_device: Option<Arm64FdtSerialDevice>,
+        virtio_mmio_devices: &'a [Arm64FdtVirtioMmioDevice],
+    ) -> Arm64FdtConfig<'a> {
+        Arm64FdtConfig {
+            vmgenid_device,
+            vmclock_device,
             ..test_config_with_optional_devices(
                 layout,
                 boot,
@@ -4671,6 +5474,14 @@ mod tests {
 
     fn vmgenid_device(base: u64, size: u64, line: u32) -> Arm64FdtVmGenIdDevice {
         Arm64FdtVmGenIdDevice {
+            region: Arm64FdtRegion { base, size },
+            interrupt_line: GuestInterruptLine::new(line)
+                .expect("test interrupt line should be nonzero"),
+        }
+    }
+
+    fn vmclock_device(base: u64, size: u64, line: u32) -> Arm64FdtVmClockDevice {
+        Arm64FdtVmClockDevice {
             region: Arm64FdtRegion { base, size },
             interrupt_line: GuestInterruptLine::new(line)
                 .expect("test interrupt line should be nonzero"),
