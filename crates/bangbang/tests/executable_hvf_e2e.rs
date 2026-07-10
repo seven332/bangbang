@@ -136,6 +136,14 @@ mod macos_arm64 {
         content_source: DirectRootfsMmdsContentSource,
     }
 
+    #[derive(Clone, Copy)]
+    struct DirectRootfsNoApiMmdsFetchCase<'a> {
+        request_context: &'a str,
+        mmds_config_body: &'a str,
+        boot_args: &'a str,
+        success_marker: &'a [u8],
+    }
+
     #[test]
     fn signed_executable_starts_instance_and_guest_writes_block_marker() {
         let test_dir = TestDir::new();
@@ -2594,102 +2602,12 @@ mod macos_arm64 {
 
     #[test]
     fn signed_executable_serves_metadata_file_mmds_to_no_api_direct_rootfs_guest() {
-        let test_dir = TestDir::new();
-        let socket_path = test_dir.path().join("api.socket");
-        let config_path = test_dir.path().join("vm-config.json");
-        let metadata_path = test_dir.path().join("metadata.json");
-        let data_backing_path = test_dir.path().join("data.img");
-        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
-        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
-        let instance_id = test_dir.instance_id();
-
-        create_zeroed_block_backing(&data_backing_path);
-        fs::write(&metadata_path, DIRECT_ROOTFS_MMDS_CONTENT)
-            .expect("metadata file should be written");
-
-        let kernel_path_json = json_string(path_text(&kernel_path));
-        let boot_args_json = json_string(DIRECT_ROOTFS_MMDS_BOOT_ARGS);
-        let rootfs_path_json = json_string(path_text(&rootfs_path));
-        let data_backing_path_json = json_string(path_text(&data_backing_path));
-        let config = format!(
-            r#"{{
-                "machine-config": {{"vcpu_count": 1, "mem_size_mib": 256}},
-                "network-interfaces": [
-                    {{
-                        "iface_id": "eth0",
-                        "host_dev_name": "vmnet:shared",
-                        "guest_mac": "06:00:00:00:00:01"
-                    }}
-                ],
-                "mmds-config": {{
-                    "network_interfaces": ["eth0"],
-                    "version": "V1",
-                    "ipv4_address": "169.254.169.254"
-                }},
-                "boot-source": {{
-                    "kernel_image_path": {kernel_path_json},
-                    "boot_args": {boot_args_json}
-                }},
-                "drives": [
-                    {{
-                        "drive_id": "rootfs",
-                        "path_on_host": {rootfs_path_json},
-                        "is_root_device": true,
-                        "is_read_only": true
-                    }},
-                    {{
-                        "drive_id": "data",
-                        "path_on_host": {data_backing_path_json},
-                        "is_root_device": false,
-                        "is_read_only": false
-                    }}
-                ]
-            }}"#
-        );
-        fs::write(&config_path, config).expect("config file should be written");
-
-        let mut bangbang = BangbangProcess::start_with_extra_args(
-            &socket_path,
-            &instance_id,
-            &[
-                "--config-file",
-                path_text(&config_path),
-                "--metadata",
-                path_text(&metadata_path),
-                "--no-api",
-            ],
-        );
-
-        assert!(
-            !socket_path.exists(),
-            "no-api metadata-file MMDS startup must not publish an API socket"
-        );
-
-        if let Err(err) = wait_for_file_prefix_marker(
-            &data_backing_path,
-            DIRECT_ROOTFS_MMDS_MARKER,
-            GUEST_EXECUTION_TIMEOUT,
-        ) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
-            let output = bangbang.force_stop_and_collect();
-            panic!(
-                "direct rootfs guest did not fetch no-api metadata-file MMDS through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status, output.stdout, output.stderr
-            );
-        }
-
-        let output = bangbang.terminate();
-        assert!(
-            output.status.success(),
-            "no-api metadata-file MMDS shutdown signal should make bangbang exit successfully; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            output.stdout,
-            output.stderr
-        );
-        assert!(
-            !socket_path.exists(),
-            "no-api metadata-file MMDS path must leave the API socket absent"
-        );
+        run_direct_rootfs_no_api_mmds_guest_fetch_test(DirectRootfsNoApiMmdsFetchCase {
+            request_context: "no-api metadata-file MMDS guest fetch",
+            mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
+            boot_args: DIRECT_ROOTFS_MMDS_BOOT_ARGS,
+            success_marker: DIRECT_ROOTFS_MMDS_MARKER,
+        });
     }
 
     #[test]
@@ -2700,6 +2618,16 @@ mod macos_arm64 {
             boot_args: DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_V2_MARKER,
             content_source: DirectRootfsMmdsContentSource::ApiRequest,
+        });
+    }
+
+    #[test]
+    fn signed_executable_serves_metadata_file_mmds_v2_to_no_api_direct_rootfs_guest() {
+        run_direct_rootfs_no_api_mmds_guest_fetch_test(DirectRootfsNoApiMmdsFetchCase {
+            request_context: "no-api metadata-file MMDS v2 guest fetch",
+            mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#,
+            boot_args: DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS,
+            success_marker: DIRECT_ROOTFS_MMDS_V2_MARKER,
         });
     }
 
@@ -3773,6 +3701,105 @@ mod macos_arm64 {
 
         let shutdown_context = format!("bangbang direct rootfs {}", case.request_context);
         assert_clean_shutdown(bangbang.terminate(), &socket_path, &shutdown_context);
+    }
+
+    fn run_direct_rootfs_no_api_mmds_guest_fetch_test(case: DirectRootfsNoApiMmdsFetchCase<'_>) {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let config_path = test_dir.path().join("vm-config.json");
+        let metadata_path = test_dir.path().join("metadata.json");
+        let data_backing_path = test_dir.path().join("data.img");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&data_backing_path);
+        fs::write(&metadata_path, DIRECT_ROOTFS_MMDS_CONTENT)
+            .expect("metadata file should be written");
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let boot_args_json = json_string(case.boot_args);
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let data_backing_path_json = json_string(path_text(&data_backing_path));
+        let mmds_config_body = case.mmds_config_body;
+        let config = format!(
+            r#"{{
+                "machine-config": {{"vcpu_count": 1, "mem_size_mib": 256}},
+                "network-interfaces": [
+                    {{
+                        "iface_id": "eth0",
+                        "host_dev_name": "vmnet:shared",
+                        "guest_mac": "06:00:00:00:00:01"
+                    }}
+                ],
+                "mmds-config": {mmds_config_body},
+                "boot-source": {{
+                    "kernel_image_path": {kernel_path_json},
+                    "boot_args": {boot_args_json}
+                }},
+                "drives": [
+                    {{
+                        "drive_id": "rootfs",
+                        "path_on_host": {rootfs_path_json},
+                        "is_root_device": true,
+                        "is_read_only": true
+                    }},
+                    {{
+                        "drive_id": "data",
+                        "path_on_host": {data_backing_path_json},
+                        "is_root_device": false,
+                        "is_read_only": false
+                    }}
+                ]
+            }}"#
+        );
+        fs::write(&config_path, config).expect("config file should be written");
+
+        let mut bangbang = BangbangProcess::start_with_extra_args(
+            &socket_path,
+            &instance_id,
+            &[
+                "--config-file",
+                path_text(&config_path),
+                "--metadata",
+                path_text(&metadata_path),
+                "--no-api",
+            ],
+        );
+
+        assert!(
+            !socket_path.exists(),
+            "{} must not publish an API socket",
+            case.request_context
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            case.success_marker,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not complete {} through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                case.request_context, output.status, output.stdout, output.stderr
+            );
+        }
+
+        let output = bangbang.terminate();
+        assert!(
+            output.status.success(),
+            "{} shutdown signal should make bangbang exit successfully; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+            case.request_context,
+            output.status,
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            !socket_path.exists(),
+            "{} path must leave the API socket absent",
+            case.request_context
+        );
     }
 
     #[test]
