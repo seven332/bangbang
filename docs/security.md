@@ -91,6 +91,29 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | macOS sandboxing | Deferred feasible macOS work | Do not claim production containment until a sandbox profile and resource policy are designed and tested. |
 | Launcher or resource broker | Deferred feasible macOS work | Keep host-path and shared-resource isolation as operator responsibility until a separate broker owns privileged preparation and cleanup. |
 
+## macOS Isolation Design Boundaries
+
+The current isolation boundary is one macOS process running as the invoking host
+user. bangbang does not yet split privilege between a launcher, broker, and VMM
+worker, and it does not install a sandbox profile. The host user account,
+filesystem permissions, API socket directory, and per-resource validation are
+therefore the only deployed host isolation controls.
+
+Use the following boundaries when designing or reviewing macOS isolation work:
+
+| Boundary or option | Current behavior | Future direction |
+| --- | --- | --- |
+| Operator-owned private directories | Required for API sockets, vsock sockets, observability sinks, and other configured paths that should not be shared. | A launcher or broker could create and own these directories before starting a VM process. |
+| HVF entitlement and code signing | Required to execute Hypervisor.framework code paths; signed integration wrappers cover the validation path. | A production launcher may control which executable receives the entitlement, but the entitlement itself is not guest containment. |
+| macOS sandbox profile | Not implemented. | A future profile must be resource-specific and tested against configured host paths, HVF access, vmnet use, logging, metrics, and guest artifacts before it is a claimed security boundary. |
+| Launcher or resource broker | Not implemented. | A future process could prepare privileged or shared host resources, pass owned descriptors to the VMM, and centralize cleanup policy. |
+| Firecracker Linux jailer model | Platform-limited unsupported as a direct port. | Keep Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege-drop flags rejected or documented until macOS replacements exist. |
+
+This document intentionally does not define a sandbox profile, broker protocol,
+privilege-dropping flow, or new public API. PRs that add host resource types
+should state which current boundary protects the resource and whether a future
+launcher, broker, or sandbox profile would need to own it.
+
 ## API Socket Handling
 
 The API socket is a local control interface with no protocol-level
