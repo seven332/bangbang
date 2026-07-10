@@ -1830,20 +1830,27 @@ fn help_text() -> String {
             "  -h, --help             Print help\n\n",
             "Current scope:\n",
             "  Serves GET /, GET /version, GET /vm/config, GET /machine-config, ",
-            "pre-boot PUT /machine-config, pre-boot PUT /boot-source, ",
-            "pre-boot PUT /drives/{{drive_id}}, pre-boot ",
-            "PUT /network-interfaces/{{iface_id}}, pre-boot PUT /vsock, ",
-            "pre-boot PUT /metrics and startup metrics output configuration, ",
-            "and pre-boot PUT /logger and startup logger configuration with ",
-            "minimal action logs; --config-file can apply the same supported ",
-            "pre-boot configuration and start the VM before API serving, ",
-            "or with --no-api can start without publishing an API socket; ",
-            "PATCH /vm supports Paused and Resumed for the current ",
-            "process-owned boot worker; PUT /cpu-config accepts empty ",
-            "CPU config as no-op and rejects custom CPU templates; ",
-            "PUT /actions starts a process-owned ",
-            "HVF boot run-loop worker across bounded step windows for InstanceStart; ",
-            "full Firecracker run-loop control remains deferred."
+            "GET /mmds, GET /hotplug/memory, GET /balloon, ",
+            "GET /balloon/statistics, and GET /balloon/hinting/status.\n",
+            "  Accepts configuration PUTs for /machine-config, /boot-source, ",
+            "/drives/{{drive_id}}, /network-interfaces/{{iface_id}}, /vsock, ",
+            "/metrics, /logger, /serial, /entropy, /balloon, ",
+            "/hotplug/memory, /pmem/{{id}}, /mmds, /mmds/config, ",
+            "and empty /cpu-config.\n",
+            "  Accepts PATCH routes for /vm, /machine-config, ",
+            "/drives/{{drive_id}}, /network-interfaces/{{iface_id}}, /mmds, ",
+            "/balloon, /balloon/statistics, /balloon/hinting/start, ",
+            "/balloon/hinting/stop, /hotplug/memory, and /pmem/{{id}}.\n",
+            "  Parses DELETE /drives/{{drive_id}}, DELETE ",
+            "/network-interfaces/{{iface_id}}, and DELETE /pmem/{{id}} ",
+            "as Firecracker-shaped hot-unplug requests; hot-unplug remains ",
+            "unsupported.\n",
+            "  --config-file can apply the same supported pre-boot configuration ",
+            "and start the VM before API serving, or with --no-api can start ",
+            "without publishing an API socket.\n",
+            "  PUT /actions starts a process-owned HVF boot run-loop worker ",
+            "across bounded step windows for InstanceStart; full Firecracker ",
+            "run-loop control remains deferred."
         ),
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
@@ -2721,16 +2728,33 @@ mod tests {
         assert!(help.contains("--boot-timer"));
         assert!(help.contains("--config-file <PATH>"));
         assert!(help.contains("GET /machine-config"));
-        assert!(help.contains("pre-boot PUT /machine-config"));
-        assert!(help.contains("pre-boot PUT /boot-source"));
-        assert!(help.contains("pre-boot PUT /drives/{drive_id}"));
-        assert!(help.contains("pre-boot PUT /metrics"));
-        assert!(help.contains("startup metrics output configuration"));
-        assert!(help.contains("pre-boot PUT /logger and startup logger configuration"));
-        assert!(help.contains("minimal action logs"));
+        assert!(help.contains("GET /mmds"));
+        assert!(help.contains("GET /hotplug/memory"));
+        assert!(help.contains("GET /balloon/statistics"));
+        assert!(help.contains("GET /balloon/hinting/status"));
+        assert!(help.contains("Accepts configuration PUTs for /machine-config"));
+        assert!(help.contains("/boot-source"));
+        assert!(help.contains("/drives/{drive_id}"));
+        assert!(help.contains("/network-interfaces/{iface_id}"));
+        assert!(help.contains("/metrics"));
+        assert!(help.contains("/logger"));
+        assert!(help.contains("/serial"));
+        assert!(help.contains("/entropy"));
+        assert!(help.contains("/balloon"));
+        assert!(help.contains("/hotplug/memory"));
+        assert!(help.contains("/pmem/{id}"));
+        assert!(help.contains("/mmds/config"));
+        assert!(help.contains("and empty /cpu-config"));
+        assert!(help.contains("Accepts PATCH routes for /vm"));
+        assert!(help.contains("/machine-config"));
+        assert!(help.contains("/balloon/statistics"));
+        assert!(help.contains("/balloon/hinting/start"));
+        assert!(help.contains("/balloon/hinting/stop"));
+        assert!(help.contains("Parses DELETE /drives/{drive_id}"));
+        assert!(help.contains("DELETE /network-interfaces/{iface_id}"));
+        assert!(help.contains("DELETE /pmem/{id}"));
+        assert!(help.contains("hot-unplug remains unsupported"));
         assert!(help.contains("--config-file can apply the same supported pre-boot configuration"));
-        assert!(help.contains("PATCH /vm supports Paused and Resumed"));
-        assert!(help.contains("PUT /cpu-config accepts empty CPU config as no-op"));
         assert!(help.contains("--log-path <PATH>"));
         assert!(help.contains("Logger level: Off, Trace, Debug, Info, Warn, Warning, or Error"));
         assert!(help.contains("--metrics-path <PATH>"));
@@ -2749,7 +2773,6 @@ mod tests {
         assert!(help.contains("--parent-cpu-time-us <MICROS>"));
         assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
         assert!(help.contains("across bounded step windows for InstanceStart"));
-        assert!(help.contains("PATCH /vm supports Paused and Resumed"));
         assert!(help.contains("full Firecracker run-loop control remains deferred"));
     }
 
