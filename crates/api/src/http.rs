@@ -54,7 +54,7 @@ pub enum ApiRequest {
     PutPmem(Box<PmemConfigRequest>),
     PatchPmem(Box<PmemPatchRequest>),
     PutSerial(Box<SerialConfigRequest>),
-    PutSnapshotCreate,
+    PutSnapshotCreate(SnapshotCreateRequest),
     PutSnapshotLoad(SnapshotLoadRequest),
     PutVsock(Box<VsockConfigRequest>),
     PatchMmds(Box<MmdsContentRequest>),
@@ -1882,23 +1882,38 @@ const fn default_balloon_acknowledge_on_stop() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
-enum SnapshotTypeRequestBody {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum SnapshotType {
     Full,
     Diff,
 }
 
-const fn default_snapshot_type_request_body() -> SnapshotTypeRequestBody {
-    SnapshotTypeRequestBody::Full
+const fn default_snapshot_type() -> SnapshotType {
+    SnapshotType::Full
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotCreateRequestBody {
-    #[serde(default = "default_snapshot_type_request_body")]
-    snapshot_type: SnapshotTypeRequestBody,
+    #[serde(default = "default_snapshot_type")]
+    snapshot_type: SnapshotType,
     snapshot_path: String,
     mem_file_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotCreateRequest {
+    snapshot_type: SnapshotType,
+}
+
+impl SnapshotCreateRequest {
+    const fn new(snapshot_type: SnapshotType) -> Self {
+        Self { snapshot_type }
+    }
+
+    pub const fn snapshot_type(self) -> SnapshotType {
+        self.snapshot_type
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3045,9 +3060,11 @@ fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError
         mem_file_path,
     } = serde_json::from_slice::<SnapshotCreateRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let _ = (snapshot_type, snapshot_path, mem_file_path);
+    let _ = (snapshot_path, mem_file_path);
 
-    Ok(ApiRequest::PutSnapshotCreate)
+    Ok(ApiRequest::PutSnapshotCreate(SnapshotCreateRequest::new(
+        snapshot_type,
+    )))
 }
 
 fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -3793,7 +3810,7 @@ impl From<ApiRequest> for Endpoint {
             }
             ApiRequest::PutPmem(_) | ApiRequest::PatchPmem(_) => Self::Pmem,
             ApiRequest::PutSerial(_) => Self::Serial,
-            ApiRequest::PutSnapshotCreate | ApiRequest::PutSnapshotLoad(_) => Self::Snapshot,
+            ApiRequest::PutSnapshotCreate(_) | ApiRequest::PutSnapshotLoad(_) => Self::Snapshot,
             ApiRequest::PutVsock(_) => Self::Vsock,
         }
     }
@@ -7556,16 +7573,27 @@ mod tests {
 
     #[test]
     fn parses_valid_snapshot_create_requests() {
-        for body in [
-            r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
-            r#"{"snapshot_type":"Full","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
-            r#"{"snapshot_type":"Diff","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+        for (body, expected_type) in [
+            (
+                r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+                SnapshotType::Full,
+            ),
+            (
+                r#"{"snapshot_type":"Full","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+                SnapshotType::Full,
+            ),
+            (
+                r#"{"snapshot_type":"Diff","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+                SnapshotType::Diff,
+            ),
         ] {
             let request = request_with_body("PUT", "/snapshot/create", body);
 
             assert_eq!(
                 parse_request(&request),
-                Ok(ApiRequest::PutSnapshotCreate),
+                Ok(ApiRequest::PutSnapshotCreate(SnapshotCreateRequest::new(
+                    expected_type,
+                ))),
                 "{body}"
             );
         }

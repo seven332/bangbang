@@ -140,6 +140,18 @@ impl MetricsState {
         self.latencies_us.record_resume_vm(duration_us);
     }
 
+    pub(crate) fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        self.latencies_us.record_full_create_snapshot(duration_us);
+    }
+
+    pub(crate) fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        self.latencies_us.record_diff_create_snapshot(duration_us);
+    }
+
+    pub(crate) fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
+        self.latencies_us.record_load_snapshot(duration_us);
+    }
+
     pub(crate) fn record_put_actions_request(&mut self) {
         self.put_api_requests.record_actions_request();
     }
@@ -443,13 +455,32 @@ impl LoggerMetrics {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LatencyMetrics {
+    full_create_snapshot: Option<u64>,
+    diff_create_snapshot: Option<u64>,
+    load_snapshot: Option<u64>,
     pause_vm: Option<u64>,
     resume_vm: Option<u64>,
 }
 
 impl LatencyMetrics {
     const fn is_empty(self) -> bool {
-        self.pause_vm.is_none() && self.resume_vm.is_none()
+        self.full_create_snapshot.is_none()
+            && self.diff_create_snapshot.is_none()
+            && self.load_snapshot.is_none()
+            && self.pause_vm.is_none()
+            && self.resume_vm.is_none()
+    }
+
+    fn record_full_create_snapshot(&mut self, duration_us: u64) {
+        self.full_create_snapshot = Some(duration_us);
+    }
+
+    fn record_diff_create_snapshot(&mut self, duration_us: u64) {
+        self.diff_create_snapshot = Some(duration_us);
+    }
+
+    fn record_load_snapshot(&mut self, duration_us: u64) {
+        self.load_snapshot = Some(duration_us);
     }
 
     fn record_pause_vm(&mut self, duration_us: u64) {
@@ -458,6 +489,18 @@ impl LatencyMetrics {
 
     fn record_resume_vm(&mut self, duration_us: u64) {
         self.resume_vm = Some(duration_us);
+    }
+
+    const fn full_create_snapshot(self) -> Option<u64> {
+        self.full_create_snapshot
+    }
+
+    const fn diff_create_snapshot(self) -> Option<u64> {
+        self.diff_create_snapshot
+    }
+
+    const fn load_snapshot(self) -> Option<u64> {
+        self.load_snapshot
     }
 
     const fn pause_vm(self) -> Option<u64> {
@@ -4168,6 +4211,24 @@ fn latency_metrics_json_object(
     metrics: LatencyMetrics,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut latencies = serde_json::Map::new();
+    if let Some(value) = metrics.full_create_snapshot() {
+        latencies.insert(
+            "full_create_snapshot".to_string(),
+            serde_json::Value::Number(value.into()),
+        );
+    }
+    if let Some(value) = metrics.diff_create_snapshot() {
+        latencies.insert(
+            "diff_create_snapshot".to_string(),
+            serde_json::Value::Number(value.into()),
+        );
+    }
+    if let Some(value) = metrics.load_snapshot() {
+        latencies.insert(
+            "load_snapshot".to_string(),
+            serde_json::Value::Number(value.into()),
+        );
+    }
     if let Some(value) = metrics.pause_vm() {
         latencies.insert(
             "pause_vm".to_string(),
@@ -6363,6 +6424,28 @@ mod tests {
         assert_eq!(
             output,
             "{\"latencies_us\":{\"pause_vm\":0,\"resume_vm\":42},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_snapshot_latency_metrics_when_recorded() {
+        let path = unique_metrics_path("snapshot-latencies-us");
+        let mut state = MetricsState::default();
+
+        state.record_full_create_snapshot_latency_us(1);
+        state.record_diff_create_snapshot_latency_us(2);
+        state.record_load_snapshot_latency_us(3);
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush(), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"latencies_us\":{\"diff_create_snapshot\":2,\"full_create_snapshot\":1,\"load_snapshot\":3},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

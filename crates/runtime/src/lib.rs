@@ -945,6 +945,21 @@ impl VmmController {
         self.metrics_state.record_resume_vm_latency_us(duration_us);
     }
 
+    pub fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        self.metrics_state
+            .record_full_create_snapshot_latency_us(duration_us);
+    }
+
+    pub fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        self.metrics_state
+            .record_diff_create_snapshot_latency_us(duration_us);
+    }
+
+    pub fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
+        self.metrics_state
+            .record_load_snapshot_latency_us(duration_us);
+    }
+
     pub fn record_patch_drive_request(&mut self) {
         self.metrics_state.record_patch_drive_request();
     }

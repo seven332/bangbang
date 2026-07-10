@@ -27,9 +27,9 @@ use bangbang_api::http::{
     MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest,
     MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
     NetworkInterfacePatchRequest, PmemConfigRequest, PmemConfigResponse, PmemPatchRequest,
-    RequestError, SerialConfigRequest, TokenBucketRequest, VmConfigResponse, VmStateUpdate,
-    VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse, api_request_metric_endpoint,
-    parse_request_with_limit, request_total_len_with_limit,
+    RequestError, SerialConfigRequest, SnapshotCreateRequest, SnapshotType, TokenBucketRequest,
+    VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
+    api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
     BalloonConfig, BalloonConfigInput, BalloonHintingStartInput, BalloonHintingStatus,
@@ -833,8 +833,8 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PatchPmem(config) => handle_empty(vmm.handle_patch_request(
             PatchApiRequest::pmem(pmem_update_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PutSnapshotCreate => handle_empty(vmm.handle_action(VmmAction::CreateSnapshot)),
-        ApiRequest::PutSnapshotLoad(_) => handle_empty(vmm.handle_action(VmmAction::LoadSnapshot)),
+        ApiRequest::PutSnapshotCreate(config) => handle_snapshot_create_request(config, vmm),
+        ApiRequest::PutSnapshotLoad(_) => handle_snapshot_load_request(vmm),
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_put_request(PutApiRequest::vsock(
             vsock_config_input_from_request(config.as_ref()),
         ))),
@@ -887,7 +887,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::PutNetworkInterface(_)
         | ApiRequest::PutPmem(_)
         | ApiRequest::PutSerial(_)
-        | ApiRequest::PutSnapshotCreate => false,
+        | ApiRequest::PutSnapshotCreate(_) => false,
     }
 }
 
@@ -913,6 +913,43 @@ fn record_vm_state_latency(
     match state {
         VmStateUpdate::Paused => vmm.record_pause_vm_latency_us(duration_us),
         VmStateUpdate::Resumed => vmm.record_resume_vm_latency_us(duration_us),
+    }
+}
+
+fn handle_snapshot_create_request(
+    request: SnapshotCreateRequest,
+    vmm: &mut impl VmmRequestHandler,
+) -> HttpResponse {
+    let snapshot_type = request.snapshot_type();
+    let started = Instant::now();
+    let result = vmm.handle_action(VmmAction::CreateSnapshot);
+    if matches!(&result, Err(VmmActionError::SnapshotUnsupported)) {
+        record_snapshot_create_latency(
+            snapshot_type,
+            duration_as_micros_u64(started.elapsed()),
+            vmm,
+        );
+    }
+    handle_empty(result)
+}
+
+fn handle_snapshot_load_request(vmm: &mut impl VmmRequestHandler) -> HttpResponse {
+    let started = Instant::now();
+    let result = vmm.handle_action(VmmAction::LoadSnapshot);
+    if matches!(&result, Err(VmmActionError::SnapshotUnsupported)) {
+        vmm.record_load_snapshot_latency_us(duration_as_micros_u64(started.elapsed()));
+    }
+    handle_empty(result)
+}
+
+fn record_snapshot_create_latency(
+    snapshot_type: SnapshotType,
+    duration_us: u64,
+    vmm: &mut impl VmmRequestHandler,
+) {
+    match snapshot_type {
+        SnapshotType::Full => vmm.record_full_create_snapshot_latency_us(duration_us),
+        SnapshotType::Diff => vmm.record_diff_create_snapshot_latency_us(duration_us),
     }
 }
 
@@ -1002,7 +1039,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
         | ApiRequest::PutMmds(_)
-        | ApiRequest::PutSnapshotCreate
+        | ApiRequest::PutSnapshotCreate(_)
         | ApiRequest::PutSnapshotLoad(_) => None,
     }
 }
@@ -2376,6 +2413,17 @@ mod tests {
         assert_eq!(actual, expected, "{group}.{field}");
     }
 
+    fn assert_latency_metric_present(metrics: &serde_json::Value, field: &str) {
+        assert!(
+            metrics
+                .get("latencies_us")
+                .and_then(|latencies| latencies.get(field))
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "latencies_us.{field} should be present"
+        );
+    }
+
     fn put_action_over_socket(
         vmm: &mut impl VmmRequestHandler,
         socket_name: &str,
@@ -2466,6 +2514,20 @@ mod tests {
 
         fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
             self.inner.record_resume_vm_latency_us(duration_us);
+        }
+
+        fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
+            self.inner
+                .record_full_create_snapshot_latency_us(duration_us);
+        }
+
+        fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
+            self.inner
+                .record_diff_create_snapshot_latency_us(duration_us);
+        }
+
+        fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
+            self.inner.record_load_snapshot_latency_us(duration_us);
         }
 
         fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
@@ -5398,6 +5460,18 @@ mod tests {
             bangbang_api::http::StatusCode::BadRequest
         );
 
+        let boot_request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "deprecated-a1", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
         let snapshot_load_body = r#"{"snapshot_path":"/private/tmp/deprecated-vmstate","mem_file_path":"/private/tmp/deprecated-memory"}"#;
         let snapshot_load_response = handle_request_bytes(
             request_with_body("PUT", "/snapshot/load", snapshot_load_body).as_bytes(),
@@ -5441,18 +5515,6 @@ mod tests {
             malformed_snapshot_load_response.status(),
             bangbang_api::http::StatusCode::BadRequest
         );
-
-        let boot_request = request_with_body(
-            "PUT",
-            "/boot-source",
-            r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
-        );
-        assert_eq!(
-            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
-            bangbang_api::http::StatusCode::NoContent
-        );
-        let start_response = put_action_over_socket(&mut vmm, "deprecated-a1", "InstanceStart");
-        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
         let flush_response = put_action_over_socket(&mut vmm, "deprecated-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -7354,6 +7416,215 @@ mod tests {
         assert!(
             metrics.get("latencies_us").is_none(),
             "failed vm-state updates must not emit latency metrics"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_records_snapshot_create_latencies_on_snapshot_fault() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("scl").with_extension("metrics");
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PUT", "/metrics", &metrics_body).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body(
+                    "PUT",
+                    "/boot-source",
+                    r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#,
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "scs", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let pause_response = request_over_socket(
+            &mut vmm,
+            "scp",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#),
+        );
+        assert!(pause_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        for (socket_name, body) in [
+            (
+                "scf",
+                r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+            ),
+            (
+                "scd",
+                r#"{"snapshot_type":"Diff","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+            ),
+        ] {
+            let response = request_over_socket(
+                &mut vmm,
+                socket_name,
+                &request_with_body("PUT", "/snapshot/create", body),
+            );
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains("Snapshot and restore are not supported."));
+        }
+
+        let flush_response = put_action_over_socket(&mut vmm, "scfl", "FlushMetrics");
+        assert!(
+            flush_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{flush_response}"
+        );
+        let metrics = read_metrics_json(&metrics_path);
+        assert_latency_metric_present(&metrics, "full_create_snapshot");
+        assert_latency_metric_present(&metrics, "diff_create_snapshot");
+        assert!(
+            metrics
+                .get("latencies_us")
+                .and_then(|latencies| latencies.get("load_snapshot"))
+                .is_none(),
+            "create requests must not emit load_snapshot"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_records_snapshot_load_latency_on_snapshot_fault() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("sll").with_extension("metrics");
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PUT", "/metrics", &metrics_body).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let response = request_over_socket(
+            &mut vmm,
+            "sl",
+            &request_with_body(
+                "PUT",
+                "/snapshot/load",
+                r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains("Snapshot and restore are not supported."));
+
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body(
+                    "PUT",
+                    "/boot-source",
+                    r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#,
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "sls", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let flush_response = put_action_over_socket(&mut vmm, "slfl", "FlushMetrics");
+        assert!(
+            flush_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{flush_response}"
+        );
+        let metrics = read_metrics_json(&metrics_path);
+        assert_latency_metric_present(&metrics, "load_snapshot");
+        assert!(
+            metrics
+                .get("latencies_us")
+                .and_then(|latencies| latencies.get("full_create_snapshot"))
+                .is_none(),
+            "load requests must not emit create snapshot latency"
+        );
+        assert!(
+            metrics
+                .get("latencies_us")
+                .and_then(|latencies| latencies.get("diff_create_snapshot"))
+                .is_none(),
+            "load requests must not emit diff snapshot latency"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_omits_snapshot_latencies_for_parser_or_state_failures() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("slf").with_extension("metrics");
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PUT", "/metrics", &metrics_body).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let malformed_create_response = request_over_socket(
+            &mut vmm,
+            "smc",
+            &request_with_body("PUT", "/snapshot/create", r#"{"snapshot_path":"vmstate"}"#),
+        );
+        assert!(malformed_create_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        let not_started_create_response = request_over_socket(
+            &mut vmm,
+            "snc",
+            &request_with_body(
+                "PUT",
+                "/snapshot/create",
+                r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+            ),
+        );
+        assert!(not_started_create_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body(
+                    "PUT",
+                    "/boot-source",
+                    r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#,
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "sss", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let running_load_response = request_over_socket(
+            &mut vmm,
+            "srl",
+            &request_with_body(
+                "PUT",
+                "/snapshot/load",
+                r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+            ),
+        );
+        assert!(running_load_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        let flush_response = put_action_over_socket(&mut vmm, "sff", "FlushMetrics");
+        assert!(
+            flush_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{flush_response}"
+        );
+        let metrics = read_metrics_json(&metrics_path);
+        assert!(
+            metrics.get("latencies_us").is_none(),
+            "snapshot parser or state failures must not emit latency metrics"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
