@@ -1850,6 +1850,20 @@ fn executable_configures_vm_before_start() {
         "GET / after failed PATCH /vm",
     );
 
+    let vm_resume_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+    assert_bad_request_response(&vm_resume_response, "PATCH /vm resumed");
+    assert_response_contains(
+        &vm_resume_response,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: Resume"}"#,
+        "PATCH /vm resumed",
+    );
+    let instance_info_after_vm_resume_patch = http_get(&socket_path, "/");
+    assert_response_contains(
+        &instance_info_after_vm_resume_patch,
+        r#""state":"Not started""#,
+        "GET / after failed PATCH /vm resumed",
+    );
+
     let flush_metrics_response = http_put_json(
         &socket_path,
         "/actions",
