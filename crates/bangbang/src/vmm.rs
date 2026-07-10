@@ -6767,6 +6767,14 @@ mod tests {
                 supervisor.admission_state(),
                 BootRunLoopCommandAdmissionState::SnapshotLeased
             );
+            assert_eq!(
+                supervisor.metrics_diagnostics().boot_run_loop_status(),
+                Some(BootRunLoopMetricStatus::Paused)
+            );
+            assert_eq!(
+                supervisor.process_exit_status(),
+                super::ProcessSessionExitStatus::Running
+            );
 
             let command_error = supervisor
                 .run_command(|_| Ok::<_, FakeRunLoopCommandError>(()))
@@ -7057,6 +7065,21 @@ mod tests {
             .expect_err("zero-capacity queue should reject snapshot command");
 
         assert_eq!(error, BootRunLoopCommandSubmissionError::QueueFull);
+        assert_eq!(
+            admission.snapshot(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let error = admission
+            .try_send_snapshot::<FakeRunLoopSession>(
+                &sender,
+                Box::new(|_| panic!("disconnected command should not execute")),
+            )
+            .expect_err("disconnected queue should reject snapshot command");
+
+        assert_eq!(error, BootRunLoopCommandSubmissionError::QueueClosed);
         assert_eq!(
             admission.snapshot(),
             BootRunLoopCommandAdmissionState::Ordinary
