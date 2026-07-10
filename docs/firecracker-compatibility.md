@@ -983,6 +983,8 @@ requests parse the Firecracker-shaped `drive_id`, `path_on_host`, and
 runtime updates to the process-owned block-device refresh path. The running API server
 converts parsed initial drive requests into a VMM action; valid pre-boot
 requests are recorded as VM configuration state and return `204 No Content`.
+Replacing an existing pre-boot drive ID preserves its Firecracker-shaped device
+ordering slot, while newly configured root drives are still kept first.
 
 The runtime crate has an internal, Firecracker-shaped drive configuration model
 for the initial virtio-block subset. It validates path and body `drive_id`

@@ -458,15 +458,18 @@ impl DriveConfigs {
             return Err(DriveConfigError::RootDeviceAlreadyConfigured);
         }
 
+        let is_root_device = config.is_root_device();
         if let Some(index) = self
             .configs
             .iter()
             .position(|existing| existing.drive_id() == config.drive_id())
         {
             self.configs.remove(index);
-        }
-
-        if config.is_root_device() {
+            self.configs.insert(index, config);
+            if is_root_device && index != 0 {
+                self.configs.swap(0, index);
+            }
+        } else if is_root_device {
             self.configs.insert(0, config);
         } else {
             self.configs.push(config);
@@ -4946,6 +4949,169 @@ mod tests {
         assert_eq!(config.path_on_host(), PathBuf::from("/tmp/replaced.ext4"));
         assert!(config.is_root_device());
         assert!(config.is_read_only());
+    }
+
+    #[test]
+    fn drive_configs_preserve_non_root_order_when_replacing_existing_drive() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive config should be stored");
+        configs
+            .insert(DriveConfigInput::new(
+                "data1",
+                "data1",
+                "/tmp/data1.ext4",
+                false,
+            ))
+            .expect("first data drive config should be stored");
+        configs
+            .insert(DriveConfigInput::new(
+                "data2",
+                "data2",
+                "/tmp/data2.ext4",
+                false,
+            ))
+            .expect("second data drive config should be stored");
+
+        configs
+            .insert(DriveConfigInput::new(
+                "data1",
+                "data1",
+                "/tmp/data1-replaced.ext4",
+                false,
+            ))
+            .expect("replacement data drive config should be stored");
+
+        assert_eq!(configs.as_slice().len(), 3);
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+        assert_eq!(configs.as_slice()[1].drive_id(), "data1");
+        assert_eq!(
+            configs.as_slice()[1].path_on_host(),
+            PathBuf::from("/tmp/data1-replaced.ext4")
+        );
+        assert_eq!(configs.as_slice()[2].drive_id(), "data2");
+    }
+
+    #[test]
+    fn drive_configs_keep_root_first_when_replacing_existing_root() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive config should be stored");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                "/tmp/data.ext4",
+                false,
+            ))
+            .expect("data drive config should be stored");
+
+        configs
+            .insert(
+                DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs-new.ext4", true)
+                    .with_is_read_only(true),
+            )
+            .expect("replacement root drive config should be stored");
+
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+        assert_eq!(
+            configs.as_slice()[0].path_on_host(),
+            PathBuf::from("/tmp/rootfs-new.ext4")
+        );
+        assert!(configs.as_slice()[0].is_root_device());
+        assert!(configs.as_slice()[0].is_read_only());
+        assert_eq!(configs.as_slice()[1].drive_id(), "data");
+    }
+
+    #[test]
+    fn drive_configs_preserve_root_slot_when_replacing_root_as_non_root() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive config should be stored");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                "/tmp/data.ext4",
+                false,
+            ))
+            .expect("data drive config should be stored");
+
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs-data.ext4",
+                false,
+            ))
+            .expect("replacement non-root drive config should be stored");
+
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+        assert_eq!(
+            configs.as_slice()[0].path_on_host(),
+            PathBuf::from("/tmp/rootfs-data.ext4")
+        );
+        assert!(!configs.as_slice()[0].is_root_device());
+        assert_eq!(configs.as_slice()[1].drive_id(), "data");
+    }
+
+    #[test]
+    fn drive_configs_move_existing_drive_to_front_when_promoted_to_root() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "data1",
+                "data1",
+                "/tmp/data1.ext4",
+                false,
+            ))
+            .expect("first data drive config should be stored");
+        configs
+            .insert(DriveConfigInput::new(
+                "data2",
+                "data2",
+                "/tmp/data2.ext4",
+                false,
+            ))
+            .expect("second data drive config should be stored");
+
+        configs
+            .insert(DriveConfigInput::new(
+                "data2",
+                "data2",
+                "/tmp/data2-root.ext4",
+                true,
+            ))
+            .expect("promoted root drive config should be stored");
+
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(configs.as_slice()[0].drive_id(), "data2");
+        assert_eq!(
+            configs.as_slice()[0].path_on_host(),
+            PathBuf::from("/tmp/data2-root.ext4")
+        );
+        assert!(configs.as_slice()[0].is_root_device());
+        assert_eq!(configs.as_slice()[1].drive_id(), "data1");
     }
 
     #[test]
