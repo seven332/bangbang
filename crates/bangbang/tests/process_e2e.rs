@@ -287,6 +287,45 @@ fn executable_rejects_invalid_api_routes_without_stopping() {
 }
 
 #[test]
+fn executable_rejects_empty_mutating_api_requests_without_stopping() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    for (request_name, response, fault_message) in [
+        (
+            "empty PUT /actions",
+            http_json(&socket_path, "PUT", "/actions", ""),
+            r#"{"fault_message":"Empty PUT request."}"#,
+        ),
+        (
+            "empty PATCH /vm",
+            http_json(&socket_path, "PATCH", "/vm", ""),
+            r#"{"fault_message":"Empty PATCH request."}"#,
+        ),
+        (
+            "body-carrying DELETE /drives/rootfs",
+            http_json(&socket_path, "DELETE", "/drives/rootfs", "{}"),
+            r#"{"fault_message":"Empty Delete request."}"#,
+        ),
+    ] {
+        assert_bad_request_response(&response, request_name);
+        assert_response_contains(&response, fault_message, request_name);
+    }
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after empty mutating API requests");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / after empty mutating API requests",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_handles_sigint_shutdown_cleanly() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");

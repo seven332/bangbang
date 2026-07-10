@@ -643,7 +643,9 @@ fn record_unsupported_put_action_request(bytes: &[u8], vmm: &mut impl VmmRequest
 const fn should_record_api_request_parse_failure(err: &RequestError) -> bool {
     matches!(
         err,
-        RequestError::MalformedRequest
+        RequestError::EmptyPatchRequest
+            | RequestError::EmptyPutRequest
+            | RequestError::MalformedRequest
             | RequestError::MismatchedDriveId
             | RequestError::MismatchedInterfaceId
             | RequestError::MismatchedPmemId
@@ -7583,7 +7585,7 @@ mod tests {
                 "DELETE",
                 "/drives/rootfs",
                 "{}",
-                r#"{"fault_message":"Malformed HTTP request."}"#,
+                r#"{"fault_message":"Empty Delete request."}"#,
             ),
             (
                 "net",
