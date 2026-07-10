@@ -111,6 +111,71 @@ fn executable_prints_version_and_exits_before_socket_publication() {
 }
 
 #[test]
+fn executable_short_help_alias_exits_before_socket_publication() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("short-help.socket");
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::run_with_extra_args_expect_successful_exit(
+        &socket_path,
+        &instance_id,
+        &["-h"],
+    );
+
+    assert_eq!(output.stderr, "", "short help should not write stderr");
+    assert!(
+        output.stdout.contains("Usage:\n  bangbang [OPTIONS]"),
+        "short help should print usage; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("Current scope:"),
+        "short help should describe current public scope; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening")
+            && !output.stdout.contains("status: VM running without API"),
+        "short help must exit before startup readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !socket_path.exists(),
+        "short help must not publish the API socket"
+    );
+}
+
+#[test]
+fn executable_short_version_alias_exits_before_socket_publication() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("short-version.socket");
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::run_with_extra_args_expect_successful_exit(
+        &socket_path,
+        &instance_id,
+        &["-V"],
+    );
+
+    assert_eq!(
+        output.stdout,
+        format!("bangbang {BANGBANG_VERSION}\n"),
+        "short version should report the package version"
+    );
+    assert_eq!(output.stderr, "", "short version should not write stderr");
+    assert!(
+        !output.stdout.contains("status: API server listening")
+            && !output.stdout.contains("status: VM running without API"),
+        "short version must exit before startup readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !socket_path.exists(),
+        "short version must not publish the API socket"
+    );
+}
+
+#[test]
 fn executable_help_precedence_ignores_later_unknown_args() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("help-precedence.socket");
