@@ -288,6 +288,28 @@ mod macos_arm64 {
             "GET / after PATCH /vm Resumed",
         );
 
+        let duplicate_resume_response =
+            http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        assert_bad_request_response(
+            &duplicate_resume_response,
+            "PATCH /vm Resumed while running",
+        );
+        assert_response_contains(
+            &duplicate_resume_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: Resume"}"#,
+            "PATCH /vm Resumed while running",
+        );
+        let running_after_duplicate_resume = http_get(&socket_path, "/");
+        assert_ok_response(
+            &running_after_duplicate_resume,
+            "GET / after rejected duplicate PATCH /vm Resumed",
+        );
+        assert_response_contains(
+            &running_after_duplicate_resume,
+            r#""state":"Running""#,
+            "GET / after rejected duplicate PATCH /vm Resumed",
+        );
+
         let replacement_kernel_path = test_dir.path().join("replacement-vmlinux");
         let replacement_kernel_path_json = json_string(path_text(&replacement_kernel_path));
         let boot_update_body = format!(r#"{{"kernel_image_path":{replacement_kernel_path_json}}}"#);
@@ -723,7 +745,7 @@ mod macos_arm64 {
         assert_metrics_output(
             &metrics_path,
             Some(
-                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":6,"machine_cfg_count":0,"mmds_count":2,"vmm_version_count":0}"#,
+                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":7,"machine_cfg_count":0,"mmds_count":2,"vmm_version_count":0}"#,
             ),
             r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":3,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
             Some(
