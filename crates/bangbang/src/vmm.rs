@@ -40,7 +40,7 @@ use bangbang_runtime::memory_hotplug::{
 };
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
-    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMmdsMetrics,
     SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
     SharedSignalMetrics, SharedVsockDeviceMetrics,
 };
@@ -1586,15 +1586,15 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             controller,
             serial_output.clone(),
         );
-        let packet_io =
-            ProcessNetworkPacketIoProvider::from_controller(controller).map_err(|err| {
+        let (packet_io, mmds_metrics) = ProcessNetworkPacketIoProvider::from_controller(controller)
+            .map_err(|err| {
                 BackendError::Hypervisor(format!(
                     "failed to build network packet I/O provider: {err}"
                 ))
             })?;
         let session = OwnedHvfArm64BootSession::new(controller, boot_session_config)
             .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
-        let session = ProcessHvfBootSession::new(session, packet_io);
+        let session = ProcessHvfBootSession::new(session, packet_io, mmds_metrics);
         let supervisor =
             HvfBootRunLoopSupervisor::start(session, default_hvf_boot_run_loop_step_limit())?;
         self.active_serial_output = Some(serial_output);
@@ -1617,11 +1617,16 @@ pub(crate) type HvfBootRunLoopSupervisor = BootRunLoopSupervisor<
 pub(crate) struct ProcessHvfBootSession<S, P> {
     session: S,
     packet_io: P,
+    mmds_metrics: Option<SharedMmdsMetrics>,
 }
 
 impl<S, P> ProcessHvfBootSession<S, P> {
-    const fn new(session: S, packet_io: P) -> Self {
-        Self { session, packet_io }
+    const fn new(session: S, packet_io: P, mmds_metrics: Option<SharedMmdsMetrics>) -> Self {
+        Self {
+            session,
+            packet_io,
+            mmds_metrics,
+        }
     }
 }
 
@@ -1634,6 +1639,7 @@ where
         f.debug_struct("ProcessHvfBootSession")
             .field("session", &self.session)
             .field("packet_io", &self.packet_io)
+            .field("mmds_metrics", &self.mmds_metrics)
             .finish()
     }
 }
@@ -1670,18 +1676,28 @@ pub(crate) enum ProcessNetworkPacketIoProvider {
 impl ProcessNetworkPacketIoProvider {
     fn from_controller(
         controller: &VmmController,
-    ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
+    ) -> Result<(Self, Option<SharedMmdsMetrics>), ProcessNetworkPacketIoProviderBuildError> {
         let mmds_config = controller
             .mmds_config()
             .map_err(|source| ProcessNetworkPacketIoProviderBuildError::MmdsState { source })?;
-        let mmds_detour = mmds_config.as_ref().map(|config| {
-            ProcessMmdsPacketDetourConfig::from_mmds_config(controller.mmds_state_handle(), config)
-        });
+        let mmds_metrics = mmds_config.as_ref().map(|_| SharedMmdsMetrics::default());
+        let mmds_detour =
+            mmds_config
+                .as_ref()
+                .zip(mmds_metrics.as_ref())
+                .map(|(config, metrics)| {
+                    ProcessMmdsPacketDetourConfig::from_mmds_config(
+                        controller.mmds_state_handle(),
+                        config,
+                        metrics.clone(),
+                    )
+                });
 
-        Self::from_network_configs_and_mmds_detour(
+        let provider = Self::from_network_configs_and_mmds_detour(
             controller.network_interface_configs(),
             mmds_detour.as_ref(),
-        )
+        )?;
+        Ok((provider, mmds_metrics))
     }
 
     #[cfg(test)]
@@ -1725,14 +1741,20 @@ struct ProcessMmdsPacketDetourConfig {
     mmds_state: MmdsStateHandle,
     mmds_ipv4_address: Ipv4Addr,
     network_interfaces: Vec<String>,
+    metrics: SharedMmdsMetrics,
 }
 
 impl ProcessMmdsPacketDetourConfig {
-    fn from_mmds_config(mmds_state: MmdsStateHandle, config: &MmdsConfig) -> Self {
+    fn from_mmds_config(
+        mmds_state: MmdsStateHandle,
+        config: &MmdsConfig,
+        metrics: SharedMmdsMetrics,
+    ) -> Self {
         Self {
             mmds_state,
             mmds_ipv4_address: config.effective_ipv4_address(),
             network_interfaces: config.network_interfaces().to_vec(),
+            metrics,
         }
     }
 
@@ -1749,6 +1771,7 @@ impl ProcessMmdsPacketDetourConfig {
             self.mmds_state.clone(),
             self.mmds_ipv4_address,
             MmdsResponseQueue::default(),
+            self.metrics.clone(),
         ))
     }
 
@@ -2260,6 +2283,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_mmds_metrics(&self) -> Option<SharedMmdsMetrics> {
+        None
+    }
+
     fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
         None
     }
@@ -2341,6 +2368,10 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         Some(OwnedHvfArm64BootSession::shared_network_interface_metrics(
             self,
         ))
+    }
+
+    fn shared_mmds_metrics(&self) -> Option<SharedMmdsMetrics> {
+        None
     }
 
     fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
@@ -2430,6 +2461,10 @@ where
 
     fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
         self.session.shared_network_interface_metrics()
+    }
+
+    fn shared_mmds_metrics(&self) -> Option<SharedMmdsMetrics> {
+        self.mmds_metrics.clone()
     }
 
     fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
@@ -2938,6 +2973,7 @@ where
     pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
     balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
     network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
+    mmds_metrics: Option<SharedMmdsMetrics>,
     vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
     entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
     rtc_device_metrics: Option<SharedRtcDeviceMetrics>,
@@ -2973,6 +3009,7 @@ where
         let pmem_device_metrics = session.shared_pmem_device_metrics();
         let balloon_device_metrics = session.shared_balloon_device_metrics();
         let network_interface_metrics = session.shared_network_interface_metrics();
+        let mmds_metrics = session.shared_mmds_metrics();
         let vsock_device_metrics = session.shared_vsock_device_metrics();
         let entropy_device_metrics = session.shared_entropy_device_metrics();
         let rtc_device_metrics = session.shared_rtc_device_metrics();
@@ -3060,6 +3097,7 @@ where
             pmem_device_metrics,
             balloon_device_metrics,
             network_interface_metrics,
+            mmds_metrics,
             vsock_device_metrics,
             entropy_device_metrics,
             rtc_device_metrics,
@@ -3193,6 +3231,9 @@ where
             diagnostics = diagnostics
                 .with_network_interface_metrics(metrics.aggregate_snapshot())
                 .with_network_interface_metrics_by_interface(metrics.per_interface_snapshot());
+        }
+        if let Some(metrics) = &self.mmds_metrics {
+            diagnostics = diagnostics.with_mmds_metrics(metrics.snapshot());
         }
         if let Some(metrics) = &self.vsock_device_metrics {
             diagnostics = diagnostics.with_vsock_device_metrics(metrics.snapshot());
@@ -3515,9 +3556,9 @@ mod tests {
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigInput, MetricsDiagnostics,
-        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
-        PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        MmdsMetrics, NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface,
+        PmemDeviceMetrics, PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMmdsMetrics,
         SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
         SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
@@ -4296,6 +4337,7 @@ mod tests {
         pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
         network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
+        mmds_metrics: Option<SharedMmdsMetrics>,
         vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
         entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
         rtc_device_metrics: Option<SharedRtcDeviceMetrics>,
@@ -4326,6 +4368,7 @@ mod tests {
                 pmem_device_metrics: None,
                 balloon_device_metrics: None,
                 network_interface_metrics: None,
+                mmds_metrics: None,
                 vsock_device_metrics: None,
                 entropy_device_metrics: None,
                 rtc_device_metrics: None,
@@ -4391,6 +4434,11 @@ mod tests {
             metrics: SharedNetworkInterfaceMetricsRegistry,
         ) -> Self {
             self.network_interface_metrics = Some(metrics);
+            self
+        }
+
+        fn with_mmds_metrics(mut self, metrics: SharedMmdsMetrics) -> Self {
+            self.mmds_metrics = Some(metrics);
             self
         }
 
@@ -4463,6 +4511,10 @@ mod tests {
             &self,
         ) -> Option<SharedNetworkInterfaceMetricsRegistry> {
             self.network_interface_metrics.clone()
+        }
+
+        fn shared_mmds_metrics(&self) -> Option<SharedMmdsMetrics> {
+            self.mmds_metrics.clone()
         }
 
         fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
@@ -5270,7 +5322,7 @@ mod tests {
         let fake_session = FakeNetworkPacketIoRunLoopSession::new(control, max_steps_sender);
         let provider = RecordingProcessNetworkPacketIoProvider::default();
         let requested_ifaces = provider.requested_ifaces();
-        let mut session = ProcessHvfBootSession::new(fake_session, provider);
+        let mut session = ProcessHvfBootSession::new(fake_session, provider, None);
 
         let result = session
             .run_loop(
@@ -5379,6 +5431,7 @@ mod tests {
         let detour_config = ProcessMmdsPacketDetourConfig::from_mmds_config(
             MmdsStateHandle::default(),
             &mmds_config,
+            SharedMmdsMetrics::default(),
         );
 
         let eth0 = detour_config
@@ -5404,6 +5457,7 @@ mod tests {
         let detour_config = ProcessMmdsPacketDetourConfig::from_mmds_config(
             MmdsStateHandle::default(),
             &mmds_config,
+            SharedMmdsMetrics::default(),
         );
 
         let mut provider = ProcessNetworkPacketIoProvider::from_network_configs_and_mmds_detour(
@@ -5432,6 +5486,7 @@ mod tests {
         let detour_config = ProcessMmdsPacketDetourConfig::from_mmds_config(
             MmdsStateHandle::default(),
             &mmds_config,
+            SharedMmdsMetrics::default(),
         );
 
         let error = ProcessNetworkPacketIoProvider::from_network_configs_and_mmds_detour(
@@ -5847,6 +5902,47 @@ mod tests {
                         .with_rx_queue_event_count(1)
                         .with_tx_queue_event_count(2),
                 )
+            )
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_reports_mmds_metrics() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedMmdsMetrics::default();
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_mmds_metrics(metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        metrics.record_rx_accepted();
+        metrics.record_tx_frame(4);
+        let diagnostics = supervisor.metrics_diagnostics();
+
+        assert_eq!(
+            diagnostics.mmds_metrics(),
+            Some(
+                MmdsMetrics::default()
+                    .with_rx_accepted(1)
+                    .with_tx_bytes(4)
+                    .with_tx_count(1)
+                    .with_tx_frames(1)
             )
         );
 

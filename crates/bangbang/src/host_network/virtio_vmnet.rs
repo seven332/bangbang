@@ -6,10 +6,12 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use bangbang_runtime::memory::{GuestMemory, GuestMemoryAccessError};
+use bangbang_runtime::metrics::SharedMmdsMetrics;
 use bangbang_runtime::mmds::{
-    MmdsGuestArpResponseFrameError, MmdsGuestTcpPacket, MmdsGuestTcpResponseContext,
-    MmdsGuestTcpResponseFrameError, MmdsStateHandle, MmdsStateLockError,
-    classify_mmds_guest_arp_request, classify_mmds_guest_tcp_packet,
+    MmdsGuestArpResponseFrameError, MmdsGuestRequest, MmdsGuestTcpPacket,
+    MmdsGuestTcpResponseContext, MmdsGuestTcpResponseFrameError, MmdsGuestToken, MmdsState,
+    MmdsStateHandle, MmdsStateLockError, MmdsVersion, classify_mmds_guest_arp_request,
+    classify_mmds_guest_tcp_packet,
 };
 use bangbang_runtime::network::{
     VIRTIO_NET_MAX_BUFFER_SIZE, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
@@ -113,6 +115,7 @@ pub(crate) struct MmdsPacketDetour {
     mmds_ipv4_address: Ipv4Addr,
     response_queue: MmdsResponseQueue,
     request_buffers: MmdsRequestBuffers,
+    metrics: SharedMmdsMetrics,
 }
 
 impl MmdsPacketDetour {
@@ -120,22 +123,25 @@ impl MmdsPacketDetour {
         mmds_state: MmdsStateHandle,
         mmds_ipv4_address: Ipv4Addr,
         response_queue: MmdsResponseQueue,
+        metrics: SharedMmdsMetrics,
     ) -> Self {
+        let response_queue = response_queue.with_shared_metrics(metrics.clone());
         Self {
             mmds_state,
             mmds_ipv4_address,
             response_queue,
             request_buffers: MmdsRequestBuffers::default(),
+            metrics,
         }
     }
 
     fn detour_packet(&mut self, packet: &[u8]) -> Result<bool, MmdsPacketDetourError> {
         if let Some(arp_request) = classify_mmds_guest_arp_request(packet, self.mmds_ipv4_address) {
-            self.response_queue.push_priority_with(|| {
+            self.record_rx_accepted_result(self.response_queue.push_priority_with(|| {
                 arp_request
                     .response_frame()
                     .map_err(MmdsPacketDetourError::ArpResponseFrame)
-            })?;
+            }))?;
             return Ok(true);
         }
 
@@ -144,33 +150,39 @@ impl MmdsPacketDetour {
             return Ok(false);
         };
         if classified.is_initial_synchronization_request() {
-            self.response_queue.push_with(|| {
+            self.record_rx_count_result(self.response_queue.push_with(|| {
                 classified
                     .syn_ack_response_frame()
                     .map_err(MmdsPacketDetourError::ResponseFrame)
-            })?;
+            }))?;
+            self.metrics.record_connection_created();
             return Ok(true);
         }
         if classified.acknowledges_initial_synchronization_response() {
+            self.record_rx_count();
             return Ok(true);
         }
         if classified.is_empty_fin_close_request() {
-            self.response_queue.push_pair_with(|| {
+            self.record_rx_count_result(self.response_queue.push_pair_with(|| {
                 classified
                     .fin_close_response_frames()
                     .map_err(MmdsPacketDetourError::ResponseFrame)
-            })?;
+            }))?;
+            self.metrics.record_connection_destroyed();
             return Ok(true);
         }
         if classified.is_reset_control() {
+            self.record_rx_count();
+            self.metrics.record_connection_destroyed();
             return Ok(true);
         }
         if classified.is_unsupported_empty_control_reset_request() {
-            self.response_queue.push_with(|| {
+            self.record_rx_count_result(self.response_queue.push_with(|| {
                 classified
                     .reset_response_frame()
                     .map_err(MmdsPacketDetourError::ResponseFrame)
-            })?;
+            }))?;
+            self.metrics.record_rx_accepted_unusual();
             return Ok(true);
         }
         if classified.payload().is_empty() {
@@ -184,17 +196,25 @@ impl MmdsPacketDetour {
         }
 
         let key = MmdsRequestBufferKey::from_packet(classified);
-        if let Some(request) = self.request_buffers.append_existing(
+        let appended_request = self.request_buffers.append_existing(
             key,
             classified.sequence_number(),
             classified.payload(),
-        )? {
-            self.queue_response(
-                request.response_context,
-                request.payload.len(),
-                &request.payload,
-            )?;
-            return Ok(true);
+        );
+        match self.record_rx_accepted_error_result(appended_request)? {
+            MmdsRequestBufferAppend::Complete(request) => {
+                self.queue_response(
+                    request.response_context,
+                    request.payload.len(),
+                    &request.payload,
+                )?;
+                return Ok(true);
+            }
+            MmdsRequestBufferAppend::Buffered => {
+                self.record_rx_count();
+                return Ok(true);
+            }
+            MmdsRequestBufferAppend::NotFound => {}
         }
 
         if mmds_http_request_is_complete(classified.payload()) {
@@ -206,12 +226,14 @@ impl MmdsPacketDetour {
             return Ok(true);
         }
 
-        self.request_buffers.start_request(
+        let start_request_result = self.request_buffers.start_request(
             key,
             classified.response_context(),
             classified.sequence_number(),
             classified.payload(),
-        )?;
+        );
+        self.record_rx_accepted_error_result(start_request_result)?;
+        self.record_rx_count();
         Ok(true)
     }
 
@@ -221,19 +243,91 @@ impl MmdsPacketDetour {
         request_payload_len: usize,
         request_payload: &[u8],
     ) -> Result<(), MmdsPacketDetourError> {
-        self.response_queue.push_with(|| {
+        self.record_rx_count_result(self.response_queue.push_with(|| {
             let response = self
                 .mmds_state
-                .with_mut(|state| state.guest_http_response_bytes(request_payload))
+                .with_mut(|state| {
+                    record_mmds_guest_http_request_metrics(&self.metrics, state, request_payload);
+                    state.guest_http_response_bytes(request_payload)
+                })
                 .map_err(MmdsPacketDetourError::MmdsState)?;
             response_context
                 .response_frame(&response, request_payload_len)
                 .map_err(MmdsPacketDetourError::ResponseFrame)
-        })
+        }))
     }
 
     pub(crate) fn response_queue(&self) -> MmdsResponseQueue {
         self.response_queue.clone()
+    }
+
+    fn record_rx_count(&self) {
+        self.metrics.record_rx_accepted();
+        self.metrics.record_rx_count();
+    }
+
+    fn record_rx_count_result(
+        &self,
+        result: Result<(), MmdsPacketDetourError>,
+    ) -> Result<(), MmdsPacketDetourError> {
+        match result {
+            Ok(()) => {
+                self.record_rx_count();
+                Ok(())
+            }
+            Err(err) => {
+                self.metrics.record_rx_accepted_error();
+                Err(err)
+            }
+        }
+    }
+
+    fn record_rx_accepted_result(
+        &self,
+        result: Result<(), MmdsPacketDetourError>,
+    ) -> Result<(), MmdsPacketDetourError> {
+        match result {
+            Ok(()) => {
+                self.metrics.record_rx_accepted();
+                Ok(())
+            }
+            Err(err) => {
+                self.metrics.record_rx_accepted_error();
+                Err(err)
+            }
+        }
+    }
+
+    fn record_rx_accepted_error_result<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
+        if result.is_err() {
+            self.metrics.record_rx_accepted_error();
+        }
+
+        result
+    }
+}
+
+fn record_mmds_guest_http_request_metrics(
+    metrics: &SharedMmdsMetrics,
+    state: &MmdsState,
+    request_payload: &[u8],
+) {
+    let Some(config) = state.config() else {
+        return;
+    };
+    if config.version() != MmdsVersion::V2 {
+        return;
+    }
+    let Ok(MmdsGuestRequest::Get(request)) = MmdsGuestRequest::parse_http(request_payload) else {
+        return;
+    };
+
+    match request.token() {
+        MmdsGuestToken::Missing => metrics.record_rx_no_token(),
+        MmdsGuestToken::Header { token_value, .. } if state.is_guest_token_valid(token_value) => {}
+        MmdsGuestToken::Header { .. } | MmdsGuestToken::Duplicate => {
+            metrics.record_rx_invalid_token();
+        }
     }
 }
 
@@ -260,19 +354,21 @@ impl MmdsRequestBuffers {
         key: MmdsRequestBufferKey,
         sequence_number: u32,
         payload: &[u8],
-    ) -> Result<Option<MmdsBufferedRequest>, MmdsRequestBufferError> {
+    ) -> Result<MmdsRequestBufferAppend, MmdsRequestBufferError> {
         let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
-            return Ok(None);
+            return Ok(MmdsRequestBufferAppend::NotFound);
         };
 
         let mut entry = self.entries.swap_remove(index);
         entry.append_payload(sequence_number, payload, self.request_len_limit)?;
         if entry.is_complete() {
-            return Ok(Some(entry.into_buffered_request()));
+            return Ok(MmdsRequestBufferAppend::Complete(
+                entry.into_buffered_request(),
+            ));
         }
 
         self.entries.push(entry);
-        Ok(None)
+        Ok(MmdsRequestBufferAppend::Buffered)
     }
 
     fn start_request(
@@ -318,6 +414,13 @@ impl MmdsRequestBuffers {
         });
         Ok(())
     }
+}
+
+#[derive(Debug)]
+enum MmdsRequestBufferAppend {
+    NotFound,
+    Buffered,
+    Complete(MmdsBufferedRequest),
 }
 
 #[derive(Debug)]
@@ -475,6 +578,7 @@ fn mmds_http_request_is_complete(payload: &[u8]) -> bool {
 #[derive(Debug, Clone)]
 pub(crate) struct MmdsResponseQueue {
     state: Arc<Mutex<MmdsResponseQueueState>>,
+    metrics: SharedMmdsMetrics,
 }
 
 impl Default for MmdsResponseQueue {
@@ -490,6 +594,14 @@ impl MmdsResponseQueue {
                 capacity,
                 responses: VecDeque::new(),
             })),
+            metrics: SharedMmdsMetrics::default(),
+        }
+    }
+
+    fn with_shared_metrics(&self, metrics: SharedMmdsMetrics) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            metrics,
         }
     }
 
@@ -504,28 +616,34 @@ impl MmdsResponseQueue {
         &self,
         responses: impl FnOnce() -> Result<[Vec<u8>; 2], MmdsPacketDetourError>,
     ) -> Result<(), MmdsPacketDetourError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| MmdsPacketDetourError::ResponseQueue(MmdsResponseQueueError::Poisoned))?;
-        if state.responses.len().saturating_add(2) > state.capacity {
-            return Err(MmdsPacketDetourError::ResponseQueue(
-                MmdsResponseQueueError::Full {
-                    capacity: state.capacity,
-                },
-            ));
+        let result = (|| {
+            let mut state = self.state.lock().map_err(|_| {
+                MmdsPacketDetourError::ResponseQueue(MmdsResponseQueueError::Poisoned)
+            })?;
+            if state.responses.len().saturating_add(2) > state.capacity {
+                return Err(MmdsPacketDetourError::ResponseQueue(
+                    MmdsResponseQueueError::Full {
+                        capacity: state.capacity,
+                    },
+                ));
+            }
+
+            let [first, second] = responses()?;
+            state.responses.push_back(MmdsQueuedResponse {
+                priority: MmdsResponseQueuePriority::Normal,
+                frame: first,
+            });
+            state.responses.push_back(MmdsQueuedResponse {
+                priority: MmdsResponseQueuePriority::Normal,
+                frame: second,
+            });
+            Ok(())
+        })();
+        if result.is_err() {
+            self.metrics.record_tx_error();
         }
 
-        let [first, second] = responses()?;
-        state.responses.push_back(MmdsQueuedResponse {
-            priority: MmdsResponseQueuePriority::Normal,
-            frame: first,
-        });
-        state.responses.push_back(MmdsQueuedResponse {
-            priority: MmdsResponseQueuePriority::Normal,
-            frame: second,
-        });
-        Ok(())
+        result
     }
 
     fn push_priority_with(
@@ -540,60 +658,75 @@ impl MmdsResponseQueue {
         response: impl FnOnce() -> Result<Vec<u8>, MmdsPacketDetourError>,
         direction: MmdsResponseQueueDirection,
     ) -> Result<(), MmdsPacketDetourError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| MmdsPacketDetourError::ResponseQueue(MmdsResponseQueueError::Poisoned))?;
-        if state.responses.len() >= state.capacity {
-            return Err(MmdsPacketDetourError::ResponseQueue(
-                MmdsResponseQueueError::Full {
-                    capacity: state.capacity,
-                },
-            ));
+        let result = (|| {
+            let mut state = self.state.lock().map_err(|_| {
+                MmdsPacketDetourError::ResponseQueue(MmdsResponseQueueError::Poisoned)
+            })?;
+            if state.responses.len() >= state.capacity {
+                return Err(MmdsPacketDetourError::ResponseQueue(
+                    MmdsResponseQueueError::Full {
+                        capacity: state.capacity,
+                    },
+                ));
+            }
+
+            let response = response()?;
+            match direction {
+                MmdsResponseQueueDirection::Normal => {
+                    state.responses.push_back(MmdsQueuedResponse {
+                        priority: MmdsResponseQueuePriority::Normal,
+                        frame: response,
+                    });
+                }
+                MmdsResponseQueueDirection::Priority => {
+                    let insert_at = state
+                        .responses
+                        .iter()
+                        .position(|queued| queued.priority == MmdsResponseQueuePriority::Normal)
+                        .unwrap_or(state.responses.len());
+                    state.responses.insert(
+                        insert_at,
+                        MmdsQueuedResponse {
+                            priority: MmdsResponseQueuePriority::Priority,
+                            frame: response,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.metrics.record_tx_error();
         }
 
-        let response = response()?;
-        match direction {
-            MmdsResponseQueueDirection::Normal => state.responses.push_back(MmdsQueuedResponse {
-                priority: MmdsResponseQueuePriority::Normal,
-                frame: response,
-            }),
-            MmdsResponseQueueDirection::Priority => {
-                let insert_at = state
-                    .responses
-                    .iter()
-                    .position(|queued| queued.priority == MmdsResponseQueuePriority::Normal)
-                    .unwrap_or(state.responses.len());
-                state.responses.insert(
-                    insert_at,
-                    MmdsQueuedResponse {
-                        priority: MmdsResponseQueuePriority::Priority,
-                        frame: response,
-                    },
-                );
-            }
-        }
-        Ok(())
+        result
     }
 
     fn copy_front_into(&self, buffer: &mut [u8]) -> Result<Option<usize>, MmdsResponseQueueError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| MmdsResponseQueueError::Poisoned)?;
-        let Some(response) = state.responses.front() else {
-            return Ok(None);
-        };
-        let len = response.frame.len();
-        let Some(target) = buffer.get_mut(..len) else {
-            return Err(MmdsResponseQueueError::ResponseFrameTooLarge {
-                len,
-                buffer_len: buffer.len(),
-            });
-        };
+        let result = (|| {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| MmdsResponseQueueError::Poisoned)?;
+            let Some(response) = state.responses.front() else {
+                return Ok(None);
+            };
+            let len = response.frame.len();
+            let Some(target) = buffer.get_mut(..len) else {
+                return Err(MmdsResponseQueueError::ResponseFrameTooLarge {
+                    len,
+                    buffer_len: buffer.len(),
+                });
+            };
 
-        target.copy_from_slice(&response.frame);
-        Ok(Some(len))
+            target.copy_from_slice(&response.frame);
+            Ok(Some(len))
+        })();
+        if result.is_err() {
+            self.metrics.record_tx_error();
+        }
+
+        result
     }
 
     fn may_have_response(&self) -> bool {
@@ -604,13 +737,12 @@ impl MmdsResponseQueue {
         }
     }
 
-    fn pop_front(&self) -> Result<(), MmdsResponseQueueError> {
+    fn pop_front(&self) -> Result<bool, MmdsResponseQueueError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| MmdsResponseQueueError::Poisoned)?;
-        state.responses.pop_front();
-        Ok(())
+        Ok(state.responses.pop_front().is_some())
     }
 
     #[cfg(test)]
@@ -1132,7 +1264,12 @@ where
             && cached_packet.source == CachedRxPacketSource::MmdsResponse
             && let Some(mmds_response_queue) = &self.mmds_response_queue
         {
-            let _ = mmds_response_queue.pop_front();
+            match mmds_response_queue.pop_front() {
+                Ok(true) => mmds_response_queue
+                    .metrics
+                    .record_tx_frame(cached_packet.len),
+                Ok(false) | Err(_) => mmds_response_queue.metrics.record_tx_error(),
+            }
         }
     }
 }
@@ -1241,8 +1378,11 @@ impl VirtioNetworkRxPacketSource for MmdsOnlyVirtioNetworkRxPacketSource {
     }
 
     fn consume_packet(&mut self) {
-        if self.cached_len.take().is_some() {
-            let _ = self.response_queue.pop_front();
+        if let Some(len) = self.cached_len.take() {
+            match self.response_queue.pop_front() {
+                Ok(true) => self.response_queue.metrics.record_tx_frame(len),
+                Ok(false) | Err(_) => self.response_queue.metrics.record_tx_error(),
+            }
         }
     }
 }
@@ -1442,6 +1582,7 @@ mod tests {
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
+    use bangbang_runtime::metrics::{MmdsMetrics, SharedMmdsMetrics};
     use bangbang_runtime::mmds::{
         DEFAULT_MMDS_IPV4_ADDRESS, DEFAULT_MMDS_MAC_ADDRESS, MMDS_GUEST_TCP_PORT, MmdsConfigInput,
         MmdsStateHandle, MmdsVersion,
@@ -1966,7 +2107,26 @@ mod tests {
         mmds_state: MmdsStateHandle,
         response_queue: MmdsResponseQueue,
     ) -> VmnetVirtioNetworkPacketIo<FakeVmnetPacketIoBackend> {
-        let detour = MmdsPacketDetour::new(mmds_state, DEFAULT_MMDS_IPV4_ADDRESS, response_queue);
+        packet_io_with_mmds_detour_and_metrics(
+            backend,
+            mmds_state,
+            response_queue,
+            SharedMmdsMetrics::default(),
+        )
+    }
+
+    fn packet_io_with_mmds_detour_and_metrics(
+        backend: FakeVmnetPacketIoBackend,
+        mmds_state: MmdsStateHandle,
+        response_queue: MmdsResponseQueue,
+        metrics: SharedMmdsMetrics,
+    ) -> VmnetVirtioNetworkPacketIo<FakeVmnetPacketIoBackend> {
+        let detour = MmdsPacketDetour::new(
+            mmds_state,
+            DEFAULT_MMDS_IPV4_ADDRESS,
+            response_queue,
+            metrics,
+        );
         VmnetVirtioNetworkPacketIo::with_mmds_detour(backend, fake_interface(), detour)
             .expect("packet I/O with MMDS detour should build")
     }
@@ -1975,7 +2135,12 @@ mod tests {
         mmds_state: MmdsStateHandle,
         response_queue: MmdsResponseQueue,
     ) -> MmdsOnlyVirtioNetworkPacketIo {
-        let detour = MmdsPacketDetour::new(mmds_state, DEFAULT_MMDS_IPV4_ADDRESS, response_queue);
+        let detour = MmdsPacketDetour::new(
+            mmds_state,
+            DEFAULT_MMDS_IPV4_ADDRESS,
+            response_queue,
+            SharedMmdsMetrics::default(),
+        );
         MmdsOnlyVirtioNetworkPacketIo::new(detour).expect("MMDS-only packet I/O should build")
     }
 
@@ -2182,6 +2347,109 @@ mod tests {
     }
 
     #[test]
+    fn tx_sink_records_mmds_guest_request_metrics() {
+        let packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let metrics = SharedMmdsMetrics::default();
+        let response_queue = MmdsResponseQueue::with_capacity(1);
+        let mut packet_io = packet_io_with_mmds_detour_and_metrics(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue,
+            metrics.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS GET should detour");
+
+        assert_eq!(
+            metrics.snapshot(),
+            MmdsMetrics::default().with_rx_accepted(1).with_rx_count(1)
+        );
+    }
+
+    #[test]
+    fn rx_source_records_mmds_response_tx_metrics_on_consume() {
+        let packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let metrics = SharedMmdsMetrics::default();
+        let response_queue = MmdsResponseQueue::with_capacity(1);
+        let mut packet_io = packet_io_with_mmds_detour_and_metrics(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue,
+            metrics.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS GET should detour");
+        let response_len = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect("MMDS response peek should succeed")
+            .expect("MMDS response should be present")
+            .bytes()
+            .len();
+        packet_io.rx_source().consume_packet();
+
+        assert_eq!(
+            metrics.snapshot(),
+            MmdsMetrics::default()
+                .with_rx_accepted(1)
+                .with_rx_count(1)
+                .with_tx_bytes(u64::try_from(response_len).expect("response length fits in u64"))
+                .with_tx_count(1)
+                .with_tx_frames(1)
+        );
+    }
+
+    #[test]
+    fn tx_sink_records_mmds_v2_guest_token_rejections() {
+        let missing_token_packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+        let invalid_token_packet =
+            mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: bad\r\n\r\n");
+        let mut memory = tx_memory();
+        let missing_token_frame =
+            tx_frame(&mut memory, &[(&missing_token_packet, PAYLOAD_ADDRESS)]);
+        let invalid_token_frame = tx_frame(
+            &mut memory,
+            &[(&invalid_token_packet, SECOND_PAYLOAD_ADDRESS)],
+        );
+        let metrics = SharedMmdsMetrics::default();
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour_and_metrics(
+            FakeVmnetPacketIoBackend::default(),
+            v2_mmds_state_handle(),
+            response_queue,
+            metrics.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &missing_token_frame)
+            .expect("MMDS GET without token should detour");
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &invalid_token_frame)
+            .expect("MMDS GET with invalid token should detour");
+
+        assert_eq!(
+            metrics.snapshot(),
+            MmdsMetrics::default()
+                .with_rx_accepted(2)
+                .with_rx_invalid_token(1)
+                .with_rx_no_token(1)
+                .with_rx_count(2)
+        );
+    }
+
+    #[test]
     fn packet_io_delivers_detoured_mmds_response_through_rx_source() {
         let payload = b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n";
         let packet = mmds_tcp_packet(payload);
@@ -2345,6 +2613,7 @@ mod tests {
             MmdsStateHandle::default(),
             configured_mmds_address,
             response_queue.clone(),
+            SharedMmdsMetrics::default(),
         );
         let mut packet_io = VmnetVirtioNetworkPacketIo::with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -2675,6 +2944,7 @@ mod tests {
             MmdsStateHandle::default(),
             configured_mmds_address,
             response_queue.clone(),
+            SharedMmdsMetrics::default(),
         );
         let mut packet_io = VmnetVirtioNetworkPacketIo::with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -2781,6 +3051,42 @@ mod tests {
         assert!(
             mmds_response_frame_tcp_payload(&responses[0]).is_empty(),
             "SYN-ACK should not carry MMDS HTTP payload"
+        );
+    }
+
+    #[test]
+    fn tx_sink_records_mmds_connection_metrics() {
+        let syn_packet = mmds_tcp_syn_packet(0x0102_0304);
+        let fin_packet =
+            mmds_tcp_fin_close_packet(0x1112_1314, 0x2122_2324, TCP_FLAG_FIN | TCP_FLAG_ACK);
+        let mut memory = tx_memory();
+        let syn_frame = tx_frame(&mut memory, &[(&syn_packet, PAYLOAD_ADDRESS)]);
+        let fin_frame = tx_frame(&mut memory, &[(&fin_packet, SECOND_PAYLOAD_ADDRESS)]);
+        let metrics = SharedMmdsMetrics::default();
+        let response_queue = MmdsResponseQueue::with_capacity(3);
+        let mut packet_io = packet_io_with_mmds_detour_and_metrics(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue,
+            metrics.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &syn_frame)
+            .expect("MMDS SYN should detour");
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &fin_frame)
+            .expect("MMDS FIN should detour");
+
+        assert_eq!(
+            metrics.snapshot(),
+            MmdsMetrics::default()
+                .with_rx_accepted(2)
+                .with_rx_count(2)
+                .with_connections_created(1)
+                .with_connections_destroyed(1)
         );
     }
 
@@ -3563,6 +3869,57 @@ mod tests {
             .lock()
             .expect("test state lock should succeed");
         assert_eq!(state.backend.write_calls, 0);
+    }
+
+    #[test]
+    fn tx_sink_buffers_three_part_mmds_get_until_request_header_complete() {
+        let first_payload = b"GET /meta-";
+        let second_payload = b"data/host";
+        let third_payload = b"name HTTP/1.1\r\n\r\n";
+        let first_sequence_number = 0x1000;
+        let second_sequence_number = first_sequence_number
+            + u32::try_from(first_payload.len()).expect("test payload length should fit u32");
+        let third_sequence_number = second_sequence_number
+            + u32::try_from(second_payload.len()).expect("test payload length should fit u32");
+        let first_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, first_sequence_number, first_payload);
+        let second_packet = mmds_tcp_packet_from_source(
+            TEST_SOURCE_TCP_PORT,
+            second_sequence_number,
+            second_payload,
+        );
+        let third_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, third_sequence_number, third_payload);
+        let mut memory = tx_memory();
+        let metrics = SharedMmdsMetrics::default();
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour_and_metrics(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+            metrics.clone(),
+        );
+
+        for packet in [&first_packet, &second_packet, &third_packet] {
+            let frame = tx_frame(&mut memory, &[(packet, PAYLOAD_ADDRESS)]);
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("MMDS split GET fragment should detour");
+        }
+
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            mmds_response_body(&responses[0]),
+            b"The MMDS data store is not initialized."
+        );
+        assert_eq!(
+            metrics.snapshot(),
+            MmdsMetrics::default().with_rx_accepted(3).with_rx_count(3)
+        );
     }
 
     #[test]
@@ -4474,6 +4831,7 @@ mod tests {
                 MmdsStateHandle::default(),
                 DEFAULT_MMDS_IPV4_ADDRESS,
                 response_queue.clone(),
+                SharedMmdsMetrics::default(),
             )),
         )
         .expect("packet I/O with MMDS detour should build");

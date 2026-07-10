@@ -198,11 +198,13 @@ failures; a top-level aggregate `pmem` object and non-empty per-device
 `pmem_{id}` objects for implemented virtio-pmem queue activity and failures;
 top-level aggregate `net` and non-empty per-interface
 `net_{iface_id}` objects for implemented virtio-net RX/TX queue activity,
-packet counts, byte counts, and failures; a top-level `vsock` object for
-implemented virtio-vsock RX/TX queue activity, packet counts, byte counts,
-connection cleanup counters, and classifiable queue/event failures; a
-top-level `entropy` object with Firecracker-shaped counters for implemented
-virtio-rng request, byte, host-randomness failure, and event-failure activity; a
+packet counts, byte counts, and failures; a top-level `mmds` object for
+implemented guest MMDS packet detour and response queue activity; a top-level
+`vsock` object for implemented virtio-vsock RX/TX queue activity, packet
+counts, byte counts, connection cleanup counters, and classifiable queue/event
+failures; a top-level `entropy` object with Firecracker-shaped counters for
+implemented virtio-rng request, byte, host-randomness failure, and event-failure
+activity; a
 top-level `uart` object with Firecracker-shaped serial counters for implemented
 TX writes, missed writes, output errors, and rate-limiter drops; a top-level
 `signals` object with `sigpipe` counts for handled non-terminating `SIGPIPE`;
