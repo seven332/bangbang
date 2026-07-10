@@ -2939,16 +2939,16 @@ fn executable_fails_when_api_socket_path_exists_without_removing_it() {
 
 #[test]
 fn concurrent_executables_keep_api_resources_isolated() {
-    let first_dir = TestDir::new();
-    let second_dir = TestDir::new();
-    let first_socket_path = first_dir.path().join("api.socket");
-    let second_socket_path = second_dir.path().join("api.socket");
-    let first_metadata_path = first_dir.path().join("metadata.json");
-    let second_metadata_path = second_dir.path().join("metadata.json");
-    let first_metrics_path = first_dir.path().join("startup.metrics");
-    let second_metrics_path = second_dir.path().join("startup.metrics");
-    let first_instance_id = first_dir.instance_id();
-    let second_instance_id = second_dir.instance_id();
+    let test_dir = TestDir::new();
+    let first_socket_path = test_dir.path().join("first-api.socket");
+    let second_socket_path = test_dir.path().join("second-api.socket");
+    let first_metadata_path = test_dir.path().join("first-metadata.json");
+    let second_metadata_path = test_dir.path().join("second-metadata.json");
+    let first_metrics_path = test_dir.path().join("first-startup.metrics");
+    let second_metrics_path = test_dir.path().join("second-startup.metrics");
+    let instance_id = test_dir.instance_id();
+    let first_instance_id = format!("{instance_id}-first");
+    let second_instance_id = format!("{instance_id}-second");
     fs::write(
         &first_metadata_path,
         r#"{"latest":{"meta-data":{"ami-id":"ami-first"},"user-data":"first-user-data"}}"#,
@@ -3041,10 +3041,27 @@ fn concurrent_executables_keep_api_resources_isolated() {
         "second bangbang",
     );
 
-    let first_output = first_bangbang.terminate();
-    let second_output = second_bangbang.terminate();
-    assert_clean_shutdown(first_output, &first_socket_path, "first bangbang");
-    assert_clean_shutdown(second_output, &second_socket_path, "second bangbang");
+    assert_clean_shutdown(
+        first_bangbang.terminate(),
+        &first_socket_path,
+        "first bangbang",
+    );
+    assert!(
+        second_socket_path.exists(),
+        "first bangbang shutdown should not remove the second API socket"
+    );
+    assert_instance_info_matches(
+        &second_socket_path,
+        &second_instance_id,
+        &first_instance_id,
+        "second bangbang after first shutdown",
+    );
+
+    assert_clean_shutdown(
+        second_bangbang.terminate(),
+        &second_socket_path,
+        "second bangbang",
+    );
 }
 
 fn write_rejected_drive_socket_config(
