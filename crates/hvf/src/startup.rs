@@ -70,7 +70,7 @@ use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
 use crate::runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
-use crate::vcpu::HvfArm64BootRegisters;
+use crate::vcpu::{HvfArm64BootRegisters, HvfArm64VcpuGeneralRegisterState};
 
 const SINGLE_VCPU_COUNT: u8 = 1;
 const BLOCK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME: &str = "bangbang-hvf-block-retry-wakeup";
@@ -1163,6 +1163,16 @@ impl HvfArm64BootSession<'_> {
         self.boot_registers
     }
 
+    /// Capture X0-X30, PC, and CPSR on the primary vCPU's owner thread.
+    ///
+    /// This is runner plumbing for later lease-owned orchestration. It does not
+    /// establish snapshot readiness or return complete restorable vCPU state.
+    pub fn capture_arm64_general_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_general_register_state()
+    }
+
     /// Run the boot session's primary vCPU once with runner-thread MMIO handling.
     ///
     /// This is runner-loop plumbing. It does not dispatch boot block or
@@ -1708,6 +1718,16 @@ impl OwnedHvfArm64BootSession {
 
     pub const fn boot_registers(&self) -> HvfArm64BootRegisters {
         self.boot_registers
+    }
+
+    /// Capture X0-X30, PC, and CPSR on the primary vCPU's owner thread.
+    ///
+    /// This is runner plumbing for later lease-owned orchestration. It does not
+    /// establish snapshot readiness or return complete restorable vCPU state.
+    pub fn capture_arm64_general_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_general_register_state()
     }
 
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {

@@ -17,7 +17,10 @@ use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
     PsciCall, PsciCallAction, call_uses_arg0, handle_call as handle_psci_call, not_supported_result,
 };
-use crate::vcpu::{HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpuOwner};
+use crate::vcpu::{
+    HvfArm64BootRegisters, HvfArm64VcpuGeneralRegisterState, HvfRegister, HvfSystemRegister,
+    HvfVcpuOwner, capture_arm64_vcpu_general_register_state_with,
+};
 
 const RUNNER_SHUT_DOWN_MESSAGE: &str = "vCPU runner is shut down";
 const RUNNER_SHUTTING_DOWN_MESSAGE: &str = "vCPU runner shutdown is already in progress";
@@ -32,6 +35,8 @@ const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
     "vCPU runner boot registers are already configured";
 const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
 const METADATA_READ_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has metadata read in flight";
+const GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE: &str =
+    "vCPU runner already has general-register capture in flight";
 const VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has virtual timer mask operation in flight";
 const GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE: &str =
@@ -196,6 +201,7 @@ struct RunnerHandleState {
     mmio_dispatch_in_flight: bool,
     boot_register_setup_in_flight: bool,
     metadata_read_in_flight: bool,
+    general_register_capture_in_flight: bool,
     vtimer_mask_operation_in_flight: bool,
     gic_ppi_pending_operation_in_flight: bool,
     boot_register_setup_failed: bool,
@@ -222,6 +228,10 @@ enum RunnerCommand {
     },
     ReadMpidrEl1 {
         response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    },
+    CaptureArm64GeneralRegisterState {
+        admission: InFlightGeneralRegisterCapture,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError>>,
     },
     GetVtimerMask {
         response_sender: mpsc::Sender<Result<bool, HvfVcpuRunnerError>>,
@@ -267,6 +277,11 @@ trait RunnerVcpu {
         Err(BackendError::InvalidState(
             "vCPU does not support general register writes",
         ))
+    }
+    fn capture_arm64_general_register_state(
+        &mut self,
+    ) -> Result<HvfArm64VcpuGeneralRegisterState, BackendError> {
+        capture_arm64_vcpu_general_register_state_with(|register| self.read_register(register))
     }
     fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
         Err(BackendError::InvalidState(
@@ -473,6 +488,21 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
+    /// Capture X0-X30, PC, and CPSR on the vCPU-owning runner thread.
+    ///
+    /// This value is a read-only architectural subset for later snapshot
+    /// orchestration, not a complete or serialized vCPU state.
+    pub fn capture_arm64_general_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_general_register_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
     /// Read the HVF virtual timer mask on the vCPU-owning runner thread.
     pub fn get_vtimer_mask(&self) -> Result<bool, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
@@ -559,6 +589,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 mmio_dispatch_in_flight: false,
                 boot_register_setup_in_flight: false,
                 metadata_read_in_flight: false,
+                general_register_capture_in_flight: false,
                 vtimer_mask_operation_in_flight: false,
                 gic_ppi_pending_operation_in_flight: false,
                 boot_register_setup_failed: false,
@@ -599,6 +630,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.metadata_read_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.general_register_capture_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.vtimer_mask_operation_in_flight {
@@ -666,6 +702,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.general_register_capture_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+            ));
+        }
         if state.vtimer_mask_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
@@ -724,6 +765,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.metadata_read_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.general_register_capture_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.vtimer_mask_operation_in_flight {
@@ -788,6 +834,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.metadata_read_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.general_register_capture_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.vtimer_mask_operation_in_flight {
@@ -864,6 +915,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.general_register_capture_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+            ));
+        }
         if state.vtimer_mask_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
@@ -888,6 +944,72 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
 
         Ok(InFlightMetadataRead::new(&self.state))
+    }
+
+    fn start_arm64_general_register_capture(
+        &self,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        // Capture admission follows queued owner-thread work rather than the
+        // caller's response lifetime, so abandoning the response cannot admit
+        // cancellation while register reads are still active.
+        let admission = {
+            let mut state = self.lock_state()?;
+            if state.thread.is_none() {
+                return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+            }
+            if state.shutting_down {
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    RUNNER_SHUTTING_DOWN_MESSAGE,
+                ));
+            }
+            if state.in_flight_runs > 0 {
+                return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+            }
+            if state.mmio_dispatch_in_flight {
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+                ));
+            }
+            if state.boot_register_setup_in_flight {
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+                ));
+            }
+            if state.metadata_read_in_flight {
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    METADATA_READ_IN_FLIGHT_MESSAGE,
+                ));
+            }
+            if state.general_register_capture_in_flight {
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                ));
+            }
+            if state.vtimer_mask_operation_in_flight {
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+                ));
+            }
+            if state.gic_ppi_pending_operation_in_flight {
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
+                ));
+            }
+
+            state.general_register_capture_in_flight = true;
+            InFlightGeneralRegisterCapture::new(&self.state)
+        };
+
+        // The state lock is deliberately released before send: if the command
+        // channel is closed, dropping the unsent command can reacquire that
+        // lock through its admission guard and restore the capture bit.
+        self.command_sender
+            .send(RunnerCommand::CaptureArm64GeneralRegisterState {
+                admission,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
     }
 
     fn start_get_vtimer_mask(
@@ -946,6 +1068,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.general_register_capture_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+            ));
+        }
         if state.vtimer_mask_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
@@ -1001,6 +1128,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.general_register_capture_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+            ));
+        }
         if state.vtimer_mask_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
@@ -1045,6 +1177,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.metadata_read_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.general_register_capture_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.vtimer_mask_operation_in_flight {
@@ -1110,6 +1247,11 @@ fn prepare_cancel(
             METADATA_READ_IN_FLIGHT_MESSAGE,
         ));
     }
+    if state.general_register_capture_in_flight {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+        ));
+    }
     if state.vtimer_mask_operation_in_flight {
         return Err(HvfVcpuRunnerError::InvalidState(
             VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
@@ -1154,6 +1296,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.mmio_dispatch_in_flight,
                 state.boot_register_setup_in_flight,
                 state.metadata_read_in_flight,
+                state.general_register_capture_in_flight,
                 state.vtimer_mask_operation_in_flight,
                 state.gic_ppi_pending_operation_in_flight,
                 state.boot_register_setup_failed,
@@ -1170,6 +1313,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 mmio_dispatch_in_flight,
                 boot_register_setup_in_flight,
                 metadata_read_in_flight,
+                general_register_capture_in_flight,
                 vtimer_mask_operation_in_flight,
                 gic_ppi_pending_operation_in_flight,
                 boot_register_setup_failed,
@@ -1186,6 +1330,10 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                     &boot_register_setup_in_flight,
                 )
                 .field("metadata_read_in_flight", &metadata_read_in_flight)
+                .field(
+                    "general_register_capture_in_flight",
+                    &general_register_capture_in_flight,
+                )
                 .field(
                     "vtimer_mask_operation_in_flight",
                     &vtimer_mask_operation_in_flight,
@@ -1308,6 +1456,34 @@ impl Drop for InFlightMetadataRead {
         if let Ok(mut state) = self.state.lock() {
             state.metadata_read_in_flight = false;
         }
+    }
+}
+
+/// Command-owned admission for one general-register capture.
+struct InFlightGeneralRegisterCapture {
+    state: Option<RunnerState>,
+}
+
+impl InFlightGeneralRegisterCapture {
+    fn new(state: &RunnerState) -> Self {
+        Self {
+            state: Some(Arc::clone(state)),
+        }
+    }
+
+    fn release(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        if let Ok(mut state) = state.lock() {
+            state.general_register_capture_in_flight = false;
+        }
+    }
+}
+
+impl Drop for InFlightGeneralRegisterCapture {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -1446,6 +1622,19 @@ fn run_runner_thread<C, V>(
             }
             RunnerCommand::ReadMpidrEl1 { response_sender } => {
                 let result = vcpu.mpidr_el1().map_err(HvfVcpuRunnerError::Backend);
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::CaptureArm64GeneralRegisterState {
+                mut admission,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .capture_arm64_general_register_state()
+                    .map_err(HvfVcpuRunnerError::Backend);
+                // The last owner-thread read has finished. Restore admission
+                // before responding so even a dropped receiver is not part of
+                // the capture lifetime.
+                admission.release();
                 let _ = response_sender.send(result);
             }
             RunnerCommand::GetVtimerMask { response_sender } => {
@@ -1659,7 +1848,7 @@ mod tests {
     };
     use crate::gic::HvfGicError;
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
-    use crate::vcpu::{HvfArm64BootRegisters, HvfRegister};
+    use crate::vcpu::{HvfArm64BootRegisters, HvfArm64VcpuGeneralRegisterState, HvfRegister};
 
     const ESR_EC_HVC: u64 = 0x16;
     const ESR_EC_SYS64: u64 = 0x18;
@@ -1719,6 +1908,26 @@ mod tests {
         entered_read_sender: mpsc::Sender<()>,
         release_read_receiver: mpsc::Receiver<Result<u64, BackendError>>,
     }
+
+    struct GeneralRegisterCaptureRecordingVcpu {
+        read_sender: mpsc::Sender<HvfRegister>,
+        fail_next_register: Option<HvfRegister>,
+    }
+
+    struct BlockingGeneralRegisterCaptureVcpu {
+        entered_capture_sender: mpsc::Sender<()>,
+        release_capture_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnGeneralRegisterCaptureVcpu;
+
+    type BlockingGeneralRegisterCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
 
     struct VtimerMaskRecordingVcpu {
         masked: bool,
@@ -2101,6 +2310,131 @@ mod tests {
             self.release_read_receiver
                 .recv()
                 .map_err(|_| BackendError::InvalidState("fake MPIDR release sender closed"))?
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for GeneralRegisterCaptureRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            self.read_sender
+                .send(register)
+                .map_err(|_| BackendError::InvalidState("fake register-read receiver closed"))?;
+            if self.fail_next_register == Some(register) {
+                self.fail_next_register = None;
+                Err(BackendError::InvalidState(
+                    "fake general-register capture failed",
+                ))
+            } else {
+                Ok(0x1000 + u64::from(register.raw()))
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingGeneralRegisterCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            if register == HvfRegister::X0 {
+                self.entered_capture_sender.send(()).map_err(|_| {
+                    BackendError::InvalidState("fake capture entry receiver closed")
+                })?;
+                self.release_capture_receiver.recv().map_err(|_| {
+                    BackendError::InvalidState("fake capture release sender closed")
+                })??;
+            }
+
+            Ok(0x1000 + u64::from(register.raw()))
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnGeneralRegisterCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_register(&mut self, _register: HvfRegister) -> Result<u64, BackendError> {
+            panic!("fake general-register capture panic");
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -2976,6 +3310,47 @@ mod tests {
         )
     }
 
+    fn start_general_register_capture_recording_runner(
+        fail_next_register: Option<HvfRegister>,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<HvfRegister>) {
+        let (read_sender, read_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(GeneralRegisterCaptureRecordingVcpu {
+                read_sender,
+                fail_next_register,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            read_receiver,
+        )
+    }
+
+    fn start_blocking_general_register_capture_runner() -> BlockingGeneralRegisterCaptureRunner {
+        let (entered_capture_sender, entered_capture_receiver) = mpsc::channel();
+        let (release_capture_sender, release_capture_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingGeneralRegisterCaptureVcpu {
+                entered_capture_sender,
+                release_capture_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_capture_receiver,
+            release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
     fn start_vtimer_mask_recording_runner(
         masked: bool,
         fail_next_get: bool,
@@ -3092,6 +3467,250 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<super::HvfVcpuRunCancelHandle>();
+        assert_send_sync::<HvfArm64VcpuGeneralRegisterState>();
+    }
+
+    #[test]
+    fn captures_arm64_general_register_state_on_runner_thread() {
+        let (runner, read_receiver) = start_general_register_capture_recording_runner(None);
+
+        let state = runner
+            .capture_arm64_general_register_state()
+            .expect("general-register capture should succeed");
+
+        assert_eq!(state.general_purpose_registers().len(), 31);
+        assert_eq!(state.general_purpose_register(0), Some(0x1000));
+        assert_eq!(state.general_purpose_register(30), Some(0x101e));
+        assert_eq!(state.general_purpose_register(31), None);
+        assert_eq!(state.pc(), 0x1000 + u64::from(HvfRegister::PC.raw()));
+        assert_eq!(state.cpsr(), 0x1000 + u64::from(HvfRegister::CPSR.raw()));
+        assert_eq!(
+            read_receiver.try_iter().collect::<Vec<_>>(),
+            (0_u8..31)
+                .map(|index| {
+                    HvfRegister::general_purpose(index).expect("X0-X30 should map to registers")
+                })
+                .chain([HvfRegister::PC, HvfRegister::CPSR])
+                .collect::<Vec<_>>()
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_arm64_general_register_capture_can_be_retried_without_stale_state() {
+        let (runner, read_receiver) =
+            start_general_register_capture_recording_runner(Some(HvfRegister::X2));
+
+        assert_eq!(
+            runner.capture_arm64_general_register_state(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake general-register capture failed"
+            )))
+        );
+        assert_eq!(
+            read_receiver.try_iter().collect::<Vec<_>>(),
+            vec![HvfRegister::X0, HvfRegister::X1, HvfRegister::X2]
+        );
+
+        let state = runner
+            .capture_arm64_general_register_state()
+            .expect("general-register capture retry should succeed");
+        assert_eq!(state.general_purpose_register(2), Some(0x1002));
+        assert_eq!(read_receiver.try_iter().count(), 33);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn commands_during_arm64_general_register_capture_are_rejected_without_queueing() {
+        let (runner, entered_capture_receiver, release_capture_sender, _barrier_receiver) =
+            start_blocking_general_register_capture_runner();
+
+        thread::scope(|scope| {
+            let capture = scope.spawn(|| runner.capture_arm64_general_register_state());
+            entered_capture_receiver
+                .recv()
+                .expect("runner should enter fake general-register capture");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
+            assert_eq!(
+                runner.capture_arm64_general_register_state(),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_eq!(runner.get_vtimer_mask(), Err(expected.clone()));
+            assert_eq!(runner.set_vtimer_mask(false), Err(expected.clone()));
+            assert_eq!(runner.set_gic_ppi_pending(27), Err(expected.clone()));
+            assert_eq!(runner.clear_gic_ppi_pending(27), Err(expected.clone()));
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_capture_sender
+                .send(Ok(()))
+                .expect("general-register capture release should be sent");
+            let state = capture
+                .join()
+                .expect("general-register capture thread should join")
+                .expect("general-register capture should succeed");
+            assert_eq!(state.general_purpose_register(30), Some(0x101e));
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_arm64_general_register_capture_admitted_until_command_finishes() {
+        let (runner, entered_capture_receiver, release_capture_sender, barrier_receiver) =
+            start_blocking_general_register_capture_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_general_register_capture(response_sender)
+                .expect("general-register capture should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_capture_receiver
+            .recv()
+            .expect("runner should enter fake general-register capture");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::GENERAL_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind capture");
+        release_capture_sender
+            .send(Ok(()))
+            .expect("general-register capture release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after capture");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn arm64_general_register_capture_send_failure_releases_admission() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.capture_arm64_general_register_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .general_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_arm64_general_register_capture_panic() {
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnGeneralRegisterCaptureVcpu));
+
+        assert_eq!(
+            runner.capture_arm64_general_register_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn arm64_general_register_capture_after_shutdown_is_rejected() {
+        let (runner, _read_receiver) = start_general_register_capture_recording_runner(None);
+
+        runner.shutdown().expect("runner should shut down");
+
+        assert_eq!(
+            runner.capture_arm64_general_register_state(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+    }
+
+    #[test]
+    fn arm64_general_register_capture_during_shutdown_is_rejected() {
+        let (runner, _, destroyed_receiver) = start_fake_runner();
+        let (command_sender, should_cancel) = runner
+            .prepare_shutdown()
+            .expect("first shutdown should be prepared");
+
+        assert!(!should_cancel);
+        assert_eq!(
+            runner.capture_arm64_general_register_state(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+
+        let thread = runner
+            .take_thread()
+            .expect("runner state should be lockable");
+        let (response_sender, response_receiver) = mpsc::channel();
+        command_sender
+            .send(super::RunnerCommand::Shutdown { response_sender })
+            .expect("shutdown command should be sent");
+        assert_eq!(
+            response_receiver
+                .recv()
+                .expect("shutdown response should be sent"),
+            Ok(())
+        );
+        super::join_runner_thread(thread).expect("runner thread should join");
+        runner.finish_shutdown();
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
     }
 
     #[test]
@@ -3172,6 +3791,12 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake vtimer mask read");
 
+            assert_eq!(
+                runner.capture_arm64_general_register_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
             assert_eq!(
                 runner.get_vtimer_mask(),
                 Err(HvfVcpuRunnerError::InvalidState(
@@ -3351,6 +3976,12 @@ mod tests {
                 .expect("runner should enter fake GIC PPI pending operation");
 
             assert_eq!(
+                runner.capture_arm64_general_register_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
                 runner.set_gic_ppi_pending(27),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
@@ -3457,6 +4088,12 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake MPIDR read");
 
+            assert_eq!(
+                runner.capture_arm64_general_register_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
             assert_eq!(
                 runner.mpidr_el1(),
                 Err(HvfVcpuRunnerError::InvalidState(
@@ -5199,6 +5836,12 @@ mod tests {
                 .expect("runner should enter fake run");
 
             assert_eq!(
+                runner.capture_arm64_general_register_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
                 runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::RUN_IN_FLIGHT_MESSAGE
@@ -5238,6 +5881,12 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake setup");
 
+            assert_eq!(
+                runner.capture_arm64_general_register_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
             assert_eq!(
                 runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
                 Err(HvfVcpuRunnerError::InvalidState(
@@ -5308,6 +5957,12 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake MMIO dispatch");
 
+            assert_eq!(
+                runner.capture_arm64_general_register_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
+            );
             assert_eq!(
                 runner.dispatch_mmio_access(access, shared_dispatcher()),
                 Err(HvfVcpuRunnerError::InvalidState(

@@ -34,7 +34,7 @@ ownership on separate threads:
 | --- | --- |
 | Process owner | `ProcessVmm` owns the VMM controller, startup executor, and active `BootRunLoopSupervisor` handle. It serves API requests and commits public instance-state transitions, but it does not own the live boot session after startup. |
 | Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy state, and block and entropy retry schedulers. Device-update commands execute here. |
-| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes thread-affine HVF operations through commands, but it has no architectural-state capture command today. |
+| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes thread-affine HVF operations through commands and can return an immutable X0-X30, PC, and CPSR subset through one owner-thread command. The snapshot barrier does not invoke it, and the remaining architectural inventory is not implemented. |
 | Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. The snapshot barrier can temporarily quiesce the block and entropy schedulers. The vmnet interface, vsock listener, retained streams, and their host/kernel buffers remain open for the lifetime of the boot session. A transient vsock polling thread is joined at the end of each vCPU run step. |
 
 A successful public pause has a narrower boundary than a snapshot needs:
@@ -64,6 +64,14 @@ this is not a frozen runtime boundary. In particular:
 
 The current pause path does not capture vCPU, GIC, device, or guest-memory state
 and does not transfer ownership of any live resource.
+
+The HVF crate now has a narrower runner-local building block: one command reads
+X0-X30, PC, and CPSR in architectural order on the owning thread and returns a
+detached immutable value only after every read succeeds. Dedicated command-owned
+admission excludes runs, MMIO completion, boot setup, metadata, virtual-timer,
+GIC PPI, cancellation, and shutdown until capture finishes, including when the
+caller abandons its response. This command is not called by the public pause or
+snapshot-create paths and is not complete restorable vCPU state.
 
 Paused snapshot create now exercises the first lease-based ownership
 foundation. A separate admission cell atomically reserves snapshot preparation
@@ -236,9 +244,10 @@ tested:
   process-owner mutations, auxiliary wakeups, or terminal teardown.
 - Guest-memory file model: bangbang needs explicit ownership, layout, copy or
   mapping rules, and failure behavior for memory snapshot files.
-- HVF vCPU state capture: all required general, system, SIMD/FP, timer, pending
-  interrupt, and optional architecture state must be inventoried and restored on
-  the owning thread.
+- HVF vCPU state capture: the first X0-X30, PC, and CPSR owner-thread capture
+  subset is available, but system, SIMD/FP, timer, pending-interrupt, and other
+  optional architecture state still needs a full inventory, and every captured
+  field still needs a restore path on the owning thread.
 - Interrupt-controller state: GIC distributor, redistributor, and CPU interface
   state must have a versioned restore plan before interrupt delivery can be
   considered compatible.
@@ -263,7 +272,7 @@ API behavior until all of its prerequisites exist.
 | --- | --- | --- |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence (block and entropy implemented) | #1162 adds acknowledged RAII quiescence for the existing block and entropy limiter retry schedulers, waits for in-flight publication, preserves absolute deadlines, drains and defers pending tokens, and keeps stop terminal. Periodic work and any later wakeup scheduler remain deferred. | Deterministic scheduler concurrency tests and supervisor lease-order tests; signed lifecycle coverage remains follow-up work. |
-| Runner capture boundary | Add a typed runner command for the first vCPU architectural-state inventory without exposing raw HVF ownership. | Runner command/conflict unit tests and signed HVF get/set round trips. |
+| Runner capture boundary (first subset implemented) | #1164 adds a typed immutable X0-X30, PC, and CPSR value plus one serialized owner-thread command with command-owned failure-atomic admission. Borrowed and owned HVF boot sessions expose it, but the snapshot lease does not invoke it. System registers, SIMD/FP, full timer and interrupt state, restore, and multi-vCPU coordination remain deferred. | Deterministic runner command/conflict/failure tests and signed HVF known boot-register capture. |
 | GIC and device state | Inventory GIC ownership and add stable state models for each implemented MMIO device. | Per-device round-trip unit tests and signed HVF interrupt-state coverage. |
 | Full guest-memory capture | Define immutable capture ownership, full-memory file layout, error cleanup, and path-redaction behavior before considering diff snapshots. | Memory/file unit tests, process failure tests, and signed full-capture coverage. |
 | External resource policy | Define disk, vmnet, and vsock metadata, buffering boundary, disconnect/reconnect behavior, and restore overrides. | Resource-policy unit/process tests and focused signed network/vsock coverage. |

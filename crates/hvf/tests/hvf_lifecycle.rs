@@ -122,6 +122,50 @@ fn configures_hvf_vcpu_arm64_boot_registers() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_configured_arm64_general_registers_on_runner_thread() {
+    use bangbang_hvf::{ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfBackend};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::GuestAddress;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let registers = HvfArm64BootRegisters {
+        kernel_entry: GuestAddress::new(0x8028_0000),
+        fdt_address: GuestAddress::new(0x8fe0_0000),
+    };
+
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(registers)
+            .expect("boot registers should be configured");
+
+        let state = runner
+            .capture_arm64_general_register_state()
+            .expect("general-register state should be captured");
+        assert_eq!(state.general_purpose_registers().len(), 31);
+        assert_eq!(
+            state.general_purpose_register(0),
+            Some(registers.fdt_address.raw_value())
+        );
+        assert_eq!(state.general_purpose_register(1), Some(0));
+        assert_eq!(state.general_purpose_register(2), Some(0));
+        assert_eq!(state.general_purpose_register(3), Some(0));
+        assert_eq!(state.pc(), registers.kernel_entry.raw_value());
+        assert_eq!(state.cpsr(), ARM64_LINUX_BOOT_CPSR);
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn creates_hvf_gic_before_vcpu() {
     use bangbang_hvf::{HvfBackend, HvfGicMetadata};
     use bangbang_runtime::VmBackend;
@@ -269,7 +313,7 @@ fn maps_guest_memory_and_unmaps_before_destroying_vm() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn prepares_internal_hvf_arm64_boot_session() {
-    use bangbang_hvf::{HvfArm64BootSessionConfig, HvfBackend};
+    use bangbang_hvf::{ARM64_LINUX_BOOT_CPSR, HvfArm64BootSessionConfig, HvfBackend};
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::BlockMmioLayout;
     use bangbang_runtime::boot::BootSourceConfigInput;
@@ -416,6 +460,18 @@ fn prepares_internal_hvf_arm64_boot_session() {
         session.boot_registers().fdt_address,
         session.runtime_resources().fdt.address
     );
+    let register_state = session
+        .capture_arm64_general_register_state()
+        .expect("internal session should capture general-register state");
+    assert_eq!(
+        register_state.general_purpose_register(0),
+        Some(session.boot_registers().fdt_address.raw_value())
+    );
+    assert_eq!(
+        register_state.pc(),
+        session.boot_registers().kernel_entry.raw_value()
+    );
+    assert_eq!(register_state.cpsr(), ARM64_LINUX_BOOT_CPSR);
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();
@@ -447,7 +503,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn prepares_owned_hvf_arm64_boot_session() {
-    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+    use bangbang_hvf::{
+        ARM64_LINUX_BOOT_CPSR, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+    };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::BlockMmioLayout;
     use bangbang_runtime::boot::BootSourceConfigInput;
@@ -521,6 +579,18 @@ fn prepares_owned_hvf_arm64_boot_session() {
         session.boot_registers().fdt_address,
         session.runtime_resources().fdt.address
     );
+    let register_state = session
+        .capture_arm64_general_register_state()
+        .expect("owned session should capture general-register state");
+    assert_eq!(
+        register_state.general_purpose_register(0),
+        Some(session.boot_registers().fdt_address.raw_value())
+    );
+    assert_eq!(
+        register_state.pc(),
+        session.boot_registers().kernel_entry.raw_value()
+    );
+    assert_eq!(register_state.cpsr(), ARM64_LINUX_BOOT_CPSR);
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();

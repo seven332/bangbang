@@ -1637,7 +1637,11 @@ run-loop now handles virtual timer exits by asserting the EL1 virtual timer PPI
 through that runner-thread command. Full timer delivery policy, including how to
 detect EOI/deactivation and unmask the HVF virtual timer, remains future work.
 These commands reject overlapping metadata reads, runs, boot-register setup,
-MMIO dispatches, virtual timer mask operations, or GIC PPI pending operations.
+MMIO dispatches, general-register capture, virtual timer mask operations, or
+GIC PPI pending operations. The general-register capture command returns only
+after X0-X30, PC, and CPSR have all been read, and both borrowed and owned HVF
+boot sessions expose it for later lease-owned orchestration. The process
+snapshot barrier does not invoke it.
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared
 MMIO dispatcher, so a
@@ -1935,7 +1939,7 @@ Their eventual support level should follow the endpoint matrix:
 - full logger integration, and full Firecracker metrics counters beyond the
   currently implemented minimal metrics subset
 - memory hotplug
-- full multi-vCPU pause coordination, HVF vCPU state capture, and
+- full multi-vCPU pause coordination, complete HVF vCPU state capture/restore, and
   snapshot-ready paused ownership beyond the current supervisor plus block and
   entropy retry-scheduler barrier
 - PATCH and DELETE hotplug/update behavior
@@ -1961,7 +1965,9 @@ macOS design work instead of direct implementation:
   single resolved MMIO exit dispatch/completion, and the single primary arm64
   Linux boot-register setup. The current runner skeleton creates a vCPU on a
   dedicated thread, applies that boot-register setup on the owning thread before
-  the first run, gets and sets the HVF virtual timer mask on that owning thread,
+  the first run, can capture a detached X0-X30, PC, and CPSR subset through one
+  owner-thread command, gets and sets the HVF virtual timer mask on that owning
+  thread,
   explicitly dispatches one resolved MMIO access through a shared runtime
   dispatcher on the owning thread, runs once and handles a resulting
   MMIO exit through that dispatcher, supports one cancellable
@@ -1986,7 +1992,8 @@ macOS design work instead of direct implementation:
 - Firecracker's full paused/resumed microVM loop is not implemented yet. The
   current `PATCH /vm` support pauses the process-owned single boot-worker
   scheduler between bounded run-loop windows, while multi-vCPU coordination,
-  HVF state capture, and snapshot-ready paused ownership remain deferred.
+  complete HVF state capture/restore, capture orchestration, and snapshot-ready
+  paused ownership remain deferred.
 - Device-facing interrupt triggers are backend-neutral runtime state today, and
   HVF interrupt-line support can allocate deterministic SPI lines from GIC
   metadata and set validated SPI levels through `hv_gic_set_spi`. Internal boot
