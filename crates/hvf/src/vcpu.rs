@@ -62,6 +62,52 @@ impl HvfArm64VcpuGeneralRegisterState {
     }
 }
 
+/// Detached raw core system-register state captured from one arm64 vCPU.
+///
+/// This stack and exception-return subset contains `SP_EL0`, `SP_EL1`,
+/// `ELR_EL1`, and `SPSR_EL1`. The values are unvalidated observations for later
+/// owner-thread orchestration, not a complete or serialized restorable vCPU
+/// state. The wider system-register, SIMD/FP, and interrupt inventories remain
+/// outside this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuCoreSystemRegisterState {
+    sp_el0: u64,
+    sp_el1: u64,
+    elr_el1: u64,
+    spsr_el1: u64,
+}
+
+impl HvfArm64VcpuCoreSystemRegisterState {
+    pub(crate) const fn new(sp_el0: u64, sp_el1: u64, elr_el1: u64, spsr_el1: u64) -> Self {
+        Self {
+            sp_el0,
+            sp_el1,
+            elr_el1,
+            spsr_el1,
+        }
+    }
+
+    /// Return the raw `SP_EL0` value.
+    pub const fn sp_el0(self) -> u64 {
+        self.sp_el0
+    }
+
+    /// Return the raw `SP_EL1` value.
+    pub const fn sp_el1(self) -> u64 {
+        self.sp_el1
+    }
+
+    /// Return the raw `ELR_EL1` value.
+    pub const fn elr_el1(self) -> u64 {
+        self.elr_el1
+    }
+
+    /// Return the raw `SPSR_EL1` value.
+    pub const fn spsr_el1(self) -> u64 {
+        self.spsr_el1
+    }
+}
+
 /// Detached raw virtual-timer state captured from one arm64 vCPU.
 ///
 /// The offset is the Hypervisor.framework value used in its
@@ -143,6 +189,7 @@ impl HvfSystemRegister {
     pub const MPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MPIDR_EL1);
     pub const SPSR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SPSR_EL1);
     pub const ELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ELR_EL1);
+    pub const SP_EL0: Self = Self(crate::ffi::HV_SYS_REG_SP_EL0);
     pub const CNTV_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CTL_EL0);
     pub const CNTV_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CVAL_EL0);
     pub const SP_EL1: Self = Self(crate::ffi::HV_SYS_REG_SP_EL1);
@@ -496,6 +543,19 @@ pub(crate) fn capture_arm64_vcpu_general_register_state_with(
     })
 }
 
+pub(crate) fn capture_arm64_vcpu_core_system_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuCoreSystemRegisterState, BackendError> {
+    let sp_el0 = get_system_register(HvfSystemRegister::SP_EL0)?;
+    let sp_el1 = get_system_register(HvfSystemRegister::SP_EL1)?;
+    let elr_el1 = get_system_register(HvfSystemRegister::ELR_EL1)?;
+    let spsr_el1 = get_system_register(HvfSystemRegister::SPSR_EL1)?;
+
+    Ok(HvfArm64VcpuCoreSystemRegisterState::new(
+        sp_el0, sp_el1, elr_el1, spsr_el1,
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn capture_arm64_vcpu_virtual_timer_state_with(
     get_mask: impl FnOnce() -> Result<bool, BackendError>,
@@ -530,6 +590,7 @@ mod tests {
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfRegister,
         HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
+        capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_general_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with, configure_arm64_boot_registers_with,
     };
@@ -794,6 +855,88 @@ mod tests {
             .expect("general-register capture retry should succeed");
         assert_eq!(state.general_purpose_register(2), Some(2));
         assert_eq!(reads.borrow().len(), 33);
+    }
+
+    #[test]
+    fn captures_arm64_core_system_register_state_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_core_system_register_state_with(|register| {
+            reads.push(register);
+            Ok(0x1_0000 + u64::from(register.raw()))
+        })
+        .expect("core system-register capture should succeed");
+
+        assert_eq!(
+            reads,
+            [
+                HvfSystemRegister::SP_EL0,
+                HvfSystemRegister::SP_EL1,
+                HvfSystemRegister::ELR_EL1,
+                HvfSystemRegister::SPSR_EL1,
+            ]
+        );
+        assert_eq!(
+            state.sp_el0(),
+            0x1_0000 + u64::from(HvfSystemRegister::SP_EL0.raw())
+        );
+        assert_eq!(
+            state.sp_el1(),
+            0x1_0000 + u64::from(HvfSystemRegister::SP_EL1.raw())
+        );
+        assert_eq!(
+            state.elr_el1(),
+            0x1_0000 + u64::from(HvfSystemRegister::ELR_EL1.raw())
+        );
+        assert_eq!(
+            state.spsr_el1(),
+            0x1_0000 + u64::from(HvfSystemRegister::SPSR_EL1.raw())
+        );
+    }
+
+    #[test]
+    fn arm64_core_system_register_capture_stops_after_each_error_and_can_retry() {
+        let registers = [
+            HvfSystemRegister::SP_EL0,
+            HvfSystemRegister::SP_EL1,
+            HvfSystemRegister::ELR_EL1,
+            HvfSystemRegister::SPSR_EL1,
+        ];
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake system register read failed",
+                    ))
+                } else {
+                    Ok(u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_core_system_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake system register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_core_system_register_state_with(&read_system_register)
+                .expect("core system-register capture retry should succeed");
+            assert_eq!(state.sp_el0(), u64::from(HvfSystemRegister::SP_EL0.raw()));
+            assert_eq!(state.sp_el1(), u64::from(HvfSystemRegister::SP_EL1.raw()));
+            assert_eq!(state.elr_el1(), u64::from(HvfSystemRegister::ELR_EL1.raw()));
+            assert_eq!(
+                state.spsr_el1(),
+                u64::from(HvfSystemRegister::SPSR_EL1.raw())
+            );
+            assert_eq!(*reads.borrow(), registers);
+        }
     }
 
     #[test]

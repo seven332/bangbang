@@ -71,7 +71,8 @@ use crate::runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 use crate::vcpu::{
-    HvfArm64BootRegisters, HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuVirtualTimerState,
+    HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuGeneralRegisterState,
+    HvfArm64VcpuVirtualTimerState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1175,6 +1176,17 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_general_register_state()
     }
 
+    /// Capture raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values on the primary
+    /// vCPU owner thread.
+    ///
+    /// This is runner plumbing for later lease-owned orchestration. It omits
+    /// the wider system-register, SIMD/FP, interrupt, and restore inventories.
+    pub fn capture_arm64_core_system_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuCoreSystemRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_core_system_register_state()
+    }
+
     /// Capture raw virtual-timer mask, offset, control, and compare state on the
     /// primary vCPU owner thread.
     ///
@@ -1742,6 +1754,17 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_general_register_state()
+    }
+
+    /// Capture raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values on the primary
+    /// vCPU owner thread.
+    ///
+    /// This is runner plumbing for later lease-owned orchestration. It omits
+    /// the wider system-register, SIMD/FP, interrupt, and restore inventories.
+    pub fn capture_arm64_core_system_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuCoreSystemRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_core_system_register_state()
     }
 
     /// Capture raw virtual-timer mask, offset, control, and compare state on the
