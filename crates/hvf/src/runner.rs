@@ -247,6 +247,20 @@ enum RunnerCommand {
         offset: u64,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
+    GetVtimerControl {
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    },
+    SetVtimerControl {
+        control: u64,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
+    GetVtimerCompareValue {
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    },
+    SetVtimerCompareValue {
+        compare_value: u64,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
     CaptureArm64VirtualTimerState {
         admission: InFlightVtimerOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuVirtualTimerState, HvfVcpuRunnerError>>,
@@ -319,12 +333,39 @@ trait RunnerVcpu {
             "vCPU does not support virtual timer offset writes",
         ))
     }
+    fn get_vtimer_control(&mut self) -> Result<u64, BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support virtual timer control reads",
+        ))
+    }
+    fn set_vtimer_control(&mut self, _control: u64) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support virtual timer control writes",
+        ))
+    }
+    fn get_vtimer_compare_value(&mut self) -> Result<u64, BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support virtual timer compare-value reads",
+        ))
+    }
+    fn set_vtimer_compare_value(&mut self, _compare_value: u64) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support virtual timer compare-value writes",
+        ))
+    }
     fn capture_arm64_virtual_timer_state(
         &mut self,
     ) -> Result<HvfArm64VcpuVirtualTimerState, BackendError> {
         let masked = self.get_vtimer_mask()?;
         let offset = self.get_vtimer_offset()?;
-        Ok(HvfArm64VcpuVirtualTimerState::new(masked, offset))
+        let control = self.get_vtimer_control()?;
+        let compare_value = self.get_vtimer_compare_value()?;
+        Ok(HvfArm64VcpuVirtualTimerState::new(
+            masked,
+            offset,
+            control,
+            compare_value,
+        ))
     }
     fn set_gic_ppi_pending(&mut self, _intid: u32, _pending: bool) -> Result<(), HvfGicError> {
         Err(HvfGicError::InvalidState(
@@ -406,6 +447,26 @@ impl RunnerVcpu for RealRunnerVcpu {
 
     fn set_vtimer_offset(&mut self, offset: u64) -> Result<(), BackendError> {
         self.owner.set_vtimer_offset(offset)
+    }
+
+    fn get_vtimer_control(&mut self) -> Result<u64, BackendError> {
+        self.owner
+            .get_system_register(HvfSystemRegister::CNTV_CTL_EL0)
+    }
+
+    fn set_vtimer_control(&mut self, control: u64) -> Result<(), BackendError> {
+        self.owner
+            .set_system_register(HvfSystemRegister::CNTV_CTL_EL0, control)
+    }
+
+    fn get_vtimer_compare_value(&mut self) -> Result<u64, BackendError> {
+        self.owner
+            .get_system_register(HvfSystemRegister::CNTV_CVAL_EL0)
+    }
+
+    fn set_vtimer_compare_value(&mut self, compare_value: u64) -> Result<(), BackendError> {
+        self.owner
+            .set_system_register(HvfSystemRegister::CNTV_CVAL_EL0, compare_value)
     }
 
     fn set_gic_ppi_pending(&mut self, intid: u32, pending: bool) -> Result<(), HvfGicError> {
@@ -579,10 +640,52 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
-    /// Capture the raw virtual-timer mask and offset on the vCPU owner thread.
+    /// Read the raw `CNTV_CTL_EL0` value on the vCPU-owning runner thread.
+    pub fn get_vtimer_control(&self) -> Result<u64, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_operation = self.start_get_vtimer_control(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Set the raw `CNTV_CTL_EL0` value on the vCPU-owning runner thread.
+    pub fn set_vtimer_control(&self, control: u64) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_operation = self.start_set_vtimer_control(control, response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Read the raw `CNTV_CVAL_EL0` value on the vCPU-owning runner thread.
+    pub fn get_vtimer_compare_value(&self) -> Result<u64, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_operation = self.start_get_vtimer_compare_value(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Set the raw `CNTV_CVAL_EL0` value on the vCPU-owning runner thread.
+    pub fn set_vtimer_compare_value(&self, compare_value: u64) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_operation =
+            self.start_set_vtimer_compare_value(compare_value, response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Capture raw virtual-timer mask, offset, control, and compare state.
     ///
-    /// The result does not include compare/control registers, pending
-    /// interrupts, GIC state, or a portable snapshot-time adjustment policy.
+    /// The result does not include pending interrupts, GIC state, or a portable
+    /// snapshot-time adjustment policy. Its control status bit is derived and
+    /// may change as virtual time advances.
     pub fn capture_arm64_virtual_timer_state(
         &self,
     ) -> Result<HvfArm64VcpuVirtualTimerState, HvfVcpuRunnerError> {
@@ -1131,12 +1234,60 @@ impl<'vm> HvfVcpuRunner<'vm> {
         )
     }
 
+    fn start_get_vtimer_control(
+        &self,
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightVtimerOperation, HvfVcpuRunnerError> {
+        self.start_vtimer_operation(
+            |response_sender| RunnerCommand::GetVtimerControl { response_sender },
+            response_sender,
+        )
+    }
+
+    fn start_set_vtimer_control(
+        &self,
+        control: u64,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<InFlightVtimerOperation, HvfVcpuRunnerError> {
+        self.start_vtimer_operation(
+            |response_sender| RunnerCommand::SetVtimerControl {
+                control,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_get_vtimer_compare_value(
+        &self,
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightVtimerOperation, HvfVcpuRunnerError> {
+        self.start_vtimer_operation(
+            |response_sender| RunnerCommand::GetVtimerCompareValue { response_sender },
+            response_sender,
+        )
+    }
+
+    fn start_set_vtimer_compare_value(
+        &self,
+        compare_value: u64,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<InFlightVtimerOperation, HvfVcpuRunnerError> {
+        self.start_vtimer_operation(
+            |response_sender| RunnerCommand::SetVtimerCompareValue {
+                compare_value,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
     fn start_arm64_virtual_timer_capture(
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuVirtualTimerState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        // Pair-capture admission follows queued owner-thread work rather than
-        // the caller's response lifetime.
+        // Aggregate capture admission follows queued owner-thread work rather
+        // than the caller's response lifetime.
         let admission = {
             let _state = self.reserve_vtimer_operation()?;
             InFlightVtimerOperation::new(&self.state)
@@ -1792,6 +1943,36 @@ fn run_runner_thread<C, V>(
                     .map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::GetVtimerControl { response_sender } => {
+                let result = vcpu
+                    .get_vtimer_control()
+                    .map_err(HvfVcpuRunnerError::Backend);
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::SetVtimerControl {
+                control,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .set_vtimer_control(control)
+                    .map_err(HvfVcpuRunnerError::Backend);
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::GetVtimerCompareValue { response_sender } => {
+                let result = vcpu
+                    .get_vtimer_compare_value()
+                    .map_err(HvfVcpuRunnerError::Backend);
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::SetVtimerCompareValue {
+                compare_value,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .set_vtimer_compare_value(compare_value)
+                    .map_err(HvfVcpuRunnerError::Backend);
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureArm64VirtualTimerState {
                 mut admission,
                 response_sender,
@@ -1799,7 +1980,7 @@ fn run_runner_thread<C, V>(
                 let result = vcpu
                     .capture_arm64_virtual_timer_state()
                     .map_err(HvfVcpuRunnerError::Backend);
-                // Both owner-thread reads have finished. Restore admission
+                // All owner-thread reads have finished. Restore admission
                 // before response send so receiver failure is not cleanup.
                 admission.release();
                 let _ = response_sender.send(result);
@@ -2094,11 +2275,22 @@ mod tests {
     struct VtimerMaskRecordingVcpu {
         masked: bool,
         offset: u64,
-        fail_next_get: bool,
-        fail_next_set: bool,
-        fail_next_get_offset: bool,
-        fail_next_set_offset: bool,
+        control: u64,
+        compare_value: u64,
+        failures: VtimerFailures,
         operation_sender: Option<mpsc::Sender<VtimerOperation>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct VtimerFailures {
+        get_mask: bool,
+        set_mask: bool,
+        get_offset: bool,
+        set_offset: bool,
+        get_control: bool,
+        set_control: bool,
+        get_compare_value: bool,
+        set_compare_value: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2107,12 +2299,18 @@ mod tests {
         SetMask(bool),
         GetOffset,
         SetOffset(u64),
+        GetControl,
+        SetControl(u64),
+        GetCompareValue,
+        SetCompareValue(u64),
     }
 
     struct BlockingVtimerMaskVcpu {
         entered_get_sender: mpsc::Sender<()>,
         release_get_receiver: mpsc::Receiver<Result<bool, BackendError>>,
         offset: u64,
+        control: u64,
+        compare_value: u64,
         barrier_sender: Option<mpsc::Sender<()>>,
     }
 
@@ -2690,8 +2888,8 @@ mod tests {
                     BackendError::InvalidState("fake vtimer operation receiver closed")
                 })?;
             }
-            if self.fail_next_get {
-                self.fail_next_get = false;
+            if self.failures.get_mask {
+                self.failures.get_mask = false;
                 Err(BackendError::InvalidState("fake vtimer mask read failed"))
             } else {
                 Ok(self.masked)
@@ -2704,8 +2902,8 @@ mod tests {
                     BackendError::InvalidState("fake vtimer operation receiver closed")
                 })?;
             }
-            if self.fail_next_set {
-                self.fail_next_set = false;
+            if self.failures.set_mask {
+                self.failures.set_mask = false;
                 Err(BackendError::InvalidState("fake vtimer mask write failed"))
             } else {
                 self.masked = masked;
@@ -2719,8 +2917,8 @@ mod tests {
                     BackendError::InvalidState("fake vtimer operation receiver closed")
                 })?;
             }
-            if self.fail_next_get_offset {
-                self.fail_next_get_offset = false;
+            if self.failures.get_offset {
+                self.failures.get_offset = false;
                 Err(BackendError::InvalidState("fake vtimer offset read failed"))
             } else {
                 Ok(self.offset)
@@ -2735,13 +2933,83 @@ mod tests {
                         BackendError::InvalidState("fake vtimer operation receiver closed")
                     })?;
             }
-            if self.fail_next_set_offset {
-                self.fail_next_set_offset = false;
+            if self.failures.set_offset {
+                self.failures.set_offset = false;
                 Err(BackendError::InvalidState(
                     "fake vtimer offset write failed",
                 ))
             } else {
                 self.offset = offset;
+                Ok(())
+            }
+        }
+
+        fn get_vtimer_control(&mut self) -> Result<u64, BackendError> {
+            if let Some(sender) = &self.operation_sender {
+                sender.send(VtimerOperation::GetControl).map_err(|_| {
+                    BackendError::InvalidState("fake vtimer operation receiver closed")
+                })?;
+            }
+            if self.failures.get_control {
+                self.failures.get_control = false;
+                Err(BackendError::InvalidState(
+                    "fake vtimer control read failed",
+                ))
+            } else {
+                Ok(self.control)
+            }
+        }
+
+        fn set_vtimer_control(&mut self, control: u64) -> Result<(), BackendError> {
+            if let Some(sender) = &self.operation_sender {
+                sender
+                    .send(VtimerOperation::SetControl(control))
+                    .map_err(|_| {
+                        BackendError::InvalidState("fake vtimer operation receiver closed")
+                    })?;
+            }
+            if self.failures.set_control {
+                self.failures.set_control = false;
+                Err(BackendError::InvalidState(
+                    "fake vtimer control write failed",
+                ))
+            } else {
+                self.control = control;
+                Ok(())
+            }
+        }
+
+        fn get_vtimer_compare_value(&mut self) -> Result<u64, BackendError> {
+            if let Some(sender) = &self.operation_sender {
+                sender.send(VtimerOperation::GetCompareValue).map_err(|_| {
+                    BackendError::InvalidState("fake vtimer operation receiver closed")
+                })?;
+            }
+            if self.failures.get_compare_value {
+                self.failures.get_compare_value = false;
+                Err(BackendError::InvalidState(
+                    "fake vtimer compare-value read failed",
+                ))
+            } else {
+                Ok(self.compare_value)
+            }
+        }
+
+        fn set_vtimer_compare_value(&mut self, compare_value: u64) -> Result<(), BackendError> {
+            if let Some(sender) = &self.operation_sender {
+                sender
+                    .send(VtimerOperation::SetCompareValue(compare_value))
+                    .map_err(|_| {
+                        BackendError::InvalidState("fake vtimer operation receiver closed")
+                    })?;
+            }
+            if self.failures.set_compare_value {
+                self.failures.set_compare_value = false;
+                Err(BackendError::InvalidState(
+                    "fake vtimer compare-value write failed",
+                ))
+            } else {
+                self.compare_value = compare_value;
                 Ok(())
             }
         }
@@ -2786,6 +3054,14 @@ mod tests {
 
         fn get_vtimer_offset(&mut self) -> Result<u64, BackendError> {
             Ok(self.offset)
+        }
+
+        fn get_vtimer_control(&mut self) -> Result<u64, BackendError> {
+            Ok(self.control)
+        }
+
+        fn get_vtimer_compare_value(&mut self) -> Result<u64, BackendError> {
+            Ok(self.compare_value)
         }
 
         fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
@@ -3368,6 +3644,10 @@ mod tests {
         assert_eq!(runner.set_vtimer_mask(false), Err(expected.clone()));
         assert_eq!(runner.get_vtimer_offset(), Err(expected.clone()));
         assert_eq!(runner.set_vtimer_offset(0), Err(expected.clone()));
+        assert_eq!(runner.get_vtimer_control(), Err(expected.clone()));
+        assert_eq!(runner.set_vtimer_control(0), Err(expected.clone()));
+        assert_eq!(runner.get_vtimer_compare_value(), Err(expected.clone()));
+        assert_eq!(runner.set_vtimer_compare_value(0), Err(expected.clone()));
         assert_eq!(runner.capture_arm64_virtual_timer_state(), Err(expected));
     }
 
@@ -3642,10 +3922,13 @@ mod tests {
             Ok(VtimerMaskRecordingVcpu {
                 masked,
                 offset: 0,
-                fail_next_get,
-                fail_next_set,
-                fail_next_get_offset: false,
-                fail_next_set_offset: false,
+                control: 0,
+                compare_value: 0,
+                failures: VtimerFailures {
+                    get_mask: fail_next_get,
+                    set_mask: fail_next_set,
+                    ..VtimerFailures::default()
+                },
                 operation_sender: None,
             })
         })
@@ -3667,6 +3950,8 @@ mod tests {
                 entered_get_sender,
                 release_get_receiver,
                 offset: 0,
+                control: 0,
+                compare_value: 0,
                 barrier_sender: None,
             })
         })
@@ -3683,20 +3968,18 @@ mod tests {
     fn start_vtimer_recording_runner(
         masked: bool,
         offset: u64,
-        fail_next_get_mask: bool,
-        fail_next_set_mask: bool,
-        fail_next_get_offset: bool,
-        fail_next_set_offset: bool,
+        control: u64,
+        compare_value: u64,
+        failures: VtimerFailures,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<VtimerOperation>) {
         let (operation_sender, operation_receiver) = mpsc::channel();
         let started = spawn_runner_thread(move || {
             Ok(VtimerMaskRecordingVcpu {
                 masked,
                 offset,
-                fail_next_get: fail_next_get_mask,
-                fail_next_set: fail_next_set_mask,
-                fail_next_get_offset,
-                fail_next_set_offset,
+                control,
+                compare_value,
+                failures,
                 operation_sender: Some(operation_sender),
             })
         })
@@ -3718,6 +4001,8 @@ mod tests {
                 entered_get_sender,
                 release_get_receiver,
                 offset: 0x1234_5678,
+                control: 0b101,
+                compare_value: 0xfedc_ba98,
                 barrier_sender: Some(barrier_sender),
             })
         })
@@ -4095,7 +4380,7 @@ mod tests {
     #[test]
     fn reads_and_sets_vtimer_offset_on_runner_thread() {
         let (runner, operation_receiver) =
-            start_vtimer_recording_runner(false, 0x1234, false, false, false, false);
+            start_vtimer_recording_runner(false, 0x1234, 0, 0, VtimerFailures::default());
 
         assert_eq!(runner.get_vtimer_offset(), Ok(0x1234));
         assert_eq!(runner.set_vtimer_offset(0x5678), Ok(()));
@@ -4113,9 +4398,40 @@ mod tests {
     }
 
     #[test]
-    fn captures_arm64_virtual_timer_state_on_runner_thread() {
+    fn reads_and_sets_vtimer_control_and_compare_value_on_runner_thread() {
         let (runner, operation_receiver) =
-            start_vtimer_recording_runner(true, 0x1234_5678, false, false, false, false);
+            start_vtimer_recording_runner(false, 0, 0b101, 0x1234, VtimerFailures::default());
+
+        assert_eq!(runner.get_vtimer_control(), Ok(0b101));
+        assert_eq!(runner.set_vtimer_control(0b010), Ok(()));
+        assert_eq!(runner.get_vtimer_control(), Ok(0b010));
+        assert_eq!(runner.get_vtimer_compare_value(), Ok(0x1234));
+        assert_eq!(runner.set_vtimer_compare_value(0x5678), Ok(()));
+        assert_eq!(runner.get_vtimer_compare_value(), Ok(0x5678));
+        assert_eq!(
+            operation_receiver.try_iter().collect::<Vec<_>>(),
+            vec![
+                VtimerOperation::GetControl,
+                VtimerOperation::SetControl(0b010),
+                VtimerOperation::GetControl,
+                VtimerOperation::GetCompareValue,
+                VtimerOperation::SetCompareValue(0x5678),
+                VtimerOperation::GetCompareValue,
+            ]
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn captures_arm64_virtual_timer_state_on_runner_thread() {
+        let (runner, operation_receiver) = start_vtimer_recording_runner(
+            true,
+            0x1234_5678,
+            0b101,
+            0xfedc_ba98,
+            VtimerFailures::default(),
+        );
 
         let state = runner
             .capture_arm64_virtual_timer_state()
@@ -4123,9 +4439,16 @@ mod tests {
 
         assert!(state.masked());
         assert_eq!(state.offset(), 0x1234_5678);
+        assert_eq!(state.control(), 0b101);
+        assert_eq!(state.compare_value(), 0xfedc_ba98);
         assert_eq!(
             operation_receiver.try_iter().collect::<Vec<_>>(),
-            vec![VtimerOperation::GetMask, VtimerOperation::GetOffset]
+            vec![
+                VtimerOperation::GetMask,
+                VtimerOperation::GetOffset,
+                VtimerOperation::GetControl,
+                VtimerOperation::GetCompareValue,
+            ]
         );
 
         runner.shutdown().expect("runner should shut down");
@@ -4161,10 +4484,26 @@ mod tests {
 
     #[test]
     fn failed_vtimer_offset_commands_can_be_retried_without_stale_state() {
-        let (get_runner, _get_operations) =
-            start_vtimer_recording_runner(false, 0x1234, false, false, true, false);
-        let (set_runner, _set_operations) =
-            start_vtimer_recording_runner(false, 0x1234, false, false, false, true);
+        let (get_runner, _get_operations) = start_vtimer_recording_runner(
+            false,
+            0x1234,
+            0,
+            0,
+            VtimerFailures {
+                get_offset: true,
+                ..VtimerFailures::default()
+            },
+        );
+        let (set_runner, _set_operations) = start_vtimer_recording_runner(
+            false,
+            0x1234,
+            0,
+            0,
+            VtimerFailures {
+                set_offset: true,
+                ..VtimerFailures::default()
+            },
+        );
 
         assert_eq!(
             get_runner.get_vtimer_offset(),
@@ -4190,59 +4529,176 @@ mod tests {
     }
 
     #[test]
+    fn failed_vtimer_control_commands_can_be_retried_without_stale_state() {
+        let (get_runner, _get_operations) = start_vtimer_recording_runner(
+            false,
+            0,
+            0b101,
+            0,
+            VtimerFailures {
+                get_control: true,
+                ..VtimerFailures::default()
+            },
+        );
+        let (set_runner, _set_operations) = start_vtimer_recording_runner(
+            false,
+            0,
+            0b101,
+            0,
+            VtimerFailures {
+                set_control: true,
+                ..VtimerFailures::default()
+            },
+        );
+
+        assert_eq!(
+            get_runner.get_vtimer_control(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake vtimer control read failed"
+            )))
+        );
+        assert_eq!(get_runner.get_vtimer_control(), Ok(0b101));
+        assert_eq!(get_runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        assert_eq!(
+            set_runner.set_vtimer_control(0b010),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake vtimer control write failed"
+            )))
+        );
+        assert_eq!(set_runner.set_vtimer_control(0b010), Ok(()));
+        assert_eq!(set_runner.get_vtimer_control(), Ok(0b010));
+        assert_eq!(set_runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        get_runner.shutdown().expect("runner should shut down");
+        set_runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_vtimer_compare_commands_can_be_retried_without_stale_state() {
+        let (get_runner, _get_operations) = start_vtimer_recording_runner(
+            false,
+            0,
+            0,
+            0x1234,
+            VtimerFailures {
+                get_compare_value: true,
+                ..VtimerFailures::default()
+            },
+        );
+        let (set_runner, _set_operations) = start_vtimer_recording_runner(
+            false,
+            0,
+            0,
+            0x1234,
+            VtimerFailures {
+                set_compare_value: true,
+                ..VtimerFailures::default()
+            },
+        );
+
+        assert_eq!(
+            get_runner.get_vtimer_compare_value(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake vtimer compare-value read failed"
+            )))
+        );
+        assert_eq!(get_runner.get_vtimer_compare_value(), Ok(0x1234));
+        assert_eq!(get_runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        assert_eq!(
+            set_runner.set_vtimer_compare_value(0x5678),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake vtimer compare-value write failed"
+            )))
+        );
+        assert_eq!(set_runner.set_vtimer_compare_value(0x5678), Ok(()));
+        assert_eq!(set_runner.get_vtimer_compare_value(), Ok(0x5678));
+        assert_eq!(set_runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        get_runner.shutdown().expect("runner should shut down");
+        set_runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
     fn failed_arm64_virtual_timer_capture_can_be_retried_without_partial_state() {
-        let (mask_runner, mask_operations) =
-            start_vtimer_recording_runner(true, 0x1234, true, false, false, false);
-        let (offset_runner, offset_operations) =
-            start_vtimer_recording_runner(true, 0x5678, false, false, true, false);
+        let cases = [
+            (
+                VtimerFailures {
+                    get_mask: true,
+                    ..VtimerFailures::default()
+                },
+                "fake vtimer mask read failed",
+                vec![VtimerOperation::GetMask],
+            ),
+            (
+                VtimerFailures {
+                    get_offset: true,
+                    ..VtimerFailures::default()
+                },
+                "fake vtimer offset read failed",
+                vec![VtimerOperation::GetMask, VtimerOperation::GetOffset],
+            ),
+            (
+                VtimerFailures {
+                    get_control: true,
+                    ..VtimerFailures::default()
+                },
+                "fake vtimer control read failed",
+                vec![
+                    VtimerOperation::GetMask,
+                    VtimerOperation::GetOffset,
+                    VtimerOperation::GetControl,
+                ],
+            ),
+            (
+                VtimerFailures {
+                    get_compare_value: true,
+                    ..VtimerFailures::default()
+                },
+                "fake vtimer compare-value read failed",
+                vec![
+                    VtimerOperation::GetMask,
+                    VtimerOperation::GetOffset,
+                    VtimerOperation::GetControl,
+                    VtimerOperation::GetCompareValue,
+                ],
+            ),
+        ];
 
-        assert_eq!(
-            mask_runner.capture_arm64_virtual_timer_state(),
-            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
-                "fake vtimer mask read failed"
-            )))
-        );
-        assert_eq!(
-            mask_runner
-                .capture_arm64_virtual_timer_state()
-                .expect("mask-read failure should leave capture retryable"),
-            HvfArm64VcpuVirtualTimerState::new(true, 0x1234)
-        );
-        assert_eq!(
-            mask_operations.try_iter().collect::<Vec<_>>(),
-            vec![
-                VtimerOperation::GetMask,
-                VtimerOperation::GetMask,
-                VtimerOperation::GetOffset,
-            ]
-        );
+        for (failures, message, first_attempt) in cases {
+            let (runner, operations) =
+                start_vtimer_recording_runner(true, 0x1234, 0b101, 0x5678, failures);
 
-        assert_eq!(
-            offset_runner.capture_arm64_virtual_timer_state(),
-            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
-                "fake vtimer offset read failed"
-            )))
-        );
-        assert_eq!(
-            offset_runner
-                .capture_arm64_virtual_timer_state()
-                .expect("offset-read failure should leave capture retryable"),
-            HvfArm64VcpuVirtualTimerState::new(true, 0x5678)
-        );
-        assert_eq!(
-            offset_operations.try_iter().collect::<Vec<_>>(),
-            vec![
-                VtimerOperation::GetMask,
-                VtimerOperation::GetOffset,
-                VtimerOperation::GetMask,
-                VtimerOperation::GetOffset,
-            ]
-        );
-        assert_eq!(mask_runner.run_once(), Ok(HvfVcpuExit::Canceled));
-        assert_eq!(offset_runner.run_once(), Ok(HvfVcpuExit::Canceled));
+            assert_eq!(
+                runner.capture_arm64_virtual_timer_state(),
+                Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                    message
+                )))
+            );
+            assert_eq!(
+                runner
+                    .capture_arm64_virtual_timer_state()
+                    .expect("read failure should leave timer capture retryable"),
+                HvfArm64VcpuVirtualTimerState::new(true, 0x1234, 0b101, 0x5678)
+            );
 
-        mask_runner.shutdown().expect("runner should shut down");
-        offset_runner.shutdown().expect("runner should shut down");
+            let expected_operations = first_attempt
+                .into_iter()
+                .chain([
+                    VtimerOperation::GetMask,
+                    VtimerOperation::GetOffset,
+                    VtimerOperation::GetControl,
+                    VtimerOperation::GetCompareValue,
+                ])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                operations.try_iter().collect::<Vec<_>>(),
+                expected_operations
+            );
+            assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+            runner.shutdown().expect("runner should shut down");
+        }
     }
 
     #[test]
@@ -4380,6 +4836,8 @@ mod tests {
                 .expect("virtual-timer capture should succeed");
             assert!(state.masked());
             assert_eq!(state.offset(), 0x1234_5678);
+            assert_eq!(state.control(), 0b101);
+            assert_eq!(state.compare_value(), 0xfedc_ba98);
         });
 
         assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));

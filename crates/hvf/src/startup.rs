@@ -1175,10 +1175,12 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_general_register_state()
     }
 
-    /// Capture the raw virtual-timer mask and offset on the primary vCPU owner thread.
+    /// Capture raw virtual-timer mask, offset, control, and compare state on the
+    /// primary vCPU owner thread.
     ///
-    /// This pair omits timer compare/control registers, pending interrupt and
-    /// GIC state, and host-time adjustment required by a restore policy.
+    /// This subset omits pending interrupt and GIC state, and the host-time
+    /// adjustment required by a restore policy. The control status bit is
+    /// derived and may change as virtual time advances.
     pub fn capture_arm64_virtual_timer_state(
         &self,
     ) -> Result<HvfArm64VcpuVirtualTimerState, HvfVcpuRunnerError> {
@@ -1742,10 +1744,12 @@ impl OwnedHvfArm64BootSession {
         self.runner.capture_arm64_general_register_state()
     }
 
-    /// Capture the raw virtual-timer mask and offset on the primary vCPU owner thread.
+    /// Capture raw virtual-timer mask, offset, control, and compare state on the
+    /// primary vCPU owner thread.
     ///
-    /// This pair omits timer compare/control registers, pending interrupt and
-    /// GIC state, and host-time adjustment required by a restore policy.
+    /// This subset omits pending interrupt and GIC state, and the host-time
+    /// adjustment required by a restore policy. The control status bit is
+    /// derived and may change as virtual time advances.
     pub fn capture_arm64_virtual_timer_state(
         &self,
     ) -> Result<HvfArm64VcpuVirtualTimerState, HvfVcpuRunnerError> {

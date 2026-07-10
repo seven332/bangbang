@@ -237,13 +237,15 @@ is resource-specific:
   redaction, and prevent one process from cleaning up or overwriting another
   process's snapshot resources. The current implementation boundary is
   documented in [Snapshot Feasibility](snapshot-feasibility.md).
-- Detached vCPU general-register values and virtual-timer mask/offset values are
-  sensitive guest/VMM execution state. Current internal capture commands keep
-  these values in process memory and do not write them to logs, metrics, error
-  strings, or persistence. The raw timer offset is tied to HVF's host-time
-  relation and must not be treated as portable restore data without an explicit
-  adjustment and validation policy. The public pause and snapshot paths do not
-  invoke either capture command.
+- Detached vCPU general-register values and raw virtual-timer mask, offset,
+  control, and CVAL values are sensitive guest/VMM execution state. Current
+  internal capture commands keep these values in process memory and do not
+  write them to logs, metrics, error strings, or persistence. The raw timer
+  offset is tied to HVF's host-time relation, and the control ISTATUS bit is a
+  time-sensitive observation rather than writable configuration. These values
+  must not be treated as portable or trusted restore data without explicit
+  adjustment, writable-bit, and validation policies. The public pause and
+  snapshot paths do not invoke either capture command.
 - `/vsock` stores the configured Unix socket path during configuration. Startup
   can attach a guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the

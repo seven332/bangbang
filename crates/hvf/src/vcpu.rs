@@ -65,18 +65,27 @@ impl HvfArm64VcpuGeneralRegisterState {
 /// Detached raw virtual-timer state captured from one arm64 vCPU.
 ///
 /// The offset is the Hypervisor.framework value used in its
-/// `CNTVCT_EL0 = mach_absolute_time() - offset` relation. This pair does not
-/// include timer compare/control registers, pending interrupts, GIC state, or a
-/// portable snapshot-time adjustment policy.
+/// `CNTVCT_EL0 = mach_absolute_time() - offset` relation. `control` is the raw
+/// `CNTV_CTL_EL0` observation, including its time-sensitive ISTATUS bit, so raw
+/// equality does not imply restore-equivalent timer configuration. This subset
+/// does not include pending interrupts, GIC state, or a portable snapshot-time
+/// adjustment policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuVirtualTimerState {
     masked: bool,
     offset: u64,
+    control: u64,
+    compare_value: u64,
 }
 
 impl HvfArm64VcpuVirtualTimerState {
-    pub(crate) const fn new(masked: bool, offset: u64) -> Self {
-        Self { masked, offset }
+    pub(crate) const fn new(masked: bool, offset: u64, control: u64, compare_value: u64) -> Self {
+        Self {
+            masked,
+            offset,
+            control,
+            compare_value,
+        }
     }
 
     /// Return whether Hypervisor.framework virtual-timer exits are masked.
@@ -87,6 +96,19 @@ impl HvfArm64VcpuVirtualTimerState {
     /// Return the raw Hypervisor.framework virtual-timer offset.
     pub const fn offset(self) -> u64 {
         self.offset
+    }
+
+    /// Return the raw `CNTV_CTL_EL0` value captured from the guest timer.
+    ///
+    /// ENABLE and IMASK are writable control bits, while ISTATUS is derived
+    /// from the timer condition and can change as the virtual count advances.
+    pub const fn control(self) -> u64 {
+        self.control
+    }
+
+    /// Return the raw `CNTV_CVAL_EL0` compare value.
+    pub const fn compare_value(self) -> u64 {
+        self.compare_value
     }
 }
 
@@ -121,6 +143,8 @@ impl HvfSystemRegister {
     pub const MPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MPIDR_EL1);
     pub const SPSR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SPSR_EL1);
     pub const ELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ELR_EL1);
+    pub const CNTV_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CTL_EL0);
+    pub const CNTV_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CVAL_EL0);
     pub const SP_EL1: Self = Self(crate::ffi::HV_SYS_REG_SP_EL1);
 
     pub const fn raw(self) -> u16 {
@@ -476,11 +500,20 @@ pub(crate) fn capture_arm64_vcpu_general_register_state_with(
 pub(crate) fn capture_arm64_vcpu_virtual_timer_state_with(
     get_mask: impl FnOnce() -> Result<bool, BackendError>,
     get_offset: impl FnOnce() -> Result<u64, BackendError>,
+    get_control: impl FnOnce() -> Result<u64, BackendError>,
+    get_compare_value: impl FnOnce() -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuVirtualTimerState, BackendError> {
     let masked = get_mask()?;
     let offset = get_offset()?;
+    let control = get_control()?;
+    let compare_value = get_compare_value()?;
 
-    Ok(HvfArm64VcpuVirtualTimerState::new(masked, offset))
+    Ok(HvfArm64VcpuVirtualTimerState::new(
+        masked,
+        offset,
+        control,
+        compare_value,
+    ))
 }
 
 #[cfg(test)]
@@ -764,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn captures_arm64_virtual_timer_state_in_mask_then_offset_order() {
+    fn captures_arm64_virtual_timer_state_in_documented_order() {
         let reads = RefCell::new(Vec::new());
 
         let state = capture_arm64_vcpu_virtual_timer_state_with(
@@ -776,16 +809,26 @@ mod tests {
                 reads.borrow_mut().push("offset");
                 Ok(0x1234_5678_9abc_def0)
             },
+            || {
+                reads.borrow_mut().push("control");
+                Ok(0b101)
+            },
+            || {
+                reads.borrow_mut().push("compare");
+                Ok(0xfedc_ba98_7654_3210)
+            },
         )
         .expect("virtual-timer capture should succeed");
 
-        assert_eq!(*reads.borrow(), ["mask", "offset"]);
+        assert_eq!(*reads.borrow(), ["mask", "offset", "control", "compare"]);
         assert!(state.masked());
         assert_eq!(state.offset(), 0x1234_5678_9abc_def0);
+        assert_eq!(state.control(), 0b101);
+        assert_eq!(state.compare_value(), 0xfedc_ba98_7654_3210);
     }
 
     #[test]
-    fn arm64_virtual_timer_capture_returns_no_state_after_either_read_error() {
+    fn arm64_virtual_timer_capture_returns_no_state_after_any_read_error() {
         let offset_called = Cell::new(false);
         assert_eq!(
             capture_arm64_vcpu_virtual_timer_state_with(
@@ -794,23 +837,64 @@ mod tests {
                     offset_called.set(true);
                     Ok(1)
                 },
+                || Ok(2),
+                || Ok(3),
             ),
             Err(BackendError::InvalidState("fake mask read failed"))
         );
         assert!(!offset_called.get());
 
+        let control_called = Cell::new(false);
         assert_eq!(
             capture_arm64_vcpu_virtual_timer_state_with(
                 || Ok(false),
                 || Err(BackendError::InvalidState("fake offset read failed")),
+                || {
+                    control_called.set(true);
+                    Ok(2)
+                },
+                || Ok(3),
             ),
             Err(BackendError::InvalidState("fake offset read failed"))
         );
+        assert!(!control_called.get());
+
+        let compare_called = Cell::new(false);
         assert_eq!(
-            capture_arm64_vcpu_virtual_timer_state_with(|| Ok(false), || Ok(7)),
+            capture_arm64_vcpu_virtual_timer_state_with(
+                || Ok(false),
+                || Ok(1),
+                || Err(BackendError::InvalidState("fake control read failed")),
+                || {
+                    compare_called.set(true);
+                    Ok(3)
+                },
+            ),
+            Err(BackendError::InvalidState("fake control read failed"))
+        );
+        assert!(!compare_called.get());
+
+        assert_eq!(
+            capture_arm64_vcpu_virtual_timer_state_with(
+                || Ok(false),
+                || Ok(7),
+                || Ok(3),
+                || Err(BackendError::InvalidState("fake compare read failed")),
+            ),
+            Err(BackendError::InvalidState("fake compare read failed"))
+        );
+        assert_eq!(
+            capture_arm64_vcpu_virtual_timer_state_with(
+                || Ok(false),
+                || Ok(7),
+                || Ok(3),
+                || Ok(11),
+            ),
             Ok(super::HvfArm64VcpuVirtualTimerState {
                 masked: false,
                 offset: 7,
+                control: 3,
+                compare_value: 11,
             })
         );
     }
