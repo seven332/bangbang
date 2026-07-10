@@ -4,8 +4,8 @@ use std::net::Ipv4Addr;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use crate::HTTP_MAX_PAYLOAD_SIZE;
 use crate::route::Endpoint;
+use crate::{HTTP_MAX_PAYLOAD_SIZE, HTTP_MAX_REQUEST_HEAD_SIZE};
 
 const MAX_HEADERS: usize = 32;
 const RATE_LIMITER_BANDWIDTH_FIELD: &str = "bandwidth";
@@ -2557,11 +2557,8 @@ pub fn parse_request_with_limit(
     bytes: &[u8],
     max_payload_size: usize,
 ) -> Result<ApiRequest, RequestError> {
-    if bytes.len() > max_payload_size {
-        return Err(RequestError::PayloadTooLarge);
-    }
-
     let (method, path, header_len, request_body) = parse_request_head(bytes)?;
+    checked_request_head_len(header_len)?;
     let body = bytes
         .get(header_len..)
         .ok_or(RequestError::MalformedRequest)?;
@@ -2570,7 +2567,7 @@ pub fn parse_request_with_limit(
         return Err(RequestError::MalformedRequest);
     }
 
-    checked_request_len(header_len, request_body.content_length(), max_payload_size)?;
+    checked_payload_len(request_body.content_length(), max_payload_size)?;
 
     if body.len() != request_body.content_length() {
         return Err(RequestError::MalformedRequest);
@@ -3597,10 +3594,6 @@ pub fn request_total_len_with_limit(
     bytes: &[u8],
     max_payload_size: usize,
 ) -> Result<Option<usize>, RequestError> {
-    if bytes.len() > max_payload_size {
-        return Err(RequestError::PayloadTooLarge);
-    }
-
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut request = httparse::Request::new(&mut headers);
     let status = request
@@ -3608,18 +3601,25 @@ pub fn request_total_len_with_limit(
         .map_err(|_| RequestError::MalformedRequest)?;
     let header_len = match status {
         httparse::Status::Complete(header_len) => header_len,
-        httparse::Status::Partial => return Ok(None),
+        httparse::Status::Partial => {
+            if bytes.len() >= HTTP_MAX_REQUEST_HEAD_SIZE {
+                return Err(RequestError::MalformedRequest);
+            }
+            return Ok(None);
+        }
     };
     let body = request_body(request.headers)?;
+    checked_request_head_len(header_len)?;
 
     if body.has_unsupported_encoding() {
         return Err(RequestError::MalformedRequest);
     }
 
+    checked_payload_len(body.content_length(), max_payload_size)?;
+
     Ok(Some(checked_request_len(
         header_len,
         body.content_length(),
-        max_payload_size,
     )?))
 }
 
@@ -3729,20 +3729,26 @@ const fn is_http_optional_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
 }
 
-fn checked_request_len(
-    header_len: usize,
-    content_length: usize,
-    max_payload_size: usize,
-) -> Result<usize, RequestError> {
-    let total_len = header_len
+fn checked_request_len(header_len: usize, content_length: usize) -> Result<usize, RequestError> {
+    header_len
         .checked_add(content_length)
-        .ok_or(RequestError::PayloadTooLarge)?;
+        .ok_or(RequestError::PayloadTooLarge)
+}
 
-    if total_len > max_payload_size {
+fn checked_payload_len(content_length: usize, max_payload_size: usize) -> Result<(), RequestError> {
+    if content_length > max_payload_size {
         return Err(RequestError::PayloadTooLarge);
     }
 
-    Ok(total_len)
+    Ok(())
+}
+
+fn checked_request_head_len(header_len: usize) -> Result<(), RequestError> {
+    if header_len > HTTP_MAX_REQUEST_HEAD_SIZE {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    Ok(())
 }
 
 impl From<ApiRequest> for Endpoint {
@@ -3990,30 +3996,63 @@ mod tests {
     }
 
     #[test]
-    fn parses_request_at_custom_payload_limit() {
-        let request = b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    fn parses_request_body_at_custom_payload_limit() {
+        let body = "{}";
+        let request = request_with_body("PUT", "/logger", body);
 
+        assert!(request.len() > body.len());
         assert_eq!(
-            parse_request_with_limit(request, request.len()),
-            Ok(ApiRequest::GetVersion)
+            parse_request_with_limit(&request, body.len()),
+            Ok(ApiRequest::PutLogger(Box::new(LoggerConfigRequest {
+                log_path: None,
+                level: None,
+                show_level: None,
+                show_log_origin: None,
+                module: None,
+            })))
         );
         assert_eq!(
-            request_total_len_with_limit(request, request.len()),
+            request_total_len_with_limit(&request, body.len()),
             Ok(Some(request.len()))
         );
     }
 
     #[test]
-    fn rejects_request_over_custom_payload_limit() {
-        let request = b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let limit = request.len() - 1;
+    fn parses_request_with_headers_above_custom_payload_limit() {
+        let body = "{}";
+        let padding = "a".repeat(64);
+        let request = format!(
+            "PUT /logger HTTP/1.1\r\nHost: localhost\r\nX-Fill: {padding}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        assert!(request.len() > body.len());
+        assert_eq!(
+            parse_request_with_limit(request.as_bytes(), body.len()),
+            Ok(ApiRequest::PutLogger(Box::new(LoggerConfigRequest {
+                log_path: None,
+                level: None,
+                show_level: None,
+                show_log_origin: None,
+                module: None,
+            })))
+        );
+        assert_eq!(
+            request_total_len_with_limit(request.as_bytes(), body.len()),
+            Ok(Some(request.len()))
+        );
+    }
+
+    #[test]
+    fn rejects_body_over_custom_payload_limit() {
+        let request = request_with_body("PUT", "/logger", "{}");
 
         assert_eq!(
-            parse_request_with_limit(request, limit),
+            parse_request_with_limit(&request, 1),
             Err(RequestError::PayloadTooLarge)
         );
         assert_eq!(
-            request_total_len_with_limit(request, limit),
+            request_total_len_with_limit(&request, 1),
             Err(RequestError::PayloadTooLarge)
         );
     }
@@ -7728,11 +7767,11 @@ mod tests {
         let request = b"GET /version HTTP/1.1\r\nContent-Length: 10\r\n\r\n";
 
         assert_eq!(
-            parse_request_with_limit(request, request.len()),
+            parse_request_with_limit(request, 9),
             Err(RequestError::PayloadTooLarge)
         );
         assert_eq!(
-            request_total_len_with_limit(request, request.len()),
+            request_total_len_with_limit(request, 9),
             Err(RequestError::PayloadTooLarge)
         );
     }
@@ -7750,10 +7789,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_request_over_payload_limit() {
-        let request = vec![b'a'; HTTP_MAX_PAYLOAD_SIZE + 1];
+    fn rejects_incomplete_request_head_at_head_limit() {
+        let mut request = b"GET /version HTTP/1.1\r\nX-Fill: ".to_vec();
+        request.resize(HTTP_MAX_REQUEST_HEAD_SIZE, b'a');
 
-        assert_eq!(parse_request(&request), Err(RequestError::PayloadTooLarge));
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        assert_eq!(
+            request_total_len(&request),
+            Err(RequestError::MalformedRequest)
+        );
+    }
+
+    #[test]
+    fn rejects_complete_request_head_over_head_limit() {
+        let padding = "a".repeat(HTTP_MAX_REQUEST_HEAD_SIZE);
+        let request = format!("GET /version HTTP/1.1\r\nX-Fill: {padding}\r\n\r\n");
+        let header_len = request
+            .find("\r\n\r\n")
+            .map(|delimiter| delimiter + "\r\n\r\n".len())
+            .expect("request should have a header terminator");
+
+        assert!(header_len > HTTP_MAX_REQUEST_HEAD_SIZE);
+        assert_eq!(
+            parse_request(request.as_bytes()),
+            Err(RequestError::MalformedRequest)
+        );
+        assert_eq!(
+            request_total_len(request.as_bytes()),
+            Err(RequestError::MalformedRequest)
+        );
     }
 
     #[test]

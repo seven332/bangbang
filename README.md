@@ -44,7 +44,8 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
   supported startup subset from a readable regular file up to 1 MiB, starts the
   VM, then serves the API socket unless `--no-api` is set.
 - `--http-api-max-payload-size <BYTES>` sets the maximum accepted HTTP API
-  request size. The default is `51200` bytes.
+  request body size declared by `Content-Length`. The default is `51200` bytes;
+  request-head bytes are bounded separately by the parser.
 - `--id <ID>` records the microVM identifier. The default is
   `anonymous-instance`.
 - `--start-time-us <MICROS>`, `--start-time-cpu-us <MICROS>`, and
