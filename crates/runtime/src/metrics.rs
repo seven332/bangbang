@@ -2437,6 +2437,270 @@ impl SharedNetworkInterfaceMetricsRegistry {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MmdsMetrics {
+    rx_accepted: u64,
+    rx_accepted_err: u64,
+    rx_accepted_unusual: u64,
+    rx_bad_eth: u64,
+    rx_invalid_token: u64,
+    rx_no_token: u64,
+    rx_count: u64,
+    tx_bytes: u64,
+    tx_count: u64,
+    tx_errors: u64,
+    tx_frames: u64,
+    connections_created: u64,
+    connections_destroyed: u64,
+}
+
+impl MmdsMetrics {
+    pub const fn is_empty(self) -> bool {
+        self.rx_accepted == 0
+            && self.rx_accepted_err == 0
+            && self.rx_accepted_unusual == 0
+            && self.rx_bad_eth == 0
+            && self.rx_invalid_token == 0
+            && self.rx_no_token == 0
+            && self.rx_count == 0
+            && self.tx_bytes == 0
+            && self.tx_count == 0
+            && self.tx_errors == 0
+            && self.tx_frames == 0
+            && self.connections_created == 0
+            && self.connections_destroyed == 0
+    }
+
+    pub const fn rx_accepted(self) -> u64 {
+        self.rx_accepted
+    }
+
+    pub const fn rx_accepted_err(self) -> u64 {
+        self.rx_accepted_err
+    }
+
+    pub const fn rx_accepted_unusual(self) -> u64 {
+        self.rx_accepted_unusual
+    }
+
+    pub const fn rx_bad_eth(self) -> u64 {
+        self.rx_bad_eth
+    }
+
+    pub const fn rx_invalid_token(self) -> u64 {
+        self.rx_invalid_token
+    }
+
+    pub const fn rx_no_token(self) -> u64 {
+        self.rx_no_token
+    }
+
+    pub const fn rx_count(self) -> u64 {
+        self.rx_count
+    }
+
+    pub const fn tx_bytes(self) -> u64 {
+        self.tx_bytes
+    }
+
+    pub const fn tx_count(self) -> u64 {
+        self.tx_count
+    }
+
+    pub const fn tx_errors(self) -> u64 {
+        self.tx_errors
+    }
+
+    pub const fn tx_frames(self) -> u64 {
+        self.tx_frames
+    }
+
+    pub const fn connections_created(self) -> u64 {
+        self.connections_created
+    }
+
+    pub const fn connections_destroyed(self) -> u64 {
+        self.connections_destroyed
+    }
+
+    pub const fn with_rx_accepted(mut self, rx_accepted: u64) -> Self {
+        self.rx_accepted = rx_accepted;
+        self
+    }
+
+    pub const fn with_rx_accepted_err(mut self, rx_accepted_err: u64) -> Self {
+        self.rx_accepted_err = rx_accepted_err;
+        self
+    }
+
+    pub const fn with_rx_accepted_unusual(mut self, rx_accepted_unusual: u64) -> Self {
+        self.rx_accepted_unusual = rx_accepted_unusual;
+        self
+    }
+
+    pub const fn with_rx_bad_eth(mut self, rx_bad_eth: u64) -> Self {
+        self.rx_bad_eth = rx_bad_eth;
+        self
+    }
+
+    pub const fn with_rx_invalid_token(mut self, rx_invalid_token: u64) -> Self {
+        self.rx_invalid_token = rx_invalid_token;
+        self
+    }
+
+    pub const fn with_rx_no_token(mut self, rx_no_token: u64) -> Self {
+        self.rx_no_token = rx_no_token;
+        self
+    }
+
+    pub const fn with_rx_count(mut self, rx_count: u64) -> Self {
+        self.rx_count = rx_count;
+        self
+    }
+
+    pub const fn with_tx_bytes(mut self, tx_bytes: u64) -> Self {
+        self.tx_bytes = tx_bytes;
+        self
+    }
+
+    pub const fn with_tx_count(mut self, tx_count: u64) -> Self {
+        self.tx_count = tx_count;
+        self
+    }
+
+    pub const fn with_tx_errors(mut self, tx_errors: u64) -> Self {
+        self.tx_errors = tx_errors;
+        self
+    }
+
+    pub const fn with_tx_frames(mut self, tx_frames: u64) -> Self {
+        self.tx_frames = tx_frames;
+        self
+    }
+
+    pub const fn with_connections_created(mut self, connections_created: u64) -> Self {
+        self.connections_created = connections_created;
+        self
+    }
+
+    pub const fn with_connections_destroyed(mut self, connections_destroyed: u64) -> Self {
+        self.connections_destroyed = connections_destroyed;
+        self
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            rx_accepted: self.rx_accepted.saturating_add(other.rx_accepted),
+            rx_accepted_err: self.rx_accepted_err.saturating_add(other.rx_accepted_err),
+            rx_accepted_unusual: self
+                .rx_accepted_unusual
+                .saturating_add(other.rx_accepted_unusual),
+            rx_bad_eth: self.rx_bad_eth.saturating_add(other.rx_bad_eth),
+            rx_invalid_token: self.rx_invalid_token.saturating_add(other.rx_invalid_token),
+            rx_no_token: self.rx_no_token.saturating_add(other.rx_no_token),
+            rx_count: self.rx_count.saturating_add(other.rx_count),
+            tx_bytes: self.tx_bytes.saturating_add(other.tx_bytes),
+            tx_count: self.tx_count.saturating_add(other.tx_count),
+            tx_errors: self.tx_errors.saturating_add(other.tx_errors),
+            tx_frames: self.tx_frames.saturating_add(other.tx_frames),
+            connections_created: self
+                .connections_created
+                .saturating_add(other.connections_created),
+            connections_destroyed: self
+                .connections_destroyed
+                .saturating_add(other.connections_destroyed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedMmdsMetrics {
+    inner: Arc<SharedMmdsMetricsInner>,
+}
+
+impl SharedMmdsMetrics {
+    pub fn record_rx_accepted(&self) {
+        record_atomic_metric(&self.inner.rx_accepted, 1);
+    }
+
+    pub fn record_rx_accepted_error(&self) {
+        record_atomic_metric(&self.inner.rx_accepted_err, 1);
+    }
+
+    pub fn record_rx_accepted_unusual(&self) {
+        record_atomic_metric(&self.inner.rx_accepted_unusual, 1);
+    }
+
+    pub fn record_rx_bad_eth(&self) {
+        record_atomic_metric(&self.inner.rx_bad_eth, 1);
+    }
+
+    pub fn record_rx_invalid_token(&self) {
+        record_atomic_metric(&self.inner.rx_invalid_token, 1);
+    }
+
+    pub fn record_rx_no_token(&self) {
+        record_atomic_metric(&self.inner.rx_no_token, 1);
+    }
+
+    pub fn record_rx_count(&self) {
+        record_atomic_metric(&self.inner.rx_count, 1);
+    }
+
+    pub fn record_tx_frame(&self, len: usize) {
+        record_atomic_metric(&self.inner.tx_count, 1);
+        record_atomic_metric(&self.inner.tx_frames, 1);
+        record_atomic_metric(&self.inner.tx_bytes, usize_to_u64_saturating(len));
+    }
+
+    pub fn record_tx_error(&self) {
+        record_atomic_metric(&self.inner.tx_errors, 1);
+    }
+
+    pub fn record_connection_created(&self) {
+        record_atomic_metric(&self.inner.connections_created, 1);
+    }
+
+    pub fn record_connection_destroyed(&self) {
+        record_atomic_metric(&self.inner.connections_destroyed, 1);
+    }
+
+    pub fn snapshot(&self) -> MmdsMetrics {
+        MmdsMetrics {
+            rx_accepted: self.inner.rx_accepted.load(Ordering::Relaxed),
+            rx_accepted_err: self.inner.rx_accepted_err.load(Ordering::Relaxed),
+            rx_accepted_unusual: self.inner.rx_accepted_unusual.load(Ordering::Relaxed),
+            rx_bad_eth: self.inner.rx_bad_eth.load(Ordering::Relaxed),
+            rx_invalid_token: self.inner.rx_invalid_token.load(Ordering::Relaxed),
+            rx_no_token: self.inner.rx_no_token.load(Ordering::Relaxed),
+            rx_count: self.inner.rx_count.load(Ordering::Relaxed),
+            tx_bytes: self.inner.tx_bytes.load(Ordering::Relaxed),
+            tx_count: self.inner.tx_count.load(Ordering::Relaxed),
+            tx_errors: self.inner.tx_errors.load(Ordering::Relaxed),
+            tx_frames: self.inner.tx_frames.load(Ordering::Relaxed),
+            connections_created: self.inner.connections_created.load(Ordering::Relaxed),
+            connections_destroyed: self.inner.connections_destroyed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedMmdsMetricsInner {
+    rx_accepted: AtomicU64,
+    rx_accepted_err: AtomicU64,
+    rx_accepted_unusual: AtomicU64,
+    rx_bad_eth: AtomicU64,
+    rx_invalid_token: AtomicU64,
+    rx_no_token: AtomicU64,
+    rx_count: AtomicU64,
+    tx_bytes: AtomicU64,
+    tx_count: AtomicU64,
+    tx_errors: AtomicU64,
+    tx_frames: AtomicU64,
+    connections_created: AtomicU64,
+    connections_destroyed: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VsockDeviceMetrics {
     activate_fails: u64,
     cfg_fails: u64,
@@ -3521,6 +3785,7 @@ pub struct MetricsDiagnostics {
     pmem_device_metrics_by_device: Option<PmemDeviceMetricsByDevice>,
     network_interface_metrics: Option<NetworkInterfaceMetrics>,
     network_interface_metrics_by_interface: Option<NetworkInterfaceMetricsByInterface>,
+    mmds_metrics: Option<MmdsMetrics>,
     vsock_device_metrics: Option<VsockDeviceMetrics>,
     entropy_device_metrics: Option<EntropyDeviceMetrics>,
     rtc_device_metrics: Option<RtcDeviceMetrics>,
@@ -3542,6 +3807,7 @@ impl MetricsDiagnostics {
             pmem_device_metrics_by_device: None,
             network_interface_metrics: None,
             network_interface_metrics_by_interface: None,
+            mmds_metrics: None,
             vsock_device_metrics: None,
             entropy_device_metrics: None,
             rtc_device_metrics: None,
@@ -3594,6 +3860,11 @@ impl MetricsDiagnostics {
         network_interface_metrics_by_interface: NetworkInterfaceMetricsByInterface,
     ) -> Self {
         self.network_interface_metrics_by_interface = Some(network_interface_metrics_by_interface);
+        self
+    }
+
+    pub fn with_mmds_metrics(mut self, mmds_metrics: MmdsMetrics) -> Self {
+        self.mmds_metrics = Some(mmds_metrics);
         self
     }
 
@@ -3694,6 +3965,12 @@ impl MetricsDiagnostics {
                     None => metrics,
                 });
         }
+        if let Some(metrics) = other.mmds_metrics {
+            self.mmds_metrics = Some(match self.mmds_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
         if let Some(metrics) = other.vsock_device_metrics {
             self.vsock_device_metrics = Some(match self.vsock_device_metrics {
                 Some(existing) => existing.merged_with(metrics),
@@ -3767,6 +4044,10 @@ impl MetricsDiagnostics {
         &self,
     ) -> Option<&NetworkInterfaceMetricsByInterface> {
         self.network_interface_metrics_by_interface.as_ref()
+    }
+
+    pub fn mmds_metrics(&self) -> Option<MmdsMetrics> {
+        self.mmds_metrics
     }
 
     pub fn vsock_device_metrics(&self) -> Option<VsockDeviceMetrics> {
@@ -4015,6 +4296,63 @@ fn network_interface_metrics_json_object(
         serde_json::Value::Number(metrics.tx_queue_event_count().into()),
     );
     net
+}
+
+fn mmds_metrics_json_object(metrics: MmdsMetrics) -> serde_json::Map<String, serde_json::Value> {
+    let mut mmds = serde_json::Map::new();
+    mmds.insert(
+        "rx_accepted".to_string(),
+        serde_json::Value::Number(metrics.rx_accepted().into()),
+    );
+    mmds.insert(
+        "rx_accepted_err".to_string(),
+        serde_json::Value::Number(metrics.rx_accepted_err().into()),
+    );
+    mmds.insert(
+        "rx_accepted_unusual".to_string(),
+        serde_json::Value::Number(metrics.rx_accepted_unusual().into()),
+    );
+    mmds.insert(
+        "rx_bad_eth".to_string(),
+        serde_json::Value::Number(metrics.rx_bad_eth().into()),
+    );
+    mmds.insert(
+        "rx_invalid_token".to_string(),
+        serde_json::Value::Number(metrics.rx_invalid_token().into()),
+    );
+    mmds.insert(
+        "rx_no_token".to_string(),
+        serde_json::Value::Number(metrics.rx_no_token().into()),
+    );
+    mmds.insert(
+        "rx_count".to_string(),
+        serde_json::Value::Number(metrics.rx_count().into()),
+    );
+    mmds.insert(
+        "tx_bytes".to_string(),
+        serde_json::Value::Number(metrics.tx_bytes().into()),
+    );
+    mmds.insert(
+        "tx_count".to_string(),
+        serde_json::Value::Number(metrics.tx_count().into()),
+    );
+    mmds.insert(
+        "tx_errors".to_string(),
+        serde_json::Value::Number(metrics.tx_errors().into()),
+    );
+    mmds.insert(
+        "tx_frames".to_string(),
+        serde_json::Value::Number(metrics.tx_frames().into()),
+    );
+    mmds.insert(
+        "connections_created".to_string(),
+        serde_json::Value::Number(metrics.connections_created().into()),
+    );
+    mmds.insert(
+        "connections_destroyed".to_string(),
+        serde_json::Value::Number(metrics.connections_destroyed().into()),
+    );
+    mmds
 }
 
 fn vsock_device_metrics_json_object(
@@ -4399,6 +4737,14 @@ impl MetricsSink {
                 )),
             );
         }
+        if let Some(mmds_metrics) = diagnostics.mmds_metrics()
+            && !mmds_metrics.is_empty()
+        {
+            root.insert(
+                "mmds".to_string(),
+                serde_json::Value::Object(mmds_metrics_json_object(mmds_metrics)),
+            );
+        }
         if let Some(vsock_device_metrics) = diagnostics.vsock_device_metrics()
             && !vsock_device_metrics.is_empty()
         {
@@ -4725,11 +5071,11 @@ mod tests {
     use super::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
-        MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState,
+        MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
         PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
         SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
         SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
         SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
@@ -4837,6 +5183,23 @@ mod tests {
             .with_tx_count(10)
             .with_tx_packets_count(11)
             .with_tx_queue_event_count(12)
+    }
+
+    fn mmds_metrics_with_all_fields() -> MmdsMetrics {
+        MmdsMetrics::default()
+            .with_rx_accepted(1)
+            .with_rx_accepted_err(2)
+            .with_rx_accepted_unusual(3)
+            .with_rx_bad_eth(4)
+            .with_rx_invalid_token(5)
+            .with_rx_no_token(6)
+            .with_rx_count(7)
+            .with_tx_bytes(8)
+            .with_tx_count(9)
+            .with_tx_errors(10)
+            .with_tx_frames(11)
+            .with_connections_created(12)
+            .with_connections_destroyed(13)
     }
 
     fn vsock_metrics_with_all_fields() -> VsockDeviceMetrics {
@@ -5718,6 +6081,115 @@ mod tests {
         assert_eq!(
             merged.network_interface_metrics_by_interface(),
             Some(&expected)
+        );
+    }
+
+    #[test]
+    fn writes_mmds_metrics_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_mmds_metrics(mmds_metrics_with_all_fields());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"mmds":{"connections_created":12,"connections_destroyed":13,"rx_accepted":1,"rx_accepted_err":2,"rx_accepted_unusual":3,"rx_bad_eth":4,"rx_count":7,"rx_invalid_token":5,"rx_no_token":6,"tx_bytes":8,"tx_count":9,"tx_errors":10,"tx_frames":11},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_empty_mmds_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new().with_mmds_metrics(MmdsMetrics::default());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn shared_mmds_metrics_snapshot_is_per_instance() {
+        let first = SharedMmdsMetrics::default();
+        let second = SharedMmdsMetrics::default();
+
+        first.record_rx_accepted();
+        first.record_rx_accepted_error();
+        first.record_rx_accepted_unusual();
+        first.record_rx_bad_eth();
+        first.record_rx_invalid_token();
+        first.record_rx_no_token();
+        first.record_rx_count();
+        first.record_tx_frame(7);
+        first.record_tx_error();
+        first.record_connection_created();
+        first.record_connection_destroyed();
+
+        assert_eq!(
+            first.snapshot(),
+            MmdsMetrics::default()
+                .with_rx_accepted(1)
+                .with_rx_accepted_err(1)
+                .with_rx_accepted_unusual(1)
+                .with_rx_bad_eth(1)
+                .with_rx_invalid_token(1)
+                .with_rx_no_token(1)
+                .with_rx_count(1)
+                .with_tx_bytes(7)
+                .with_tx_count(1)
+                .with_tx_errors(1)
+                .with_tx_frames(1)
+                .with_connections_created(1)
+                .with_connections_destroyed(1)
+        );
+        assert_eq!(second.snapshot(), MmdsMetrics::default());
+    }
+
+    #[test]
+    fn mmds_metric_increment_saturates() {
+        let metrics = SharedMmdsMetrics::default();
+        metrics
+            .inner
+            .tx_bytes
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        metrics.record_tx_frame(3);
+
+        assert_eq!(metrics.snapshot().tx_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn mmds_diagnostics_merge_saturates() {
+        let base = MetricsDiagnostics::new().with_mmds_metrics(
+            MmdsMetrics::default()
+                .with_rx_accepted(u64::MAX - 1)
+                .with_tx_bytes(u64::MAX - 2),
+        );
+        let additional =
+            MetricsDiagnostics::new().with_mmds_metrics(mmds_metrics_with_all_fields());
+
+        assert_eq!(
+            base.merged_with(additional).mmds_metrics(),
+            Some(
+                MmdsMetrics::default()
+                    .with_rx_accepted(u64::MAX)
+                    .with_rx_accepted_err(2)
+                    .with_rx_accepted_unusual(3)
+                    .with_rx_bad_eth(4)
+                    .with_rx_invalid_token(5)
+                    .with_rx_no_token(6)
+                    .with_rx_count(7)
+                    .with_tx_bytes(u64::MAX)
+                    .with_tx_count(9)
+                    .with_tx_errors(10)
+                    .with_tx_frames(11)
+                    .with_connections_created(12)
+                    .with_connections_destroyed(13)
+            )
         );
     }
 
