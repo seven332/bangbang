@@ -1622,6 +1622,7 @@ impl std::error::Error for MmdsDataStoreError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmdsState {
     config: Option<MmdsConfig>,
+    data_store_present: bool,
     value: Option<Value>,
     data_store_limit_bytes: usize,
     token_authority: MmdsTokenAuthority,
@@ -1684,6 +1685,7 @@ impl MmdsState {
     pub fn new(data_store_limit_bytes: usize) -> Self {
         Self {
             config: None,
+            data_store_present: false,
             value: None,
             data_store_limit_bytes,
             token_authority: MmdsTokenAuthority::default(),
@@ -1698,12 +1700,22 @@ impl MmdsState {
         self.config.as_ref()
     }
 
+    pub const fn data_store_present(&self) -> bool {
+        self.data_store_present
+    }
+
+    pub fn ensure_data_store_present(&mut self) {
+        self.data_store_present = true;
+    }
+
     pub fn put_config(
         &mut self,
         input: MmdsConfigInput,
         configured_network_interfaces: &[NetworkInterfaceConfig],
     ) -> Result<(), MmdsConfigError> {
-        self.config = Some(input.validate(configured_network_interfaces)?);
+        let config = input.validate(configured_network_interfaces)?;
+        self.ensure_data_store_present();
+        self.config = Some(config);
         Ok(())
     }
 
@@ -1716,6 +1728,19 @@ impl MmdsState {
 
     pub fn get_data_or_null(&self) -> Value {
         self.value.as_ref().cloned().unwrap_or(Value::Null)
+    }
+
+    pub fn get_or_create_data_store_value(&mut self) -> Value {
+        self.ensure_data_store_present();
+        self.get_data_or_null()
+    }
+
+    pub fn get_existing_data_store_value(&self) -> Result<Value, MmdsDataStoreError> {
+        if !self.data_store_present {
+            return Err(MmdsDataStoreError::NotInitialized);
+        }
+
+        Ok(self.get_data_or_null())
     }
 
     pub fn query_data(
@@ -1814,8 +1839,20 @@ impl MmdsState {
         let value = input.into_value();
         validate_object(&value)?;
         self.ensure_within_limit(&value)?;
+        self.ensure_data_store_present();
         self.value = Some(value);
         Ok(())
+    }
+
+    pub fn put_existing_data_store(
+        &mut self,
+        input: MmdsContentInput,
+    ) -> Result<(), MmdsDataStoreError> {
+        if !self.data_store_present {
+            return Err(MmdsDataStoreError::NotInitialized);
+        }
+
+        self.put_data(input)
     }
 
     pub fn patch_data(&mut self, input: MmdsContentInput) -> Result<(), MmdsDataStoreError> {
@@ -1829,6 +1866,17 @@ impl MmdsState {
         self.ensure_within_limit(&patched)?;
         self.value = Some(patched);
         Ok(())
+    }
+
+    pub fn patch_existing_data_store(
+        &mut self,
+        input: MmdsContentInput,
+    ) -> Result<(), MmdsDataStoreError> {
+        if !self.data_store_present {
+            return Err(MmdsDataStoreError::NotInitialized);
+        }
+
+        self.patch_data(input)
     }
 
     fn ensure_within_limit(&self, value: &Value) -> Result<(), MmdsDataStoreError> {
@@ -4044,6 +4092,36 @@ mod tests {
     }
 
     #[test]
+    fn get_or_create_data_store_value_marks_store_present_without_data() {
+        let mut state = MmdsState::default();
+
+        assert_eq!(state.get_or_create_data_store_value(), Value::Null);
+        assert!(state.data_store_present());
+        assert_eq!(state.get_data(), Err(MmdsDataStoreError::NotInitialized));
+        assert_eq!(state.get_existing_data_store_value(), Ok(Value::Null));
+    }
+
+    #[test]
+    fn existing_data_store_operations_require_store_presence() {
+        let mut state = MmdsState::default();
+        let value = query_value();
+
+        assert_eq!(
+            state.get_existing_data_store_value(),
+            Err(MmdsDataStoreError::NotInitialized)
+        );
+        assert_eq!(
+            state.put_existing_data_store(MmdsContentInput::new(value)),
+            Err(MmdsDataStoreError::NotInitialized)
+        );
+        assert_eq!(
+            state.patch_existing_data_store(MmdsContentInput::new(serde_json::json!({}))),
+            Err(MmdsDataStoreError::NotInitialized)
+        );
+        assert!(!state.data_store_present());
+    }
+
+    #[test]
     fn mmds_config_effective_ipv4_address_uses_default_or_configured_value() {
         let mut state = MmdsState::default();
         enable_mmds_v1(&mut state);
@@ -4071,6 +4149,7 @@ mod tests {
                 .effective_ipv4_address(),
             Ipv4Addr::new(169, 254, 169, 253)
         );
+        assert!(state.data_store_present());
     }
 
     #[test]
@@ -4091,6 +4170,7 @@ mod tests {
 
         assert_eq!(state.get_data_or_null(), Value::Null);
         assert_eq!(state.get_data(), Err(MmdsDataStoreError::NotInitialized));
+        assert!(!state.data_store_present());
     }
 
     #[test]

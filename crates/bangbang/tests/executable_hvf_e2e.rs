@@ -231,6 +231,14 @@ mod macos_arm64 {
             "PUT /vsock should store config without binding the host socket path"
         );
 
+        let preboot_mmds_data = http_get(&socket_path, "/mmds");
+        assert_ok_response(&preboot_mmds_data, "GET /mmds before InstanceStart");
+        assert_response_contains(
+            &preboot_mmds_data,
+            "\r\n\r\nnull",
+            "GET /mmds before InstanceStart",
+        );
+
         let start_response = http_put_json(
             &socket_path,
             "/actions",
@@ -706,7 +714,7 @@ mod macos_arm64 {
         assert_metrics_output(
             &metrics_path,
             Some(
-                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":6,"machine_cfg_count":0,"mmds_count":1,"vmm_version_count":0}"#,
+                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":6,"machine_cfg_count":0,"mmds_count":2,"vmm_version_count":0}"#,
             ),
             r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":3,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
             Some(
