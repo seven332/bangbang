@@ -376,20 +376,20 @@ impl HvfArm64BootLimiterRetryWakeupScheduler {
         cancel_handle: HvfVcpuRunCancelHandle,
         wakeup_token: HvfArm64BootLimiterRetryWakeupToken,
     ) -> Result<Self, io::Error> {
-        Self::start_with_publisher(thread_name, wakeup_token, move || cancel_handle.cancel())
+        Self::start_with_cancellation(thread_name, wakeup_token, move || cancel_handle.cancel())
     }
 
-    fn start_with_publisher<R>(
+    fn start_with_cancellation<R>(
         thread_name: &'static str,
         wakeup_token: HvfArm64BootLimiterRetryWakeupToken,
-        publish_wakeup: impl Fn() -> R + Send + 'static,
+        cancel_vcpu_run: impl Fn() -> R + Send + 'static,
     ) -> Result<Self, io::Error> {
         let shared = Arc::new(HvfArm64BootLimiterRetryWakeupSchedulerShared::default());
         let thread_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name(thread_name.to_owned())
             .spawn(move || {
-                run_limiter_retry_wakeup_scheduler(thread_shared, wakeup_token, publish_wakeup);
+                run_limiter_retry_wakeup_scheduler(thread_shared, wakeup_token, cancel_vcpu_run);
             })?;
 
         Ok(Self {
@@ -536,8 +536,9 @@ impl Drop for HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard {
 
 /// Holds block and entropy limiter retry wakeup schedulers quiesced.
 ///
-/// Dropping the guard resumes both schedulers and republishes any retry wakeup
-/// that became due while the guard was held.
+/// Dropping the guard resumes each scheduler that has not stopped. Active
+/// scheduler threads then publish any retry wakeup that became due while the
+/// guard was held.
 #[derive(Debug)]
 #[must_use = "dropping the guard resumes limiter retry wakeup publication"]
 pub struct HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
@@ -710,14 +711,14 @@ fn wait_to_publish_limiter_retry_wakeup(
 fn run_limiter_retry_wakeup_scheduler<R>(
     shared: Arc<HvfArm64BootLimiterRetryWakeupSchedulerShared>,
     wakeup_token: HvfArm64BootLimiterRetryWakeupToken,
-    publish_wakeup: impl Fn() -> R,
+    cancel_vcpu_run: impl Fn() -> R,
 ) {
     while wait_to_publish_limiter_retry_wakeup(Arc::clone(&shared)) {
         let _publication = HvfArm64BootLimiterRetryWakeupPublicationGuard {
             shared: Arc::clone(&shared),
         };
         wakeup_token.request_wakeup();
-        let _publish_result = publish_wakeup();
+        let _cancel_result = cancel_vcpu_run();
     }
 }
 
@@ -5722,7 +5723,7 @@ mod tests {
         let wakeup_token = HvfArm64BootLimiterRetryWakeupToken::default();
         let (publication_sender, publication_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
-        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_publisher(
+        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
             "bangbang-hvf-test-limiter-retry-in-flight",
             wakeup_token.clone(),
             move || {
@@ -5791,7 +5792,7 @@ mod tests {
     fn limiter_retry_quiescence_coalesces_deferred_and_overdue_work() {
         let wakeup_token = HvfArm64BootLimiterRetryWakeupToken::default();
         let (publication_sender, publication_receiver) = mpsc::channel();
-        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_publisher(
+        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
             "bangbang-hvf-test-limiter-retry-coalesce",
             wakeup_token.clone(),
             move || {
@@ -5835,7 +5836,7 @@ mod tests {
     fn limiter_retry_quiescence_preserves_future_deadline_after_deferred_publication() {
         let wakeup_token = HvfArm64BootLimiterRetryWakeupToken::default();
         let (publication_sender, publication_receiver) = mpsc::channel();
-        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_publisher(
+        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
             "bangbang-hvf-test-limiter-retry-future",
             wakeup_token.clone(),
             move || {
@@ -5876,7 +5877,7 @@ mod tests {
     #[test]
     fn limiter_retry_schedule_cancellation_discards_deferred_publication() {
         let (publication_sender, publication_receiver) = mpsc::channel();
-        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_publisher(
+        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
             "bangbang-hvf-test-limiter-retry-cancel",
             HvfArm64BootLimiterRetryWakeupToken::default(),
             move || {
@@ -5911,7 +5912,7 @@ mod tests {
         let entropy_token = HvfArm64BootLimiterRetryWakeupToken::default();
         let (block_sender, block_receiver) = mpsc::channel();
         let (entropy_sender, entropy_receiver) = mpsc::channel();
-        let mut block_scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_publisher(
+        let mut block_scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
             "bangbang-hvf-test-block-retry-quiescence",
             block_token.clone(),
             move || {
@@ -5921,16 +5922,17 @@ mod tests {
             },
         )
         .expect("test block retry wakeup scheduler should start");
-        let mut entropy_scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_publisher(
-            "bangbang-hvf-test-entropy-retry-quiescence",
-            entropy_token.clone(),
-            move || {
-                entropy_sender
-                    .send(())
-                    .expect("test should observe entropy retry wakeup publication");
-            },
-        )
-        .expect("test entropy retry wakeup scheduler should start");
+        let mut entropy_scheduler =
+            HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                "bangbang-hvf-test-entropy-retry-quiescence",
+                entropy_token.clone(),
+                move || {
+                    entropy_sender
+                        .send(())
+                        .expect("test should observe entropy retry wakeup publication");
+                },
+            )
+            .expect("test entropy retry wakeup scheduler should start");
         block_token.request_wakeup();
         entropy_token.request_wakeup();
 
