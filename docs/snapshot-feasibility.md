@@ -147,8 +147,8 @@ invariants hold:
 - shutdown and terminal status are checked before readiness is returned, so a
   stale successful acknowledgement cannot outlive the session.
 
-The last-but-one invariant controls bangbang's access to external resources; it
-does not freeze the host. Packets may accumulate in vmnet/kernel queues, and
+The vmnet and vsock invariant controls bangbang's access to external resources;
+it does not freeze the host. Packets may accumulate in vmnet/kernel queues, and
 peer activity may change socket buffers or connection state. Those resources
 need an explicit metadata, discard, or reconnect policy during later restore
 design. Live host descriptors and opaque kernel buffers are outside the guest
