@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v27"
+direct_boot_variant="direct-boot-v28"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -736,6 +736,62 @@ check_vmgenid_marker() {
   write_vdb_marker BANGBANG_VMGENID_GUEST_CHECK_OK
 }
 
+check_vmclock_marker() {
+  vmclock_path=
+  for compatible_path in $(find /proc/device-tree /sys/firmware/devicetree/base -type f -name compatible 2>/dev/null); do
+    if grep -q 'amazon,vmclock' "$compatible_path" 2>/dev/null; then
+      vmclock_path=${compatible_path%/compatible}
+      break
+    fi
+  done
+
+  if [ -z "$vmclock_path" ]; then
+    emit_line BANGBANG_VMCLOCK_GUEST_CHECK_FAIL_NO_NODE
+    write_vdb_marker BANGBANG_VMCLOCK_GUEST_CHECK_FAIL
+    return
+  fi
+
+  case "${vmclock_path##*/}" in
+    ptp@*) ;;
+    *)
+      emit_line BANGBANG_VMCLOCK_GUEST_CHECK_FAIL_NODE_NAME
+      write_vdb_marker BANGBANG_VMCLOCK_GUEST_CHECK_FAIL
+      return
+      ;;
+  esac
+
+  if [ ! -r "$vmclock_path/reg" ]; then
+    emit_line BANGBANG_VMCLOCK_GUEST_CHECK_FAIL_NO_REG
+    write_vdb_marker BANGBANG_VMCLOCK_GUEST_CHECK_FAIL
+    return
+  fi
+
+  set -- $(wc -c < "$vmclock_path/reg" 2>/dev/null || printf '0')
+  if [ "${1:-0}" != 16 ]; then
+    emit_line BANGBANG_VMCLOCK_GUEST_CHECK_FAIL_REG_SIZE
+    write_vdb_marker BANGBANG_VMCLOCK_GUEST_CHECK_FAIL
+    return
+  fi
+
+  if ! command -v od >/dev/null 2>&1; then
+    emit_line BANGBANG_VMCLOCK_GUEST_CHECK_FAIL_NO_OD
+    write_vdb_marker BANGBANG_VMCLOCK_GUEST_CHECK_FAIL
+    return
+  fi
+
+  reg_hex=$(od -An -tx1 -v "$vmclock_path/reg" 2>/dev/null | tr -d ' \n' || true)
+  case "$reg_hex" in
+    *0000000000001000)
+      emit_line BANGBANG_VMCLOCK_GUEST_CHECK_OK
+      write_vdb_marker BANGBANG_VMCLOCK_GUEST_CHECK_OK
+      ;;
+    *)
+      emit_line BANGBANG_VMCLOCK_GUEST_CHECK_FAIL_REG_VALUE
+      write_vdb_marker BANGBANG_VMCLOCK_GUEST_CHECK_FAIL
+      ;;
+  esac
+}
+
 flush_writeback_block_marker() {
   if [ ! -b /dev/vdb ]; then
     emit_line BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL_NO_VDB
@@ -1347,6 +1403,8 @@ elif cmdline_has bangbang.rtc-check=1; then
   check_rtc_marker
 elif cmdline_has bangbang.vmgenid-check=1; then
   check_vmgenid_marker
+elif cmdline_has bangbang.vmclock-check=1; then
+  check_vmclock_marker
 elif cmdline_has bangbang.block-writeback-flush=1; then
   flush_writeback_block_marker
 elif cmdline_has bangbang.pmem-read-flush=1; then
