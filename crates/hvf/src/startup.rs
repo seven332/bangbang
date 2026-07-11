@@ -79,8 +79,9 @@ use crate::vcpu::{
     HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
     HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePstate,
     HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
-    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
-    HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState,
+    HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuThreadContextRegisterState,
+    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
+    HvfArm64VcpuWatchpointRegisterState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1314,10 +1315,23 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_sme_system_register_state()
     }
 
+    /// Capture raw system-context registers on the primary vCPU owner thread.
+    ///
+    /// This macOS 15.2+ getter-only value contains `SCXTNUM_EL0` and
+    /// `SCXTNUM_EL1`; `Debug` redacts both guest software context numbers. It
+    /// excludes interpretation, feature validation, persistence, schema, and
+    /// restore ordering.
+    pub fn capture_arm64_system_context_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSystemContextRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_system_context_register_state()
+    }
+
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
-    /// This subset omits table memory, feature validation, TLB/cache
-    /// maintenance, persistence, and a safe restore sequence.
+    /// `SCXTNUM_EL0`/`SCXTNUM_EL1` context is captured separately. This subset
+    /// omits table memory, feature validation, TLB/cache maintenance,
+    /// persistence, and a safe restore sequence.
     pub fn capture_arm64_translation_register_state(
         &self,
     ) -> Result<HvfArm64VcpuTranslationRegisterState, HvfVcpuRunnerError> {
@@ -1339,7 +1353,8 @@ impl HvfArm64BootSession<'_> {
     /// vCPU owner thread.
     ///
     /// These sensitive software thread-ID values can contain guest pointers.
-    /// `TPIDR2_EL0` is captured separately with SME system registers. Wider
+    /// `TPIDR2_EL0` is captured separately with SME system registers, while
+    /// `SCXTNUM_EL0`/`SCXTNUM_EL1` use a separate system-context value. Wider
     /// system state and restore policy remain outside this subset.
     pub fn capture_arm64_thread_context_register_state(
         &self,
@@ -2096,10 +2111,23 @@ impl OwnedHvfArm64BootSession {
         self.runner.capture_arm64_sme_system_register_state()
     }
 
+    /// Capture raw system-context registers on the primary vCPU owner thread.
+    ///
+    /// This macOS 15.2+ getter-only value contains `SCXTNUM_EL0` and
+    /// `SCXTNUM_EL1`; `Debug` redacts both guest software context numbers. It
+    /// excludes interpretation, feature validation, persistence, schema, and
+    /// restore ordering.
+    pub fn capture_arm64_system_context_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSystemContextRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_system_context_register_state()
+    }
+
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
-    /// This subset omits table memory, feature validation, TLB/cache
-    /// maintenance, persistence, and a safe restore sequence.
+    /// `SCXTNUM_EL0`/`SCXTNUM_EL1` context is captured separately. This subset
+    /// omits table memory, feature validation, TLB/cache maintenance,
+    /// persistence, and a safe restore sequence.
     pub fn capture_arm64_translation_register_state(
         &self,
     ) -> Result<HvfArm64VcpuTranslationRegisterState, HvfVcpuRunnerError> {
@@ -2121,7 +2149,8 @@ impl OwnedHvfArm64BootSession {
     /// vCPU owner thread.
     ///
     /// These sensitive software thread-ID values can contain guest pointers.
-    /// `TPIDR2_EL0` is captured separately with SME system registers. Wider
+    /// `TPIDR2_EL0` is captured separately with SME system registers, while
+    /// `SCXTNUM_EL0`/`SCXTNUM_EL1` use a separate system-context value. Wider
     /// system state and restore policy remain outside this subset.
     pub fn capture_arm64_thread_context_register_state(
         &self,

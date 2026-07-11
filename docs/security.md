@@ -244,6 +244,7 @@ is resource-specific:
   MDCCINT_EL1/MDSCR_EL1 debug controls, raw Hypervisor.framework debug-trap
   policy, raw pointer-authentication keys, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1
   values, raw SME SMCR_EL1/SMPRI_EL1/TPIDR2_EL0 values, raw
+  SCXTNUM_EL0/SCXTNUM_EL1 software context numbers, raw
   Q0-Q31/FPCR/FPSR values, raw
   physical-timer CNTKCTL/control/CVAL values, raw virtual-timer
   mask/offset/control/CVAL values, raw EL1
@@ -307,6 +308,12 @@ is resource-specific:
   internal composition. The values must not be logged, persisted, trusted, or
   restored without feature and writable-bit validation, maximum-SVL policy,
   and ordering with PSTATE plus conditional Z/P/ZA/ZT0 contents.
+  The separate raw `SCXTNUM_EL0` and `SCXTNUM_EL1` values can identify guest
+  software execution contexts. Their detached value redacts both registers from
+  `Debug`, and capture performs no writes, but raw accessors remain restricted
+  to trusted internal composition. The values must not be logged, persisted,
+  trusted, or restored without feature, interpretation, destination, and
+  ordering policy coordinated with TPIDR and `CONTEXTIDR_EL1` state.
   Current internal capture commands keep these values in process memory and do
   not write them to logs, metrics, error strings, or persistence. The raw
   virtual-timer offset is tied to HVF's host-time relation, the physical-timer
