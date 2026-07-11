@@ -1676,8 +1676,8 @@ reads raw `CNTKCTL_EL1`, `CNTP_CTL_EL0`, and `CNTP_CVAL_EL0` in that order,
 publishes no partial state if any read fails, and shares generalized timer
 admission with every virtual-timer command. Both boot-session forms expose the
 immutable value. CNTP access requires macOS 15 and GIC creation before the vCPU.
-Control ISTATUS is derived, and the absolute CVAL advances against a continuing
-physical count, so the value has no portable elapsed-time adjustment,
+Control ISTATUS is derived, and the absolute CVAL is compared against a
+continuing physical count, so the value has no portable elapsed-time adjustment,
 interrupt-delivery, writable-bit, or restore policy. A separate command
 reads the virtual-timer mask, raw offset, control, and CVAL in that order,
 publishes no partial state if any read fails, and keeps command-owned admission
