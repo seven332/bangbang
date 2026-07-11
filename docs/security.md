@@ -239,8 +239,9 @@ is resource-specific:
   documented in [Snapshot Feasibility](snapshot-feasibility.md).
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
-  ACTLR_EL1/CPACR_EL1 execution controls, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1
-  values, raw Q0-Q31/FPCR/FPSR values, raw physical-timer
+  ACTLR_EL1/CPACR_EL1 execution controls, raw pointer-authentication keys, raw
+  TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1 values, raw Q0-Q31/FPCR/FPSR values, raw
+  physical-timer
   CNTKCTL/control/CVAL values, raw virtual-timer mask/offset/control/CVAL values,
   raw EL1
   SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
@@ -253,8 +254,11 @@ is resource-specific:
   FAR and PAR can expose guest fault or translation-result addresses, VBAR can
   expose a guest kernel vector address, and syndrome/fault fields can reveal
   guest execution details.
-  The opaque GIC byte value uses a custom `Debug` implementation that reports
-  only its length rather than formatting its contents.
+  Pointer-authentication keys are cryptographic secrets. Their detached value
+  uses a custom `Debug` implementation that exposes only a redacted marker, and
+  future persistence must protect key confidentiality and integrity. The opaque
+  GIC byte value uses a custom `Debug` implementation that reports only its
+  length rather than formatting its contents.
   Current internal capture commands keep these values in process memory and do
   not write them to logs, metrics, error strings, or persistence. The raw
   virtual-timer offset is tied to HVF's host-time relation, the physical-timer

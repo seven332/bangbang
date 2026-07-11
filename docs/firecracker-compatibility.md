@@ -47,10 +47,11 @@ including an HVF wrapper path for injected virtio-net packet I/O, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
-access, one-step runner-thread MMIO handling, a run-cancellation boundary, raw
+access, one-step runner-thread MMIO handling, a run-cancellation boundary,
+pointer-authentication key-state capture with redacted `Debug`, raw
 physical-timer capture, a virtual-timer mask/offset/control/CVAL boundary, a
-bounded internal boot-session
-run-loop pump, owned internal boot-session handle, process-level owned
+bounded internal boot-session run-loop pump, owned internal boot-session handle,
+process-level owned
 startup-session wiring with optional serial capture and boot run-loop supervision
 across bounded step windows with retained internal worker status, process-owned
 virtio-net packet-I/O provider selection with no-op fallback and vmnet-backed
@@ -1655,20 +1656,24 @@ Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
 `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1`, `MAIR_EL1`, `AMAIR_EL1`, and
 `CONTEXTIDR_EL1`. A sixth reads raw `AFSR0_EL1`, `AFSR1_EL1`, `ESR_EL1`,
 `FAR_EL1`, `PAR_EL1`, and `VBAR_EL1`. A seventh reads raw `ACTLR_EL1` then
-`CPACR_EL1`; complete capture requires macOS 15 for ACTLR.EnTSO. The seven
-commands share one
+`CPACR_EL1`; complete capture requires macOS 15 for ACTLR.EnTSO. An eighth reads
+the low and high halves of APIA, APIB, APDA, APDB, and APGA and publishes five
+128-bit pointer-authentication keys. The eight commands share one
 command-owned core-register admission domain, publish no partial state after a
 read failure, and are exposed by borrowed and owned HVF boot sessions for later
 lease-owned orchestration. TPIDR values can contain guest TLS or kernel
 pointers; translation table bases, context ids, fault addresses, and the vector
-base are sensitive; and the optional SME-era `TPIDR2_EL0` remains outside the
-baseline. The translation value omits table memory, feature validation,
+base are sensitive; pointer-authentication keys are cryptographic secrets; and
+the optional SME-era `TPIDR2_EL0` remains outside the baseline. The key value
+redacts all material from `Debug` but provides raw named accessors for trusted
+internal composition. The translation value omits table memory, feature validation,
 TLB/cache maintenance, and an ordered restore path. The exception value omits
 vector-table memory, semantic validation, and safe restore ordering. Signed
 validation leaves the MMU disabled, uses an aligned unused VBAR without an
 intervening guest exception, and accepts implementation-defined AMAIR and AFSR
 readback after guest writes. Execution-control validation writes only EnTSO and
-baseline FPEN, executes ISB, and does not cover optional CPACR features.
+baseline FPEN, executes ISB, and does not cover optional CPACR features. Key
+validation uses visibly fake values and does not enable or execute PAC.
 The SIMD getter uses an explicitly 16-byte-aligned
 HVF output value; in streaming SVE mode, its Q values alias only the low 128
 bits of Z registers and are not complete SVE/SME state. A separate command
@@ -1687,10 +1692,12 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The core system-register, exception,
-execution-control, translation, thread-context, baseline SIMD/FP, and physical-
-timer subsets are raw and read-only and likewise have no restore validation,
-snapshot schema, or Firecracker on-disk compatibility. The process snapshot
-barrier invokes none of these captures.
+execution-control, translation, pointer-authentication, thread-context,
+baseline SIMD/FP, and physical-timer subsets are raw and read-only and likewise
+have no restore validation, snapshot schema, or Firecracker on-disk
+compatibility. Pointer-authentication capture additionally has no feature
+validation, zeroization, protected persistence, or safe enable ordering. The
+process snapshot barrier invokes none of these captures.
 
 A separate failure-atomic command reads CPU IRQ then FIQ pending levels and is
 available through both boot-session forms. It shares generalized interrupt
@@ -2053,9 +2060,12 @@ macOS design work instead of direct implementation:
   TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 translation state.
   A sixth captures raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and
   VBAR_EL1 exception state; and a seventh captures raw ACTLR_EL1 and CPACR_EL1
-  execution controls, requiring macOS 15 for ACTLR.EnTSO. Streaming SVE/SME
-  state, table and vector memory, optional CPACR feature validation, and restore
-  ordering remain outside these subsets. The runner can capture raw CNTKCTL_EL1,
+  execution controls, requiring macOS 15 for ACTLR.EnTSO. An eighth captures
+  five 128-bit pointer-authentication keys from all ten APIA/APIB/APDA/APDB/APGA
+  halves and redacts them from `Debug`. Streaming SVE/SME state, table and
+  vector memory, optional CPACR and pointer-authentication feature validation,
+  protected key persistence, and restore ordering remain outside these subsets.
+  The runner can capture raw CNTKCTL_EL1,
   CNTP_CTL_EL0, and CNTP_CVAL_EL0 on the owning thread when macOS 15 physical-
   timer prerequisites are met. It also gets and sets the HVF virtual-timer mask,
   raw offset, raw control, and raw CVAL on that owning thread and can capture

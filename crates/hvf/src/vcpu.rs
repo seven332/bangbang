@@ -331,6 +331,68 @@ impl HvfArm64VcpuTranslationRegisterState {
     }
 }
 
+/// Detached EL1 pointer-authentication keys captured from one arm64 vCPU.
+///
+/// The five 128-bit keys are cryptographic secrets. `Debug` redacts every key,
+/// but the named accessors intentionally expose raw values to trusted internal
+/// snapshot orchestration. This value has no feature validation, zeroization,
+/// persistence protection, restore ordering, or serialized schema policy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64VcpuPointerAuthenticationKeyState {
+    keys: [u128; 5],
+}
+
+impl HvfArm64VcpuPointerAuthenticationKeyState {
+    pub(crate) const fn new(halves: [u64; 10]) -> Self {
+        Self {
+            keys: [
+                pointer_authentication_key(halves[0], halves[1]),
+                pointer_authentication_key(halves[2], halves[3]),
+                pointer_authentication_key(halves[4], halves[5]),
+                pointer_authentication_key(halves[6], halves[7]),
+                pointer_authentication_key(halves[8], halves[9]),
+            ],
+        }
+    }
+
+    /// Return the raw 128-bit instruction A key.
+    pub const fn apia_key(&self) -> u128 {
+        self.keys[0]
+    }
+
+    /// Return the raw 128-bit instruction B key.
+    pub const fn apib_key(&self) -> u128 {
+        self.keys[1]
+    }
+
+    /// Return the raw 128-bit data A key.
+    pub const fn apda_key(&self) -> u128 {
+        self.keys[2]
+    }
+
+    /// Return the raw 128-bit data B key.
+    pub const fn apdb_key(&self) -> u128 {
+        self.keys[3]
+    }
+
+    /// Return the raw 128-bit generic key.
+    pub const fn apga_key(&self) -> u128 {
+        self.keys[4]
+    }
+}
+
+impl fmt::Debug for HvfArm64VcpuPointerAuthenticationKeyState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64VcpuPointerAuthenticationKeyState")
+            .field("keys", &"<redacted>")
+            .finish()
+    }
+}
+
+const fn pointer_authentication_key(low: u64, high: u64) -> u128 {
+    (low as u128) | ((high as u128) << 64)
+}
+
 /// Detached raw thread-context register state captured from one arm64 vCPU.
 ///
 /// These software thread-ID values can contain guest TLS or kernel pointers.
@@ -558,6 +620,16 @@ impl HvfSystemRegister {
     pub const TTBR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_TTBR0_EL1);
     pub const TTBR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_TTBR1_EL1);
     pub const TCR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TCR_EL1);
+    pub const APIAKEYLO_EL1: Self = Self(crate::ffi::HV_SYS_REG_APIAKEYLO_EL1);
+    pub const APIAKEYHI_EL1: Self = Self(crate::ffi::HV_SYS_REG_APIAKEYHI_EL1);
+    pub const APIBKEYLO_EL1: Self = Self(crate::ffi::HV_SYS_REG_APIBKEYLO_EL1);
+    pub const APIBKEYHI_EL1: Self = Self(crate::ffi::HV_SYS_REG_APIBKEYHI_EL1);
+    pub const APDAKEYLO_EL1: Self = Self(crate::ffi::HV_SYS_REG_APDAKEYLO_EL1);
+    pub const APDAKEYHI_EL1: Self = Self(crate::ffi::HV_SYS_REG_APDAKEYHI_EL1);
+    pub const APDBKEYLO_EL1: Self = Self(crate::ffi::HV_SYS_REG_APDBKEYLO_EL1);
+    pub const APDBKEYHI_EL1: Self = Self(crate::ffi::HV_SYS_REG_APDBKEYHI_EL1);
+    pub const APGAKEYLO_EL1: Self = Self(crate::ffi::HV_SYS_REG_APGAKEYLO_EL1);
+    pub const APGAKEYHI_EL1: Self = Self(crate::ffi::HV_SYS_REG_APGAKEYHI_EL1);
     pub const SPSR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SPSR_EL1);
     pub const ELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ELR_EL1);
     pub const SP_EL0: Self = Self(crate::ffi::HV_SYS_REG_SP_EL0);
@@ -1039,6 +1111,25 @@ pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_pointer_authentication_key_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuPointerAuthenticationKeyState, BackendError> {
+    let halves = [
+        get_system_register(HvfSystemRegister::APIAKEYLO_EL1)?,
+        get_system_register(HvfSystemRegister::APIAKEYHI_EL1)?,
+        get_system_register(HvfSystemRegister::APIBKEYLO_EL1)?,
+        get_system_register(HvfSystemRegister::APIBKEYHI_EL1)?,
+        get_system_register(HvfSystemRegister::APDAKEYLO_EL1)?,
+        get_system_register(HvfSystemRegister::APDAKEYHI_EL1)?,
+        get_system_register(HvfSystemRegister::APDBKEYLO_EL1)?,
+        get_system_register(HvfSystemRegister::APDBKEYHI_EL1)?,
+        get_system_register(HvfSystemRegister::APGAKEYLO_EL1)?,
+        get_system_register(HvfSystemRegister::APGAKEYHI_EL1)?,
+    ];
+
+    Ok(HvfArm64VcpuPointerAuthenticationKeyState::new(halves))
+}
+
 pub(crate) fn capture_arm64_vcpu_thread_context_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuThreadContextRegisterState, BackendError> {
@@ -1135,7 +1226,9 @@ mod tests {
         capture_arm64_vcpu_execution_control_register_state_with,
         capture_arm64_vcpu_general_register_state_with,
         capture_arm64_vcpu_pending_interrupt_state_with,
-        capture_arm64_vcpu_physical_timer_state_with, capture_arm64_vcpu_simd_fp_state_with,
+        capture_arm64_vcpu_physical_timer_state_with,
+        capture_arm64_vcpu_pointer_authentication_key_state_with,
+        capture_arm64_vcpu_simd_fp_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
         capture_arm64_vcpu_translation_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with, configure_arm64_boot_registers_with,
@@ -1146,6 +1239,41 @@ mod tests {
     enum SimdFpRead {
         Q(HvfSimdFpRegister),
         Scalar(HvfRegister),
+    }
+
+    const POINTER_AUTHENTICATION_TEST_HALVES: [u64; 10] = [
+        0x0123_4567_89ab_cdef,
+        0xfedc_ba98_7654_3210,
+        0x0f1e_2d3c_4b5a_6978,
+        0x8796_a5b4_c3d2_e1f0,
+        0x1357_9bdf_2468_ace0,
+        0x0eca_8642_fdb9_7531,
+        0x1122_3344_5566_7788,
+        0x8877_6655_4433_2211,
+        0xa5a5_5a5a_c3c3_3c3c,
+        0x3c3c_c3c3_5a5a_a5a5,
+    ];
+
+    fn pointer_authentication_key_registers() -> [HvfSystemRegister; 10] {
+        [
+            HvfSystemRegister::APIAKEYLO_EL1,
+            HvfSystemRegister::APIAKEYHI_EL1,
+            HvfSystemRegister::APIBKEYLO_EL1,
+            HvfSystemRegister::APIBKEYHI_EL1,
+            HvfSystemRegister::APDAKEYLO_EL1,
+            HvfSystemRegister::APDAKEYHI_EL1,
+            HvfSystemRegister::APDBKEYLO_EL1,
+            HvfSystemRegister::APDBKEYHI_EL1,
+            HvfSystemRegister::APGAKEYLO_EL1,
+            HvfSystemRegister::APGAKEYHI_EL1,
+        ]
+    }
+
+    fn pointer_authentication_test_key(index: usize) -> u128 {
+        super::pointer_authentication_key(
+            POINTER_AUTHENTICATION_TEST_HALVES[index * 2],
+            POINTER_AUTHENTICATION_TEST_HALVES[index * 2 + 1],
+        )
     }
 
     fn simd_fp_q_value(register: HvfSimdFpRegister) -> [u8; 16] {
@@ -1617,6 +1745,36 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_pointer_authentication_keys_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_pointer_authentication_key_state_with(|register| {
+            let value = POINTER_AUTHENTICATION_TEST_HALVES[reads.len()];
+            reads.push(register);
+            Ok(value)
+        })
+        .expect("pointer-authentication key capture should succeed");
+
+        let registers = pointer_authentication_key_registers();
+        assert_eq!(reads, registers);
+        assert_eq!(state.apia_key(), pointer_authentication_test_key(0));
+        assert_eq!(state.apib_key(), pointer_authentication_test_key(1));
+        assert_eq!(state.apda_key(), pointer_authentication_test_key(2));
+        assert_eq!(state.apdb_key(), pointer_authentication_test_key(3));
+        assert_eq!(state.apga_key(), pointer_authentication_test_key(4));
+        assert_eq!(
+            registers.map(HvfSystemRegister::raw),
+            [
+                0xc108, 0xc109, 0xc10a, 0xc10b, 0xc110, 0xc111, 0xc112, 0xc113, 0xc118, 0xc119,
+            ]
+        );
+        assert_eq!(
+            format!("{state:?}"),
+            "HvfArm64VcpuPointerAuthenticationKeyState { keys: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
     fn captures_arm64_pending_interrupt_state_in_irq_then_fiq_order() {
         let mut reads = Vec::new();
 
@@ -1860,6 +2018,42 @@ mod tests {
                 state.contextidr_el1(),
                 u64::from(HvfSystemRegister::CONTEXTIDR_EL1.raw())
             );
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_pointer_authentication_key_capture_stops_after_each_error_and_can_retry() {
+        let registers = pointer_authentication_key_registers();
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake pointer-authentication key read failed",
+                    ))
+                } else {
+                    Ok(POINTER_AUTHENTICATION_TEST_HALVES[reads.borrow().len() - 1])
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_pointer_authentication_key_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake pointer-authentication key read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state =
+                capture_arm64_vcpu_pointer_authentication_key_state_with(&read_system_register)
+                    .expect("pointer-authentication key capture retry should succeed");
+            assert_eq!(state.apia_key(), pointer_authentication_test_key(0));
+            assert_eq!(state.apga_key(), pointer_authentication_test_key(4));
             assert_eq!(*reads.borrow(), registers);
         }
     }

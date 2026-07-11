@@ -120,6 +120,11 @@ Physical-timer signed tests require macOS 15 and must create the GIC before the
 vCPU. They must keep CNTP disabled and masked, assert writable control bits
 separately from derived ISTATUS, and avoid claiming that an absolute CVAL can be
 restored without elapsed-time and interrupt-delivery policy.
+Pointer-authentication key signed tests must use visibly non-secret sentinels,
+must not enable or execute PAC instructions, and must assert that debug output
+contains no raw key material. Failure assertions must not format actual key
+values. Destroy the VM after capture rather than treating readback as feature
+compatibility or a safe restore round trip.
 
 ## Stability Rules
 
