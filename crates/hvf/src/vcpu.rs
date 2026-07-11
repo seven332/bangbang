@@ -341,9 +341,10 @@ impl HvfArm64VcpuExceptionRegisterState {
 ///
 /// Hypervisor.framework exposes only `ACTLR_EL1.EnTSO`, and that register is
 /// available on macOS 15 and newer. `CPACR_EL1` includes baseline FP/SIMD
-/// access control plus optional architecture feature controls. These raw
-/// observations are not feature-validated or safe to restore in isolation;
-/// restore requires writable-bit policy, wider feature state, and ISB ordering.
+/// access control plus optional architecture feature controls. The complete
+/// typed value can be reapplied through an owner-thread primitive, but it is
+/// not feature- or destination-validated and does not define writable-bit
+/// policy, wider feature-state ordering, or guest-visible ISB transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuExecutionControlRegisterState {
     actlr_el1: u64,
@@ -2322,6 +2323,29 @@ pub(crate) fn capture_arm64_vcpu_execution_control_register_state_with(
     ))
 }
 
+pub(crate) fn restore_arm64_vcpu_execution_control_register_state_with(
+    state: &HvfArm64VcpuExecutionControlRegisterState,
+    mut set_system_register: impl FnMut(HvfSystemRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+    let mut completed_writes = 0;
+    let mut write_system_register = |register, value| {
+        set_system_register(register, value).map_err(|source| {
+            HvfArm64VcpuSystemRegisterRestoreError::new(register, completed_writes, source)
+        })?;
+        completed_writes += 1;
+        Ok(())
+    };
+
+    for (register, value) in [
+        (HvfSystemRegister::ACTLR_EL1, state.actlr_el1()),
+        (HvfSystemRegister::CPACR_EL1, state.cpacr_el1()),
+    ] {
+        write_system_register(register, value)?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn capture_arm64_vcpu_cache_selection_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuCacheSelectionRegisterState, BackendError> {
@@ -2854,6 +2878,7 @@ mod tests {
         capture_arm64_vcpu_watchpoint_register_state_with, configure_arm64_boot_registers_with,
         restore_arm64_vcpu_core_system_register_state_with,
         restore_arm64_vcpu_exception_register_state_with,
+        restore_arm64_vcpu_execution_control_register_state_with,
         restore_arm64_vcpu_general_register_state_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
@@ -3833,6 +3858,88 @@ mod tests {
         );
         assert_eq!(HvfSystemRegister::ACTLR_EL1.raw(), 0xc081);
         assert_eq!(HvfSystemRegister::CPACR_EL1.raw(), 0xc082);
+    }
+
+    fn execution_control_restore_test_state() -> super::HvfArm64VcpuExecutionControlRegisterState {
+        capture_arm64_vcpu_execution_control_register_state_with(|register| {
+            Ok(0xd800_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("execution-control test state should be captured")
+    }
+
+    fn execution_control_restore_test_entries(
+        state: super::HvfArm64VcpuExecutionControlRegisterState,
+    ) -> [(HvfSystemRegister, u64); 2] {
+        [
+            (HvfSystemRegister::ACTLR_EL1, state.actlr_el1()),
+            (HvfSystemRegister::CPACR_EL1, state.cpacr_el1()),
+        ]
+    }
+
+    #[test]
+    fn restores_arm64_execution_control_register_state_in_capture_order() {
+        let state = execution_control_restore_test_state();
+        let expected = execution_control_restore_test_entries(state);
+        let mut writes = Vec::new();
+
+        restore_arm64_vcpu_execution_control_register_state_with(&state, |register, value| {
+            writes.push((register, value));
+            Ok(())
+        })
+        .expect("execution-control restore should succeed");
+
+        assert_eq!(writes, expected);
+    }
+
+    #[test]
+    fn every_arm64_execution_control_restore_failure_stops_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = execution_control_restore_test_state();
+        let expected = execution_control_restore_test_entries(state);
+
+        for (failed_index, (failed_register, _)) in expected.iter().copied().enumerate() {
+            let fail_once = Cell::new(true);
+            let writes = RefCell::new(Vec::new());
+            let write_system_register = |register, value| {
+                writes.borrow_mut().push((register, value));
+                if register == failed_register && fail_once.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake execution-control restore failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error = restore_arm64_vcpu_execution_control_register_state_with(
+                &state,
+                &write_system_register,
+            )
+            .expect_err("injected execution-control write should fail");
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake execution-control restore failed".to_string())
+            );
+            assert_eq!(*writes.borrow(), expected[..=failed_index]);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 system register id {} after {failed_index} successful writes: invalid backend state: fake execution-control restore failed",
+                    failed_register.raw()
+                )
+            );
+
+            writes.borrow_mut().clear();
+            restore_arm64_vcpu_execution_control_register_state_with(
+                &state,
+                &write_system_register,
+            )
+            .expect("complete execution-control restore retry should succeed");
+            assert_eq!(*writes.borrow(), expected);
+        }
     }
 
     #[test]

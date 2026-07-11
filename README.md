@@ -29,15 +29,16 @@ general registers, plus ordered nontransactional restore of the same typed
 X0-X30/PC/CPSR value, raw core system registers plus ordered nontransactional
 restore of their typed SP_EL0/SP_EL1/ELR_EL1/SPSR_EL1 value, raw EL1 exception
 registers plus ordered nontransactional restore of their typed
-AFSR0/AFSR1/ESR/FAR/PAR/VBAR value, baseline and optional SVE/SME guest-visible
-processor
+AFSR0/AFSR1/ESR/FAR/PAR/VBAR value, raw EL1 execution controls plus ordered
+nontransactional restore of their typed ACTLR/CPACR value, baseline and optional
+SVE/SME guest-visible processor
 identification metadata, mutable SME PSTATE flags, raw SME system registers
 with redacted `Debug`, conditional maximum-width streaming Z0-Z31 contents with
 redacted `Debug`, conditional maximum-derived streaming P0-P15 predicates with
 redacted `Debug`, conditional maximum-SVL-square ZA contents with redacted
 `Debug`, conditional fixed-size SME2 ZT0 contents with redacted `Debug`, raw
-system-context registers with redacted `Debug`, raw execution-control,
-cache-selection, hardware-breakpoint,
+system-context registers with redacted `Debug`, raw cache-selection,
+hardware-breakpoint,
 hardware-watchpoint, debug-control, raw Hypervisor.framework debug-trap policy,
 translation, and thread-context system-register subsets,
 pointer-authentication key state with redacted `Debug`, baseline SIMD/FP state,

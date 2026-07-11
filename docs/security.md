@@ -274,8 +274,15 @@ is resource-specific:
   AFSR contents can be implementation-defined, report fields are not a
   validated coherent exception, and address/vector fields are not validated
   against guest memory. After failure, retry the complete retained value or
-  discard the vCPU before execution. Public snapshot load invokes none of the
-  three restore primitives.
+  discard the vCPU before execution.
+  The paired execution-control restore applies the same boundary to raw
+  `ACTLR_EL1` and `CPACR_EL1`. It accepts only the complete typed capture,
+  writes ACTLR then CPACR, and reports the exact failed register, completed
+  prefix, and backend source without values. EnTSO changes the guest memory
+  model, while CPACR can expose optional feature controls; neither is validated
+  against a destination or accompanied by a guest ISB transition. After
+  failure, retry the complete retained value or discard the vCPU before
+  execution. Public snapshot load invokes none of the four restore primitives.
   TPIDR fields can contain guest TLS or kernel pointers, and
   SIMD/FP bytes can contain guest application or cryptographic working data.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can

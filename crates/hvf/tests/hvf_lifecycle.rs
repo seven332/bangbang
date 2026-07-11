@@ -983,7 +983,7 @@ fn captures_and_restores_guest_written_arm64_exception_registers_on_runner_threa
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_guest_written_arm64_execution_controls_on_runner_thread() {
+fn captures_and_restores_guest_written_arm64_execution_controls_on_runner_thread() {
     use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
     use bangbang_runtime::VmBackend;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
@@ -1038,6 +1038,28 @@ fn captures_guest_written_arm64_execution_controls_on_runner_thread() {
             .expect("execution-control state should be captured");
         assert_eq!(state.actlr_el1(), EXECUTION_CONTROL_TEST_ACTLR_EL1);
         assert_eq!(state.cpacr_el1(), EXECUTION_CONTROL_TEST_CPACR_EL1);
+
+        runner
+            .restore_arm64_execution_control_register_state(&state)
+            .expect("execution-control state should be restored");
+        let restored = runner
+            .capture_arm64_execution_control_register_state()
+            .expect("execution-control state should be recaptured after restore");
+        assert!(
+            restored == state,
+            "execution-control state should round trip without exposing values"
+        );
+
+        runner
+            .restore_arm64_execution_control_register_state(&state)
+            .expect("repeated execution-control restore should succeed");
+        let repeated = runner
+            .capture_arm64_execution_control_register_state()
+            .expect("execution-control state should be recaptured after repeated restore");
+        assert!(
+            repeated == state,
+            "repeated execution-control restore should preserve the complete state"
+        );
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -2664,9 +2686,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .restore_arm64_exception_register_state(&exception_register_state)
         .expect("internal session should restore exception-register state");
-    session
+    let execution_control_state = session
         .capture_arm64_execution_control_register_state()
         .expect("internal session should capture execution-control state");
+    session
+        .restore_arm64_execution_control_register_state(&execution_control_state)
+        .expect("internal session should restore execution-control state");
     session
         .capture_arm64_cache_selection_register_state()
         .expect("internal session should capture cache-selection state");
@@ -2877,9 +2902,12 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .restore_arm64_exception_register_state(&exception_register_state)
         .expect("owned session should restore exception-register state");
-    session
+    let execution_control_state = session
         .capture_arm64_execution_control_register_state()
         .expect("owned session should capture execution-control state");
+    session
+        .restore_arm64_execution_control_register_state(&execution_control_state)
+        .expect("owned session should restore execution-control state");
     session
         .capture_arm64_cache_selection_register_state()
         .expect("owned session should capture cache-selection state");

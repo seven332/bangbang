@@ -1248,12 +1248,26 @@ impl HvfArm64BootSession<'_> {
 
     /// Capture raw EL1 ACTLR and CPACR controls on the primary owner thread.
     ///
-    /// Complete capture requires macOS 15 and omits feature validation,
-    /// persistence, and a safe restore sequence.
+    /// Complete capture requires macOS 15 and has a paired low-level restore,
+    /// but omits feature validation, persistence, and transition ordering.
     pub fn capture_arm64_execution_control_register_state(
         &self,
     ) -> Result<HvfArm64VcpuExecutionControlRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_execution_control_register_state()
+    }
+
+    /// Restore raw EL1 ACTLR and CPACR controls on the primary owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. Feature validation, guest ISB transitions, schema, and
+    /// wider ordering remain outside this runner primitive.
+    pub fn restore_arm64_execution_control_register_state(
+        &self,
+        state: &HvfArm64VcpuExecutionControlRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_execution_control_register_state(state)
     }
 
     /// Capture raw EL1 CSSELR cache-size selection state on the primary owner
@@ -2130,12 +2144,26 @@ impl OwnedHvfArm64BootSession {
 
     /// Capture raw EL1 ACTLR and CPACR controls on the primary owner thread.
     ///
-    /// Complete capture requires macOS 15 and omits feature validation,
-    /// persistence, and a safe restore sequence.
+    /// Complete capture requires macOS 15 and has a paired low-level restore,
+    /// but omits feature validation, persistence, and transition ordering.
     pub fn capture_arm64_execution_control_register_state(
         &self,
     ) -> Result<HvfArm64VcpuExecutionControlRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_execution_control_register_state()
+    }
+
+    /// Restore raw EL1 ACTLR and CPACR controls on the primary owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. Feature validation, guest ISB transitions, schema, and
+    /// wider ordering remain outside this runner primitive.
+    pub fn restore_arm64_execution_control_register_state(
+        &self,
+        state: &HvfArm64VcpuExecutionControlRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_execution_control_register_state(state)
     }
 
     /// Capture raw EL1 CSSELR cache-size selection state on the primary owner
