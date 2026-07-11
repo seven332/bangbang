@@ -2220,7 +2220,7 @@ fn creates_hvf_gic_before_vcpu() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_opaque_hvf_gic_device_state_on_runner_thread() {
+fn captures_and_restores_opaque_hvf_gic_device_state_before_run() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;
 
@@ -2240,6 +2240,9 @@ fn captures_opaque_hvf_gic_device_state_on_runner_thread() {
             .expect("opaque GIC device state should be captured");
         assert!(!state.is_empty());
         assert_eq!(state.as_bytes().len(), state.len());
+        runner
+            .restore_gic_device_state(&state)
+            .expect("opaque GIC device state should be restored before run");
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -2961,12 +2964,13 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .restore_arm64_pending_interrupt_state(&pending_interrupt_state)
         .expect("internal session should restore pending-interrupt state");
-    assert!(
-        !session
-            .capture_gic_device_state()
-            .expect("internal session should capture GIC device state")
-            .is_empty()
-    );
+    let gic_device_state = session
+        .capture_gic_device_state()
+        .expect("internal session should capture GIC device state");
+    assert!(!gic_device_state.is_empty());
+    session
+        .restore_gic_device_state(&gic_device_state)
+        .expect("internal session should restore GIC device state before run");
     session
         .capture_arm64_gic_icc_register_state()
         .expect("internal session should capture GIC ICC register state");
@@ -3204,12 +3208,13 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .restore_arm64_pending_interrupt_state(&pending_interrupt_state)
         .expect("owned session should restore pending-interrupt state");
-    assert!(
-        !session
-            .capture_gic_device_state()
-            .expect("owned session should capture GIC device state")
-            .is_empty()
-    );
+    let gic_device_state = session
+        .capture_gic_device_state()
+        .expect("owned session should capture GIC device state");
+    assert!(!gic_device_state.is_empty());
+    session
+        .restore_gic_device_state(&gic_device_state)
+        .expect("owned session should restore GIC device state before run");
     session
         .capture_arm64_gic_icc_register_state()
         .expect("owned session should capture GIC ICC register state");

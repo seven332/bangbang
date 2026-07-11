@@ -416,7 +416,15 @@ is resource-specific:
   caller or queued copies, validate a destination, or define SCTLR enable
   ordering. Future persistence must protect key confidentiality and integrity.
   The opaque GIC byte value uses a custom `Debug` implementation that reports
-  only its length rather than formatting its contents.
+  only its length rather than formatting its contents. Its borrowed pre-run
+  apply clones the complete value into command ownership and passes only the
+  exact pointer and length to Hypervisor.framework; neither copy is zeroized.
+  Empty input is rejected without an FFI call, and backend failures contain no
+  bytes. Because Apple documents neither transactional rollback nor a distinct
+  compatibility status, a failed apply must not be relabelled as corruption or
+  followed by guest execution: discard the destination or use a future explicit
+  recovery policy. The isolated command does not protect the later ICC, timer,
+  pending-interrupt, vCPU, and device restore sequence from an intervening run.
   The separate MIDR, MPIDR, PFR, DFR, ISAR, and MMFR baseline plus optional
   ZFR0/SMFR0 capture are read-only virtual-CPU/HVF compatibility metadata rather
   than mutable execution state, but they can fingerprint the exposed processor

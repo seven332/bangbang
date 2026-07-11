@@ -1650,6 +1650,18 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_gic_device_state()
     }
 
+    /// Reapply complete opaque GIC device state before the primary vCPU runs.
+    ///
+    /// Session preparation has already created the GIC and vCPU. Compatible
+    /// ICC state must follow under a future wider restore lease; after any
+    /// failure, discard the session rather than execute it.
+    pub fn restore_gic_device_state(
+        &self,
+        state: &HvfGicDeviceState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_gic_device_state(state)
+    }
+
     /// Capture raw EL1 GIC ICC registers on the primary vCPU owner thread.
     ///
     /// This per-vCPU value complements the opaque GIC device blob but is not a
@@ -2679,6 +2691,18 @@ impl OwnedHvfArm64BootSession {
     /// bangbang snapshot schema or validated restore input.
     pub fn capture_gic_device_state(&self) -> Result<HvfGicDeviceState, HvfVcpuRunnerError> {
         self.runner.capture_gic_device_state()
+    }
+
+    /// Reapply complete opaque GIC device state before the primary vCPU runs.
+    ///
+    /// Session preparation has already created the GIC and vCPU. Compatible
+    /// ICC state must follow under a future wider restore lease; after any
+    /// failure, discard the session rather than execute it.
+    pub fn restore_gic_device_state(
+        &self,
+        state: &HvfGicDeviceState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_gic_device_state(state)
     }
 
     /// Capture raw EL1 GIC ICC registers on the primary vCPU owner thread.
