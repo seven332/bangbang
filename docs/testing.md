@@ -152,6 +152,12 @@ results only with fixed failure messages and must verify that `Debug` redacts
 both raw values. They must not log or format those values, write the registers,
 run guest code, hard-code reset values, or treat stable readback as feature,
 destination-compatibility, or safely restorable state.
+Default vCPU cache-configuration signed tests must query CTR_EL0, CLIDR_EL1,
+and DCZID_EL0 twice before creating a backend or VM. They may compare same-host
+values only through fixed failure messages and must not format or log raw
+registers. Tests must not create or run a vCPU, read or write `CSSELR_EL1`,
+query instruction/data CCSIDR values, perform cache maintenance, or treat the
+triple as a complete cache topology or destination-compatibility policy.
 Cache-selection signed tests must capture CSSELR_EL1 from an idle real vCPU
 without hard-coding or validating its architecturally unknown reset value. They
 must not write the selector, query CCSIDR, execute ISB or cache maintenance, run

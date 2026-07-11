@@ -261,8 +261,13 @@ is resource-specific:
   CSSELR records the guest's current cache-size query selector but does not
   contain cache topology. Capture does not change it or query CCSIDR. A future
   restore must treat selector bits as untrusted, validate them against a
-  destination CTR/CLIDR/DCZID/CCSIDR manifest, and define synchronization and
-  cache-maintenance policy before dependent cache-size queries.
+  destination cache manifest, and define synchronization and cache-maintenance
+  policy before dependent cache-size queries. The separately queried default
+  vCPU configuration's raw CTR_EL0, CLIDR_EL1, and DCZID_EL0 values are
+  read-only feature metadata, not guest execution state, but can fingerprint
+  the exposed virtual CPU model. They must not be logged or persisted without
+  a defined need and are not trusted topology or destination policy without the
+  corresponding instruction/data CCSIDR values, interpretation, and masks.
   Breakpoint value registers can expose guest virtual addresses, Context IDs,
   or VMIDs. Watchpoint value registers expose guest data virtual addresses, and
   their controls can encode access type, byte selection, linking, and enabled

@@ -206,9 +206,18 @@ mod imp {
     const HV_FAULT: HvReturn = 0xfae94008u32 as HvReturn;
     const HV_UNSUPPORTED: HvReturn = 0xfae9400fu32 as HvReturn;
 
+    type HvFeatureReg = u32;
+    type HvVcpuConfigCreate = unsafe extern "C" fn() -> HvVcpuConfig;
+    type HvVcpuConfigGetFeatureReg =
+        unsafe extern "C" fn(HvVcpuConfig, HvFeatureReg, *mut u64) -> HvReturn;
+    type OsRelease = unsafe extern "C" fn(*mut c_void);
     type HvSmeConfigGetMaxSvlBytes = unsafe extern "C" fn(value: *mut usize) -> HvReturn;
     type HvVcpuGetSmeState =
         unsafe extern "C" fn(vcpu: HvVcpu, sme_state: *mut HvVcpuSmeState) -> HvReturn;
+
+    const HV_FEATURE_REG_CTR_EL0: HvFeatureReg = 9;
+    const HV_FEATURE_REG_CLIDR_EL1: HvFeatureReg = 10;
+    const HV_FEATURE_REG_DCZID_EL0: HvFeatureReg = 11;
 
     #[link(name = "Hypervisor", kind = "framework")]
     unsafe extern "C" {
@@ -224,6 +233,12 @@ mod imp {
             flags: HvMemoryFlags,
         ) -> HvReturn;
         pub fn hv_vm_unmap(ipa: u64, size: usize) -> HvReturn;
+        pub fn hv_vcpu_config_create() -> HvVcpuConfig;
+        pub fn hv_vcpu_config_get_feature_reg(
+            config: HvVcpuConfig,
+            feature_reg: HvFeatureReg,
+            value: *mut u64,
+        ) -> HvReturn;
         pub fn hv_vcpu_create(
             vcpu: *mut HvVcpu,
             exit: *mut *mut HvVcpuExit,
@@ -268,6 +283,12 @@ mod imp {
         config: NonNull<c_void>,
     }
 
+    #[derive(Debug)]
+    struct HvVcpuConfigOwner {
+        config: NonNull<c_void>,
+        release: OsRelease,
+    }
+
     impl HvVmConfigOwner {
         fn with_max_ipa_size() -> Result<Self, BackendError> {
             // SAFETY: Creates a retained Hypervisor.framework VM configuration object.
@@ -307,6 +328,34 @@ mod imp {
         fn drop(&mut self) {
             // SAFETY: `self.config` is a retained OS object returned by `hv_vm_config_create`.
             unsafe { os_release(self.config.as_ptr()) };
+        }
+    }
+
+    impl HvVcpuConfigOwner {
+        fn create_with(
+            create: HvVcpuConfigCreate,
+            release: OsRelease,
+        ) -> Result<Self, BackendError> {
+            // SAFETY: The injected function has the SDK's exact
+            // `hv_vcpu_config_create` ABI and returns a retained object or null.
+            let config = unsafe { create() };
+            let config = NonNull::new(config).ok_or(BackendError::Hypervisor(
+                "hv_vcpu_config_create returned null".to_string(),
+            ))?;
+
+            Ok(Self { config, release })
+        }
+
+        fn as_ptr(&self) -> HvVcpuConfig {
+            self.config.as_ptr()
+        }
+    }
+
+    impl Drop for HvVcpuConfigOwner {
+        fn drop(&mut self) {
+            // SAFETY: `self.config` is the retained object returned by the
+            // injected create function, and this guard releases it exactly once.
+            unsafe { (self.release)(self.config.as_ptr()) };
         }
     }
 
@@ -404,6 +453,50 @@ mod imp {
                 format_hv_return(code)
             )))
         }
+    }
+
+    fn get_vcpu_config_feature_reg_with(
+        config: &HvVcpuConfigOwner,
+        get_feature_reg: HvVcpuConfigGetFeatureReg,
+        feature_reg: HvFeatureReg,
+    ) -> Result<u64, BackendError> {
+        let mut value = 0;
+
+        // SAFETY: `config` owns a live configuration object, the injected
+        // function has the SDK's exact getter ABI, and `value` is a valid output
+        // pointer for the duration of the call.
+        unsafe {
+            check(
+                get_feature_reg(config.as_ptr(), feature_reg, &mut value),
+                "hv_vcpu_config_get_feature_reg",
+            )?;
+        }
+
+        Ok(value)
+    }
+
+    fn get_arm64_vcpu_cache_feature_registers_with(
+        create: HvVcpuConfigCreate,
+        get_feature_reg: HvVcpuConfigGetFeatureReg,
+        release: OsRelease,
+    ) -> Result<[u64; 3], BackendError> {
+        let config = HvVcpuConfigOwner::create_with(create, release)?;
+        let ctr_el0 =
+            get_vcpu_config_feature_reg_with(&config, get_feature_reg, HV_FEATURE_REG_CTR_EL0)?;
+        let clidr_el1 =
+            get_vcpu_config_feature_reg_with(&config, get_feature_reg, HV_FEATURE_REG_CLIDR_EL1)?;
+        let dczid_el0 =
+            get_vcpu_config_feature_reg_with(&config, get_feature_reg, HV_FEATURE_REG_DCZID_EL0)?;
+
+        Ok([ctr_el0, clidr_el1, dczid_el0])
+    }
+
+    pub fn get_arm64_vcpu_cache_feature_registers() -> Result<[u64; 3], BackendError> {
+        get_arm64_vcpu_cache_feature_registers_with(
+            hv_vcpu_config_create,
+            hv_vcpu_config_get_feature_reg,
+            os_release,
+        )
     }
 
     pub fn create_vm() -> Result<(), BackendError> {
@@ -682,20 +775,125 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use std::ffi::c_void;
+        use std::panic;
         use std::ptr;
+        use std::sync::Mutex;
 
         use bangbang_runtime::BackendError;
 
         use super::{
-            HV_BAD_ARGUMENT, HV_DENIED, HV_SUCCESS, HV_UNSUPPORTED, check,
-            get_sme_config_max_svl_bytes_with, sme_config_max_svl_bytes_getter_from_symbol,
-            sme_state_getter_from_symbol,
+            HV_BAD_ARGUMENT, HV_DENIED, HV_FEATURE_REG_CLIDR_EL1, HV_FEATURE_REG_CTR_EL0,
+            HV_FEATURE_REG_DCZID_EL0, HV_SUCCESS, HV_UNSUPPORTED, HvVcpuConfig, HvVcpuConfigOwner,
+            check, get_arm64_vcpu_cache_feature_registers_with, get_sme_config_max_svl_bytes_with,
+            sme_config_max_svl_bytes_getter_from_symbol, sme_state_getter_from_symbol,
         };
         use crate::ffi::{
             SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
         };
 
         const TEST_MAX_SVL_BYTES: usize = usize::MAX - 0x1234;
+        const TEST_CACHE_FEATURE_VALUES: [u64; 3] = [0, u64::MAX, 0x0123_4567_89ab_cdef];
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum TestVcpuConfigCall {
+            Create,
+            Get(u32),
+            Release,
+        }
+
+        #[derive(Debug)]
+        struct TestVcpuConfigState {
+            calls: Vec<TestVcpuConfigCall>,
+            fail_on_get: Option<usize>,
+            get_count: usize,
+            config_pointer_matches: bool,
+        }
+
+        impl TestVcpuConfigState {
+            const fn new() -> Self {
+                Self {
+                    calls: Vec::new(),
+                    fail_on_get: None,
+                    get_count: 0,
+                    config_pointer_matches: true,
+                }
+            }
+        }
+
+        static TEST_VCPU_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+        static TEST_VCPU_CONFIG_STATE: Mutex<TestVcpuConfigState> =
+            Mutex::new(TestVcpuConfigState::new());
+
+        fn test_vcpu_config_pointer() -> HvVcpuConfig {
+            std::ptr::NonNull::<u8>::dangling()
+                .cast::<c_void>()
+                .as_ptr()
+        }
+
+        fn reset_test_vcpu_config_state(fail_on_get: Option<usize>) {
+            *lock_test_vcpu_config_state() = TestVcpuConfigState {
+                fail_on_get,
+                ..TestVcpuConfigState::new()
+            };
+        }
+
+        fn lock_test_vcpu_config_state() -> std::sync::MutexGuard<'static, TestVcpuConfigState> {
+            TEST_VCPU_CONFIG_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        unsafe extern "C" fn test_vcpu_config_create() -> HvVcpuConfig {
+            lock_test_vcpu_config_state()
+                .calls
+                .push(TestVcpuConfigCall::Create);
+            test_vcpu_config_pointer()
+        }
+
+        unsafe extern "C" fn test_vcpu_config_create_null() -> HvVcpuConfig {
+            lock_test_vcpu_config_state()
+                .calls
+                .push(TestVcpuConfigCall::Create);
+            ptr::null_mut()
+        }
+
+        unsafe extern "C" fn test_vcpu_config_get_feature_reg(
+            config: HvVcpuConfig,
+            feature_reg: u32,
+            value: *mut u64,
+        ) -> super::HvReturn {
+            let mut state = lock_test_vcpu_config_state();
+            state.config_pointer_matches &= config == test_vcpu_config_pointer();
+            state.calls.push(TestVcpuConfigCall::Get(feature_reg));
+            let get_index = state.get_count;
+            state.get_count += 1;
+            if state.fail_on_get == Some(get_index) {
+                return HV_BAD_ARGUMENT;
+            }
+            let register_value = match feature_reg {
+                HV_FEATURE_REG_CTR_EL0 => TEST_CACHE_FEATURE_VALUES[0],
+                HV_FEATURE_REG_CLIDR_EL1 => TEST_CACHE_FEATURE_VALUES[1],
+                HV_FEATURE_REG_DCZID_EL0 => TEST_CACHE_FEATURE_VALUES[2],
+                _ => return HV_BAD_ARGUMENT,
+            };
+            drop(state);
+
+            // SAFETY: The FFI test helper is called only through the production
+            // helper, which supplies a live `u64` output pointer.
+            unsafe { *value = register_value };
+            HV_SUCCESS
+        }
+
+        unsafe extern "C" fn test_vcpu_config_release(config: *mut c_void) {
+            let mut state = lock_test_vcpu_config_state();
+            state.config_pointer_matches &= config == test_vcpu_config_pointer();
+            state.calls.push(TestVcpuConfigCall::Release);
+        }
+
+        fn test_vcpu_config_calls() -> (Vec<TestVcpuConfigCall>, bool) {
+            let state = lock_test_vcpu_config_state();
+            (state.calls.clone(), state.config_pointer_matches)
+        }
 
         unsafe extern "C" fn test_get_max_svl_bytes(value: *mut usize) -> super::HvReturn {
             // SAFETY: The FFI test helper is called only through
@@ -805,6 +1003,129 @@ mod imp {
                 "hypervisor error: hv_sme_config_get_max_svl_bytes failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)"
             );
         }
+
+        #[test]
+        fn vcpu_cache_feature_ids_match_hvf_sdk() {
+            assert_eq!(HV_FEATURE_REG_CTR_EL0, 9);
+            assert_eq!(HV_FEATURE_REG_CLIDR_EL1, 10);
+            assert_eq!(HV_FEATURE_REG_DCZID_EL0, 11);
+        }
+
+        #[test]
+        fn null_vcpu_configuration_stops_without_getter_or_release() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            reset_test_vcpu_config_state(None);
+
+            assert_eq!(
+                get_arm64_vcpu_cache_feature_registers_with(
+                    test_vcpu_config_create_null,
+                    test_vcpu_config_get_feature_reg,
+                    test_vcpu_config_release,
+                ),
+                Err(BackendError::Hypervisor(
+                    "hv_vcpu_config_create returned null".to_string()
+                ))
+            );
+            assert_eq!(
+                test_vcpu_config_calls(),
+                (vec![TestVcpuConfigCall::Create], true)
+            );
+        }
+
+        #[test]
+        fn vcpu_cache_features_preserve_values_order_and_release() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            reset_test_vcpu_config_state(None);
+
+            assert_eq!(
+                get_arm64_vcpu_cache_feature_registers_with(
+                    test_vcpu_config_create,
+                    test_vcpu_config_get_feature_reg,
+                    test_vcpu_config_release,
+                ),
+                Ok(TEST_CACHE_FEATURE_VALUES)
+            );
+            assert_eq!(
+                test_vcpu_config_calls(),
+                (
+                    vec![
+                        TestVcpuConfigCall::Create,
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_CTR_EL0),
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_CLIDR_EL1),
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_DCZID_EL0),
+                        TestVcpuConfigCall::Release,
+                    ],
+                    true,
+                )
+            );
+        }
+
+        #[test]
+        fn every_vcpu_cache_feature_failure_stops_and_releases() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            let registers = [
+                HV_FEATURE_REG_CTR_EL0,
+                HV_FEATURE_REG_CLIDR_EL1,
+                HV_FEATURE_REG_DCZID_EL0,
+            ];
+
+            for fail_on_get in 0..registers.len() {
+                reset_test_vcpu_config_state(Some(fail_on_get));
+                let err = get_arm64_vcpu_cache_feature_registers_with(
+                    test_vcpu_config_create,
+                    test_vcpu_config_get_feature_reg,
+                    test_vcpu_config_release,
+                )
+                .expect_err("configured feature getter should fail");
+                assert_eq!(
+                    err.to_string(),
+                    "hypervisor error: hv_vcpu_config_get_feature_reg failed with HV_BAD_ARGUMENT (hv_return_t=0xfae94003)"
+                );
+
+                let mut expected_calls = vec![TestVcpuConfigCall::Create];
+                expected_calls.extend(
+                    registers
+                        .iter()
+                        .take(fail_on_get + 1)
+                        .copied()
+                        .map(TestVcpuConfigCall::Get),
+                );
+                expected_calls.push(TestVcpuConfigCall::Release);
+                assert_eq!(test_vcpu_config_calls(), (expected_calls, true));
+            }
+        }
+
+        #[test]
+        fn vcpu_configuration_guard_releases_during_unwind() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            reset_test_vcpu_config_state(None);
+
+            let unwind = panic::catch_unwind(|| {
+                let _config = HvVcpuConfigOwner::create_with(
+                    test_vcpu_config_create,
+                    test_vcpu_config_release,
+                )
+                .expect("test vCPU config should be created");
+                panic!("exercise retained vCPU configuration unwind cleanup");
+            });
+
+            assert!(unwind.is_err());
+            assert_eq!(
+                test_vcpu_config_calls(),
+                (
+                    vec![TestVcpuConfigCall::Create, TestVcpuConfigCall::Release],
+                    true,
+                )
+            );
+        }
     }
 }
 
@@ -842,6 +1163,10 @@ mod imp {
     }
 
     pub fn create_vcpu() -> Result<CreatedVcpu, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_arm64_vcpu_cache_feature_registers() -> Result<[u64; 3], BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 
