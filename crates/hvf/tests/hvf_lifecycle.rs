@@ -137,6 +137,51 @@ fn assert_sme_z_register_capture_supported_or_unavailable(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_sme_za_register_capture_supported_or_unavailable(
+    result: Result<bangbang_hvf::HvfArm64VcpuSmeZaRegisterState, bangbang_hvf::HvfVcpuRunnerError>,
+) -> Result<Option<bangbang_hvf::HvfArm64VcpuSmeZaRegisterState>, bangbang_hvf::HvfVcpuRunnerError>
+{
+    use bangbang_hvf::{HvfArm64VcpuSmeZaRegisterCaptureError, HvfVcpuRunnerError};
+    use bangbang_runtime::BackendError;
+
+    match result {
+        Ok(state) => Ok(Some(state)),
+        Err(HvfVcpuRunnerError::SmeZaRegisterCapture(
+            HvfArm64VcpuSmeZaRegisterCaptureError::ZaStorageDisabled,
+        )) => Ok(None),
+        Err(HvfVcpuRunnerError::SmeZaRegisterCapture(
+            HvfArm64VcpuSmeZaRegisterCaptureError::Backend(BackendError::Unsupported(message)),
+        )) => {
+            assert!(
+                [
+                    "Hypervisor.framework SME state capture requires macOS 15.2 or newer",
+                    "Hypervisor.framework SME configuration queries require macOS 15.2 or newer",
+                    "Hypervisor.framework SME ZA-register capture requires macOS 15.2 or newer",
+                ]
+                .contains(&message),
+                "only a documented macOS 15.2 SME availability boundary is accepted"
+            );
+            Ok(None)
+        }
+        Err(HvfVcpuRunnerError::SmeZaRegisterCapture(
+            HvfArm64VcpuSmeZaRegisterCaptureError::Backend(BackendError::Hypervisor(message)),
+        )) => {
+            assert!(
+                [
+                    "hv_vcpu_get_sme_state failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)",
+                    "hv_sme_config_get_max_svl_bytes failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)",
+                    "hv_vcpu_get_sme_za_reg failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)",
+                ]
+                .contains(&message.as_str()),
+                "only a documented HV_UNSUPPORTED SME availability result is accepted"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn assert_sme_configuration_supported_or_unavailable(
     result: Result<bangbang_hvf::HvfArm64SmeConfiguration, bangbang_runtime::BackendError>,
 ) -> Result<Option<bangbang_hvf::HvfArm64SmeConfiguration>, bangbang_runtime::BackendError> {
@@ -1342,6 +1387,70 @@ fn captures_arm64_sme_z_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_arm64_sme_za_register_on_runner_thread() {
+    use bangbang_hvf::HvfBackend;
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let first = assert_sme_za_register_capture_supported_or_unavailable(
+            runner.capture_arm64_sme_za_register_state(),
+        )
+        .expect("first SME ZA-register capture should succeed or report unavailable");
+        let second = assert_sme_za_register_capture_supported_or_unavailable(
+            runner.capture_arm64_sme_za_register_state(),
+        )
+        .expect("second SME ZA-register capture should succeed or report unavailable");
+
+        assert!(
+            first.is_some() == second.is_some(),
+            "SME ZA-register capture availability should remain stable within one vCPU lifetime"
+        );
+        if let (Some(first), Some(second)) = (first, second) {
+            assert!(
+                first.maximum_svl_bytes() == second.maximum_svl_bytes(),
+                "SME maximum streaming vector length should remain stable"
+            );
+            let expected_size = first
+                .maximum_svl_bytes()
+                .checked_mul(first.maximum_svl_bytes())
+                .expect("SME maximum streaming vector length should have a square byte size");
+            assert!(
+                first.len() == expected_size && first.as_bytes().len() == expected_size,
+                "first SME ZA capture should retain the exact maximum-SVL square"
+            );
+            assert!(
+                second.len() == expected_size && second.as_bytes().len() == expected_size,
+                "second SME ZA capture should retain the exact maximum-SVL square"
+            );
+            assert!(
+                !first.is_empty() && !second.is_empty(),
+                "successful SME ZA captures should contain the complete matrix"
+            );
+            assert!(
+                first == second,
+                "SME ZA-register state should remain stable on one idle vCPU"
+            );
+            assert!(
+                format!("{first:?}").contains("<redacted>"),
+                "SME ZA-register debug output should remain redacted"
+            );
+        }
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_arm64_sme_system_registers_on_runner_thread() {
     use bangbang_hvf::{HvfArm64VcpuSmeSystemRegisterState, HvfBackend};
     use bangbang_runtime::VmBackend;
@@ -2389,6 +2498,10 @@ fn prepares_internal_hvf_arm64_boot_session() {
         session.capture_arm64_sme_z_register_state(),
     )
     .expect("internal session SME Z-register capture should succeed or report unavailable");
+    let _sme_za_register = assert_sme_za_register_capture_supported_or_unavailable(
+        session.capture_arm64_sme_za_register_state(),
+    )
+    .expect("internal session SME ZA-register capture should succeed or report unavailable");
     session
         .capture_arm64_sme_system_register_state()
         .expect("internal session should capture SME system-register state");
@@ -2585,6 +2698,10 @@ fn prepares_owned_hvf_arm64_boot_session() {
         session.capture_arm64_sme_z_register_state(),
     )
     .expect("owned session SME Z-register capture should succeed or report unavailable");
+    let _sme_za_register = assert_sme_za_register_capture_supported_or_unavailable(
+        session.capture_arm64_sme_za_register_state(),
+    )
+    .expect("owned session SME ZA-register capture should succeed or report unavailable");
     session
         .capture_arm64_sme_system_register_state()
         .expect("owned session should capture SME system-register state");

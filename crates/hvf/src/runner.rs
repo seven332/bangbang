@@ -30,7 +30,8 @@ use crate::vcpu::{
     HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
     HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate,
     HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
-    HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
+    HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError,
+    HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
     HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuThreadContextRegisterState,
     HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
     HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
@@ -46,7 +47,7 @@ use crate::vcpu::{
     capture_arm64_vcpu_pointer_authentication_key_state_with,
     capture_arm64_vcpu_simd_fp_state_with, capture_arm64_vcpu_sme_p_register_state,
     capture_arm64_vcpu_sme_pstate_with, capture_arm64_vcpu_sme_system_register_state_with,
-    capture_arm64_vcpu_sme_z_register_state,
+    capture_arm64_vcpu_sme_z_register_state, capture_arm64_vcpu_sme_za_register_state,
     capture_arm64_vcpu_sve_sme_identification_register_state_with,
     capture_arm64_vcpu_system_context_register_state_with,
     capture_arm64_vcpu_thread_context_register_state_with,
@@ -89,6 +90,7 @@ pub enum HvfVcpuRunnerError {
     Gic(HvfGicError),
     SmePRegisterCapture(HvfArm64VcpuSmePRegisterCaptureError),
     SmeZRegisterCapture(HvfArm64VcpuSmeZRegisterCaptureError),
+    SmeZaRegisterCapture(HvfArm64VcpuSmeZaRegisterCaptureError),
     VcpuExitResolve(HvfVcpuExitResolveError),
     MmioDispatch(HvfMmioDispatchError),
     UnsupportedSys64 { exit: HvfSys64Exit },
@@ -136,6 +138,7 @@ impl fmt::Display for HvfVcpuRunnerError {
             Self::Gic(err) => write!(f, "{err}"),
             Self::SmePRegisterCapture(err) => write!(f, "{err}"),
             Self::SmeZRegisterCapture(err) => write!(f, "{err}"),
+            Self::SmeZaRegisterCapture(err) => write!(f, "{err}"),
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
             Self::MmioDispatch(err) => write!(f, "{err}"),
             Self::UnsupportedSys64 { exit } => write!(
@@ -162,6 +165,7 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::Gic(err) => Some(err),
             Self::SmePRegisterCapture(err) => Some(err),
             Self::SmeZRegisterCapture(err) => Some(err),
+            Self::SmeZaRegisterCapture(err) => Some(err),
             Self::VcpuExitResolve(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
             Self::InvalidState(_)
@@ -194,6 +198,12 @@ impl From<HvfArm64VcpuSmePRegisterCaptureError> for HvfVcpuRunnerError {
 impl From<HvfArm64VcpuSmeZRegisterCaptureError> for HvfVcpuRunnerError {
     fn from(err: HvfArm64VcpuSmeZRegisterCaptureError) -> Self {
         Self::SmeZRegisterCapture(err)
+    }
+}
+
+impl From<HvfArm64VcpuSmeZaRegisterCaptureError> for HvfVcpuRunnerError {
+    fn from(err: HvfArm64VcpuSmeZaRegisterCaptureError) -> Self {
+        Self::SmeZaRegisterCapture(err)
     }
 }
 
@@ -342,6 +352,10 @@ enum RunnerCommand {
     CaptureArm64SmeZRegisterState {
         admission: InFlightCoreRegisterCapture,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmeZRegisterState, HvfVcpuRunnerError>>,
+    },
+    CaptureArm64SmeZaRegisterState {
+        admission: InFlightCoreRegisterCapture,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuSmeZaRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SmeSystemRegisterState {
         admission: InFlightCoreRegisterCapture,
@@ -626,6 +640,21 @@ trait RunnerVcpu {
             |vcpu, register, value| vcpu.get_sme_z_register(register, value),
         )
     }
+    fn get_sme_za_register(&mut self, _value: &mut [u8]) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support SME ZA-register reads",
+        ))
+    }
+    fn capture_arm64_sme_za_register_state(
+        &mut self,
+    ) -> Result<HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError> {
+        capture_arm64_vcpu_sme_za_register_state(
+            self,
+            |vcpu| vcpu.get_sme_pstate(),
+            |vcpu| vcpu.get_sme_maximum_svl_bytes(),
+            |vcpu, value| vcpu.get_sme_za_register(value),
+        )
+    }
     fn capture_arm64_sme_system_register_state(
         &mut self,
     ) -> Result<HvfArm64VcpuSmeSystemRegisterState, BackendError> {
@@ -862,6 +891,10 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner.get_sme_z_register(register, value)
     }
 
+    fn get_sme_za_register(&mut self, value: &mut [u8]) -> Result<(), BackendError> {
+        self.owner.get_sme_za_register(value)
+    }
+
     fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
         self.owner.get_system_register(HvfSystemRegister::MPIDR_EL1)
     }
@@ -994,6 +1027,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 HvfVcpuRunnerError::Gic(_)
                 | HvfVcpuRunnerError::SmePRegisterCapture(_)
                 | HvfVcpuRunnerError::SmeZRegisterCapture(_)
+                | HvfVcpuRunnerError::SmeZaRegisterCapture(_)
                 | HvfVcpuRunnerError::InvalidState(_)
                 | HvfVcpuRunnerError::UnsupportedSys64 { .. }
                 | HvfVcpuRunnerError::VcpuExitResolve(_)
@@ -1290,6 +1324,23 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<HvfArm64VcpuSmeZRegisterState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_sme_z_register_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Capture the complete SME ZA matrix contents on the vCPU-owning thread.
+    ///
+    /// The getter-only command requires `PSTATE.ZA` but not `PSTATE.SM`, sizes
+    /// the private buffer to the square of Hypervisor.framework's maximum SVL,
+    /// and publishes no state unless the read succeeds. `Debug` redacts every
+    /// sensitive byte. It does not change SME state or capture Z, P, or ZT0.
+    pub fn capture_arm64_sme_za_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSmeZaRegisterState, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_sme_za_register_capture(response_sender)?;
 
         response_receiver
             .recv()
@@ -2206,6 +2257,19 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<(), HvfVcpuRunnerError> {
         self.start_core_register_capture(
             |admission, response_sender| RunnerCommand::CaptureArm64SmeZRegisterState {
+                admission,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_sme_za_register_capture(
+        &self,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuSmeZaRegisterState, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_core_register_capture(
+            |admission, response_sender| RunnerCommand::CaptureArm64SmeZaRegisterState {
                 admission,
                 response_sender,
             },
@@ -3406,6 +3470,19 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::CaptureArm64SmeZaRegisterState {
+                mut admission,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .capture_arm64_sme_za_register_state()
+                    .map_err(HvfVcpuRunnerError::SmeZaRegisterCapture);
+                // PSTATE, maximum-SVL, allocation, and the owner-thread ZA read
+                // have finished. Restore admission before response send so
+                // receiver failure is not part of the capture lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureArm64SmeSystemRegisterState {
                 mut admission,
                 response_sender,
@@ -3829,7 +3906,8 @@ mod tests {
         HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
         HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate,
         HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
-        HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
+        HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError,
+        HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
         HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuThreadContextRegisterState,
         HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
         HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
@@ -4165,6 +4243,36 @@ mod tests {
     struct PanicOnSmeZRegisterCaptureVcpu;
 
     type BlockingSmeZRegisterCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SmeZaRegisterCaptureRead {
+        Pstate,
+        MaximumSvl,
+        Za { length: usize },
+    }
+
+    struct SmeZaRegisterCaptureRecordingVcpu {
+        read_sender: mpsc::Sender<SmeZaRegisterCaptureRead>,
+        streaming_sve_mode_enabled: bool,
+        za_storage_enabled: bool,
+        maximum_svl_bytes: usize,
+        fail_next_read: bool,
+    }
+
+    struct BlockingSmeZaRegisterCaptureVcpu {
+        entered_capture_sender: mpsc::Sender<()>,
+        release_capture_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnSmeZaRegisterCaptureVcpu;
+
+    type BlockingSmeZaRegisterCaptureRunner = (
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<(), BackendError>>,
@@ -6527,6 +6635,163 @@ mod tests {
 
         fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
             panic!("fake SME Z-register capture panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for SmeZaRegisterCaptureRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+            self.read_sender
+                .send(SmeZaRegisterCaptureRead::Pstate)
+                .map_err(|_| {
+                    BackendError::InvalidState("fake SME ZA-register read receiver closed")
+                })?;
+            Ok((self.streaming_sve_mode_enabled, self.za_storage_enabled))
+        }
+
+        fn get_sme_maximum_svl_bytes(&mut self) -> Result<usize, BackendError> {
+            self.read_sender
+                .send(SmeZaRegisterCaptureRead::MaximumSvl)
+                .map_err(|_| {
+                    BackendError::InvalidState("fake SME ZA-register read receiver closed")
+                })?;
+            Ok(self.maximum_svl_bytes)
+        }
+
+        fn get_sme_za_register(&mut self, value: &mut [u8]) -> Result<(), BackendError> {
+            self.read_sender
+                .send(SmeZaRegisterCaptureRead::Za {
+                    length: value.len(),
+                })
+                .map_err(|_| {
+                    BackendError::InvalidState("fake SME ZA-register read receiver closed")
+                })?;
+            if self.fail_next_read {
+                self.fail_next_read = false;
+                return Err(BackendError::InvalidState(
+                    "fake SME ZA-register capture failed",
+                ));
+            }
+            for (offset, byte) in value.iter_mut().enumerate() {
+                *byte = sme_za_register_test_byte(offset);
+            }
+            Ok(())
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingSmeZaRegisterCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+            self.entered_capture_sender.send(()).map_err(|_| {
+                BackendError::InvalidState("fake SME ZA-register capture entry receiver closed")
+            })?;
+            self.release_capture_receiver.recv().map_err(|_| {
+                BackendError::InvalidState("fake SME ZA-register capture release sender closed")
+            })??;
+            Ok((false, true))
+        }
+
+        fn get_sme_maximum_svl_bytes(&mut self) -> Result<usize, BackendError> {
+            Ok(3)
+        }
+
+        fn get_sme_za_register(&mut self, value: &mut [u8]) -> Result<(), BackendError> {
+            for (offset, byte) in value.iter_mut().enumerate() {
+                *byte = sme_za_register_test_byte(offset);
+            }
+            Ok(())
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnSmeZaRegisterCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+            panic!("fake SME ZA-register capture panic");
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -9219,6 +9484,28 @@ mod tests {
         );
     }
 
+    fn sme_za_register_test_byte(offset: usize) -> u8 {
+        offset.to_le_bytes()[0].wrapping_mul(23) ^ 0x5a
+    }
+
+    fn assert_sme_za_register_test_state(
+        state: &HvfArm64VcpuSmeZaRegisterState,
+        maximum_svl_bytes: usize,
+    ) {
+        let capture_size = maximum_svl_bytes * maximum_svl_bytes;
+        let expected = (0..capture_size)
+            .map(sme_za_register_test_byte)
+            .collect::<Vec<_>>();
+        assert_eq!(state.maximum_svl_bytes(), maximum_svl_bytes);
+        assert_eq!(state.as_bytes(), expected);
+        assert_eq!(state.len(), capture_size);
+        assert!(!state.is_empty());
+        assert_eq!(
+            format!("{state:?}"),
+            "HvfArm64VcpuSmeZaRegisterState { register: \"<redacted>\" }"
+        );
+    }
+
     fn assert_sme_system_register_test_state(state: HvfArm64VcpuSmeSystemRegisterState) {
         let registers = sme_system_registers();
         assert_eq!(
@@ -9427,6 +9714,10 @@ mod tests {
         );
         assert_eq!(
             runner.capture_arm64_sme_z_register_state(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            runner.capture_arm64_sme_za_register_state(),
             Err(expected.clone())
         );
         assert_eq!(
@@ -10240,6 +10531,56 @@ mod tests {
         let (barrier_sender, barrier_receiver) = mpsc::channel();
         let started = spawn_runner_thread(move || {
             Ok(BlockingSmeZRegisterCaptureVcpu {
+                entered_capture_sender,
+                release_capture_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_capture_receiver,
+            release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
+    fn start_sme_za_register_capture_recording_runner(
+        streaming_sve_mode_enabled: bool,
+        za_storage_enabled: bool,
+        maximum_svl_bytes: usize,
+        fail_next_read: bool,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<SmeZaRegisterCaptureRead>,
+    ) {
+        let (read_sender, read_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(SmeZaRegisterCaptureRecordingVcpu {
+                read_sender,
+                streaming_sve_mode_enabled,
+                za_storage_enabled,
+                maximum_svl_bytes,
+                fail_next_read,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            read_receiver,
+        )
+    }
+
+    fn start_blocking_sme_za_register_capture_runner() -> BlockingSmeZaRegisterCaptureRunner {
+        let (entered_capture_sender, entered_capture_receiver) = mpsc::channel();
+        let (release_capture_sender, release_capture_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingSmeZaRegisterCaptureVcpu {
                 entered_capture_sender,
                 release_capture_receiver,
                 barrier_sender,
@@ -11745,6 +12086,93 @@ mod tests {
 
             runner.shutdown().expect("runner should shut down");
         }
+    }
+
+    #[test]
+    fn captures_arm64_sme_za_register_on_runner_thread_without_streaming_mode() {
+        let maximum_svl_bytes = 3;
+        let capture_size = maximum_svl_bytes * maximum_svl_bytes;
+        let (runner, read_receiver) =
+            start_sme_za_register_capture_recording_runner(false, true, maximum_svl_bytes, false);
+
+        let state = runner
+            .capture_arm64_sme_za_register_state()
+            .expect("SME ZA-register capture should succeed");
+
+        assert_sme_za_register_test_state(&state, maximum_svl_bytes);
+        assert_eq!(
+            read_receiver.try_iter().collect::<Vec<_>>(),
+            [
+                SmeZaRegisterCaptureRead::Pstate,
+                SmeZaRegisterCaptureRead::MaximumSvl,
+                SmeZaRegisterCaptureRead::Za {
+                    length: capture_size
+                }
+            ]
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn inactive_arm64_sme_za_register_capture_stops_before_sizing() {
+        for streaming_sve_mode_enabled in [false, true] {
+            let (runner, read_receiver) = start_sme_za_register_capture_recording_runner(
+                streaming_sve_mode_enabled,
+                false,
+                3,
+                false,
+            );
+
+            assert_eq!(
+                runner.capture_arm64_sme_za_register_state(),
+                Err(HvfVcpuRunnerError::SmeZaRegisterCapture(
+                    HvfArm64VcpuSmeZaRegisterCaptureError::ZaStorageDisabled
+                ))
+            );
+            assert_eq!(
+                read_receiver.try_iter().collect::<Vec<_>>(),
+                [SmeZaRegisterCaptureRead::Pstate]
+            );
+            assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn failed_arm64_sme_za_register_capture_can_retry_without_partial_state() {
+        let maximum_svl_bytes = 3;
+        let capture_size = maximum_svl_bytes * maximum_svl_bytes;
+        let (runner, read_receiver) =
+            start_sme_za_register_capture_recording_runner(false, true, maximum_svl_bytes, true);
+
+        assert_eq!(
+            runner.capture_arm64_sme_za_register_state(),
+            Err(HvfVcpuRunnerError::SmeZaRegisterCapture(
+                HvfArm64VcpuSmeZaRegisterCaptureError::Backend(BackendError::InvalidState(
+                    "fake SME ZA-register capture failed"
+                ))
+            ))
+        );
+        let expected_reads = [
+            SmeZaRegisterCaptureRead::Pstate,
+            SmeZaRegisterCaptureRead::MaximumSvl,
+            SmeZaRegisterCaptureRead::Za {
+                length: capture_size,
+            },
+        ];
+        assert_eq!(read_receiver.try_iter().collect::<Vec<_>>(), expected_reads);
+
+        let state = runner
+            .capture_arm64_sme_za_register_state()
+            .expect("SME ZA-register capture retry should succeed");
+        assert_sme_za_register_test_state(&state, maximum_svl_bytes);
+        assert_eq!(read_receiver.try_iter().collect::<Vec<_>>(), expected_reads);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
     }
 
     #[test]
@@ -14333,6 +14761,199 @@ mod tests {
 
         assert_eq!(
             runner.capture_arm64_sme_z_register_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn commands_during_arm64_sme_za_register_capture_are_rejected_without_queueing() {
+        let (runner, entered_capture_receiver, release_capture_sender, _barrier_receiver) =
+            start_blocking_sme_za_register_capture_runner();
+
+        thread::scope(|scope| {
+            let capture = scope.spawn(|| runner.capture_arm64_sme_za_register_state());
+            entered_capture_receiver
+                .recv()
+                .expect("runner should enter fake SME ZA-register capture");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
+            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_capture_sender
+                .send(Ok(()))
+                .expect("SME ZA-register capture release should be sent");
+            let state = capture
+                .join()
+                .expect("SME ZA-register capture thread should join")
+                .expect("SME ZA-register capture should succeed");
+            assert_sme_za_register_test_state(&state, 3);
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_sme_za_register_capture_admitted_until_command_finishes() {
+        let (runner, entered_capture_receiver, release_capture_sender, barrier_receiver) =
+            start_blocking_sme_za_register_capture_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_sme_za_register_capture(response_sender)
+                .expect("SME ZA-register capture should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_capture_receiver
+            .recv()
+            .expect("runner should enter fake SME ZA-register capture");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind capture");
+        release_capture_sender
+            .send(Ok(()))
+            .expect("SME ZA-register capture release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after capture");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn arm64_sme_za_register_capture_send_failure_releases_admission() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.capture_arm64_sme_za_register_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_sme_za_register_capture_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (capture_response_sender, capture_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_sme_za_register_capture(capture_response_sender)
+            .expect("SME ZA-register capture should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(capture_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_sme_za_register_capture_panic() {
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnSmeZaRegisterCaptureVcpu));
+
+        assert_eq!(
+            runner.capture_arm64_sme_za_register_state(),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))

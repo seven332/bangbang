@@ -304,8 +304,9 @@ is resource-specific:
   The configuration-wide maximum SME streaming vector length is a read-only
   HVF host capability, not guest data or mutable execution state. It can still
   contribute to fingerprinting the exposed host capability and must not be
-  logged or persisted without a defined need. The scalar is only a future
-  buffer-sizing bound: it neither proves that a particular vCPU exposes SME nor
+  logged or persisted without a defined need. The scalar is only a
+  buffer-sizing bound for conditional Z, P, and ZA captures: it neither proves
+  that a particular vCPU exposes SME nor
   defines its effective `SMCR_EL1.LEN`, and it must not be trusted as a feature
   or destination-compatibility decision.
   The separately captured SME `PSTATE.SM` and `PSTATE.ZA` flags are mutable
@@ -333,6 +334,15 @@ is resource-specific:
   confidentiality, integrity, zeroization, feature/destination, effective-SVL,
   schema, and transition/restore policies coordinated with Z/FPSR and
   conditional ZA/ZT0 contents, none of which exists yet.
+  The conditionally captured ZA matrix is sensitive guest execution and
+  potentially cryptographic state. Capture preflights `PSTATE.ZA` without
+  requiring `PSTATE.SM`, checked-squares the non-zero maximum SVL, fallibly
+  allocates that exact byte count, and publishes no value after a getter
+  failure. The detached value redacts bytes and dimensions from `Debug`; raw
+  access remains restricted to trusted internal composition. Persistence
+  requires confidentiality, integrity, zeroization, layout and effective-SVL
+  policy, feature/destination validation, schema, and transition/restore
+  ordering coordinated with Z/P/FPSR and conditional ZT0, none of which exists.
   The separately captured raw `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` values
   are mutable SME and thread-context state; `TPIDR2_EL0` can contain sensitive
   guest pointers. Their detached value redacts every register from `Debug`, and

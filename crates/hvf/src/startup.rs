@@ -79,10 +79,10 @@ use crate::vcpu::{
     HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
     HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
     HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate, HvfArm64VcpuSmeSystemRegisterState,
-    HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
-    HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuThreadContextRegisterState,
-    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
-    HvfArm64VcpuWatchpointRegisterState,
+    HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterState,
+    HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuSystemContextRegisterState,
+    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+    HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1327,6 +1327,18 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_sme_z_register_state()
     }
 
+    /// Capture the complete SME ZA matrix on the primary vCPU owner thread.
+    ///
+    /// This macOS 15.2+ getter-only value requires `PSTATE.ZA` but not
+    /// `PSTATE.SM`, preserves the maximum-SVL square, and redacts `Debug`. It
+    /// excludes Z/P/ZT0, setters, layout interpretation, persistence, snapshot
+    /// schema, and restore ordering.
+    pub fn capture_arm64_sme_za_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSmeZaRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_sme_za_register_state()
+    }
+
     /// Capture raw SME system registers on the primary vCPU owner thread.
     ///
     /// This macOS 15.2+ getter-only value contains `SMCR_EL1`, `SMPRI_EL1`,
@@ -2144,6 +2156,18 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuSmeZRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_sme_z_register_state()
+    }
+
+    /// Capture the complete SME ZA matrix on the primary vCPU owner thread.
+    ///
+    /// This macOS 15.2+ getter-only value requires `PSTATE.ZA` but not
+    /// `PSTATE.SM`, preserves the maximum-SVL square, and redacts `Debug`. It
+    /// excludes Z/P/ZT0, setters, layout interpretation, persistence, snapshot
+    /// schema, and restore ordering.
+    pub fn capture_arm64_sme_za_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSmeZaRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_sme_za_register_state()
     }
 
     /// Capture raw SME system registers on the primary vCPU owner thread.
