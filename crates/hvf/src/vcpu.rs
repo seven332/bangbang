@@ -962,21 +962,31 @@ impl HvfArm64VcpuSimdFpState {
 /// Hypervisor.framework exposes the CNTP registers on macOS 15 and newer only
 /// when the VM creates a GIC before its vCPU. `CNTP_CTL_EL0` includes derived
 /// ISTATUS, while `CNTP_CVAL_EL0` is an absolute comparator against a continuing
-/// physical count. These raw values have no portable elapsed-time adjustment,
-/// writable-bit, interrupt-delivery, or restore policy.
+/// physical count. `CNTP_TVAL_EL0` is the architecturally signed 32-bit relative
+/// view of that comparator, returned here as the raw Hypervisor.framework `u64`.
+/// It changes as time advances between the separately timed CVAL and TVAL reads.
+/// These raw values have no portable elapsed-time adjustment, writable-bit,
+/// interrupt-delivery, or restore policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuPhysicalTimerState {
     cntkctl_el1: u64,
     cntp_ctl_el0: u64,
     cntp_cval_el0: u64,
+    cntp_tval_el0: u64,
 }
 
 impl HvfArm64VcpuPhysicalTimerState {
-    pub(crate) const fn new(cntkctl_el1: u64, cntp_ctl_el0: u64, cntp_cval_el0: u64) -> Self {
+    pub(crate) const fn new(
+        cntkctl_el1: u64,
+        cntp_ctl_el0: u64,
+        cntp_cval_el0: u64,
+        cntp_tval_el0: u64,
+    ) -> Self {
         Self {
             cntkctl_el1,
             cntp_ctl_el0,
             cntp_cval_el0,
+            cntp_tval_el0,
         }
     }
 
@@ -993,6 +1003,11 @@ impl HvfArm64VcpuPhysicalTimerState {
     /// Return the raw absolute `CNTP_CVAL_EL0` compare value.
     pub const fn cntp_cval_el0(self) -> u64 {
         self.cntp_cval_el0
+    }
+
+    /// Return the raw `CNTP_TVAL_EL0` relative timer value.
+    pub const fn cntp_tval_el0(self) -> u64 {
+        self.cntp_tval_el0
     }
 }
 
@@ -1151,6 +1166,7 @@ impl HvfSystemRegister {
     pub const SCXTNUM_EL0: Self = Self(crate::ffi::HV_SYS_REG_SCXTNUM_EL0);
     pub const CNTP_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_CTL_EL0);
     pub const CNTP_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_CVAL_EL0);
+    pub const CNTP_TVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_TVAL_EL0);
     pub const CNTV_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CTL_EL0);
     pub const CNTV_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CVAL_EL0);
     pub const SP_EL1: Self = Self(crate::ffi::HV_SYS_REG_SP_EL1);
@@ -1886,11 +1902,13 @@ pub(crate) fn capture_arm64_vcpu_physical_timer_state_with(
     let cntkctl_el1 = get_system_register(HvfSystemRegister::CNTKCTL_EL1)?;
     let cntp_ctl_el0 = get_system_register(HvfSystemRegister::CNTP_CTL_EL0)?;
     let cntp_cval_el0 = get_system_register(HvfSystemRegister::CNTP_CVAL_EL0)?;
+    let cntp_tval_el0 = get_system_register(HvfSystemRegister::CNTP_TVAL_EL0)?;
 
     Ok(HvfArm64VcpuPhysicalTimerState::new(
         cntkctl_el1,
         cntp_ctl_el0,
         cntp_cval_el0,
+        cntp_tval_el0,
     ))
 }
 
@@ -3934,6 +3952,7 @@ mod tests {
                 HvfSystemRegister::CNTKCTL_EL1,
                 HvfSystemRegister::CNTP_CTL_EL0,
                 HvfSystemRegister::CNTP_CVAL_EL0,
+                HvfSystemRegister::CNTP_TVAL_EL0,
             ]
         );
         assert_eq!(
@@ -3948,9 +3967,14 @@ mod tests {
             state.cntp_cval_el0(),
             0xcafe_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_CNTP_CVAL_EL0)
         );
+        assert_eq!(
+            state.cntp_tval_el0(),
+            0xcafe_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_CNTP_TVAL_EL0)
+        );
         assert_eq!(HvfSystemRegister::CNTKCTL_EL1.raw(), 0xc708);
         assert_eq!(HvfSystemRegister::CNTP_CTL_EL0.raw(), 0xdf11);
         assert_eq!(HvfSystemRegister::CNTP_CVAL_EL0.raw(), 0xdf12);
+        assert_eq!(HvfSystemRegister::CNTP_TVAL_EL0.raw(), 0xdf10);
     }
 
     #[test]
@@ -3959,6 +3983,7 @@ mod tests {
             HvfSystemRegister::CNTKCTL_EL1,
             HvfSystemRegister::CNTP_CTL_EL0,
             HvfSystemRegister::CNTP_CVAL_EL0,
+            HvfSystemRegister::CNTP_TVAL_EL0,
         ];
 
         for (failed_index, failed_register) in registers.into_iter().enumerate() {
@@ -3993,6 +4018,10 @@ mod tests {
             assert_eq!(
                 state.cntp_cval_el0(),
                 u64::from(HvfSystemRegister::CNTP_CVAL_EL0.raw())
+            );
+            assert_eq!(
+                state.cntp_tval_el0(),
+                u64::from(HvfSystemRegister::CNTP_TVAL_EL0.raw())
             );
             assert_eq!(*reads.borrow(), registers);
         }

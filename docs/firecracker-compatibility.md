@@ -51,7 +51,8 @@ access, one-step runner-thread MMIO handling, a run-cancellation boundary,
 baseline and optional SVE/SME guest-visible identification metadata, pointer-
 authentication key-state capture with redacted `Debug`, raw cache-selection,
 hardware-breakpoint, hardware-watchpoint, debug-control, debug-trap policy, and
-physical-timer capture, a virtual-timer mask/offset/control/CVAL boundary, a bounded
+physical-timer CNTKCTL/control/CVAL/TVAL capture, a virtual-timer
+mask/offset/control/CVAL boundary, a bounded
 internal boot-session run-loop pump, owned internal boot-session handle,
 process-level owned
 startup-session wiring with optional serial capture and boot run-loop supervision
@@ -1760,12 +1761,15 @@ The SIMD getter uses an explicitly 16-byte-aligned HVF output value; the
 separate SME PSTATE observation determines whether streaming mode is active,
 where its Q values alias only the low 128 bits of Z registers. Neither value
 contains complete Z/P/ZA/ZT0 state. A separate command
-reads raw `CNTKCTL_EL1`, `CNTP_CTL_EL0`, and `CNTP_CVAL_EL0` in that order,
-publishes no partial state if any read fails, and shares generalized timer
-admission with every virtual-timer command. Both boot-session forms expose the
-immutable value. CNTP access requires macOS 15 and GIC creation before the vCPU.
-Control ISTATUS is derived, and the absolute CVAL is compared against a
-continuing physical count, so the value has no portable elapsed-time adjustment,
+reads raw `CNTKCTL_EL1`, `CNTP_CTL_EL0`, `CNTP_CVAL_EL0`, and
+`CNTP_TVAL_EL0` in that order, publishes no partial state if any read fails, and
+shares generalized timer admission with every virtual-timer command. Both boot-
+session forms expose the immutable value. CNTP access requires macOS 15 and GIC
+creation before the vCPU.
+Control ISTATUS is derived, the absolute CVAL is compared against a continuing
+physical count, and the architecturally signed 32-bit relative TVAL is returned
+as raw `u64` and changes while the sequential reads proceed. The value therefore
+has no simultaneous CVAL/TVAL guarantee, portable elapsed-time adjustment,
 interrupt-delivery, writable-bit, or restore policy. A separate command
 reads the virtual-timer mask, raw offset, control, and CVAL in that order,
 publishes no partial state if any read fails, and keeps command-owned admission
@@ -2182,11 +2186,12 @@ macOS design work instead of direct implementation:
   maintenance, breakpoint and watchpoint control
   validation, debug-trap policy validation/setters, protected key persistence,
   and restore ordering remain outside these subsets.
-  The runner can capture raw CNTKCTL_EL1,
-  CNTP_CTL_EL0, and CNTP_CVAL_EL0 on the owning thread when macOS 15 physical-
-  timer prerequisites are met. It also gets and sets the HVF virtual-timer mask,
-  raw offset, raw control, and raw CVAL on that owning thread and can capture
-  those fields through one serialized command. It can
+  The runner can capture raw CNTKCTL_EL1, CNTP_CTL_EL0, CNTP_CVAL_EL0, and
+  CNTP_TVAL_EL0 on the owning thread when macOS 15 physical-timer prerequisites
+  are met. The absolute and relative views are read sequentially and do not
+  form a simultaneous observation. It also gets and sets the HVF virtual-timer
+  mask, raw offset, raw control, and raw CVAL on that owning thread and can
+  capture those fields through one serialized command. It can
   also capture Hypervisor.framework's stable, versioned opaque GIC device blob
   except CPU system registers while the current single-vCPU runner is stopped.
   A companion owner-thread command captures all ten EL1 ICC CPU-interface

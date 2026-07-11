@@ -1356,10 +1356,12 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
-    /// Capture raw EL1 physical-timer access, control, and compare state.
+    /// Capture raw EL1 physical-timer access, control, compare, and relative state.
     ///
     /// The CNTP fields require macOS 15 and a GIC created before the vCPU. The
-    /// control status bit is derived, and the absolute compare value has no
+    /// control status bit is derived. CVAL is an absolute compare value, while
+    /// TVAL is a time-sensitive signed 32-bit relative view returned as raw
+    /// `u64`; their sequential reads are not simultaneous. Neither has a
     /// portable snapshot-time adjustment or restore policy.
     pub fn capture_arm64_physical_timer_state(
         &self,
@@ -8629,11 +8631,12 @@ mod tests {
         );
     }
 
-    fn physical_timer_registers() -> [HvfSystemRegister; 3] {
+    fn physical_timer_registers() -> [HvfSystemRegister; 4] {
         [
             HvfSystemRegister::CNTKCTL_EL1,
             HvfSystemRegister::CNTP_CTL_EL0,
             HvfSystemRegister::CNTP_CVAL_EL0,
+            HvfSystemRegister::CNTP_TVAL_EL0,
         ]
     }
 
@@ -8649,6 +8652,10 @@ mod tests {
         assert_eq!(
             state.cntp_cval_el0(),
             0x9_0000 + u64::from(HvfSystemRegister::CNTP_CVAL_EL0.raw())
+        );
+        assert_eq!(
+            state.cntp_tval_el0(),
+            0x9_0000 + u64::from(HvfSystemRegister::CNTP_TVAL_EL0.raw())
         );
     }
 

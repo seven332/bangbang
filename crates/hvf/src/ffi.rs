@@ -95,6 +95,7 @@ pub(crate) const HV_SYS_REG_TPIDR2_EL0: HvSysReg = 0xde85;
 pub(crate) const HV_SYS_REG_SCXTNUM_EL0: HvSysReg = 0xde87;
 pub(crate) const HV_SYS_REG_CNTP_CTL_EL0: HvSysReg = 0xdf11;
 pub(crate) const HV_SYS_REG_CNTP_CVAL_EL0: HvSysReg = 0xdf12;
+pub(crate) const HV_SYS_REG_CNTP_TVAL_EL0: HvSysReg = 0xdf10;
 pub(crate) const HV_SYS_REG_CNTV_CTL_EL0: HvSysReg = 0xdf19;
 pub(crate) const HV_SYS_REG_CNTV_CVAL_EL0: HvSysReg = 0xdf1a;
 pub(crate) const HV_SYS_REG_SP_EL1: HvSysReg = 0xe208;
