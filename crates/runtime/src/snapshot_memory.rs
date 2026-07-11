@@ -21,7 +21,6 @@ const SNAPSHOT_MEMORY_BINDING_MAGIC: [u8; 8] = *b"BANGMBND";
 const SNAPSHOT_MEMORY_RESERVED_FLAGS: u32 = 0;
 const SNAPSHOT_MEMORY_BINDING_RESERVED: u32 = 0;
 const SNAPSHOT_MEMORY_IMAGE_ID_BYTES: usize = 16;
-const SNAPSHOT_MEMORY_IO_CHUNK_BYTES_U64: u64 = 1024 * 1024;
 const REDACTED: &str = "<redacted>";
 
 const IMAGE_MAGIC_OFFSET: usize = 0;
@@ -67,7 +66,7 @@ pub const SNAPSHOT_MEMORY_BINDING_RANGE_BYTES: usize = 24;
 pub const NATIVE_V1_SNAPSHOT_MEMORY_MAX_RANGES: usize = 4096;
 
 /// Maximum native-v1 guest-memory data length.
-pub const NATIVE_V1_SNAPSHOT_MEMORY_MAX_DATA_BYTES: u64 = aarch64::DRAM_MEM_MAX_SIZE;
+pub const NATIVE_V1_SNAPSHOT_MEMORY_MAX_DATA_BYTES: u64 = 0x00ff_8000_0000;
 
 /// Maximum encoded native-v1 memory-binding size.
 pub const NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES: usize = SNAPSHOT_MEMORY_BINDING_HEADER_BYTES
@@ -75,6 +74,8 @@ pub const NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES: usize = SNAPSHOT_MEMORY_B
 
 /// Reusable buffer size for native-v1 memory image I/O.
 pub const SNAPSHOT_MEMORY_IO_CHUNK_BYTES: usize = 1024 * 1024;
+
+const SNAPSHOT_MEMORY_IO_CHUNK_BYTES_U64: u64 = SNAPSHOT_MEMORY_IO_CHUNK_BYTES as u64;
 
 /// Persistent native-v1 state-to-memory image identity.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1483,8 +1484,10 @@ fn array_at<const LENGTH: usize>(bytes: &[u8], offset: usize) -> Option<[u8; LEN
     Some(result)
 }
 
-const _: () =
+const _: () = {
     assert!(NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES <= NATIVE_V1_SNAPSHOT_MAX_PAYLOAD_BYTES);
+    assert!(NATIVE_V1_SNAPSHOT_MEMORY_MAX_DATA_BYTES == aarch64::DRAM_MEM_MAX_SIZE);
+};
 
 #[cfg(test)]
 mod tests {
