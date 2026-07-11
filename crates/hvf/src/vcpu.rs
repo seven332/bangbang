@@ -255,6 +255,39 @@ impl HvfArm64VcpuExecutionControlRegisterState {
     }
 }
 
+/// Detached raw EL1 debug-control state captured from one arm64 vCPU.
+///
+/// `MDCCINT_EL1` and `MDSCR_EL1` control security-sensitive self-hosted debug
+/// behavior. This getter-only value does not include breakpoint/watchpoint
+/// comparators, Hypervisor.framework debug trap configuration, feature or
+/// writable-bit validation, or a safe restore policy. Capturing it does not
+/// enable monitor debug, software stepping, debug exceptions, guest debug-
+/// register access, or debug communications-channel interrupts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuDebugControlRegisterState {
+    mdccint_el1: u64,
+    mdscr_el1: u64,
+}
+
+impl HvfArm64VcpuDebugControlRegisterState {
+    pub(crate) const fn new(mdccint_el1: u64, mdscr_el1: u64) -> Self {
+        Self {
+            mdccint_el1,
+            mdscr_el1,
+        }
+    }
+
+    /// Return the raw `MDCCINT_EL1` value.
+    pub const fn mdccint_el1(self) -> u64 {
+        self.mdccint_el1
+    }
+
+    /// Return the raw `MDSCR_EL1` value.
+    pub const fn mdscr_el1(self) -> u64 {
+        self.mdscr_el1
+    }
+}
+
 /// Detached arm64 processor identification state captured from one vCPU.
 ///
 /// These guest-visible MIDR, MPIDR, and baseline `ID_AA64*` values describe
@@ -722,6 +755,8 @@ impl HvfSimdFpRegister {
 pub struct HvfSystemRegister(u16);
 
 impl HvfSystemRegister {
+    pub const MDCCINT_EL1: Self = Self(crate::ffi::HV_SYS_REG_MDCCINT_EL1);
+    pub const MDSCR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MDSCR_EL1);
     pub const MIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MIDR_EL1);
     pub const MPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MPIDR_EL1);
     pub const ID_AA64PFR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64PFR0_EL1);
@@ -1208,6 +1243,18 @@ pub(crate) fn capture_arm64_vcpu_execution_control_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_debug_control_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuDebugControlRegisterState, BackendError> {
+    let mdccint_el1 = get_system_register(HvfSystemRegister::MDCCINT_EL1)?;
+    let mdscr_el1 = get_system_register(HvfSystemRegister::MDSCR_EL1)?;
+
+    Ok(HvfArm64VcpuDebugControlRegisterState::new(
+        mdccint_el1,
+        mdscr_el1,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_identification_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuIdentificationRegisterState, BackendError> {
@@ -1361,6 +1408,7 @@ mod tests {
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfInterruptType,
         HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
         NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_core_system_register_state_with,
+        capture_arm64_vcpu_debug_control_register_state_with,
         capture_arm64_vcpu_exception_register_state_with,
         capture_arm64_vcpu_execution_control_register_state_with,
         capture_arm64_vcpu_general_register_state_with,
@@ -1846,6 +1894,32 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_debug_control_register_state_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_debug_control_register_state_with(|register| {
+            reads.push(register);
+            Ok(0xd06_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("debug-control capture should succeed");
+
+        assert_eq!(
+            reads,
+            [HvfSystemRegister::MDCCINT_EL1, HvfSystemRegister::MDSCR_EL1,]
+        );
+        assert_eq!(
+            state.mdccint_el1(),
+            0xd06_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_MDCCINT_EL1)
+        );
+        assert_eq!(
+            state.mdscr_el1(),
+            0xd06_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_MDSCR_EL1)
+        );
+        assert_eq!(HvfSystemRegister::MDCCINT_EL1.raw(), 0x8010);
+        assert_eq!(HvfSystemRegister::MDSCR_EL1.raw(), 0x8012);
+    }
+
+    #[test]
     fn captures_arm64_translation_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -2187,6 +2261,47 @@ mod tests {
             assert_eq!(
                 state.cpacr_el1(),
                 u64::from(HvfSystemRegister::CPACR_EL1.raw())
+            );
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_debug_control_register_capture_stops_after_each_error_and_can_retry() {
+        let registers = [HvfSystemRegister::MDCCINT_EL1, HvfSystemRegister::MDSCR_EL1];
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake debug-control register read failed",
+                    ))
+                } else {
+                    Ok(u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_debug_control_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake debug-control register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_debug_control_register_state_with(&read_system_register)
+                .expect("debug-control capture retry should succeed");
+            assert_eq!(
+                state.mdccint_el1(),
+                u64::from(HvfSystemRegister::MDCCINT_EL1.raw())
+            );
+            assert_eq!(
+                state.mdscr_el1(),
+                u64::from(HvfSystemRegister::MDSCR_EL1.raw())
             );
             assert_eq!(*reads.borrow(), registers);
         }

@@ -239,9 +239,9 @@ is resource-specific:
   documented in [Snapshot Feasibility](snapshot-feasibility.md).
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
-  ACTLR_EL1/CPACR_EL1 execution controls, raw pointer-authentication keys, raw
-  TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1 values, raw Q0-Q31/FPCR/FPSR values, raw
-  physical-timer
+  ACTLR_EL1/CPACR_EL1 execution controls, raw MDCCINT_EL1/MDSCR_EL1 debug
+  controls, raw pointer-authentication keys, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1
+  values, raw Q0-Q31/FPCR/FPSR values, raw physical-timer
   CNTKCTL/control/CVAL values, raw virtual-timer mask/offset/control/CVAL values,
   raw EL1
   SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
@@ -254,6 +254,14 @@ is resource-specific:
   FAR and PAR can expose guest fault or translation-result addresses, VBAR can
   expose a guest kernel vector address, and syndrome/fault fields can reveal
   guest execution details.
+  MDCCINT and MDSCR can reveal security-sensitive guest debugging controls and
+  status. The two-field getter does not enable debug behavior, but it is not a
+  safe restore model: raw writes could activate monitor debug, software
+  stepping, or debug communications behavior. Breakpoint/watchpoint arrays,
+  DFR0 implemented-count policy, and Hypervisor.framework's separate debug-
+  exception and debug-register-access trap settings are not captured. Any
+  future restore must validate features and writable/status bits, coordinate
+  trap policy and ordering, and treat restored debug controls as untrusted.
   Pointer-authentication keys are cryptographic secrets. Their detached value
   uses a custom `Debug` implementation that exposes only a redacted marker, and
   future persistence must protect key confidentiality and integrity. The opaque
