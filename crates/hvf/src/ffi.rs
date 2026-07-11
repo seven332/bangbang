@@ -206,8 +206,11 @@ mod imp {
     const HV_FAULT: HvReturn = 0xfae94008u32 as HvReturn;
     const HV_UNSUPPORTED: HvReturn = 0xfae9400fu32 as HvReturn;
 
+    type HvCacheType = u32;
     type HvFeatureReg = u32;
     type HvVcpuConfigCreate = unsafe extern "C" fn() -> HvVcpuConfig;
+    type HvVcpuConfigGetCcsidrEl1SysRegValues =
+        unsafe extern "C" fn(HvVcpuConfig, HvCacheType, *mut u64) -> HvReturn;
     type HvVcpuConfigGetFeatureReg =
         unsafe extern "C" fn(HvVcpuConfig, HvFeatureReg, *mut u64) -> HvReturn;
     type OsRelease = unsafe extern "C" fn(*mut c_void);
@@ -215,6 +218,8 @@ mod imp {
     type HvVcpuGetSmeState =
         unsafe extern "C" fn(vcpu: HvVcpu, sme_state: *mut HvVcpuSmeState) -> HvReturn;
 
+    const HV_CACHE_TYPE_DATA: HvCacheType = 0;
+    const HV_CACHE_TYPE_INSTRUCTION: HvCacheType = 1;
     const HV_FEATURE_REG_CTR_EL0: HvFeatureReg = 9;
     const HV_FEATURE_REG_CLIDR_EL1: HvFeatureReg = 10;
     const HV_FEATURE_REG_DCZID_EL0: HvFeatureReg = 11;
@@ -234,6 +239,11 @@ mod imp {
         ) -> HvReturn;
         pub fn hv_vm_unmap(ipa: u64, size: usize) -> HvReturn;
         pub fn hv_vcpu_config_create() -> HvVcpuConfig;
+        pub fn hv_vcpu_config_get_ccsidr_el1_sys_reg_values(
+            config: HvVcpuConfig,
+            cache_type: HvCacheType,
+            values: *mut u64,
+        ) -> HvReturn;
         pub fn hv_vcpu_config_get_feature_reg(
             config: HvVcpuConfig,
             feature_reg: HvFeatureReg,
@@ -495,6 +505,55 @@ mod imp {
         get_arm64_vcpu_cache_feature_registers_with(
             hv_vcpu_config_create,
             hv_vcpu_config_get_feature_reg,
+            os_release,
+        )
+    }
+
+    fn get_vcpu_config_ccsidr_el1_values_with(
+        config: &HvVcpuConfigOwner,
+        get_ccsidr_el1_sys_reg_values: HvVcpuConfigGetCcsidrEl1SysRegValues,
+        cache_type: HvCacheType,
+    ) -> Result<[u64; 8], BackendError> {
+        let mut values = [0; 8];
+
+        // SAFETY: `config` owns a live configuration object, the injected
+        // function has the SDK's exact getter ABI, and `values` supplies the
+        // required writable eight-element `u64` buffer for the duration of the
+        // call.
+        unsafe {
+            check(
+                get_ccsidr_el1_sys_reg_values(config.as_ptr(), cache_type, values.as_mut_ptr()),
+                "hv_vcpu_config_get_ccsidr_el1_sys_reg_values",
+            )?;
+        }
+
+        Ok(values)
+    }
+
+    fn get_arm64_vcpu_cache_geometry_with(
+        create: HvVcpuConfigCreate,
+        get_ccsidr_el1_sys_reg_values: HvVcpuConfigGetCcsidrEl1SysRegValues,
+        release: OsRelease,
+    ) -> Result<[[u64; 8]; 2], BackendError> {
+        let config = HvVcpuConfigOwner::create_with(create, release)?;
+        let data_or_unified = get_vcpu_config_ccsidr_el1_values_with(
+            &config,
+            get_ccsidr_el1_sys_reg_values,
+            HV_CACHE_TYPE_DATA,
+        )?;
+        let instruction = get_vcpu_config_ccsidr_el1_values_with(
+            &config,
+            get_ccsidr_el1_sys_reg_values,
+            HV_CACHE_TYPE_INSTRUCTION,
+        )?;
+
+        Ok([data_or_unified, instruction])
+    }
+
+    pub fn get_arm64_vcpu_cache_geometry() -> Result<[[u64; 8]; 2], BackendError> {
+        get_arm64_vcpu_cache_geometry_with(
+            hv_vcpu_config_create,
+            hv_vcpu_config_get_ccsidr_el1_sys_reg_values,
             os_release,
         )
     }
@@ -782,10 +841,12 @@ mod imp {
         use bangbang_runtime::BackendError;
 
         use super::{
-            HV_BAD_ARGUMENT, HV_DENIED, HV_FEATURE_REG_CLIDR_EL1, HV_FEATURE_REG_CTR_EL0,
-            HV_FEATURE_REG_DCZID_EL0, HV_SUCCESS, HV_UNSUPPORTED, HvVcpuConfig, HvVcpuConfigOwner,
-            check, get_arm64_vcpu_cache_feature_registers_with, get_sme_config_max_svl_bytes_with,
-            sme_config_max_svl_bytes_getter_from_symbol, sme_state_getter_from_symbol,
+            HV_BAD_ARGUMENT, HV_CACHE_TYPE_DATA, HV_CACHE_TYPE_INSTRUCTION, HV_DENIED,
+            HV_FEATURE_REG_CLIDR_EL1, HV_FEATURE_REG_CTR_EL0, HV_FEATURE_REG_DCZID_EL0, HV_SUCCESS,
+            HV_UNSUPPORTED, HvVcpuConfig, HvVcpuConfigOwner, check,
+            get_arm64_vcpu_cache_feature_registers_with, get_arm64_vcpu_cache_geometry_with,
+            get_sme_config_max_svl_bytes_with, sme_config_max_svl_bytes_getter_from_symbol,
+            sme_state_getter_from_symbol,
         };
         use crate::ffi::{
             SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
@@ -793,11 +854,34 @@ mod imp {
 
         const TEST_MAX_SVL_BYTES: usize = usize::MAX - 0x1234;
         const TEST_CACHE_FEATURE_VALUES: [u64; 3] = [0, u64::MAX, 0x0123_4567_89ab_cdef];
+        const TEST_CACHE_GEOMETRY: [[u64; 8]; 2] = [
+            [
+                0,
+                1,
+                u64::MAX,
+                0x0123_4567_89ab_cdef,
+                0xfedc_ba98_7654_3210,
+                0x1111_2222_3333_4444,
+                0xaaaa_bbbb_cccc_dddd,
+                0x5555_6666_7777_8888,
+            ],
+            [
+                0x8000_0000_0000_0000,
+                0x7fff_ffff_ffff_ffff,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+            ],
+        ];
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum TestVcpuConfigCall {
             Create,
             Get(u32),
+            GetCcsidr(u32),
             Release,
         }
 
@@ -881,6 +965,32 @@ mod imp {
             // SAFETY: The FFI test helper is called only through the production
             // helper, which supplies a live `u64` output pointer.
             unsafe { *value = register_value };
+            HV_SUCCESS
+        }
+
+        unsafe extern "C" fn test_vcpu_config_get_ccsidr_el1_sys_reg_values(
+            config: HvVcpuConfig,
+            cache_type: u32,
+            values: *mut u64,
+        ) -> super::HvReturn {
+            let mut state = lock_test_vcpu_config_state();
+            state.config_pointer_matches &= config == test_vcpu_config_pointer();
+            state.calls.push(TestVcpuConfigCall::GetCcsidr(cache_type));
+            let get_index = state.get_count;
+            state.get_count += 1;
+            if state.fail_on_get == Some(get_index) {
+                return HV_BAD_ARGUMENT;
+            }
+            let cache_values = match cache_type {
+                HV_CACHE_TYPE_DATA => &TEST_CACHE_GEOMETRY[0],
+                HV_CACHE_TYPE_INSTRUCTION => &TEST_CACHE_GEOMETRY[1],
+                _ => return HV_BAD_ARGUMENT,
+            };
+            drop(state);
+
+            // SAFETY: The FFI test helper is called only through the production
+            // helper, which supplies a live eight-element `u64` output buffer.
+            unsafe { ptr::copy_nonoverlapping(cache_values.as_ptr(), values, cache_values.len()) };
             HV_SUCCESS
         }
 
@@ -1012,6 +1122,12 @@ mod imp {
         }
 
         #[test]
+        fn vcpu_cache_types_match_hvf_sdk() {
+            assert_eq!(HV_CACHE_TYPE_DATA, 0);
+            assert_eq!(HV_CACHE_TYPE_INSTRUCTION, 1);
+        }
+
+        #[test]
         fn null_vcpu_configuration_stops_without_getter_or_release() {
             let _lock = TEST_VCPU_CONFIG_LOCK
                 .lock()
@@ -1102,6 +1218,91 @@ mod imp {
         }
 
         #[test]
+        fn null_vcpu_configuration_stops_without_ccsidr_getter_or_release() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            reset_test_vcpu_config_state(None);
+
+            assert_eq!(
+                get_arm64_vcpu_cache_geometry_with(
+                    test_vcpu_config_create_null,
+                    test_vcpu_config_get_ccsidr_el1_sys_reg_values,
+                    test_vcpu_config_release,
+                ),
+                Err(BackendError::Hypervisor(
+                    "hv_vcpu_config_create returned null".to_string()
+                ))
+            );
+            assert_eq!(
+                test_vcpu_config_calls(),
+                (vec![TestVcpuConfigCall::Create], true)
+            );
+        }
+
+        #[test]
+        fn vcpu_cache_geometry_preserves_values_order_and_release() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            reset_test_vcpu_config_state(None);
+
+            assert_eq!(
+                get_arm64_vcpu_cache_geometry_with(
+                    test_vcpu_config_create,
+                    test_vcpu_config_get_ccsidr_el1_sys_reg_values,
+                    test_vcpu_config_release,
+                ),
+                Ok(TEST_CACHE_GEOMETRY)
+            );
+            assert_eq!(
+                test_vcpu_config_calls(),
+                (
+                    vec![
+                        TestVcpuConfigCall::Create,
+                        TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_DATA),
+                        TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_INSTRUCTION),
+                        TestVcpuConfigCall::Release,
+                    ],
+                    true,
+                )
+            );
+        }
+
+        #[test]
+        fn every_vcpu_cache_geometry_failure_stops_and_releases() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            let cache_types = [HV_CACHE_TYPE_DATA, HV_CACHE_TYPE_INSTRUCTION];
+
+            for fail_on_get in 0..cache_types.len() {
+                reset_test_vcpu_config_state(Some(fail_on_get));
+                let err = get_arm64_vcpu_cache_geometry_with(
+                    test_vcpu_config_create,
+                    test_vcpu_config_get_ccsidr_el1_sys_reg_values,
+                    test_vcpu_config_release,
+                )
+                .expect_err("configured CCSIDR getter should fail");
+                assert_eq!(
+                    err.to_string(),
+                    "hypervisor error: hv_vcpu_config_get_ccsidr_el1_sys_reg_values failed with HV_BAD_ARGUMENT (hv_return_t=0xfae94003)"
+                );
+
+                let mut expected_calls = vec![TestVcpuConfigCall::Create];
+                expected_calls.extend(
+                    cache_types
+                        .iter()
+                        .take(fail_on_get + 1)
+                        .copied()
+                        .map(TestVcpuConfigCall::GetCcsidr),
+                );
+                expected_calls.push(TestVcpuConfigCall::Release);
+                assert_eq!(test_vcpu_config_calls(), (expected_calls, true));
+            }
+        }
+
+        #[test]
         fn vcpu_configuration_guard_releases_during_unwind() {
             let _lock = TEST_VCPU_CONFIG_LOCK
                 .lock()
@@ -1167,6 +1368,10 @@ mod imp {
     }
 
     pub fn get_arm64_vcpu_cache_feature_registers() -> Result<[u64; 3], BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_arm64_vcpu_cache_geometry() -> Result<[[u64; 8]; 2], BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 

@@ -60,4 +60,4 @@ pub use vcpu::{
     HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
     HvfSystemRegister, HvfVcpu,
 };
-pub use vcpu_config::HvfArm64VcpuCacheConfiguration;
+pub use vcpu_config::{HvfArm64VcpuCacheConfiguration, HvfArm64VcpuCacheGeometry};

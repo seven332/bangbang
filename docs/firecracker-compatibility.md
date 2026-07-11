@@ -1702,6 +1702,15 @@ used by vCPU creation or enter runner admission. The triple is separate from a
 live guest `CSSELR_EL1` selector and the instruction/data `CCSIDR_EL1` arrays;
 it defines no interpretation, feature mask, destination decision, cache
 maintenance, persistence, schema, or restore behavior.
+A separate no-handle `HvfBackend::arm64_vcpu_cache_geometry()` query creates
+and releases another fresh default configuration, reads all eight raw data or
+unified `CCSIDR_EL1` values followed by all eight instruction values, and
+publishes only the complete detached geometry. It preserves every SDK entry
+without selecting cache levels, interpreting fields, or entering runner
+admission. Because the feature and geometry methods own independent
+configurations, their results do not form one atomic manifest. The geometry
+defines no feature mask, destination decision, synchronization, cache
+maintenance, persistence, schema, or restore behavior.
 TPIDR values can contain
 guest TLS or kernel pointers; translation table bases, context ids, fault
 addresses, and the vector base are sensitive; pointer-authentication keys are
@@ -1788,10 +1797,14 @@ CSSELR, issue ISB, query CCSIDR, perform cache maintenance, or run guest code.
 Default-cache-configuration validation queries CTR_EL0/CLIDR_EL1/DCZID_EL0
 twice before constructing a backend or VM and compares only through fixed
 messages without logging raw values. It creates/runs no vCPU, touches no live
-selector, queries no CCSIDR, performs no maintenance, and infers no topology or
-destination policy. The selector is not cache topology: the default feature
-triple is queried separately, while instruction/data CCSIDR geometry remains
-separate compatibility work.
+selector, queries no CCSIDR itself, performs no maintenance, and infers no
+topology or destination policy. Separate default-cache-geometry validation
+queries both complete eight-entry arrays twice before backend or VM creation
+and compares them only through fixed messages without logging raw values. It
+also creates/runs no vCPU, touches no live selector, issues no live CCSIDR read
+or ISB, and performs no maintenance. The selector is not cache topology: the
+default feature triple and geometry are independent fresh-configuration
+queries, not one atomic compatibility manifest.
 The SIMD getter uses an explicitly 16-byte-aligned HVF output value; the
 separate SME PSTATE observation determines whether streaming mode is active,
 where its Q values alias only the low 128 bits of Z registers. Neither value
@@ -2215,12 +2228,14 @@ macOS design work instead of direct implementation:
   separate value whose `Debug` output redacts both software context numbers.
   A separate pre-VM query captures raw default-configuration CTR_EL0,
   CLIDR_EL1, and DCZID_EL0 feature metadata without changing vCPU creation.
+  Another independent pre-VM query captures all eight raw data/unified and all
+  eight instruction CCSIDR_EL1 values from a fresh default configuration.
   Newer beta-only IDs, broader configuration-time feature manifests, feature
   masking, destination policy, maximum SME streaming vector length, streaming
   Z/P/ZA/ZT0 data,
   table and vector memory, optional CPACR and pointer-authentication feature
-  validation, cache CCSIDR geometry and feature interpretation, selector validation and
-  maintenance, breakpoint and watchpoint control
+  validation, cache feature/geometry interpretation and masks, selector
+  validation and maintenance, breakpoint and watchpoint control
   validation, debug-trap policy validation/setters, protected key persistence,
   and restore ordering remain outside these subsets.
   The runner can capture raw CNTKCTL_EL1, CNTP_CTL_EL0, CNTP_CVAL_EL0, and
