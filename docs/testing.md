@@ -92,6 +92,23 @@ rejection, while late truncation/growth tests prove the final trailer/EOF guard
 and that partial anonymous memory never escapes. Run the focused module with
 `cargo test -p bangbang-runtime snapshot_memory --locked`.
 
+Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
+record and its exact nested binding/envelope composition. They must reject every
+length, schema, kind, flags, reserved, nested-binding, outer-envelope, and
+trailing-data failure without leaking identities, checksums, paths, or bytes.
+Artifact tests run on macOS and cover same- and cross-directory success,
+owner-only staging modes, exact and opened-parent aliases, case-equivalent volume
+behavior, pre-existing regular/directory/FIFO/socket/symlink entries, missing and
+unwritable parents, every ordered write/sync/publish failure, late final-name
+collisions, observed staging replacement, cleanup failure precedence,
+memory-only orphans, committed-but-durability-uncertain state, state-first
+loading, bounded/nonregular inputs, swapped/truncated/extended/corrupt pairs,
+diagnostic redaction, and coordinated multiprocess contention with exactly one
+durable winner. Failure hooks may prove an observed replacement is refused, but
+must not claim atomic source identity against a hostile directory writer. Run
+the focused surface with
+`cargo test -p bangbang-runtime snapshot_artifact --locked`.
+
 For process, socket, and multi-bangbang behavior, cover unique resource names,
 stale socket handling, shutdown cleanup, replacement races, and concurrent runs
 where practical.

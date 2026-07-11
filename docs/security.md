@@ -264,8 +264,33 @@ is resource-specific:
   and `ErrorKind`; image IDs, checksums, guest bytes, and host paths stay out of
   diagnostics. The random image ID and CRC detect mismatched or accidentally
   corrupt pairs but do not authenticate an actor able to rewrite both files.
-  These helpers open, truncate, flush, sync, publish, and clean no path; future
-  publication must add no-clobber ownership and replacement-safe cleanup.
+  The handle-level codec itself opens no path. The internal artifact layer
+  composes it with a minimal bounded commit record, but public snapshot paths do
+  not invoke that layer.
+- Internal native snapshot publication treats both final paths and all existing
+  directory entries as untrusted. It opens each parent once, anchors later
+  operations to that descriptor, rejects exact aliases, preflights final names
+  without following them, and creates unreported 128-bit-random staging names
+  with exclusive `0600` regular files. Both private contents and file barriers
+  complete before memory is published; memory uses `RENAME_EXCL` and a directory
+  barrier before state is published the same way as the only commit marker.
+  Existing files, directories, FIFOs, sockets, and symlinks are never opened for
+  write, truncated, or replaced. A failure after memory publication leaves a
+  typed orphan rather than unlinking a final name. A state-directory sync error
+  after state rename is a committed, durability-uncertain result and is not safe
+  to retry under unchanged names.
+- Destination directories are trusted security boundaries. Darwin has no
+  public rename or unlink conditioned on the identity of an already-open file,
+  so the immediate staging inode check is best-effort and has a residual race.
+  Random names and `0600` protect against accidental collision and actors
+  lacking directory authority; they do not protect against an uncooperative
+  writer with mutation rights in that directory. Such a writer can also replace
+  final names after publication. `RENAME_EXCL` authoritatively prevents this
+  operation from overwriting a target present at the rename instant. CRCs and
+  image IDs detect accidental corruption or mismatched pairs but do not
+  authenticate either artifact. Diagnostics retain only typed stages, byte
+  counts, and `ErrorKind`; paths, staging names, IDs, checksums, state bytes, and
+  guest bytes remain redacted.
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
   ACTLR_EL1/CPACR_EL1 execution controls, raw CSSELR_EL1 cache selection, raw
