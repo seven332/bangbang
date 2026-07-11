@@ -112,6 +112,13 @@ and compare it with fixed failure messages, and repeat the round trip without
 guest execution or logging register values. A failed restore is
 nontransactional; tests and callers must retry the complete retained value or
 discard the vCPU before any run.
+Core system-register restore tests must likewise verify
+`SP_EL0`/`SP_EL1`/`ELR_EL1`/`SPSR_EL1` capture-order writes, all four failure
+positions, reusable system-register error context, complete retry, 24-way
+admission, and lifecycle cleanup. Signed coverage must extend the known-value
+guest-written capture with repeated same-vCPU restore/recapture after the HVC
+exit, use fixed failure messages that do not format raw state, and never run the
+guest after restore or claim the values are portable or validated.
 Translation-register signed tests must leave `SCTLR_EL1.M` clear, write back
 the original SCTLR value, and only then write inert TTBR/TCR/attribute/context
 values before HVC. AMAIR is implementation-defined: current Apple Silicon reads
