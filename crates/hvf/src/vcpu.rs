@@ -440,9 +440,10 @@ impl HvfArm64VcpuExecutionControlRegisterState {
 ///
 /// `CSSELR_EL1` selects the cache level and type observed by a subsequent
 /// `CCSIDR_EL1` read; it is not cache topology itself. Reset and unsupported
-/// selector encodings can be architecturally unknown. This getter-only value
-/// does not validate the selector, capture cache feature/size metadata, issue
-/// synchronization or maintenance, or provide a portable restore policy.
+/// selector encodings can be architecturally unknown. This complete typed value
+/// can be reapplied through an owner-thread primitive, but does not validate the
+/// selector, capture an atomic cache feature/size manifest, issue synchronization
+/// or maintenance, or provide a portable restore policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuCacheSelectionRegisterState {
     csselr_el1: u64,
@@ -2453,6 +2454,15 @@ pub(crate) fn capture_arm64_vcpu_cache_selection_register_state_with(
     Ok(HvfArm64VcpuCacheSelectionRegisterState::new(csselr_el1))
 }
 
+pub(crate) fn restore_arm64_vcpu_cache_selection_register_state_with(
+    state: &HvfArm64VcpuCacheSelectionRegisterState,
+    mut set_system_register: impl FnMut(HvfSystemRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+    set_system_register(HvfSystemRegister::CSSELR_EL1, state.csselr_el1()).map_err(|source| {
+        HvfArm64VcpuSystemRegisterRestoreError::new(HvfSystemRegister::CSSELR_EL1, 0, source)
+    })
+}
+
 pub(crate) fn capture_arm64_vcpu_breakpoint_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuBreakpointRegisterState, BackendError> {
@@ -3128,6 +3138,7 @@ mod tests {
         capture_arm64_vcpu_translation_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with,
         capture_arm64_vcpu_watchpoint_register_state_with, configure_arm64_boot_registers_with,
+        restore_arm64_vcpu_cache_selection_register_state_with,
         restore_arm64_vcpu_core_system_register_state_with,
         restore_arm64_vcpu_exception_register_state_with,
         restore_arm64_vcpu_execution_control_register_state_with,
@@ -4282,6 +4293,72 @@ mod tests {
             0xca5e_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_CSSELR_EL1)
         );
         assert_eq!(HvfSystemRegister::CSSELR_EL1.raw(), 0xd000);
+    }
+
+    fn cache_selection_restore_test_state() -> super::HvfArm64VcpuCacheSelectionRegisterState {
+        super::HvfArm64VcpuCacheSelectionRegisterState::new(0x0123_4567_89ab_cdef)
+    }
+
+    #[test]
+    fn restores_arm64_cache_selection_register_state() {
+        let state = cache_selection_restore_test_state();
+        let mut writes = Vec::new();
+
+        restore_arm64_vcpu_cache_selection_register_state_with(&state, |register, value| {
+            writes.push((register, value));
+            Ok(())
+        })
+        .expect("cache-selection restore should succeed");
+
+        assert_eq!(
+            writes,
+            [(HvfSystemRegister::CSSELR_EL1, state.csselr_el1())]
+        );
+    }
+
+    #[test]
+    fn arm64_cache_selection_register_restore_failure_can_retry() {
+        use std::error::Error as _;
+
+        let state = cache_selection_restore_test_state();
+        let fail_next = Cell::new(true);
+        let writes = RefCell::new(Vec::new());
+        let write_system_register = |register, value| {
+            writes.borrow_mut().push((register, value));
+            if fail_next.replace(false) {
+                Err(BackendError::InvalidState(
+                    "fake cache-selection register restore failed",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let error =
+            restore_arm64_vcpu_cache_selection_register_state_with(&state, &write_system_register)
+                .expect_err("injected cache-selection write should fail");
+        assert_eq!(error.failed_register(), HvfSystemRegister::CSSELR_EL1);
+        assert_eq!(error.completed_writes(), 0);
+        assert_eq!(
+            error.source().map(ToString::to_string),
+            Some("invalid backend state: fake cache-selection register restore failed".to_string())
+        );
+        assert_eq!(
+            error.to_string(),
+            "failed to restore arm64 system register id 53248 after 0 successful writes: invalid backend state: fake cache-selection register restore failed"
+        );
+        assert_eq!(
+            *writes.borrow(),
+            [(HvfSystemRegister::CSSELR_EL1, state.csselr_el1())]
+        );
+
+        writes.borrow_mut().clear();
+        restore_arm64_vcpu_cache_selection_register_state_with(&state, &write_system_register)
+            .expect("complete cache-selection restore retry should succeed");
+        assert_eq!(
+            *writes.borrow(),
+            [(HvfSystemRegister::CSSELR_EL1, state.csselr_el1())]
+        );
     }
 
     #[test]
