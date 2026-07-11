@@ -106,6 +106,16 @@ messages, then clear and recapture both levels before shutdown. No guest run may
 intervene because HVF would clear the injection levels and invalidate the raw
 round trip. Equality proves neither GIC/device composition, delivery/EOI,
 automatic per-run reassertion, persistence, nor portable snapshot restore.
+Opaque GIC device-state restore tests must verify exact non-null pointer and
+`usize`/`size_t` propagation, empty-input rejection without a setter call,
+unchanged HVF error provenance, the sticky never-run gate, generalized
+interrupt-operation conflicts, caller abandonment, closed channels, queued
+destruction, panic, and exactly-once admission cleanup. A setter failure has no
+documented rollback or retry guarantee; tests may prove cleanup and shutdown but
+must not execute the VM afterwards. Signed coverage must create the GIC and vCPU,
+capture a non-empty original blob, reapply that exact value before any run, and
+then destroy the VM without parsing, comparing, mutating, or logging opaque
+bytes. Both prepared boot-session forms must cover the same pre-run delegate.
 GIC ICC signed tests must create the GIC before the vCPU, write architecturally
 writable EL1 ICC values from signed guest code, and assert only fields or masked
 bits whose readback is stable; read-only active-priority values remain host-

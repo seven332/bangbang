@@ -2018,20 +2018,27 @@ sizing, fallible allocation, data copy, and retained-object release run on the
 serialized owner loop. The command shares generalized interrupt admission with
 CPU pending and GIC PPI operations, and the current single-vCPU runner enforces
 Apple's stopped-VM condition against `hv_vcpu_run`. Both boot-session forms
-expose the redacted immutable value. The bytes are not parsed or persisted,
-have no restore validation or bangbang/Firecracker schema, and can still become
-incompatible after a host software update. The command does not quiesce
-device-side SPI producers. The process snapshot barrier invokes none of these
-captures.
+expose the redacted immutable value and a separate owner-thread setter that
+reapplies its exact non-empty pointer/`size_t` before any run has ever been
+enqueued. Setter availability is loaded independently from capture, and every
+HVF failure retains its original status without exposing bytes. Apple can still
+reject an older opaque format after a host software update and publishes no
+transactional rollback guarantee, so failure requires destination discard or a
+future explicit recovery policy before execution. The bytes are not parsed or
+persisted and have no bangbang/Firecracker schema. The apply command releases
+its interrupt admission before returning, does not quiesce device-side SPI
+producers, and is not a lease across later ICC/timer/pending/vCPU restore. The
+process snapshot barrier invokes neither capture nor apply.
 
 A companion failure-atomic command captures the ten EL1 ICC CPU-interface
 registers exposed by Hypervisor.framework: PMR, BPR0, AP0R0, AP1R0, RPR, BPR1,
 CTLR, SRE, IGRPEN0, and IGRPEN1. All reads execute on the vCPU owner thread and
 share generalized interrupt admission with CPU pending, GIC PPI, and opaque GIC
 device-state operations. Both boot-session forms expose the fixed typed value.
-It is per-vCPU and separate from the VM-scoped opaque blob; neither value is
-persisted or restored. The process snapshot barrier invokes neither command,
-and `ICC_SRE_EL2`, ICH/ICV, compatible restore ordering, and multi-vCPU
+It is per-vCPU and separate from the VM-scoped opaque blob. The opaque blob has
+the isolated pre-run apply above, but ICC remains capture-only; neither value is
+persisted. The process snapshot barrier invokes none of these commands, and
+`ICC_SRE_EL2`, ICH/ICV, compatible composite ordering, and multi-vCPU
 association remain future work.
 
 By themselves, these commands do not yet form a continuous guest run loop. The
@@ -2446,7 +2453,8 @@ macOS design work instead of direct implementation:
   mask, raw offset, raw control, and raw CVAL on that owning thread and can
   capture those fields through one serialized command. It can
   also capture Hypervisor.framework's stable, versioned opaque GIC device blob
-  except CPU system registers while the current single-vCPU runner is stopped.
+  except CPU system registers while the current single-vCPU runner is stopped,
+  and reapply that complete value through a separate never-run owner command.
   A companion owner-thread command captures all ten EL1 ICC CPU-interface
   registers exposed by the current SDK as a separate per-vCPU value.
   None of these subsets is a complete or portable restore model. The

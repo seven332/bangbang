@@ -14,7 +14,8 @@ use crate::exit::{
 };
 use crate::gic::{
     HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicIccRegisterReader,
-    HvfGicPpiPendingWriter, HvfGicStateSnapshotter, validate_gic_ppi_pending_intid,
+    HvfGicPpiPendingWriter, HvfGicStateRestorer, HvfGicStateSnapshotter,
+    validate_gic_ppi_pending_intid,
 };
 use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
@@ -578,6 +579,11 @@ enum RunnerCommand {
         admission: InFlightInterruptOperation,
         response_sender: mpsc::Sender<Result<HvfGicDeviceState, HvfVcpuRunnerError>>,
     },
+    RestoreGicDeviceState {
+        admission: InFlightInterruptOperation,
+        state: HvfGicDeviceState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
     CaptureArm64GicIccRegisterState {
         admission: InFlightInterruptOperation,
         response_sender: mpsc::Sender<Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError>>,
@@ -1078,6 +1084,11 @@ trait RunnerVcpu {
             "vCPU does not support GIC device-state capture",
         ))
     }
+    fn restore_gic_device_state(&mut self, _state: &HvfGicDeviceState) -> Result<(), HvfGicError> {
+        Err(HvfGicError::InvalidState(
+            "vCPU does not support GIC device-state restore",
+        ))
+    }
     fn capture_arm64_gic_icc_register_state(
         &mut self,
     ) -> Result<HvfArm64GicIccRegisterState, HvfGicError> {
@@ -1092,6 +1103,7 @@ struct RealRunnerVcpu {
     owner: HvfVcpuOwner,
     gic_ppi_pending_writer: Option<HvfGicPpiPendingWriter>,
     gic_state_snapshotter: Option<HvfGicStateSnapshotter>,
+    gic_state_restorer: Option<HvfGicStateRestorer>,
     gic_icc_register_reader: Option<HvfGicIccRegisterReader>,
 }
 
@@ -1107,6 +1119,7 @@ impl RealRunnerVcpu {
             owner,
             gic_ppi_pending_writer: None,
             gic_state_snapshotter: None,
+            gic_state_restorer: None,
             gic_icc_register_reader: None,
         })
     }
@@ -1295,6 +1308,20 @@ impl RunnerVcpu for RealRunnerVcpu {
             ))?;
 
         snapshotter.capture()
+    }
+
+    fn restore_gic_device_state(&mut self, state: &HvfGicDeviceState) -> Result<(), HvfGicError> {
+        if self.gic_state_restorer.is_none() {
+            self.gic_state_restorer = Some(HvfGicStateRestorer::new()?);
+        }
+        let restorer = self
+            .gic_state_restorer
+            .as_ref()
+            .ok_or(HvfGicError::InvalidState(
+                "GIC state restorer was not initialized",
+            ))?;
+
+        restorer.restore(state)
     }
 
     fn capture_arm64_gic_icc_register_state(
@@ -2213,6 +2240,31 @@ impl<'vm> HvfVcpuRunner<'vm> {
     pub fn capture_gic_device_state(&self) -> Result<HvfGicDeviceState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_gic_device_state_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Restore Hypervisor.framework's complete opaque GIC device state.
+    ///
+    /// The destination GIC and this current single vCPU must already exist, and
+    /// no run command may ever have been enqueued. The command is serialized
+    /// with runner-managed CPU/GIC interrupt operations, but releases that
+    /// admission before returning; later ICC, timer, pending-interrupt, and
+    /// vCPU state restore therefore require a future wider no-run lease.
+    ///
+    /// The opaque bytes are copied into the owner command and never formatted.
+    /// Hypervisor.framework may reject a value after an incompatible host
+    /// update. The setter is nontransactional at this boundary, so after any
+    /// failure callers must discard the VM or follow a future explicit recovery
+    /// policy rather than execute it.
+    pub fn restore_gic_device_state(
+        &self,
+        state: &HvfGicDeviceState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_gic_device_state_restore(state, response_sender)?;
 
         response_receiver
             .recv()
@@ -3443,7 +3495,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     ) -> Result<InFlightInterruptOperation, HvfVcpuRunnerError> {
         self.start_interrupt_operation(
-            || validate_gic_ppi_pending_intid(intid).map_err(HvfVcpuRunnerError::Gic),
+            |_| validate_gic_ppi_pending_intid(intid).map_err(HvfVcpuRunnerError::Gic),
             |response_sender| RunnerCommand::SetGicPpiPending {
                 intid,
                 pending,
@@ -3459,7 +3511,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         response_sender: mpsc::Sender<Result<bool, HvfVcpuRunnerError>>,
     ) -> Result<InFlightInterruptOperation, HvfVcpuRunnerError> {
         self.start_interrupt_operation(
-            || Ok(()),
+            |_| Ok(()),
             |response_sender| RunnerCommand::GetPendingInterrupt {
                 interrupt_type,
                 response_sender,
@@ -3475,7 +3527,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     ) -> Result<InFlightInterruptOperation, HvfVcpuRunnerError> {
         self.start_interrupt_operation(
-            || Ok(()),
+            |_| Ok(()),
             |response_sender| RunnerCommand::SetPendingInterrupt {
                 interrupt_type,
                 pending,
@@ -3492,7 +3544,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
         let admission = {
-            let _state = self.reserve_interrupt_operation(|| Ok(()))?;
+            let _state = self.reserve_interrupt_operation(|_| Ok(()))?;
             InFlightInterruptOperation::new(&self.state)
         };
 
@@ -3510,7 +3562,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
         let admission = {
-            let _state = self.reserve_interrupt_operation(|| Ok(()))?;
+            let _state = self.reserve_interrupt_operation(|_| Ok(()))?;
             InFlightInterruptOperation::new(&self.state)
         };
 
@@ -3528,7 +3580,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         response_sender: mpsc::Sender<Result<HvfGicDeviceState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
         let admission = {
-            let _state = self.reserve_interrupt_operation(|| Ok(()))?;
+            let _state = self.reserve_interrupt_operation(|_| Ok(()))?;
             InFlightInterruptOperation::new(&self.state)
         };
 
@@ -3540,12 +3592,42 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
     }
 
+    fn start_gic_device_state_restore(
+        &self,
+        state: &HvfGicDeviceState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        // Clone before reserving runner state so allocation unwind cannot leave
+        // interrupt admission set without a command-owned guard.
+        let state = state.clone();
+        let admission = {
+            let _state = self.reserve_interrupt_operation(|state| {
+                if state.run_started {
+                    Err(HvfVcpuRunnerError::InvalidState(
+                        RUN_ALREADY_STARTED_MESSAGE,
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
+            InFlightInterruptOperation::new(&self.state)
+        };
+
+        self.command_sender
+            .send(RunnerCommand::RestoreGicDeviceState {
+                admission,
+                state,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
+    }
+
     fn start_arm64_gic_icc_register_state_capture(
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
         let admission = {
-            let _state = self.reserve_interrupt_operation(|| Ok(()))?;
+            let _state = self.reserve_interrupt_operation(|_| Ok(()))?;
             InFlightInterruptOperation::new(&self.state)
         };
 
@@ -3559,7 +3641,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
 
     fn start_interrupt_operation<T>(
         &self,
-        validate: impl FnOnce() -> Result<(), HvfVcpuRunnerError>,
+        validate: impl FnOnce(&RunnerHandleState) -> Result<(), HvfVcpuRunnerError>,
         command: impl FnOnce(mpsc::Sender<Result<T, HvfVcpuRunnerError>>) -> RunnerCommand,
         response_sender: mpsc::Sender<Result<T, HvfVcpuRunnerError>>,
     ) -> Result<InFlightInterruptOperation, HvfVcpuRunnerError> {
@@ -3576,7 +3658,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
 
     fn reserve_interrupt_operation(
         &self,
-        validate: impl FnOnce() -> Result<(), HvfVcpuRunnerError>,
+        validate: impl FnOnce(&RunnerHandleState) -> Result<(), HvfVcpuRunnerError>,
     ) -> Result<MutexGuard<'_, RunnerHandleState>, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
@@ -3620,7 +3702,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
-        validate()?;
+        validate(&state)?;
 
         state.interrupt_operation_in_flight = true;
         Ok(state)
@@ -4687,6 +4769,20 @@ fn run_runner_thread<C, V>(
                 // State-object creation, sizing, and data copy have finished.
                 // Restore admission before response send so receiver failure
                 // is not part of the capture lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::RestoreGicDeviceState {
+                mut admission,
+                state,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .restore_gic_device_state(&state)
+                    .map_err(HvfVcpuRunnerError::Gic);
+                // The single opaque-state apply has finished or failed.
+                // Restore admission before responding so receiver failure is
+                // not part of the setter lifetime.
                 admission.release();
                 let _ = response_sender.send(result);
             }
@@ -5905,6 +6001,27 @@ mod tests {
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<Vec<u8>, HvfGicError>>,
+        mpsc::Receiver<()>,
+    );
+
+    struct GicDeviceStateRestoreRecordingVcpu {
+        fail_restore: bool,
+        fail_run: bool,
+        restore_sender: mpsc::Sender<HvfGicDeviceState>,
+    }
+
+    struct BlockingGicDeviceStateRestoreVcpu {
+        entered_restore_sender: mpsc::Sender<()>,
+        release_restore_receiver: mpsc::Receiver<Result<(), HvfGicError>>,
+        barrier_sender: Option<mpsc::Sender<()>>,
+    }
+
+    struct PanicOnGicDeviceStateRestoreVcpu;
+
+    type BlockingGicDeviceStateRestoreRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), HvfGicError>>,
         mpsc::Receiver<()>,
     );
 
@@ -11665,6 +11782,141 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for GicDeviceStateRestoreRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            if self.fail_run {
+                Err(BackendError::InvalidState("fake run failed"))
+            } else {
+                Ok(HvfVcpuExit::Canceled)
+            }
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn restore_gic_device_state(
+            &mut self,
+            state: &HvfGicDeviceState,
+        ) -> Result<(), HvfGicError> {
+            self.restore_sender
+                .send(state.clone())
+                .map_err(|_| HvfGicError::InvalidState("fake GIC restore receiver closed"))?;
+            if self.fail_restore {
+                Err(HvfGicError::InvalidState(
+                    "fake GIC device-state restore failed",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingGicDeviceStateRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn restore_gic_device_state(
+            &mut self,
+            _state: &HvfGicDeviceState,
+        ) -> Result<(), HvfGicError> {
+            self.entered_restore_sender
+                .send(())
+                .map_err(|_| HvfGicError::InvalidState("fake GIC restore entry receiver closed"))?;
+            self.release_restore_receiver
+                .recv()
+                .map_err(|_| HvfGicError::InvalidState("fake GIC restore release sender closed"))?
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            if let Some(sender) = &self.barrier_sender {
+                sender
+                    .send(())
+                    .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            }
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnGicDeviceStateRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn restore_gic_device_state(
+            &mut self,
+            _state: &HvfGicDeviceState,
+        ) -> Result<(), HvfGicError> {
+            panic!("fake GIC device-state restore panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for GicIccRegisterStateRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -13276,6 +13528,10 @@ mod tests {
         HvfArm64VcpuPendingInterruptState::new(true, false)
     }
 
+    fn gic_device_state_restore_test_state() -> HvfGicDeviceState {
+        HvfGicDeviceState::new(GIC_DEVICE_STATE_TEST_BYTES.to_vec())
+    }
+
     fn assert_interrupt_operations_rejected(
         runner: &HvfVcpuRunner<'_>,
         expected: HvfVcpuRunnerError,
@@ -13305,6 +13561,10 @@ mod tests {
             Err(expected.clone())
         );
         assert_eq!(runner.capture_gic_device_state(), Err(expected.clone()));
+        assert_eq!(
+            runner.restore_gic_device_state(&gic_device_state_restore_test_state()),
+            Err(expected.clone())
+        );
         assert_eq!(
             runner.capture_arm64_gic_icc_register_state(),
             Err(expected.clone())
@@ -15253,6 +15513,49 @@ mod tests {
                 .expect("runner should be created"),
             entered_capture_receiver,
             release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
+    fn start_gic_device_state_restore_recording_runner(
+        fail_restore: bool,
+        fail_run: bool,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<HvfGicDeviceState>) {
+        let (restore_sender, restore_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(GicDeviceStateRestoreRecordingVcpu {
+                fail_restore,
+                fail_run,
+                restore_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            restore_receiver,
+        )
+    }
+
+    fn start_blocking_gic_device_state_restore_runner() -> BlockingGicDeviceStateRestoreRunner {
+        let (entered_restore_sender, entered_restore_receiver) = mpsc::channel();
+        let (release_restore_sender, release_restore_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingGicDeviceStateRestoreVcpu {
+                entered_restore_sender,
+                release_restore_receiver,
+                barrier_sender: Some(barrier_sender),
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_restore_receiver,
+            release_restore_sender,
             barrier_receiver,
         )
     }
@@ -25745,6 +26048,286 @@ mod tests {
 
         assert_eq!(
             runner.capture_gic_device_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn restores_opaque_gic_device_state_on_runner_thread() {
+        let (runner, restore_receiver) =
+            start_gic_device_state_restore_recording_runner(false, false);
+        let state = gic_device_state_restore_test_state();
+        let original_pointer = state.as_bytes().as_ptr();
+
+        runner
+            .restore_gic_device_state(&state)
+            .expect("GIC device-state restore should succeed");
+
+        let restored = restore_receiver
+            .recv()
+            .expect("fake vCPU should receive GIC device state");
+        assert_eq!(restored, state);
+        assert_ne!(restored.as_bytes().as_ptr(), original_pointer);
+        assert_eq!(state.as_bytes().as_ptr(), original_pointer);
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_gic_device_state_restore_releases_admission_without_running() {
+        let (runner, restore_receiver) =
+            start_gic_device_state_restore_recording_runner(true, false);
+        let state = gic_device_state_restore_test_state();
+
+        assert_eq!(
+            runner.restore_gic_device_state(&state),
+            Err(HvfVcpuRunnerError::Gic(HvfGicError::InvalidState(
+                "fake GIC device-state restore failed"
+            )))
+        );
+        assert_eq!(
+            restore_receiver
+                .recv()
+                .expect("fake vCPU should receive GIC device state"),
+            state
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn gic_device_state_restore_is_rejected_after_completed_run() {
+        let (runner, restore_receiver) =
+            start_gic_device_state_restore_recording_runner(false, false);
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        assert_eq!(
+            runner.restore_gic_device_state(&gic_device_state_restore_test_state()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUN_ALREADY_STARTED_MESSAGE
+            ))
+        );
+        assert!(restore_receiver.try_recv().is_err());
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn gic_device_state_restore_is_rejected_after_failed_run() {
+        let (runner, restore_receiver) =
+            start_gic_device_state_restore_recording_runner(false, true);
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake run failed"
+            )))
+        );
+        assert_eq!(
+            runner.restore_gic_device_state(&gic_device_state_restore_test_state()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUN_ALREADY_STARTED_MESSAGE
+            ))
+        );
+        assert!(restore_receiver.try_recv().is_err());
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn commands_during_gic_device_state_restore_are_rejected_without_queueing() {
+        let (runner, entered_restore_receiver, release_restore_sender, _barrier_receiver) =
+            start_blocking_gic_device_state_restore_runner();
+        let state = gic_device_state_restore_test_state();
+
+        thread::scope(|scope| {
+            let restore = scope.spawn(|| runner.restore_gic_device_state(&state));
+            entered_restore_receiver
+                .recv()
+                .expect("runner should enter fake GIC device-state restore");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_core_register_operations_rejected(&runner, expected.clone());
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_restore_sender
+                .send(Ok(()))
+                .expect("GIC device-state restore release should be sent");
+            restore
+                .join()
+                .expect("GIC device-state restore thread should join")
+                .expect("GIC device-state restore should succeed");
+        });
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_gic_device_state_restore_admitted_until_command_finishes() {
+        let (runner, entered_restore_receiver, release_restore_sender, barrier_receiver) =
+            start_blocking_gic_device_state_restore_runner();
+        let state = gic_device_state_restore_test_state();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_gic_device_state_restore(&state, response_sender)
+                .expect("GIC device-state restore should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_restore_receiver
+            .recv()
+            .expect("runner should enter fake GIC device-state restore");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind restore");
+        release_restore_sender
+            .send(Ok(()))
+            .expect("GIC device-state restore release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after restore");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn gic_device_state_restore_send_failure_releases_admission() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+
+        assert!(run_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.restore_gic_device_state(&gic_device_state_restore_test_state()),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_gic_device_state_restore_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let state = gic_device_state_restore_test_state();
+        let (restore_response_sender, restore_response_receiver) = mpsc::channel();
+        runner
+            .start_gic_device_state_restore(&state, restore_response_sender)
+            .expect("GIC device-state restore should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(restore_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn gic_device_state_restore_panic_releases_admission() {
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnGicDeviceStateRestoreVcpu));
+
+        assert_eq!(
+            runner.restore_gic_device_state(&gic_device_state_restore_test_state()),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))
