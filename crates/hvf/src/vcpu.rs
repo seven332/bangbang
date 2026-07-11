@@ -412,6 +412,45 @@ impl HvfArm64VcpuSimdFpState {
     }
 }
 
+/// Detached raw physical-timer state captured from one arm64 vCPU.
+///
+/// Hypervisor.framework exposes the CNTP registers on macOS 15 and newer only
+/// when the VM creates a GIC before its vCPU. `CNTP_CTL_EL0` includes derived
+/// ISTATUS, while `CNTP_CVAL_EL0` is an absolute comparator against a continuing
+/// physical count. These raw values have no portable elapsed-time adjustment,
+/// writable-bit, interrupt-delivery, or restore policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuPhysicalTimerState {
+    cntkctl_el1: u64,
+    cntp_ctl_el0: u64,
+    cntp_cval_el0: u64,
+}
+
+impl HvfArm64VcpuPhysicalTimerState {
+    pub(crate) const fn new(cntkctl_el1: u64, cntp_ctl_el0: u64, cntp_cval_el0: u64) -> Self {
+        Self {
+            cntkctl_el1,
+            cntp_ctl_el0,
+            cntp_cval_el0,
+        }
+    }
+
+    /// Return the raw `CNTKCTL_EL1` value.
+    pub const fn cntkctl_el1(self) -> u64 {
+        self.cntkctl_el1
+    }
+
+    /// Return the raw `CNTP_CTL_EL0` value, including derived ISTATUS.
+    pub const fn cntp_ctl_el0(self) -> u64 {
+        self.cntp_ctl_el0
+    }
+
+    /// Return the raw absolute `CNTP_CVAL_EL0` compare value.
+    pub const fn cntp_cval_el0(self) -> u64 {
+        self.cntp_cval_el0
+    }
+}
+
 /// Detached raw virtual-timer state captured from one arm64 vCPU.
 ///
 /// The offset is the Hypervisor.framework value used in its
@@ -532,8 +571,11 @@ impl HvfSystemRegister {
     pub const VBAR_EL1: Self = Self(crate::ffi::HV_SYS_REG_VBAR_EL1);
     pub const CONTEXTIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CONTEXTIDR_EL1);
     pub const TPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL1);
+    pub const CNTKCTL_EL1: Self = Self(crate::ffi::HV_SYS_REG_CNTKCTL_EL1);
     pub const TPIDR_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL0);
     pub const TPIDRRO_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDRRO_EL0);
+    pub const CNTP_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_CTL_EL0);
+    pub const CNTP_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_CVAL_EL0);
     pub const CNTV_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CTL_EL0);
     pub const CNTV_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CVAL_EL0);
     pub const SP_EL1: Self = Self(crate::ffi::HV_SYS_REG_SP_EL1);
@@ -1011,6 +1053,20 @@ pub(crate) fn capture_arm64_vcpu_thread_context_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_physical_timer_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuPhysicalTimerState, BackendError> {
+    let cntkctl_el1 = get_system_register(HvfSystemRegister::CNTKCTL_EL1)?;
+    let cntp_ctl_el0 = get_system_register(HvfSystemRegister::CNTP_CTL_EL0)?;
+    let cntp_cval_el0 = get_system_register(HvfSystemRegister::CNTP_CVAL_EL0)?;
+
+    Ok(HvfArm64VcpuPhysicalTimerState::new(
+        cntkctl_el1,
+        cntp_ctl_el0,
+        cntp_cval_el0,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_pending_interrupt_state_with(
     mut get_pending_interrupt: impl FnMut(HvfInterruptType) -> Result<bool, BackendError>,
 ) -> Result<HvfArm64VcpuPendingInterruptState, BackendError> {
@@ -1078,7 +1134,8 @@ mod tests {
         capture_arm64_vcpu_exception_register_state_with,
         capture_arm64_vcpu_execution_control_register_state_with,
         capture_arm64_vcpu_general_register_state_with,
-        capture_arm64_vcpu_pending_interrupt_state_with, capture_arm64_vcpu_simd_fp_state_with,
+        capture_arm64_vcpu_pending_interrupt_state_with,
+        capture_arm64_vcpu_physical_timer_state_with, capture_arm64_vcpu_simd_fp_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
         capture_arm64_vcpu_translation_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with, configure_arm64_boot_registers_with,
@@ -1993,6 +2050,86 @@ mod tests {
             assert_eq!(state.fpcr(), u64::from(HvfRegister::FPCR.raw()));
             assert_eq!(state.fpsr(), u64::from(HvfRegister::FPSR.raw()));
             assert_eq!(*reads.borrow(), expected_reads);
+        }
+    }
+
+    #[test]
+    fn captures_arm64_physical_timer_state_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_physical_timer_state_with(|register| {
+            reads.push(register);
+            Ok(0xcafe_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("physical-timer capture should succeed");
+
+        assert_eq!(
+            reads,
+            [
+                HvfSystemRegister::CNTKCTL_EL1,
+                HvfSystemRegister::CNTP_CTL_EL0,
+                HvfSystemRegister::CNTP_CVAL_EL0,
+            ]
+        );
+        assert_eq!(
+            state.cntkctl_el1(),
+            0xcafe_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_CNTKCTL_EL1)
+        );
+        assert_eq!(
+            state.cntp_ctl_el0(),
+            0xcafe_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_CNTP_CTL_EL0)
+        );
+        assert_eq!(
+            state.cntp_cval_el0(),
+            0xcafe_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_CNTP_CVAL_EL0)
+        );
+        assert_eq!(HvfSystemRegister::CNTKCTL_EL1.raw(), 0xc708);
+        assert_eq!(HvfSystemRegister::CNTP_CTL_EL0.raw(), 0xdf11);
+        assert_eq!(HvfSystemRegister::CNTP_CVAL_EL0.raw(), 0xdf12);
+    }
+
+    #[test]
+    fn physical_timer_capture_stops_after_each_error_and_can_retry() {
+        let registers = [
+            HvfSystemRegister::CNTKCTL_EL1,
+            HvfSystemRegister::CNTP_CTL_EL0,
+            HvfSystemRegister::CNTP_CVAL_EL0,
+        ];
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake physical-timer register read failed",
+                    ))
+                } else {
+                    Ok(u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_physical_timer_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake physical-timer register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_physical_timer_state_with(&read_system_register)
+                .expect("physical-timer capture retry should succeed");
+            assert_eq!(
+                state.cntkctl_el1(),
+                u64::from(HvfSystemRegister::CNTKCTL_EL1.raw())
+            );
+            assert_eq!(
+                state.cntp_cval_el0(),
+                u64::from(HvfSystemRegister::CNTP_CVAL_EL0.raw())
+            );
+            assert_eq!(*reads.borrow(), registers);
         }
     }
 
