@@ -1668,7 +1668,9 @@ Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
 owner-thread restore that writes the same three fields in capture order under
 the reusable system-register partial-write contract. A fifth reads raw `SCTLR_EL1`,
 `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1`, `MAIR_EL1`, `AMAIR_EL1`, and
-`CONTEXTIDR_EL1`. A sixth reads raw `AFSR0_EL1`, `AFSR1_EL1`, `ESR_EL1`,
+`CONTEXTIDR_EL1`. Its typed value has a paired owner-thread restore that writes
+the same seven fields in capture order under the reusable system-register
+partial-write contract. A sixth reads raw `AFSR0_EL1`, `AFSR1_EL1`, `ESR_EL1`,
 `FAR_EL1`, `PAR_EL1`, and `VBAR_EL1`. Its typed value has a paired owner-thread
 restore that writes the same six fields in capture order and reuses the typed
 system-register failure with exact partial progress. A seventh reads raw
@@ -1715,10 +1717,10 @@ requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
 commands plus the general-, core-system-, exception-register, execution-
-control, and thread-context restore operations form a twenty-seven-operation,
+control, thread-context, and translation restore operations form a twenty-eight-operation,
 command-owned core-register admission domain. Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose all five restores
+setter failure. Borrowed and owned HVF boot sessions expose all six restores
 and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
@@ -1821,11 +1823,13 @@ The separate system-context capture uses macOS 15.2 SDK register ids through the
 same owner-thread getter, preserves raw backend errors, and performs no writes.
 It defines no interpretation, feature or destination validation, persistence,
 schema, or restore ordering with TPIDR and `CONTEXTIDR_EL1` state.
-The translation value omits table memory, feature validation, TLB/cache
-maintenance, and an ordered restore path. The exception value omits vector-
-table memory, semantic validation, and safe restore ordering. Signed validation
-leaves the MMU disabled, uses an aligned unused VBAR without an intervening guest
-exception, and accepts implementation-defined AMAIR and AFSR readback after guest writes.
+The translation value omits table memory, feature and destination validation,
+TLB/cache maintenance, barriers, and a safe MMU transition sequence. Its paired
+restore merely reapplies the complete raw capture in field order and may leave
+a written prefix on failure. The exception value omits vector-table memory,
+semantic validation, and safe restore ordering. Signed validation leaves the
+MMU disabled, uses an aligned unused VBAR without an intervening guest exception,
+and accepts implementation-defined AMAIR and AFSR readback after guest writes.
 Execution-control validation writes only EnTSO and baseline FPEN, executes ISB,
 and does not cover optional CPACR features. Key validation uses visibly fake
 values and does not enable or execute PAC. Identification validation compares
@@ -1928,14 +1932,13 @@ or control-restore policy. The baseline and optional SVE/SME identification,
 SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register, system-context,
 cache-selection, breakpoint, watchpoint,
 debug-control, debug-trap,
-translation,
 pointer-authentication, baseline SIMD/FP, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
-The core system-register, EL1 exception, execution-control, and thread-context
-subsets have paired ordered, nontransactional restore operations but likewise
-have no validation, schema, vector-memory, feature-transition, or wider
-ordering policy.
+The core system-register, EL1 exception, execution-control, thread-context, and
+translation subsets have paired ordered, nontransactional restore operations
+but likewise have no validation, schema, dependent-memory, maintenance,
+feature-transition, or wider ordering policy.
 Identification capture is compatibility metadata rather than mutable restore
 state and defines no feature-mask or destination policy. Debug-control and
 debug-trap capture remain separate and
@@ -2312,7 +2315,9 @@ macOS design work instead of direct implementation:
   complete typed value in capture order without validating guest pointers or
   composing wider software-context state; and a fifth captures
   raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1,
-  TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 translation state.
+  TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 translation state and can
+  reapply the complete typed value in capture order without providing table
+  memory, validation, barriers, maintenance, or a safe MMU transition sequence.
   A sixth captures raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and
   VBAR_EL1 exception state and can reapply the same complete typed value in
   capture order through a nontransactional owner-thread operation. A seventh

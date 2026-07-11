@@ -290,8 +290,19 @@ is resource-specific:
   TPIDR fields can contain guest TLS or kernel pointers and are not validated
   against destination memory or coordinated with separately captured TPIDR2,
   SCXTNUM, or CONTEXTIDR state. After failure, retry the complete retained
-  value or discard the vCPU before execution. Public snapshot load invokes
-  none of the five restore primitives.
+  value or discard the vCPU before execution.
+  The paired EL1 translation-register restore extends the boundary to raw
+  `SCTLR_EL1`, `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1`, `MAIR_EL1`, `AMAIR_EL1`,
+  and `CONTEXTIDR_EL1`. It accepts only the complete typed capture, writes the
+  seven fields in capture order, and reports the exact failed register,
+  completed prefix, and backend source without values. TTBR fields and
+  CONTEXTIDR can expose sensitive guest addresses and identities, and every raw
+  control remains untrusted. The primitive supplies no translation-table
+  memory, feature or destination validation, barriers, TLB/cache maintenance,
+  safe MMU transition sequence, rollback, or wider restore ordering. It must
+  preserve actual implementation-defined AMAIR readback; after failure, retry
+  the complete retained value or discard the vCPU before execution. Public
+  snapshot load invokes none of the six restore primitives.
   SIMD/FP bytes can contain guest application or cryptographic working data.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
   expose guest process or kernel context identifiers.
