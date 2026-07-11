@@ -1751,7 +1751,7 @@ fn captures_arm64_system_context_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_guest_written_arm64_translation_registers_on_runner_thread() {
+fn captures_and_restores_guest_written_arm64_translation_registers_on_runner_thread() {
     use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
     use bangbang_runtime::VmBackend;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
@@ -1817,6 +1817,28 @@ fn captures_guest_written_arm64_translation_registers_on_runner_thread() {
             0 | TRANSLATION_TEST_AMAIR_EL1_WRITE
         ));
         assert_eq!(state.contextidr_el1(), TRANSLATION_TEST_CONTEXTIDR_EL1);
+
+        runner
+            .restore_arm64_translation_register_state(&state)
+            .expect("translation-register state should be restored");
+        let restored = runner
+            .capture_arm64_translation_register_state()
+            .expect("translation-register state should be recaptured after restore");
+        assert!(
+            restored == state,
+            "translation-register state should round trip without exposing values"
+        );
+
+        runner
+            .restore_arm64_translation_register_state(&state)
+            .expect("repeated translation-register restore should succeed");
+        let repeated = runner
+            .capture_arm64_translation_register_state()
+            .expect("translation-register state should be recaptured after repeated restore");
+        assert!(
+            repeated == state,
+            "repeated translation-register restore should preserve the complete state"
+        );
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -2760,9 +2782,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .capture_arm64_system_context_register_state()
         .expect("internal session should capture system-context register state");
-    session
+    let translation_state = session
         .capture_arm64_translation_register_state()
         .expect("internal session should capture translation-register state");
+    session
+        .restore_arm64_translation_register_state(&translation_state)
+        .expect("internal session should restore translation-register state");
     session
         .capture_arm64_pointer_authentication_key_state()
         .expect("internal session should capture pointer-authentication key state");
@@ -2979,9 +3004,12 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_system_context_register_state()
         .expect("owned session should capture system-context register state");
-    session
+    let translation_state = session
         .capture_arm64_translation_register_state()
         .expect("owned session should capture translation-register state");
+    session
+        .restore_arm64_translation_register_state(&translation_state)
+        .expect("owned session should restore translation-register state");
     session
         .capture_arm64_pointer_authentication_key_state()
         .expect("owned session should capture pointer-authentication key state");

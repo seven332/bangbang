@@ -1430,12 +1430,26 @@ impl HvfArm64BootSession<'_> {
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
     /// `SCXTNUM_EL0`/`SCXTNUM_EL1` context is captured separately. This subset
-    /// omits table memory, feature validation, TLB/cache maintenance,
-    /// persistence, and a safe restore sequence.
+    /// has a paired low-level capture-order restore, but omits table memory,
+    /// feature validation, TLB/cache maintenance, persistence, and a safe MMU
+    /// transition sequence.
     pub fn capture_arm64_translation_register_state(
         &self,
     ) -> Result<HvfArm64VcpuTranslationRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_translation_register_state()
+    }
+
+    /// Restore raw EL1 translation-register state on the primary owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. Page tables, validation, barriers/maintenance, safe
+    /// MMU transition ordering, and schema remain outside this primitive.
+    pub fn restore_arm64_translation_register_state(
+        &self,
+        state: &HvfArm64VcpuTranslationRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_translation_register_state(state)
     }
 
     /// Capture the five raw EL1 pointer-authentication keys on the primary
@@ -2342,12 +2356,26 @@ impl OwnedHvfArm64BootSession {
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
     /// `SCXTNUM_EL0`/`SCXTNUM_EL1` context is captured separately. This subset
-    /// omits table memory, feature validation, TLB/cache maintenance,
-    /// persistence, and a safe restore sequence.
+    /// has a paired low-level capture-order restore, but omits table memory,
+    /// feature validation, TLB/cache maintenance, persistence, and a safe MMU
+    /// transition sequence.
     pub fn capture_arm64_translation_register_state(
         &self,
     ) -> Result<HvfArm64VcpuTranslationRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_translation_register_state()
+    }
+
+    /// Restore raw EL1 translation-register state on the primary owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. Page tables, validation, barriers/maintenance, safe
+    /// MMU transition ordering, and schema remain outside this primitive.
+    pub fn restore_arm64_translation_register_state(
+        &self,
+        state: &HvfArm64VcpuTranslationRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_translation_register_state(state)
     }
 
     /// Capture the five raw EL1 pointer-authentication keys on the primary

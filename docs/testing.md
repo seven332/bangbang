@@ -114,19 +114,26 @@ nontransactional; tests and callers must retry the complete retained value or
 discard the vCPU before any run.
 Core system-register restore tests must likewise verify
 `SP_EL0`/`SP_EL1`/`ELR_EL1`/`SPSR_EL1` capture-order writes, all four failure
-positions, reusable system-register error context, complete retry, 27-way
+positions, reusable system-register error context, complete retry, 28-way
 admission, and lifecycle cleanup. Signed coverage must extend the known-value
 guest-written capture with repeated same-vCPU restore/recapture after the HVC
 exit, use fixed failure messages that do not format raw state, and never run the
 guest after restore or claim the values are portable or validated.
-Translation-register signed tests must leave `SCTLR_EL1.M` clear, write back
-the original SCTLR value, and only then write inert TTBR/TCR/attribute/context
-values before HVC. AMAIR is implementation-defined: current Apple Silicon reads
-zero after a guest write, while other hosts may preserve the written value.
+Translation-register restore tests must verify SCTLR_EL1-then-TTBR0_EL1-then-
+TTBR1_EL1-then-TCR_EL1-then-MAIR_EL1-then-AMAIR_EL1-then-CONTEXTIDR_EL1
+writes, all seven failure positions, the reusable system-register error,
+complete retry, 28-way admission, and lifecycle cleanup. Signed coverage must
+leave `SCTLR_EL1.M` clear, write back the original SCTLR value before inert
+TTBR/TCR/attribute/context values and HVC, then repeat same-vCPU
+restore/recapture with fixed messages and no post-restore guest execution.
+AMAIR is implementation-defined: preserve the actual captured readback instead
+of assuming the guest-written value is writable. The round trip proves only raw
+field reapplication, not table-memory capture, validation, barriers,
+TLB/cache maintenance, or a safe MMU transition sequence.
 Exception-register restore tests must verify
 `AFSR0_EL1`/`AFSR1_EL1`/`ESR_EL1`/`FAR_EL1`/`PAR_EL1`/`VBAR_EL1`
 capture-order writes, all six failure positions, the reusable system-register
-error, complete retry, 27-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 28-way admission, and lifecycle cleanup. Signed coverage
 must use an aligned VBAR address, preserve the actual captured AFSR readback,
 repeat same-vCPU restore/recapture with fixed messages, take no guest exception
 or run after restore, and never claim coherent exception semantics or
@@ -135,7 +142,7 @@ Silicon reads AFSR0 as zero after a guest write while preserving the test's
 AFSR1 value.
 Execution-control restore tests require macOS 15 for ACTLR and must verify
 ACTLR-then-CPACR writes, both failure positions, the reusable system-register
-error, complete retry, 27-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 28-way admission, and lifecycle cleanup. Signed coverage
 must write only the Hypervisor.framework-supported `ACTLR_EL1.EnTSO` bit and
 baseline `CPACR_EL1.FPEN`, execute ISB before HVC, then repeat same-vCPU
 restore/recapture with fixed messages and no post-restore guest execution. It
@@ -143,7 +150,7 @@ must not treat equality as destination feature validation or a complete
 transition/ISB policy.
 Thread-context restore tests must verify TPIDR_EL0-then-TPIDRRO_EL0-then-
 TPIDR_EL1 writes, all three failure positions, the reusable system-register
-error, complete retry, 27-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 28-way admission, and lifecycle cleanup. Signed coverage
 must extend the known guest-written values with repeated same-vCPU
 restore/recapture after HVC, use fixed messages, take no post-restore guest run,
 and never claim pointer validation, portability, or complete context semantics.

@@ -1294,11 +1294,13 @@ impl fmt::Debug for HvfArm64VcpuSystemContextRegisterState {
 ///
 /// This value contains `SCTLR_EL1`, both translation table bases, `TCR_EL1`,
 /// `MAIR_EL1`, `AMAIR_EL1`, and `CONTEXTIDR_EL1`. Table bases can expose guest
-/// physical addresses, and context values can expose guest identifiers. These
-/// are sensitive, unvalidated observations, not a complete or serialized
-/// restorable vCPU state. Table-memory persistence, feature validation,
-/// TLB/cache maintenance, and an ordered restore policy remain outside it.
-/// Optional `SCXTNUM_EL0`/`SCXTNUM_EL1` context is captured separately.
+/// physical addresses, and context values can expose guest identifiers. The
+/// complete typed value can be reapplied through an owner-thread primitive,
+/// but it remains sensitive, unvalidated raw state rather than a complete or
+/// serialized restorable vCPU. Table-memory persistence, destination and
+/// writable-bit validation, dependency ordering, MMU transitions, barriers,
+/// TLB/cache maintenance, and schema remain outside it. Optional
+/// `SCXTNUM_EL0`/`SCXTNUM_EL1` context is captured separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuTranslationRegisterState {
     sctlr_el1: u64,
@@ -2740,6 +2742,34 @@ pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     ))
 }
 
+pub(crate) fn restore_arm64_vcpu_translation_register_state_with(
+    state: &HvfArm64VcpuTranslationRegisterState,
+    mut set_system_register: impl FnMut(HvfSystemRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+    let mut completed_writes = 0;
+    let mut write_system_register = |register, value| {
+        set_system_register(register, value).map_err(|source| {
+            HvfArm64VcpuSystemRegisterRestoreError::new(register, completed_writes, source)
+        })?;
+        completed_writes += 1;
+        Ok(())
+    };
+
+    for (register, value) in [
+        (HvfSystemRegister::SCTLR_EL1, state.sctlr_el1()),
+        (HvfSystemRegister::TTBR0_EL1, state.ttbr0_el1()),
+        (HvfSystemRegister::TTBR1_EL1, state.ttbr1_el1()),
+        (HvfSystemRegister::TCR_EL1, state.tcr_el1()),
+        (HvfSystemRegister::MAIR_EL1, state.mair_el1()),
+        (HvfSystemRegister::AMAIR_EL1, state.amair_el1()),
+        (HvfSystemRegister::CONTEXTIDR_EL1, state.contextidr_el1()),
+    ] {
+        write_system_register(register, value)?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn capture_arm64_vcpu_pointer_authentication_key_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuPointerAuthenticationKeyState, BackendError> {
@@ -2906,6 +2936,7 @@ mod tests {
         restore_arm64_vcpu_execution_control_register_state_with,
         restore_arm64_vcpu_general_register_state_with,
         restore_arm64_vcpu_thread_context_register_state_with,
+        restore_arm64_vcpu_translation_register_state_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
@@ -5174,6 +5205,88 @@ mod tests {
         assert_eq!(HvfSystemRegister::MAIR_EL1.raw(), 0xc510);
         assert_eq!(HvfSystemRegister::AMAIR_EL1.raw(), 0xc518);
         assert_eq!(HvfSystemRegister::CONTEXTIDR_EL1.raw(), 0xc681);
+    }
+
+    fn translation_restore_test_state() -> super::HvfArm64VcpuTranslationRegisterState {
+        capture_arm64_vcpu_translation_register_state_with(|register| {
+            Ok(0xda00_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("translation test state should be captured")
+    }
+
+    fn translation_restore_test_entries(
+        state: super::HvfArm64VcpuTranslationRegisterState,
+    ) -> [(HvfSystemRegister, u64); 7] {
+        [
+            (HvfSystemRegister::SCTLR_EL1, state.sctlr_el1()),
+            (HvfSystemRegister::TTBR0_EL1, state.ttbr0_el1()),
+            (HvfSystemRegister::TTBR1_EL1, state.ttbr1_el1()),
+            (HvfSystemRegister::TCR_EL1, state.tcr_el1()),
+            (HvfSystemRegister::MAIR_EL1, state.mair_el1()),
+            (HvfSystemRegister::AMAIR_EL1, state.amair_el1()),
+            (HvfSystemRegister::CONTEXTIDR_EL1, state.contextidr_el1()),
+        ]
+    }
+
+    #[test]
+    fn restores_arm64_translation_register_state_in_capture_order() {
+        let state = translation_restore_test_state();
+        let expected = translation_restore_test_entries(state);
+        let mut writes = Vec::new();
+
+        restore_arm64_vcpu_translation_register_state_with(&state, |register, value| {
+            writes.push((register, value));
+            Ok(())
+        })
+        .expect("translation restore should succeed");
+
+        assert_eq!(writes, expected);
+    }
+
+    #[test]
+    fn every_arm64_translation_restore_failure_stops_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = translation_restore_test_state();
+        let expected = translation_restore_test_entries(state);
+
+        for (failed_index, (failed_register, _)) in expected.iter().copied().enumerate() {
+            let fail_once = Cell::new(true);
+            let writes = RefCell::new(Vec::new());
+            let write_system_register = |register, value| {
+                writes.borrow_mut().push((register, value));
+                if register == failed_register && fail_once.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake translation restore failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error =
+                restore_arm64_vcpu_translation_register_state_with(&state, &write_system_register)
+                    .expect_err("injected translation write should fail");
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake translation restore failed".to_string())
+            );
+            assert_eq!(*writes.borrow(), expected[..=failed_index]);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 system register id {} after {failed_index} successful writes: invalid backend state: fake translation restore failed",
+                    failed_register.raw()
+                )
+            );
+
+            writes.borrow_mut().clear();
+            restore_arm64_vcpu_translation_register_state_with(&state, &write_system_register)
+                .expect("complete translation restore retry should succeed");
+            assert_eq!(*writes.borrow(), expected);
+        }
     }
 
     #[test]
