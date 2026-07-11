@@ -121,6 +121,10 @@ values twice within one vCPU lifetime and compare MPIDR with the existing
 owner-thread getter. They must not hard-code one Apple MIDR/feature model,
 include availability-gated or beta-only IDs, or claim that equal raw values are
 a sufficient destination compatibility policy.
+Cache-selection signed tests must capture CSSELR_EL1 from an idle real vCPU
+without hard-coding or validating its architecturally unknown reset value. They
+must not write the selector, query CCSIDR, execute ISB or cache maintenance, run
+guest code, or treat CSSELR as cache topology or portable restore input.
 Debug-control signed tests must remain observation-only: capture MDCCINT_EL1
 and MDSCR_EL1 from an idle real vCPU without hard-coding or logging their raw
 values. They must not call register or debug-trap setters, run guest debug

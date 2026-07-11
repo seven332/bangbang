@@ -49,8 +49,8 @@ boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary,
 guest-visible identification-register metadata, pointer-authentication
-key-state capture with redacted `Debug`, raw debug-control and physical-timer
-capture, a
+key-state capture with redacted `Debug`, raw cache-selection, debug-control, and
+physical-timer capture, a
 virtual-timer mask/offset/control/CVAL boundary, a bounded internal boot-session
 run-loop pump, owned internal boot-session handle, process-level owned
 startup-session wiring with optional serial capture and boot run-loop supervision
@@ -1661,11 +1661,13 @@ Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
 the low and high halves of APIA, APIB, APDA, APDB, and APGA and publishes five
 128-bit pointer-authentication keys. A ninth reads guest-visible `MIDR_EL1`,
 `MPIDR_EL1`, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 compatibility metadata. The
-last command reads raw `MDCCINT_EL1` then `MDSCR_EL1` without writing either
-register or changing Hypervisor.framework debug trap settings. The ten commands
-share one command-owned core-register admission domain, publish no partial
-state after a read failure, and are exposed by borrowed and owned HVF boot
-sessions for later lease-owned orchestration. TPIDR values can contain
+A tenth reads raw `MDCCINT_EL1` then `MDSCR_EL1` without writing either register
+or changing Hypervisor.framework debug trap settings. An eleventh reads raw
+`CSSELR_EL1` without changing the selector or consuming its selected
+`CCSIDR_EL1` view. The eleven commands share one command-owned core-register
+admission domain, publish no partial state after a read failure, and are exposed
+by borrowed and owned HVF boot sessions for later lease-owned orchestration.
+TPIDR values can contain
 guest TLS or kernel pointers; translation table bases, context ids, fault
 addresses, and the vector base are sensitive; pointer-authentication keys are
 cryptographic secrets; debug controls are security-sensitive execution state;
@@ -1689,7 +1691,11 @@ both values from an idle real vCPU; it does not enable monitor debug, software
 stepping, debug exceptions, guest debug-register access, or DCC interrupts.
 Breakpoint/watchpoint arrays, implemented-count policy from `ID_AA64DFR0_EL1`,
 and HVF's separate debug-exception and debug-register-access trap booleans are
-not part of the two-field value.
+not part of the two-field value. Cache-selection validation only reads the
+selector twice from an idle real vCPU; it does not assume a reset value, write
+CSSELR, issue ISB, query CCSIDR, perform cache maintenance, or run guest code.
+The selector is not cache topology: CTR/CLIDR/DCZID and instruction/data CCSIDR
+configuration manifests remain separate compatibility work.
 The SIMD getter uses an explicitly 16-byte-aligned
 HVF output value; in streaming SVE mode, its Q values alias only the low 128
 bits of Z registers and are not complete SVE/SME state. A separate command
@@ -1708,13 +1714,16 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The identification, core system-register, exception,
-execution-control, debug-control, translation, pointer-authentication, thread-
-context, baseline SIMD/FP, and physical-timer subsets are raw and read-only and
-likewise have no restore validation, snapshot schema, or Firecracker on-disk
-compatibility. Identification capture is compatibility metadata rather than
-mutable restore state and defines no feature-mask or destination policy. Debug-
-control capture is incomplete and defines no feature, writable/status-bit,
-security, trap-coordination, synchronization, or restore policy.
+execution-control, cache-selection, debug-control, translation, pointer-
+authentication, thread-context, baseline SIMD/FP, and physical-timer subsets
+are raw and read-only and likewise have no restore validation, snapshot schema,
+or Firecracker on-disk compatibility. Identification capture is compatibility
+metadata rather than mutable restore state and defines no feature-mask or
+destination policy. Debug-control capture is incomplete and defines no feature,
+writable/status-bit, security, trap-coordination, synchronization, or restore
+policy.
+Cache-selection capture defines no topology manifest, selector validation,
+synchronization, maintenance, compatibility, or restore policy.
 Pointer-authentication capture additionally has no feature validation,
 zeroization, protected persistence, or safe enable ordering. The process
 snapshot barrier invokes none of these captures.
@@ -2085,11 +2094,13 @@ macOS design work instead of direct implementation:
   halves and redacts them from `Debug`. A ninth captures guest-visible MIDR,
   MPIDR, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 as raw virtual-CPU/HVF
   compatibility inputs. A tenth captures raw MDCCINT_EL1 and MDSCR_EL1 as an
-  observation-only, incomplete debug-control subset. Stable-baseline optional
-  SVE/SME IDs, newer beta-only IDs, feature masking, destination policy,
-  streaming SVE/SME state, table and vector memory, optional CPACR and pointer-
-  authentication feature validation, breakpoint/watchpoint arrays, DFR0 debug-
-  resource count policy, HVF debug trap configuration, protected key
+  observation-only, incomplete debug-control subset. An eleventh captures raw
+  CSSELR_EL1 as cache-size selection state, not cache topology. Stable-baseline
+  optional SVE/SME IDs, newer beta-only IDs, feature masking, destination
+  policy, streaming SVE/SME state, table and vector memory, optional CPACR and
+  pointer-authentication feature validation, cache feature/CCSIDR manifests,
+  selector validation and maintenance, breakpoint/watchpoint arrays, DFR0
+  debug-resource count policy, HVF debug trap configuration, protected key
   persistence, and restore ordering remain outside these subsets.
   The runner can capture raw CNTKCTL_EL1,
   CNTP_CTL_EL0, and CNTP_CVAL_EL0 on the owning thread when macOS 15 physical-
