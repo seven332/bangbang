@@ -240,9 +240,12 @@ is resource-specific:
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1 values, raw
   Q0-Q31/FPCR/FPSR values, raw virtual-timer mask/offset/control/CVAL values,
-  and CPU IRQ/FIQ pending levels are sensitive guest/VMM execution state.
+  CPU IRQ/FIQ pending levels, and opaque GIC device-state bytes are sensitive
+  guest/VMM execution state.
   TPIDR fields can contain guest TLS or kernel pointers, and
   SIMD/FP bytes can contain guest application or cryptographic working data.
+  The GIC value uses a custom `Debug` implementation that reports only its
+  length rather than formatting opaque contents.
   Current internal capture commands keep these values in process memory and do
   not write them to logs, metrics, error strings, or persistence. The raw timer
   offset is tied to HVF's host-time relation, and the control ISTATUS bit is a

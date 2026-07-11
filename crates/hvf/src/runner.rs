@@ -12,7 +12,10 @@ use crate::exit::{
     HvfHvcExit, HvfResolvedMmioAccess, HvfSys64Direction, HvfSys64Exit, HvfSys64Register,
     HvfVcpuExit, HvfVcpuExitResolveError,
 };
-use crate::gic::{HvfGicError, HvfGicPpiPendingWriter, validate_gic_ppi_pending_intid};
+use crate::gic::{
+    HvfGicDeviceState, HvfGicError, HvfGicPpiPendingWriter, HvfGicStateSnapshotter,
+    validate_gic_ppi_pending_intid,
+};
 use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
     PsciCall, PsciCallAction, call_uses_arg0, handle_call as handle_psci_call, not_supported_result,
@@ -299,6 +302,10 @@ enum RunnerCommand {
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuPendingInterruptState, HvfVcpuRunnerError>>,
     },
+    CaptureGicDeviceState {
+        admission: InFlightInterruptOperation,
+        response_sender: mpsc::Sender<Result<HvfGicDeviceState, HvfVcpuRunnerError>>,
+    },
     SetGicPpiPending {
         intid: u32,
         pending: bool,
@@ -464,12 +471,18 @@ trait RunnerVcpu {
             "vCPU does not support GIC PPI pending control",
         ))
     }
+    fn capture_gic_device_state(&mut self) -> Result<HvfGicDeviceState, HvfGicError> {
+        Err(HvfGicError::InvalidState(
+            "vCPU does not support GIC device-state capture",
+        ))
+    }
     fn destroy(&mut self) -> Result<(), BackendError>;
 }
 
 struct RealRunnerVcpu {
     owner: HvfVcpuOwner,
     gic_ppi_pending_writer: Option<HvfGicPpiPendingWriter>,
+    gic_state_snapshotter: Option<HvfGicStateSnapshotter>,
 }
 
 impl RealRunnerVcpu {
@@ -483,6 +496,7 @@ impl RealRunnerVcpu {
         Ok(Self {
             owner,
             gic_ppi_pending_writer: None,
+            gic_state_snapshotter: None,
         })
     }
 }
@@ -600,6 +614,20 @@ impl RunnerVcpu for RealRunnerVcpu {
             ))?;
 
         self.owner.set_gic_ppi_pending(writer, intid, pending)
+    }
+
+    fn capture_gic_device_state(&mut self) -> Result<HvfGicDeviceState, HvfGicError> {
+        if self.gic_state_snapshotter.is_none() {
+            self.gic_state_snapshotter = Some(HvfGicStateSnapshotter::new()?);
+        }
+        let snapshotter = self
+            .gic_state_snapshotter
+            .as_ref()
+            .ok_or(HvfGicError::InvalidState(
+                "GIC state snapshotter was not initialized",
+            ))?;
+
+        snapshotter.capture()
     }
 
     fn destroy(&mut self) -> Result<(), BackendError> {
@@ -904,6 +932,21 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<HvfArm64VcpuPendingInterruptState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_pending_interrupt_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Capture Hypervisor.framework's opaque GIC device state.
+    ///
+    /// The command runs while this current single-vCPU runner is stopped and
+    /// serialized against runner-managed CPU/PPI interrupt mutations. It does
+    /// not quiesce external SPI producers. The versioned bytes exclude GIC CPU
+    /// system registers and are not a complete or restored snapshot.
+    pub fn capture_gic_device_state(&self) -> Result<HvfGicDeviceState, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_gic_device_state_capture(response_sender)?;
 
         response_receiver
             .recv()
@@ -1711,6 +1754,23 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
     }
 
+    fn start_gic_device_state_capture(
+        &self,
+        response_sender: mpsc::Sender<Result<HvfGicDeviceState, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let admission = {
+            let _state = self.reserve_interrupt_operation(|| Ok(()))?;
+            InFlightInterruptOperation::new(&self.state)
+        };
+
+        self.command_sender
+            .send(RunnerCommand::CaptureGicDeviceState {
+                admission,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
+    }
+
     fn start_interrupt_operation<T>(
         &self,
         validate: impl FnOnce() -> Result<(), HvfVcpuRunnerError>,
@@ -2404,6 +2464,19 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::CaptureGicDeviceState {
+                mut admission,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .capture_gic_device_state()
+                    .map_err(HvfVcpuRunnerError::Gic);
+                // State-object creation, sizing, and data copy have finished.
+                // Restore admission before response send so receiver failure
+                // is not part of the capture lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::SetGicPpiPending {
                 intid,
                 pending,
@@ -2600,7 +2673,7 @@ mod tests {
         HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfSys64Direction, HvfSys64Exit,
         HvfSys64Register, HvfVcpuExit, HvfVcpuExitResolveError,
     };
-    use crate::gic::HvfGicError;
+    use crate::gic::{HvfGicDeviceState, HvfGicError};
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
     use crate::vcpu::{
         HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState,
@@ -2634,6 +2707,7 @@ mod tests {
     const PSCI_VERSION_0_2: u64 = 0x0000_0002;
     const PSCI_RET_SUCCESS: u64 = 0;
     const PSCI_RET_NOT_SUPPORTED: u64 = u64::MAX;
+    const GIC_DEVICE_STATE_TEST_BYTES: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
 
     struct FakeVcpu {
         entered_run_sender: mpsc::Sender<()>,
@@ -2838,6 +2912,26 @@ mod tests {
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    struct GicDeviceStateRecordingVcpu {
+        fail_next_capture: bool,
+        capture_sender: mpsc::Sender<()>,
+    }
+
+    struct BlockingGicDeviceStateVcpu {
+        entered_capture_sender: mpsc::Sender<()>,
+        release_capture_receiver: mpsc::Receiver<Result<Vec<u8>, HvfGicError>>,
+        barrier_sender: Option<mpsc::Sender<()>>,
+    }
+
+    struct PanicOnGicDeviceStateVcpu;
+
+    type BlockingGicDeviceStateCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<Vec<u8>, HvfGicError>>,
         mpsc::Receiver<()>,
     );
 
@@ -4211,6 +4305,130 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for GicDeviceStateRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn capture_gic_device_state(&mut self) -> Result<HvfGicDeviceState, HvfGicError> {
+            self.capture_sender
+                .send(())
+                .map_err(|_| HvfGicError::InvalidState("fake GIC capture receiver closed"))?;
+            if self.fail_next_capture {
+                self.fail_next_capture = false;
+                Err(HvfGicError::InvalidState(
+                    "fake GIC device-state capture failed",
+                ))
+            } else {
+                Ok(HvfGicDeviceState::new(GIC_DEVICE_STATE_TEST_BYTES.to_vec()))
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingGicDeviceStateVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn capture_gic_device_state(&mut self) -> Result<HvfGicDeviceState, HvfGicError> {
+            self.entered_capture_sender
+                .send(())
+                .map_err(|_| HvfGicError::InvalidState("fake GIC capture entry receiver closed"))?;
+            let bytes = self.release_capture_receiver.recv().map_err(|_| {
+                HvfGicError::InvalidState("fake GIC capture release sender closed")
+            })??;
+            Ok(HvfGicDeviceState::new(bytes))
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            if let Some(sender) = &self.barrier_sender {
+                sender
+                    .send(())
+                    .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            }
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnGicDeviceStateVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn capture_gic_device_state(&mut self) -> Result<HvfGicDeviceState, HvfGicError> {
+            panic!("fake GIC device-state capture panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for GicPpiPendingRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -4812,6 +5030,7 @@ mod tests {
             runner.capture_arm64_pending_interrupt_state(),
             Err(expected.clone())
         );
+        assert_eq!(runner.capture_gic_device_state(), Err(expected.clone()));
         assert_eq!(runner.set_gic_ppi_pending(27), Err(expected.clone()));
         assert_eq!(runner.clear_gic_ppi_pending(27), Err(expected));
     }
@@ -5357,6 +5576,47 @@ mod tests {
         )
     }
 
+    fn start_gic_device_state_recording_runner(
+        fail_next_capture: bool,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<()>) {
+        let (capture_sender, capture_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(GicDeviceStateRecordingVcpu {
+                fail_next_capture,
+                capture_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            capture_receiver,
+        )
+    }
+
+    fn start_blocking_gic_device_state_capture_runner() -> BlockingGicDeviceStateCaptureRunner {
+        let (entered_capture_sender, entered_capture_receiver) = mpsc::channel();
+        let (release_capture_sender, release_capture_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingGicDeviceStateVcpu {
+                entered_capture_sender,
+                release_capture_receiver,
+                barrier_sender: Some(barrier_sender),
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_capture_receiver,
+            release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
     fn start_gic_ppi_pending_recording_runner(
         fail_next_operation: bool,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(u32, bool)>) {
@@ -5438,6 +5698,7 @@ mod tests {
         assert_send_sync::<HvfArm64VcpuSimdFpState>();
         assert_send_sync::<HvfArm64VcpuThreadContextRegisterState>();
         assert_send_sync::<HvfArm64VcpuVirtualTimerState>();
+        assert_send_sync::<HvfGicDeviceState>();
         assert_send_sync::<HvfInterruptType>();
     }
 
@@ -6970,6 +7231,7 @@ mod tests {
                 Err(expected.clone())
             );
             assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_eq!(runner.capture_gic_device_state(), Err(expected.clone()));
             assert_eq!(runner.set_gic_ppi_pending(27), Err(expected.clone()));
             assert_eq!(runner.clear_gic_ppi_pending(27), Err(expected.clone()));
             assert_eq!(runner.cancel(), Err(expected.clone()));
@@ -7465,6 +7727,234 @@ mod tests {
     }
 
     #[test]
+    fn captures_opaque_gic_device_state_on_runner_thread() {
+        let (runner, capture_receiver) = start_gic_device_state_recording_runner(false);
+
+        let state = runner
+            .capture_gic_device_state()
+            .expect("GIC device-state capture should succeed");
+
+        assert_eq!(state.as_bytes(), GIC_DEVICE_STATE_TEST_BYTES);
+        assert_eq!(capture_receiver.try_iter().count(), 1);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_gic_device_state_capture_can_be_retried_without_stale_admission() {
+        let (runner, capture_receiver) = start_gic_device_state_recording_runner(true);
+
+        assert_eq!(
+            runner.capture_gic_device_state(),
+            Err(HvfVcpuRunnerError::Gic(HvfGicError::InvalidState(
+                "fake GIC device-state capture failed"
+            )))
+        );
+        assert_eq!(capture_receiver.try_iter().count(), 1);
+
+        let state = runner
+            .capture_gic_device_state()
+            .expect("GIC device-state capture retry should succeed");
+        assert_eq!(state.as_bytes(), GIC_DEVICE_STATE_TEST_BYTES);
+        assert_eq!(capture_receiver.try_iter().count(), 1);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn commands_during_gic_device_state_capture_are_rejected_without_queueing() {
+        let (runner, entered_capture_receiver, release_capture_sender, _barrier_receiver) =
+            start_blocking_gic_device_state_capture_runner();
+
+        thread::scope(|scope| {
+            let capture = scope.spawn(|| runner.capture_gic_device_state());
+            entered_capture_receiver
+                .recv()
+                .expect("runner should enter fake GIC device-state capture");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_vtimer_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_capture_sender
+                .send(Ok(GIC_DEVICE_STATE_TEST_BYTES.to_vec()))
+                .expect("GIC device-state capture release should be sent");
+            let state = capture
+                .join()
+                .expect("GIC device-state capture thread should join")
+                .expect("GIC device-state capture should succeed");
+            assert_eq!(state.as_bytes(), GIC_DEVICE_STATE_TEST_BYTES);
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_gic_device_state_capture_admitted_until_command_finishes() {
+        let (runner, entered_capture_receiver, release_capture_sender, barrier_receiver) =
+            start_blocking_gic_device_state_capture_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_gic_device_state_capture(response_sender)
+                .expect("GIC device-state capture should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_capture_receiver
+            .recv()
+            .expect("runner should enter fake GIC device-state capture");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind capture");
+        release_capture_sender
+            .send(Ok(GIC_DEVICE_STATE_TEST_BYTES.to_vec()))
+            .expect("GIC device-state capture release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after capture");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn gic_device_state_capture_send_failure_releases_admission() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.capture_gic_device_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_gic_device_state_capture_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (capture_response_sender, capture_response_receiver) = mpsc::channel();
+        runner
+            .start_gic_device_state_capture(capture_response_sender)
+            .expect("GIC device-state capture should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(capture_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn gic_device_state_capture_panic_releases_admission() {
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnGicDeviceStateVcpu));
+
+        assert_eq!(
+            runner.capture_gic_device_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
     fn sets_and_clears_gic_ppi_pending_on_runner_thread() {
         let (runner, operation_receiver) = start_gic_ppi_pending_recording_runner(false);
 
@@ -7679,6 +8169,12 @@ mod tests {
             assert_vtimer_operations_rejected(
                 &runner,
                 HvfVcpuRunnerError::InvalidState(super::METADATA_READ_IN_FLIGHT_MESSAGE),
+            );
+            assert_eq!(
+                runner.capture_gic_device_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
             );
             assert_eq!(
                 runner.set_gic_ppi_pending(27),
@@ -8043,6 +8539,12 @@ mod tests {
                 HvfVcpuRunnerError::InvalidState(super::RUN_IN_FLIGHT_MESSAGE),
             );
             assert_eq!(
+                runner.capture_gic_device_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
                 runner.set_gic_ppi_pending(27),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::RUN_IN_FLIGHT_MESSAGE
@@ -8120,6 +8622,12 @@ mod tests {
 
             assert_eq!(
                 runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.capture_gic_device_state(),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
                 ))
@@ -9472,6 +9980,12 @@ mod tests {
             assert_vtimer_operations_rejected(
                 &runner,
                 HvfVcpuRunnerError::InvalidState(super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE),
+            );
+            assert_eq!(
+                runner.capture_gic_device_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
             );
             assert_eq!(
                 runner.set_gic_ppi_pending(27),

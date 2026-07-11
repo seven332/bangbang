@@ -63,8 +63,8 @@ use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
 use crate::backend::HvfBackend;
 use crate::gic::{
-    HvfGicError, HvfGicInterruptLineAllocator, HvfGicMetadata, HvfGicSpiSignalError,
-    HvfGicSpiSignaler, HvfInterruptLineAllocationError,
+    HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator, HvfGicMetadata,
+    HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
 use crate::runner::{
@@ -1232,6 +1232,15 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_pending_interrupt_state()
     }
 
+    /// Capture opaque, versioned GIC device state while the primary runner is
+    /// stopped.
+    ///
+    /// The bytes exclude vCPU-affine GIC CPU registers and are not yet a
+    /// bangbang snapshot schema or validated restore input.
+    pub fn capture_gic_device_state(&self) -> Result<HvfGicDeviceState, HvfVcpuRunnerError> {
+        self.runner.capture_gic_device_state()
+    }
+
     /// Run the boot session's primary vCPU once with runner-thread MMIO handling.
     ///
     /// This is runner-loop plumbing. It does not dispatch boot block or
@@ -1842,6 +1851,15 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuPendingInterruptState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_pending_interrupt_state()
+    }
+
+    /// Capture opaque, versioned GIC device state while the primary runner is
+    /// stopped.
+    ///
+    /// The bytes exclude vCPU-affine GIC CPU registers and are not yet a
+    /// bangbang snapshot schema or validated restore input.
+    pub fn capture_gic_device_state(&self) -> Result<HvfGicDeviceState, HvfVcpuRunnerError> {
+        self.runner.capture_gic_device_state()
     }
 
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
