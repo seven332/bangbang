@@ -1439,8 +1439,10 @@ impl HvfArm64VcpuTranslationRegisterState {
 ///
 /// The five 128-bit keys are cryptographic secrets. `Debug` redacts every key,
 /// but the named accessors intentionally expose raw values to trusted internal
-/// snapshot orchestration. This value has no feature validation, zeroization,
-/// persistence protection, restore ordering, or serialized schema policy.
+/// snapshot orchestration. The complete typed value can be reapplied through an
+/// owner-thread primitive, but this value has no feature or destination
+/// validation, zeroization, persistence protection, SCTLR enable ordering,
+/// rollback, or serialized schema policy.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HvfArm64VcpuPointerAuthenticationKeyState {
     keys: [u128; 5],
@@ -1495,6 +1497,10 @@ impl fmt::Debug for HvfArm64VcpuPointerAuthenticationKeyState {
 
 const fn pointer_authentication_key(low: u64, high: u64) -> u128 {
     (low as u128) | ((high as u128) << 64)
+}
+
+const fn pointer_authentication_key_halves(key: u128) -> (u64, u64) {
+    (key as u64, (key >> 64) as u64)
 }
 
 /// Detached raw thread-context register state captured from one arm64 vCPU.
@@ -2878,6 +2884,42 @@ pub(crate) fn capture_arm64_vcpu_pointer_authentication_key_state_with(
     Ok(HvfArm64VcpuPointerAuthenticationKeyState::new(halves))
 }
 
+pub(crate) fn restore_arm64_vcpu_pointer_authentication_key_state_with(
+    state: &HvfArm64VcpuPointerAuthenticationKeyState,
+    mut set_system_register: impl FnMut(HvfSystemRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+    let (apia_low, apia_high) = pointer_authentication_key_halves(state.apia_key());
+    let (apib_low, apib_high) = pointer_authentication_key_halves(state.apib_key());
+    let (apda_low, apda_high) = pointer_authentication_key_halves(state.apda_key());
+    let (apdb_low, apdb_high) = pointer_authentication_key_halves(state.apdb_key());
+    let (apga_low, apga_high) = pointer_authentication_key_halves(state.apga_key());
+    let mut completed_writes = 0;
+    let mut write_system_register = |register, value| {
+        set_system_register(register, value).map_err(|source| {
+            HvfArm64VcpuSystemRegisterRestoreError::new(register, completed_writes, source)
+        })?;
+        completed_writes += 1;
+        Ok(())
+    };
+
+    for (register, value) in [
+        (HvfSystemRegister::APIAKEYLO_EL1, apia_low),
+        (HvfSystemRegister::APIAKEYHI_EL1, apia_high),
+        (HvfSystemRegister::APIBKEYLO_EL1, apib_low),
+        (HvfSystemRegister::APIBKEYHI_EL1, apib_high),
+        (HvfSystemRegister::APDAKEYLO_EL1, apda_low),
+        (HvfSystemRegister::APDAKEYHI_EL1, apda_high),
+        (HvfSystemRegister::APDBKEYLO_EL1, apdb_low),
+        (HvfSystemRegister::APDBKEYHI_EL1, apdb_high),
+        (HvfSystemRegister::APGAKEYLO_EL1, apga_low),
+        (HvfSystemRegister::APGAKEYHI_EL1, apga_high),
+    ] {
+        write_system_register(register, value)?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn capture_arm64_vcpu_thread_context_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuThreadContextRegisterState, BackendError> {
@@ -3065,7 +3107,9 @@ mod tests {
         restore_arm64_vcpu_core_system_register_state_with,
         restore_arm64_vcpu_exception_register_state_with,
         restore_arm64_vcpu_execution_control_register_state_with,
-        restore_arm64_vcpu_general_register_state_with, restore_arm64_vcpu_simd_fp_state_with,
+        restore_arm64_vcpu_general_register_state_with,
+        restore_arm64_vcpu_pointer_authentication_key_state_with,
+        restore_arm64_vcpu_simd_fp_state_with,
         restore_arm64_vcpu_thread_context_register_state_with,
         restore_arm64_vcpu_translation_register_state_with,
     };
@@ -3399,6 +3443,17 @@ mod tests {
             POINTER_AUTHENTICATION_TEST_HALVES[index * 2],
             POINTER_AUTHENTICATION_TEST_HALVES[index * 2 + 1],
         )
+    }
+
+    fn pointer_authentication_restore_test_state()
+    -> super::HvfArm64VcpuPointerAuthenticationKeyState {
+        super::HvfArm64VcpuPointerAuthenticationKeyState::new(POINTER_AUTHENTICATION_TEST_HALVES)
+    }
+
+    fn pointer_authentication_restore_test_entries()
+    -> [(HvfSystemRegister, u64); POINTER_AUTHENTICATION_TEST_HALVES.len()] {
+        let registers = pointer_authentication_key_registers();
+        std::array::from_fn(|index| (registers[index], POINTER_AUTHENTICATION_TEST_HALVES[index]))
     }
 
     fn simd_fp_q_value(register: HvfSimdFpRegister) -> [u8; 16] {
@@ -5574,6 +5629,25 @@ mod tests {
     }
 
     #[test]
+    fn restores_arm64_pointer_authentication_keys_in_capture_order() {
+        let state = pointer_authentication_restore_test_state();
+        let expected = pointer_authentication_restore_test_entries();
+        let mut writes = Vec::new();
+
+        restore_arm64_vcpu_pointer_authentication_key_state_with(&state, |register, value| {
+            writes.push((register, value));
+            Ok(())
+        })
+        .expect("pointer-authentication key restore should succeed");
+
+        assert_eq!(writes, expected);
+        assert_eq!(
+            format!("{state:?}"),
+            "HvfArm64VcpuPointerAuthenticationKeyState { keys: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
     fn captures_arm64_pending_interrupt_state_in_irq_then_fiq_order() {
         let mut reads = Vec::new();
 
@@ -6201,6 +6275,60 @@ mod tests {
             assert_eq!(state.apia_key(), pointer_authentication_test_key(0));
             assert_eq!(state.apga_key(), pointer_authentication_test_key(4));
             assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn every_arm64_pointer_authentication_key_restore_failure_stops_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = pointer_authentication_restore_test_state();
+        let expected = pointer_authentication_restore_test_entries();
+
+        for (failed_index, (failed_register, _)) in expected.iter().copied().enumerate() {
+            let fail_once = Cell::new(true);
+            let writes = RefCell::new(Vec::new());
+            let write_system_register = |register, value| {
+                writes.borrow_mut().push((register, value));
+                if register == failed_register && fail_once.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake pointer-authentication key restore failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error = restore_arm64_vcpu_pointer_authentication_key_state_with(
+                &state,
+                &write_system_register,
+            )
+            .expect_err("injected pointer-authentication key write should fail");
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some(
+                    "invalid backend state: fake pointer-authentication key restore failed"
+                        .to_string()
+                )
+            );
+            assert_eq!(*writes.borrow(), expected[..=failed_index]);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 system register id {} after {failed_index} successful writes: invalid backend state: fake pointer-authentication key restore failed",
+                    failed_register.raw()
+                )
+            );
+
+            writes.borrow_mut().clear();
+            restore_arm64_vcpu_pointer_authentication_key_state_with(
+                &state,
+                &write_system_register,
+            )
+            .expect("complete pointer-authentication key restore retry should succeed");
+            assert_eq!(*writes.borrow(), expected);
         }
     }
 

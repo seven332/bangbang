@@ -1455,12 +1455,29 @@ impl HvfArm64BootSession<'_> {
     /// Capture the five raw EL1 pointer-authentication keys on the primary
     /// owner thread.
     ///
-    /// Debug formatting is redacted. Feature validation, persistence
-    /// protection, and restore ordering remain outside this getter-only value.
+    /// Debug formatting is redacted. The complete typed value has a paired
+    /// low-level restore, but feature validation, persistence protection, and
+    /// safe SCTLR enable ordering remain outside this subset.
     pub fn capture_arm64_pointer_authentication_key_state(
         &self,
     ) -> Result<HvfArm64VcpuPointerAuthenticationKeyState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_pointer_authentication_key_state()
+    }
+
+    /// Restore the five raw EL1 pointer-authentication keys on the primary
+    /// owner thread.
+    ///
+    /// Ten low/high writes follow capture order but are nontransactional. If a
+    /// setter fails, retry the complete redacted typed state or discard the
+    /// session before guest execution. Feature/destination validation,
+    /// zeroization, protected persistence, SCTLR ordering, rollback, schema,
+    /// and snapshot orchestration remain outside this primitive.
+    pub fn restore_arm64_pointer_authentication_key_state(
+        &self,
+        state: &HvfArm64VcpuPointerAuthenticationKeyState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_pointer_authentication_key_state(state)
     }
 
     /// Capture raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary
@@ -2395,12 +2412,29 @@ impl OwnedHvfArm64BootSession {
     /// Capture the five raw EL1 pointer-authentication keys on the primary
     /// owner thread.
     ///
-    /// Debug formatting is redacted. Feature validation, persistence
-    /// protection, and restore ordering remain outside this getter-only value.
+    /// Debug formatting is redacted. The complete typed value has a paired
+    /// low-level restore, but feature validation, persistence protection, and
+    /// safe SCTLR enable ordering remain outside this subset.
     pub fn capture_arm64_pointer_authentication_key_state(
         &self,
     ) -> Result<HvfArm64VcpuPointerAuthenticationKeyState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_pointer_authentication_key_state()
+    }
+
+    /// Restore the five raw EL1 pointer-authentication keys on the primary
+    /// owner thread.
+    ///
+    /// Ten low/high writes follow capture order but are nontransactional. If a
+    /// setter fails, retry the complete redacted typed state or discard the
+    /// session before guest execution. Feature/destination validation,
+    /// zeroization, protected persistence, SCTLR ordering, rollback, schema,
+    /// and snapshot orchestration remain outside this primitive.
+    pub fn restore_arm64_pointer_authentication_key_state(
+        &self,
+        state: &HvfArm64VcpuPointerAuthenticationKeyState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_pointer_authentication_key_state(state)
     }
 
     /// Capture raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary

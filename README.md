@@ -45,8 +45,9 @@ redacted `Debug`, conditional maximum-SVL-square ZA contents with redacted
 system-context registers with redacted `Debug`, raw cache-selection,
 hardware-breakpoint,
 hardware-watchpoint, debug-control, raw Hypervisor.framework debug-trap policy,
-pointer-authentication key state with redacted `Debug`, raw physical and virtual
-timer state, CPU-level IRQ/FIQ pending injection
+pointer-authentication key state with redacted `Debug` plus ordered
+nontransactional restore of the complete APIA/APIB/APDA/APDB/APGA value, raw
+physical and virtual timer state, CPU-level IRQ/FIQ pending injection
 levels, opaque GIC device state, and raw EL1 GIC ICC CPU-interface registers.
 A separate no-handle query exposes the maximum SME streaming vector length used
 for the Z-, P-, and ZA-register allocations. These are internal snapshot feasibility

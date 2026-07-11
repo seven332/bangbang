@@ -302,6 +302,16 @@ is resource-specific:
   safe MMU transition sequence, rollback, or wider restore ordering. It must
   preserve actual implementation-defined AMAIR readback; after failure, retry
   the complete retained value or discard the vCPU before execution.
+  The paired pointer-authentication restore extends the same boundary to APIA,
+  APIB, APDA, APDB, and APGA. It accepts only the complete redacted typed
+  capture, writes each low then high half in capture order, and reports the
+  exact failed register, completed prefix, and backend source without key
+  material. The borrowed API clones the non-`Copy` state once into command
+  ownership; neither that restriction nor redacted `Debug` provides memory
+  zeroization. This primitive supplies no algorithm/feature or destination
+  validation, protected persistence, safe keys-before-SCTLR-enable ordering,
+  rollback, or schema. After failure, retry the complete retained value or
+  discard the vCPU before execution.
   The paired baseline SIMD/FP restore extends the boundary to Q0-Q31, FPCR, and
   FPSR. It accepts only the complete typed capture, writes all 34 fields in
   capture order, and reports the exact SIMD/FP or scalar register space,
@@ -313,7 +323,7 @@ is resource-specific:
   validation, FPCR/FPSR writable-bit policy, protected persistence,
   zeroization, rollback, or schema. After failure, retry the complete retained
   value or discard the vCPU before execution. Public snapshot load invokes none
-  of the seven restore primitives.
+  of the eight restore primitives.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
   expose guest process or kernel context identifiers.
   FAR and PAR can expose guest fault or translation-result addresses, VBAR can
@@ -351,10 +361,12 @@ is resource-specific:
   features and writable/status bits, and coordinate policy and ordering before
   introducing setters.
   Pointer-authentication keys are cryptographic secrets. Their detached value
-  uses a custom `Debug` implementation that exposes only a redacted marker, and
-  future persistence must protect key confidentiality and integrity. The opaque
-  GIC byte value uses a custom `Debug` implementation that reports only its
-  length rather than formatting its contents.
+  uses a custom `Debug` implementation that exposes only a redacted marker.
+  Current capture-order apply never formats the value, but does not zero the
+  caller or queued copies, validate a destination, or define SCTLR enable
+  ordering. Future persistence must protect key confidentiality and integrity.
+  The opaque GIC byte value uses a custom `Debug` implementation that reports
+  only its length rather than formatting its contents.
   The separate MIDR, MPIDR, PFR, DFR, ISAR, and MMFR baseline plus optional
   ZFR0/SMFR0 capture are read-only virtual-CPU/HVF compatibility metadata rather
   than mutable execution state, but they can fingerprint the exposed processor
