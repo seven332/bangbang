@@ -296,6 +296,9 @@ fn rejects_non_normal_final_components_before_io() {
         PathBuf::from("trailing/."),
         PathBuf::from("trailing/.."),
         PathBuf::from(std::ffi::OsString::from_vec(b"nul\0component".to_vec())),
+        PathBuf::from(std::ffi::OsString::from_vec(
+            b"nul\0parent/state.snap".to_vec(),
+        )),
     ];
 
     for (index, state) in invalid.into_iter().enumerate() {

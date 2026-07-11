@@ -331,6 +331,9 @@ fn split_final_path(
     artifact: SnapshotArtifactKind,
 ) -> Result<SplitFinalPath, SnapshotPublicationFailure> {
     let raw_path = path.as_os_str().as_bytes();
+    if raw_path.contains(&0) {
+        return Err(SnapshotPublicationFailure::InvalidFinalPath { artifact });
+    }
     let Some(raw_component) = raw_path.rsplit(|byte| *byte == b'/').next() else {
         return Err(SnapshotPublicationFailure::InvalidFinalPath { artifact });
     };
