@@ -1686,6 +1686,14 @@ The eighteen commands share one command-owned
 core-register admission domain,
 publish no partial state after a read failure, and are exposed by borrowed and
 owned HVF boot sessions for later lease-owned orchestration.
+Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
+runtime-resolves macOS 15.2+
+`hv_sme_config_get_max_svl_bytes` and publishes the maximum streaming vector
+length, in bytes, that guests may use. It can run before backend or VM creation,
+does not enter the core-register admission domain, and preserves missing-symbol,
+target, and exact HVF failures. This configuration maximum is only a future
+Z/P/ZA buffer-sizing prerequisite; it is not the effective SVL selected through
+`SMCR_EL1`, feature metadata, PSTATE, or any Z/P/ZA/ZT0 content.
 TPIDR values can contain
 guest TLS or kernel pointers; translation table bases, context ids, fault
 addresses, and the vector base are sensitive; pointer-authentication keys are
@@ -1702,7 +1710,14 @@ describe the virtual CPU/HVF view, including bangbang's deterministic MPIDR
 affinity zero; they are not
 physical-host identity or a destination compatibility decision. The stable
 baseline keeps macOS 15.2 ZFR0/SMFR0 metadata in a separate optional value;
-newer beta-only IDs and configuration-time feature manifests remain omitted.
+newer beta-only IDs and broader configuration-time feature manifests remain
+omitted. The separate maximum-SVL configuration query is runtime-resolved so a
+pre-macOS-15.2 process returns a structured unsupported error instead of
+failing to load. An available symbol preserves HVF's raw `HV_UNSUPPORTED` on
+SME-incapable hardware, and the `size_t` result remains a Rust `usize` without
+narrowing, caching, or architecture-specific inference. It defines no feature
+or destination policy, effective-SVL selection, data allocation, persistence,
+schema, or restore behavior.
 The SME PSTATE getter is resolved at runtime so a pre-macOS-15.2 process returns
 a structured unsupported error instead of failing to load. An available symbol
 preserves HVF's raw `HV_UNSUPPORTED` result on SME-incapable hardware. The two
@@ -1729,7 +1744,14 @@ two captures and the existing MPIDR getter without hard-coding an Apple CPU
 model or claiming destination portability. Optional SVE/SME identification
 validation reads ZFR0/SMFR0 twice from an idle macOS 15.2+ vCPU without enabling
 SVE/SME, entering streaming mode, reading execution state, running the guest,
-or treating equality as a destination policy. SME PSTATE validation calls the
+or treating equality as a destination policy.
+The maximum-SVL configuration validation queries twice before constructing a
+backend or VM, compares two successful values only through fixed failure
+messages without logging the byte length, and accepts two exact raw
+`HV_UNSUPPORTED` outcomes. Missing symbols, mixed outcomes, and unrelated
+errors fail. It does not infer effective `SMCR_EL1.LEN`, create or run a vCPU,
+change SME state, read SME data, or claim feature/destination compatibility.
+SME PSTATE validation calls the
 getter twice on the same idle vCPU and compares supported results without
 assuming or logging either flag; documented missing-symbol and raw
 `HV_UNSUPPORTED` outcomes are accepted, while unrelated errors fail. It never

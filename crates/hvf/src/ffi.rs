@@ -1,5 +1,7 @@
 pub(crate) const UNSUPPORTED_TARGET_MESSAGE: &str =
     "Hypervisor.framework backend currently targets macOS on Apple Silicon";
+pub(crate) const SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE: &str =
+    "Hypervisor.framework SME configuration queries require macOS 15.2 or newer";
 pub(crate) const SME_STATE_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME state capture requires macOS 15.2 or newer";
 
@@ -184,7 +186,8 @@ mod imp {
 
     use super::{
         CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSimdFpValue, HvSysReg,
-        HvVcpu, HvVcpuExit, HvVcpuSmeState, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
+        HvVcpu, HvVcpuExit, HvVcpuSmeState, SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE,
+        SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
     };
 
     pub type HvReturn = i32;
@@ -203,6 +206,7 @@ mod imp {
     const HV_FAULT: HvReturn = 0xfae94008u32 as HvReturn;
     const HV_UNSUPPORTED: HvReturn = 0xfae9400fu32 as HvReturn;
 
+    type HvSmeConfigGetMaxSvlBytes = unsafe extern "C" fn(value: *mut usize) -> HvReturn;
     type HvVcpuGetSmeState =
         unsafe extern "C" fn(vcpu: HvVcpu, sme_state: *mut HvVcpuSmeState) -> HvReturn;
 
@@ -327,6 +331,40 @@ mod imp {
             Some(name) => format!("{name} (hv_return_t=0x{code:08x})"),
             None => format!("hv_return_t=0x{code:08x}"),
         }
+    }
+
+    fn load_sme_config_max_svl_bytes_getter() -> Result<HvSmeConfigGetMaxSvlBytes, BackendError> {
+        // SAFETY: `RTLD_DEFAULT` searches the already loaded process images, and
+        // the symbol name is a NUL-terminated static C string.
+        let symbol = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"hv_sme_config_get_max_svl_bytes".as_ptr(),
+            )
+        };
+        sme_config_max_svl_bytes_getter_from_symbol(symbol)
+    }
+
+    fn sme_config_max_svl_bytes_getter_from_symbol(
+        symbol: *mut c_void,
+    ) -> Result<HvSmeConfigGetMaxSvlBytes, BackendError> {
+        if mem::size_of::<HvSmeConfigGetMaxSvlBytes>() != mem::size_of::<*mut c_void>() {
+            return Err(BackendError::InvalidState(
+                DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE,
+            ));
+        }
+
+        if symbol.is_null() {
+            return Err(BackendError::Unsupported(
+                SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE,
+            ));
+        }
+
+        // SAFETY: The requested symbol has the SDK's
+        // `hv_sme_config_get_max_svl_bytes` signature. Function pointers and
+        // dynamic symbol pointers have the same representation on this target,
+        // checked above.
+        Ok(unsafe { mem::transmute_copy::<*mut c_void, HvSmeConfigGetMaxSvlBytes>(&symbol) })
     }
 
     fn load_get_sme_state() -> Result<HvVcpuGetSmeState, BackendError> {
@@ -534,6 +572,28 @@ mod imp {
         Ok(value.into_parts())
     }
 
+    fn get_sme_config_max_svl_bytes_with(
+        get_max_svl_bytes: HvSmeConfigGetMaxSvlBytes,
+    ) -> Result<usize, BackendError> {
+        let mut value = 0;
+
+        // SAFETY: The dynamically resolved function has the SDK's exact C ABI,
+        // and `value` is a valid `size_t` out-pointer for the duration of the
+        // call.
+        unsafe {
+            check(
+                get_max_svl_bytes(&mut value),
+                "hv_sme_config_get_max_svl_bytes",
+            )?;
+        }
+
+        Ok(value)
+    }
+
+    pub fn get_sme_config_max_svl_bytes() -> Result<usize, BackendError> {
+        get_sme_config_max_svl_bytes_with(load_sme_config_max_svl_bytes_getter()?)
+    }
+
     pub fn get_simd_fp_reg(vcpu: HvVcpu, reg: HvSimdFpReg) -> Result<[u8; 16], BackendError> {
         let mut value = HvSimdFpValue::zeroed();
 
@@ -621,14 +681,33 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        use std::ffi::c_void;
         use std::ptr;
 
         use bangbang_runtime::BackendError;
 
         use super::{
-            HV_BAD_ARGUMENT, HV_DENIED, HV_UNSUPPORTED, check, sme_state_getter_from_symbol,
+            HV_BAD_ARGUMENT, HV_DENIED, HV_SUCCESS, HV_UNSUPPORTED, check,
+            get_sme_config_max_svl_bytes_with, sme_config_max_svl_bytes_getter_from_symbol,
+            sme_state_getter_from_symbol,
         };
-        use crate::ffi::SME_STATE_REQUIRES_MACOS_15_2_MESSAGE;
+        use crate::ffi::{
+            SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
+        };
+
+        const TEST_MAX_SVL_BYTES: usize = usize::MAX - 0x1234;
+
+        unsafe extern "C" fn test_get_max_svl_bytes(value: *mut usize) -> super::HvReturn {
+            // SAFETY: The FFI test helper is called only through
+            // `get_sme_config_max_svl_bytes_with`, which supplies a live `usize`
+            // out-pointer.
+            unsafe { *value = TEST_MAX_SVL_BYTES };
+            HV_SUCCESS
+        }
+
+        unsafe extern "C" fn test_get_max_svl_bytes_unsupported(_: *mut usize) -> super::HvReturn {
+            HV_UNSUPPORTED
+        }
 
         #[test]
         fn check_displays_named_hv_return() {
@@ -691,6 +770,39 @@ mod imp {
                 Err(BackendError::Unsupported(
                     SME_STATE_REQUIRES_MACOS_15_2_MESSAGE
                 ))
+            );
+        }
+
+        #[test]
+        fn missing_sme_configuration_symbol_reports_macos_boundary() {
+            assert_eq!(
+                sme_config_max_svl_bytes_getter_from_symbol(ptr::null_mut()),
+                Err(BackendError::Unsupported(
+                    SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE
+                ))
+            );
+        }
+
+        #[test]
+        fn sme_configuration_getter_preserves_size_t_value() {
+            let symbol = test_get_max_svl_bytes as *const () as *mut c_void;
+            let getter = sme_config_max_svl_bytes_getter_from_symbol(symbol)
+                .expect("present SME configuration symbol should resolve");
+
+            assert_eq!(
+                get_sme_config_max_svl_bytes_with(getter),
+                Ok(TEST_MAX_SVL_BYTES)
+            );
+        }
+
+        #[test]
+        fn sme_configuration_getter_preserves_unsupported_return() {
+            let err = get_sme_config_max_svl_bytes_with(test_get_max_svl_bytes_unsupported)
+                .expect_err("HV_UNSUPPORTED should fail");
+
+            assert_eq!(
+                err.to_string(),
+                "hypervisor error: hv_sme_config_get_max_svl_bytes failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)"
             );
         }
     }
@@ -774,6 +886,10 @@ mod imp {
     }
 
     pub fn get_sme_state(_: HvVcpu) -> Result<(bool, bool), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_sme_config_max_svl_bytes() -> Result<usize, BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 
