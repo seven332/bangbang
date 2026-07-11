@@ -152,10 +152,11 @@ executing the guest, hard-coding one model, or inferring portability.
 A separate runtime-resolved macOS 15.2+ configuration query publishes the
 maximum streaming vector length, in bytes, that guests may use. The SDK takes
 no VM/vCPU handle, so the typed value is queried before VM creation and remains
-outside runner admission and both boot-session forms. It is a future Z/P/ZA
-buffer-sizing prerequisite, not the effective SVL selected through `SMCR_EL1`,
-feature or destination compatibility policy, execution data, persistence, or a
-snapshot schema. Missing symbols report the OS boundary and an available
+outside runner admission and both boot-session forms. It is the conditional
+Z-register allocation width and a future P/ZA buffer-sizing prerequisite, not
+the effective SVL selected through `SMCR_EL1`, feature or destination
+compatibility policy, execution data, persistence, or a snapshot schema.
+Missing symbols report the OS boundary and an available
 symbol's exact `HV_UNSUPPORTED` result remains visible. Signed coverage compares
 two successful same-host queries without logging the value, or accepts two
 exact `HV_UNSUPPORTED` results.

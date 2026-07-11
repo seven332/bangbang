@@ -53,8 +53,9 @@ and `PSTATE.ZA` without calling the setter. Unit coverage validates the C ABI,
 all Boolean combinations, raw error propagation, fresh retry, bidirectional
 admission, and cleanup; signed HVF coverage validates same-vCPU idle observation
 or the exact documented unavailable result. Snapshot create invokes, persists,
-and restores none of it. Maximum SVL, Z/P/ZA/ZT0 data, feature and transition
-validation, schema, persistence, and restore remain deferred.
+and restores none of it. Maximum SVL and Z0-Z31 are captured separately;
+P/ZA/ZT0 data, feature and transition validation, schema, persistence, and
+restore remain deferred.
 
 #1208 extends the same rows with a seventeenth shared-core capture: raw macOS
 15.2+ `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` reads publish only after all
@@ -85,8 +86,8 @@ operation behavior, the public accessor, and the non-target boundary. Signed
 HVF coverage queries twice before VM creation without logging the value and
 accepts only two successful equal observations or two exact `HV_UNSUPPORTED`
 results. Snapshot create invokes, persists, and restores none of it; effective
-SVL selection, feature/destination policy, SME data, schema, persistence, and
-restore remain deferred.
+SVL selection, feature/destination policy, P/ZA/ZT0 data, schema, persistence,
+and restore remain deferred.
 
 #1216 extends the lifecycle and snapshot rows with raw macOS 11+
 `CTR_EL0`/`CLIDR_EL1`/`DCZID_EL0` feature metadata from a fresh retained default

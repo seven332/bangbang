@@ -1984,13 +1984,8 @@ pub(crate) fn capture_arm64_vcpu_sme_z_register_state_with<R: ?Sized>(
         return Err(HvfArm64VcpuSmeZRegisterCaptureError::AllocationFailed { size: capture_size });
     }
 
-    for register in 0_u8..32 {
-        let start = usize::from(register) * maximum_svl_bytes;
-        let end = start + maximum_svl_bytes;
-        let value = bytes
-            .get_mut(start..end)
-            .ok_or(HvfArm64VcpuSmeZRegisterCaptureError::AllocationFailed { size: capture_size })?;
-        get_sme_z_register(reader, u32::from(register), value)?;
+    for (register, value) in (0_u32..).zip(bytes.chunks_exact_mut(maximum_svl_bytes)) {
+        get_sme_z_register(reader, register, value)?;
     }
 
     Ok(HvfArm64VcpuSmeZRegisterState::new(maximum_svl_bytes, bytes))

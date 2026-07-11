@@ -1696,8 +1696,9 @@ runtime-resolves macOS 15.2+
 length, in bytes, that guests may use. It can run before backend or VM creation,
 does not enter the core-register admission domain, and preserves missing-symbol,
 target, and exact HVF failures. This configuration maximum is only a future
-Z/P/ZA buffer-sizing prerequisite; it is not the effective SVL selected through
-`SMCR_EL1`, feature metadata, PSTATE, or any Z/P/ZA/ZT0 content.
+P/ZA buffer-sizing prerequisite and the current conditional Z-register
+allocation width; it is not the effective SVL selected through `SMCR_EL1`,
+feature metadata, PSTATE, or any Z/P/ZA/ZT0 content.
 Another no-handle `HvfBackend::arm64_vcpu_cache_configuration()` query creates
 and releases a fresh macOS 11+ default vCPU configuration, reads raw `CTR_EL0`,
 `CLIDR_EL1`, and `DCZID_EL0` feature values in that order, and publishes only
@@ -1739,8 +1740,8 @@ pre-macOS-15.2 process returns a structured unsupported error instead of
 failing to load. An available symbol preserves HVF's raw `HV_UNSUPPORTED` on
 SME-incapable hardware, and the `size_t` result remains a Rust `usize` without
 narrowing, caching, or architecture-specific inference. It defines no feature
-or destination policy, effective-SVL selection, data allocation, persistence,
-schema, or restore behavior.
+or destination policy, effective-SVL selection, persistence, schema, or restore
+behavior and does not itself allocate execution state.
 The SME PSTATE getter is resolved at runtime so a pre-macOS-15.2 process returns
 a structured unsupported error instead of failing to load. An available symbol
 preserves HVF's raw `HV_UNSUPPORTED` result on SME-incapable hardware. The two
