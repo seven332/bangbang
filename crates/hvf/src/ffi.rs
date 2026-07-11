@@ -1,5 +1,7 @@
 pub(crate) const UNSUPPORTED_TARGET_MESSAGE: &str =
     "Hypervisor.framework backend currently targets macOS on Apple Silicon";
+pub(crate) const SME_STATE_REQUIRES_MACOS_15_2_MESSAGE: &str =
+    "Hypervisor.framework SME state capture requires macOS 15.2 or newer";
 
 pub(crate) type HvVcpu = u64;
 pub(crate) type HvExitReason = u32;
@@ -108,6 +110,26 @@ impl HvSimdFpValue {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HvVcpuSmeState {
+    streaming_sve_mode_enabled: bool,
+    za_storage_enabled: bool,
+}
+
+impl HvVcpuSmeState {
+    const fn zeroed() -> Self {
+        Self {
+            streaming_sve_mode_enabled: false,
+            za_storage_enabled: false,
+        }
+    }
+
+    const fn into_parts(self) -> (bool, bool) {
+        (self.streaming_sve_mode_enabled, self.za_storage_enabled)
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HvVcpuExitException {
     pub(crate) syndrome: u64,
     pub(crate) virtual_address: u64,
@@ -148,6 +170,7 @@ pub(crate) unsafe fn copy_vcpu_exit(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod imp {
     use std::ffi::c_void;
+    use std::mem;
     use std::ptr;
     use std::ptr::NonNull;
 
@@ -155,7 +178,7 @@ mod imp {
 
     use super::{
         CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSimdFpValue, HvSysReg,
-        HvVcpu, HvVcpuExit,
+        HvVcpu, HvVcpuExit, HvVcpuSmeState, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
     };
 
     pub type HvReturn = i32;
@@ -163,6 +186,8 @@ mod imp {
     pub type HvVcpuConfig = *mut c_void;
 
     pub const HV_SUCCESS: HvReturn = 0;
+    const DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE: &str =
+        "Hypervisor.framework SME symbol pointer size does not match a function pointer";
     const HV_ERROR: HvReturn = 0xfae94001u32 as HvReturn;
     const HV_BUSY: HvReturn = 0xfae94002u32 as HvReturn;
     const HV_BAD_ARGUMENT: HvReturn = 0xfae94003u32 as HvReturn;
@@ -171,6 +196,9 @@ mod imp {
     const HV_DENIED: HvReturn = 0xfae94007u32 as HvReturn;
     const HV_FAULT: HvReturn = 0xfae94008u32 as HvReturn;
     const HV_UNSUPPORTED: HvReturn = 0xfae9400fu32 as HvReturn;
+
+    type HvVcpuGetSmeState =
+        unsafe extern "C" fn(vcpu: HvVcpu, sme_state: *mut HvVcpuSmeState) -> HvReturn;
 
     #[link(name = "Hypervisor", kind = "framework")]
     unsafe extern "C" {
@@ -293,6 +321,34 @@ mod imp {
             Some(name) => format!("{name} (hv_return_t=0x{code:08x})"),
             None => format!("hv_return_t=0x{code:08x}"),
         }
+    }
+
+    fn load_get_sme_state() -> Result<HvVcpuGetSmeState, BackendError> {
+        // SAFETY: `RTLD_DEFAULT` searches the already loaded process images, and
+        // the symbol name is a NUL-terminated static C string.
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"hv_vcpu_get_sme_state".as_ptr()) };
+        sme_state_getter_from_symbol(symbol)
+    }
+
+    fn sme_state_getter_from_symbol(
+        symbol: *mut c_void,
+    ) -> Result<HvVcpuGetSmeState, BackendError> {
+        if mem::size_of::<HvVcpuGetSmeState>() != mem::size_of::<*mut c_void>() {
+            return Err(BackendError::InvalidState(
+                DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE,
+            ));
+        }
+
+        if symbol.is_null() {
+            return Err(BackendError::Unsupported(
+                SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
+            ));
+        }
+
+        // SAFETY: The requested symbol has the SDK's `hv_vcpu_get_sme_state`
+        // signature. Function pointers and dynamic symbol pointers have the same
+        // representation on this target, checked above.
+        Ok(unsafe { mem::transmute_copy::<*mut c_void, HvVcpuGetSmeState>(&symbol) })
     }
 
     pub fn check(code: HvReturn, operation: &'static str) -> Result<(), BackendError> {
@@ -458,6 +514,20 @@ mod imp {
         Ok(value)
     }
 
+    pub fn get_sme_state(vcpu: HvVcpu) -> Result<(bool, bool), BackendError> {
+        let get_sme_state = load_get_sme_state()?;
+        let mut value = HvVcpuSmeState::zeroed();
+
+        // SAFETY: The caller owns this current-thread vCPU handle, the dynamically
+        // resolved function has the SDK's exact C ABI, and `value` is a valid
+        // `hv_vcpu_sme_state_t` out-pointer for the duration of the call.
+        unsafe {
+            check(get_sme_state(vcpu, &mut value), "hv_vcpu_get_sme_state")?;
+        }
+
+        Ok(value.into_parts())
+    }
+
     pub fn get_simd_fp_reg(vcpu: HvVcpu, reg: HvSimdFpReg) -> Result<[u8; 16], BackendError> {
         let mut value = HvSimdFpValue::zeroed();
 
@@ -545,7 +615,14 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{HV_BAD_ARGUMENT, HV_DENIED, HV_UNSUPPORTED, check};
+        use std::ptr;
+
+        use bangbang_runtime::BackendError;
+
+        use super::{
+            HV_BAD_ARGUMENT, HV_DENIED, HV_UNSUPPORTED, check, sme_state_getter_from_symbol,
+        };
+        use crate::ffi::SME_STATE_REQUIRES_MACOS_15_2_MESSAGE;
 
         #[test]
         fn check_displays_named_hv_return() {
@@ -587,6 +664,27 @@ mod imp {
             assert_eq!(
                 err.to_string(),
                 "hypervisor error: hv_vcpu_get_trap_debug_exceptions failed with HV_BAD_ARGUMENT (hv_return_t=0xfae94003)"
+            );
+        }
+
+        #[test]
+        fn check_displays_sme_state_operation_hv_return() {
+            let err = check(HV_UNSUPPORTED, "hv_vcpu_get_sme_state")
+                .expect_err("HV_UNSUPPORTED should fail");
+
+            assert_eq!(
+                err.to_string(),
+                "hypervisor error: hv_vcpu_get_sme_state failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)"
+            );
+        }
+
+        #[test]
+        fn missing_sme_state_symbol_reports_macos_boundary() {
+            assert_eq!(
+                sme_state_getter_from_symbol(ptr::null_mut()),
+                Err(BackendError::Unsupported(
+                    SME_STATE_REQUIRES_MACOS_15_2_MESSAGE
+                ))
             );
         }
     }
@@ -669,6 +767,10 @@ mod imp {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 
+    pub fn get_sme_state(_: HvVcpu) -> Result<(bool, bool), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
     pub fn get_simd_fp_reg(_: HvVcpu, _: HvSimdFpReg) -> Result<[u8; 16], BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
@@ -706,7 +808,7 @@ mod tests {
 
     use super::{
         HV_INTERRUPT_TYPE_FIQ, HV_INTERRUPT_TYPE_IRQ, HV_SIMD_FP_REG_Q0, HV_SIMD_FP_REG_Q31,
-        HvSimdFpValue, HvVcpuExit, HvVcpuExitException,
+        HvSimdFpValue, HvVcpuExit, HvVcpuExitException, HvVcpuSmeState,
     };
 
     #[test]
@@ -715,6 +817,14 @@ mod tests {
         assert_eq!(align_of::<HvSimdFpValue>(), 16);
         assert_eq!(HV_SIMD_FP_REG_Q0, 0);
         assert_eq!(HV_SIMD_FP_REG_Q31, 31);
+    }
+
+    #[test]
+    fn sme_state_layout_matches_hvf_sdk() {
+        assert_eq!(size_of::<HvVcpuSmeState>(), 2);
+        assert_eq!(align_of::<HvVcpuSmeState>(), 1);
+        assert_eq!(offset_of!(HvVcpuSmeState, streaming_sve_mode_enabled), 0);
+        assert_eq!(offset_of!(HvVcpuSmeState, za_storage_enabled), 1);
     }
 
     #[test]

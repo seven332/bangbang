@@ -126,6 +126,13 @@ and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
 must not hard-code one feature model, enable SVE/SME, enter streaming mode,
 read vector/predicate/matrix state, run the vCPU, or treat equality as a
 destination compatibility policy.
+SME PSTATE signed tests must runtime-resolve the macOS 15.2 getter and call it
+twice on one idle real vCPU. SME-capable hosts may compare same-vCPU results but
+must not assume or log `PSTATE.SM` or `PSTATE.ZA`. A missing pre-15.2 symbol or
+the getter's exact raw `HV_UNSUPPORTED` result may be treated as documented
+unavailability; every unrelated error must fail. Tests must not call the setter,
+change PSTATE, query maximum SVL, read Z/P/ZA/ZT0, run guest code, or treat the
+flags as complete or safely restorable SME state.
 Cache-selection signed tests must capture CSSELR_EL1 from an idle real vCPU
 without hard-coding or validating its architecturally unknown reset value. They
 must not write the selector, query CCSIDR, execute ISB or cache maintenance, run

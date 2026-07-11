@@ -611,6 +611,40 @@ impl HvfArm64VcpuSveSmeIdentificationRegisterState {
     }
 }
 
+/// Detached SME PSTATE captured from one arm64 vCPU.
+///
+/// Hypervisor.framework exposes these `PSTATE.SM` streaming-SVE-mode and
+/// `PSTATE.ZA` storage-enable flags on macOS 15.2 and newer when SME is
+/// supported. They are mutable guest execution controls, not SVE/SME
+/// identification metadata or the conditionally present Z, P, ZA, and ZT0
+/// register contents. In streaming mode, baseline Q registers alias the low
+/// 128 bits of Z registers. This getter-only value defines no transition,
+/// persistence, snapshot-schema, or restore-ordering policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuSmePstate {
+    streaming_sve_mode_enabled: bool,
+    za_storage_enabled: bool,
+}
+
+impl HvfArm64VcpuSmePstate {
+    pub(crate) const fn new(streaming_sve_mode_enabled: bool, za_storage_enabled: bool) -> Self {
+        Self {
+            streaming_sve_mode_enabled,
+            za_storage_enabled,
+        }
+    }
+
+    /// Return whether streaming SVE mode (`PSTATE.SM`) is enabled.
+    pub const fn streaming_sve_mode_enabled(self) -> bool {
+        self.streaming_sve_mode_enabled
+    }
+
+    /// Return whether ZA storage (`PSTATE.ZA`) is enabled.
+    pub const fn za_storage_enabled(self) -> bool {
+        self.za_storage_enabled
+    }
+}
+
 /// Detached raw EL1 translation-register state captured from one arm64 vCPU.
 ///
 /// This value contains `SCTLR_EL1`, both translation table bases, `TCR_EL1`,
@@ -1178,6 +1212,10 @@ impl HvfVcpuOwner {
         crate::ffi::get_trap_debug_reg_accesses(self.handle()?.vcpu)
     }
 
+    pub(crate) fn get_sme_pstate(&self) -> Result<(bool, bool), BackendError> {
+        crate::ffi::get_sme_state(self.handle()?.vcpu)
+    }
+
     pub(crate) fn configure_arm64_boot_registers(
         &mut self,
         registers: HvfArm64BootRegisters,
@@ -1654,6 +1692,17 @@ pub(crate) fn capture_arm64_vcpu_sve_sme_identification_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_sme_pstate_with(
+    get_sme_pstate: impl FnOnce() -> Result<(bool, bool), BackendError>,
+) -> Result<HvfArm64VcpuSmePstate, BackendError> {
+    let (streaming_sve_mode_enabled, za_storage_enabled) = get_sme_pstate()?;
+
+    Ok(HvfArm64VcpuSmePstate::new(
+        streaming_sve_mode_enabled,
+        za_storage_enabled,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
@@ -1797,7 +1846,7 @@ mod tests {
         capture_arm64_vcpu_pending_interrupt_state_with,
         capture_arm64_vcpu_physical_timer_state_with,
         capture_arm64_vcpu_pointer_authentication_key_state_with,
-        capture_arm64_vcpu_simd_fp_state_with,
+        capture_arm64_vcpu_simd_fp_state_with, capture_arm64_vcpu_sme_pstate_with,
         capture_arm64_vcpu_sve_sme_identification_register_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
         capture_arm64_vcpu_translation_register_state_with,
@@ -2549,6 +2598,27 @@ mod tests {
     }
 
     #[test]
+    fn captures_all_arm64_sme_pstate_combinations_with_one_read() {
+        for (streaming_sve_mode_enabled, za_storage_enabled) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let reads = Cell::new(0);
+            let state = capture_arm64_vcpu_sme_pstate_with(|| {
+                reads.set(reads.get() + 1);
+                Ok((streaming_sve_mode_enabled, za_storage_enabled))
+            })
+            .expect("SME PSTATE capture should succeed");
+
+            assert_eq!(reads.get(), 1);
+            assert_eq!(
+                state.streaming_sve_mode_enabled(),
+                streaming_sve_mode_enabled
+            );
+            assert_eq!(state.za_storage_enabled(), za_storage_enabled);
+        }
+    }
+
+    #[test]
     fn captures_arm64_translation_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -3150,6 +3220,32 @@ mod tests {
             assert!(!state.trap_debug_reg_accesses());
             assert_eq!(reads, expected_reads);
         }
+    }
+
+    #[test]
+    fn failed_arm64_sme_pstate_capture_can_retry_without_partial_state() {
+        let fail_next = Cell::new(true);
+        let reads = Cell::new(0);
+        let read_sme_pstate = || {
+            reads.set(reads.get() + 1);
+            if fail_next.replace(false) {
+                Err(BackendError::InvalidState("fake SME PSTATE capture failed"))
+            } else {
+                Ok((true, false))
+            }
+        };
+
+        assert_eq!(
+            capture_arm64_vcpu_sme_pstate_with(read_sme_pstate),
+            Err(BackendError::InvalidState("fake SME PSTATE capture failed"))
+        );
+        assert_eq!(reads.get(), 1);
+
+        let state = capture_arm64_vcpu_sme_pstate_with(read_sme_pstate)
+            .expect("SME PSTATE capture retry should succeed");
+        assert!(state.streaming_sve_mode_enabled());
+        assert!(!state.za_storage_enabled());
+        assert_eq!(reads.get(), 2);
     }
 
     #[test]

@@ -20,6 +20,34 @@ const PHYSICAL_TIMER_WRITABLE_CONTROL_MASK: u64 = 0b11;
 const PHYSICAL_TIMER_ISTATUS_MASK: u64 = 0b100;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PHYSICAL_TIMER_DEFINED_CONTROL_MASK: u64 = 0b111;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_sme_pstate_capture_supported_or_unavailable(
+    result: Result<bangbang_hvf::HvfArm64VcpuSmePstate, bangbang_hvf::HvfVcpuRunnerError>,
+) -> Result<Option<bangbang_hvf::HvfArm64VcpuSmePstate>, bangbang_hvf::HvfVcpuRunnerError> {
+    use bangbang_hvf::HvfVcpuRunnerError;
+    use bangbang_runtime::BackendError;
+
+    match result {
+        Ok(state) => Ok(Some(state)),
+        Err(HvfVcpuRunnerError::Backend(BackendError::Unsupported(message))) => {
+            assert_eq!(
+                message,
+                "Hypervisor.framework SME state capture requires macOS 15.2 or newer"
+            );
+            Ok(None)
+        }
+        Err(HvfVcpuRunnerError::Backend(BackendError::Hypervisor(message))) => {
+            assert_eq!(
+                message,
+                "hv_vcpu_get_sme_state failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PHYSICAL_TIMER_GUEST_CODE: [u32; 9] = [
     0xd280_0060, // mov x0, #3
@@ -919,6 +947,59 @@ fn captures_arm64_sve_sme_identification_registers_on_runner_thread() {
             first == second,
             "SVE/SME identification state should remain stable within one vCPU lifetime"
         );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn captures_arm64_sme_pstate_on_runner_thread() {
+    use bangbang_hvf::HvfBackend;
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let first =
+            assert_sme_pstate_capture_supported_or_unavailable(runner.capture_arm64_sme_pstate())
+                .expect("first SME PSTATE capture should succeed or report unsupported");
+        let second =
+            assert_sme_pstate_capture_supported_or_unavailable(runner.capture_arm64_sme_pstate())
+                .expect("second SME PSTATE capture should succeed or report unsupported");
+
+        assert_eq!(
+            first.is_some(),
+            second.is_some(),
+            "SME availability should remain stable within one vCPU lifetime"
+        );
+        if let (Some(first), Some(second)) = (first, second) {
+            // Exercise both accessors without assuming or logging the flags,
+            // entering streaming mode, enabling ZA, or reading SME data.
+            let first_values = (
+                first.streaming_sve_mode_enabled(),
+                first.za_storage_enabled(),
+            );
+            let second_values = (
+                second.streaming_sve_mode_enabled(),
+                second.za_storage_enabled(),
+            );
+            assert!(
+                first_values == second_values,
+                "SME PSTATE should remain stable on one idle vCPU"
+            );
+            assert!(
+                first == second,
+                "SME PSTATE value should remain stable on one idle vCPU"
+            );
+        }
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -1844,6 +1925,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .capture_arm64_sve_sme_identification_register_state()
         .expect("internal session should capture SVE/SME identification state");
+    let _sme_pstate =
+        assert_sme_pstate_capture_supported_or_unavailable(session.capture_arm64_sme_pstate())
+            .expect("internal session SME PSTATE capture should succeed or report unsupported");
     session
         .capture_arm64_translation_register_state()
         .expect("internal session should capture translation-register state");
@@ -2023,6 +2107,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_sve_sme_identification_register_state()
         .expect("owned session should capture SVE/SME identification state");
+    let _sme_pstate =
+        assert_sme_pstate_capture_supported_or_unavailable(session.capture_arm64_sme_pstate())
+            .expect("owned session SME PSTATE capture should succeed or report unsupported");
     session
         .capture_arm64_translation_register_state()
         .expect("owned session should capture translation-register state");

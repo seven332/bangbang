@@ -27,7 +27,7 @@ use crate::vcpu::{
     HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
     HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
     HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePstate,
     HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuThreadContextRegisterState,
     HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
     HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
@@ -41,7 +41,7 @@ use crate::vcpu::{
     capture_arm64_vcpu_identification_register_state_with,
     capture_arm64_vcpu_pending_interrupt_state_with, capture_arm64_vcpu_physical_timer_state_with,
     capture_arm64_vcpu_pointer_authentication_key_state_with,
-    capture_arm64_vcpu_simd_fp_state_with,
+    capture_arm64_vcpu_simd_fp_state_with, capture_arm64_vcpu_sme_pstate_with,
     capture_arm64_vcpu_sve_sme_identification_register_state_with,
     capture_arm64_vcpu_thread_context_register_state_with,
     capture_arm64_vcpu_translation_register_state_with,
@@ -307,6 +307,10 @@ enum RunnerCommand {
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuSveSmeIdentificationRegisterState, HvfVcpuRunnerError>>,
     },
+    CaptureArm64SmePstate {
+        admission: InFlightCoreRegisterCapture,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuSmePstate, HvfVcpuRunnerError>>,
+    },
     CaptureArm64TranslationRegisterState {
         admission: InFlightCoreRegisterCapture,
         response_sender:
@@ -529,6 +533,14 @@ trait RunnerVcpu {
             self.read_system_register(register)
         })
     }
+    fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support SME PSTATE reads",
+        ))
+    }
+    fn capture_arm64_sme_pstate(&mut self) -> Result<HvfArm64VcpuSmePstate, BackendError> {
+        capture_arm64_vcpu_sme_pstate_with(|| self.get_sme_pstate())
+    }
     fn capture_arm64_translation_register_state(
         &mut self,
     ) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
@@ -733,6 +745,10 @@ impl RunnerVcpu for RealRunnerVcpu {
 
     fn get_trap_debug_reg_accesses(&mut self) -> Result<bool, BackendError> {
         self.owner.get_trap_debug_reg_accesses()
+    }
+
+    fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+        self.owner.get_sme_pstate()
     }
 
     fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
@@ -1113,6 +1129,20 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<HvfArm64VcpuSveSmeIdentificationRegisterState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_sve_sme_identification_register_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Capture mutable SME PSTATE on the vCPU-owning runner thread.
+    ///
+    /// Hypervisor.framework exposes `PSTATE.SM` and `PSTATE.ZA` on macOS 15.2
+    /// and newer when SME is supported. This getter-only value excludes
+    /// streaming Z/P data, ZA/ZT0 contents, setters, persistence, and restore.
+    pub fn capture_arm64_sme_pstate(&self) -> Result<HvfArm64VcpuSmePstate, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_sme_pstate_capture(response_sender)?;
 
         response_receiver
             .recv()
@@ -1957,6 +1987,19 @@ impl<'vm> HvfVcpuRunner<'vm> {
                     admission,
                     response_sender,
                 }
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_sme_pstate_capture(
+        &self,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuSmePstate, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_core_register_capture(
+            |admission, response_sender| RunnerCommand::CaptureArm64SmePstate {
+                admission,
+                response_sender,
             },
             response_sender,
         )
@@ -3086,6 +3129,19 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::CaptureArm64SmePstate {
+                mut admission,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .capture_arm64_sme_pstate()
+                    .map_err(HvfVcpuRunnerError::Backend);
+                // The owner-thread SME PSTATE getter has finished. Restore
+                // admission before response send so receiver failure is not
+                // part of the capture lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureArm64TranslationRegisterState {
                 mut admission,
                 response_sender,
@@ -3480,7 +3536,7 @@ mod tests {
         HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
         HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
         HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-        HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
+        HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePstate,
         HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuThreadContextRegisterState,
         HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
         HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
@@ -3736,6 +3792,28 @@ mod tests {
     struct PanicOnDebugTrapStateCaptureVcpu;
 
     type BlockingDebugTrapStateCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    struct SmePstateCaptureRecordingVcpu {
+        read_sender: mpsc::Sender<()>,
+        fail_next_read: bool,
+        streaming_sve_mode_enabled: bool,
+        za_storage_enabled: bool,
+    }
+
+    struct BlockingSmePstateCaptureVcpu {
+        entered_capture_sender: mpsc::Sender<()>,
+        release_capture_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnSmePstateCaptureVcpu;
+
+    type BlockingSmePstateCaptureRunner = (
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<(), BackendError>>,
@@ -5606,6 +5684,126 @@ mod tests {
 
         fn get_trap_debug_exceptions(&mut self) -> Result<bool, BackendError> {
             panic!("fake debug-trap state capture panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for SmePstateCaptureRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+            self.read_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake SME PSTATE read receiver closed"))?;
+            if self.fail_next_read {
+                self.fail_next_read = false;
+                Err(BackendError::InvalidState("fake SME PSTATE capture failed"))
+            } else {
+                Ok((self.streaming_sve_mode_enabled, self.za_storage_enabled))
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingSmePstateCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+            self.entered_capture_sender.send(()).map_err(|_| {
+                BackendError::InvalidState("fake SME PSTATE capture entry receiver closed")
+            })?;
+            self.release_capture_receiver.recv().map_err(|_| {
+                BackendError::InvalidState("fake SME PSTATE capture release sender closed")
+            })??;
+            Ok((true, false))
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnSmePstateCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+            panic!("fake SME PSTATE capture panic");
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -7939,6 +8137,18 @@ mod tests {
         );
     }
 
+    fn assert_sme_pstate_test_state(
+        state: HvfArm64VcpuSmePstate,
+        streaming_sve_mode_enabled: bool,
+        za_storage_enabled: bool,
+    ) {
+        assert_eq!(
+            state.streaming_sve_mode_enabled(),
+            streaming_sve_mode_enabled
+        );
+        assert_eq!(state.za_storage_enabled(), za_storage_enabled);
+    }
+
     fn physical_timer_registers() -> [HvfSystemRegister; 3] {
         [
             HvfSystemRegister::CNTKCTL_EL1,
@@ -8107,6 +8317,7 @@ mod tests {
             runner.capture_arm64_sve_sme_identification_register_state(),
             Err(expected.clone())
         );
+        assert_eq!(runner.capture_arm64_sme_pstate(), Err(expected.clone()));
         assert_eq!(
             runner.capture_arm64_translation_register_state(),
             Err(expected.clone())
@@ -8785,6 +8996,51 @@ mod tests {
         )
     }
 
+    fn start_sme_pstate_capture_recording_runner(
+        streaming_sve_mode_enabled: bool,
+        za_storage_enabled: bool,
+        fail_next_read: bool,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<()>) {
+        let (read_sender, read_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(SmePstateCaptureRecordingVcpu {
+                read_sender,
+                fail_next_read,
+                streaming_sve_mode_enabled,
+                za_storage_enabled,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            read_receiver,
+        )
+    }
+
+    fn start_blocking_sme_pstate_capture_runner() -> BlockingSmePstateCaptureRunner {
+        let (entered_capture_sender, entered_capture_receiver) = mpsc::channel();
+        let (release_capture_sender, release_capture_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingSmePstateCaptureVcpu {
+                entered_capture_sender,
+                release_capture_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_capture_receiver,
+            release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
     fn start_identification_register_capture_recording_runner(
         fail_next_register: Option<HvfSystemRegister>,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<HvfSystemRegister>) {
@@ -9370,6 +9626,7 @@ mod tests {
         assert_send_sync::<HvfArm64VcpuGeneralRegisterState>();
         assert_send_sync::<HvfArm64VcpuIdentificationRegisterState>();
         assert_send_sync::<HvfArm64VcpuSveSmeIdentificationRegisterState>();
+        assert_send_sync::<HvfArm64VcpuSmePstate>();
         assert_send_sync::<HvfArm64VcpuPendingInterruptState>();
         assert_send_sync::<HvfArm64VcpuPhysicalTimerState>();
         assert_send_sync::<HvfArm64VcpuPointerAuthenticationKeyState>();
@@ -9940,6 +10197,50 @@ mod tests {
 
             runner.shutdown().expect("runner should shut down");
         }
+    }
+
+    #[test]
+    fn captures_all_arm64_sme_pstate_combinations_on_runner_thread() {
+        for (streaming_sve_mode_enabled, za_storage_enabled) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let (runner, read_receiver) = start_sme_pstate_capture_recording_runner(
+                streaming_sve_mode_enabled,
+                za_storage_enabled,
+                false,
+            );
+
+            let state = runner
+                .capture_arm64_sme_pstate()
+                .expect("SME PSTATE capture should succeed");
+
+            assert_sme_pstate_test_state(state, streaming_sve_mode_enabled, za_storage_enabled);
+            assert_eq!(read_receiver.try_iter().count(), 1);
+
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn failed_arm64_sme_pstate_capture_can_retry_without_partial_state() {
+        let (runner, read_receiver) = start_sme_pstate_capture_recording_runner(true, false, true);
+
+        assert_eq!(
+            runner.capture_arm64_sme_pstate(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake SME PSTATE capture failed"
+            )))
+        );
+        assert_eq!(read_receiver.try_iter().count(), 1);
+
+        let state = runner
+            .capture_arm64_sme_pstate()
+            .expect("SME PSTATE capture retry should succeed");
+        assert_sme_pstate_test_state(state, true, false);
+        assert_eq!(read_receiver.try_iter().count(), 1);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
     }
 
     #[test]
@@ -11847,6 +12148,199 @@ mod tests {
 
         assert_eq!(
             runner.capture_arm64_debug_trap_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn commands_during_arm64_sme_pstate_capture_are_rejected_without_queueing() {
+        let (runner, entered_capture_receiver, release_capture_sender, _barrier_receiver) =
+            start_blocking_sme_pstate_capture_runner();
+
+        thread::scope(|scope| {
+            let capture = scope.spawn(|| runner.capture_arm64_sme_pstate());
+            entered_capture_receiver
+                .recv()
+                .expect("runner should enter fake SME PSTATE capture");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
+            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_capture_sender
+                .send(Ok(()))
+                .expect("SME PSTATE capture release should be sent");
+            let state = capture
+                .join()
+                .expect("SME PSTATE capture thread should join")
+                .expect("SME PSTATE capture should succeed");
+            assert_sme_pstate_test_state(state, true, false);
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_sme_pstate_capture_admitted_until_command_finishes() {
+        let (runner, entered_capture_receiver, release_capture_sender, barrier_receiver) =
+            start_blocking_sme_pstate_capture_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_sme_pstate_capture(response_sender)
+                .expect("SME PSTATE capture should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_capture_receiver
+            .recv()
+            .expect("runner should enter fake SME PSTATE capture");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind capture");
+        release_capture_sender
+            .send(Ok(()))
+            .expect("SME PSTATE capture release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after capture");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn arm64_sme_pstate_capture_send_failure_releases_admission() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.capture_arm64_sme_pstate(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_sme_pstate_capture_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (capture_response_sender, capture_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_sme_pstate_capture(capture_response_sender)
+            .expect("SME PSTATE capture should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(capture_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_sme_pstate_capture_panic() {
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnSmePstateCaptureVcpu));
+
+        assert_eq!(
+            runner.capture_arm64_sme_pstate(),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))

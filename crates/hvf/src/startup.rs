@@ -77,7 +77,7 @@ use crate::vcpu::{
     HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
     HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
     HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePstate,
     HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuThreadContextRegisterState,
     HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
     HvfArm64VcpuWatchpointRegisterState,
@@ -1294,6 +1294,15 @@ impl HvfArm64BootSession<'_> {
             .capture_arm64_sve_sme_identification_register_state()
     }
 
+    /// Capture mutable SME PSTATE on the primary vCPU owner thread.
+    ///
+    /// This macOS 15.2+ getter-only value contains `PSTATE.SM` and
+    /// `PSTATE.ZA`. It excludes SVE/SME register contents, setters,
+    /// persistence, snapshot schema, and restore ordering.
+    pub fn capture_arm64_sme_pstate(&self) -> Result<HvfArm64VcpuSmePstate, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_sme_pstate()
+    }
+
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
     /// This subset omits table memory, feature validation, TLB/cache
@@ -2053,6 +2062,15 @@ impl OwnedHvfArm64BootSession {
     ) -> Result<HvfArm64VcpuSveSmeIdentificationRegisterState, HvfVcpuRunnerError> {
         self.runner
             .capture_arm64_sve_sme_identification_register_state()
+    }
+
+    /// Capture mutable SME PSTATE on the primary vCPU owner thread.
+    ///
+    /// This macOS 15.2+ getter-only value contains `PSTATE.SM` and
+    /// `PSTATE.ZA`. It excludes SVE/SME register contents, setters,
+    /// persistence, snapshot schema, and restore ordering.
+    pub fn capture_arm64_sme_pstate(&self) -> Result<HvfArm64VcpuSmePstate, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_sme_pstate()
     }
 
     /// Capture raw EL1 translation-register state on the primary owner thread.
