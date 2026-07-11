@@ -1210,7 +1210,7 @@ fn captures_all_implemented_arm64_watchpoint_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_arm64_debug_control_registers_on_runner_thread() {
+fn restores_arm64_debug_control_registers_on_runner_thread() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;
 
@@ -1223,20 +1223,32 @@ fn captures_arm64_debug_control_registers_on_runner_thread() {
         let runner = backend
             .start_vcpu_runner()
             .expect("vCPU runner should start");
-        let first = runner
+        let original = runner
             .capture_arm64_debug_control_register_state()
-            .expect("first debug-control state should be captured");
-        let second = runner
+            .expect("original debug-control state should be captured");
+        runner
+            .restore_arm64_debug_control_register_state(&original)
+            .expect("first debug-control state restore should succeed");
+        let first_recapture = runner
             .capture_arm64_debug_control_register_state()
-            .expect("second debug-control state should be captured");
+            .expect("debug-control state should be recaptured after first restore");
+        assert_eq!(first_recapture, original);
+        runner
+            .restore_arm64_debug_control_register_state(&original)
+            .expect("second debug-control state restore should succeed");
+        let second_recapture = runner
+            .capture_arm64_debug_control_register_state()
+            .expect("debug-control state should be recaptured after second restore");
+        assert_eq!(second_recapture, original);
 
-        // Exercise both raw accessors without assuming model-specific values
-        // or stability for security-sensitive control/status fields.
+        // Exercise both accessors without assuming or logging reset values.
+        // Reapplying only the captured original does not manufacture active
+        // debug controls, touch adjacent debug state, or execute the guest.
         let _captured_values = [
-            first.mdccint_el1(),
-            first.mdscr_el1(),
-            second.mdccint_el1(),
-            second.mdscr_el1(),
+            first_recapture.mdccint_el1(),
+            first_recapture.mdscr_el1(),
+            second_recapture.mdccint_el1(),
+            second_recapture.mdscr_el1(),
         ];
 
         runner.shutdown().expect("runner should shut down");
@@ -2867,9 +2879,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .capture_arm64_watchpoint_register_state()
         .expect("internal session should capture watchpoint-register state");
-    session
+    let debug_control_state = session
         .capture_arm64_debug_control_register_state()
         .expect("internal session should capture debug-control state");
+    session
+        .restore_arm64_debug_control_register_state(&debug_control_state)
+        .expect("internal session should restore debug-control state");
     let debug_trap_state = session
         .capture_arm64_debug_trap_state()
         .expect("internal session should capture debug-trap state");
@@ -3107,9 +3122,12 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_watchpoint_register_state()
         .expect("owned session should capture watchpoint-register state");
-    session
+    let debug_control_state = session
         .capture_arm64_debug_control_register_state()
         .expect("owned session should capture debug-control state");
+    session
+        .restore_arm64_debug_control_register_state(&debug_control_state)
+        .expect("owned session should restore debug-control state");
     let debug_trap_state = session
         .capture_arm64_debug_trap_state()
         .expect("owned session should capture debug-trap state");

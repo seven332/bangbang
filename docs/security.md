@@ -318,6 +318,15 @@ is resource-specific:
   nor supplies ISB/dependent CCSIDR visibility or cache maintenance. After
   failure, retry the complete retained value or discard the vCPU before
   execution.
+  The paired debug-control restore extends the boundary to raw `MDCCINT_EL1`
+  and `MDSCR_EL1`. It accepts only the complete typed capture, writes MDCCINT
+  then MDSCR, and reports the exact failed register, completed prefix, and
+  backend source without either raw value. A retained value can request monitor
+  debug, stepping, or DCC behavior; after partial failure, retry the complete
+  value or discard the vCPU before execution. The primitive provides no
+  feature/writable-bit or destination validation, comparator or host trap-policy
+  coordination, protected persistence, rollback, schema, or safe complete debug
+  restore.
   The paired debug-trap restore extends the boundary to Hypervisor.framework's
   host debug-exception and debug-register-access policies. It accepts only the
   complete two-Boolean typed capture, writes exception policy then register-
@@ -384,10 +393,10 @@ is resource-specific:
   must protect confidentiality, and future restore must validate each
   destination count, features, control bits, ordering, and host trap policy.
   MDCCINT and MDSCR can reveal security-sensitive guest debugging controls and
-  status. The two-field getter does not enable debug behavior, but it is not a
-  safe restore model: raw writes could activate monitor debug, software
-  stepping, or debug communications behavior. Breakpoint and watchpoint
-  comparators are captured through separate values.
+  status. The bounded pair apply can reapply a complete capture, but raw writes
+  can activate monitor debug, software stepping, or debug communications
+  behavior and are not a validated safe restore model. Breakpoint/watchpoint
+  comparators and host trap policy use separate values and operations.
   Hypervisor.framework's separate debug-exception and debug-register-access
   booleans reveal whether guest debug exceptions and documented debug-register
   accesses exit to the host. The bounded pair apply can reapply a complete

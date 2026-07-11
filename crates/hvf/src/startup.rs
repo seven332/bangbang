@@ -1326,13 +1326,26 @@ impl HvfArm64BootSession<'_> {
     /// Capture raw EL1 MDCCINT and MDSCR debug controls on the primary owner
     /// thread.
     ///
-    /// This getter-only subset excludes the separately captured breakpoint,
-    /// watchpoint, and HVF trap state, feature validation, persistence, debug
-    /// activation, and a safe restore sequence.
+    /// Capture reads this incomplete guest debug subset only and excludes the
+    /// separately captured comparator and host trap-policy state.
     pub fn capture_arm64_debug_control_register_state(
         &self,
     ) -> Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_debug_control_register_state()
+    }
+
+    /// Restore raw EL1 MDCCINT and MDSCR controls on the primary owner thread.
+    ///
+    /// The two writes are ordered and nontransactional. Retry the complete
+    /// typed state or discard the vCPU after failure. This primitive excludes
+    /// feature/writable-bit validation, comparator/trap coordination,
+    /// persistence, wider debug ordering, and public snapshot-load behavior.
+    pub fn restore_arm64_debug_control_register_state(
+        &self,
+        state: &HvfArm64VcpuDebugControlRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_debug_control_register_state(state)
     }
 
     /// Capture Hypervisor.framework debug-trap policy on the primary owner thread.
@@ -2344,13 +2357,26 @@ impl OwnedHvfArm64BootSession {
     /// Capture raw EL1 MDCCINT and MDSCR debug controls on the primary owner
     /// thread.
     ///
-    /// This getter-only subset excludes the separately captured breakpoint,
-    /// watchpoint, and HVF trap state, feature validation, persistence, debug
-    /// activation, and a safe restore sequence.
+    /// Capture reads this incomplete guest debug subset only and excludes the
+    /// separately captured comparator and host trap-policy state.
     pub fn capture_arm64_debug_control_register_state(
         &self,
     ) -> Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_debug_control_register_state()
+    }
+
+    /// Restore raw EL1 MDCCINT and MDSCR controls on the primary owner thread.
+    ///
+    /// The two writes are ordered and nontransactional. Retry the complete
+    /// typed state or discard the vCPU after failure. This primitive excludes
+    /// feature/writable-bit validation, comparator/trap coordination,
+    /// persistence, wider debug ordering, and public snapshot-load behavior.
+    pub fn restore_arm64_debug_control_register_state(
+        &self,
+        state: &HvfArm64VcpuDebugControlRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_debug_control_register_state(state)
     }
 
     /// Capture Hypervisor.framework debug-trap policy on the primary owner thread.
