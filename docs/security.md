@@ -285,11 +285,13 @@ is resource-specific:
   future persistence must protect key confidentiality and integrity. The opaque
   GIC byte value uses a custom `Debug` implementation that reports only its
   length rather than formatting its contents.
-  The separate MIDR, MPIDR, PFR, DFR, ISAR, and MMFR capture is read-only
-  virtual-CPU/HVF compatibility metadata rather than mutable execution state,
-  but it can fingerprint the exposed processor feature model. It must not be
-  logged or persisted without a defined need and must not be mistaken for
-  physical-host identity or a trusted destination compatibility decision.
+  The separate MIDR, MPIDR, PFR, DFR, ISAR, and MMFR baseline plus optional
+  ZFR0/SMFR0 capture are read-only virtual-CPU/HVF compatibility metadata rather
+  than mutable execution state, but they can fingerprint the exposed processor
+  feature model. They must not be logged or persisted without a defined need
+  and must not be mistaken for physical-host identity or a trusted destination
+  compatibility decision. The optional IDs do not contain or protect streaming
+  SVE/SME execution state.
   Current internal capture commands keep these values in process memory and do
   not write them to logs, metrics, error strings, or persistence. The raw
   virtual-timer offset is tied to HVF's host-time relation, the physical-timer

@@ -78,8 +78,9 @@ use crate::vcpu::{
     HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
     HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
     HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
-    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
-    HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState,
+    HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuThreadContextRegisterState,
+    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
+    HvfArm64VcpuWatchpointRegisterState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1282,6 +1283,17 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_identification_register_state()
     }
 
+    /// Capture optional SVE/SME identification metadata on the primary owner thread.
+    ///
+    /// These macOS 15.2+ ZFR0/SMFR0 compatibility inputs exclude feature masks,
+    /// destination policy, SVE/SME execution state, persistence, and restore.
+    pub fn capture_arm64_sve_sme_identification_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSveSmeIdentificationRegisterState, HvfVcpuRunnerError> {
+        self.runner
+            .capture_arm64_sve_sme_identification_register_state()
+    }
+
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
     /// This subset omits table memory, feature validation, TLB/cache
@@ -2030,6 +2042,17 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuIdentificationRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_identification_register_state()
+    }
+
+    /// Capture optional SVE/SME identification metadata on the primary owner thread.
+    ///
+    /// These macOS 15.2+ ZFR0/SMFR0 compatibility inputs exclude feature masks,
+    /// destination policy, SVE/SME execution state, persistence, and restore.
+    pub fn capture_arm64_sve_sme_identification_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSveSmeIdentificationRegisterState, HvfVcpuRunnerError> {
+        self.runner
+            .capture_arm64_sve_sme_identification_register_state()
     }
 
     /// Capture raw EL1 translation-register state on the primary owner thread.

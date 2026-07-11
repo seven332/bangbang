@@ -48,10 +48,10 @@ backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary,
-guest-visible identification-register metadata, pointer-authentication
-key-state capture with redacted `Debug`, raw cache-selection, hardware-
-breakpoint, hardware-watchpoint, debug-control, debug-trap policy, and physical-
-timer capture, a virtual-timer mask/offset/control/CVAL boundary, a bounded
+baseline and optional SVE/SME guest-visible identification metadata, pointer-
+authentication key-state capture with redacted `Debug`, raw cache-selection,
+hardware-breakpoint, hardware-watchpoint, debug-control, debug-trap policy, and
+physical-timer capture, a virtual-timer mask/offset/control/CVAL boundary, a bounded
 internal boot-session run-loop pump, owned internal boot-session handle,
 process-level owned
 startup-session wiring with optional serial capture and boot run-loop supervision
@@ -1672,10 +1672,12 @@ order without writing or enabling debug state. A thirteenth reads
 `DBGWVR<n>_EL1` / `DBGWCR<n>_EL1` pair in ascending order under the same
 observation-only constraints. A fourteenth calls Hypervisor.framework's
 debug-exception trap getter then its debug-register-access trap getter, exposing
-the two host TDE/TDA-equivalent policy booleans without calling either setter.
-The fourteen commands share one command-owned core-register admission domain,
-publish no partial state after a read failure, and are exposed by borrowed and
-owned HVF boot sessions for later lease-owned orchestration.
+the two host TDE/TDA-equivalent policy booleans without calling either setter. A
+fifteenth reads optional `ID_AA64ZFR0_EL1` then `ID_AA64SMFR0_EL1`
+compatibility metadata and requires macOS 15.2. The fifteen commands share one
+command-owned core-register admission domain, publish no partial state after a
+read failure, and are exposed by borrowed and owned HVF boot sessions for later
+lease-owned orchestration.
 TPIDR values can contain
 guest TLS or kernel pointers; translation table bases, context ids, fault
 addresses, and the vector base are sensitive; pointer-authentication keys are
@@ -1684,22 +1686,26 @@ identities; watchpoint values reveal guest data virtual addresses; comparator
 and debug controls plus host debug-trap policy are security-sensitive execution
 state; and the optional SME-era `TPIDR2_EL0` remains outside the baseline. The
 key value redacts all material from `Debug` but provides raw named accessors for
-trusted internal composition. Identification values describe the virtual CPU/HVF view,
-including bangbang's deterministic MPIDR affinity zero; they are not
+trusted internal composition. Identification values describe the virtual CPU/
+HVF view, including bangbang's deterministic MPIDR affinity zero; they are not
 physical-host identity or a destination compatibility decision. The stable
-baseline omits macOS 15.2 SVE/SME IDs and newer beta-only IDs. The translation
-value omits table memory, feature validation, TLB/cache maintenance, and an
-ordered restore path. The exception value omits vector-table memory, semantic
-validation, and safe restore ordering. Signed validation leaves the MMU
-disabled, uses an aligned unused VBAR without an intervening guest exception,
-and accepts implementation-defined AMAIR and AFSR readback after guest writes.
+baseline keeps macOS 15.2 ZFR0/SMFR0 metadata in a separate optional value;
+newer beta-only IDs and configuration-time feature manifests remain omitted.
+The translation value omits table memory, feature validation, TLB/cache
+maintenance, and an ordered restore path. The exception value omits vector-
+table memory, semantic validation, and safe restore ordering. Signed validation
+leaves the MMU disabled, uses an aligned unused VBAR without an intervening guest
+exception, and accepts implementation-defined AMAIR and AFSR readback after guest writes.
 Execution-control validation writes only EnTSO and baseline FPEN, executes ISB,
 and does not cover optional CPACR features. Key validation uses visibly fake
 values and does not enable or execute PAC. Identification validation compares
 two captures and the existing MPIDR getter without hard-coding an Apple CPU
-model or claiming destination portability. Debug-control validation only reads
-both values from an idle real vCPU; it does not enable monitor debug, software
-stepping, debug exceptions, guest debug-register access, or DCC interrupts.
+model or claiming destination portability. Optional SVE/SME identification
+validation reads ZFR0/SMFR0 twice from an idle macOS 15.2+ vCPU without enabling
+SVE/SME, entering streaming mode, reading execution state, running the guest,
+or treating equality as a destination policy. Debug-control validation only
+reads both values from an idle real vCPU; it does not enable monitor debug,
+software stepping, debug exceptions, guest debug-register access, or DCC interrupts.
 Breakpoint and watchpoint comparators and their respective DFR0-reported counts
 are captured through separate values. HVF's separate debug-exception and debug-
 register-access trap booleans are captured through another value and correspond
@@ -1730,14 +1736,15 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 `CNTVCT_EL0 = mach_absolute_time() - offset` relation, while control ISTATUS is
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
-or control-restore policy. The identification, core system-register, exception,
-execution-control, cache-selection, breakpoint, watchpoint, debug-control,
-debug-trap, translation, pointer-authentication, thread-context, baseline
-SIMD/FP, and physical-timer subsets are raw and read-only and likewise have no
-restore validation, snapshot schema, or Firecracker on-disk compatibility.
-Identification capture is compatibility
-metadata rather than mutable restore state and defines no feature-mask or
-destination policy. Debug-control and debug-trap capture remain separate and
+or control-restore policy. The baseline and optional SVE/SME identification,
+core system-register, exception, execution-control, cache-selection,
+breakpoint, watchpoint, debug-control, debug-trap, translation,
+pointer-authentication, thread-context, baseline SIMD/FP, and physical-timer
+subsets are raw and read-only and likewise have no restore validation, snapshot
+schema, or Firecracker on-disk compatibility.
+Identification capture is compatibility metadata rather than mutable restore
+state and defines no feature-mask or destination policy. Debug-control and
+debug-trap capture remain separate and
 define no feature, writable/status-bit, security, setter, trap-coordination,
 synchronization, or restore policy.
 Cache-selection capture defines no topology manifest, selector validation,
@@ -2118,11 +2125,13 @@ macOS design work instead of direct implementation:
   pairs as sensitive observation-only state. A thirteenth reads DFR0 first and
   captures only the implemented hardware-watchpoint value/control pairs under
   the same constraints. A fourteenth captures Hypervisor.framework's two raw
-  host debug-trap policy booleans without invoking either setter. Stable-
-  baseline optional SVE/SME IDs, newer beta-only IDs, feature masking, destination
-  policy, streaming SVE/SME state, table and vector memory, optional CPACR and
-  pointer-authentication feature validation, cache feature/CCSIDR manifests,
-  selector validation and maintenance, breakpoint and watchpoint control
+  host debug-trap policy booleans without invoking either setter. A fifteenth
+  captures optional macOS 15.2 ZFR0/SMFR0 compatibility metadata separately
+  from the stable baseline. Newer beta-only IDs, configuration-time feature
+  manifests, feature masking, destination policy, streaming SVE/SME state,
+  table and vector memory, optional CPACR and pointer-authentication feature
+  validation, cache feature/CCSIDR manifests, selector validation and
+  maintenance, breakpoint and watchpoint control
   validation, debug-trap policy validation/setters, protected key persistence,
   and restore ordering remain outside these subsets.
   The runner can capture raw CNTKCTL_EL1,

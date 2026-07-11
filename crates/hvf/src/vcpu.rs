@@ -474,9 +474,9 @@ impl HvfArm64VcpuDebugTrapState {
 /// These guest-visible MIDR, MPIDR, and baseline `ID_AA64*` values describe
 /// the virtual CPU and Hypervisor.framework feature model. They are raw inputs
 /// for later compatibility checks, not physical-host identity, mutable guest
-/// state, or a destination compatibility decision. Optional SVE/SME and newer
-/// identification registers, persistence, and a serialized schema remain
-/// outside this value.
+/// state, or a destination compatibility decision. Optional SVE/SME
+/// identification metadata is captured separately; newer identification
+/// registers, persistence, and a serialized schema remain outside this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuIdentificationRegisterState {
     midr_el1: u64,
@@ -575,6 +575,39 @@ impl HvfArm64VcpuIdentificationRegisterState {
     /// Return the raw `ID_AA64MMFR2_EL1` value.
     pub const fn id_aa64mmfr2_el1(self) -> u64 {
         self.id_aa64mmfr2_el1
+    }
+}
+
+/// Detached optional SVE/SME identification metadata captured from one arm64 vCPU.
+///
+/// Hypervisor.framework exposes these guest-visible `ID_AA64ZFR0_EL1` and
+/// `ID_AA64SMFR0_EL1` values on macOS 15.2 and newer. They describe the virtual
+/// CPU feature model and are raw inputs for later compatibility checks, not
+/// mutable guest execution state, complete SVE/SME state, or a destination
+/// compatibility decision. Feature masks, persistence, snapshot schema, and
+/// restore behavior remain outside this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuSveSmeIdentificationRegisterState {
+    id_aa64zfr0_el1: u64,
+    id_aa64smfr0_el1: u64,
+}
+
+impl HvfArm64VcpuSveSmeIdentificationRegisterState {
+    pub(crate) const fn new(id_aa64zfr0_el1: u64, id_aa64smfr0_el1: u64) -> Self {
+        Self {
+            id_aa64zfr0_el1,
+            id_aa64smfr0_el1,
+        }
+    }
+
+    /// Return the raw `ID_AA64ZFR0_EL1` value.
+    pub const fn id_aa64zfr0_el1(self) -> u64 {
+        self.id_aa64zfr0_el1
+    }
+
+    /// Return the raw `ID_AA64SMFR0_EL1` value.
+    pub const fn id_aa64smfr0_el1(self) -> u64 {
+        self.id_aa64smfr0_el1
     }
 }
 
@@ -942,6 +975,8 @@ impl HvfSystemRegister {
     pub const MPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MPIDR_EL1);
     pub const ID_AA64PFR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64PFR0_EL1);
     pub const ID_AA64PFR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64PFR1_EL1);
+    pub const ID_AA64ZFR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64ZFR0_EL1);
+    pub const ID_AA64SMFR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64SMFR0_EL1);
     pub const ID_AA64DFR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64DFR0_EL1);
     pub const ID_AA64DFR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64DFR1_EL1);
     pub const ID_AA64ISAR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64ISAR0_EL1);
@@ -1607,6 +1642,18 @@ pub(crate) fn capture_arm64_vcpu_identification_register_state_with(
     Ok(HvfArm64VcpuIdentificationRegisterState::new(values))
 }
 
+pub(crate) fn capture_arm64_vcpu_sve_sme_identification_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuSveSmeIdentificationRegisterState, BackendError> {
+    let id_aa64zfr0_el1 = get_system_register(HvfSystemRegister::ID_AA64ZFR0_EL1)?;
+    let id_aa64smfr0_el1 = get_system_register(HvfSystemRegister::ID_AA64SMFR0_EL1)?;
+
+    Ok(HvfArm64VcpuSveSmeIdentificationRegisterState::new(
+        id_aa64zfr0_el1,
+        id_aa64smfr0_el1,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
@@ -1751,6 +1798,7 @@ mod tests {
         capture_arm64_vcpu_physical_timer_state_with,
         capture_arm64_vcpu_pointer_authentication_key_state_with,
         capture_arm64_vcpu_simd_fp_state_with,
+        capture_arm64_vcpu_sve_sme_identification_register_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
         capture_arm64_vcpu_translation_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with,
@@ -1783,6 +1831,13 @@ mod tests {
             HvfSystemRegister::ID_AA64MMFR0_EL1,
             HvfSystemRegister::ID_AA64MMFR1_EL1,
             HvfSystemRegister::ID_AA64MMFR2_EL1,
+        ]
+    }
+
+    fn sve_sme_identification_registers() -> [HvfSystemRegister; 2] {
+        [
+            HvfSystemRegister::ID_AA64ZFR0_EL1,
+            HvfSystemRegister::ID_AA64SMFR0_EL1,
         ]
     }
 
@@ -2612,6 +2667,29 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_sve_sme_identification_register_state_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_sve_sme_identification_register_state_with(|register| {
+            reads.push(register);
+            Ok(identification_test_value(register))
+        })
+        .expect("SVE/SME identification-register capture should succeed");
+
+        let registers = sve_sme_identification_registers();
+        assert_eq!(reads, registers);
+        assert_eq!(
+            state.id_aa64zfr0_el1(),
+            identification_test_value(registers[0])
+        );
+        assert_eq!(
+            state.id_aa64smfr0_el1(),
+            identification_test_value(registers[1])
+        );
+        assert_eq!(registers.map(HvfSystemRegister::raw), [0xc024, 0xc025]);
+    }
+
+    #[test]
     fn captures_arm64_pointer_authentication_keys_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -3193,6 +3271,51 @@ mod tests {
             assert_eq!(
                 state.id_aa64mmfr2_el1(),
                 identification_test_value(registers[10])
+            );
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_sve_sme_identification_capture_stops_after_each_error_and_can_retry() {
+        let registers = sve_sme_identification_registers();
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake SVE/SME identification register read failed",
+                    ))
+                } else {
+                    Ok(identification_test_value(register))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_sve_sme_identification_register_state_with(
+                    &read_system_register
+                ),
+                Err(BackendError::InvalidState(
+                    "fake SVE/SME identification register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_sve_sme_identification_register_state_with(
+                &read_system_register,
+            )
+            .expect("SVE/SME identification-register capture retry should succeed");
+            assert_eq!(
+                state.id_aa64zfr0_el1(),
+                identification_test_value(registers[0])
+            );
+            assert_eq!(
+                state.id_aa64smfr0_el1(),
+                identification_test_value(registers[1])
             );
             assert_eq!(*reads.borrow(), registers);
         }
