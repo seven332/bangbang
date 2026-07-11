@@ -326,6 +326,14 @@ mod imp {
     }
 
     unsafe extern "C" {
+        fn bangbang_hv_vcpu_set_simd_fp_reg(
+            vcpu: HvVcpu,
+            reg: HvSimdFpReg,
+            value: *const u8,
+        ) -> HvReturn;
+    }
+
+    unsafe extern "C" {
         fn os_release(object: *mut c_void);
     }
 
@@ -1003,6 +1011,22 @@ mod imp {
         };
 
         Ok(value.into_bytes())
+    }
+
+    pub fn set_simd_fp_reg(
+        vcpu: HvVcpu,
+        reg: HvSimdFpReg,
+        value: [u8; 16],
+    ) -> Result<(), BackendError> {
+        // SAFETY: The caller owns this current-thread vCPU handle. The target-gated C shim
+        // reads exactly 16 bytes from `value` during the call, materializes the SDK vector
+        // with Clang's ABI, and does not retain the pointer.
+        unsafe {
+            check(
+                bangbang_hv_vcpu_set_simd_fp_reg(vcpu, reg, value.as_ptr()),
+                "hv_vcpu_set_simd_fp_reg",
+            )
+        }
     }
 
     pub fn get_sys_reg(vcpu: HvVcpu, reg: HvSysReg) -> Result<u64, BackendError> {
@@ -2077,6 +2101,10 @@ mod imp {
     }
 
     pub fn get_simd_fp_reg(_: HvVcpu, _: HvSimdFpReg) -> Result<[u8; 16], BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn set_simd_fp_reg(_: HvVcpu, _: HvSimdFpReg, _: [u8; 16]) -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 

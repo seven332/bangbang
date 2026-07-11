@@ -28,8 +28,8 @@ use crate::vcpu::{
     HvfArm64VcpuGeneralRegisterRestoreError, HvfArm64VcpuGeneralRegisterState,
     HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
     HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
-    HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState,
-    HvfArm64VcpuSmePstate, HvfArm64VcpuSmeSystemRegisterState,
+    HvfArm64VcpuSimdFpRestoreError, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePRegisterCaptureError,
+    HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate, HvfArm64VcpuSmeSystemRegisterState,
     HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
     HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
     HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState,
@@ -59,7 +59,7 @@ use crate::vcpu::{
     restore_arm64_vcpu_core_system_register_state_with,
     restore_arm64_vcpu_exception_register_state_with,
     restore_arm64_vcpu_execution_control_register_state_with,
-    restore_arm64_vcpu_general_register_state_with,
+    restore_arm64_vcpu_general_register_state_with, restore_arm64_vcpu_simd_fp_state_with,
     restore_arm64_vcpu_thread_context_register_state_with,
     restore_arm64_vcpu_translation_register_state_with,
 };
@@ -98,6 +98,7 @@ pub enum HvfVcpuRunnerError {
     Backend(BackendError),
     Gic(HvfGicError),
     GeneralRegisterRestore(HvfArm64VcpuGeneralRegisterRestoreError),
+    SimdFpRestore(HvfArm64VcpuSimdFpRestoreError),
     SystemRegisterRestore(HvfArm64VcpuSystemRegisterRestoreError),
     SmePRegisterCapture(HvfArm64VcpuSmePRegisterCaptureError),
     SmeZRegisterCapture(HvfArm64VcpuSmeZRegisterCaptureError),
@@ -149,6 +150,7 @@ impl fmt::Display for HvfVcpuRunnerError {
             Self::Backend(err) => write!(f, "{err}"),
             Self::Gic(err) => write!(f, "{err}"),
             Self::GeneralRegisterRestore(err) => write!(f, "{err}"),
+            Self::SimdFpRestore(err) => write!(f, "{err}"),
             Self::SystemRegisterRestore(err) => write!(f, "{err}"),
             Self::SmePRegisterCapture(err) => write!(f, "{err}"),
             Self::SmeZRegisterCapture(err) => write!(f, "{err}"),
@@ -179,6 +181,7 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::Backend(err) => Some(err),
             Self::Gic(err) => Some(err),
             Self::GeneralRegisterRestore(err) => Some(err),
+            Self::SimdFpRestore(err) => Some(err),
             Self::SystemRegisterRestore(err) => Some(err),
             Self::SmePRegisterCapture(err) => Some(err),
             Self::SmeZRegisterCapture(err) => Some(err),
@@ -210,6 +213,12 @@ impl From<HvfGicError> for HvfVcpuRunnerError {
 impl From<HvfArm64VcpuGeneralRegisterRestoreError> for HvfVcpuRunnerError {
     fn from(err: HvfArm64VcpuGeneralRegisterRestoreError) -> Self {
         Self::GeneralRegisterRestore(err)
+    }
+}
+
+impl From<HvfArm64VcpuSimdFpRestoreError> for HvfVcpuRunnerError {
+    fn from(err: HvfArm64VcpuSimdFpRestoreError) -> Self {
+        Self::SimdFpRestore(err)
     }
 }
 
@@ -456,6 +465,11 @@ enum RunnerCommand {
         admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSimdFpState, HvfVcpuRunnerError>>,
     },
+    RestoreArm64SimdFpState {
+        admission: InFlightCoreRegisterOperation,
+        state: Box<HvfArm64VcpuSimdFpState>,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
     GetVtimerMask {
         response_sender: mpsc::Sender<Result<bool, HvfVcpuRunnerError>>,
     },
@@ -573,11 +587,31 @@ trait RunnerVcpu {
             "vCPU does not support SIMD/FP register reads",
         ))
     }
+    fn write_simd_fp_register(
+        &mut self,
+        _register: HvfSimdFpRegister,
+        _value: [u8; 16],
+    ) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support SIMD/FP register writes",
+        ))
+    }
     fn capture_arm64_simd_fp_state(&mut self) -> Result<HvfArm64VcpuSimdFpState, BackendError> {
         capture_arm64_vcpu_simd_fp_state_with(
             self,
             |vcpu, register| vcpu.read_simd_fp_register(register),
             |vcpu, register| vcpu.read_register(register),
+        )
+    }
+    fn restore_arm64_simd_fp_state(
+        &mut self,
+        state: &HvfArm64VcpuSimdFpState,
+    ) -> Result<(), HvfArm64VcpuSimdFpRestoreError> {
+        restore_arm64_vcpu_simd_fp_state_with(
+            state,
+            self,
+            |vcpu, register, value| vcpu.write_simd_fp_register(register, value),
+            |vcpu, register, value| vcpu.write_register(register, value),
         )
     }
     fn read_system_register(&mut self, _register: HvfSystemRegister) -> Result<u64, BackendError> {
@@ -1004,6 +1038,14 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner.get_simd_fp_register(register)
     }
 
+    fn write_simd_fp_register(
+        &mut self,
+        register: HvfSimdFpRegister,
+        value: [u8; 16],
+    ) -> Result<(), BackendError> {
+        self.owner.set_simd_fp_register(register, value)
+    }
+
     fn read_system_register(&mut self, register: HvfSystemRegister) -> Result<u64, BackendError> {
         self.owner.get_system_register(register)
     }
@@ -1179,6 +1221,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Err(
                 HvfVcpuRunnerError::Gic(_)
                 | HvfVcpuRunnerError::GeneralRegisterRestore(_)
+                | HvfVcpuRunnerError::SimdFpRestore(_)
                 | HvfVcpuRunnerError::SystemRegisterRestore(_)
                 | HvfVcpuRunnerError::SmePRegisterCapture(_)
                 | HvfVcpuRunnerError::SmeZRegisterCapture(_)
@@ -1729,6 +1772,26 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<HvfArm64VcpuSimdFpState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_simd_fp_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Restore raw Q0-Q31, FPCR, and FPSR values on the vCPU-owning runner
+    /// thread.
+    ///
+    /// The 34 writes follow capture order and are not transactional. After an
+    /// error, retry the complete typed state or discard the vCPU before
+    /// execution. In streaming SVE mode, Q writes also change the aliased low
+    /// 128 bits of Z registers; this primitive defines no wider-state ordering,
+    /// feature/destination validation, rollback, or snapshot schema.
+    pub fn restore_arm64_simd_fp_state(
+        &self,
+        state: &HvfArm64VcpuSimdFpState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_simd_fp_restore(state.clone(), response_sender)?;
 
         response_receiver
             .recv()
@@ -2706,6 +2769,21 @@ impl<'vm> HvfVcpuRunner<'vm> {
         self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64SimdFpState {
                 admission,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_simd_fp_restore(
+        &self,
+        state: HvfArm64VcpuSimdFpState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_core_register_operation(
+            |admission, response_sender| RunnerCommand::RestoreArm64SimdFpState {
+                admission,
+                state: Box::new(state),
                 response_sender,
             },
             response_sender,
@@ -4049,6 +4127,20 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::RestoreArm64SimdFpState {
+                mut admission,
+                state,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .restore_arm64_simd_fp_state(&state)
+                    .map_err(HvfVcpuRunnerError::SimdFpRestore);
+                // The last owner-thread write or first failed write has
+                // finished. Restore admission before responding so receiver
+                // failure is not part of the restore lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::GetVtimerMask { response_sender } => {
                 let result = vcpu.get_vtimer_mask().map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
@@ -4393,19 +4485,20 @@ mod tests {
         HvfArm64VcpuGeneralRegisterRestoreError, HvfArm64VcpuGeneralRegisterState,
         HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
         HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
-        HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePRegisterCaptureError,
-        HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate, HvfArm64VcpuSmeSystemRegisterState,
-        HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
-        HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
-        HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState,
-        HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuSystemContextRegisterState,
-        HvfArm64VcpuSystemRegisterRestoreError, HvfArm64VcpuThreadContextRegisterState,
-        HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
-        HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
-        HvfSystemRegister, capture_arm64_vcpu_core_system_register_state_with,
+        HvfArm64VcpuSimdFpRestoreError, HvfArm64VcpuSimdFpRestoreRegister, HvfArm64VcpuSimdFpState,
+        HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate,
+        HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
+        HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError,
+        HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZt0RegisterCaptureError,
+        HvfArm64VcpuSmeZt0RegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
+        HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuSystemRegisterRestoreError,
+        HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+        HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState, HvfInterruptType,
+        HvfRegister, HvfSimdFpRegister, HvfSystemRegister,
+        capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_exception_register_state_with,
         capture_arm64_vcpu_execution_control_register_state_with,
-        capture_arm64_vcpu_general_register_state_with,
+        capture_arm64_vcpu_general_register_state_with, capture_arm64_vcpu_simd_fp_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
         capture_arm64_vcpu_translation_register_state_with,
     };
@@ -5066,6 +5159,21 @@ mod tests {
         Scalar(HvfRegister),
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimdFpRestoreWrite {
+        Q(HvfSimdFpRegister, [u8; 16]),
+        Scalar(HvfRegister, u64),
+    }
+
+    impl SimdFpRestoreWrite {
+        const fn register(self) -> HvfArm64VcpuSimdFpRestoreRegister {
+            match self {
+                Self::Q(register, _) => HvfArm64VcpuSimdFpRestoreRegister::SimdFp(register),
+                Self::Scalar(register, _) => HvfArm64VcpuSimdFpRestoreRegister::Scalar(register),
+            }
+        }
+    }
+
     struct SimdFpCaptureRecordingVcpu {
         read_sender: mpsc::Sender<SimdFpCaptureRead>,
         fail_next_read: Option<SimdFpCaptureRead>,
@@ -5079,7 +5187,27 @@ mod tests {
 
     struct PanicOnSimdFpCaptureVcpu;
 
+    struct SimdFpRestoreRecordingVcpu {
+        write_sender: mpsc::Sender<SimdFpRestoreWrite>,
+        fail_next_register: Option<HvfArm64VcpuSimdFpRestoreRegister>,
+    }
+
+    struct BlockingSimdFpRestoreVcpu {
+        entered_restore_sender: mpsc::Sender<()>,
+        release_restore_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnSimdFpRestoreVcpu;
+
     type BlockingSimdFpCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    type BlockingSimdFpRestoreRunner = (
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<(), BackendError>>,
@@ -9365,6 +9493,163 @@ mod tests {
         }
     }
 
+    impl SimdFpRestoreRecordingVcpu {
+        fn record_write(&mut self, write: SimdFpRestoreWrite) -> Result<(), BackendError> {
+            self.write_sender
+                .send(write)
+                .map_err(|_| BackendError::InvalidState("fake SIMD/FP write receiver closed"))?;
+            if self.fail_next_register == Some(write.register()) {
+                self.fail_next_register = None;
+                Err(BackendError::InvalidState("fake SIMD/FP restore failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl RunnerVcpu for SimdFpRestoreRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            self.record_write(SimdFpRestoreWrite::Scalar(register, value))
+        }
+
+        fn write_simd_fp_register(
+            &mut self,
+            register: HvfSimdFpRegister,
+            value: [u8; 16],
+        ) -> Result<(), BackendError> {
+            self.record_write(SimdFpRestoreWrite::Q(register, value))
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingSimdFpRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn write_register(
+            &mut self,
+            _register: HvfRegister,
+            _value: u64,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn write_simd_fp_register(
+            &mut self,
+            register: HvfSimdFpRegister,
+            _value: [u8; 16],
+        ) -> Result<(), BackendError> {
+            if register == HvfSimdFpRegister::q(0).expect("Q0 should map to a SIMD register") {
+                self.entered_restore_sender.send(()).map_err(|_| {
+                    BackendError::InvalidState("fake SIMD/FP restore entry receiver closed")
+                })?;
+                self.release_restore_receiver.recv().map_err(|_| {
+                    BackendError::InvalidState("fake SIMD/FP restore release sender closed")
+                })??;
+            }
+
+            Ok(())
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnSimdFpRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn write_simd_fp_register(
+            &mut self,
+            _register: HvfSimdFpRegister,
+            _value: [u8; 16],
+        ) -> Result<(), BackendError> {
+            panic!("fake SIMD/FP restore panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for PhysicalTimerCaptureRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -10716,6 +11001,32 @@ mod tests {
             .collect()
     }
 
+    fn simd_fp_restore_test_state() -> HvfArm64VcpuSimdFpState {
+        let mut reader = ();
+        capture_arm64_vcpu_simd_fp_state_with(
+            &mut reader,
+            |_, register| Ok(simd_fp_capture_q_value(register)),
+            |_, register| Ok(0x4_0000 + u64::from(register.raw())),
+        )
+        .expect("SIMD/FP restore test state should be captured")
+    }
+
+    fn expected_simd_fp_restore_writes(state: &HvfArm64VcpuSimdFpState) -> Vec<SimdFpRestoreWrite> {
+        (0_u8..32)
+            .zip(state.q_registers())
+            .map(|(index, value)| {
+                SimdFpRestoreWrite::Q(
+                    HvfSimdFpRegister::q(index).expect("Q0-Q31 should map to SIMD registers"),
+                    *value,
+                )
+            })
+            .chain([
+                SimdFpRestoreWrite::Scalar(HvfRegister::FPCR, state.fpcr()),
+                SimdFpRestoreWrite::Scalar(HvfRegister::FPSR, state.fpsr()),
+            ])
+            .collect()
+    }
+
     fn exception_registers() -> [HvfSystemRegister; 6] {
         [
             HvfSystemRegister::AFSR0_EL1,
@@ -11512,7 +11823,11 @@ mod tests {
                 .restore_arm64_thread_context_register_state(&thread_context_restore_test_state()),
             Err(expected.clone())
         );
-        assert_eq!(runner.capture_arm64_simd_fp_state(), Err(expected));
+        assert_eq!(runner.capture_arm64_simd_fp_state(), Err(expected.clone()));
+        assert_eq!(
+            runner.restore_arm64_simd_fp_state(&simd_fp_restore_test_state()),
+            Err(expected)
+        );
     }
 
     fn assert_timer_operations_rejected(runner: &HvfVcpuRunner<'_>, expected: HvfVcpuRunnerError) {
@@ -12988,6 +13303,47 @@ mod tests {
         )
     }
 
+    fn start_simd_fp_restore_recording_runner(
+        fail_next_register: Option<HvfArm64VcpuSimdFpRestoreRegister>,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<SimdFpRestoreWrite>) {
+        let (write_sender, write_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(SimdFpRestoreRecordingVcpu {
+                write_sender,
+                fail_next_register,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            write_receiver,
+        )
+    }
+
+    fn start_blocking_simd_fp_restore_runner() -> BlockingSimdFpRestoreRunner {
+        let (entered_restore_sender, entered_restore_receiver) = mpsc::channel();
+        let (release_restore_sender, release_restore_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingSimdFpRestoreVcpu {
+                entered_restore_sender,
+                release_restore_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_restore_receiver,
+            release_restore_sender,
+            barrier_receiver,
+        )
+    }
+
     fn start_physical_timer_capture_recording_runner(
         fail_next_register: Option<HvfSystemRegister>,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<HvfSystemRegister>) {
@@ -13360,6 +13716,8 @@ mod tests {
         assert_send_sync::<HvfArm64VcpuPendingInterruptState>();
         assert_send_sync::<HvfArm64VcpuPhysicalTimerState>();
         assert_send_sync::<HvfArm64VcpuPointerAuthenticationKeyState>();
+        assert_send_sync::<HvfArm64VcpuSimdFpRestoreError>();
+        assert_send_sync::<HvfArm64VcpuSimdFpRestoreRegister>();
         assert_send_sync::<HvfArm64VcpuSimdFpState>();
         assert_send_sync::<HvfArm64VcpuThreadContextRegisterState>();
         assert_send_sync::<HvfArm64VcpuTranslationRegisterState>();
@@ -14988,6 +15346,59 @@ mod tests {
             assert_eq!(state.fpcr(), 0x4_0000 + u64::from(HvfRegister::FPCR.raw()));
             assert_eq!(state.fpsr(), 0x4_0000 + u64::from(HvfRegister::FPSR.raw()));
             assert_eq!(read_receiver.try_iter().collect::<Vec<_>>(), expected_reads);
+            assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn restores_arm64_simd_fp_state_on_runner_thread() {
+        let state = simd_fp_restore_test_state();
+        let expected = expected_simd_fp_restore_writes(&state);
+        let (runner, write_receiver) = start_simd_fp_restore_recording_runner(None);
+
+        runner
+            .restore_arm64_simd_fp_state(&state)
+            .expect("SIMD/FP restore should succeed");
+
+        assert_eq!(write_receiver.try_iter().collect::<Vec<_>>(), expected);
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn every_arm64_simd_fp_restore_failure_is_typed_and_retryable() {
+        use std::error::Error as _;
+
+        let state = simd_fp_restore_test_state();
+        let expected = expected_simd_fp_restore_writes(&state);
+
+        for (failed_index, failed_write) in expected.iter().copied().enumerate() {
+            let failed_register = failed_write.register();
+            let (runner, write_receiver) =
+                start_simd_fp_restore_recording_runner(Some(failed_register));
+
+            let error = runner
+                .restore_arm64_simd_fp_state(&state)
+                .expect_err("injected SIMD/FP write should fail");
+            let HvfVcpuRunnerError::SimdFpRestore(error) = error else {
+                panic!("SIMD/FP restore failure should retain its typed context");
+            };
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake SIMD/FP restore failed".to_string())
+            );
+            assert_eq!(
+                write_receiver.try_iter().collect::<Vec<_>>(),
+                expected[..=failed_index]
+            );
+
+            runner
+                .restore_arm64_simd_fp_state(&state)
+                .expect("complete SIMD/FP restore retry should succeed");
+            assert_eq!(write_receiver.try_iter().collect::<Vec<_>>(), expected);
             assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
             runner.shutdown().expect("runner should shut down");
@@ -20380,6 +20791,202 @@ mod tests {
 
         assert_eq!(
             runner.capture_arm64_simd_fp_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn commands_during_arm64_simd_fp_restore_are_rejected_without_queueing() {
+        let state = simd_fp_restore_test_state();
+        let (runner, entered_restore_receiver, release_restore_sender, _barrier_receiver) =
+            start_blocking_simd_fp_restore_runner();
+
+        thread::scope(|scope| {
+            let restore = scope.spawn(|| runner.restore_arm64_simd_fp_state(&state));
+            entered_restore_receiver
+                .recv()
+                .expect("runner should enter fake SIMD/FP restore");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_restore_sender
+                .send(Ok(()))
+                .expect("SIMD/FP restore release should be sent");
+            restore
+                .join()
+                .expect("SIMD/FP restore thread should join")
+                .expect("SIMD/FP restore should succeed");
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_arm64_simd_fp_restore_admitted_until_command_finishes() {
+        let state = simd_fp_restore_test_state();
+        let (runner, entered_restore_receiver, release_restore_sender, barrier_receiver) =
+            start_blocking_simd_fp_restore_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_simd_fp_restore(state.clone(), response_sender)
+                .expect("SIMD/FP restore should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_restore_receiver
+            .recv()
+            .expect("runner should enter fake SIMD/FP restore");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind restore");
+        release_restore_sender
+            .send(Ok(()))
+            .expect("SIMD/FP restore release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after restore");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn arm64_simd_fp_restore_send_failure_releases_admission() {
+        let state = simd_fp_restore_test_state();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.restore_arm64_simd_fp_state(&state),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_arm64_simd_fp_restore_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (restore_response_sender, restore_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_simd_fp_restore(simd_fp_restore_test_state(), restore_response_sender)
+            .expect("SIMD/FP restore should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(restore_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn simd_fp_restore_panic_releases_admission() {
+        let state = simd_fp_restore_test_state();
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnSimdFpRestoreVcpu));
+
+        assert_eq!(
+            runner.restore_arm64_simd_fp_state(&state),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))

@@ -301,9 +301,19 @@ is resource-specific:
   memory, feature or destination validation, barriers, TLB/cache maintenance,
   safe MMU transition sequence, rollback, or wider restore ordering. It must
   preserve actual implementation-defined AMAIR readback; after failure, retry
-  the complete retained value or discard the vCPU before execution. Public
-  snapshot load invokes none of the six restore primitives.
-  SIMD/FP bytes can contain guest application or cryptographic working data.
+  the complete retained value or discard the vCPU before execution.
+  The paired baseline SIMD/FP restore extends the boundary to Q0-Q31, FPCR, and
+  FPSR. It accepts only the complete typed capture, writes all 34 fields in
+  capture order, and reports the exact SIMD/FP or scalar register space,
+  completed prefix, and backend source without values. Q bytes can contain guest
+  application or cryptographic working data. The target-gated C shim receives
+  only a transient 16-byte pointer, copies it into the SDK vector, and retains
+  nothing. In streaming mode Q writes alias the low 128 bits of Z registers;
+  this primitive provides no wider Z/P/ZA/ZT0 ordering, feature or destination
+  validation, FPCR/FPSR writable-bit policy, protected persistence,
+  zeroization, rollback, or schema. After failure, retry the complete retained
+  value or discard the vCPU before execution. Public snapshot load invokes none
+  of the seven restore primitives.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
   expose guest process or kernel context identifiers.
   FAR and PAR can expose guest fault or translation-result addresses, VBAR can

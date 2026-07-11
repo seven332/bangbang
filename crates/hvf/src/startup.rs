@@ -1495,12 +1495,26 @@ impl HvfArm64BootSession<'_> {
     /// Capture raw Q0-Q31, FPCR, and FPSR values on the primary vCPU owner
     /// thread.
     ///
-    /// This baseline SIMD/FP view omits SVE/SME state, restore policy, and the
-    /// wider snapshot inventory.
+    /// This baseline SIMD/FP view has a paired low-level capture-order restore,
+    /// but omits SVE/SME state, alias ordering, validation, and the wider
+    /// snapshot inventory.
     pub fn capture_arm64_simd_fp_state(
         &self,
     ) -> Result<HvfArm64VcpuSimdFpState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_simd_fp_state()
+    }
+
+    /// Restore raw Q0-Q31, FPCR, and FPSR values on the primary owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. SVE/SME alias ordering, validation, rollback, schema,
+    /// and snapshot orchestration remain outside this primitive.
+    pub fn restore_arm64_simd_fp_state(
+        &self,
+        state: &HvfArm64VcpuSimdFpState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_simd_fp_state(state)
     }
 
     /// Capture raw EL1 physical-timer state on the primary owner thread.
@@ -2421,12 +2435,26 @@ impl OwnedHvfArm64BootSession {
     /// Capture raw Q0-Q31, FPCR, and FPSR values on the primary vCPU owner
     /// thread.
     ///
-    /// This baseline SIMD/FP view omits SVE/SME state, restore policy, and the
-    /// wider snapshot inventory.
+    /// This baseline SIMD/FP view has a paired low-level capture-order restore,
+    /// but omits SVE/SME state, alias ordering, validation, and the wider
+    /// snapshot inventory.
     pub fn capture_arm64_simd_fp_state(
         &self,
     ) -> Result<HvfArm64VcpuSimdFpState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_simd_fp_state()
+    }
+
+    /// Restore raw Q0-Q31, FPCR, and FPSR values on the primary owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. SVE/SME alias ordering, validation, rollback, schema,
+    /// and snapshot orchestration remain outside this primitive.
+    pub fn restore_arm64_simd_fp_state(
+        &self,
+        state: &HvfArm64VcpuSimdFpState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_simd_fp_state(state)
     }
 
     /// Capture raw EL1 physical-timer state on the primary owner thread.

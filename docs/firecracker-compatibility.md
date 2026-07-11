@@ -1663,7 +1663,11 @@ owner-thread restore operation that writes the same four fields in capture
 order. A reusable system-register failure identifies the exact failed register
 and completed-write count; the writes are nontransactional and require the same
 complete-retry-or-discard rule. A third capture reads all 16 bytes of
-Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
+Q0-Q31 in ascending order, then raw FPCR and FPSR. Its typed value has a paired
+owner-thread restore that writes the same 34 fields in capture order. A
+dedicated typed failure distinguishes the SIMD/FP and scalar register spaces,
+identifies the completed prefix, and requires the same complete-retry-or-
+discard rule. A fourth reads raw
 `TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. Its typed value has a paired
 owner-thread restore that writes the same three fields in capture order under
 the reusable system-register partial-write contract. A fifth reads raw `SCTLR_EL1`,
@@ -1717,10 +1721,11 @@ requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
 commands plus the general-, core-system-, exception-register, execution-
-control, thread-context, and translation restore operations form a twenty-eight-operation,
-command-owned core-register admission domain. Captures publish no partial state
+control, thread-context, translation, and baseline SIMD/FP restore operations
+form a twenty-nine-operation command-owned core-register admission domain.
+Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose all six restores
+setter failure. Borrowed and owned HVF boot sessions expose all seven restores
 and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
@@ -1904,9 +1909,13 @@ also creates/runs no vCPU, touches no live selector, issues no live CCSIDR read
 or ISB, and performs no maintenance. The selector is not cache topology: the
 default feature triple and geometry are independent fresh-configuration
 queries, not one atomic compatibility manifest.
-The SIMD getter uses an explicitly 16-byte-aligned HVF output value; the
-separate SME PSTATE observation determines whether streaming mode is active,
-where its Q values alias only the low 128 bits of Z registers. The separate
+The SIMD getter uses an explicitly 16-byte-aligned HVF output value. The SDK
+setter instead accepts a Clang vector by value, which stable Rust cannot declare
+through `extern "C"`; one macOS arm64 C shim accepts an ordinary 16-byte pointer
+and invokes the SDK with Clang's matching vector ABI. The separate SME PSTATE
+observation determines whether streaming mode is active, where Q writes and
+reads alias the low 128 bits of Z registers. The baseline restore defines no
+ordering with that wider state. The separate
 maximum-width Z capture contains Z0-Z31 only when streaming mode is already
 active; the separate maximum-derived P capture contains P0-P15 under the same
 precondition. The separate maximum-square ZA and fixed-size SME2 ZT0 captures
@@ -1932,13 +1941,14 @@ or control-restore policy. The baseline and optional SVE/SME identification,
 SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register, system-context,
 cache-selection, breakpoint, watchpoint,
 debug-control, debug-trap,
-pointer-authentication, baseline SIMD/FP, and physical-timer
+pointer-authentication, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
 The core system-register, EL1 exception, execution-control, thread-context, and
-translation subsets have paired ordered, nontransactional restore operations
-but likewise have no validation, schema, dependent-memory, maintenance,
-feature-transition, or wider ordering policy.
+translation subsets plus baseline SIMD/FP have paired ordered,
+nontransactional restore operations but likewise have no validation, schema,
+dependent-memory, maintenance, feature-transition, SVE/SME alias, or wider
+ordering policy.
 Identification capture is compatibility metadata rather than mutable restore
 state and defines no feature-mask or destination policy. Debug-control and
 debug-trap capture remain separate and
@@ -2309,7 +2319,10 @@ macOS design work instead of direct implementation:
   admission domain. It can also reapply that complete typed system-register
   value in capture order through another nontransactional owner-thread
   operation. A third command captures baseline Q0-Q31, FPCR, and FPSR
-  state under that admission, retaining every 128-bit Q value; a fourth
+  state under that admission, retaining every 128-bit Q value, and can reapply
+  the complete typed value in capture order through a nontransactional
+  owner-thread operation whose SIMD setters cross one target-gated C ABI shim;
+  it defines no SVE/SME alias ordering or destination validation. A fourth
   captures raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values while keeping
   TPIDR2_EL0 in the separate SME system-register subset, and can reapply the
   complete typed value in capture order without validating guest pointers or

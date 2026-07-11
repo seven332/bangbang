@@ -221,6 +221,72 @@ impl std::error::Error for HvfArm64VcpuSystemRegisterRestoreError {
     }
 }
 
+/// Register space containing a failed baseline arm64 SIMD/FP state write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64VcpuSimdFpRestoreRegister {
+    /// One Q0-Q31 register written through Hypervisor.framework's SIMD/FP API.
+    SimdFp(HvfSimdFpRegister),
+    /// `FPCR` or `FPSR` written through Hypervisor.framework's scalar API.
+    Scalar(HvfRegister),
+}
+
+/// Failure while restoring one field of baseline arm64 SIMD/FP state.
+///
+/// Hypervisor.framework writes one register at a time and provides no batch
+/// transaction. Registers before [`Self::failed_register`] have already been
+/// written when this error is returned. Callers must retry the complete typed
+/// state or discard the vCPU before execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64VcpuSimdFpRestoreError {
+    failed_register: HvfArm64VcpuSimdFpRestoreRegister,
+    completed_writes: usize,
+    source: BackendError,
+}
+
+impl HvfArm64VcpuSimdFpRestoreError {
+    const fn new(
+        failed_register: HvfArm64VcpuSimdFpRestoreRegister,
+        completed_writes: usize,
+        source: BackendError,
+    ) -> Self {
+        Self {
+            failed_register,
+            completed_writes,
+            source,
+        }
+    }
+
+    /// Return the typed register whose setter failed.
+    pub const fn failed_register(&self) -> HvfArm64VcpuSimdFpRestoreRegister {
+        self.failed_register
+    }
+
+    /// Return the number of target registers written before the failure.
+    pub const fn completed_writes(&self) -> usize {
+        self.completed_writes
+    }
+}
+
+impl fmt::Display for HvfArm64VcpuSimdFpRestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (register_space, register_id) = match self.failed_register {
+            HvfArm64VcpuSimdFpRestoreRegister::SimdFp(register) => ("SIMD/FP", register.raw()),
+            HvfArm64VcpuSimdFpRestoreRegister::Scalar(register) => ("scalar", register.raw()),
+        };
+        write!(
+            f,
+            "failed to restore arm64 {register_space} register id {register_id} after {} successful writes: {}",
+            self.completed_writes, self.source
+        )
+    }
+}
+
+impl std::error::Error for HvfArm64VcpuSimdFpRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Detached raw core system-register state captured from one arm64 vCPU.
 ///
 /// This stack and exception-return subset contains `SP_EL0`, `SP_EL1`,
@@ -1476,8 +1542,11 @@ impl HvfArm64VcpuThreadContextRegisterState {
 ///
 /// This value contains Q0-Q31, FPCR, and FPSR. Each Q register is preserved as
 /// 16 uninterpreted bytes. In streaming SVE mode, Hypervisor.framework aliases
-/// these Q values to the low 128 bits of the corresponding Z registers, so this
-/// is not complete SVE/SME or restorable vCPU state.
+/// these Q values to the low 128 bits of the corresponding Z registers. The
+/// complete typed value can be reapplied through an owner-thread primitive, but
+/// that raw operation defines no streaming-mode or Q/Z ordering, feature or
+/// destination validation, writable-bit policy, persistence, rollback, schema,
+/// or complete SVE/SME restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HvfArm64VcpuSimdFpState {
     q_registers: [[u8; 16]; 32],
@@ -1853,6 +1922,14 @@ impl HvfVcpuOwner {
         crate::ffi::get_simd_fp_reg(self.handle()?.vcpu, register.raw())
     }
 
+    pub(crate) fn set_simd_fp_register(
+        &mut self,
+        register: HvfSimdFpRegister,
+        value: [u8; 16],
+    ) -> Result<(), BackendError> {
+        crate::ffi::set_simd_fp_reg(self.handle()?.vcpu, register.raw(), value)
+    }
+
     pub(crate) fn set_register(
         &mut self,
         register: HvfRegister,
@@ -2073,6 +2150,18 @@ impl<'vm> HvfVcpu<'vm> {
         register: HvfSimdFpRegister,
     ) -> Result<[u8; 16], BackendError> {
         self.owner.get_simd_fp_register(register)
+    }
+
+    /// Write one raw 128-bit Q-register value on this current-thread vCPU.
+    ///
+    /// In streaming SVE mode, this also changes the low 128 bits of the aliased
+    /// Z register. The caller is responsible for wider-state ordering.
+    pub fn set_simd_fp_register(
+        &mut self,
+        register: HvfSimdFpRegister,
+        value: [u8; 16],
+    ) -> Result<(), BackendError> {
+        self.owner.set_simd_fp_register(register, value)
     }
 
     pub fn set_register(&mut self, register: HvfRegister, value: u64) -> Result<(), BackendError> {
@@ -2872,6 +2961,47 @@ pub(crate) fn capture_arm64_vcpu_simd_fp_state_with<R: ?Sized>(
     Ok(HvfArm64VcpuSimdFpState::new(q_registers, fpcr, fpsr))
 }
 
+pub(crate) fn restore_arm64_vcpu_simd_fp_state_with<W: ?Sized>(
+    state: &HvfArm64VcpuSimdFpState,
+    writer: &mut W,
+    mut set_simd_fp_register: impl FnMut(
+        &mut W,
+        HvfSimdFpRegister,
+        [u8; 16],
+    ) -> Result<(), BackendError>,
+    mut set_register: impl FnMut(&mut W, HvfRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuSimdFpRestoreError> {
+    let mut completed_writes = 0;
+    for (index, value) in (0_u8..32).zip(state.q_registers()) {
+        let register =
+            HvfSimdFpRegister(crate::ffi::HV_SIMD_FP_REG_Q0 + crate::ffi::HvSimdFpReg::from(index));
+        set_simd_fp_register(writer, register, *value).map_err(|source| {
+            HvfArm64VcpuSimdFpRestoreError::new(
+                HvfArm64VcpuSimdFpRestoreRegister::SimdFp(register),
+                completed_writes,
+                source,
+            )
+        })?;
+        completed_writes += 1;
+    }
+
+    for (register, value) in [
+        (HvfRegister::FPCR, state.fpcr()),
+        (HvfRegister::FPSR, state.fpsr()),
+    ] {
+        set_register(writer, register, value).map_err(|source| {
+            HvfArm64VcpuSimdFpRestoreError::new(
+                HvfArm64VcpuSimdFpRestoreRegister::Scalar(register),
+                completed_writes,
+                source,
+            )
+        })?;
+        completed_writes += 1;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn capture_arm64_vcpu_virtual_timer_state_with(
     get_mask: impl FnOnce() -> Result<bool, BackendError>,
@@ -2905,12 +3035,13 @@ mod tests {
 
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters,
-        HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState,
-        HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
-        HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
-        HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState, HvfInterruptType,
-        HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
-        NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_breakpoint_register_state_with,
+        HvfArm64VcpuSimdFpRestoreRegister, HvfArm64VcpuSmePRegisterCaptureError,
+        HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
+        HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError,
+        HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZt0RegisterCaptureError,
+        HvfArm64VcpuSmeZt0RegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
+        HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
+        capture_arm64_vcpu_breakpoint_register_state_with,
         capture_arm64_vcpu_cache_selection_register_state_with,
         capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_debug_control_register_state_with,
@@ -2934,7 +3065,7 @@ mod tests {
         restore_arm64_vcpu_core_system_register_state_with,
         restore_arm64_vcpu_exception_register_state_with,
         restore_arm64_vcpu_execution_control_register_state_with,
-        restore_arm64_vcpu_general_register_state_with,
+        restore_arm64_vcpu_general_register_state_with, restore_arm64_vcpu_simd_fp_state_with,
         restore_arm64_vcpu_thread_context_register_state_with,
         restore_arm64_vcpu_translation_register_state_with,
     };
@@ -2944,6 +3075,21 @@ mod tests {
     enum SimdFpRead {
         Q(HvfSimdFpRegister),
         Scalar(HvfRegister),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimdFpWrite {
+        Q(HvfSimdFpRegister, [u8; 16]),
+        Scalar(HvfRegister, u64),
+    }
+
+    impl SimdFpWrite {
+        const fn register(self) -> HvfArm64VcpuSimdFpRestoreRegister {
+            match self {
+                Self::Q(register, _) => HvfArm64VcpuSimdFpRestoreRegister::SimdFp(register),
+                Self::Scalar(register, _) => HvfArm64VcpuSimdFpRestoreRegister::Scalar(register),
+            }
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3269,6 +3415,32 @@ mod tests {
             .chain([
                 SimdFpRead::Scalar(HvfRegister::FPCR),
                 SimdFpRead::Scalar(HvfRegister::FPSR),
+            ])
+            .collect()
+    }
+
+    fn simd_fp_restore_test_state() -> super::HvfArm64VcpuSimdFpState {
+        let mut reader = ();
+        capture_arm64_vcpu_simd_fp_state_with(
+            &mut reader,
+            |_, register| Ok(simd_fp_q_value(register)),
+            |_, register| Ok(0x3_0000 + u64::from(register.raw())),
+        )
+        .expect("SIMD/FP restore test state should be captured")
+    }
+
+    fn expected_simd_fp_writes(state: &super::HvfArm64VcpuSimdFpState) -> Vec<SimdFpWrite> {
+        (0_u8..32)
+            .zip(state.q_registers())
+            .map(|(index, value)| {
+                SimdFpWrite::Q(
+                    HvfSimdFpRegister::q(index).expect("Q0-Q31 should map to SIMD registers"),
+                    *value,
+                )
+            })
+            .chain([
+                SimdFpWrite::Scalar(HvfRegister::FPCR, state.fpcr()),
+                SimdFpWrite::Scalar(HvfRegister::FPSR, state.fpsr()),
             ])
             .collect()
     }
@@ -6321,6 +6493,90 @@ mod tests {
         assert_eq!(state.q_register(32), None);
         assert_eq!(state.fpcr(), 0x3_0000 + u64::from(HvfRegister::FPCR.raw()));
         assert_eq!(state.fpsr(), 0x3_0000 + u64::from(HvfRegister::FPSR.raw()));
+    }
+
+    #[test]
+    fn restores_arm64_simd_fp_state_in_capture_order() {
+        let state = simd_fp_restore_test_state();
+        let expected = expected_simd_fp_writes(&state);
+        let writes = RefCell::new(Vec::new());
+        let mut writer = ();
+
+        restore_arm64_vcpu_simd_fp_state_with(
+            &state,
+            &mut writer,
+            |_, register, value| {
+                writes.borrow_mut().push(SimdFpWrite::Q(register, value));
+                Ok(())
+            },
+            |_, register, value| {
+                writes
+                    .borrow_mut()
+                    .push(SimdFpWrite::Scalar(register, value));
+                Ok(())
+            },
+        )
+        .expect("SIMD/FP restore should succeed");
+
+        assert_eq!(*writes.borrow(), expected);
+    }
+
+    #[test]
+    fn every_arm64_simd_fp_restore_failure_stops_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = simd_fp_restore_test_state();
+        let expected = expected_simd_fp_writes(&state);
+
+        for (failed_index, failed_write) in expected.iter().copied().enumerate() {
+            let failed_register = failed_write.register();
+            let fail_once = Cell::new(true);
+            let writes = RefCell::new(Vec::new());
+            let record_write = |write: SimdFpWrite| {
+                writes.borrow_mut().push(write);
+                if write.register() == failed_register && fail_once.replace(false) {
+                    Err(BackendError::InvalidState("fake SIMD/FP restore failed"))
+                } else {
+                    Ok(())
+                }
+            };
+            let mut writer = ();
+
+            let error = restore_arm64_vcpu_simd_fp_state_with(
+                &state,
+                &mut writer,
+                |_, register, value| record_write(SimdFpWrite::Q(register, value)),
+                |_, register, value| record_write(SimdFpWrite::Scalar(register, value)),
+            )
+            .expect_err("injected SIMD/FP write should fail");
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake SIMD/FP restore failed".to_string())
+            );
+            assert_eq!(*writes.borrow(), expected[..=failed_index]);
+            let (register_space, register_id) = match failed_register {
+                HvfArm64VcpuSimdFpRestoreRegister::SimdFp(register) => ("SIMD/FP", register.raw()),
+                HvfArm64VcpuSimdFpRestoreRegister::Scalar(register) => ("scalar", register.raw()),
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 {register_space} register id {register_id} after {failed_index} successful writes: invalid backend state: fake SIMD/FP restore failed"
+                )
+            );
+
+            writes.borrow_mut().clear();
+            restore_arm64_vcpu_simd_fp_state_with(
+                &state,
+                &mut writer,
+                |_, register, value| record_write(SimdFpWrite::Q(register, value)),
+                |_, register, value| record_write(SimdFpWrite::Scalar(register, value)),
+            )
+            .expect("complete SIMD/FP restore retry should succeed");
+            assert_eq!(*writes.borrow(), expected);
+        }
     }
 
     #[test]

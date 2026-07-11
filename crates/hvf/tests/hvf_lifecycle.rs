@@ -2019,7 +2019,7 @@ fn captures_and_restores_guest_written_arm64_thread_context_registers_on_runner_
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_guest_written_arm64_simd_fp_state_on_runner_thread() {
+fn captures_and_restores_guest_written_arm64_simd_fp_state_on_runner_thread() {
     use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
     use bangbang_runtime::VmBackend;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
@@ -2076,6 +2076,28 @@ fn captures_guest_written_arm64_simd_fp_state_on_runner_thread() {
         assert_eq!(state.q_register(31), Some(SIMD_FP_TEST_Q31));
         assert_eq!(state.fpcr(), SIMD_FP_TEST_FPCR);
         assert_eq!(state.fpsr(), SIMD_FP_TEST_FPSR);
+
+        runner
+            .restore_arm64_simd_fp_state(&state)
+            .expect("SIMD/FP state should be restored");
+        let restored = runner
+            .capture_arm64_simd_fp_state()
+            .expect("SIMD/FP state should be recaptured after restore");
+        assert!(
+            restored == state,
+            "SIMD/FP state should round trip without exposing values"
+        );
+
+        runner
+            .restore_arm64_simd_fp_state(&state)
+            .expect("repeated SIMD/FP restore should succeed");
+        let repeated = runner
+            .capture_arm64_simd_fp_state()
+            .expect("SIMD/FP state should be recaptured after repeated restore");
+        assert!(
+            repeated == state,
+            "repeated SIMD/FP restore should preserve the complete state"
+        );
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -2797,9 +2819,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .restore_arm64_thread_context_register_state(&thread_context_state)
         .expect("internal session should restore thread-context register state");
-    session
+    let simd_fp_state = session
         .capture_arm64_simd_fp_state()
         .expect("internal session should capture SIMD/FP state");
+    session
+        .restore_arm64_simd_fp_state(&simd_fp_state)
+        .expect("internal session should restore SIMD/FP state");
     session
         .capture_arm64_physical_timer_state()
         .expect("internal session should capture physical-timer state");
@@ -3019,9 +3044,12 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .restore_arm64_thread_context_register_state(&thread_context_state)
         .expect("owned session should restore thread-context register state");
-    session
+    let simd_fp_state = session
         .capture_arm64_simd_fp_state()
         .expect("owned session should capture SIMD/FP state");
+    session
+        .restore_arm64_simd_fp_state(&simd_fp_state)
+        .expect("owned session should restore SIMD/FP state");
     session
         .capture_arm64_physical_timer_state()
         .expect("owned session should capture physical-timer state");
