@@ -71,8 +71,8 @@ use crate::runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 use crate::vcpu::{
-    HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState,
+    HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuExceptionRegisterState,
+    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState,
     HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
     HvfArm64VcpuVirtualTimerState,
 };
@@ -1189,6 +1189,16 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_core_system_register_state()
     }
 
+    /// Capture raw EL1 exception-register state on the primary owner thread.
+    ///
+    /// This subset omits vector-table memory, semantic validation,
+    /// persistence, and a safe restore sequence.
+    pub fn capture_arm64_exception_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuExceptionRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_exception_register_state()
+    }
+
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
     /// This subset omits table memory, feature validation, TLB/cache
@@ -1828,6 +1838,16 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuCoreSystemRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_core_system_register_state()
+    }
+
+    /// Capture raw EL1 exception-register state on the primary owner thread.
+    ///
+    /// This subset omits vector-table memory, semantic validation,
+    /// persistence, and a safe restore sequence.
+    pub fn capture_arm64_exception_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuExceptionRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_exception_register_state()
     }
 
     /// Capture raw EL1 translation-register state on the primary owner thread.

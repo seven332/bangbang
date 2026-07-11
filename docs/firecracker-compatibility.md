@@ -1651,15 +1651,19 @@ X0-X30, PC, and CPSR have all been read. A second command reads raw `SP_EL0`,
 Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
 `TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. A fifth reads raw `SCTLR_EL1`,
 `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1`, `MAIR_EL1`, `AMAIR_EL1`, and
-`CONTEXTIDR_EL1`. The five commands share one
+`CONTEXTIDR_EL1`. A sixth reads raw `AFSR0_EL1`, `AFSR1_EL1`, `ESR_EL1`,
+`FAR_EL1`, `PAR_EL1`, and `VBAR_EL1`. The six commands share one
 command-owned core-register admission domain, publish no partial state after a
 read failure, and are exposed by borrowed and owned HVF boot sessions for later
 lease-owned orchestration. TPIDR values can contain guest TLS or kernel
-pointers; translation table bases and context ids are sensitive; and the
-optional SME-era `TPIDR2_EL0` remains outside the baseline. The translation
-value omits table memory, feature validation, TLB/cache maintenance, and an
-ordered restore path. Signed validation leaves the MMU disabled and accepts
-implementation-defined AMAIR readback after a guest write.
+pointers; translation table bases, context ids, fault addresses, and the vector
+base are sensitive; and the optional SME-era `TPIDR2_EL0` remains outside the
+baseline. The translation value omits table memory, feature validation,
+TLB/cache maintenance, and an ordered restore path. The exception value omits
+vector-table memory, semantic validation, and safe restore ordering. Signed
+validation leaves the MMU disabled, uses an aligned unused VBAR without an
+intervening guest exception, and accepts implementation-defined AMAIR and AFSR
+readback after guest writes.
 The SIMD getter uses an explicitly 16-byte-aligned
 HVF output value; in streaming SVE mode, its Q values alias only the low 128
 bits of Z registers and are not complete SVE/SME state. A separate command
@@ -1670,7 +1674,7 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 `CNTVCT_EL0 = mach_absolute_time() - offset` relation, while control ISTATUS is
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
-or control-restore policy. The core system-register, translation,
+or control-restore policy. The core system-register, exception, translation,
 thread-context, and baseline SIMD/FP subsets are raw and read-only and likewise
 have no restore validation, snapshot schema, or Firecracker on-disk
 compatibility. The process snapshot barrier invokes none of these captures.
@@ -2034,11 +2038,12 @@ macOS design work instead of direct implementation:
   captures raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values while excluding
   TPIDR2_EL0; and a fifth captures raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1,
   TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 translation state.
-  Streaming SVE/SME state, table memory, and translation restore ordering
-  remain outside these subsets. It also
-  gets and sets the HVF
-  virtual-timer mask, raw offset, raw control, and raw CVAL on that owning
-  thread and can capture those fields through one serialized command. It can
+  A sixth captures raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and
+  VBAR_EL1 exception state. Streaming SVE/SME state, table and vector memory,
+  semantic validation, and restore ordering remain outside these subsets. The
+  runner also gets and sets the HVF virtual-timer mask, raw offset, raw control,
+  and raw CVAL on that owning thread and can capture those fields through one
+  serialized command. It can
   also capture Hypervisor.framework's stable, versioned opaque GIC device blob
   except CPU system registers while the current single-vCPU runner is stopped.
   A companion owner-thread command captures all ten EL1 ICC CPU-interface
