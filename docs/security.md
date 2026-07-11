@@ -324,6 +324,15 @@ is resource-specific:
   confidentiality and integrity protection, effective-SVL and feature policy,
   coordinated P/ZA/ZT0 and FPSR handling, destination validation, schema,
   zeroization, and safe transition/restore ordering, none of which exists yet.
+  The conditionally captured streaming P0-P15 predicate bytes are likewise
+  sensitive guest execution state. Capture preflights `PSTATE.SM`, requires a
+  non-zero maximum SVL divisible by eight, uses one eighth of that maximum as
+  each predicate width, and publishes no partial buffer after a getter failure.
+  The detached value redacts all bytes from `Debug`; bounded raw access remains
+  restricted to trusted internal composition. Persistence requires the same
+  confidentiality, integrity, zeroization, feature/destination, effective-SVL,
+  schema, and transition/restore policies coordinated with Z/FPSR and
+  conditional ZA/ZT0 contents, none of which exists yet.
   The separately captured raw `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` values
   are mutable SME and thread-context state; `TPIDR2_EL0` can contain sensitive
   guest pointers. Their detached value redacts every register from `Debug`, and
