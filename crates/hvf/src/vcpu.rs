@@ -278,14 +278,78 @@ impl HvfArm64VcpuCacheSelectionRegisterState {
     }
 }
 
+/// Detached raw EL1 hardware-breakpoint state captured from one arm64 vCPU.
+///
+/// The implemented count is derived from `ID_AA64DFR0_EL1.BRPs`, and only
+/// that many `DBGBVR<n>_EL1` / `DBGBCR<n>_EL1` pairs are exposed. Breakpoint
+/// values can contain guest virtual addresses, Context IDs, or VMIDs, and the
+/// controls can enable sensitive debug behavior. Treat this observation as
+/// confidential guest state. It is not feature-validated, serialized, or safe
+/// to restore, and capture does not write the registers, enable debugging, or
+/// change Hypervisor.framework debug-register trap policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuBreakpointRegisterState {
+    implemented_breakpoint_count: u8,
+    breakpoint_value_registers: [u64; 16],
+    breakpoint_control_registers: [u64; 16],
+}
+
+impl HvfArm64VcpuBreakpointRegisterState {
+    pub(crate) const fn new(
+        implemented_breakpoint_count: u8,
+        breakpoint_value_registers: [u64; 16],
+        breakpoint_control_registers: [u64; 16],
+    ) -> Self {
+        Self {
+            implemented_breakpoint_count,
+            breakpoint_value_registers,
+            breakpoint_control_registers,
+        }
+    }
+
+    /// Return the number of implemented hardware-breakpoint register pairs.
+    pub const fn implemented_breakpoint_count(&self) -> u8 {
+        self.implemented_breakpoint_count
+    }
+
+    /// Return the implemented `DBGBVR<n>_EL1` values in ascending slot order.
+    pub fn breakpoint_value_registers(&self) -> &[u64] {
+        self.breakpoint_value_registers
+            .get(..usize::from(self.implemented_breakpoint_count))
+            .unwrap_or_default()
+    }
+
+    /// Return the implemented `DBGBCR<n>_EL1` values in ascending slot order.
+    pub fn breakpoint_control_registers(&self) -> &[u64] {
+        self.breakpoint_control_registers
+            .get(..usize::from(self.implemented_breakpoint_count))
+            .unwrap_or_default()
+    }
+
+    /// Return one raw `DBGBVR<n>_EL1` value when `index` is implemented.
+    pub fn breakpoint_value_register(&self, index: u8) -> Option<u64> {
+        self.breakpoint_value_registers()
+            .get(usize::from(index))
+            .copied()
+    }
+
+    /// Return one raw `DBGBCR<n>_EL1` value when `index` is implemented.
+    pub fn breakpoint_control_register(&self, index: u8) -> Option<u64> {
+        self.breakpoint_control_registers()
+            .get(usize::from(index))
+            .copied()
+    }
+}
+
 /// Detached raw EL1 debug-control state captured from one arm64 vCPU.
 ///
 /// `MDCCINT_EL1` and `MDSCR_EL1` control security-sensitive self-hosted debug
-/// behavior. This getter-only value does not include breakpoint/watchpoint
-/// comparators, Hypervisor.framework debug trap configuration, feature or
-/// writable-bit validation, or a safe restore policy. Capturing it does not
-/// enable monitor debug, software stepping, debug exceptions, guest debug-
-/// register access, or debug communications-channel interrupts.
+/// behavior. This getter-only value does not include the separately captured
+/// breakpoint comparators, watchpoint comparators, Hypervisor.framework debug
+/// trap configuration, feature or writable-bit validation, or a safe restore
+/// policy. Capturing it does not enable monitor debug, software stepping,
+/// debug exceptions, guest debug-register access, or debug communications-
+/// channel interrupts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuDebugControlRegisterState {
     mdccint_el1: u64,
@@ -830,6 +894,28 @@ impl HvfSystemRegister {
     pub const CNTV_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CVAL_EL0);
     pub const SP_EL1: Self = Self(crate::ffi::HV_SYS_REG_SP_EL1);
 
+    /// Return the typed `DBGBVR<n>_EL1` identifier for `index` in 0..=15.
+    pub const fn debug_breakpoint_value(index: u8) -> Option<Self> {
+        let raw = crate::ffi::HV_SYS_REG_DBGBVR0_EL1
+            + index as u16 * crate::ffi::HV_SYS_REG_DEBUG_BREAKPOINT_STRIDE;
+        if raw <= crate::ffi::HV_SYS_REG_DBGBVR15_EL1 {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    /// Return the typed `DBGBCR<n>_EL1` identifier for `index` in 0..=15.
+    pub const fn debug_breakpoint_control(index: u8) -> Option<Self> {
+        let raw = crate::ffi::HV_SYS_REG_DBGBCR0_EL1
+            + index as u16 * crate::ffi::HV_SYS_REG_DEBUG_BREAKPOINT_STRIDE;
+        if raw <= crate::ffi::HV_SYS_REG_DBGBCR15_EL1 {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
     pub const fn raw(self) -> u16 {
         self.0
     }
@@ -1275,6 +1361,44 @@ pub(crate) fn capture_arm64_vcpu_cache_selection_register_state_with(
     Ok(HvfArm64VcpuCacheSelectionRegisterState::new(csselr_el1))
 }
 
+pub(crate) fn capture_arm64_vcpu_breakpoint_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuBreakpointRegisterState, BackendError> {
+    const BRPS_SHIFT: u32 = 12;
+    const BRPS_MASK: u64 = 0xf;
+    const INVALID_BREAKPOINT_INDEX_MESSAGE: &str =
+        "ID_AA64DFR0_EL1 reported an invalid breakpoint register index";
+
+    let id_aa64dfr0_el1 = get_system_register(HvfSystemRegister::ID_AA64DFR0_EL1)?;
+    let implemented_breakpoint_count = ((id_aa64dfr0_el1 >> BRPS_SHIFT) & BRPS_MASK) as u8 + 1;
+    let mut breakpoint_value_registers = [0; 16];
+    let mut breakpoint_control_registers = [0; 16];
+
+    for index in 0..implemented_breakpoint_count {
+        let value_register = HvfSystemRegister::debug_breakpoint_value(index)
+            .ok_or(BackendError::InvalidState(INVALID_BREAKPOINT_INDEX_MESSAGE))?;
+        let value = get_system_register(value_register)?;
+        let value_slot = breakpoint_value_registers
+            .get_mut(usize::from(index))
+            .ok_or(BackendError::InvalidState(INVALID_BREAKPOINT_INDEX_MESSAGE))?;
+        *value_slot = value;
+
+        let control_register = HvfSystemRegister::debug_breakpoint_control(index)
+            .ok_or(BackendError::InvalidState(INVALID_BREAKPOINT_INDEX_MESSAGE))?;
+        let control = get_system_register(control_register)?;
+        let control_slot = breakpoint_control_registers
+            .get_mut(usize::from(index))
+            .ok_or(BackendError::InvalidState(INVALID_BREAKPOINT_INDEX_MESSAGE))?;
+        *control_slot = control;
+    }
+
+    Ok(HvfArm64VcpuBreakpointRegisterState::new(
+        implemented_breakpoint_count,
+        breakpoint_value_registers,
+        breakpoint_control_registers,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_debug_control_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuDebugControlRegisterState, BackendError> {
@@ -1439,7 +1563,8 @@ mod tests {
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfInterruptType,
         HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
-        NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_cache_selection_register_state_with,
+        NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_breakpoint_register_state_with,
+        capture_arm64_vcpu_cache_selection_register_state_with,
         capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_debug_control_register_state_with,
         capture_arm64_vcpu_exception_register_state_with,
@@ -1945,6 +2070,94 @@ mod tests {
     }
 
     #[test]
+    fn maps_all_arm64_debug_breakpoint_register_slots() {
+        for index in 0_u8..16 {
+            assert_eq!(
+                HvfSystemRegister::debug_breakpoint_value(index)
+                    .expect("breakpoint value slot should be mapped")
+                    .raw(),
+                0x8004 + u16::from(index) * 8
+            );
+            assert_eq!(
+                HvfSystemRegister::debug_breakpoint_control(index)
+                    .expect("breakpoint control slot should be mapped")
+                    .raw(),
+                0x8005 + u16::from(index) * 8
+            );
+        }
+
+        assert_eq!(HvfSystemRegister::debug_breakpoint_value(16), None);
+        assert_eq!(HvfSystemRegister::debug_breakpoint_control(16), None);
+        assert_eq!(HvfSystemRegister::debug_breakpoint_value(u8::MAX), None);
+        assert_eq!(HvfSystemRegister::debug_breakpoint_control(u8::MAX), None);
+    }
+
+    #[test]
+    fn captures_implemented_arm64_breakpoint_register_pairs_in_order() {
+        for implemented_count in [1_u8, 3, 16] {
+            let mut reads = Vec::new();
+            let dfr0 = u64::from(implemented_count - 1) << 12;
+            let state = capture_arm64_vcpu_breakpoint_register_state_with(|register| {
+                reads.push(register);
+                if register == HvfSystemRegister::ID_AA64DFR0_EL1 {
+                    Ok(dfr0)
+                } else {
+                    Ok(0xb00_0000_0000_0000 | u64::from(register.raw()))
+                }
+            })
+            .expect("breakpoint-register capture should succeed");
+
+            let mut expected_reads = vec![HvfSystemRegister::ID_AA64DFR0_EL1];
+            for index in 0..implemented_count {
+                expected_reads.push(
+                    HvfSystemRegister::debug_breakpoint_value(index)
+                        .expect("implemented value slot should be mapped"),
+                );
+                expected_reads.push(
+                    HvfSystemRegister::debug_breakpoint_control(index)
+                        .expect("implemented control slot should be mapped"),
+                );
+            }
+            assert_eq!(reads, expected_reads);
+            assert_eq!(state.implemented_breakpoint_count(), implemented_count);
+            assert_eq!(
+                state.breakpoint_value_registers().len(),
+                usize::from(implemented_count)
+            );
+            assert_eq!(
+                state.breakpoint_control_registers().len(),
+                usize::from(implemented_count)
+            );
+            for index in 0..implemented_count {
+                assert_eq!(
+                    state.breakpoint_value_register(index),
+                    Some(
+                        0xb00_0000_0000_0000
+                            | u64::from(
+                                HvfSystemRegister::debug_breakpoint_value(index)
+                                    .expect("implemented value slot should be mapped")
+                                    .raw()
+                            )
+                    )
+                );
+                assert_eq!(
+                    state.breakpoint_control_register(index),
+                    Some(
+                        0xb00_0000_0000_0000
+                            | u64::from(
+                                HvfSystemRegister::debug_breakpoint_control(index)
+                                    .expect("implemented control slot should be mapped")
+                                    .raw()
+                            )
+                    )
+                );
+            }
+            assert_eq!(state.breakpoint_value_register(implemented_count), None);
+            assert_eq!(state.breakpoint_control_register(implemented_count), None);
+        }
+    }
+
+    #[test]
     fn captures_arm64_debug_control_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -2348,6 +2561,54 @@ mod tests {
             u64::from(HvfSystemRegister::CSSELR_EL1.raw())
         );
         assert_eq!(*reads.borrow(), [HvfSystemRegister::CSSELR_EL1]);
+    }
+
+    #[test]
+    fn arm64_breakpoint_register_capture_stops_after_each_error_and_can_retry() {
+        let implemented_count = 16_u8;
+        let dfr0 = u64::from(implemented_count - 1) << 12;
+        let mut registers = vec![HvfSystemRegister::ID_AA64DFR0_EL1];
+        for index in 0..implemented_count {
+            registers.push(
+                HvfSystemRegister::debug_breakpoint_value(index)
+                    .expect("implemented value slot should be mapped"),
+            );
+            registers.push(
+                HvfSystemRegister::debug_breakpoint_control(index)
+                    .expect("implemented control slot should be mapped"),
+            );
+        }
+
+        for (failed_index, failed_register) in registers.iter().copied().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake breakpoint register read failed",
+                    ))
+                } else if register == HvfSystemRegister::ID_AA64DFR0_EL1 {
+                    Ok(dfr0)
+                } else {
+                    Ok(u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_breakpoint_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake breakpoint register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_breakpoint_register_state_with(&read_system_register)
+                .expect("breakpoint-register capture retry should succeed");
+            assert_eq!(state.implemented_breakpoint_count(), implemented_count);
+            assert_eq!(*reads.borrow(), registers);
+        }
     }
 
     #[test]

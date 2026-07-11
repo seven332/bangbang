@@ -125,6 +125,12 @@ Cache-selection signed tests must capture CSSELR_EL1 from an idle real vCPU
 without hard-coding or validating its architecturally unknown reset value. They
 must not write the selector, query CCSIDR, execute ISB or cache maintenance, run
 guest code, or treat CSSELR as cache topology or portable restore input.
+Hardware-breakpoint signed tests must read `ID_AA64DFR0_EL1.BRPs`, capture only
+the reported 1–16 `DBGBVR<n>_EL1` / `DBGBCR<n>_EL1` pairs from an idle real
+vCPU, and assert shape rather than reset values. They must not log raw values,
+write debug registers, enable breakpoints or monitor debug, change HVF debug-
+register trap policy, execute guest/debug instructions, run the vCPU, or treat
+the raw controls as safe restore input.
 Debug-control signed tests must remain observation-only: capture MDCCINT_EL1
 and MDSCR_EL1 from an idle real vCPU without hard-coding or logging their raw
 values. They must not call register or debug-trap setters, run guest debug

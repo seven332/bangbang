@@ -668,6 +668,51 @@ fn captures_arm64_cache_selection_register_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_all_implemented_arm64_breakpoint_registers_on_runner_thread() {
+    use bangbang_hvf::HvfBackend;
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let first = runner
+            .capture_arm64_breakpoint_register_state()
+            .expect("first breakpoint-register state should be captured");
+        let second = runner
+            .capture_arm64_breakpoint_register_state()
+            .expect("second breakpoint-register state should be captured");
+
+        for state in [&first, &second] {
+            let count = state.implemented_breakpoint_count();
+            assert!((1..=16).contains(&count));
+            assert_eq!(state.breakpoint_value_registers().len(), usize::from(count));
+            assert_eq!(
+                state.breakpoint_control_registers().len(),
+                usize::from(count)
+            );
+            for index in 0..count {
+                assert!(state.breakpoint_value_register(index).is_some());
+                assert!(state.breakpoint_control_register(index).is_some());
+            }
+            if count < 16 {
+                assert_eq!(state.breakpoint_value_register(count), None);
+                assert_eq!(state.breakpoint_control_register(count), None);
+            }
+        }
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_arm64_debug_control_registers_on_runner_thread() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;
@@ -1662,6 +1707,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .capture_arm64_cache_selection_register_state()
         .expect("internal session should capture cache-selection state");
     session
+        .capture_arm64_breakpoint_register_state()
+        .expect("internal session should capture breakpoint-register state");
+    session
         .capture_arm64_debug_control_register_state()
         .expect("internal session should capture debug-control state");
     session
@@ -1828,6 +1876,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_cache_selection_register_state()
         .expect("owned session should capture cache-selection state");
+    session
+        .capture_arm64_breakpoint_register_state()
+        .expect("owned session should capture breakpoint-register state");
     session
         .capture_arm64_debug_control_register_state()
         .expect("owned session should capture debug-control state");

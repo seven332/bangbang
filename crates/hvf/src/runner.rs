@@ -21,15 +21,17 @@ use crate::psci::{
     PsciCall, PsciCallAction, call_uses_arg0, handle_call as handle_psci_call, not_supported_result,
 };
 use crate::vcpu::{
-    HvfArm64BootRegisters, HvfArm64VcpuCacheSelectionRegisterState,
-    HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuDebugControlRegisterState,
-    HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
-    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
-    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
-    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
-    HvfArm64VcpuVirtualTimerState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
-    HvfSystemRegister, HvfVcpuOwner, capture_arm64_vcpu_cache_selection_register_state_with,
+    HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
+    HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
+    HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuExceptionRegisterState,
+    HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
+    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
+    HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
+    HvfArm64VcpuSimdFpState, HvfArm64VcpuThreadContextRegisterState,
+    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState, HvfInterruptType,
+    HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpuOwner,
+    capture_arm64_vcpu_breakpoint_register_state_with,
+    capture_arm64_vcpu_cache_selection_register_state_with,
     capture_arm64_vcpu_core_system_register_state_with,
     capture_arm64_vcpu_debug_control_register_state_with,
     capture_arm64_vcpu_exception_register_state_with,
@@ -272,6 +274,11 @@ enum RunnerCommand {
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuCacheSelectionRegisterState, HvfVcpuRunnerError>>,
     },
+    CaptureArm64BreakpointRegisterState {
+        admission: InFlightCoreRegisterCapture,
+        response_sender:
+            mpsc::Sender<Result<HvfArm64VcpuBreakpointRegisterState, HvfVcpuRunnerError>>,
+    },
     CaptureArm64DebugControlRegisterState {
         admission: InFlightCoreRegisterCapture,
         response_sender:
@@ -447,6 +454,13 @@ trait RunnerVcpu {
         &mut self,
     ) -> Result<HvfArm64VcpuCacheSelectionRegisterState, BackendError> {
         capture_arm64_vcpu_cache_selection_register_state_with(|register| {
+            self.read_system_register(register)
+        })
+    }
+    fn capture_arm64_breakpoint_register_state(
+        &mut self,
+    ) -> Result<HvfArm64VcpuBreakpointRegisterState, BackendError> {
+        capture_arm64_vcpu_breakpoint_register_state_with(|register| {
             self.read_system_register(register)
         })
     }
@@ -943,13 +957,31 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
+    /// Capture all implemented raw EL1 hardware-breakpoint pairs on the owner thread.
+    ///
+    /// This getter-only value reads the implemented count from DFR0 before the
+    /// corresponding DBGBVR/DBGBCR pairs. Values can contain sensitive guest
+    /// addresses or identities. Capture does not write or enable breakpoints,
+    /// change debug trap policy, persist state, or define safe restore policy.
+    pub fn capture_arm64_breakpoint_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuBreakpointRegisterState, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_breakpoint_register_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
     /// Capture raw EL1 MDCCINT and MDSCR debug controls on the owner thread.
     ///
     /// This getter-only value is an incomplete debug-state subset. It excludes
-    /// breakpoint/watchpoint comparators, Hypervisor.framework trap settings,
-    /// feature and writable-bit validation, and safe restore policy. Capture
-    /// does not enable monitor debug, stepping, debug exceptions, guest debug-
-    /// register access, or debug communications-channel interrupts.
+    /// the separately captured breakpoint comparators, watchpoint comparators,
+    /// Hypervisor.framework trap settings, feature and writable-bit validation,
+    /// and safe restore policy. Capture does not enable monitor debug, stepping,
+    /// debug exceptions, guest debug-register access, or debug communications-
+    /// channel interrupts.
     pub fn capture_arm64_debug_control_register_state(
         &self,
     ) -> Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError> {
@@ -1725,6 +1757,21 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<(), HvfVcpuRunnerError> {
         self.start_core_register_capture(
             |admission, response_sender| RunnerCommand::CaptureArm64CacheSelectionRegisterState {
+                admission,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_breakpoint_register_capture(
+        &self,
+        response_sender: mpsc::Sender<
+            Result<HvfArm64VcpuBreakpointRegisterState, HvfVcpuRunnerError>,
+        >,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_core_register_capture(
+            |admission, response_sender| RunnerCommand::CaptureArm64BreakpointRegisterState {
                 admission,
                 response_sender,
             },
@@ -2808,6 +2855,19 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::CaptureArm64BreakpointRegisterState {
+                mut admission,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .capture_arm64_breakpoint_register_state()
+                    .map_err(HvfVcpuRunnerError::Backend);
+                // DFR0 and every implemented breakpoint pair have finished.
+                // Restore admission before response send so receiver failure
+                // is not part of the capture lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureArm64DebugControlRegisterState {
                 mut admission,
                 response_sender,
@@ -3222,15 +3282,15 @@ mod tests {
     use crate::gic::{HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError};
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
     use crate::vcpu::{
-        HvfArm64BootRegisters, HvfArm64VcpuCacheSelectionRegisterState,
-        HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuDebugControlRegisterState,
-        HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
-        HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
-        HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-        HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
-        HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
-        HvfArm64VcpuVirtualTimerState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
-        HvfSystemRegister,
+        HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
+        HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
+        HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuExceptionRegisterState,
+        HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
+        HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
+        HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
+        HvfArm64VcpuSimdFpState, HvfArm64VcpuThreadContextRegisterState,
+        HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState, HvfInterruptType,
+        HvfRegister, HvfSimdFpRegister, HvfSystemRegister,
     };
 
     const ESR_EC_HVC: u64 = 0x16;
@@ -3394,6 +3454,26 @@ mod tests {
     struct PanicOnCacheSelectionRegisterCaptureVcpu;
 
     type BlockingCacheSelectionRegisterCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    struct BreakpointRegisterCaptureRecordingVcpu {
+        read_sender: mpsc::Sender<HvfSystemRegister>,
+        fail_next_read: bool,
+    }
+
+    struct BlockingBreakpointRegisterCaptureVcpu {
+        entered_capture_sender: mpsc::Sender<()>,
+        release_capture_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnBreakpointRegisterCaptureVcpu;
+
+    type BlockingBreakpointRegisterCaptureRunner = (
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<(), BackendError>>,
@@ -4735,6 +4815,144 @@ mod tests {
             _register: HvfSystemRegister,
         ) -> Result<u64, BackendError> {
             panic!("fake cache-selection capture panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BreakpointRegisterCaptureRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+        ) -> Result<u64, BackendError> {
+            self.read_sender.send(register).map_err(|_| {
+                BackendError::InvalidState("fake breakpoint-register read receiver closed")
+            })?;
+            if self.fail_next_read {
+                self.fail_next_read = false;
+                Err(BackendError::InvalidState(
+                    "fake breakpoint-register capture failed",
+                ))
+            } else {
+                Ok(breakpoint_register_test_value(register))
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingBreakpointRegisterCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+        ) -> Result<u64, BackendError> {
+            if register == HvfSystemRegister::ID_AA64DFR0_EL1 {
+                self.entered_capture_sender.send(()).map_err(|_| {
+                    BackendError::InvalidState(
+                        "fake breakpoint-register capture entry receiver closed",
+                    )
+                })?;
+                self.release_capture_receiver.recv().map_err(|_| {
+                    BackendError::InvalidState(
+                        "fake breakpoint-register capture release sender closed",
+                    )
+                })??;
+            }
+
+            Ok(breakpoint_register_test_value(register))
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnBreakpointRegisterCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_system_register(
+            &mut self,
+            _register: HvfSystemRegister,
+        ) -> Result<u64, BackendError> {
+            panic!("fake breakpoint-register capture panic");
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -6981,6 +7199,60 @@ mod tests {
         );
     }
 
+    const BREAKPOINT_REGISTER_TEST_COUNT: u8 = 3;
+
+    fn breakpoint_registers() -> Vec<HvfSystemRegister> {
+        let mut registers = vec![HvfSystemRegister::ID_AA64DFR0_EL1];
+        for index in 0..BREAKPOINT_REGISTER_TEST_COUNT {
+            registers.push(
+                HvfSystemRegister::debug_breakpoint_value(index)
+                    .expect("implemented breakpoint value slot should map"),
+            );
+            registers.push(
+                HvfSystemRegister::debug_breakpoint_control(index)
+                    .expect("implemented breakpoint control slot should map"),
+            );
+        }
+        registers
+    }
+
+    fn breakpoint_register_test_value(register: HvfSystemRegister) -> u64 {
+        if register == HvfSystemRegister::ID_AA64DFR0_EL1 {
+            u64::from(BREAKPOINT_REGISTER_TEST_COUNT - 1) << 12
+        } else {
+            0xb_0000 + u64::from(register.raw())
+        }
+    }
+
+    fn assert_breakpoint_register_test_state(state: &HvfArm64VcpuBreakpointRegisterState) {
+        assert_eq!(
+            state.implemented_breakpoint_count(),
+            BREAKPOINT_REGISTER_TEST_COUNT
+        );
+        for index in 0..BREAKPOINT_REGISTER_TEST_COUNT {
+            let value_register = HvfSystemRegister::debug_breakpoint_value(index)
+                .expect("implemented breakpoint value slot should map");
+            let control_register = HvfSystemRegister::debug_breakpoint_control(index)
+                .expect("implemented breakpoint control slot should map");
+            assert_eq!(
+                state.breakpoint_value_register(index),
+                Some(breakpoint_register_test_value(value_register))
+            );
+            assert_eq!(
+                state.breakpoint_control_register(index),
+                Some(breakpoint_register_test_value(control_register))
+            );
+        }
+        assert_eq!(
+            state.breakpoint_value_register(BREAKPOINT_REGISTER_TEST_COUNT),
+            None
+        );
+        assert_eq!(
+            state.breakpoint_control_register(BREAKPOINT_REGISTER_TEST_COUNT),
+            None
+        );
+    }
+
     fn debug_control_registers() -> [HvfSystemRegister; 2] {
         [HvfSystemRegister::MDCCINT_EL1, HvfSystemRegister::MDSCR_EL1]
     }
@@ -7199,6 +7471,10 @@ mod tests {
         );
         assert_eq!(
             runner.capture_arm64_cache_selection_register_state(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            runner.capture_arm64_breakpoint_register_state(),
             Err(expected.clone())
         );
         assert_eq!(
@@ -7700,6 +7976,48 @@ mod tests {
         let (barrier_sender, barrier_receiver) = mpsc::channel();
         let started = spawn_runner_thread(move || {
             Ok(BlockingCacheSelectionRegisterCaptureVcpu {
+                entered_capture_sender,
+                release_capture_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_capture_receiver,
+            release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
+    fn start_breakpoint_register_capture_recording_runner(
+        fail_next_read: bool,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<HvfSystemRegister>) {
+        let (read_sender, read_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BreakpointRegisterCaptureRecordingVcpu {
+                read_sender,
+                fail_next_read,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            read_receiver,
+        )
+    }
+
+    fn start_blocking_breakpoint_register_capture_runner() -> BlockingBreakpointRegisterCaptureRunner
+    {
+        let (entered_capture_sender, entered_capture_receiver) = mpsc::channel();
+        let (release_capture_sender, release_capture_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingBreakpointRegisterCaptureVcpu {
                 entered_capture_sender,
                 release_capture_receiver,
                 barrier_sender,
@@ -8320,6 +8638,7 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<super::HvfVcpuRunCancelHandle>();
+        assert_send_sync::<HvfArm64VcpuBreakpointRegisterState>();
         assert_send_sync::<HvfArm64VcpuCacheSelectionRegisterState>();
         assert_send_sync::<HvfArm64VcpuCoreSystemRegisterState>();
         assert_send_sync::<HvfArm64VcpuDebugControlRegisterState>();
@@ -8614,6 +8933,51 @@ mod tests {
         assert_eq!(
             read_receiver.try_iter().collect::<Vec<_>>(),
             [HvfSystemRegister::CSSELR_EL1]
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn captures_arm64_breakpoint_register_state_on_runner_thread() {
+        let (runner, read_receiver) = start_breakpoint_register_capture_recording_runner(false);
+
+        let state = runner
+            .capture_arm64_breakpoint_register_state()
+            .expect("breakpoint-register capture should succeed");
+
+        assert_breakpoint_register_test_state(&state);
+        assert_eq!(
+            read_receiver.try_iter().collect::<Vec<_>>(),
+            breakpoint_registers()
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_arm64_breakpoint_register_capture_can_retry_without_stale_state() {
+        let (runner, read_receiver) = start_breakpoint_register_capture_recording_runner(true);
+
+        assert_eq!(
+            runner.capture_arm64_breakpoint_register_state(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake breakpoint-register capture failed"
+            )))
+        );
+        assert_eq!(
+            read_receiver.try_iter().collect::<Vec<_>>(),
+            [HvfSystemRegister::ID_AA64DFR0_EL1]
+        );
+
+        let state = runner
+            .capture_arm64_breakpoint_register_state()
+            .expect("breakpoint-register capture retry should succeed");
+        assert_breakpoint_register_test_state(&state);
+        assert_eq!(
+            read_receiver.try_iter().collect::<Vec<_>>(),
+            breakpoint_registers()
         );
         assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
@@ -9847,6 +10211,199 @@ mod tests {
 
         assert_eq!(
             runner.capture_arm64_cache_selection_register_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn commands_during_arm64_breakpoint_register_capture_are_rejected_without_queueing() {
+        let (runner, entered_capture_receiver, release_capture_sender, _barrier_receiver) =
+            start_blocking_breakpoint_register_capture_runner();
+
+        thread::scope(|scope| {
+            let capture = scope.spawn(|| runner.capture_arm64_breakpoint_register_state());
+            entered_capture_receiver
+                .recv()
+                .expect("runner should enter fake breakpoint-register capture");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
+            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_capture_sender
+                .send(Ok(()))
+                .expect("breakpoint-register capture release should be sent");
+            let state = capture
+                .join()
+                .expect("breakpoint-register capture thread should join")
+                .expect("breakpoint-register capture should succeed");
+            assert_breakpoint_register_test_state(&state);
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_breakpoint_register_capture_admitted_until_command_finishes() {
+        let (runner, entered_capture_receiver, release_capture_sender, barrier_receiver) =
+            start_blocking_breakpoint_register_capture_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_breakpoint_register_capture(response_sender)
+                .expect("breakpoint-register capture should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_capture_receiver
+            .recv()
+            .expect("runner should enter fake breakpoint-register capture");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind capture");
+        release_capture_sender
+            .send(Ok(()))
+            .expect("breakpoint-register capture release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after capture");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn arm64_breakpoint_register_capture_send_failure_releases_admission() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.capture_arm64_breakpoint_register_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_breakpoint_register_capture_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (capture_response_sender, capture_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_breakpoint_register_capture(capture_response_sender)
+            .expect("breakpoint-register capture should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(capture_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_breakpoint_register_capture_panic() {
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnBreakpointRegisterCaptureVcpu));
+
+        assert_eq!(
+            runner.capture_arm64_breakpoint_register_state(),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))

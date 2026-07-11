@@ -71,14 +71,14 @@ use crate::runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 use crate::vcpu::{
-    HvfArm64BootRegisters, HvfArm64VcpuCacheSelectionRegisterState,
-    HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuDebugControlRegisterState,
-    HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
-    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
-    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
-    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
-    HvfArm64VcpuVirtualTimerState,
+    HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
+    HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
+    HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuExceptionRegisterState,
+    HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
+    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
+    HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
+    HvfArm64VcpuSimdFpState, HvfArm64VcpuThreadContextRegisterState,
+    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1224,11 +1224,24 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_cache_selection_register_state()
     }
 
+    /// Capture every implemented raw EL1 hardware-breakpoint pair on the
+    /// primary owner thread.
+    ///
+    /// Values can contain sensitive guest addresses or identities. This
+    /// getter-only subset omits watchpoints, HVF trap state, persistence,
+    /// breakpoint activation, and a safe restore sequence.
+    pub fn capture_arm64_breakpoint_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuBreakpointRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_breakpoint_register_state()
+    }
+
     /// Capture raw EL1 MDCCINT and MDSCR debug controls on the primary owner
     /// thread.
     ///
-    /// This getter-only subset excludes comparator and HVF trap state, feature
-    /// validation, persistence, debug activation, and a safe restore sequence.
+    /// This getter-only subset excludes the separately captured breakpoint
+    /// comparators, watchpoint and HVF trap state, feature validation,
+    /// persistence, debug activation, and a safe restore sequence.
     pub fn capture_arm64_debug_control_register_state(
         &self,
     ) -> Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError> {
@@ -1939,11 +1952,24 @@ impl OwnedHvfArm64BootSession {
         self.runner.capture_arm64_cache_selection_register_state()
     }
 
+    /// Capture every implemented raw EL1 hardware-breakpoint pair on the
+    /// primary owner thread.
+    ///
+    /// Values can contain sensitive guest addresses or identities. This
+    /// getter-only subset omits watchpoints, HVF trap state, persistence,
+    /// breakpoint activation, and a safe restore sequence.
+    pub fn capture_arm64_breakpoint_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuBreakpointRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_breakpoint_register_state()
+    }
+
     /// Capture raw EL1 MDCCINT and MDSCR debug controls on the primary owner
     /// thread.
     ///
-    /// This getter-only subset excludes comparator and HVF trap state, feature
-    /// validation, persistence, debug activation, and a safe restore sequence.
+    /// This getter-only subset excludes the separately captured breakpoint
+    /// comparators, watchpoint and HVF trap state, feature validation,
+    /// persistence, debug activation, and a safe restore sequence.
     pub fn capture_arm64_debug_control_register_state(
         &self,
     ) -> Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError> {
