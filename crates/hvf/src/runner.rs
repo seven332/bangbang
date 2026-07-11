@@ -59,8 +59,9 @@ use crate::vcpu::{
     restore_arm64_vcpu_core_system_register_state_with,
     restore_arm64_vcpu_exception_register_state_with,
     restore_arm64_vcpu_execution_control_register_state_with,
-    restore_arm64_vcpu_general_register_state_with, restore_arm64_vcpu_simd_fp_state_with,
-    restore_arm64_vcpu_thread_context_register_state_with,
+    restore_arm64_vcpu_general_register_state_with,
+    restore_arm64_vcpu_pointer_authentication_key_state_with,
+    restore_arm64_vcpu_simd_fp_state_with, restore_arm64_vcpu_thread_context_register_state_with,
     restore_arm64_vcpu_translation_register_state_with,
 };
 
@@ -450,6 +451,11 @@ enum RunnerCommand {
         admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuPointerAuthenticationKeyState, HvfVcpuRunnerError>>,
+    },
+    RestoreArm64PointerAuthenticationKeyState {
+        admission: InFlightCoreRegisterOperation,
+        state: HvfArm64VcpuPointerAuthenticationKeyState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     CaptureArm64ThreadContextRegisterState {
         admission: InFlightCoreRegisterOperation,
@@ -848,6 +854,14 @@ trait RunnerVcpu {
     ) -> Result<HvfArm64VcpuPointerAuthenticationKeyState, BackendError> {
         capture_arm64_vcpu_pointer_authentication_key_state_with(|register| {
             self.read_system_register(register)
+        })
+    }
+    fn restore_arm64_pointer_authentication_key_state(
+        &mut self,
+        state: &HvfArm64VcpuPointerAuthenticationKeyState,
+    ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+        restore_arm64_vcpu_pointer_authentication_key_state_with(state, |register, value| {
+            self.write_system_register(register, value)
         })
     }
     fn capture_arm64_thread_context_register_state(
@@ -1712,13 +1726,35 @@ impl<'vm> HvfVcpuRunner<'vm> {
     /// runner thread.
     ///
     /// These values are cryptographic secrets whose `Debug` output is redacted.
-    /// This getter-only subset has no feature validation, persistence
-    /// protection, restore ordering, or serialized schema policy.
+    /// The complete typed value has a paired low-level restore, but this subset
+    /// has no feature validation, persistence protection, safe SCTLR enable
+    /// ordering, or serialized schema policy.
     pub fn capture_arm64_pointer_authentication_key_state(
         &self,
     ) -> Result<HvfArm64VcpuPointerAuthenticationKeyState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_pointer_authentication_key_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Restore the five raw EL1 pointer-authentication keys on the vCPU-owning
+    /// runner thread.
+    ///
+    /// The ten low/high writes follow capture order and are not transactional.
+    /// After an error, retry the complete redacted typed state or discard the
+    /// vCPU before execution. This low-level apply does not validate pointer-
+    /// authentication features or the destination, zeroize memory, protect
+    /// persistence, order key writes before SCTLR authentication enables,
+    /// provide rollback, or deserialize a snapshot.
+    pub fn restore_arm64_pointer_authentication_key_state(
+        &self,
+        state: &HvfArm64VcpuPointerAuthenticationKeyState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_pointer_authentication_key_restore(state.clone(), response_sender)?;
 
         response_receiver
             .recv()
@@ -2850,6 +2886,21 @@ impl<'vm> HvfVcpuRunner<'vm> {
         self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64PointerAuthenticationKeyState {
                 admission,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_pointer_authentication_key_restore(
+        &self,
+        state: HvfArm64VcpuPointerAuthenticationKeyState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_core_register_operation(
+            |admission, response_sender| RunnerCommand::RestoreArm64PointerAuthenticationKeyState {
+                admission,
+                state,
                 response_sender,
             },
             response_sender,
@@ -4087,6 +4138,20 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::RestoreArm64PointerAuthenticationKeyState {
+                mut admission,
+                state,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .restore_arm64_pointer_authentication_key_state(&state)
+                    .map_err(HvfVcpuRunnerError::SystemRegisterRestore);
+                // The last owner-thread key write or first failed write has
+                // finished. Restore admission before responding so receiver
+                // failure is not part of the restore lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureArm64ThreadContextRegisterState {
                 mut admission,
                 response_sender,
@@ -5106,7 +5171,27 @@ mod tests {
 
     struct PanicOnPointerAuthenticationKeyCaptureVcpu;
 
+    struct PointerAuthenticationKeyRestoreRecordingVcpu {
+        write_sender: mpsc::Sender<(HvfSystemRegister, u64)>,
+        fail_next_register: Option<HvfSystemRegister>,
+    }
+
+    struct BlockingPointerAuthenticationKeyRestoreVcpu {
+        entered_restore_sender: mpsc::Sender<()>,
+        release_restore_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnPointerAuthenticationKeyRestoreVcpu;
+
     type BlockingPointerAuthenticationKeyCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    type BlockingPointerAuthenticationKeyRestoreRunner = (
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<(), BackendError>>,
@@ -9074,6 +9159,147 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for PointerAuthenticationKeyRestoreRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn write_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            self.write_sender.send((register, value)).map_err(|_| {
+                BackendError::InvalidState("fake pointer-authentication key write receiver closed")
+            })?;
+            if self.fail_next_register == Some(register) {
+                self.fail_next_register = None;
+                Err(BackendError::InvalidState(
+                    "fake pointer-authentication key restore failed",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingPointerAuthenticationKeyRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn write_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+            _value: u64,
+        ) -> Result<(), BackendError> {
+            if register == HvfSystemRegister::APIAKEYLO_EL1 {
+                self.entered_restore_sender.send(()).map_err(|_| {
+                    BackendError::InvalidState(
+                        "fake pointer-authentication key restore entry receiver closed",
+                    )
+                })?;
+                self.release_restore_receiver.recv().map_err(|_| {
+                    BackendError::InvalidState(
+                        "fake pointer-authentication key restore release sender closed",
+                    )
+                })??;
+            }
+
+            Ok(())
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnPointerAuthenticationKeyRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn write_system_register(
+            &mut self,
+            _register: HvfSystemRegister,
+            _value: u64,
+        ) -> Result<(), BackendError> {
+            panic!("fake pointer-authentication key restore panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for ThreadContextRegisterCaptureRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -11588,6 +11814,23 @@ mod tests {
         );
     }
 
+    fn pointer_authentication_key_restore_test_state() -> HvfArm64VcpuPointerAuthenticationKeyState
+    {
+        HvfArm64VcpuPointerAuthenticationKeyState::new(
+            pointer_authentication_key_registers().map(pointer_authentication_test_half),
+        )
+    }
+
+    fn pointer_authentication_key_restore_test_entries() -> [(HvfSystemRegister, u64); 10] {
+        let registers = pointer_authentication_key_registers();
+        std::array::from_fn(|index| {
+            (
+                registers[index],
+                pointer_authentication_test_half(registers[index]),
+            )
+        })
+    }
+
     fn general_register_restore_test_state() -> HvfArm64VcpuGeneralRegisterState {
         capture_arm64_vcpu_general_register_state_with(|register| {
             Ok(0xa500_0000_0000_0000 | u64::from(register.raw()))
@@ -11812,6 +12055,12 @@ mod tests {
         );
         assert_eq!(
             runner.capture_arm64_pointer_authentication_key_state(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            runner.restore_arm64_pointer_authentication_key_state(
+                &pointer_authentication_key_restore_test_state()
+            ),
             Err(expected.clone())
         );
         assert_eq!(
@@ -13171,6 +13420,51 @@ mod tests {
                 .expect("runner should be created"),
             entered_capture_receiver,
             release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
+    fn start_pointer_authentication_key_restore_recording_runner(
+        fail_next_register: Option<HvfSystemRegister>,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<(HvfSystemRegister, u64)>,
+    ) {
+        let (write_sender, write_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(PointerAuthenticationKeyRestoreRecordingVcpu {
+                write_sender,
+                fail_next_register,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            write_receiver,
+        )
+    }
+
+    fn start_blocking_pointer_authentication_key_restore_runner()
+    -> BlockingPointerAuthenticationKeyRestoreRunner {
+        let (entered_restore_sender, entered_restore_receiver) = mpsc::channel();
+        let (release_restore_sender, release_restore_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingPointerAuthenticationKeyRestoreVcpu {
+                entered_restore_sender,
+                release_restore_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_restore_receiver,
+            release_restore_sender,
             barrier_receiver,
         )
     }
@@ -15158,6 +15452,74 @@ mod tests {
                 .expect("pointer-authentication key capture retry should succeed");
             assert_pointer_authentication_key_test_state(&state);
             assert_eq!(read_receiver.try_iter().collect::<Vec<_>>(), registers);
+            assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn restores_arm64_pointer_authentication_keys_on_runner_thread() {
+        let state = pointer_authentication_key_restore_test_state();
+        let expected = pointer_authentication_key_restore_test_entries();
+        let (runner, write_receiver) =
+            start_pointer_authentication_key_restore_recording_runner(None);
+
+        runner
+            .restore_arm64_pointer_authentication_key_state(&state)
+            .expect("pointer-authentication key restore should succeed");
+
+        assert_eq!(write_receiver.try_iter().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            format!("{state:?}"),
+            "HvfArm64VcpuPointerAuthenticationKeyState { keys: \"<redacted>\" }"
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn every_arm64_pointer_authentication_key_restore_failure_is_typed_and_retryable() {
+        use std::error::Error as _;
+
+        let state = pointer_authentication_key_restore_test_state();
+        let expected = pointer_authentication_key_restore_test_entries();
+
+        for (failed_index, (failed_register, _)) in expected.iter().copied().enumerate() {
+            let (runner, write_receiver) =
+                start_pointer_authentication_key_restore_recording_runner(Some(failed_register));
+
+            let error = runner
+                .restore_arm64_pointer_authentication_key_state(&state)
+                .expect_err("injected pointer-authentication key write should fail");
+            let HvfVcpuRunnerError::SystemRegisterRestore(error) = error else {
+                panic!("restore failure should retain its typed context");
+            };
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some(
+                    "invalid backend state: fake pointer-authentication key restore failed"
+                        .to_string()
+                )
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 system register id {} after {failed_index} successful writes: invalid backend state: fake pointer-authentication key restore failed",
+                    failed_register.raw()
+                )
+            );
+            assert_eq!(
+                write_receiver.try_iter().collect::<Vec<_>>(),
+                expected[..=failed_index]
+            );
+
+            runner
+                .restore_arm64_pointer_authentication_key_state(&state)
+                .expect("complete pointer-authentication key restore retry should succeed");
+            assert_eq!(write_receiver.try_iter().collect::<Vec<_>>(), expected);
             assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
             runner.shutdown().expect("runner should shut down");
@@ -20196,6 +20558,206 @@ mod tests {
 
         assert_eq!(
             runner.capture_arm64_pointer_authentication_key_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn commands_during_arm64_pointer_authentication_key_restore_are_rejected_without_queueing() {
+        let state = pointer_authentication_key_restore_test_state();
+        let (runner, entered_restore_receiver, release_restore_sender, _barrier_receiver) =
+            start_blocking_pointer_authentication_key_restore_runner();
+
+        thread::scope(|scope| {
+            let restore =
+                scope.spawn(|| runner.restore_arm64_pointer_authentication_key_state(&state));
+            entered_restore_receiver
+                .recv()
+                .expect("runner should enter fake pointer-authentication key restore");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_restore_sender
+                .send(Ok(()))
+                .expect("pointer-authentication key restore release should be sent");
+            restore
+                .join()
+                .expect("pointer-authentication key restore thread should join")
+                .expect("pointer-authentication key restore should succeed");
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_arm64_pointer_authentication_key_restore_admitted_until_finish() {
+        let state = pointer_authentication_key_restore_test_state();
+        let (runner, entered_restore_receiver, release_restore_sender, barrier_receiver) =
+            start_blocking_pointer_authentication_key_restore_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_pointer_authentication_key_restore(state.clone(), response_sender)
+                .expect("pointer-authentication key restore should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_restore_receiver
+            .recv()
+            .expect("runner should enter fake pointer-authentication key restore");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind restore");
+        release_restore_sender
+            .send(Ok(()))
+            .expect("pointer-authentication key restore release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after restore");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn arm64_pointer_authentication_key_restore_send_failure_releases_admission() {
+        let state = pointer_authentication_key_restore_test_state();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.restore_arm64_pointer_authentication_key_state(&state),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_arm64_pointer_authentication_key_restore_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (restore_response_sender, restore_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_pointer_authentication_key_restore(
+                pointer_authentication_key_restore_test_state(),
+                restore_response_sender,
+            )
+            .expect("pointer-authentication key restore should queue behind panic");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(restore_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn pointer_authentication_key_restore_panic_releases_admission() {
+        let state = pointer_authentication_key_restore_test_state();
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnPointerAuthenticationKeyRestoreVcpu));
+
+        assert_eq!(
+            runner.restore_arm64_pointer_authentication_key_state(&state),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))

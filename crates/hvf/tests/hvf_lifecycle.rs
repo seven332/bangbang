@@ -1847,7 +1847,7 @@ fn captures_and_restores_guest_written_arm64_translation_registers_on_runner_thr
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_guest_written_arm64_pointer_authentication_keys_on_runner_thread() {
+fn captures_and_restores_guest_written_arm64_pointer_authentication_keys_on_runner_thread() {
     use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
     use bangbang_runtime::VmBackend;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
@@ -1924,6 +1924,28 @@ fn captures_guest_written_arm64_pointer_authentication_keys_on_runner_thread() {
         assert!(
             state.apga_key() == POINTER_AUTHENTICATION_TEST_APGA_KEY,
             "APGA should match the non-secret test key"
+        );
+
+        runner
+            .restore_arm64_pointer_authentication_key_state(&state)
+            .expect("pointer-authentication key state should be restored");
+        let restored = runner
+            .capture_arm64_pointer_authentication_key_state()
+            .expect("pointer-authentication key state should be recaptured after restore");
+        assert!(
+            restored == state,
+            "pointer-authentication key state should round trip without exposing values"
+        );
+
+        runner
+            .restore_arm64_pointer_authentication_key_state(&state)
+            .expect("repeated pointer-authentication key restore should succeed");
+        let repeated = runner
+            .capture_arm64_pointer_authentication_key_state()
+            .expect("pointer-authentication key state should be recaptured after repeated restore");
+        assert!(
+            repeated == state,
+            "repeated pointer-authentication key restore should preserve the complete state"
         );
 
         runner.shutdown().expect("runner should shut down");
@@ -2810,9 +2832,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .restore_arm64_translation_register_state(&translation_state)
         .expect("internal session should restore translation-register state");
-    session
+    let pointer_authentication_key_state = session
         .capture_arm64_pointer_authentication_key_state()
         .expect("internal session should capture pointer-authentication key state");
+    session
+        .restore_arm64_pointer_authentication_key_state(&pointer_authentication_key_state)
+        .expect("internal session should restore pointer-authentication key state");
     let thread_context_state = session
         .capture_arm64_thread_context_register_state()
         .expect("internal session should capture thread-context register state");
@@ -3035,9 +3060,12 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .restore_arm64_translation_register_state(&translation_state)
         .expect("owned session should restore translation-register state");
-    session
+    let pointer_authentication_key_state = session
         .capture_arm64_pointer_authentication_key_state()
         .expect("owned session should capture pointer-authentication key state");
+    session
+        .restore_arm64_pointer_authentication_key_state(&pointer_authentication_key_state)
+        .expect("owned session should restore pointer-authentication key state");
     let thread_context_state = session
         .capture_arm64_thread_context_register_state()
         .expect("owned session should capture thread-context register state");

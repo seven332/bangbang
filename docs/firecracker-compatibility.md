@@ -1682,7 +1682,9 @@ system-register failure with exact partial progress. A seventh reads raw
 ACTLR.EnTSO. Its typed value has a paired owner-thread restore that writes both
 fields in capture order under the same typed partial-write contract. An eighth
 reads the low and high halves of APIA, APIB, APDA, APDB, and APGA and publishes
-five 128-bit pointer-authentication keys. A ninth reads guest-visible `MIDR_EL1`,
+five 128-bit pointer-authentication keys. Its redacted typed value has a paired
+owner-thread restore that writes the same ten halves in capture order through
+the reusable system-register partial-write contract. A ninth reads guest-visible `MIDR_EL1`,
 `MPIDR_EL1`, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 compatibility metadata. A
 tenth reads raw `MDCCINT_EL1` then `MDSCR_EL1` without writing either register
 or changing Hypervisor.framework debug trap settings. An eleventh reads raw
@@ -1721,11 +1723,12 @@ requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
 commands plus the general-, core-system-, exception-register, execution-
-control, thread-context, translation, and baseline SIMD/FP restore operations
-form a twenty-nine-operation command-owned core-register admission domain.
+control, thread-context, translation, baseline SIMD/FP, and pointer-
+authentication restore operations
+form a thirty-operation command-owned core-register admission domain.
 Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose all seven restores
+setter failure. Borrowed and owned HVF boot sessions expose all eight restores
 and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
@@ -1940,12 +1943,11 @@ GIC state and does not define portable offset adjustment
 or control-restore policy. The baseline and optional SVE/SME identification,
 SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register, system-context,
 cache-selection, breakpoint, watchpoint,
-debug-control, debug-trap,
-pointer-authentication, and physical-timer
+debug-control, debug-trap, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
 The core system-register, EL1 exception, execution-control, thread-context, and
-translation subsets plus baseline SIMD/FP have paired ordered,
+translation subsets plus baseline SIMD/FP and pointer-authentication keys have paired ordered,
 nontransactional restore operations but likewise have no validation, schema,
 dependent-memory, maintenance, feature-transition, SVE/SME alias, or wider
 ordering policy.
@@ -1956,9 +1958,10 @@ define no feature, writable/status-bit, security, setter, trap-coordination,
 synchronization, or restore policy.
 Cache-selection capture defines no topology manifest, selector validation,
 synchronization, maintenance, compatibility, or restore policy.
-Pointer-authentication capture additionally has no feature validation,
-zeroization, protected persistence, or safe enable ordering. The process
-snapshot barrier invokes none of these captures.
+Pointer-authentication capture and raw apply additionally have no feature or
+destination validation, zeroization, protected persistence, rollback, or safe
+SCTLR enable ordering. The process snapshot barrier invokes none of these
+captures or restore operations.
 
 A separate failure-atomic command reads CPU IRQ then FIQ pending levels and is
 available through both boot-session forms. It shares generalized interrupt
@@ -2339,7 +2342,9 @@ macOS design work instead of direct implementation:
   complete typed value in capture order without defining feature validation or
   guest ISB transition policy. An eighth captures
   five 128-bit pointer-authentication keys from all ten APIA/APIB/APDA/APDB/APGA
-  halves and redacts them from `Debug`. A ninth captures guest-visible MIDR,
+  halves, redacts them from `Debug`, and can reapply the complete typed value in
+  the same low/high capture order without feature/destination validation,
+  protected persistence, zeroization, or SCTLR enable ordering. A ninth captures guest-visible MIDR,
   MPIDR, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 as raw virtual-CPU/HVF
   compatibility inputs. A tenth captures raw MDCCINT_EL1 and MDSCR_EL1 as an
   observation-only, incomplete debug-control subset. An eleventh captures raw
@@ -2382,7 +2387,7 @@ macOS design work instead of direct implementation:
   validation, debug-trap policy validation/setters, protected key persistence,
   and wider restore ordering remain outside these subsets. General-register,
   core-system-register, exception-register, execution-control, and
-  thread-context restore report their typed failed register and completed-write
+  thread-context and pointer-authentication restore report their typed failed register and completed-write
   count; callers must retry the complete captured value or discard the vCPU
   before execution.
   The runner can capture raw CNTKCTL_EL1, CNTP_CTL_EL0, CNTP_CVAL_EL0, and
