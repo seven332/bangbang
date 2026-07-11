@@ -76,6 +76,47 @@ pub struct HvfGicMetadata {
     pub msi: Option<HvfGicMsiMetadata>,
 }
 
+/// Detached opaque Hypervisor.framework GIC device state.
+///
+/// Apple defines these bytes as stable, versioned serialized GIC device state,
+/// excluding the vCPU-affine GIC CPU system registers. The contents are
+/// sensitive guest/VMM execution state and are not a bangbang or Firecracker
+/// snapshot schema. Restore validation and host compatibility policy remain
+/// outside this value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfGicDeviceState {
+    bytes: Vec<u8>,
+}
+
+impl HvfGicDeviceState {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    /// Return the opaque serialized GIC device-state bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Return the opaque state size in bytes.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Return whether the opaque state contains no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl fmt::Debug for HvfGicDeviceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicDeviceState")
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl HvfGicMetadata {
     pub const FDT_COMPATIBILITY: &'static str = "arm,gic-v3";
     pub const FDT_INTERRUPT_CELLS: u32 = 3;
@@ -350,6 +391,10 @@ pub enum HvfGicError {
     InvalidState(&'static str),
     MissingSymbol(&'static str),
     ConfigCreateFailed,
+    StateCreateFailed,
+    StateAllocationFailed {
+        size: u64,
+    },
     InvalidParameter {
         name: &'static str,
         value: u64,
@@ -379,7 +424,7 @@ impl fmt::Display for HvfGicError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Backend(source) => write!(f, "{source}"),
-            Self::Unsupported(message) => write!(f, "unsupported GIC setup: {message}"),
+            Self::Unsupported(message) => write!(f, "unsupported GIC operation: {message}"),
             Self::InvalidState(message) => write!(f, "invalid GIC state: {message}"),
             Self::MissingSymbol(symbol) => write!(
                 f,
@@ -387,6 +432,15 @@ impl fmt::Display for HvfGicError {
             ),
             Self::ConfigCreateFailed => {
                 f.write_str("failed to create Hypervisor.framework GIC configuration")
+            }
+            Self::StateCreateFailed => {
+                f.write_str("failed to create Hypervisor.framework GIC state object")
+            }
+            Self::StateAllocationFailed { size } => {
+                write!(
+                    f,
+                    "failed to allocate {size} bytes for Hypervisor.framework GIC state"
+                )
             }
             Self::InvalidParameter { name, value } => {
                 write!(
@@ -433,6 +487,8 @@ impl std::error::Error for HvfGicError {
             | Self::InvalidState(_)
             | Self::MissingSymbol(_)
             | Self::ConfigCreateFailed
+            | Self::StateCreateFailed
+            | Self::StateAllocationFailed { .. }
             | Self::InvalidParameter { .. }
             | Self::AddressUnderflow { .. }
             | Self::UnalignedAddress { .. }
@@ -450,6 +506,50 @@ impl From<BackendError> for HvfGicError {
 
 pub(crate) trait HvfGicCreator: fmt::Debug + Send + Sync {
     fn create_gic(&self) -> Result<HvfGicMetadata, HvfGicError>;
+}
+
+pub(crate) struct HvfGicStateSnapshotter {
+    capture: Box<dyn HvfGicStateCapture>,
+}
+
+trait HvfGicStateCapture: fmt::Debug {
+    fn capture(&self) -> Result<HvfGicDeviceState, HvfGicError>;
+}
+
+trait HvfGicStateApi: fmt::Debug {
+    type State;
+
+    fn create_state(&self) -> Result<Self::State, HvfGicError>;
+    fn state_size(&self, state: &Self::State) -> Result<usize, HvfGicError>;
+    fn copy_state(&self, state: &Self::State, data: &mut [u8]) -> Result<(), HvfGicError>;
+    fn release_state(&self, state: Self::State);
+}
+
+impl HvfGicStateSnapshotter {
+    pub(crate) fn new() -> Result<Self, HvfGicError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Ok(Self {
+                capture: Box::new(LoadedHvfGicStateCaptureApi::load()?),
+            })
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        Err(HvfGicError::Unsupported(
+            crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+        ))
+    }
+
+    pub(crate) fn capture(&self) -> Result<HvfGicDeviceState, HvfGicError> {
+        self.capture.capture()
+    }
+}
+
+impl fmt::Debug for HvfGicStateSnapshotter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicStateSnapshotter")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -898,6 +998,59 @@ impl<Api: HvfGicApi + ?Sized> Drop for GicConfigGuard<'_, Api> {
     }
 }
 
+struct GicStateGuard<'api, Api: HvfGicStateApi + ?Sized> {
+    api: &'api Api,
+    state: Option<Api::State>,
+}
+
+impl<'api, Api: HvfGicStateApi + ?Sized> GicStateGuard<'api, Api> {
+    fn new(api: &'api Api) -> Result<Self, HvfGicError> {
+        Ok(Self {
+            api,
+            state: Some(api.create_state()?),
+        })
+    }
+
+    fn state(&self) -> Result<&Api::State, HvfGicError> {
+        self.state.as_ref().ok_or(HvfGicError::InvalidState(
+            "GIC state object has already been released",
+        ))
+    }
+}
+
+impl<Api: HvfGicStateApi + ?Sized> Drop for GicStateGuard<'_, Api> {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            self.api.release_state(state);
+        }
+    }
+}
+
+fn capture_gic_device_state_with_api<Api: HvfGicStateApi + ?Sized>(
+    api: &Api,
+) -> Result<HvfGicDeviceState, HvfGicError> {
+    let state = GicStateGuard::new(api)?;
+    let size = api.state_size(state.state()?)?;
+    if size == 0 {
+        return Err(HvfGicError::InvalidParameter {
+            name: "gic_state_size",
+            value: 0,
+        });
+    }
+
+    let reported_size = u64::try_from(size).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| HvfGicError::StateAllocationFailed {
+            size: reported_size,
+        })?;
+    bytes.resize(size, 0);
+    api.copy_state(state.state()?, &mut bytes)?;
+
+    Ok(HvfGicDeviceState::new(bytes))
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_real_gic() -> Result<HvfGicMetadata, HvfGicError> {
     let api = LoadedHvfGicApi::load()?;
@@ -927,6 +1080,9 @@ mod dynamic {
     type HvGicCreate = unsafe extern "C" fn(*mut c_void) -> HvReturn;
     type HvGicSetSpi = unsafe extern "C" fn(u32, bool) -> HvReturn;
     type HvGicSetRedistributorReg = unsafe extern "C" fn(u64, u32, u64) -> HvReturn;
+    type HvGicStateCreate = unsafe extern "C" fn() -> *mut c_void;
+    type HvGicStateGetSize = unsafe extern "C" fn(*mut c_void, *mut usize) -> HvReturn;
+    type HvGicStateGetData = unsafe extern "C" fn(*mut c_void, *mut c_void) -> HvReturn;
     type HvGicGetSize = unsafe extern "C" fn(*mut usize) -> HvReturn;
     type HvGicGetSpiRange = unsafe extern "C" fn(*mut u32, *mut u32) -> HvReturn;
     type HvGicGetIntid = unsafe extern "C" fn(u16, *mut u32) -> HvReturn;
@@ -948,6 +1104,11 @@ mod dynamic {
     pub(super) struct LoadedHvfGicPpiPendingApi {
         _library: DynamicLibrary,
         symbols: HvfGicPpiPendingSymbols,
+    }
+
+    pub(super) struct LoadedHvfGicStateCaptureApi {
+        _library: DynamicLibrary,
+        symbols: HvfGicStateCaptureSymbols,
     }
 
     struct DynamicLibrary {
@@ -983,6 +1144,14 @@ mod dynamic {
     #[derive(Clone, Copy)]
     struct HvfGicPpiPendingSymbols {
         set_redistributor_reg: HvGicSetRedistributorReg,
+    }
+
+    #[derive(Clone, Copy)]
+    struct HvfGicStateCaptureSymbols {
+        state_create: HvGicStateCreate,
+        state_get_size: HvGicStateGetSize,
+        state_get_data: HvGicStateGetData,
+        os_release: OsRelease,
     }
 
     impl LoadedHvfGicApi {
@@ -1049,9 +1218,28 @@ mod dynamic {
         }
     }
 
+    impl LoadedHvfGicStateCaptureApi {
+        pub(super) fn load() -> Result<Self, HvfGicError> {
+            let library = DynamicLibrary::open(HYPERVISOR_FRAMEWORK_PATH)?;
+            let symbols = HvfGicStateCaptureSymbols::load(library.handle())?;
+
+            Ok(Self {
+                _library: library,
+                symbols,
+            })
+        }
+    }
+
     impl fmt::Debug for LoadedHvfGicPpiPendingApi {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("LoadedHvfGicPpiPendingApi")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl fmt::Debug for LoadedHvfGicStateCaptureApi {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("LoadedHvfGicStateCaptureApi")
                 .finish_non_exhaustive()
         }
     }
@@ -1164,6 +1352,30 @@ mod dynamic {
                     library,
                     c"hv_gic_set_redistributor_reg",
                     "hv_gic_set_redistributor_reg",
+                )?,
+            })
+        }
+    }
+
+    impl HvfGicStateCaptureSymbols {
+        fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
+            Ok(Self {
+                state_create: load_symbol(library, c"hv_gic_state_create", "hv_gic_state_create")?,
+                state_get_size: load_symbol(
+                    library,
+                    c"hv_gic_state_get_size",
+                    "hv_gic_state_get_size",
+                )?,
+                state_get_data: load_symbol(
+                    library,
+                    c"hv_gic_state_get_data",
+                    "hv_gic_state_get_data",
+                )?,
+                os_release: load_symbol(
+                    NonNull::new(libc::RTLD_DEFAULT)
+                        .ok_or(HvfGicError::MissingSymbol("os_release"))?,
+                    c"os_release",
+                    "os_release",
                 )?,
             })
         }
@@ -1338,6 +1550,56 @@ mod dynamic {
         }
     }
 
+    impl super::HvfGicStateApi for LoadedHvfGicStateCaptureApi {
+        type State = NonNull<c_void>;
+
+        fn create_state(&self) -> Result<Self::State, HvfGicError> {
+            // SAFETY: Creates a new retained GIC state object for the current
+            // stopped VM according to Hypervisor.framework's ownership rules.
+            let state = unsafe { (self.symbols.state_create)() };
+            NonNull::new(state).ok_or(HvfGicError::StateCreateFailed)
+        }
+
+        fn state_size(&self, state: &Self::State) -> Result<usize, HvfGicError> {
+            let mut size = 0;
+            // SAFETY: `state` is a live retained object owned by the guard and
+            // `size` is a valid out-pointer for the duration of the call.
+            unsafe {
+                crate::ffi::check(
+                    (self.symbols.state_get_size)(state.as_ptr(), &mut size),
+                    "hv_gic_state_get_size",
+                )?
+            };
+            Ok(size)
+        }
+
+        fn copy_state(&self, state: &Self::State, data: &mut [u8]) -> Result<(), HvfGicError> {
+            // SAFETY: `state` is live and `data` is the initialized mutable
+            // buffer sized from this same state object's successful size query.
+            unsafe {
+                crate::ffi::check(
+                    (self.symbols.state_get_data)(state.as_ptr(), data.as_mut_ptr().cast()),
+                    "hv_gic_state_get_data",
+                )?
+            };
+            Ok(())
+        }
+
+        fn release_state(&self, state: Self::State) {
+            // SAFETY: `state` is a retained OS object returned by
+            // `hv_gic_state_create` and is released exactly once by the guard.
+            unsafe {
+                (self.symbols.os_release)(state.as_ptr());
+            }
+        }
+    }
+
+    impl super::HvfGicStateCapture for LoadedHvfGicStateCaptureApi {
+        fn capture(&self) -> Result<super::HvfGicDeviceState, HvfGicError> {
+            super::capture_gic_device_state_with_api(self)
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::ffi::c_void;
@@ -1385,11 +1647,15 @@ mod dynamic {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use dynamic::{LoadedHvfGicApi, LoadedHvfGicPpiPendingApi, LoadedHvfGicSpiSignalApi};
+use dynamic::{
+    LoadedHvfGicApi, LoadedHvfGicPpiPendingApi, LoadedHvfGicSpiSignalApi,
+    LoadedHvfGicStateCaptureApi,
+};
 
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Barrier, Mutex};
 
     use bangbang_runtime::BackendError;
@@ -1403,17 +1669,139 @@ mod tests {
     use super::{
         GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE, GicConfigGuard, HV_GIC_INT_EL1_PHYSICAL_TIMER,
         HV_GIC_INT_EL1_VIRTUAL_TIMER, HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0,
-        HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, HvfGicApi, HvfGicError,
+        HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, HvfGicApi, HvfGicDeviceState, HvfGicError,
         HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata,
         HvfGicParameters, HvfGicPpiPendingWriter, HvfGicRegion, HvfGicSpiSignalError,
-        HvfGicSpiSignaler, HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
-        create_gic_with_api, metadata_from_parameters,
+        HvfGicSpiSignaler, HvfGicStateApi, HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
+        capture_gic_device_state_with_api, create_gic_with_api, metadata_from_parameters,
     };
 
     const DIST_SIZE: u64 = 0x1_0000;
     const REDIST_REGION_SIZE: u64 = 0x2_0000;
     const REDIST_SIZE: u64 = 0x2_0000;
     const ALIGNMENT: u64 = 0x1_0000;
+
+    #[test]
+    fn captures_opaque_gic_device_state_and_releases_object() {
+        let api = FakeGicStateApi::new(vec![0x12, 0x34, 0x56, 0x78]);
+
+        let state = capture_gic_device_state_with_api(&api)
+            .expect("opaque GIC device state should be captured");
+
+        assert_eq!(state.as_bytes(), [0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(state.len(), 4);
+        assert!(!state.is_empty());
+        assert_eq!(
+            api.calls(),
+            ["state_create", "state_size", "state_data", "os_release"]
+        );
+        assert_eq!(api.released_states(), [7]);
+    }
+
+    #[test]
+    fn opaque_gic_device_state_debug_redacts_bytes() {
+        let state = HvfGicDeviceState::new(b"sensitive-gic-state".to_vec());
+
+        let debug = format!("{state:?}");
+
+        assert!(debug.contains("HvfGicDeviceState"));
+        assert!(debug.contains("len: 19"));
+        assert!(!debug.contains("sensitive"));
+        assert!(!debug.contains("115, 101, 110"));
+    }
+
+    #[test]
+    fn displays_gic_state_capture_errors_without_buffer_contents() {
+        let create = HvfGicError::StateCreateFailed;
+        assert_eq!(
+            create.to_string(),
+            "failed to create Hypervisor.framework GIC state object"
+        );
+        assert!(create.source().is_none());
+
+        let allocation = HvfGicError::StateAllocationFailed { size: 4096 };
+        assert_eq!(
+            allocation.to_string(),
+            "failed to allocate 4096 bytes for Hypervisor.framework GIC state"
+        );
+        assert!(allocation.source().is_none());
+    }
+
+    #[test]
+    fn gic_state_create_failure_has_no_object_to_release() {
+        let api = FakeGicStateApi::new(vec![1]).with_failure("state_create");
+
+        assert_eq!(
+            capture_gic_device_state_with_api(&api),
+            Err(HvfGicError::StateCreateFailed)
+        );
+        assert_eq!(api.calls(), ["state_create"]);
+        assert!(api.released_states().is_empty());
+    }
+
+    #[test]
+    fn gic_state_size_and_data_failures_release_object_without_partial_value() {
+        for failure in ["state_size", "state_data"] {
+            let api = FakeGicStateApi::new(vec![1, 2, 3]).with_failure(failure);
+
+            assert_eq!(
+                capture_gic_device_state_with_api(&api),
+                Err(HvfGicError::Backend(BackendError::Hypervisor(format!(
+                    "injected {failure} failure"
+                ))))
+            );
+            let expected_calls = if failure == "state_size" {
+                vec!["state_create", "state_size", "os_release"]
+            } else {
+                vec!["state_create", "state_size", "state_data", "os_release"]
+            };
+            assert_eq!(api.calls(), expected_calls);
+            assert_eq!(api.released_states(), [7]);
+        }
+    }
+
+    #[test]
+    fn zero_gic_state_size_releases_object_without_copying_data() {
+        let api = FakeGicStateApi::new(Vec::new());
+
+        assert_eq!(
+            capture_gic_device_state_with_api(&api),
+            Err(HvfGicError::InvalidParameter {
+                name: "gic_state_size",
+                value: 0,
+            })
+        );
+        assert_eq!(api.calls(), ["state_create", "state_size", "os_release"]);
+        assert_eq!(api.released_states(), [7]);
+    }
+
+    #[test]
+    fn gic_state_allocation_failure_releases_object_without_copying_data() {
+        let api = FakeGicStateApi::new(vec![1]).with_reported_size(usize::MAX);
+
+        assert_eq!(
+            capture_gic_device_state_with_api(&api),
+            Err(HvfGicError::StateAllocationFailed { size: u64::MAX })
+        );
+        assert_eq!(api.calls(), ["state_create", "state_size", "os_release"]);
+        assert_eq!(api.released_states(), [7]);
+    }
+
+    #[test]
+    fn gic_state_guard_releases_object_during_unwind() {
+        let api = FakeGicStateApi::new(vec![1]).with_panic("state_data");
+
+        let unwind = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = capture_gic_device_state_with_api(&api);
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(
+            api.calls(),
+            ["state_create", "state_size", "state_data", "os_release"]
+        );
+        assert_eq!(api.released_states(), [7]);
+    }
 
     #[test]
     fn metadata_places_gic_regions_below_mmio32_start() {
@@ -2011,11 +2399,11 @@ mod tests {
         let backend = HvfGicSpiSignalError::Backend(HvfGicError::Unsupported("not available"));
         assert_eq!(
             backend.to_string(),
-            "failed to initialize HVF GIC SPI signaler: unsupported GIC setup: not available"
+            "failed to initialize HVF GIC SPI signaler: unsupported GIC operation: not available"
         );
         assert_eq!(
             backend.source().map(ToString::to_string),
-            Some("unsupported GIC setup: not available".to_string())
+            Some("unsupported GIC operation: not available".to_string())
         );
 
         let invalid_state =
@@ -2498,6 +2886,139 @@ mod tests {
 
     fn line(value: u32) -> GuestInterruptLine {
         GuestInterruptLine::new(value).expect("test interrupt line should be valid")
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeGicStateApi {
+        state: Arc<Mutex<FakeGicStateApiState>>,
+    }
+
+    impl FakeGicStateApi {
+        fn new(bytes: Vec<u8>) -> Self {
+            let reported_size = bytes.len();
+            Self {
+                state: Arc::new(Mutex::new(FakeGicStateApiState {
+                    calls: Vec::new(),
+                    released_states: Vec::new(),
+                    bytes,
+                    reported_size,
+                    failure: None,
+                    panic: None,
+                })),
+            }
+        }
+
+        fn with_failure(self, failure: &'static str) -> Self {
+            self.state
+                .lock()
+                .expect("fake GIC state API should be lockable")
+                .failure = Some(failure);
+            self
+        }
+
+        fn with_panic(self, panic: &'static str) -> Self {
+            self.state
+                .lock()
+                .expect("fake GIC state API should be lockable")
+                .panic = Some(panic);
+            self
+        }
+
+        fn with_reported_size(self, reported_size: usize) -> Self {
+            self.state
+                .lock()
+                .expect("fake GIC state API should be lockable")
+                .reported_size = reported_size;
+            self
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.state
+                .lock()
+                .expect("fake GIC state API should be lockable")
+                .calls
+                .clone()
+        }
+
+        fn released_states(&self) -> Vec<u64> {
+            self.state
+                .lock()
+                .expect("fake GIC state API should be lockable")
+                .released_states
+                .clone()
+        }
+
+        fn record(&self, call: &'static str) -> Result<(), HvfGicError> {
+            let (failure, should_panic) = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("fake GIC state API should be lockable");
+                state.calls.push(call);
+                (state.failure == Some(call), state.panic == Some(call))
+            };
+
+            assert!(!should_panic, "injected {call} panic");
+            if failure {
+                if call == "state_create" {
+                    Err(HvfGicError::StateCreateFailed)
+                } else {
+                    Err(HvfGicError::Backend(BackendError::Hypervisor(format!(
+                        "injected {call} failure"
+                    ))))
+                }
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl HvfGicStateApi for FakeGicStateApi {
+        type State = u64;
+
+        fn create_state(&self) -> Result<Self::State, HvfGicError> {
+            self.record("state_create")?;
+            Ok(7)
+        }
+
+        fn state_size(&self, _: &Self::State) -> Result<usize, HvfGicError> {
+            self.record("state_size")?;
+            Ok(self
+                .state
+                .lock()
+                .expect("fake GIC state API should be lockable")
+                .reported_size)
+        }
+
+        fn copy_state(&self, _: &Self::State, data: &mut [u8]) -> Result<(), HvfGicError> {
+            self.record("state_data")?;
+            let state = self
+                .state
+                .lock()
+                .expect("fake GIC state API should be lockable");
+            assert_eq!(data.len(), state.bytes.len());
+            data.copy_from_slice(&state.bytes);
+            Ok(())
+        }
+
+        fn release_state(&self, state_handle: Self::State) {
+            let mut state = self
+                .state
+                .lock()
+                .expect("fake GIC state API should be lockable");
+            state.calls.push("os_release");
+            state.released_states.push(state_handle);
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeGicStateApiState {
+        calls: Vec<&'static str>,
+        released_states: Vec<u64>,
+        bytes: Vec<u8>,
+        reported_size: usize,
+        failure: Option<&'static str>,
+        panic: Option<&'static str>,
     }
 
     #[derive(Debug, Clone)]

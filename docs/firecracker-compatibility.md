@@ -1675,6 +1675,18 @@ admission with individual IRQ/FIQ operations and GIC PPI mutation, but its
 two-field value does not represent distributor, redistributor, CPU-interface,
 or device interrupt state. It has no persistence or restore contract.
 
+Another command captures Hypervisor.framework's stable, versioned opaque GIC
+device-state bytes except GIC CPU system registers. State-object creation,
+sizing, fallible allocation, data copy, and retained-object release run on the
+serialized owner loop. The command shares generalized interrupt admission with
+CPU pending and GIC PPI operations, and the current single-vCPU runner enforces
+Apple's stopped-VM condition against `hv_vcpu_run`. Both boot-session forms
+expose the redacted immutable value. The bytes are not parsed or persisted,
+have no restore validation or bangbang/Firecracker schema, and can still become
+incompatible after a host software update. The command does not quiesce
+device-side SPI producers. The process snapshot barrier invokes none of these
+captures; multi-vCPU stopping and ICC/ICH/ICV capture remain future work.
+
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared
 MMIO dispatcher, so a
@@ -2007,8 +2019,10 @@ macOS design work instead of direct implementation:
   TPIDR2_EL0. Streaming SVE/SME state remains outside these subsets. It also
   gets and sets the HVF
   virtual-timer mask, raw offset, raw control, and raw CVAL on that owning
-  thread and can capture those fields through one serialized command. None of
-  these subsets is a complete or portable restore model. The
+  thread and can capture those fields through one serialized command. It can
+  also capture Hypervisor.framework's stable, versioned opaque GIC device blob
+  except CPU system registers while the current single-vCPU runner is stopped.
+  None of these subsets is a complete or portable restore model. The
   runner explicitly dispatches one resolved MMIO access through a shared runtime
   dispatcher on the owning thread, runs once and handles a resulting
   MMIO exit through that dispatcher, supports one cancellable
