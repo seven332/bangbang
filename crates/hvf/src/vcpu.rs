@@ -155,6 +155,44 @@ impl HvfArm64VcpuCoreSystemRegisterState {
     }
 }
 
+/// Detached raw thread-context register state captured from one arm64 vCPU.
+///
+/// These software thread-ID values can contain guest TLS or kernel pointers.
+/// They are sensitive raw observations for later owner-thread orchestration,
+/// not a complete or serialized restorable vCPU state. `TPIDR2_EL0`, wider
+/// system registers, and restore validation remain outside this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuThreadContextRegisterState {
+    tpidr_el0: u64,
+    tpidrro_el0: u64,
+    tpidr_el1: u64,
+}
+
+impl HvfArm64VcpuThreadContextRegisterState {
+    pub(crate) const fn new(tpidr_el0: u64, tpidrro_el0: u64, tpidr_el1: u64) -> Self {
+        Self {
+            tpidr_el0,
+            tpidrro_el0,
+            tpidr_el1,
+        }
+    }
+
+    /// Return the raw `TPIDR_EL0` value.
+    pub const fn tpidr_el0(self) -> u64 {
+        self.tpidr_el0
+    }
+
+    /// Return the raw `TPIDRRO_EL0` value.
+    pub const fn tpidrro_el0(self) -> u64 {
+        self.tpidrro_el0
+    }
+
+    /// Return the raw `TPIDR_EL1` value.
+    pub const fn tpidr_el1(self) -> u64 {
+        self.tpidr_el1
+    }
+}
+
 /// Detached raw baseline SIMD/floating-point state captured from one arm64 vCPU.
 ///
 /// This value contains Q0-Q31, FPCR, and FPSR. Each Q register is preserved as
@@ -302,6 +340,9 @@ impl HvfSystemRegister {
     pub const SPSR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SPSR_EL1);
     pub const ELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ELR_EL1);
     pub const SP_EL0: Self = Self(crate::ffi::HV_SYS_REG_SP_EL0);
+    pub const TPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL1);
+    pub const TPIDR_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL0);
+    pub const TPIDRRO_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDRRO_EL0);
     pub const CNTV_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CTL_EL0);
     pub const CNTV_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CVAL_EL0);
     pub const SP_EL1: Self = Self(crate::ffi::HV_SYS_REG_SP_EL1);
@@ -717,6 +758,20 @@ pub(crate) fn capture_arm64_vcpu_core_system_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_thread_context_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuThreadContextRegisterState, BackendError> {
+    let tpidr_el0 = get_system_register(HvfSystemRegister::TPIDR_EL0)?;
+    let tpidrro_el0 = get_system_register(HvfSystemRegister::TPIDRRO_EL0)?;
+    let tpidr_el1 = get_system_register(HvfSystemRegister::TPIDR_EL1)?;
+
+    Ok(HvfArm64VcpuThreadContextRegisterState::new(
+        tpidr_el0,
+        tpidrro_el0,
+        tpidr_el1,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_pending_interrupt_state_with(
     mut get_pending_interrupt: impl FnMut(HvfInterruptType) -> Result<bool, BackendError>,
 ) -> Result<HvfArm64VcpuPendingInterruptState, BackendError> {
@@ -783,6 +838,7 @@ mod tests {
         NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_general_register_state_with,
         capture_arm64_vcpu_pending_interrupt_state_with, capture_arm64_vcpu_simd_fp_state_with,
+        capture_arm64_vcpu_thread_context_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with, configure_arm64_boot_registers_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
@@ -1227,6 +1283,100 @@ mod tests {
             assert_eq!(
                 state.spsr_el1(),
                 u64::from(HvfSystemRegister::SPSR_EL1.raw())
+            );
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn captures_arm64_thread_context_register_state_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_thread_context_register_state_with(|register| {
+            reads.push(register);
+            Ok(0x5_0000 + u64::from(register.raw()))
+        })
+        .expect("thread-context register capture should succeed");
+
+        assert_eq!(
+            reads,
+            [
+                HvfSystemRegister::TPIDR_EL0,
+                HvfSystemRegister::TPIDRRO_EL0,
+                HvfSystemRegister::TPIDR_EL1,
+            ]
+        );
+        assert_eq!(
+            state.tpidr_el0(),
+            0x5_0000 + u64::from(HvfSystemRegister::TPIDR_EL0.raw())
+        );
+        assert_eq!(
+            state.tpidrro_el0(),
+            0x5_0000 + u64::from(HvfSystemRegister::TPIDRRO_EL0.raw())
+        );
+        assert_eq!(
+            state.tpidr_el1(),
+            0x5_0000 + u64::from(HvfSystemRegister::TPIDR_EL1.raw())
+        );
+        assert_eq!(
+            HvfSystemRegister::TPIDR_EL0.raw(),
+            crate::ffi::HV_SYS_REG_TPIDR_EL0
+        );
+        assert_eq!(
+            HvfSystemRegister::TPIDRRO_EL0.raw(),
+            crate::ffi::HV_SYS_REG_TPIDRRO_EL0
+        );
+        assert_eq!(
+            HvfSystemRegister::TPIDR_EL1.raw(),
+            crate::ffi::HV_SYS_REG_TPIDR_EL1
+        );
+    }
+
+    #[test]
+    fn arm64_thread_context_register_capture_stops_after_each_error_and_can_retry() {
+        let registers = [
+            HvfSystemRegister::TPIDR_EL0,
+            HvfSystemRegister::TPIDRRO_EL0,
+            HvfSystemRegister::TPIDR_EL1,
+        ];
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake thread-context register read failed",
+                    ))
+                } else {
+                    Ok(u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_thread_context_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake thread-context register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state =
+                capture_arm64_vcpu_thread_context_register_state_with(&read_system_register)
+                    .expect("thread-context register capture retry should succeed");
+            assert_eq!(
+                state.tpidr_el0(),
+                u64::from(HvfSystemRegister::TPIDR_EL0.raw())
+            );
+            assert_eq!(
+                state.tpidrro_el0(),
+                u64::from(HvfSystemRegister::TPIDRRO_EL0.raw())
+            );
+            assert_eq!(
+                state.tpidr_el1(),
+                u64::from(HvfSystemRegister::TPIDR_EL1.raw())
             );
             assert_eq!(*reads.borrow(), registers);
         }

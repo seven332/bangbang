@@ -1647,11 +1647,14 @@ These commands reject overlapping metadata reads, runs, boot-register setup,
 MMIO dispatches, core-register capture, virtual-timer operations, or generalized
 interrupt operations. The general-register capture command returns only after
 X0-X30, PC, and CPSR have all been read. A second command reads raw `SP_EL0`,
-`SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. A third reads all 16 bytes of
-Q0-Q31 in ascending order, then raw FPCR and FPSR. The three commands share one
+`SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. A third reads raw
+`TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. A fourth reads all 16 bytes of
+Q0-Q31 in ascending order, then raw FPCR and FPSR. The four commands share one
 command-owned core-register admission domain, publish no partial state after a
 read failure, and are exposed by borrowed and owned HVF boot sessions for later
-lease-owned orchestration. The SIMD getter uses an explicitly 16-byte-aligned
+lease-owned orchestration. TPIDR values can contain guest TLS or kernel
+pointers, and the optional SME-era `TPIDR2_EL0` remains outside the baseline.
+The SIMD getter uses an explicitly 16-byte-aligned
 HVF output value; in streaming SVE mode, its Q values alias only the low 128
 bits of Z registers and are not complete SVE/SME state. A separate command
 reads the virtual-timer mask, raw offset, control, and CVAL in that order,
@@ -1661,15 +1664,17 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 `CNTVCT_EL0 = mach_absolute_time() - offset` relation, while control ISTATUS is
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
-or control-restore policy. The core system-register and baseline SIMD/FP subsets
-are raw and read-only and likewise have no restore validation, snapshot schema,
-or Firecracker on-disk compatibility. The process snapshot barrier invokes none
-of these captures.
+or control-restore policy. The core system-register, thread-context, and
+baseline SIMD/FP subsets are raw and read-only and likewise have no restore
+validation, snapshot schema, or Firecracker on-disk compatibility. The process
+snapshot barrier invokes none of these captures.
+
 A separate failure-atomic command reads CPU IRQ then FIQ pending levels and is
 available through both boot-session forms. It shares generalized interrupt
 admission with individual IRQ/FIQ operations and GIC PPI mutation, but its
 two-field value does not represent distributor, redistributor, CPU-interface,
 or device interrupt state. It has no persistence or restore contract.
+
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared
 MMIO dispatcher, so a
