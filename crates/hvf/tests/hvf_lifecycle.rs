@@ -29,6 +29,39 @@ const CORE_SYSTEM_REGISTER_GUEST_CODE: [u32; 9] = [
     0xd400_0002, // hvc #0
 ];
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXCEPTION_TEST_AFSR0_EL1: u64 = 0x1111;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXCEPTION_TEST_AFSR1_EL1: u64 = 0x2222;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXCEPTION_TEST_ESR_EL1: u64 = 0x9600_0045;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXCEPTION_TEST_FAR_EL1: u64 = 0x3333_4444;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXCEPTION_TEST_PAR_EL1: u64 = 0x5555_6800;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXCEPTION_TEST_VBAR_EL1: u64 = 0x1234_5000;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXCEPTION_REGISTER_GUEST_CODE: [u32; 18] = [
+    0xd282_2220, // mov x0, #0x1111
+    0xd518_5100, // msr AFSR0_EL1, x0
+    0xd284_4440, // mov x0, #0x2222
+    0xd518_5120, // msr AFSR1_EL1, x0
+    0xd280_08a0, // mov x0, #0x45
+    0xf2b2_c000, // movk x0, #0x9600, lsl #16
+    0xd518_5200, // msr ESR_EL1, x0
+    0xd288_8880, // mov x0, #0x4444
+    0xf2a6_6660, // movk x0, #0x3333, lsl #16
+    0xd518_6000, // msr FAR_EL1, x0
+    0xd28d_0000, // mov x0, #0x6800
+    0xf2aa_aaa0, // movk x0, #0x5555, lsl #16
+    0xd518_7400, // msr PAR_EL1, x0
+    0xd28a_0000, // mov x0, #0x5000
+    0xf2a2_4680, // movk x0, #0x1234, lsl #16
+    0xd518_c000, // msr VBAR_EL1, x0
+    0xd503_3fdf, // isb
+    0xd400_0002, // hvc #0
+];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const TRANSLATION_TEST_TTBR0_EL1: u64 = 0x1234_5000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const TRANSLATION_TEST_TTBR1_EL1: u64 = 0x5678_9000;
@@ -390,6 +423,76 @@ fn captures_guest_written_arm64_core_system_registers_on_runner_thread() {
         assert_eq!(state.sp_el1(), CORE_SYSTEM_TEST_SP_EL1);
         assert_eq!(state.elr_el1(), CORE_SYSTEM_TEST_ELR_EL1);
         assert_eq!(state.spsr_el1(), CORE_SYSTEM_TEST_SPSR_EL1);
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn captures_guest_written_arm64_exception_registers_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_code = EXCEPTION_REGISTER_GUEST_CODE
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("exception-register guest code should be written");
+
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_entry,
+            })
+            .expect("guest code boot registers should be configured");
+
+        let HvfVcpuExit::Exception(exit) = runner
+            .run_once()
+            .expect("guest exception-register writer should exit through HVC")
+        else {
+            panic!("guest exception-register writer should produce an exception exit");
+        };
+        assert_eq!(
+            exit.decode_hvc()
+                .expect("guest exception-register writer exit should decode as HVC")
+                .immediate(),
+            0
+        );
+
+        let state = runner
+            .capture_arm64_exception_register_state()
+            .expect("exception-register state should be captured");
+        // Auxiliary fault-status contents are implementation-defined. Current
+        // Apple Silicon exposes AFSR0 as read-as-zero/write-ignored, while a
+        // future host may preserve the architecturally valid guest write.
+        assert!(matches!(state.afsr0_el1(), 0 | EXCEPTION_TEST_AFSR0_EL1));
+        assert_eq!(state.afsr1_el1(), EXCEPTION_TEST_AFSR1_EL1);
+        assert_eq!(state.esr_el1(), EXCEPTION_TEST_ESR_EL1);
+        assert_eq!(state.far_el1(), EXCEPTION_TEST_FAR_EL1);
+        assert_eq!(state.par_el1(), EXCEPTION_TEST_PAR_EL1);
+        assert_eq!(state.vbar_el1(), EXCEPTION_TEST_VBAR_EL1);
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -1125,6 +1228,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .capture_arm64_core_system_register_state()
         .expect("internal session should capture core system-register state");
     session
+        .capture_arm64_exception_register_state()
+        .expect("internal session should capture exception-register state");
+    session
         .capture_arm64_translation_register_state()
         .expect("internal session should capture translation-register state");
     session
@@ -1270,6 +1376,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_core_system_register_state()
         .expect("owned session should capture core system-register state");
+    session
+        .capture_arm64_exception_register_state()
+        .expect("owned session should capture exception-register state");
     session
         .capture_arm64_translation_register_state()
         .expect("owned session should capture translation-register state");

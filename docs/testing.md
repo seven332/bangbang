@@ -107,6 +107,11 @@ Translation-register signed tests must leave `SCTLR_EL1.M` clear, write back
 the original SCTLR value, and only then write inert TTBR/TCR/attribute/context
 values before HVC. AMAIR is implementation-defined: current Apple Silicon reads
 zero after a guest write, while other hosts may preserve the written value.
+Exception-register signed tests must use an aligned VBAR address, take no
+intervening guest exception after changing it, and never claim vector-table
+memory is present. AFSR contents are implementation-defined: current Apple
+Silicon reads AFSR0 as zero after a guest write while preserving the test's
+AFSR1 value.
 
 ## Stability Rules
 

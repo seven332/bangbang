@@ -238,15 +238,19 @@ is resource-specific:
   process's snapshot resources. The current implementation boundary is
   documented in [Snapshot Feasibility](snapshot-feasibility.md).
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
-  SPSR_EL1 values, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1 values, raw
-  Q0-Q31/FPCR/FPSR values, raw virtual-timer mask/offset/control/CVAL values,
-  raw EL1 SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ
-  pending levels, opaque GIC device-state bytes, and raw EL1 GIC ICC CPU-
-  interface values are sensitive guest/VMM execution state.
+  SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
+  TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1 values, raw Q0-Q31/FPCR/FPSR values, raw
+  virtual-timer mask/offset/control/CVAL values, raw EL1
+  SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
+  levels, opaque GIC device-state bytes, and raw EL1 GIC ICC CPU-interface
+  values are sensitive guest/VMM execution state.
   TPIDR fields can contain guest TLS or kernel pointers, and
   SIMD/FP bytes can contain guest application or cryptographic working data.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
   expose guest process or kernel context identifiers.
+  FAR and PAR can expose guest fault or translation-result addresses, VBAR can
+  expose a guest kernel vector address, and syndrome/fault fields can reveal
+  guest execution details.
   The opaque GIC byte value uses a custom `Debug` implementation that reports
   only its length rather than formatting its contents.
   Current internal capture commands keep these values in process memory and do

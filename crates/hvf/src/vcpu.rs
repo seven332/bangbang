@@ -155,6 +155,74 @@ impl HvfArm64VcpuCoreSystemRegisterState {
     }
 }
 
+/// Detached raw EL1 exception-register state captured from one arm64 vCPU.
+///
+/// This value contains both auxiliary fault status registers, the exception
+/// syndrome, fault address, address-translation result, and exception vector
+/// base. AFSR contents are implementation-defined, and the report fields are
+/// not validated as one coherent exception. FAR, PAR, and VBAR can expose
+/// sensitive guest addresses. This value omits vector-table memory, feature
+/// validation, persistence, and an ordered restore policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuExceptionRegisterState {
+    afsr0_el1: u64,
+    afsr1_el1: u64,
+    esr_el1: u64,
+    far_el1: u64,
+    par_el1: u64,
+    vbar_el1: u64,
+}
+
+impl HvfArm64VcpuExceptionRegisterState {
+    pub(crate) const fn new(
+        afsr0_el1: u64,
+        afsr1_el1: u64,
+        esr_el1: u64,
+        far_el1: u64,
+        par_el1: u64,
+        vbar_el1: u64,
+    ) -> Self {
+        Self {
+            afsr0_el1,
+            afsr1_el1,
+            esr_el1,
+            far_el1,
+            par_el1,
+            vbar_el1,
+        }
+    }
+
+    /// Return the raw `AFSR0_EL1` value.
+    pub const fn afsr0_el1(self) -> u64 {
+        self.afsr0_el1
+    }
+
+    /// Return the raw `AFSR1_EL1` value.
+    pub const fn afsr1_el1(self) -> u64 {
+        self.afsr1_el1
+    }
+
+    /// Return the raw `ESR_EL1` value.
+    pub const fn esr_el1(self) -> u64 {
+        self.esr_el1
+    }
+
+    /// Return the raw `FAR_EL1` value.
+    pub const fn far_el1(self) -> u64 {
+        self.far_el1
+    }
+
+    /// Return the raw `PAR_EL1` value.
+    pub const fn par_el1(self) -> u64 {
+        self.par_el1
+    }
+
+    /// Return the raw `VBAR_EL1` value.
+    pub const fn vbar_el1(self) -> u64 {
+        self.vbar_el1
+    }
+}
+
 /// Detached raw EL1 translation-register state captured from one arm64 vCPU.
 ///
 /// This value contains `SCTLR_EL1`, both translation table bases, `TCR_EL1`,
@@ -420,8 +488,14 @@ impl HvfSystemRegister {
     pub const SPSR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SPSR_EL1);
     pub const ELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ELR_EL1);
     pub const SP_EL0: Self = Self(crate::ffi::HV_SYS_REG_SP_EL0);
+    pub const AFSR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_AFSR0_EL1);
+    pub const AFSR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_AFSR1_EL1);
+    pub const ESR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ESR_EL1);
+    pub const FAR_EL1: Self = Self(crate::ffi::HV_SYS_REG_FAR_EL1);
+    pub const PAR_EL1: Self = Self(crate::ffi::HV_SYS_REG_PAR_EL1);
     pub const MAIR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MAIR_EL1);
     pub const AMAIR_EL1: Self = Self(crate::ffi::HV_SYS_REG_AMAIR_EL1);
+    pub const VBAR_EL1: Self = Self(crate::ffi::HV_SYS_REG_VBAR_EL1);
     pub const CONTEXTIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CONTEXTIDR_EL1);
     pub const TPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL1);
     pub const TPIDR_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL0);
@@ -841,6 +915,21 @@ pub(crate) fn capture_arm64_vcpu_core_system_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_exception_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuExceptionRegisterState, BackendError> {
+    let afsr0_el1 = get_system_register(HvfSystemRegister::AFSR0_EL1)?;
+    let afsr1_el1 = get_system_register(HvfSystemRegister::AFSR1_EL1)?;
+    let esr_el1 = get_system_register(HvfSystemRegister::ESR_EL1)?;
+    let far_el1 = get_system_register(HvfSystemRegister::FAR_EL1)?;
+    let par_el1 = get_system_register(HvfSystemRegister::PAR_EL1)?;
+    let vbar_el1 = get_system_register(HvfSystemRegister::VBAR_EL1)?;
+
+    Ok(HvfArm64VcpuExceptionRegisterState::new(
+        afsr0_el1, afsr1_el1, esr_el1, far_el1, par_el1, vbar_el1,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
@@ -941,6 +1030,7 @@ mod tests {
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfInterruptType,
         HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
         NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_core_system_register_state_with,
+        capture_arm64_vcpu_exception_register_state_with,
         capture_arm64_vcpu_general_register_state_with,
         capture_arm64_vcpu_pending_interrupt_state_with, capture_arm64_vcpu_simd_fp_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
@@ -1286,6 +1376,59 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_exception_register_state_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_exception_register_state_with(|register| {
+            reads.push(register);
+            Ok(0x5a5a_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("exception-register capture should succeed");
+
+        assert_eq!(
+            reads,
+            [
+                HvfSystemRegister::AFSR0_EL1,
+                HvfSystemRegister::AFSR1_EL1,
+                HvfSystemRegister::ESR_EL1,
+                HvfSystemRegister::FAR_EL1,
+                HvfSystemRegister::PAR_EL1,
+                HvfSystemRegister::VBAR_EL1,
+            ]
+        );
+        assert_eq!(
+            state.afsr0_el1(),
+            0x5a5a_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_AFSR0_EL1)
+        );
+        assert_eq!(
+            state.afsr1_el1(),
+            0x5a5a_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_AFSR1_EL1)
+        );
+        assert_eq!(
+            state.esr_el1(),
+            0x5a5a_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_ESR_EL1)
+        );
+        assert_eq!(
+            state.far_el1(),
+            0x5a5a_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_FAR_EL1)
+        );
+        assert_eq!(
+            state.par_el1(),
+            0x5a5a_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_PAR_EL1)
+        );
+        assert_eq!(
+            state.vbar_el1(),
+            0x5a5a_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_VBAR_EL1)
+        );
+        assert_eq!(HvfSystemRegister::AFSR0_EL1.raw(), 0xc288);
+        assert_eq!(HvfSystemRegister::AFSR1_EL1.raw(), 0xc289);
+        assert_eq!(HvfSystemRegister::ESR_EL1.raw(), 0xc290);
+        assert_eq!(HvfSystemRegister::FAR_EL1.raw(), 0xc300);
+        assert_eq!(HvfSystemRegister::PAR_EL1.raw(), 0xc3a0);
+        assert_eq!(HvfSystemRegister::VBAR_EL1.raw(), 0xc600);
+    }
+
+    #[test]
     fn captures_arm64_translation_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -1448,6 +1591,54 @@ mod tests {
             assert_eq!(
                 state.spsr_el1(),
                 u64::from(HvfSystemRegister::SPSR_EL1.raw())
+            );
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_exception_register_capture_stops_after_each_error_and_can_retry() {
+        let registers = [
+            HvfSystemRegister::AFSR0_EL1,
+            HvfSystemRegister::AFSR1_EL1,
+            HvfSystemRegister::ESR_EL1,
+            HvfSystemRegister::FAR_EL1,
+            HvfSystemRegister::PAR_EL1,
+            HvfSystemRegister::VBAR_EL1,
+        ];
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake exception register read failed",
+                    ))
+                } else {
+                    Ok(u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_exception_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake exception register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_exception_register_state_with(&read_system_register)
+                .expect("exception-register capture retry should succeed");
+            assert_eq!(
+                state.afsr0_el1(),
+                u64::from(HvfSystemRegister::AFSR0_EL1.raw())
+            );
+            assert_eq!(
+                state.vbar_el1(),
+                u64::from(HvfSystemRegister::VBAR_EL1.raw())
             );
             assert_eq!(*reads.borrow(), registers);
         }
