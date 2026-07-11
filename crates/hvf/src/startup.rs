@@ -7039,6 +7039,36 @@ mod tests {
         ));
         assert_eq!(device.generation_id, [0x33; ARM64_BOOT_VMGENID_SIZE]);
         assert!(!format!("{error:?}").contains("51, 51"));
+
+        let mut retried_signal_called = false;
+        replace_vmgenid_and_signal_with(
+            &mut memory,
+            &mut device,
+            |memory, device| {
+                assert_eq!(device.generation_id, [0x33; ARM64_BOOT_VMGENID_SIZE]);
+                let candidate = [0x44; ARM64_BOOT_VMGENID_SIZE];
+                memory
+                    .write_slice(&candidate, device.range.start())
+                    .map_err(
+                        |source| Arm64BootVmGenIdReplacementError::GuestMemoryWrite { source },
+                    )?;
+                device.generation_id = candidate;
+                Ok(())
+            },
+            || {
+                retried_signal_called = true;
+                Ok(())
+            },
+        )
+        .expect("complete VMGenID retry should replace again and signal");
+
+        assert!(retried_signal_called);
+        assert_eq!(device.generation_id, [0x44; ARM64_BOOT_VMGENID_SIZE]);
+        let mut guest_value = [0; ARM64_BOOT_VMGENID_SIZE];
+        memory
+            .read_slice(&mut guest_value, device.range.start())
+            .expect("retried VMGenID should read");
+        assert_eq!(guest_value, device.generation_id);
     }
 
     fn wait_for_limiter_retry_scheduler_status(
