@@ -49,7 +49,8 @@ boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary,
 baseline and optional SVE/SME guest-visible identification metadata, pointer-
-authentication key-state capture with redacted `Debug`, raw cache-selection,
+authentication key-state capture with redacted `Debug`, raw cache-selection
+plus ordered nontransactional restore of its typed CSSELR_EL1 value,
 hardware-breakpoint, hardware-watchpoint, debug-control, debug-trap policy, and
 physical-timer CNTKCTL/control/CVAL/TVAL capture, a virtual-timer
 mask/offset/control/CVAL boundary, a bounded
@@ -1688,8 +1689,10 @@ the reusable system-register partial-write contract. A ninth reads guest-visible
 `MPIDR_EL1`, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 compatibility metadata. A
 tenth reads raw `MDCCINT_EL1` then `MDSCR_EL1` without writing either register
 or changing Hypervisor.framework debug trap settings. An eleventh reads raw
-`CSSELR_EL1` without changing the selector or consuming its selected
-`CCSIDR_EL1` view. A twelfth reads `ID_AA64DFR0_EL1`, derives `BRPs + 1`, then
+`CSSELR_EL1`; its typed value has a paired owner-thread restore that writes the
+same selector through the reusable system-register partial-write contract
+without consuming its selected `CCSIDR_EL1` view. A twelfth reads
+`ID_AA64DFR0_EL1`, derives `BRPs + 1`, then
 reads every implemented `DBGBVR<n>_EL1` / `DBGBCR<n>_EL1` pair in ascending
 order without writing or enabling debug state. A thirteenth reads
 `ID_AA64DFR0_EL1`, derives `WRPs + 1`, then reads every implemented
@@ -1725,12 +1728,12 @@ requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
 commands plus the general-, core-system-, exception-register, execution-
-control, thread-context, translation, baseline SIMD/FP, and pointer-
-authentication key, and system-context restore operations form a thirty-one-
-operation command-owned core-register admission domain.
+control, cache-selection, thread-context, translation, baseline SIMD/FP,
+pointer-authentication key, and system-context restore operations form a
+thirty-two-operation command-owned core-register admission domain.
 Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose all nine restores
+setter failure. Borrowed and owned HVF boot sessions expose all ten restores
 and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
@@ -1837,6 +1840,14 @@ The two writes are nontransactional, so failure requires a complete retry or
 vCPU discard before execution. The primitive defines no interpretation,
 feature or destination validation, protected persistence, rollback, schema,
 or wider restore ordering with TPIDR and `CONTEXTIDR_EL1` state.
+The separate cache-selection capture uses the stable `CSSELR_EL1` SDK id
+through the same owner-thread getter. Its paired restore writes the complete
+typed selector once through the owner and reports the exact failed register,
+zero completed writes, and backend source without formatting the value.
+Failure requires a complete retry or vCPU discard before execution. The raw
+apply does not validate an encoding or destination cache manifest, issue ISB,
+guarantee a dependent `CCSIDR_EL1` view, perform maintenance, persist state,
+roll back, or define a portable snapshot schema.
 The translation value omits table memory, feature and destination validation,
 TLB/cache maintenance, barriers, and a safe MMU transition sequence. Its paired
 restore merely reapplies the complete raw capture in field order and may leave
@@ -1906,8 +1917,10 @@ logging raw values, writes, enablement, trap changes, guest instructions, or
 guest execution. Debug-trap validation observes both booleans twice from an idle
 vCPU without assuming, comparing, or logging values, calling setters,
 activating debug behavior, or executing the guest. Cache-selection validation
-only reads the selector twice from an idle real vCPU; it does not assume a reset value, write
-CSSELR, issue ISB, query CCSIDR, perform cache maintenance, or run guest code.
+captures the selector twice from an idle real vCPU, then restores and
+recaptures the first complete value twice through fixed whole-state messages.
+It does not assume or log a reset value, issue ISB, query CCSIDR, perform cache
+maintenance, run guest code, or infer topology or destination compatibility.
 Default-cache-configuration validation queries CTR_EL0/CLIDR_EL1/DCZID_EL0
 twice before constructing a backend or VM and compares only through fixed
 messages without logging raw values. It creates/runs no vCPU, touches no live
@@ -1949,22 +1962,24 @@ derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The baseline and optional SVE/SME identification,
 SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register,
-cache-selection, breakpoint, watchpoint,
+breakpoint, watchpoint,
 debug-control, debug-trap, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
-The core system-register, EL1 exception, execution-control, thread-context, and
-translation subsets plus system-context, baseline SIMD/FP, and pointer-
-authentication keys have paired ordered, nontransactional restore operations
-but likewise have no validation, schema, dependent-memory, maintenance,
-feature-transition, SVE/SME alias, or wider ordering policy.
+The core system-register, EL1 exception, execution-control, cache-selection,
+thread-context, and translation subsets plus system-context, baseline SIMD/FP,
+and pointer-authentication keys have paired ordered, nontransactional restore
+operations but likewise have no validation, schema, dependent-memory,
+maintenance, feature-transition, SVE/SME alias, or wider ordering policy.
 Identification capture is compatibility metadata rather than mutable restore
 state and defines no feature-mask or destination policy. Debug-control and
 debug-trap capture remain separate and
 define no feature, writable/status-bit, security, setter, trap-coordination,
 synchronization, or restore policy.
-Cache-selection capture defines no topology manifest, selector validation,
-synchronization, maintenance, compatibility, or restore policy.
+Cache-selection capture-order apply defines no atomic topology manifest,
+selector or destination validation, ISB/dependent CCSIDR visibility,
+maintenance, compatibility, persistence, rollback, schema, or portable restore
+policy.
 Pointer-authentication capture and raw apply additionally have no feature or
 destination validation, zeroization, protected persistence, rollback, or safe
 SCTLR enable ordering. The process snapshot barrier invokes none of these

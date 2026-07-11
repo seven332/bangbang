@@ -1068,7 +1068,7 @@ fn captures_and_restores_guest_written_arm64_execution_controls_on_runner_thread
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_arm64_cache_selection_register_on_runner_thread() {
+fn captures_and_restores_arm64_cache_selection_register_on_runner_thread() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;
 
@@ -1091,6 +1091,27 @@ fn captures_arm64_cache_selection_register_on_runner_thread() {
         // Exercise the raw accessor without assuming an architecturally
         // unknown reset value or interpreting it as cache topology.
         let _captured_values = [first.csselr_el1(), second.csselr_el1()];
+
+        runner
+            .restore_arm64_cache_selection_register_state(&first)
+            .expect("cache-selection state should be restored");
+        let restored = runner
+            .capture_arm64_cache_selection_register_state()
+            .expect("restored cache-selection state should be captured");
+        assert!(
+            restored == first,
+            "restored cache-selection state should match its idle source"
+        );
+        runner
+            .restore_arm64_cache_selection_register_state(&first)
+            .expect("cache-selection state should be restored a second time");
+        let restored_again = runner
+            .capture_arm64_cache_selection_register_state()
+            .expect("twice-restored cache-selection state should be captured");
+        assert!(
+            restored_again == first,
+            "twice-restored cache-selection state should match its idle source"
+        );
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -2801,9 +2822,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .restore_arm64_execution_control_register_state(&execution_control_state)
         .expect("internal session should restore execution-control state");
-    session
+    let cache_selection_state = session
         .capture_arm64_cache_selection_register_state()
         .expect("internal session should capture cache-selection state");
+    session
+        .restore_arm64_cache_selection_register_state(&cache_selection_state)
+        .expect("internal session should restore cache-selection state");
     session
         .capture_arm64_breakpoint_register_state()
         .expect("internal session should capture breakpoint-register state");
@@ -3032,9 +3056,12 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .restore_arm64_execution_control_register_state(&execution_control_state)
         .expect("owned session should restore execution-control state");
-    session
+    let cache_selection_state = session
         .capture_arm64_cache_selection_register_state()
         .expect("owned session should capture cache-selection state");
+    session
+        .restore_arm64_cache_selection_register_state(&cache_selection_state)
+        .expect("owned session should restore cache-selection state");
     session
         .capture_arm64_breakpoint_register_state()
         .expect("owned session should capture breakpoint-register state");

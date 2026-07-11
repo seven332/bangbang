@@ -1273,12 +1273,30 @@ impl HvfArm64BootSession<'_> {
     /// Capture raw EL1 CSSELR cache-size selection state on the primary owner
     /// thread.
     ///
-    /// This getter-only value is not cache topology and omits feature metadata,
-    /// selector validation, synchronization, maintenance, and restore policy.
+    /// This value is not cache topology. Its complete typed value has a paired
+    /// low-level restore, but omits an atomic feature/geometry manifest,
+    /// selector and destination validation, synchronization, maintenance,
+    /// persistence, schema, and portable restore policy.
     pub fn capture_arm64_cache_selection_register_state(
         &self,
     ) -> Result<HvfArm64VcpuCacheSelectionRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_cache_selection_register_state()
+    }
+
+    /// Restore raw EL1 CSSELR cache-size selection state on the primary owner
+    /// thread.
+    ///
+    /// The one write is nontransactional. If it fails, retry the complete typed
+    /// state or discard the session before guest execution. Selector
+    /// interpretation/validation, an atomic destination cache manifest, ISB
+    /// and dependent CCSIDR ordering, maintenance, persistence, rollback,
+    /// schema, and snapshot orchestration remain outside this primitive.
+    pub fn restore_arm64_cache_selection_register_state(
+        &self,
+        state: &HvfArm64VcpuCacheSelectionRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_cache_selection_register_state(state)
     }
 
     /// Capture every implemented raw EL1 hardware-breakpoint pair on the
@@ -2245,12 +2263,30 @@ impl OwnedHvfArm64BootSession {
     /// Capture raw EL1 CSSELR cache-size selection state on the primary owner
     /// thread.
     ///
-    /// This getter-only value is not cache topology and omits feature metadata,
-    /// selector validation, synchronization, maintenance, and restore policy.
+    /// This value is not cache topology. Its complete typed value has a paired
+    /// low-level restore, but omits an atomic feature/geometry manifest,
+    /// selector and destination validation, synchronization, maintenance,
+    /// persistence, schema, and portable restore policy.
     pub fn capture_arm64_cache_selection_register_state(
         &self,
     ) -> Result<HvfArm64VcpuCacheSelectionRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_cache_selection_register_state()
+    }
+
+    /// Restore raw EL1 CSSELR cache-size selection state on the primary owner
+    /// thread.
+    ///
+    /// The one write is nontransactional. If it fails, retry the complete typed
+    /// state or discard the session before guest execution. Selector
+    /// interpretation/validation, an atomic destination cache manifest, ISB
+    /// and dependent CCSIDR ordering, maintenance, persistence, rollback,
+    /// schema, and snapshot orchestration remain outside this primitive.
+    pub fn restore_arm64_cache_selection_register_state(
+        &self,
+        state: &HvfArm64VcpuCacheSelectionRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_cache_selection_register_state(state)
     }
 
     /// Capture every implemented raw EL1 hardware-breakpoint pair on the

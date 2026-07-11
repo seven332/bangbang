@@ -310,6 +310,14 @@ is resource-specific:
   destination-validated, or coordinated with separately captured TPIDR and
   `CONTEXTIDR_EL1` state. After failure, retry the complete retained value or
   discard the vCPU before execution.
+  The paired cache-selection restore extends the boundary to raw
+  `CSSELR_EL1`. It accepts only the complete typed capture, performs the one
+  owner-thread write, and reports the exact register, zero completed writes,
+  and backend source without the selector value. CSSELR is not topology, and
+  this primitive neither validates an encoding or destination cache manifest
+  nor supplies ISB/dependent CCSIDR visibility or cache maintenance. After
+  failure, retry the complete retained value or discard the vCPU before
+  execution.
   The paired pointer-authentication restore extends the same boundary to APIA,
   APIB, APDA, APDB, and APGA. It accepts only the complete redacted typed
   capture, writes each low then high half in capture order, and reports the
@@ -331,17 +339,18 @@ is resource-specific:
   validation, FPCR/FPSR writable-bit policy, protected persistence,
   zeroization, rollback, or schema. After failure, retry the complete retained
   value or discard the vCPU before execution. Public snapshot load invokes none
-  of the nine restore primitives.
+  of the ten restore primitives.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
   expose guest process or kernel context identifiers.
   FAR and PAR can expose guest fault or translation-result addresses, VBAR can
   expose a guest kernel vector address, and syndrome/fault fields can reveal
   guest execution details.
   CSSELR records the guest's current cache-size query selector but does not
-  contain cache topology. Capture does not change it or query CCSIDR. A future
-  restore must treat selector bits as untrusted, validate them against a
-  destination cache manifest, and define synchronization and cache-maintenance
-  policy before dependent cache-size queries. The separately queried default
+  contain cache topology. The internal capture-order apply treats the selector
+  as raw untrusted state and never queries CCSIDR, but it is not a validated
+  snapshot restore: a higher layer still must validate it against an atomic
+  destination cache manifest and define ISB/dependent-read synchronization and
+  cache-maintenance policy. The separately queried default
   vCPU configuration's raw CTR_EL0, CLIDR_EL1, and DCZID_EL0 values and its
   independent eight-entry data/unified and instruction CCSIDR arrays are
   read-only metadata, not guest execution state, but can fingerprint the
@@ -448,7 +457,7 @@ is resource-specific:
   snapshot restore policy: the values must not be logged, persisted, or trusted
   without feature, interpretation, destination, and ordering policy coordinated
   with TPIDR and `CONTEXTIDR_EL1` state.
-  Current internal capture commands keep these values in process memory and do
+  Current internal capture and raw-apply commands keep these values in process memory and do
   not write them to logs, metrics, error strings, or persistence. The raw
   virtual-timer offset is tied to HVF's host-time relation, the physical-timer
   CVAL is an absolute comparator against a continuing count, and the
@@ -458,7 +467,7 @@ is resource-specific:
   rather than writable configuration. These values
   must not be treated as portable or trusted restore data without explicit
   adjustment, writable-bit, and validation policies. The public pause and
-  snapshot paths do not invoke any of these capture commands.
+  snapshot paths do not invoke any of these capture or restore commands.
 - `/vsock` stores the configured Unix socket path during configuration. Startup
   can attach a guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the
