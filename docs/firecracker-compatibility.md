@@ -1671,9 +1671,9 @@ redacts all material from `Debug` but provides raw named accessors for trusted
 internal composition. Identification values describe the virtual CPU/HVF view,
 including bangbang's deterministic MPIDR affinity zero; they are not
 physical-host identity or a destination compatibility decision. The stable
-baseline omits macOS 15.2 SVE/SME IDs and newer beta-only IDs. The translation value
-omits table memory, feature validation, TLB/cache maintenance, and an ordered
-restore path. The exception value omits vector-table memory, semantic
+baseline omits macOS 15.2 SVE/SME IDs and newer beta-only IDs. The translation
+value omits table memory, feature validation, TLB/cache maintenance, and an
+ordered restore path. The exception value omits vector-table memory, semantic
 validation, and safe restore ordering. Signed validation leaves the MMU
 disabled, uses an aligned unused VBAR without an intervening guest exception,
 and accepts implementation-defined AMAIR and AFSR readback after guest writes.
