@@ -133,6 +133,12 @@ the getter's exact raw `HV_UNSUPPORTED` result may be treated as documented
 unavailability; every unrelated error must fail. Tests must not call the setter,
 change PSTATE, query maximum SVL, read Z/P/ZA/ZT0, run guest code, or treat the
 flags as complete or safely restorable SME state.
+SME system-register signed tests require macOS 15.2 and must capture `SMCR_EL1`,
+`SMPRI_EL1`, and `TPIDR2_EL0` twice from one idle real vCPU. They may compare
+same-vCPU results only with fixed failure messages and must verify that `Debug`
+redacts all raw values. They must not log or format those values, write the
+registers, query maximum SVL, read Z/P/ZA/ZT0, run guest code, or treat stable
+readback as a portable or safely restorable SME state.
 Cache-selection signed tests must capture CSSELR_EL1 from an idle real vCPU
 without hard-coding or validating its architecturally unknown reset value. They
 must not write the selector, query CCSIDR, execute ISB or cache maintenance, run

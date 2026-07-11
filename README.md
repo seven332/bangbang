@@ -26,7 +26,8 @@ crates/bangbang   VMM process entrypoint and startup CLI
 
 The HVF runner currently exposes owner-thread capture building blocks for
 general registers, baseline and optional SVE/SME guest-visible processor
-identification metadata, mutable SME PSTATE flags, raw core,
+identification metadata, mutable SME PSTATE flags, raw SME system registers
+with redacted `Debug`, raw core,
 EL1 exception, execution-control, cache-selection, hardware-breakpoint,
 hardware-watchpoint, debug-control, raw Hypervisor.framework debug-trap policy,
 translation, and thread-context system-register subsets,
@@ -35,8 +36,9 @@ raw physical and virtual timer state, CPU-level IRQ/FIQ pending injection
 levels, opaque GIC device state, and raw EL1 GIC ICC CPU-interface registers.
 These are internal snapshot feasibility primitives only: public snapshot
 create/load, restore, a persistent schema, remaining vCPU state, EL2
-GIC CPU-interface state, streaming SVE/SME Z/P/ZA/ZT0 data, cache-topology
-manifests, and complete emulated device state remain unsupported.
+GIC CPU-interface state, maximum SME streaming vector length, streaming SVE/SME
+Z/P/ZA/ZT0 data, cache-topology manifests, and complete emulated device state
+remain unsupported.
 
 ## Process CLI
 
