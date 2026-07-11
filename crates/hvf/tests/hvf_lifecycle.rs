@@ -65,6 +65,30 @@ const SIMD_FP_REGISTER_GUEST_CODE: [u32; 10] = [
     0xd51b_4420, // msr FPSR, x0
     0xd400_0002, // hvc #0
 ];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GIC_ICC_TEST_PMR_EL1: u64 = 0xa0;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GIC_ICC_TEST_BPR0_EL1: u64 = 3;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GIC_ICC_TEST_BPR1_EL1: u64 = 4;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GIC_ICC_REGISTER_GUEST_CODE: [u32; 15] = [
+    0xd538_cca0, // mrs x0, ICC_SRE_EL1
+    0xb240_0000, // orr x0, x0, #1
+    0xd518_cca0, // msr ICC_SRE_EL1, x0
+    0xd503_3fdf, // isb
+    0xd280_1400, // mov x0, #0xa0
+    0xd518_4600, // msr ICC_PMR_EL1, x0
+    0xd280_0060, // mov x0, #3
+    0xd518_c860, // msr ICC_BPR0_EL1, x0
+    0xd280_0080, // mov x0, #4
+    0xd518_cc60, // msr ICC_BPR1_EL1, x0
+    0xd280_0020, // mov x0, #1
+    0xd518_ccc0, // msr ICC_IGRPEN0_EL1, x0
+    0xd518_cce0, // msr ICC_IGRPEN1_EL1, x0
+    0xd503_3fdf, // isb
+    0xd400_0002, // hvc #0
+];
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn test_rtc_mmio_layout() -> bangbang_runtime::rtc::RtcMmioLayout {
@@ -518,6 +542,80 @@ fn captures_opaque_hvf_gic_device_state_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_guest_written_arm64_gic_icc_registers_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_code = GIC_ICC_REGISTER_GUEST_CODE
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("GIC ICC register guest code should be written");
+
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    backend.create_gic().expect("GIC should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_entry,
+            })
+            .expect("guest code boot registers should be configured");
+
+        let HvfVcpuExit::Exception(exit) = runner
+            .run_once()
+            .expect("guest GIC ICC writer should exit through HVC")
+        else {
+            panic!("guest GIC ICC writer should produce an exception exit");
+        };
+        assert_eq!(
+            exit.decode_hvc()
+                .expect("guest GIC ICC writer exit should decode as HVC")
+                .immediate(),
+            0
+        );
+
+        let state = runner
+            .capture_arm64_gic_icc_register_state()
+            .expect("GIC ICC register state should be captured");
+        assert_eq!(state.pmr_el1(), GIC_ICC_TEST_PMR_EL1);
+        assert_eq!(state.bpr0_el1(), GIC_ICC_TEST_BPR0_EL1);
+        assert_eq!(state.bpr1_el1(), GIC_ICC_TEST_BPR1_EL1);
+        assert_eq!(state.sre_el1() & 1, 1);
+        assert_eq!(state.igrpen0_el1(), 1);
+        assert_eq!(state.igrpen1_el1(), 1);
+        let _host_defined_values = (
+            state.ap0r0_el1(),
+            state.ap1r0_el1(),
+            state.rpr_el1(),
+            state.ctlr_el1(),
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn rejects_hvf_gic_after_vcpu_creation() {
     use bangbang_hvf::{HvfBackend, HvfGicError};
     use bangbang_runtime::VmBackend;
@@ -931,6 +1029,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
             .expect("internal session should capture GIC device state")
             .is_empty()
     );
+    session
+        .capture_arm64_gic_icc_register_state()
+        .expect("internal session should capture GIC ICC register state");
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();
@@ -1071,6 +1172,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
             .expect("owned session should capture GIC device state")
             .is_empty()
     );
+    session
+        .capture_arm64_gic_icc_register_state()
+        .expect("owned session should capture GIC ICC register state");
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();

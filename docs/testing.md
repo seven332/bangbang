@@ -99,7 +99,10 @@ failure and retry, forward and reverse admission conflicts, caller abandonment,
 closed command and response channels, queued-command destruction, panic, and
 shutdown. Pending-interrupt signed tests must set known asymmetric IRQ/FIQ
 values without an intervening run, then clear both levels; a run would let HVF
-clear the injection levels and invalidate the round trip.
+clear the injection levels and invalidate the round trip. GIC ICC signed tests
+must create the GIC before the vCPU, write architecturally writable EL1 ICC
+values from signed guest code, and assert only fields or masked bits whose
+readback is stable; read-only active-priority values remain host-defined.
 
 ## Stability Rules
 
