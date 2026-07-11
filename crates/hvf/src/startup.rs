@@ -1210,6 +1210,19 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_core_system_register_state()
     }
 
+    /// Restore SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 on the owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. Schema, validation, and wider ordering remain outside
+    /// this runner primitive.
+    pub fn restore_arm64_core_system_register_state(
+        &self,
+        state: &HvfArm64VcpuCoreSystemRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_core_system_register_state(state)
+    }
+
     /// Capture raw EL1 exception-register state on the primary owner thread.
     ///
     /// This subset omits vector-table memory, semantic validation,
@@ -2064,6 +2077,19 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuCoreSystemRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_core_system_register_state()
+    }
+
+    /// Restore SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 on the owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. Schema, validation, and wider ordering remain outside
+    /// this runner primitive.
+    pub fn restore_arm64_core_system_register_state(
+        &self,
+        state: &HvfArm64VcpuCoreSystemRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_core_system_register_state(state)
     }
 
     /// Capture raw EL1 exception-register state on the primary owner thread.

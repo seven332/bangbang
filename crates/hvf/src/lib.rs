@@ -60,8 +60,9 @@ pub use vcpu::{
     HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
     HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState,
     HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuSystemContextRegisterState,
-    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
-    HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState, HvfInterruptType,
-    HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu,
+    HvfArm64VcpuSystemRegisterRestoreError, HvfArm64VcpuThreadContextRegisterState,
+    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
+    HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
+    HvfSystemRegister, HvfVcpu,
 };
 pub use vcpu_config::{HvfArm64VcpuCacheConfiguration, HvfArm64VcpuCacheGeometry};

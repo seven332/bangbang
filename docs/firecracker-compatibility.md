@@ -1658,7 +1658,11 @@ in architectural order. Hypervisor.framework does not make those 33 writes
 transactional: a typed failure identifies the failed register and completed
 write count, and callers must retry the complete value or discard the vCPU
 before execution. A second capture command reads raw `SP_EL0`,
-`SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. A third reads all 16 bytes of
+`SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. Its typed value has a paired
+owner-thread restore operation that writes the same four fields in capture
+order. A reusable system-register failure identifies the exact failed register
+and completed-write count; the writes are nontransactional and require the same
+complete-retry-or-discard rule. A third capture reads all 16 bytes of
 Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
 `TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. A fifth reads raw `SCTLR_EL1`,
 `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1`, `MAIR_EL1`, `AMAIR_EL1`, and
@@ -1704,10 +1708,10 @@ value exposes the raw square while redacting all bytes and dimensions from
 requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
-commands and general-register restore form a twenty-three-operation,
+commands plus general- and core-system-register restore form a twenty-four-operation,
 command-owned core-register admission domain. Captures publish no partial state
-after a read failure; restore explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose both general-state
+after a read failure; restores explicitly may leave a written prefix after a
+setter failure. Borrowed and owned HVF boot sessions expose both paired state
 operations and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
@@ -1914,13 +1918,15 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The baseline and optional SVE/SME identification,
-SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register, system-context, core system-register,
+SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register, system-context,
 exception, execution-control, cache-selection, breakpoint, watchpoint,
 debug-control, debug-trap,
 translation,
 pointer-authentication, thread-context, baseline SIMD/FP, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
+The core system-register subset has a paired ordered, nontransactional restore
+operation but likewise has no validation, schema, or wider ordering policy.
 Identification capture is compatibility metadata rather than mutable restore
 state and defines no feature-mask or destination policy. Debug-control and
 debug-trap capture remain separate and
@@ -2288,7 +2294,9 @@ macOS design work instead of direct implementation:
   through a nontransactional owner-thread restore operation, and can capture a
   separate raw SP_EL0, SP_EL1, ELR_EL1,
   and SPSR_EL1 subset through another command in the same core-register
-  admission domain. A third command captures baseline Q0-Q31, FPCR, and FPSR
+  admission domain. It can also reapply that complete typed system-register
+  value in capture order through another nontransactional owner-thread
+  operation. A third command captures baseline Q0-Q31, FPCR, and FPSR
   state under that admission, retaining every 128-bit Q value; a fourth
   captures raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values while keeping
   TPIDR2_EL0 in the separate SME system-register subset; and a fifth captures
@@ -2339,9 +2347,10 @@ macOS design work instead of direct implementation:
   validation, cache feature/geometry interpretation and masks, selector
   validation and maintenance, breakpoint and watchpoint control
   validation, debug-trap policy validation/setters, protected key persistence,
-  and wider restore ordering remain outside these subsets. General-register
-  restore alone reports its failed register and completed-write count; callers
-  must retry the complete captured value or discard the vCPU before execution.
+  and wider restore ordering remain outside these subsets. General-register and
+  core-system-register restore report their typed failed register and completed-
+  write count; callers must retry the complete captured value or discard the
+  vCPU before execution.
   The runner can capture raw CNTKCTL_EL1, CNTP_CTL_EL0, CNTP_CVAL_EL0, and
   CNTP_TVAL_EL0 on the owning thread when macOS 15 physical-timer prerequisites
   are met. The absolute and relative views are read sequentially and do not

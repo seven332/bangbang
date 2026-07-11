@@ -260,6 +260,14 @@ is resource-specific:
   value or discard the vCPU before execution; running a partially updated vCPU
   is outside the supported boundary. Public snapshot load does not invoke this
   primitive.
+  The paired core system-register restore has the same trust and partial-write
+  boundary for raw `SP_EL0`, `SP_EL1`, `ELR_EL1`, and `SPSR_EL1`. It accepts
+  only the complete typed capture today, writes the four fields in capture
+  order, and reports the failed `HvfSystemRegister`, completed prefix, and
+  backend source without values. Stack and exception-return fields must not be
+  treated as validated addresses or legal return state. After failure, callers
+  must retry the complete retained value or discard the vCPU before execution;
+  public snapshot load invokes neither restore primitive.
   TPIDR fields can contain guest TLS or kernel pointers, and
   SIMD/FP bytes can contain guest application or cryptographic working data.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
