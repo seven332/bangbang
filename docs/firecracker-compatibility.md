@@ -2032,14 +2032,20 @@ process snapshot barrier invokes neither capture nor apply.
 
 A companion failure-atomic command captures the ten EL1 ICC CPU-interface
 registers exposed by Hypervisor.framework: PMR, BPR0, AP0R0, AP1R0, RPR, BPR1,
-CTLR, SRE, IGRPEN0, and IGRPEN1. All reads execute on the vCPU owner thread and
-share generalized interrupt admission with CPU pending, GIC PPI, and opaque GIC
-device-state operations. Both boot-session forms expose the fixed typed value.
-It is per-vCPU and separate from the VM-scoped opaque blob. The opaque blob has
-the isolated pre-run apply above, but ICC remains capture-only; neither value is
-persisted. The process snapshot barrier invokes none of these commands, and
-`ICC_SRE_EL2`, ICH/ICV, compatible composite ordering, and multi-vCPU
-association remain future work.
+CTLR, SRE, IGRPEN0, and IGRPEN1. A paired pre-first-run owner command loads the
+independent getter and setter capabilities before mutation, writes the nine
+architecturally mutable registers in capture order, and reads the derived,
+read-only RPR at its original position to validate equality. The operation is
+nontransactional; its typed value-free failure identifies the register, write or
+validation operation, completed-write prefix, and backend source. A failure
+requires complete retry or vCPU discard before execution. Both commands share
+generalized interrupt admission with CPU pending, GIC PPI, and opaque GIC
+device-state operations, and both boot-session forms expose the fixed per-vCPU
+value. Callers apply the compatible VM-scoped opaque blob first, but the isolated
+commands provide no cross-step no-run lease. Neither value is persisted, the
+process snapshot barrier invokes none of these commands, and `ICC_SRE_EL2`,
+ICH/ICV, destination validation, host-update preflight, compatible composite
+orchestration, and multi-vCPU association remain future work.
 
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared

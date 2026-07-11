@@ -19,6 +19,8 @@ const DRAM_MEM_START: u64 = bangbang_runtime::memory::aarch64::DRAM_MEM_START;
 const DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE: &str =
     "function pointer size does not match a dynamic symbol pointer";
 const GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE: &str = "HVF GIC SPI signaler lock is poisoned";
+const GIC_ICC_RPR_MISMATCH_MESSAGE: &str =
+    "restored arm64 GIC ICC_RPR_EL1 does not match captured derived state";
 
 const HV_GIC_INT_EL1_VIRTUAL_TIMER: u16 = 27;
 const HV_GIC_INT_EL1_PHYSICAL_TIMER: u16 = 30;
@@ -36,17 +38,79 @@ const HV_GIC_ICC_REG_CTLR_EL1: u16 = 0xc664;
 const HV_GIC_ICC_REG_SRE_EL1: u16 = 0xc665;
 const HV_GIC_ICC_REG_IGRPEN0_EL1: u16 = 0xc666;
 const HV_GIC_ICC_REG_IGRPEN1_EL1: u16 = 0xc667;
-const ARM64_GIC_EL1_ICC_REGISTERS: [u16; 10] = [
-    HV_GIC_ICC_REG_PMR_EL1,
-    HV_GIC_ICC_REG_BPR0_EL1,
-    HV_GIC_ICC_REG_AP0R0_EL1,
-    HV_GIC_ICC_REG_AP1R0_EL1,
-    HV_GIC_ICC_REG_RPR_EL1,
-    HV_GIC_ICC_REG_BPR1_EL1,
-    HV_GIC_ICC_REG_CTLR_EL1,
-    HV_GIC_ICC_REG_SRE_EL1,
-    HV_GIC_ICC_REG_IGRPEN0_EL1,
-    HV_GIC_ICC_REG_IGRPEN1_EL1,
+
+/// One EL1 GIC ICC CPU-interface register in the captured arm64 state.
+///
+/// Raw Hypervisor.framework enum identifiers remain private. This enum names
+/// the fixed complete inventory used for ordered capture, restore, and
+/// value-free restore failure context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfArm64GicIccRegister {
+    /// `ICC_PMR_EL1` priority mask.
+    PmrEl1,
+    /// `ICC_BPR0_EL1` Group 0 binary point.
+    Bpr0El1,
+    /// `ICC_AP0R0_EL1` Group 0 active priorities.
+    Ap0r0El1,
+    /// `ICC_AP1R0_EL1` Group 1 active priorities.
+    Ap1r0El1,
+    /// `ICC_RPR_EL1` running priority.
+    RprEl1,
+    /// `ICC_BPR1_EL1` Group 1 binary point.
+    Bpr1El1,
+    /// `ICC_CTLR_EL1` CPU-interface control.
+    CtlrEl1,
+    /// `ICC_SRE_EL1` system-register enablement.
+    SreEl1,
+    /// `ICC_IGRPEN0_EL1` Group 0 enablement.
+    Igrpen0El1,
+    /// `ICC_IGRPEN1_EL1` Group 1 enablement.
+    Igrpen1El1,
+}
+
+impl HvfArm64GicIccRegister {
+    const fn raw(self) -> u16 {
+        match self {
+            Self::PmrEl1 => HV_GIC_ICC_REG_PMR_EL1,
+            Self::Bpr0El1 => HV_GIC_ICC_REG_BPR0_EL1,
+            Self::Ap0r0El1 => HV_GIC_ICC_REG_AP0R0_EL1,
+            Self::Ap1r0El1 => HV_GIC_ICC_REG_AP1R0_EL1,
+            Self::RprEl1 => HV_GIC_ICC_REG_RPR_EL1,
+            Self::Bpr1El1 => HV_GIC_ICC_REG_BPR1_EL1,
+            Self::CtlrEl1 => HV_GIC_ICC_REG_CTLR_EL1,
+            Self::SreEl1 => HV_GIC_ICC_REG_SRE_EL1,
+            Self::Igrpen0El1 => HV_GIC_ICC_REG_IGRPEN0_EL1,
+            Self::Igrpen1El1 => HV_GIC_ICC_REG_IGRPEN1_EL1,
+        }
+    }
+
+    const fn architectural_name(self) -> &'static str {
+        match self {
+            Self::PmrEl1 => "ICC_PMR_EL1",
+            Self::Bpr0El1 => "ICC_BPR0_EL1",
+            Self::Ap0r0El1 => "ICC_AP0R0_EL1",
+            Self::Ap1r0El1 => "ICC_AP1R0_EL1",
+            Self::RprEl1 => "ICC_RPR_EL1",
+            Self::Bpr1El1 => "ICC_BPR1_EL1",
+            Self::CtlrEl1 => "ICC_CTLR_EL1",
+            Self::SreEl1 => "ICC_SRE_EL1",
+            Self::Igrpen0El1 => "ICC_IGRPEN0_EL1",
+            Self::Igrpen1El1 => "ICC_IGRPEN1_EL1",
+        }
+    }
+}
+
+const ARM64_GIC_EL1_ICC_REGISTERS: [HvfArm64GicIccRegister; 10] = [
+    HvfArm64GicIccRegister::PmrEl1,
+    HvfArm64GicIccRegister::Bpr0El1,
+    HvfArm64GicIccRegister::Ap0r0El1,
+    HvfArm64GicIccRegister::Ap1r0El1,
+    HvfArm64GicIccRegister::RprEl1,
+    HvfArm64GicIccRegister::Bpr1El1,
+    HvfArm64GicIccRegister::CtlrEl1,
+    HvfArm64GicIccRegister::SreEl1,
+    HvfArm64GicIccRegister::Igrpen0El1,
+    HvfArm64GicIccRegister::Igrpen1El1,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +270,83 @@ impl HvfArm64GicIccRegisterState {
     /// Return the raw `ICC_IGRPEN1_EL1` value.
     pub const fn igrpen1_el1(self) -> u64 {
         self.values[9]
+    }
+}
+
+/// Failure while restoring one arm64 GIC ICC CPU-interface register.
+///
+/// Hypervisor.framework writes one mutable ICC register at a time and provides
+/// no batch transaction. [`Self::completed_writes`] reports the completed
+/// prefix when either a write or the derived `ICC_RPR_EL1` validation fails.
+/// Callers must retry the complete retained state or discard the vCPU before
+/// execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64GicIccRegisterRestoreError {
+    failed_register: HvfArm64GicIccRegister,
+    operation: HvfArm64GicIccRegisterRestoreOperation,
+    completed_writes: usize,
+    source: BackendError,
+}
+
+/// Operation that failed while restoring complete arm64 GIC ICC state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfArm64GicIccRegisterRestoreOperation {
+    /// Write one architecturally mutable ICC register.
+    Write,
+    /// Read and compare an architecturally derived ICC register.
+    ValidateDerived,
+}
+
+impl HvfArm64GicIccRegisterRestoreError {
+    const fn new(
+        failed_register: HvfArm64GicIccRegister,
+        operation: HvfArm64GicIccRegisterRestoreOperation,
+        completed_writes: usize,
+        source: BackendError,
+    ) -> Self {
+        Self {
+            failed_register,
+            operation,
+            completed_writes,
+            source,
+        }
+    }
+
+    /// Return the architectural ICC register whose restore operation failed.
+    pub const fn failed_register(&self) -> HvfArm64GicIccRegister {
+        self.failed_register
+    }
+
+    /// Return the write or derived-value validation that failed.
+    pub const fn operation(&self) -> HvfArm64GicIccRegisterRestoreOperation {
+        self.operation
+    }
+
+    /// Return the number of ICC registers written before the failure.
+    pub const fn completed_writes(&self) -> usize {
+        self.completed_writes
+    }
+}
+
+impl fmt::Display for HvfArm64GicIccRegisterRestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let operation = match self.operation {
+            HvfArm64GicIccRegisterRestoreOperation::Write => "write",
+            HvfArm64GicIccRegisterRestoreOperation::ValidateDerived => "derived-value validation",
+        };
+        write!(
+            f,
+            "failed arm64 GIC {} {operation} after {} successful writes: {}",
+            self.failed_register.architectural_name(),
+            self.completed_writes,
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for HvfArm64GicIccRegisterRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -612,6 +753,10 @@ pub(crate) struct HvfGicIccRegisterReader {
     api: Box<dyn HvfGicIccRegisterApi>,
 }
 
+pub(crate) struct HvfGicIccRegisterRestorer {
+    api: Box<dyn HvfGicIccRegisterWriteApi>,
+}
+
 trait HvfGicStateCapture: fmt::Debug {
     fn capture(&self) -> Result<HvfGicDeviceState, HvfGicError>;
 }
@@ -630,7 +775,20 @@ trait HvfGicStateRestoreApi: fmt::Debug {
 }
 
 trait HvfGicIccRegisterApi: fmt::Debug {
-    fn get_icc_reg(&self, vcpu: crate::ffi::HvVcpu, register: u16) -> Result<u64, HvfGicError>;
+    fn get_icc_reg(
+        &self,
+        vcpu: crate::ffi::HvVcpu,
+        register: HvfArm64GicIccRegister,
+    ) -> Result<u64, BackendError>;
+}
+
+trait HvfGicIccRegisterWriteApi: fmt::Debug {
+    fn set_icc_reg(
+        &self,
+        vcpu: crate::ffi::HvVcpu,
+        register: HvfArm64GicIccRegister,
+        value: u64,
+    ) -> Result<(), BackendError>;
 }
 
 impl HvfGicStateSnapshotter {
@@ -714,6 +872,14 @@ impl HvfGicIccRegisterReader {
         capture_arm64_gic_icc_register_state_with_api(self.api.as_ref(), vcpu)
     }
 
+    fn read(
+        &self,
+        vcpu: crate::ffi::HvVcpu,
+        register: HvfArm64GicIccRegister,
+    ) -> Result<u64, BackendError> {
+        self.api.get_icc_reg(vcpu, register)
+    }
+
     #[cfg(test)]
     fn with_api(api: impl HvfGicIccRegisterApi + 'static) -> Self {
         Self { api: Box::new(api) }
@@ -723,6 +889,47 @@ impl HvfGicIccRegisterReader {
 impl fmt::Debug for HvfGicIccRegisterReader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HvfGicIccRegisterReader")
+            .finish_non_exhaustive()
+    }
+}
+
+impl HvfGicIccRegisterRestorer {
+    pub(crate) fn new() -> Result<Self, HvfGicError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Ok(Self {
+                api: Box::new(LoadedHvfGicIccRegisterWriteApi::load()?),
+            })
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        Err(HvfGicError::Unsupported(
+            crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+        ))
+    }
+
+    pub(crate) fn restore(
+        &self,
+        reader: &HvfGicIccRegisterReader,
+        vcpu: crate::ffi::HvVcpu,
+        state: &HvfArm64GicIccRegisterState,
+    ) -> Result<(), HvfArm64GicIccRegisterRestoreError> {
+        restore_arm64_gic_icc_register_state_with(
+            state,
+            |register, value| self.api.set_icc_reg(vcpu, register, value),
+            |register| reader.read(vcpu, register),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_api(api: impl HvfGicIccRegisterWriteApi + 'static) -> Self {
+        Self { api: Box::new(api) }
+    }
+}
+
+impl fmt::Debug for HvfGicIccRegisterRestorer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicIccRegisterRestorer")
             .finish_non_exhaustive()
     }
 }
@@ -1252,6 +1459,47 @@ fn capture_arm64_gic_icc_register_state_with_api<Api: HvfGicIccRegisterApi + ?Si
     Ok(HvfArm64GicIccRegisterState::new(values))
 }
 
+pub(crate) fn restore_arm64_gic_icc_register_state_with(
+    state: &HvfArm64GicIccRegisterState,
+    mut set_register: impl FnMut(HvfArm64GicIccRegister, u64) -> Result<(), BackendError>,
+    mut read_register: impl FnMut(HvfArm64GicIccRegister) -> Result<u64, BackendError>,
+) -> Result<(), HvfArm64GicIccRegisterRestoreError> {
+    let mut completed_writes = 0;
+    for (register, value) in ARM64_GIC_EL1_ICC_REGISTERS.into_iter().zip(state.values) {
+        if register == HvfArm64GicIccRegister::RprEl1 {
+            let restored_value = read_register(register).map_err(|source| {
+                HvfArm64GicIccRegisterRestoreError::new(
+                    register,
+                    HvfArm64GicIccRegisterRestoreOperation::ValidateDerived,
+                    completed_writes,
+                    source,
+                )
+            })?;
+            if restored_value != value {
+                return Err(HvfArm64GicIccRegisterRestoreError::new(
+                    register,
+                    HvfArm64GicIccRegisterRestoreOperation::ValidateDerived,
+                    completed_writes,
+                    BackendError::InvalidState(GIC_ICC_RPR_MISMATCH_MESSAGE),
+                ));
+            }
+            continue;
+        }
+
+        set_register(register, value).map_err(|source| {
+            HvfArm64GicIccRegisterRestoreError::new(
+                register,
+                HvfArm64GicIccRegisterRestoreOperation::Write,
+                completed_writes,
+                source,
+            )
+        })?;
+        completed_writes += 1;
+    }
+
+    Ok(())
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_real_gic() -> Result<HvfGicMetadata, HvfGicError> {
     let api = LoadedHvfGicApi::load()?;
@@ -1272,7 +1520,12 @@ mod dynamic {
     use std::mem;
     use std::ptr::NonNull;
 
-    use super::{DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE, HvfGicError, HvfGicInterruptRange};
+    use bangbang_runtime::BackendError;
+
+    use super::{
+        DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE, HvfArm64GicIccRegister, HvfGicError,
+        HvfGicInterruptRange,
+    };
 
     type HvReturn = i32;
     type HvGicConfig = NonNull<c_void>;
@@ -1286,6 +1539,7 @@ mod dynamic {
     type HvGicStateGetData = unsafe extern "C" fn(*mut c_void, *mut c_void) -> HvReturn;
     type HvGicSetState = unsafe extern "C" fn(*const c_void, usize) -> HvReturn;
     type HvGicGetIccReg = unsafe extern "C" fn(u64, u16, *mut u64) -> HvReturn;
+    type HvGicSetIccReg = unsafe extern "C" fn(u64, u16, u64) -> HvReturn;
     type HvGicGetSize = unsafe extern "C" fn(*mut usize) -> HvReturn;
     type HvGicGetSpiRange = unsafe extern "C" fn(*mut u32, *mut u32) -> HvReturn;
     type HvGicGetIntid = unsafe extern "C" fn(u16, *mut u32) -> HvReturn;
@@ -1322,6 +1576,11 @@ mod dynamic {
     pub(super) struct LoadedHvfGicIccRegisterApi {
         _library: DynamicLibrary,
         symbols: HvfGicIccRegisterSymbols,
+    }
+
+    pub(super) struct LoadedHvfGicIccRegisterWriteApi {
+        _library: DynamicLibrary,
+        symbols: HvfGicIccRegisterWriteSymbols,
     }
 
     struct DynamicLibrary {
@@ -1375,6 +1634,11 @@ mod dynamic {
     #[derive(Clone, Copy)]
     struct HvfGicIccRegisterSymbols {
         get_icc_reg: HvGicGetIccReg,
+    }
+
+    #[derive(Clone, Copy)]
+    struct HvfGicIccRegisterWriteSymbols {
+        set_icc_reg: HvGicSetIccReg,
     }
 
     impl LoadedHvfGicApi {
@@ -1477,6 +1741,18 @@ mod dynamic {
         }
     }
 
+    impl LoadedHvfGicIccRegisterWriteApi {
+        pub(super) fn load() -> Result<Self, HvfGicError> {
+            let library = DynamicLibrary::open(HYPERVISOR_FRAMEWORK_PATH)?;
+            let symbols = HvfGicIccRegisterWriteSymbols::load(library.handle())?;
+
+            Ok(Self {
+                _library: library,
+                symbols,
+            })
+        }
+    }
+
     impl fmt::Debug for LoadedHvfGicPpiPendingApi {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("LoadedHvfGicPpiPendingApi")
@@ -1501,6 +1777,13 @@ mod dynamic {
     impl fmt::Debug for LoadedHvfGicIccRegisterApi {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("LoadedHvfGicIccRegisterApi")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl fmt::Debug for LoadedHvfGicIccRegisterWriteApi {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("LoadedHvfGicIccRegisterWriteApi")
                 .finish_non_exhaustive()
         }
     }
@@ -1654,6 +1937,14 @@ mod dynamic {
         fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
             Ok(Self {
                 get_icc_reg: load_symbol(library, c"hv_gic_get_icc_reg", "hv_gic_get_icc_reg")?,
+            })
+        }
+    }
+
+    impl HvfGicIccRegisterWriteSymbols {
+        fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
+            Ok(Self {
+                set_icc_reg: load_symbol(library, c"hv_gic_set_icc_reg", "hv_gic_set_icc_reg")?,
             })
         }
     }
@@ -1893,18 +2184,41 @@ mod dynamic {
     }
 
     impl super::HvfGicIccRegisterApi for LoadedHvfGicIccRegisterApi {
-        fn get_icc_reg(&self, vcpu: crate::ffi::HvVcpu, register: u16) -> Result<u64, HvfGicError> {
+        fn get_icc_reg(
+            &self,
+            vcpu: crate::ffi::HvVcpu,
+            register: HvfArm64GicIccRegister,
+        ) -> Result<u64, BackendError> {
             let mut value = 0;
-            // SAFETY: `vcpu` is a live current-thread vCPU id, `register` is
-            // one of the SDK's `hv_gic_icc_reg_t` values, and `value` is a
-            // valid out-pointer for the duration of this loaded ABI call.
+            // SAFETY: `vcpu` is a live current-thread vCPU id,
+            // `register.raw()` is one of the fixed SDK `hv_gic_icc_reg_t`
+            // values, and `value` is a valid out-pointer for this loaded call.
             unsafe {
                 crate::ffi::check(
-                    (self.symbols.get_icc_reg)(vcpu, register, &mut value),
+                    (self.symbols.get_icc_reg)(vcpu, register.raw(), &mut value),
                     "hv_gic_get_icc_reg",
                 )?
             };
             Ok(value)
+        }
+    }
+
+    impl super::HvfGicIccRegisterWriteApi for LoadedHvfGicIccRegisterWriteApi {
+        fn set_icc_reg(
+            &self,
+            vcpu: crate::ffi::HvVcpu,
+            register: HvfArm64GicIccRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            // SAFETY: `vcpu` is a live current-thread vCPU id, `register.raw()`
+            // is one of the fixed SDK `hv_gic_icc_reg_t` values, and `value`
+            // is passed by value through the loaded SDK signature.
+            unsafe {
+                crate::ffi::check(
+                    (self.symbols.set_icc_reg)(vcpu, register.raw(), value),
+                    "hv_gic_set_icc_reg",
+                )
+            }
         }
     }
 
@@ -1956,12 +2270,14 @@ mod dynamic {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use dynamic::{
-    LoadedHvfGicApi, LoadedHvfGicIccRegisterApi, LoadedHvfGicPpiPendingApi,
-    LoadedHvfGicSpiSignalApi, LoadedHvfGicStateCaptureApi, LoadedHvfGicStateRestoreApi,
+    LoadedHvfGicApi, LoadedHvfGicIccRegisterApi, LoadedHvfGicIccRegisterWriteApi,
+    LoadedHvfGicPpiPendingApi, LoadedHvfGicSpiSignalApi, LoadedHvfGicStateCaptureApi,
+    LoadedHvfGicStateRestoreApi,
 };
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::error::Error as _;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Barrier, Mutex};
@@ -1975,18 +2291,22 @@ mod tests {
     use bangbang_runtime::interrupt::{GuestInterruptLine, GuestInterruptLineError, InterruptSink};
 
     use super::{
-        ARM64_GIC_EL1_ICC_REGISTERS, GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE, GicConfigGuard,
-        HV_GIC_ICC_REG_AP0R0_EL1, HV_GIC_ICC_REG_AP1R0_EL1, HV_GIC_ICC_REG_BPR0_EL1,
-        HV_GIC_ICC_REG_BPR1_EL1, HV_GIC_ICC_REG_CTLR_EL1, HV_GIC_ICC_REG_IGRPEN0_EL1,
-        HV_GIC_ICC_REG_IGRPEN1_EL1, HV_GIC_ICC_REG_PMR_EL1, HV_GIC_ICC_REG_RPR_EL1,
-        HV_GIC_ICC_REG_SRE_EL1, HV_GIC_INT_EL1_PHYSICAL_TIMER, HV_GIC_INT_EL1_VIRTUAL_TIMER,
-        HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0, HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, HvfGicApi,
-        HvfGicDeviceState, HvfGicError, HvfGicIccRegisterApi, HvfGicIccRegisterReader,
-        HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata,
-        HvfGicParameters, HvfGicPpiPendingWriter, HvfGicRegion, HvfGicSpiSignalError,
-        HvfGicSpiSignaler, HvfGicStateApi, HvfGicStateRestoreApi, HvfGicStateRestorer,
-        HvfGicTimerInterrupts, HvfInterruptLineAllocationError, capture_gic_device_state_with_api,
-        create_gic_with_api, metadata_from_parameters,
+        ARM64_GIC_EL1_ICC_REGISTERS, GIC_ICC_RPR_MISMATCH_MESSAGE,
+        GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE, GicConfigGuard, HV_GIC_ICC_REG_AP0R0_EL1,
+        HV_GIC_ICC_REG_AP1R0_EL1, HV_GIC_ICC_REG_BPR0_EL1, HV_GIC_ICC_REG_BPR1_EL1,
+        HV_GIC_ICC_REG_CTLR_EL1, HV_GIC_ICC_REG_IGRPEN0_EL1, HV_GIC_ICC_REG_IGRPEN1_EL1,
+        HV_GIC_ICC_REG_PMR_EL1, HV_GIC_ICC_REG_RPR_EL1, HV_GIC_ICC_REG_SRE_EL1,
+        HV_GIC_INT_EL1_PHYSICAL_TIMER, HV_GIC_INT_EL1_VIRTUAL_TIMER,
+        HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0, HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0,
+        HvfArm64GicIccRegister, HvfArm64GicIccRegisterRestoreOperation,
+        HvfArm64GicIccRegisterState, HvfGicApi, HvfGicDeviceState, HvfGicError,
+        HvfGicIccRegisterApi, HvfGicIccRegisterReader, HvfGicIccRegisterRestorer,
+        HvfGicIccRegisterWriteApi, HvfGicInterruptLineAllocator, HvfGicInterruptRange,
+        HvfGicMetadata, HvfGicMsiMetadata, HvfGicParameters, HvfGicPpiPendingWriter, HvfGicRegion,
+        HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicStateApi, HvfGicStateRestoreApi,
+        HvfGicStateRestorer, HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
+        capture_gic_device_state_with_api, create_gic_with_api, metadata_from_parameters,
+        restore_arm64_gic_icc_register_state_with,
     };
 
     const DIST_SIZE: u64 = 0x1_0000;
@@ -2030,13 +2350,14 @@ mod tests {
     #[test]
     fn every_arm64_gic_icc_read_failure_is_atomic_and_retryable() {
         for (failed_index, failed_register) in ARM64_GIC_EL1_ICC_REGISTERS.into_iter().enumerate() {
+            let failed_register_id = failed_register.raw();
             let api = FakeGicIccRegisterApi::default().with_failure(failed_register);
             let reader = HvfGicIccRegisterReader::with_api(api.clone());
 
             assert_eq!(
                 reader.capture(11),
                 Err(HvfGicError::Backend(BackendError::Hypervisor(format!(
-                    "injected ICC register 0x{failed_register:x} failure"
+                    "injected ICC register 0x{failed_register_id:x} failure"
                 ))))
             );
             assert_eq!(api.calls().len(), failed_index + 1);
@@ -2067,9 +2388,217 @@ mod tests {
         assert_eq!(
             err.source().map(ToString::to_string),
             Some(format!(
-                "hypervisor error: injected ICC register 0x{failed_register:x} failure"
+                "hypervisor error: injected ICC register 0x{:x} failure",
+                failed_register.raw()
             ))
         );
+    }
+
+    #[test]
+    fn arm64_gic_icc_register_ids_match_sdk_inventory() {
+        assert_eq!(
+            ARM64_GIC_EL1_ICC_REGISTERS.map(HvfArm64GicIccRegister::raw),
+            [
+                HV_GIC_ICC_REG_PMR_EL1,
+                HV_GIC_ICC_REG_BPR0_EL1,
+                HV_GIC_ICC_REG_AP0R0_EL1,
+                HV_GIC_ICC_REG_AP1R0_EL1,
+                HV_GIC_ICC_REG_RPR_EL1,
+                HV_GIC_ICC_REG_BPR1_EL1,
+                HV_GIC_ICC_REG_CTLR_EL1,
+                HV_GIC_ICC_REG_SRE_EL1,
+                HV_GIC_ICC_REG_IGRPEN0_EL1,
+                HV_GIC_ICC_REG_IGRPEN1_EL1,
+            ]
+        );
+    }
+
+    #[test]
+    fn restores_mutable_arm64_gic_icc_registers_and_validates_rpr_in_capture_order() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum RestoreAccess {
+            Write(HvfArm64GicIccRegister, u64),
+            Read(HvfArm64GicIccRegister),
+        }
+
+        let state = fake_icc_restore_state();
+        let accesses = RefCell::new(Vec::new());
+
+        restore_arm64_gic_icc_register_state_with(
+            &state,
+            |register, value| {
+                accesses
+                    .borrow_mut()
+                    .push(RestoreAccess::Write(register, value));
+                Ok(())
+            },
+            |register| {
+                accesses.borrow_mut().push(RestoreAccess::Read(register));
+                Ok(state.rpr_el1())
+            },
+        )
+        .expect("arm64 GIC ICC register state should be restored");
+
+        assert_eq!(
+            accesses.into_inner(),
+            vec![
+                RestoreAccess::Write(HvfArm64GicIccRegister::PmrEl1, state.pmr_el1()),
+                RestoreAccess::Write(HvfArm64GicIccRegister::Bpr0El1, state.bpr0_el1()),
+                RestoreAccess::Write(HvfArm64GicIccRegister::Ap0r0El1, state.ap0r0_el1()),
+                RestoreAccess::Write(HvfArm64GicIccRegister::Ap1r0El1, state.ap1r0_el1()),
+                RestoreAccess::Read(HvfArm64GicIccRegister::RprEl1),
+                RestoreAccess::Write(HvfArm64GicIccRegister::Bpr1El1, state.bpr1_el1()),
+                RestoreAccess::Write(HvfArm64GicIccRegister::CtlrEl1, state.ctlr_el1()),
+                RestoreAccess::Write(HvfArm64GicIccRegister::SreEl1, state.sre_el1()),
+                RestoreAccess::Write(HvfArm64GicIccRegister::Igrpen0El1, state.igrpen0_el1(),),
+                RestoreAccess::Write(HvfArm64GicIccRegister::Igrpen1El1, state.igrpen1_el1(),),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_mutable_arm64_gic_icc_restore_failure_is_typed_and_retryable() {
+        let state = fake_icc_restore_state();
+        let mutable_registers: Vec<_> = ARM64_GIC_EL1_ICC_REGISTERS
+            .into_iter()
+            .filter(|register| *register != HvfArm64GicIccRegister::RprEl1)
+            .collect();
+
+        for (failed_index, failed_register) in mutable_registers.into_iter().enumerate() {
+            let api = FakeGicIccRegisterWriteApi::default().with_failure(failed_register);
+            let reader_api = FakeGicIccRegisterApi::default();
+            let reader = HvfGicIccRegisterReader::with_api(reader_api.clone());
+            let restorer = HvfGicIccRegisterRestorer::with_api(api.clone());
+
+            let err = restorer
+                .restore(&reader, 11, &state)
+                .expect_err("injected ICC write failure should propagate");
+            assert_eq!(err.failed_register(), failed_register);
+            assert_eq!(
+                err.operation(),
+                HvfArm64GicIccRegisterRestoreOperation::Write
+            );
+            assert_eq!(err.completed_writes(), failed_index);
+            assert_eq!(
+                err.source().map(ToString::to_string),
+                Some("invalid backend state: injected ICC setter failure".to_string())
+            );
+            assert_eq!(api.calls().len(), failed_index + 1);
+            assert_eq!(
+                api.calls().last(),
+                expected_icc_restore_writes(11).get(failed_index)
+            );
+
+            restorer
+                .restore(&reader, 11, &state)
+                .expect("ICC restore should restart from PMR after a failed write");
+            assert_eq!(
+                &api.calls()[failed_index + 1..],
+                expected_icc_restore_writes(11).as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn arm64_gic_icc_rpr_read_failure_is_typed_and_retryable() {
+        let state = fake_icc_restore_state();
+        let api = FakeGicIccRegisterWriteApi::default();
+        let reader_api =
+            FakeGicIccRegisterApi::default().with_failure(HvfArm64GicIccRegister::RprEl1);
+        let reader = HvfGicIccRegisterReader::with_api(reader_api.clone());
+        let restorer = HvfGicIccRegisterRestorer::with_api(api.clone());
+
+        let err = restorer
+            .restore(&reader, 11, &state)
+            .expect_err("injected ICC_RPR_EL1 read failure should propagate");
+
+        assert_eq!(err.failed_register(), HvfArm64GicIccRegister::RprEl1);
+        assert_eq!(
+            err.operation(),
+            HvfArm64GicIccRegisterRestoreOperation::ValidateDerived
+        );
+        assert_eq!(err.completed_writes(), 4);
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some(format!(
+                "hypervisor error: injected ICC register 0x{:x} failure",
+                HV_GIC_ICC_REG_RPR_EL1
+            ))
+        );
+        assert_eq!(api.calls(), expected_icc_restore_writes(11)[..4]);
+        assert_eq!(reader_api.calls(), [(11, HvfArm64GicIccRegister::RprEl1)]);
+
+        restorer
+            .restore(&reader, 11, &state)
+            .expect("ICC restore should restart from PMR after a failed RPR read");
+        assert_eq!(&api.calls()[4..], expected_icc_restore_writes(11));
+        assert_eq!(
+            reader_api.calls(),
+            [
+                (11, HvfArm64GicIccRegister::RprEl1),
+                (11, HvfArm64GicIccRegister::RprEl1),
+            ]
+        );
+    }
+
+    #[test]
+    fn arm64_gic_icc_rpr_mismatch_stops_before_later_writes() {
+        let state = fake_icc_restore_state();
+        let api = FakeGicIccRegisterWriteApi::default();
+        let reader_api = FakeGicIccRegisterApi::default().with_rpr_value(state.rpr_el1() ^ 1);
+        let reader = HvfGicIccRegisterReader::with_api(reader_api.clone());
+        let restorer = HvfGicIccRegisterRestorer::with_api(api.clone());
+
+        let err = restorer
+            .restore(&reader, 7, &state)
+            .expect_err("mismatched derived ICC_RPR_EL1 should fail restore");
+
+        assert_eq!(err.failed_register(), HvfArm64GicIccRegister::RprEl1);
+        assert_eq!(
+            err.operation(),
+            HvfArm64GicIccRegisterRestoreOperation::ValidateDerived
+        );
+        assert_eq!(err.completed_writes(), 4);
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some(format!(
+                "invalid backend state: {GIC_ICC_RPR_MISMATCH_MESSAGE}"
+            ))
+        );
+        assert_eq!(api.calls(), expected_icc_restore_writes(7)[..4]);
+        assert_eq!(reader_api.calls(), [(7, HvfArm64GicIccRegister::RprEl1)]);
+    }
+
+    #[test]
+    fn arm64_gic_icc_restore_error_does_not_expose_attempted_values() {
+        let state = HvfArm64GicIccRegisterState::new([
+            0xdead_beef_1000_0001,
+            0xdead_beef_1000_0002,
+            0xdead_beef_1000_0003,
+            0xdead_beef_1000_0004,
+            0xdead_beef_1000_0005,
+            0xdead_beef_1000_0006,
+            0xdead_beef_1000_0007,
+            0xdead_beef_1000_0008,
+            0xdead_beef_1000_0009,
+            0xdead_beef_1000_000a,
+        ]);
+        let restorer = HvfGicIccRegisterRestorer::with_api(
+            FakeGicIccRegisterWriteApi::default().with_failure(HvfArm64GicIccRegister::PmrEl1),
+        );
+        let reader = HvfGicIccRegisterReader::with_api(FakeGicIccRegisterApi::default());
+
+        let err = restorer
+            .restore(&reader, 7, &state)
+            .expect_err("injected ICC write failure should propagate");
+        let formatted = format!("{err}\n{err:?}");
+
+        assert!(formatted.contains("ICC_PMR_EL1"));
+        assert!(formatted.contains("0 successful writes"));
+        for value in state.values {
+            assert!(!formatted.contains(&value.to_string()));
+            assert!(!formatted.contains(&format!("{value:x}")));
+        }
     }
 
     #[test]
@@ -3353,6 +3882,22 @@ mod tests {
         0xa5a5_0000_0000_0000 | u64::from(register)
     }
 
+    fn fake_icc_restore_state() -> HvfArm64GicIccRegisterState {
+        HvfArm64GicIccRegisterState::new(
+            ARM64_GIC_EL1_ICC_REGISTERS.map(|register| fake_icc_value(register.raw())),
+        )
+    }
+
+    fn expected_icc_restore_writes(
+        vcpu: crate::ffi::HvVcpu,
+    ) -> Vec<(crate::ffi::HvVcpu, HvfArm64GicIccRegister, u64)> {
+        ARM64_GIC_EL1_ICC_REGISTERS
+            .into_iter()
+            .filter(|register| *register != HvfArm64GicIccRegister::RprEl1)
+            .map(|register| (vcpu, register, fake_icc_value(register.raw())))
+            .collect()
+    }
+
     #[derive(Debug, Clone, Default)]
     struct FakeGicIccRegisterApi {
         state: Arc<Mutex<FakeGicIccRegisterApiState>>,
@@ -3360,12 +3905,13 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FakeGicIccRegisterApiState {
-        calls: Vec<(crate::ffi::HvVcpu, u16)>,
-        fail_next_register: Option<u16>,
+        calls: Vec<(crate::ffi::HvVcpu, HvfArm64GicIccRegister)>,
+        fail_next_register: Option<HvfArm64GicIccRegister>,
+        override_rpr_value: Option<u64>,
     }
 
     impl FakeGicIccRegisterApi {
-        fn with_failure(self, register: u16) -> Self {
+        fn with_failure(self, register: HvfArm64GicIccRegister) -> Self {
             self.state
                 .lock()
                 .expect("fake GIC ICC API should be lockable")
@@ -3373,7 +3919,15 @@ mod tests {
             self
         }
 
-        fn calls(&self) -> Vec<(crate::ffi::HvVcpu, u16)> {
+        fn with_rpr_value(self, value: u64) -> Self {
+            self.state
+                .lock()
+                .expect("fake GIC ICC API should be lockable")
+                .override_rpr_value = Some(value);
+            self
+        }
+
+        fn calls(&self) -> Vec<(crate::ffi::HvVcpu, HvfArm64GicIccRegister)> {
             self.state
                 .lock()
                 .expect("fake GIC ICC API should be lockable")
@@ -3383,13 +3937,80 @@ mod tests {
     }
 
     impl HvfGicIccRegisterApi for FakeGicIccRegisterApi {
-        fn get_icc_reg(&self, vcpu: crate::ffi::HvVcpu, register: u16) -> Result<u64, HvfGicError> {
-            let should_fail = {
+        fn get_icc_reg(
+            &self,
+            vcpu: crate::ffi::HvVcpu,
+            register: HvfArm64GicIccRegister,
+        ) -> Result<u64, BackendError> {
+            let (should_fail, override_rpr_value) = {
                 let mut state = self
                     .state
                     .lock()
                     .expect("fake GIC ICC API should be lockable");
                 state.calls.push((vcpu, register));
+                if state.fail_next_register == Some(register) {
+                    state.fail_next_register = None;
+                    (true, state.override_rpr_value)
+                } else {
+                    (false, state.override_rpr_value)
+                }
+            };
+
+            if should_fail {
+                Err(BackendError::Hypervisor(format!(
+                    "injected ICC register 0x{:x} failure",
+                    register.raw()
+                )))
+            } else if register == HvfArm64GicIccRegister::RprEl1 {
+                Ok(override_rpr_value.unwrap_or_else(|| fake_icc_value(register.raw())))
+            } else {
+                Ok(fake_icc_value(register.raw()))
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FakeGicIccRegisterWriteApi {
+        state: Arc<Mutex<FakeGicIccRegisterWriteApiState>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeGicIccRegisterWriteApiState {
+        calls: Vec<(crate::ffi::HvVcpu, HvfArm64GicIccRegister, u64)>,
+        fail_next_register: Option<HvfArm64GicIccRegister>,
+    }
+
+    impl FakeGicIccRegisterWriteApi {
+        fn with_failure(self, register: HvfArm64GicIccRegister) -> Self {
+            self.state
+                .lock()
+                .expect("fake GIC ICC write API should be lockable")
+                .fail_next_register = Some(register);
+            self
+        }
+
+        fn calls(&self) -> Vec<(crate::ffi::HvVcpu, HvfArm64GicIccRegister, u64)> {
+            self.state
+                .lock()
+                .expect("fake GIC ICC write API should be lockable")
+                .calls
+                .clone()
+        }
+    }
+
+    impl HvfGicIccRegisterWriteApi for FakeGicIccRegisterWriteApi {
+        fn set_icc_reg(
+            &self,
+            vcpu: crate::ffi::HvVcpu,
+            register: HvfArm64GicIccRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            let should_fail = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("fake GIC ICC write API should be lockable");
+                state.calls.push((vcpu, register, value));
                 if state.fail_next_register == Some(register) {
                     state.fail_next_register = None;
                     true
@@ -3399,11 +4020,9 @@ mod tests {
             };
 
             if should_fail {
-                Err(HvfGicError::Backend(BackendError::Hypervisor(format!(
-                    "injected ICC register 0x{register:x} failure"
-                ))))
+                Err(BackendError::InvalidState("injected ICC setter failure"))
             } else {
-                Ok(fake_icc_value(register))
+                Ok(())
             }
         }
     }

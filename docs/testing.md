@@ -116,10 +116,17 @@ must not execute the VM afterwards. Signed coverage must create the GIC and vCPU
 capture a non-empty original blob, reapply that exact value before any run, and
 then destroy the VM without parsing, comparing, mutating, or logging opaque
 bytes. Both prepared boot-session forms must cover the same pre-run delegate.
-GIC ICC signed tests must create the GIC before the vCPU, write architecturally
+GIC ICC capture tests must create the GIC before the vCPU, write architecturally
 writable EL1 ICC values from signed guest code, and assert only fields or masked
-bits whose readback is stable; read-only active-priority values remain host-
-defined.
+bits whose readback is stable. Restore unit tests must cover the exact ten-
+position sequence of nine mutable writes and a derived RPR read, every write
+failure, RPR read failure and mismatch, value-free typed context, full retry,
+the sticky never-run gate, shared interrupt conflicts, abandonment, channels,
+queued destruction, panic, and cleanup. Signed restore coverage must capture an
+idle same-VM opaque blob and ICC value, reapply the blob first, restore the ICC
+value, and prove two exact recaptures without guest execution or value logging;
+both boot-session delegates must cover the same order. Read-only active-priority
+values remain host-defined and must never be passed to the setter.
 General-register restore unit tests must verify X0-X30/PC/CPSR write order,
 every one of the 33 failure positions, exact failed-register and completed-
 write context, complete retry, shared core-operation conflicts, abandonment,
