@@ -1417,14 +1417,29 @@ impl HvfArm64BootSession<'_> {
 
     /// Capture raw system-context registers on the primary vCPU owner thread.
     ///
-    /// This macOS 15.2+ getter-only value contains `SCXTNUM_EL0` and
-    /// `SCXTNUM_EL1`; `Debug` redacts both guest software context numbers. It
-    /// excludes interpretation, feature validation, persistence, schema, and
-    /// restore ordering.
+    /// This macOS 15.2+ value contains `SCXTNUM_EL0` and `SCXTNUM_EL1`;
+    /// `Debug` redacts both guest software context numbers. The complete typed
+    /// value has a paired low-level restore, but interpretation, validation,
+    /// persistence, schema, and wider-context ordering remain outside it.
     pub fn capture_arm64_system_context_register_state(
         &self,
     ) -> Result<HvfArm64VcpuSystemContextRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_system_context_register_state()
+    }
+
+    /// Restore raw system-context registers on the primary vCPU owner thread.
+    ///
+    /// The EL0-then-EL1 writes are nontransactional. If a setter fails, retry
+    /// the complete redacted typed state or discard the session before guest
+    /// execution. Interpretation, feature/destination validation, protected
+    /// persistence, TPIDR/TPIDR2/CONTEXTIDR ordering, rollback, schema, and
+    /// snapshot orchestration remain outside this primitive.
+    pub fn restore_arm64_system_context_register_state(
+        &self,
+        state: &HvfArm64VcpuSystemContextRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_system_context_register_state(state)
     }
 
     /// Capture raw EL1 translation-register state on the primary owner thread.
@@ -2374,14 +2389,29 @@ impl OwnedHvfArm64BootSession {
 
     /// Capture raw system-context registers on the primary vCPU owner thread.
     ///
-    /// This macOS 15.2+ getter-only value contains `SCXTNUM_EL0` and
-    /// `SCXTNUM_EL1`; `Debug` redacts both guest software context numbers. It
-    /// excludes interpretation, feature validation, persistence, schema, and
-    /// restore ordering.
+    /// This macOS 15.2+ value contains `SCXTNUM_EL0` and `SCXTNUM_EL1`;
+    /// `Debug` redacts both guest software context numbers. The complete typed
+    /// value has a paired low-level restore, but interpretation, validation,
+    /// persistence, schema, and wider-context ordering remain outside it.
     pub fn capture_arm64_system_context_register_state(
         &self,
     ) -> Result<HvfArm64VcpuSystemContextRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_system_context_register_state()
+    }
+
+    /// Restore raw system-context registers on the primary vCPU owner thread.
+    ///
+    /// The EL0-then-EL1 writes are nontransactional. If a setter fails, retry
+    /// the complete redacted typed state or discard the session before guest
+    /// execution. Interpretation, feature/destination validation, protected
+    /// persistence, TPIDR/TPIDR2/CONTEXTIDR ordering, rollback, schema, and
+    /// snapshot orchestration remain outside this primitive.
+    pub fn restore_arm64_system_context_register_state(
+        &self,
+        state: &HvfArm64VcpuSystemContextRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_system_context_register_state(state)
     }
 
     /// Capture raw EL1 translation-register state on the primary owner thread.

@@ -1708,7 +1708,7 @@ fn captures_arm64_sme_system_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_arm64_system_context_registers_on_runner_thread() {
+fn captures_and_restores_arm64_system_context_registers_on_runner_thread() {
     use bangbang_hvf::{HvfArm64VcpuSystemContextRegisterState, HvfBackend};
     use bangbang_runtime::VmBackend;
 
@@ -1742,6 +1742,27 @@ fn captures_arm64_system_context_registers_on_runner_thread() {
         assert!(
             format!("{first:?}").contains("<redacted>"),
             "system-context register debug output should remain redacted"
+        );
+
+        runner
+            .restore_arm64_system_context_register_state(&first)
+            .expect("system-context register state should be restored");
+        let restored = runner
+            .capture_arm64_system_context_register_state()
+            .expect("restored system-context register state should be captured");
+        assert!(
+            restored == first,
+            "restored system-context register state should match its idle source"
+        );
+        runner
+            .restore_arm64_system_context_register_state(&first)
+            .expect("system-context register state should be restored a second time");
+        let restored_again = runner
+            .capture_arm64_system_context_register_state()
+            .expect("twice-restored system-context register state should be captured");
+        assert!(
+            restored_again == first,
+            "twice-restored system-context register state should match its idle source"
         );
 
         runner.shutdown().expect("runner should shut down");
@@ -2823,9 +2844,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .capture_arm64_sme_system_register_state()
         .expect("internal session should capture SME system-register state");
-    session
+    let system_context_state = session
         .capture_arm64_system_context_register_state()
         .expect("internal session should capture system-context register state");
+    session
+        .restore_arm64_system_context_register_state(&system_context_state)
+        .expect("internal session should restore system-context register state");
     let translation_state = session
         .capture_arm64_translation_register_state()
         .expect("internal session should capture translation-register state");
@@ -3051,9 +3075,12 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_sme_system_register_state()
         .expect("owned session should capture SME system-register state");
-    session
+    let system_context_state = session
         .capture_arm64_system_context_register_state()
         .expect("owned session should capture system-context register state");
+    session
+        .restore_arm64_system_context_register_state(&system_context_state)
+        .expect("owned session should restore system-context register state");
     let translation_state = session
         .capture_arm64_translation_register_state()
         .expect("owned session should capture translation-register state");

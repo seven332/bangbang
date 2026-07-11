@@ -302,6 +302,14 @@ is resource-specific:
   safe MMU transition sequence, rollback, or wider restore ordering. It must
   preserve actual implementation-defined AMAIR readback; after failure, retry
   the complete retained value or discard the vCPU before execution.
+  The paired system-context restore extends the same boundary to raw
+  `SCXTNUM_EL0` and `SCXTNUM_EL1`. It accepts only the complete redacted typed
+  capture, writes EL0 then EL1, and reports the exact failed register,
+  completed prefix, and backend source without either software context number.
+  Those values can identify guest execution contexts and are not interpreted,
+  destination-validated, or coordinated with separately captured TPIDR and
+  `CONTEXTIDR_EL1` state. After failure, retry the complete retained value or
+  discard the vCPU before execution.
   The paired pointer-authentication restore extends the same boundary to APIA,
   APIB, APDA, APDB, and APGA. It accepts only the complete redacted typed
   capture, writes each low then high half in capture order, and reports the
@@ -323,7 +331,7 @@ is resource-specific:
   validation, FPCR/FPSR writable-bit policy, protected persistence,
   zeroization, rollback, or schema. After failure, retry the complete retained
   value or discard the vCPU before execution. Public snapshot load invokes none
-  of the eight restore primitives.
+  of the nine restore primitives.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
   expose guest process or kernel context identifiers.
   FAR and PAR can expose guest fault or translation-result addresses, VBAR can
@@ -435,10 +443,11 @@ is resource-specific:
   and ordering with PSTATE plus conditional Z/P/ZA/ZT0 contents.
   The separate raw `SCXTNUM_EL0` and `SCXTNUM_EL1` values can identify guest
   software execution contexts. Their detached value redacts both registers from
-  `Debug`, and capture performs no writes, but raw accessors remain restricted
-  to trusted internal composition. The values must not be logged, persisted,
-  trusted, or restored without feature, interpretation, destination, and
-  ordering policy coordinated with TPIDR and `CONTEXTIDR_EL1` state.
+  `Debug`, and raw accessors remain restricted to trusted internal composition.
+  The internal capture-order apply never formats either value, but it is not a
+  snapshot restore policy: the values must not be logged, persisted, or trusted
+  without feature, interpretation, destination, and ordering policy coordinated
+  with TPIDR and `CONTEXTIDR_EL1` state.
   Current internal capture commands keep these values in process memory and do
   not write them to logs, metrics, error strings, or persistence. The raw
   virtual-timer offset is tied to HVF's host-time relation, the physical-timer

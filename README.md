@@ -42,7 +42,8 @@ conditional maximum-width streaming Z0-Z31 contents with
 redacted `Debug`, conditional maximum-derived streaming P0-P15 predicates with
 redacted `Debug`, conditional maximum-SVL-square ZA contents with redacted
 `Debug`, conditional fixed-size SME2 ZT0 contents with redacted `Debug`, raw
-system-context registers with redacted `Debug`, raw cache-selection,
+system-context registers with redacted `Debug` plus ordered nontransactional
+restore of their typed SCXTNUM_EL0/SCXTNUM_EL1 value, raw cache-selection,
 hardware-breakpoint,
 hardware-watchpoint, debug-control, raw Hypervisor.framework debug-trap policy,
 pointer-authentication key state with redacted `Debug` plus ordered

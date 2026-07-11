@@ -1704,7 +1704,9 @@ streaming-mode and `PSTATE.ZA` storage-enable flags without invoking the setter.
 A seventeenth reads raw `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` in that order
 on macOS 15.2+ and publishes them through a value whose `Debug` output redacts
 all three registers. An eighteenth reads raw `SCXTNUM_EL0` then `SCXTNUM_EL1`
-on macOS 15.2+ and redacts both guest software context numbers from `Debug`.
+on macOS 15.2+ and redacts both guest software context numbers from `Debug`;
+its typed value has a paired owner-thread restore that writes both fields in
+capture order through the reusable system-register partial-write contract.
 The nineteenth first observes `PSTATE.SM`, then, only while streaming mode is
 active, queries the maximum SVL, fallibly allocates one contiguous `32 * max`
 buffer, and runtime-resolves `hv_vcpu_get_sme_z_reg` for exact Z0-Z31 reads.
@@ -1724,11 +1726,11 @@ publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
 commands plus the general-, core-system-, exception-register, execution-
 control, thread-context, translation, baseline SIMD/FP, and pointer-
-authentication restore operations
-form a thirty-operation command-owned core-register admission domain.
+authentication key, and system-context restore operations form a thirty-one-
+operation command-owned core-register admission domain.
 Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose all eight restores
+setter failure. Borrowed and owned HVF boot sessions expose all nine restores
 and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
@@ -1828,9 +1830,13 @@ It performs no writes and defines no writable-bit or feature validation,
 maximum-SVL policy, persistence, schema, or restore ordering with PSTATE and
 the conditionally present Z/P/ZA/ZT0 contents.
 The separate system-context capture uses macOS 15.2 SDK register ids through the
-same owner-thread getter, preserves raw backend errors, and performs no writes.
-It defines no interpretation, feature or destination validation, persistence,
-schema, or restore ordering with TPIDR and `CONTEXTIDR_EL1` state.
+same owner-thread getter and preserves raw backend errors. Its paired restore
+writes `SCXTNUM_EL0` then `SCXTNUM_EL1` through the same owner and reports the
+exact failed register and completed prefix without formatting either value.
+The two writes are nontransactional, so failure requires a complete retry or
+vCPU discard before execution. The primitive defines no interpretation,
+feature or destination validation, protected persistence, rollback, schema,
+or wider restore ordering with TPIDR and `CONTEXTIDR_EL1` state.
 The translation value omits table memory, feature and destination validation,
 TLB/cache maintenance, barriers, and a safe MMU transition sequence. Its paired
 restore merely reapplies the complete raw capture in field order and may leave
@@ -1884,10 +1890,11 @@ SME system-register validation captures all three registers twice
 from the same idle vCPU, compares them only with fixed failure messages, and
 checks redacted `Debug` output. It does not log raw values, write registers,
 query maximum SVL, read Z/P/ZA/ZT0, or run the guest.
-System-context validation captures both registers twice from the same idle vCPU,
-compares them only with fixed failure messages, and checks redacted `Debug`
-output. It does not log raw values, write registers, run guest code, hard-code a
-reset value, or infer feature or destination compatibility. Debug-control validation only
+System-context validation captures both registers twice from the same idle
+vCPU, compares them only with fixed failure messages, and checks redacted
+`Debug` output. It then restores and recaptures the complete first value twice
+without logging raw values, running guest code, hard-coding a reset value, or
+inferring feature or destination compatibility. Debug-control validation only
 reads both values from an idle real vCPU; it does not enable monitor debug,
 software stepping, debug exceptions, guest debug-register access, or DCC interrupts.
 Breakpoint and watchpoint comparators and their respective DFR0-reported counts
@@ -1941,16 +1948,16 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The baseline and optional SVE/SME identification,
-SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register, system-context,
+SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register,
 cache-selection, breakpoint, watchpoint,
 debug-control, debug-trap, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
 The core system-register, EL1 exception, execution-control, thread-context, and
-translation subsets plus baseline SIMD/FP and pointer-authentication keys have paired ordered,
-nontransactional restore operations but likewise have no validation, schema,
-dependent-memory, maintenance, feature-transition, SVE/SME alias, or wider
-ordering policy.
+translation subsets plus system-context, baseline SIMD/FP, and pointer-
+authentication keys have paired ordered, nontransactional restore operations
+but likewise have no validation, schema, dependent-memory, maintenance,
+feature-transition, SVE/SME alias, or wider ordering policy.
 Identification capture is compatibility metadata rather than mutable restore
 state and defines no feature-mask or destination policy. Debug-control and
 debug-trap capture remain separate and

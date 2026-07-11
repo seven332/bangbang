@@ -1321,8 +1321,9 @@ impl fmt::Debug for HvfArm64VcpuSmeSystemRegisterState {
 /// and newer. These guest software context numbers can identify execution
 /// contexts, so `Debug` redacts both raw values. They are separate from TPIDR
 /// thread context, `CONTEXTIDR_EL1`, and processor feature metadata. This
-/// getter-only value defines no interpretation, feature validation,
-/// persistence, snapshot schema, or safe restore ordering.
+/// complete typed value can be reapplied through an owner-thread primitive,
+/// but defines no interpretation, feature or destination validation,
+/// persistence, snapshot schema, rollback, or safe wider-context ordering.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuSystemContextRegisterState {
     scxtnum_el0: u64,
@@ -2815,6 +2816,29 @@ pub(crate) fn capture_arm64_vcpu_system_context_register_state_with(
     ))
 }
 
+pub(crate) fn restore_arm64_vcpu_system_context_register_state_with(
+    state: &HvfArm64VcpuSystemContextRegisterState,
+    mut set_system_register: impl FnMut(HvfSystemRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+    let mut completed_writes = 0;
+    let mut write_system_register = |register, value| {
+        set_system_register(register, value).map_err(|source| {
+            HvfArm64VcpuSystemRegisterRestoreError::new(register, completed_writes, source)
+        })?;
+        completed_writes += 1;
+        Ok(())
+    };
+
+    for (register, value) in [
+        (HvfSystemRegister::SCXTNUM_EL0, state.scxtnum_el0()),
+        (HvfSystemRegister::SCXTNUM_EL1, state.scxtnum_el1()),
+    ] {
+        write_system_register(register, value)?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
@@ -3110,6 +3134,7 @@ mod tests {
         restore_arm64_vcpu_general_register_state_with,
         restore_arm64_vcpu_pointer_authentication_key_state_with,
         restore_arm64_vcpu_simd_fp_state_with,
+        restore_arm64_vcpu_system_context_register_state_with,
         restore_arm64_vcpu_thread_context_register_state_with,
         restore_arm64_vcpu_translation_register_state_with,
     };
@@ -3403,6 +3428,21 @@ mod tests {
         [
             HvfSystemRegister::SCXTNUM_EL0,
             HvfSystemRegister::SCXTNUM_EL1,
+        ]
+    }
+
+    fn system_context_restore_test_state() -> super::HvfArm64VcpuSystemContextRegisterState {
+        super::HvfArm64VcpuSystemContextRegisterState::new(
+            0x0123_4567_89ab_cdef,
+            0xfedc_ba98_7654_3210,
+        )
+    }
+
+    fn system_context_restore_test_entries() -> [(HvfSystemRegister, u64); 2] {
+        let state = system_context_restore_test_state();
+        [
+            (HvfSystemRegister::SCXTNUM_EL0, state.scxtnum_el0()),
+            (HvfSystemRegister::SCXTNUM_EL1, state.scxtnum_el1()),
         ]
     }
 
@@ -5376,6 +5416,25 @@ mod tests {
     }
 
     #[test]
+    fn restores_arm64_system_context_register_state_in_capture_order() {
+        let state = system_context_restore_test_state();
+        let expected = system_context_restore_test_entries();
+        let mut writes = Vec::new();
+
+        restore_arm64_vcpu_system_context_register_state_with(&state, |register, value| {
+            writes.push((register, value));
+            Ok(())
+        })
+        .expect("system-context register restore should succeed");
+
+        assert_eq!(writes, expected);
+        assert_eq!(
+            format!("{state:?}"),
+            "HvfArm64VcpuSystemContextRegisterState { registers: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
     fn captures_arm64_translation_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -6190,6 +6249,57 @@ mod tests {
                 0xc700_0000_0000_0000 | u64::from(registers[1].raw())
             );
             assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn every_arm64_system_context_register_restore_failure_stops_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = system_context_restore_test_state();
+        let expected = system_context_restore_test_entries();
+
+        for (failed_index, (failed_register, _)) in expected.iter().copied().enumerate() {
+            let fail_once = Cell::new(true);
+            let writes = RefCell::new(Vec::new());
+            let write_system_register = |register, value| {
+                writes.borrow_mut().push((register, value));
+                if register == failed_register && fail_once.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake system-context register restore failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error = restore_arm64_vcpu_system_context_register_state_with(
+                &state,
+                &write_system_register,
+            )
+            .expect_err("injected system-context register write should fail");
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some(
+                    "invalid backend state: fake system-context register restore failed"
+                        .to_string()
+                )
+            );
+            assert_eq!(*writes.borrow(), expected[..=failed_index]);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 system register id {} after {failed_index} successful writes: invalid backend state: fake system-context register restore failed",
+                    failed_register.raw()
+                )
+            );
+
+            writes.borrow_mut().clear();
+            restore_arm64_vcpu_system_context_register_state_with(&state, &write_system_register)
+                .expect("complete system-context register restore retry should succeed");
+            assert_eq!(*writes.borrow(), expected);
         }
     }
 
