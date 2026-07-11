@@ -1665,7 +1665,7 @@ impl HvfArm64BootSession<'_> {
     /// Capture raw EL1 GIC ICC registers on the primary vCPU owner thread.
     ///
     /// This per-vCPU value complements the opaque GIC device blob but is not a
-    /// restored or persisted snapshot. EL2 ICC, ICH, and ICV state are omitted.
+    /// complete or persisted snapshot. EL2 ICC, ICH, and ICV state are omitted.
     pub fn capture_arm64_gic_icc_register_state(
         &self,
     ) -> Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError> {
@@ -2722,7 +2722,7 @@ impl OwnedHvfArm64BootSession {
     /// Capture raw EL1 GIC ICC registers on the primary vCPU owner thread.
     ///
     /// This per-vCPU value complements the opaque GIC device blob but is not a
-    /// restored or persisted snapshot. EL2 ICC, ICH, and ICV state are omitted.
+    /// complete or persisted snapshot. EL2 ICC, ICH, and ICV state are omitted.
     pub fn capture_arm64_gic_icc_register_state(
         &self,
     ) -> Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError> {

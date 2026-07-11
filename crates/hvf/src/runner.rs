@@ -2328,7 +2328,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
     /// The command captures all ten EL1 ICC values exposed by the macOS 15
     /// Hypervisor.framework API and serializes them with other runner-managed
     /// interrupt/GIC operations. It covers only this current single vCPU and
-    /// excludes `ICC_SRE_EL2`, ICH/ICV state, restore, and snapshot persistence.
+    /// excludes `ICC_SRE_EL2`, ICH/ICV state, destination validation, and
+    /// snapshot persistence.
     pub fn capture_arm64_gic_icc_register_state(
         &self,
     ) -> Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError> {

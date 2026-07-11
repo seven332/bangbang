@@ -499,6 +499,9 @@ only after all reads succeed. A paired pre-first-run command loads independent
 getter and setter capabilities before its first mutation, writes the nine
 architecturally mutable registers in capture order, and reads the derived,
 read-only RPR at its original position to require equality with the capture.
+This split also matches signed Apple Silicon evidence: setting the original idle
+RPR returned `HV_DENIED`, while omitting only that forbidden call allowed all
+nine mutable writes and exact complete recapture.
 The nontransactional operation reports the exact register, write or derived-
 validation operation, completed-write count, and backend source without raw
 values; after failure callers must retry the complete retained value or discard
