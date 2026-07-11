@@ -103,6 +103,15 @@ clear the injection levels and invalidate the round trip. GIC ICC signed tests
 must create the GIC before the vCPU, write architecturally writable EL1 ICC
 values from signed guest code, and assert only fields or masked bits whose
 readback is stable; read-only active-priority values remain host-defined.
+General-register restore unit tests must verify X0-X30/PC/CPSR write order,
+every one of the 33 failure positions, exact failed-register and completed-
+write context, complete retry, shared core-operation conflicts, abandonment,
+closed channels, queued-command destruction, panic, and cleanup. Signed tests
+must restore only a complete capture from the same idle real vCPU, recapture
+and compare it with fixed failure messages, and repeat the round trip without
+guest execution or logging register values. A failed restore is
+nontransactional; tests and callers must retry the complete retained value or
+discard the vCPU before any run.
 Translation-register signed tests must leave `SCTLR_EL1.M` clear, write back
 the original SCTLR value, and only then write inert TTBR/TCR/attribute/context
 values before HVC. AMAIR is implementation-defined: current Apple Silicon reads

@@ -77,9 +77,9 @@ impl HvfArm64VcpuPendingInterruptState {
 
 /// Detached general-register state captured from one arm64 vCPU.
 ///
-/// This is the first read-only architectural subset for later snapshot
-/// orchestration. It does not include system, SIMD/FP, timer, interrupt, or
-/// device state and is not a serialized snapshot schema.
+/// This is the first captured and owner-thread-restorable architectural subset
+/// for later snapshot orchestration. It does not include system, SIMD/FP,
+/// timer, interrupt, or device state and is not a serialized snapshot schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HvfArm64VcpuGeneralRegisterState {
     general_purpose_registers: [u64; 31],
@@ -108,6 +108,61 @@ impl HvfArm64VcpuGeneralRegisterState {
     /// Return the captured CPSR/PSTATE value.
     pub const fn cpsr(&self) -> u64 {
         self.cpsr
+    }
+}
+
+/// Failure while restoring one field of arm64 general-register state.
+///
+/// Hypervisor.framework writes one register at a time and provides no batch
+/// transaction. Registers before [`Self::failed_register`] have already been
+/// written when this error is returned. Callers must retry the complete state
+/// or discard the vCPU before execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64VcpuGeneralRegisterRestoreError {
+    failed_register: HvfRegister,
+    completed_writes: usize,
+    source: BackendError,
+}
+
+impl HvfArm64VcpuGeneralRegisterRestoreError {
+    const fn new(
+        failed_register: HvfRegister,
+        completed_writes: usize,
+        source: BackendError,
+    ) -> Self {
+        Self {
+            failed_register,
+            completed_writes,
+            source,
+        }
+    }
+
+    /// Return the register whose setter failed.
+    pub const fn failed_register(&self) -> HvfRegister {
+        self.failed_register
+    }
+
+    /// Return the number of target registers written before the failure.
+    pub const fn completed_writes(&self) -> usize {
+        self.completed_writes
+    }
+}
+
+impl fmt::Display for HvfArm64VcpuGeneralRegisterRestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "failed to restore arm64 register id {} after {} successful writes: {}",
+            self.failed_register.raw(),
+            self.completed_writes,
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for HvfArm64VcpuGeneralRegisterRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -2096,6 +2151,29 @@ pub(crate) fn capture_arm64_vcpu_general_register_state_with(
     })
 }
 
+pub(crate) fn restore_arm64_vcpu_general_register_state_with(
+    state: &HvfArm64VcpuGeneralRegisterState,
+    mut set_register: impl FnMut(HvfRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuGeneralRegisterRestoreError> {
+    let mut completed_writes = 0;
+    let mut write_register = |register, value| {
+        set_register(register, value).map_err(|source| {
+            HvfArm64VcpuGeneralRegisterRestoreError::new(register, completed_writes, source)
+        })?;
+        completed_writes += 1;
+        Ok(())
+    };
+
+    for (index, value) in (0_u8..31).zip(state.general_purpose_registers.iter().copied()) {
+        let register = HvfRegister(crate::ffi::HV_REG_X0 + u32::from(index));
+        write_register(register, value)?;
+    }
+    write_register(HvfRegister::PC, state.pc)?;
+    write_register(HvfRegister::CPSR, state.cpsr)?;
+
+    Ok(())
+}
+
 pub(crate) fn capture_arm64_vcpu_core_system_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuCoreSystemRegisterState, BackendError> {
@@ -2665,6 +2743,7 @@ mod tests {
         capture_arm64_vcpu_translation_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with,
         capture_arm64_vcpu_watchpoint_register_state_with, configure_arm64_boot_registers_with,
+        restore_arm64_vcpu_general_register_state_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
@@ -3282,6 +3361,91 @@ mod tests {
             .expect("general-register capture retry should succeed");
         assert_eq!(state.general_purpose_register(2), Some(2));
         assert_eq!(reads.borrow().len(), 33);
+    }
+
+    fn general_register_restore_test_state() -> super::HvfArm64VcpuGeneralRegisterState {
+        capture_arm64_vcpu_general_register_state_with(|register| {
+            Ok(0xa500_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("general-register test state should be captured")
+    }
+
+    fn general_register_restore_test_entries(
+        state: &super::HvfArm64VcpuGeneralRegisterState,
+    ) -> Vec<(HvfRegister, u64)> {
+        (0_u8..31)
+            .zip(state.general_purpose_registers().iter().copied())
+            .map(|(index, value)| {
+                (
+                    HvfRegister::general_purpose(index).expect("X0-X30 should map to registers"),
+                    value,
+                )
+            })
+            .chain([
+                (HvfRegister::PC, state.pc()),
+                (HvfRegister::CPSR, state.cpsr()),
+            ])
+            .collect()
+    }
+
+    #[test]
+    fn restores_arm64_general_register_state_in_architectural_order() {
+        let state = general_register_restore_test_state();
+        let expected = general_register_restore_test_entries(&state);
+        let mut writes = Vec::new();
+
+        restore_arm64_vcpu_general_register_state_with(&state, |register, value| {
+            writes.push((register, value));
+            Ok(())
+        })
+        .expect("general-register restore should succeed");
+
+        assert_eq!(writes, expected);
+    }
+
+    #[test]
+    fn every_arm64_general_register_restore_failure_stops_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = general_register_restore_test_state();
+        let expected = general_register_restore_test_entries(&state);
+
+        for (failed_index, (failed_register, _)) in expected.iter().copied().enumerate() {
+            let fail_once = Cell::new(true);
+            let writes = RefCell::new(Vec::new());
+            let write_register = |register, value| {
+                writes.borrow_mut().push((register, value));
+                if register == failed_register && fail_once.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake general-register restore failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error = restore_arm64_vcpu_general_register_state_with(&state, &write_register)
+                .expect_err("injected general-register write should fail");
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake general-register restore failed".to_string())
+            );
+            assert_eq!(*writes.borrow(), expected[..=failed_index]);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 register id {} after {failed_index} successful writes: invalid backend state: fake general-register restore failed",
+                    failed_register.raw()
+                )
+            );
+
+            writes.borrow_mut().clear();
+            restore_arm64_vcpu_general_register_state_with(&state, &write_register)
+                .expect("complete general-register restore retry should succeed");
+            assert_eq!(*writes.borrow(), expected);
+        }
     }
 
     #[test]

@@ -25,18 +25,19 @@ use crate::vcpu::{
     HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
     HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapState,
     HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
-    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
-    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
-    HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate,
-    HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
-    HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError,
-    HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZt0RegisterCaptureError,
-    HvfArm64VcpuSmeZt0RegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
-    HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuThreadContextRegisterState,
-    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
-    HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
-    HvfSystemRegister, HvfVcpuOwner, capture_arm64_vcpu_breakpoint_register_state_with,
+    HvfArm64VcpuGeneralRegisterRestoreError, HvfArm64VcpuGeneralRegisterState,
+    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
+    HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
+    HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState,
+    HvfArm64VcpuSmePstate, HvfArm64VcpuSmeSystemRegisterState,
+    HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
+    HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
+    HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState,
+    HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuSystemContextRegisterState,
+    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+    HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState, HvfInterruptType,
+    HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpuOwner,
+    capture_arm64_vcpu_breakpoint_register_state_with,
     capture_arm64_vcpu_cache_selection_register_state_with,
     capture_arm64_vcpu_core_system_register_state_with,
     capture_arm64_vcpu_debug_control_register_state_with, capture_arm64_vcpu_debug_trap_state_with,
@@ -55,6 +56,7 @@ use crate::vcpu::{
     capture_arm64_vcpu_thread_context_register_state_with,
     capture_arm64_vcpu_translation_register_state_with,
     capture_arm64_vcpu_watchpoint_register_state_with,
+    restore_arm64_vcpu_general_register_state_with,
 };
 
 const RUNNER_SHUT_DOWN_MESSAGE: &str = "vCPU runner is shut down";
@@ -70,8 +72,8 @@ const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
     "vCPU runner boot registers are already configured";
 const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
 const METADATA_READ_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has metadata read in flight";
-const CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE: &str =
-    "vCPU runner already has core register capture in flight";
+const CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE: &str =
+    "vCPU runner already has core register operation in flight";
 const TIMER_OPERATION_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has timer operation in flight";
 const INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has interrupt operation in flight";
@@ -90,6 +92,7 @@ type RunnerState = Arc<Mutex<RunnerHandleState>>;
 pub enum HvfVcpuRunnerError {
     Backend(BackendError),
     Gic(HvfGicError),
+    GeneralRegisterRestore(HvfArm64VcpuGeneralRegisterRestoreError),
     SmePRegisterCapture(HvfArm64VcpuSmePRegisterCaptureError),
     SmeZRegisterCapture(HvfArm64VcpuSmeZRegisterCaptureError),
     SmeZaRegisterCapture(HvfArm64VcpuSmeZaRegisterCaptureError),
@@ -139,6 +142,7 @@ impl fmt::Display for HvfVcpuRunnerError {
         match self {
             Self::Backend(err) => write!(f, "{err}"),
             Self::Gic(err) => write!(f, "{err}"),
+            Self::GeneralRegisterRestore(err) => write!(f, "{err}"),
             Self::SmePRegisterCapture(err) => write!(f, "{err}"),
             Self::SmeZRegisterCapture(err) => write!(f, "{err}"),
             Self::SmeZaRegisterCapture(err) => write!(f, "{err}"),
@@ -167,6 +171,7 @@ impl std::error::Error for HvfVcpuRunnerError {
         match self {
             Self::Backend(err) => Some(err),
             Self::Gic(err) => Some(err),
+            Self::GeneralRegisterRestore(err) => Some(err),
             Self::SmePRegisterCapture(err) => Some(err),
             Self::SmeZRegisterCapture(err) => Some(err),
             Self::SmeZaRegisterCapture(err) => Some(err),
@@ -191,6 +196,12 @@ impl From<BackendError> for HvfVcpuRunnerError {
 impl From<HvfGicError> for HvfVcpuRunnerError {
     fn from(err: HvfGicError) -> Self {
         Self::Gic(err)
+    }
+}
+
+impl From<HvfArm64VcpuGeneralRegisterRestoreError> for HvfVcpuRunnerError {
+    fn from(err: HvfArm64VcpuGeneralRegisterRestoreError) -> Self {
+        Self::GeneralRegisterRestore(err)
     }
 }
 
@@ -271,7 +282,7 @@ struct RunnerHandleState {
     mmio_dispatch_in_flight: bool,
     boot_register_setup_in_flight: bool,
     metadata_read_in_flight: bool,
-    core_register_capture_in_flight: bool,
+    core_register_operation_in_flight: bool,
     timer_operation_in_flight: bool,
     interrupt_operation_in_flight: bool,
     boot_register_setup_failed: bool,
@@ -300,105 +311,110 @@ enum RunnerCommand {
         response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
     },
     CaptureArm64GeneralRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError>>,
     },
+    RestoreArm64GeneralRegisterState {
+        admission: InFlightCoreRegisterOperation,
+        state: HvfArm64VcpuGeneralRegisterState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
     CaptureArm64CoreSystemRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuCoreSystemRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64ExceptionRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuExceptionRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64ExecutionControlRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuExecutionControlRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64CacheSelectionRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuCacheSelectionRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64BreakpointRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuBreakpointRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64WatchpointRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuWatchpointRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64DebugControlRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64DebugTrapState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuDebugTrapState, HvfVcpuRunnerError>>,
     },
     CaptureArm64IdentificationRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuIdentificationRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SveSmeIdentificationRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuSveSmeIdentificationRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SmePstate {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmePstate, HvfVcpuRunnerError>>,
     },
     CaptureArm64SmePRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmePRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SmeZRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmeZRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SmeZaRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmeZaRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SmeZt0RegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmeZt0RegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SmeSystemRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuSmeSystemRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SystemContextRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuSystemContextRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64TranslationRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuTranslationRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64PointerAuthenticationKeyState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuPointerAuthenticationKeyState, HvfVcpuRunnerError>>,
     },
     CaptureArm64ThreadContextRegisterState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuThreadContextRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SimdFpState {
-        admission: InFlightCoreRegisterCapture,
+        admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSimdFpState, HvfVcpuRunnerError>>,
     },
     GetVtimerMask {
@@ -501,6 +517,14 @@ trait RunnerVcpu {
         &mut self,
     ) -> Result<HvfArm64VcpuGeneralRegisterState, BackendError> {
         capture_arm64_vcpu_general_register_state_with(|register| self.read_register(register))
+    }
+    fn restore_arm64_general_register_state(
+        &mut self,
+        state: &HvfArm64VcpuGeneralRegisterState,
+    ) -> Result<(), HvfArm64VcpuGeneralRegisterRestoreError> {
+        restore_arm64_vcpu_general_register_state_with(state, |register, value| {
+            self.write_register(register, value)
+        })
     }
     fn read_simd_fp_register(
         &mut self,
@@ -1058,6 +1082,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Err(HvfVcpuRunnerError::Backend(_)) => setup.mark_failed(),
             Err(
                 HvfVcpuRunnerError::Gic(_)
+                | HvfVcpuRunnerError::GeneralRegisterRestore(_)
                 | HvfVcpuRunnerError::SmePRegisterCapture(_)
                 | HvfVcpuRunnerError::SmeZRegisterCapture(_)
                 | HvfVcpuRunnerError::SmeZaRegisterCapture(_)
@@ -1136,13 +1161,32 @@ impl<'vm> HvfVcpuRunner<'vm> {
 
     /// Capture X0-X30, PC, and CPSR on the vCPU-owning runner thread.
     ///
-    /// This value is a read-only architectural subset for later snapshot
-    /// orchestration, not a complete or serialized vCPU state.
+    /// This value is a captured and owner-thread-restorable architectural
+    /// subset for later snapshot orchestration, not a complete or serialized
+    /// vCPU state.
     pub fn capture_arm64_general_register_state(
         &self,
     ) -> Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_general_register_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Restore X0-X30, PC, and CPSR on the vCPU-owning runner thread.
+    ///
+    /// The command borrows a complete typed capture and writes its 33 fields in
+    /// architectural order. Hypervisor.framework does not make the writes
+    /// transactional: after an error, retry this complete state or discard the
+    /// vCPU before execution. This is not a serialized snapshot-load API.
+    pub fn restore_arm64_general_register_state(
+        &self,
+        state: &HvfArm64VcpuGeneralRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_general_register_restore(state.clone(), response_sender)?;
 
         response_receiver
             .recv()
@@ -1756,7 +1800,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 mmio_dispatch_in_flight: false,
                 boot_register_setup_in_flight: false,
                 metadata_read_in_flight: false,
-                core_register_capture_in_flight: false,
+                core_register_operation_in_flight: false,
                 timer_operation_in_flight: false,
                 interrupt_operation_in_flight: false,
                 boot_register_setup_failed: false,
@@ -1799,9 +1843,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
-        if state.core_register_capture_in_flight {
+        if state.core_register_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
-                CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.timer_operation_in_flight {
@@ -1869,9 +1913,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
-        if state.core_register_capture_in_flight {
+        if state.core_register_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
-                CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.timer_operation_in_flight {
@@ -1934,9 +1978,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
-        if state.core_register_capture_in_flight {
+        if state.core_register_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
-                CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.timer_operation_in_flight {
@@ -2003,9 +2047,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
-        if state.core_register_capture_in_flight {
+        if state.core_register_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
-                CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.timer_operation_in_flight {
@@ -2082,9 +2126,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
-        if state.core_register_capture_in_flight {
+        if state.core_register_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
-                CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.timer_operation_in_flight {
@@ -2117,9 +2161,24 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64GeneralRegisterState {
                 admission,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_general_register_restore(
+        &self,
+        state: HvfArm64VcpuGeneralRegisterState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_core_register_operation(
+            |admission, response_sender| RunnerCommand::RestoreArm64GeneralRegisterState {
+                admission,
+                state,
                 response_sender,
             },
             response_sender,
@@ -2132,7 +2191,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuCoreSystemRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64CoreSystemRegisterState {
                 admission,
                 response_sender,
@@ -2147,7 +2206,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuExceptionRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64ExceptionRegisterState {
                 admission,
                 response_sender,
@@ -2162,7 +2221,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuExecutionControlRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64ExecutionControlRegisterState {
                 admission,
                 response_sender,
@@ -2177,7 +2236,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuCacheSelectionRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64CacheSelectionRegisterState {
                 admission,
                 response_sender,
@@ -2192,7 +2251,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuBreakpointRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64BreakpointRegisterState {
                 admission,
                 response_sender,
@@ -2207,7 +2266,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuWatchpointRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64WatchpointRegisterState {
                 admission,
                 response_sender,
@@ -2222,7 +2281,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64DebugControlRegisterState {
                 admission,
                 response_sender,
@@ -2235,7 +2294,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuDebugTrapState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64DebugTrapState {
                 admission,
                 response_sender,
@@ -2250,7 +2309,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuIdentificationRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64IdentificationRegisterState {
                 admission,
                 response_sender,
@@ -2265,7 +2324,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuSveSmeIdentificationRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| {
                 RunnerCommand::CaptureArm64SveSmeIdentificationRegisterState {
                     admission,
@@ -2280,7 +2339,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmePstate, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64SmePstate {
                 admission,
                 response_sender,
@@ -2293,7 +2352,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmePRegisterState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64SmePRegisterState {
                 admission,
                 response_sender,
@@ -2306,7 +2365,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmeZRegisterState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64SmeZRegisterState {
                 admission,
                 response_sender,
@@ -2319,7 +2378,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmeZaRegisterState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64SmeZaRegisterState {
                 admission,
                 response_sender,
@@ -2332,7 +2391,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmeZt0RegisterState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64SmeZt0RegisterState {
                 admission,
                 response_sender,
@@ -2347,7 +2406,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuSmeSystemRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64SmeSystemRegisterState {
                 admission,
                 response_sender,
@@ -2362,7 +2421,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuSystemContextRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64SystemContextRegisterState {
                 admission,
                 response_sender,
@@ -2377,7 +2436,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuThreadContextRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64ThreadContextRegisterState {
                 admission,
                 response_sender,
@@ -2390,7 +2449,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSimdFpState, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64SimdFpState {
                 admission,
                 response_sender,
@@ -2399,22 +2458,22 @@ impl<'vm> HvfVcpuRunner<'vm> {
         )
     }
 
-    fn start_core_register_capture<T>(
+    fn start_core_register_operation<T>(
         &self,
         command: impl FnOnce(
-            InFlightCoreRegisterCapture,
+            InFlightCoreRegisterOperation,
             mpsc::Sender<Result<T, HvfVcpuRunnerError>>,
         ) -> RunnerCommand,
         response_sender: mpsc::Sender<Result<T, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        // Capture admission follows queued owner-thread work rather than the
+        // Core-register admission follows queued owner-thread work rather than the
         // caller's response lifetime, so abandoning the response cannot admit
-        // cancellation while register reads are still active.
-        let admission = self.reserve_core_register_capture()?;
+        // cancellation while register reads or writes are still active.
+        let admission = self.reserve_core_register_operation()?;
 
         // Reservation returns after releasing the state lock. If the command
         // channel is closed, dropping the unsent command can therefore lock
-        // the state through its admission guard and restore the capture bit.
+        // the state through its admission guard and restore the operation bit.
         self.command_sender
             .send(command(admission, response_sender))
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
@@ -2426,7 +2485,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuTranslationRegisterState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64TranslationRegisterState {
                 admission,
                 response_sender,
@@ -2441,7 +2500,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Result<HvfArm64VcpuPointerAuthenticationKeyState, HvfVcpuRunnerError>,
         >,
     ) -> Result<(), HvfVcpuRunnerError> {
-        self.start_core_register_capture(
+        self.start_core_register_operation(
             |admission, response_sender| RunnerCommand::CaptureArm64PointerAuthenticationKeyState {
                 admission,
                 response_sender,
@@ -2450,9 +2509,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
         )
     }
 
-    fn reserve_core_register_capture(
+    fn reserve_core_register_operation(
         &self,
-    ) -> Result<InFlightCoreRegisterCapture, HvfVcpuRunnerError> {
+    ) -> Result<InFlightCoreRegisterOperation, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -2480,9 +2539,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
-        if state.core_register_capture_in_flight {
+        if state.core_register_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
-                CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.timer_operation_in_flight {
@@ -2496,8 +2555,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
             ));
         }
 
-        state.core_register_capture_in_flight = true;
-        Ok(InFlightCoreRegisterCapture::new(&self.state))
+        state.core_register_operation_in_flight = true;
+        Ok(InFlightCoreRegisterOperation::new(&self.state))
     }
 
     fn start_get_vtimer_mask(
@@ -2690,9 +2749,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
-        if state.core_register_capture_in_flight {
+        if state.core_register_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
-                CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.timer_operation_in_flight {
@@ -2860,9 +2919,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
-        if state.core_register_capture_in_flight {
+        if state.core_register_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
-                CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.timer_operation_in_flight {
@@ -2896,9 +2955,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
-        if state.core_register_capture_in_flight {
+        if state.core_register_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
-                CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.timer_operation_in_flight {
@@ -2964,9 +3023,9 @@ fn prepare_cancel(
             METADATA_READ_IN_FLIGHT_MESSAGE,
         ));
     }
-    if state.core_register_capture_in_flight {
+    if state.core_register_operation_in_flight {
         return Err(HvfVcpuRunnerError::InvalidState(
-            CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE,
+            CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
         ));
     }
     if state.timer_operation_in_flight {
@@ -3013,7 +3072,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.mmio_dispatch_in_flight,
                 state.boot_register_setup_in_flight,
                 state.metadata_read_in_flight,
-                state.core_register_capture_in_flight,
+                state.core_register_operation_in_flight,
                 state.timer_operation_in_flight,
                 state.interrupt_operation_in_flight,
                 state.boot_register_setup_failed,
@@ -3030,7 +3089,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 mmio_dispatch_in_flight,
                 boot_register_setup_in_flight,
                 metadata_read_in_flight,
-                core_register_capture_in_flight,
+                core_register_operation_in_flight,
                 timer_operation_in_flight,
                 interrupt_operation_in_flight,
                 boot_register_setup_failed,
@@ -3048,8 +3107,8 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 )
                 .field("metadata_read_in_flight", &metadata_read_in_flight)
                 .field(
-                    "core_register_capture_in_flight",
-                    &core_register_capture_in_flight,
+                    "core_register_operation_in_flight",
+                    &core_register_operation_in_flight,
                 )
                 .field("timer_operation_in_flight", &timer_operation_in_flight)
                 .field(
@@ -3173,12 +3232,12 @@ impl Drop for InFlightMetadataRead {
     }
 }
 
-/// Command-owned admission for one core-register capture command.
-struct InFlightCoreRegisterCapture {
+/// Command-owned admission for one core-register read or write command.
+struct InFlightCoreRegisterOperation {
     state: Option<RunnerState>,
 }
 
-impl InFlightCoreRegisterCapture {
+impl InFlightCoreRegisterOperation {
     fn new(state: &RunnerState) -> Self {
         Self {
             state: Some(Arc::clone(state)),
@@ -3190,12 +3249,12 @@ impl InFlightCoreRegisterCapture {
             return;
         };
         if let Ok(mut state) = state.lock() {
-            state.core_register_capture_in_flight = false;
+            state.core_register_operation_in_flight = false;
         }
     }
 }
 
-impl Drop for InFlightCoreRegisterCapture {
+impl Drop for InFlightCoreRegisterOperation {
     fn drop(&mut self) {
         self.release();
     }
@@ -3362,6 +3421,20 @@ fn run_runner_thread<C, V>(
                 // The last owner-thread read has finished. Restore admission
                 // before responding so even a dropped receiver is not part of
                 // the capture lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::RestoreArm64GeneralRegisterState {
+                mut admission,
+                state,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .restore_arm64_general_register_state(&state)
+                    .map_err(HvfVcpuRunnerError::GeneralRegisterRestore);
+                // The last owner-thread write or first failed write has
+                // finished. Restore admission before responding so receiver
+                // failure is not part of the restore lifetime.
                 admission.release();
                 let _ = response_sender.send(result);
             }
@@ -3978,18 +4051,19 @@ mod tests {
         HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
         HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapState,
         HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
-        HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
-        HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-        HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
-        HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate,
-        HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
-        HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError,
-        HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZt0RegisterCaptureError,
-        HvfArm64VcpuSmeZt0RegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
-        HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuThreadContextRegisterState,
-        HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
-        HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
-        HvfSystemRegister,
+        HvfArm64VcpuGeneralRegisterRestoreError, HvfArm64VcpuGeneralRegisterState,
+        HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
+        HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
+        HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePRegisterCaptureError,
+        HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate, HvfArm64VcpuSmeSystemRegisterState,
+        HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
+        HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
+        HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState,
+        HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuSystemContextRegisterState,
+        HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+        HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState, HvfInterruptType,
+        HvfRegister, HvfSimdFpRegister, HvfSystemRegister,
+        capture_arm64_vcpu_general_register_state_with,
     };
 
     const ESR_EC_HVC: u64 = 0x16;
@@ -4064,6 +4138,11 @@ mod tests {
         fail_next_register: Option<HvfRegister>,
     }
 
+    struct GeneralRegisterRestoreRecordingVcpu {
+        write_sender: mpsc::Sender<(HvfRegister, u64)>,
+        fail_next_register: Option<HvfRegister>,
+    }
+
     struct BlockingGeneralRegisterCaptureVcpu {
         entered_capture_sender: mpsc::Sender<()>,
         release_capture_receiver: mpsc::Receiver<Result<(), BackendError>>,
@@ -4072,7 +4151,22 @@ mod tests {
 
     struct PanicOnGeneralRegisterCaptureVcpu;
 
+    struct BlockingGeneralRegisterRestoreVcpu {
+        entered_restore_sender: mpsc::Sender<()>,
+        release_restore_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnGeneralRegisterRestoreVcpu;
+
     type BlockingGeneralRegisterCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    type BlockingGeneralRegisterRestoreRunner = (
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<(), BackendError>>,
@@ -5142,6 +5236,53 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for GeneralRegisterRestoreRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            self.write_sender
+                .send((register, value))
+                .map_err(|_| BackendError::InvalidState("fake register-write receiver closed"))?;
+            if self.fail_next_register == Some(register) {
+                self.fail_next_register = None;
+                Err(BackendError::InvalidState(
+                    "fake general-register restore failed",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for BlockingGeneralRegisterCaptureVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -5191,6 +5332,59 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for BlockingGeneralRegisterRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            _value: u64,
+        ) -> Result<(), BackendError> {
+            if register == HvfRegister::X0 {
+                self.entered_restore_sender.send(()).map_err(|_| {
+                    BackendError::InvalidState("fake restore entry receiver closed")
+                })?;
+                self.release_restore_receiver.recv().map_err(|_| {
+                    BackendError::InvalidState("fake restore release sender closed")
+                })??;
+            }
+
+            Ok(())
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for PanicOnGeneralRegisterCaptureVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -5217,6 +5411,43 @@ mod tests {
 
         fn read_register(&mut self, _register: HvfRegister) -> Result<u64, BackendError> {
             panic!("fake general-register capture panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnGeneralRegisterRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn write_register(
+            &mut self,
+            _register: HvfRegister,
+            _value: u64,
+        ) -> Result<(), BackendError> {
+            panic!("fake general-register restore panic");
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -9913,16 +10144,45 @@ mod tests {
         );
     }
 
+    fn general_register_restore_test_state() -> HvfArm64VcpuGeneralRegisterState {
+        capture_arm64_vcpu_general_register_state_with(|register| {
+            Ok(0xa500_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("general-register test state should be captured")
+    }
+
+    fn general_register_restore_test_entries(
+        state: &HvfArm64VcpuGeneralRegisterState,
+    ) -> Vec<(HvfRegister, u64)> {
+        (0_u8..31)
+            .zip(state.general_purpose_registers().iter().copied())
+            .map(|(index, value)| {
+                (
+                    HvfRegister::general_purpose(index).expect("X0-X30 should map to registers"),
+                    value,
+                )
+            })
+            .chain([
+                (HvfRegister::PC, state.pc()),
+                (HvfRegister::CPSR, state.cpsr()),
+            ])
+            .collect()
+    }
+
     fn shared_dispatcher() -> Arc<Mutex<MmioDispatcher>> {
         Arc::new(Mutex::new(MmioDispatcher::new()))
     }
 
-    fn assert_core_register_captures_rejected(
+    fn assert_core_register_operations_rejected(
         runner: &HvfVcpuRunner<'_>,
         expected: HvfVcpuRunnerError,
     ) {
         assert_eq!(
             runner.capture_arm64_general_register_state(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            runner.restore_arm64_general_register_state(&general_register_restore_test_state()),
             Err(expected.clone())
         );
         assert_eq!(
@@ -10307,6 +10567,25 @@ mod tests {
         )
     }
 
+    fn start_general_register_restore_recording_runner(
+        fail_next_register: Option<HvfRegister>,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
+        let (write_sender, write_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(GeneralRegisterRestoreRecordingVcpu {
+                write_sender,
+                fail_next_register,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            write_receiver,
+        )
+    }
+
     fn start_blocking_general_register_capture_runner() -> BlockingGeneralRegisterCaptureRunner {
         let (entered_capture_sender, entered_capture_receiver) = mpsc::channel();
         let (release_capture_sender, release_capture_receiver) = mpsc::channel();
@@ -10325,6 +10604,28 @@ mod tests {
                 .expect("runner should be created"),
             entered_capture_receiver,
             release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
+    fn start_blocking_general_register_restore_runner() -> BlockingGeneralRegisterRestoreRunner {
+        let (entered_restore_sender, entered_restore_receiver) = mpsc::channel();
+        let (release_restore_sender, release_restore_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingGeneralRegisterRestoreVcpu {
+                entered_restore_sender,
+                release_restore_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_restore_receiver,
+            release_restore_sender,
             barrier_receiver,
         )
     }
@@ -11573,6 +11874,7 @@ mod tests {
         assert_send_sync::<HvfArm64VcpuDebugTrapState>();
         assert_send_sync::<HvfArm64VcpuExceptionRegisterState>();
         assert_send_sync::<HvfArm64VcpuExecutionControlRegisterState>();
+        assert_send_sync::<HvfArm64VcpuGeneralRegisterRestoreError>();
         assert_send_sync::<HvfArm64VcpuGeneralRegisterState>();
         assert_send_sync::<HvfArm64VcpuIdentificationRegisterState>();
         assert_send_sync::<HvfArm64VcpuSveSmeIdentificationRegisterState>();
@@ -11642,6 +11944,58 @@ mod tests {
         assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
         runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn restores_arm64_general_register_state_on_runner_thread() {
+        let state = general_register_restore_test_state();
+        let expected = general_register_restore_test_entries(&state);
+        let (runner, write_receiver) = start_general_register_restore_recording_runner(None);
+
+        runner
+            .restore_arm64_general_register_state(&state)
+            .expect("general-register restore should succeed");
+
+        assert_eq!(write_receiver.try_iter().collect::<Vec<_>>(), expected);
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn every_arm64_general_register_restore_failure_is_typed_and_can_be_retried() {
+        use std::error::Error as _;
+
+        let state = general_register_restore_test_state();
+        let expected = general_register_restore_test_entries(&state);
+
+        for (failed_index, (failed_register, _)) in expected.iter().copied().enumerate() {
+            let (runner, write_receiver) =
+                start_general_register_restore_recording_runner(Some(failed_register));
+
+            let error = runner
+                .restore_arm64_general_register_state(&state)
+                .expect_err("injected general-register write should fail");
+            let HvfVcpuRunnerError::GeneralRegisterRestore(error) = error else {
+                panic!("restore failure should retain its typed context");
+            };
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake general-register restore failed".to_string())
+            );
+            assert_eq!(
+                write_receiver.try_iter().collect::<Vec<_>>(),
+                expected[..=failed_index]
+            );
+
+            runner
+                .restore_arm64_general_register_state(&state)
+                .expect("complete general-register restore retry should succeed");
+            assert_eq!(write_receiver.try_iter().collect::<Vec<_>>(), expected);
+            assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+            runner.shutdown().expect("runner should shut down");
+        }
     }
 
     #[test]
@@ -12915,8 +13269,8 @@ mod tests {
                 .expect("runner should enter fake general-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -12970,7 +13324,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -13020,7 +13374,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13041,6 +13395,206 @@ mod tests {
     }
 
     #[test]
+    fn commands_during_arm64_general_register_restore_are_rejected_without_queueing() {
+        let state = general_register_restore_test_state();
+        let (runner, entered_restore_receiver, release_restore_sender, _barrier_receiver) =
+            start_blocking_general_register_restore_runner();
+
+        thread::scope(|scope| {
+            let restore = scope.spawn(|| runner.restore_arm64_general_register_state(&state));
+            entered_restore_receiver
+                .recv()
+                .expect("runner should enter fake general-register restore");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.set_gic_ppi_pending(27), Err(expected.clone()));
+            assert_eq!(runner.clear_gic_ppi_pending(27), Err(expected.clone()));
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_restore_sender
+                .send(Ok(()))
+                .expect("general-register restore release should be sent");
+            restore
+                .join()
+                .expect("general-register restore thread should join")
+                .expect("general-register restore should succeed");
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_arm64_general_register_restore_admitted_until_command_finishes() {
+        let state = general_register_restore_test_state();
+        let (runner, entered_restore_receiver, release_restore_sender, barrier_receiver) =
+            start_blocking_general_register_restore_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_general_register_restore(state.clone(), response_sender)
+                .expect("general-register restore should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_restore_receiver
+            .recv()
+            .expect("runner should enter fake general-register restore");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind restore");
+        release_restore_sender
+            .send(Ok(()))
+            .expect("general-register restore release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after restore");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn arm64_general_register_restore_send_failure_releases_admission() {
+        let state = general_register_restore_test_state();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.restore_arm64_general_register_state(&state),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_arm64_general_register_restore_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (restore_response_sender, restore_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_general_register_restore(
+                general_register_restore_test_state(),
+                restore_response_sender,
+            )
+            .expect("general-register restore should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(restore_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn general_register_restore_panic_releases_admission() {
+        let state = general_register_restore_test_state();
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnGeneralRegisterRestoreVcpu));
+
+        assert_eq!(
+            runner.restore_arm64_general_register_state(&state),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
     fn commands_during_arm64_core_system_register_capture_are_rejected_without_queueing() {
         let (runner, entered_capture_receiver, release_capture_sender, _barrier_receiver) =
             start_blocking_core_system_register_capture_runner();
@@ -13052,8 +13606,8 @@ mod tests {
                 .expect("runner should enter fake core system-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -13110,7 +13664,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -13160,7 +13714,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13196,7 +13750,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -13210,7 +13764,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13232,7 +13786,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13249,8 +13803,8 @@ mod tests {
                 .expect("runner should enter fake exception-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -13303,7 +13857,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -13353,7 +13907,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13389,7 +13943,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -13403,7 +13957,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13425,7 +13979,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13442,8 +13996,8 @@ mod tests {
                 .expect("runner should enter fake execution-control capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -13496,7 +14050,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -13546,7 +14100,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13582,7 +14136,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -13596,7 +14150,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13618,7 +14172,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13635,8 +14189,8 @@ mod tests {
                 .expect("runner should enter fake cache-selection capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -13689,7 +14243,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -13739,7 +14293,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13775,7 +14329,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -13789,7 +14343,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13811,7 +14365,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13828,8 +14382,8 @@ mod tests {
                 .expect("runner should enter fake breakpoint-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -13882,7 +14436,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -13932,7 +14486,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -13968,7 +14522,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -13982,7 +14536,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14004,7 +14558,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14021,8 +14575,8 @@ mod tests {
                 .expect("runner should enter fake watchpoint-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -14075,7 +14629,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -14125,7 +14679,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14161,7 +14715,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -14175,7 +14729,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14197,7 +14751,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14214,8 +14768,8 @@ mod tests {
                 .expect("runner should enter fake debug-control capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -14268,7 +14822,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -14318,7 +14872,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14354,7 +14908,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -14368,7 +14922,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14390,7 +14944,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14407,8 +14961,8 @@ mod tests {
                 .expect("runner should enter fake debug-trap state capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -14461,7 +15015,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -14511,7 +15065,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14547,7 +15101,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -14561,7 +15115,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14583,7 +15137,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14600,8 +15154,8 @@ mod tests {
                 .expect("runner should enter fake SME PSTATE capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -14654,7 +15208,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -14704,7 +15258,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14740,7 +15294,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -14754,7 +15308,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14776,7 +15330,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14793,8 +15347,8 @@ mod tests {
                 .expect("runner should enter fake SME P-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -14847,7 +15401,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -14897,7 +15451,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14933,7 +15487,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -14947,7 +15501,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14969,7 +15523,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -14986,8 +15540,8 @@ mod tests {
                 .expect("runner should enter fake SME Z-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -15040,7 +15594,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -15090,7 +15644,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15126,7 +15680,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -15140,7 +15694,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15162,7 +15716,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15179,8 +15733,8 @@ mod tests {
                 .expect("runner should enter fake SME ZA-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -15233,7 +15787,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -15283,7 +15837,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15319,7 +15873,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -15333,7 +15887,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15355,7 +15909,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15372,8 +15926,8 @@ mod tests {
                 .expect("runner should enter fake SME ZT0-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -15426,7 +15980,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -15476,7 +16030,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15512,7 +16066,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -15526,7 +16080,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15548,7 +16102,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15565,8 +16119,8 @@ mod tests {
                 .expect("runner should enter fake SME system-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -15619,7 +16173,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -15669,7 +16223,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15705,7 +16259,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -15719,7 +16273,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15741,7 +16295,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15758,8 +16312,8 @@ mod tests {
                 .expect("runner should enter fake system-context register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -15812,7 +16366,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -15862,7 +16416,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15898,7 +16452,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -15912,7 +16466,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15934,7 +16488,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -15951,8 +16505,8 @@ mod tests {
                 .expect("runner should enter fake identification-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -16005,7 +16559,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -16055,7 +16609,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16091,7 +16645,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -16105,7 +16659,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16127,7 +16681,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16145,8 +16699,8 @@ mod tests {
                 .expect("runner should enter fake SVE/SME identification capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -16199,7 +16753,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -16249,7 +16803,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16285,7 +16839,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -16299,7 +16853,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16321,7 +16875,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16338,8 +16892,8 @@ mod tests {
                 .expect("runner should enter fake translation-register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -16392,7 +16946,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -16442,7 +16996,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16478,7 +17032,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -16492,7 +17046,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16514,7 +17068,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16531,8 +17085,8 @@ mod tests {
                 .expect("runner should enter fake pointer-authentication key capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -16585,7 +17139,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -16635,7 +17189,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16671,7 +17225,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -16685,7 +17239,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16707,7 +17261,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16724,8 +17278,8 @@ mod tests {
                 .expect("runner should enter fake thread-context register capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -16781,7 +17335,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -16831,7 +17385,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16867,7 +17421,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -16881,7 +17435,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16903,7 +17457,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -16920,8 +17474,8 @@ mod tests {
                 .expect("runner should enter fake SIMD/FP capture");
 
             let expected =
-                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
                 runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -16980,7 +17534,7 @@ mod tests {
         assert_eq!(
             runner.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
-                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+                super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE
             ))
         );
 
@@ -17030,7 +17584,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -17066,7 +17620,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
 
         release_run_sender
@@ -17080,7 +17634,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
@@ -17102,32 +17656,32 @@ mod tests {
                 .state
                 .lock()
                 .expect("runner state should be lockable")
-                .core_register_capture_in_flight
+                .core_register_operation_in_flight
         );
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
 
     #[test]
-    fn core_register_captures_after_shutdown_are_rejected() {
+    fn core_register_operations_after_shutdown_are_rejected() {
         let (runner, _read_receiver) = start_general_register_capture_recording_runner(None);
 
         runner.shutdown().expect("runner should shut down");
 
-        assert_core_register_captures_rejected(
+        assert_core_register_operations_rejected(
             &runner,
             HvfVcpuRunnerError::InvalidState(super::RUNNER_SHUT_DOWN_MESSAGE),
         );
     }
 
     #[test]
-    fn core_register_captures_during_shutdown_are_rejected() {
+    fn core_register_operations_during_shutdown_are_rejected() {
         let (runner, _, destroyed_receiver) = start_fake_runner();
         let (command_sender, should_cancel) = runner
             .prepare_shutdown()
             .expect("first shutdown should be prepared");
 
         assert!(!should_cancel);
-        assert_core_register_captures_rejected(
+        assert_core_register_operations_rejected(
             &runner,
             HvfVcpuRunnerError::InvalidState(super::RUNNER_SHUTTING_DOWN_MESSAGE),
         );
@@ -17573,7 +18127,7 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake vtimer mask read");
 
-            assert_core_register_captures_rejected(
+            assert_core_register_operations_rejected(
                 &runner,
                 HvfVcpuRunnerError::InvalidState(super::TIMER_OPERATION_IN_FLIGHT_MESSAGE),
             );
@@ -17662,7 +18216,7 @@ mod tests {
 
             let expected =
                 HvfVcpuRunnerError::InvalidState(super::TIMER_OPERATION_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_timer_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
@@ -17857,7 +18411,7 @@ mod tests {
 
             let expected =
                 HvfVcpuRunnerError::InvalidState(super::TIMER_OPERATION_IN_FLIGHT_MESSAGE);
-            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_timer_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
@@ -18188,7 +18742,7 @@ mod tests {
             let expected =
                 HvfVcpuRunnerError::InvalidState(super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE);
             assert_interrupt_operations_rejected(&runner, expected.clone());
-            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_timer_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
@@ -18417,7 +18971,7 @@ mod tests {
             let expected =
                 HvfVcpuRunnerError::InvalidState(super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE);
             assert_interrupt_operations_rejected(&runner, expected.clone());
-            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_timer_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
@@ -18645,7 +19199,7 @@ mod tests {
             let expected =
                 HvfVcpuRunnerError::InvalidState(super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE);
             assert_interrupt_operations_rejected(&runner, expected.clone());
-            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_core_register_operations_rejected(&runner, expected.clone());
             assert_timer_operations_rejected(&runner, expected.clone());
             assert_eq!(runner.run_once(), Err(expected.clone()));
             assert_eq!(
@@ -18907,7 +19461,7 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake GIC PPI pending operation");
 
-            assert_core_register_captures_rejected(
+            assert_core_register_operations_rejected(
                 &runner,
                 HvfVcpuRunnerError::InvalidState(super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE),
             );
@@ -19002,7 +19556,7 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake MPIDR read");
 
-            assert_core_register_captures_rejected(
+            assert_core_register_operations_rejected(
                 &runner,
                 HvfVcpuRunnerError::InvalidState(super::METADATA_READ_IN_FLIGHT_MESSAGE),
             );
@@ -20709,7 +21263,7 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake run");
 
-            assert_core_register_captures_rejected(
+            assert_core_register_operations_rejected(
                 &runner,
                 HvfVcpuRunnerError::InvalidState(super::RUN_IN_FLIGHT_MESSAGE),
             );
@@ -20753,7 +21307,7 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake setup");
 
-            assert_core_register_captures_rejected(
+            assert_core_register_operations_rejected(
                 &runner,
                 HvfVcpuRunnerError::InvalidState(super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE),
             );
@@ -20819,7 +21373,7 @@ mod tests {
                 .recv()
                 .expect("runner should enter fake MMIO dispatch");
 
-            assert_core_register_captures_rejected(
+            assert_core_register_operations_rejected(
                 &runner,
                 HvfVcpuRunnerError::InvalidState(super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE),
             );
