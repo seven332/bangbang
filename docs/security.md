@@ -239,8 +239,9 @@ is resource-specific:
   documented in [Snapshot Feasibility](snapshot-feasibility.md).
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
-  TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1 values, raw Q0-Q31/FPCR/FPSR values, raw
-  virtual-timer mask/offset/control/CVAL values, raw EL1
+  ACTLR_EL1/CPACR_EL1 execution controls, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1
+  values, raw Q0-Q31/FPCR/FPSR values, raw virtual-timer
+  mask/offset/control/CVAL values, raw EL1
   SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
   levels, opaque GIC device-state bytes, and raw EL1 GIC ICC CPU-interface
   values are sensitive guest/VMM execution state.

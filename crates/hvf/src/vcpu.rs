@@ -223,6 +223,38 @@ impl HvfArm64VcpuExceptionRegisterState {
     }
 }
 
+/// Detached raw EL1 execution-control state captured from one arm64 vCPU.
+///
+/// Hypervisor.framework exposes only `ACTLR_EL1.EnTSO`, and that register is
+/// available on macOS 15 and newer. `CPACR_EL1` includes baseline FP/SIMD
+/// access control plus optional architecture feature controls. These raw
+/// observations are not feature-validated or safe to restore in isolation;
+/// restore requires writable-bit policy, wider feature state, and ISB ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuExecutionControlRegisterState {
+    actlr_el1: u64,
+    cpacr_el1: u64,
+}
+
+impl HvfArm64VcpuExecutionControlRegisterState {
+    pub(crate) const fn new(actlr_el1: u64, cpacr_el1: u64) -> Self {
+        Self {
+            actlr_el1,
+            cpacr_el1,
+        }
+    }
+
+    /// Return the raw `ACTLR_EL1` value exposed by Hypervisor.framework.
+    pub const fn actlr_el1(self) -> u64 {
+        self.actlr_el1
+    }
+
+    /// Return the raw `CPACR_EL1` value.
+    pub const fn cpacr_el1(self) -> u64 {
+        self.cpacr_el1
+    }
+}
+
 /// Detached raw EL1 translation-register state captured from one arm64 vCPU.
 ///
 /// This value contains `SCTLR_EL1`, both translation table bases, `TCR_EL1`,
@@ -482,6 +514,8 @@ pub struct HvfSystemRegister(u16);
 impl HvfSystemRegister {
     pub const MPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MPIDR_EL1);
     pub const SCTLR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SCTLR_EL1);
+    pub const ACTLR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ACTLR_EL1);
+    pub const CPACR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CPACR_EL1);
     pub const TTBR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_TTBR0_EL1);
     pub const TTBR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_TTBR1_EL1);
     pub const TCR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TCR_EL1);
@@ -930,6 +964,17 @@ pub(crate) fn capture_arm64_vcpu_exception_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_execution_control_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuExecutionControlRegisterState, BackendError> {
+    let actlr_el1 = get_system_register(HvfSystemRegister::ACTLR_EL1)?;
+    let cpacr_el1 = get_system_register(HvfSystemRegister::CPACR_EL1)?;
+
+    Ok(HvfArm64VcpuExecutionControlRegisterState::new(
+        actlr_el1, cpacr_el1,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
@@ -1031,6 +1076,7 @@ mod tests {
         HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
         NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_exception_register_state_with,
+        capture_arm64_vcpu_execution_control_register_state_with,
         capture_arm64_vcpu_general_register_state_with,
         capture_arm64_vcpu_pending_interrupt_state_with, capture_arm64_vcpu_simd_fp_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
@@ -1429,6 +1475,32 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_execution_control_register_state_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_execution_control_register_state_with(|register| {
+            reads.push(register);
+            Ok(0xa55a_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("execution-control capture should succeed");
+
+        assert_eq!(
+            reads,
+            [HvfSystemRegister::ACTLR_EL1, HvfSystemRegister::CPACR_EL1,]
+        );
+        assert_eq!(
+            state.actlr_el1(),
+            0xa55a_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_ACTLR_EL1)
+        );
+        assert_eq!(
+            state.cpacr_el1(),
+            0xa55a_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_CPACR_EL1)
+        );
+        assert_eq!(HvfSystemRegister::ACTLR_EL1.raw(), 0xc081);
+        assert_eq!(HvfSystemRegister::CPACR_EL1.raw(), 0xc082);
+    }
+
+    #[test]
     fn captures_arm64_translation_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -1639,6 +1711,48 @@ mod tests {
             assert_eq!(
                 state.vbar_el1(),
                 u64::from(HvfSystemRegister::VBAR_EL1.raw())
+            );
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_execution_control_register_capture_stops_after_each_error_and_can_retry() {
+        let registers = [HvfSystemRegister::ACTLR_EL1, HvfSystemRegister::CPACR_EL1];
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake execution-control register read failed",
+                    ))
+                } else {
+                    Ok(u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_execution_control_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake execution-control register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state =
+                capture_arm64_vcpu_execution_control_register_state_with(&read_system_register)
+                    .expect("execution-control capture retry should succeed");
+            assert_eq!(
+                state.actlr_el1(),
+                u64::from(HvfSystemRegister::ACTLR_EL1.raw())
+            );
+            assert_eq!(
+                state.cpacr_el1(),
+                u64::from(HvfSystemRegister::CPACR_EL1.raw())
             );
             assert_eq!(*reads.borrow(), registers);
         }
