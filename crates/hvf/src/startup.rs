@@ -72,7 +72,8 @@ use crate::runner::{
 };
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuExceptionRegisterState,
-    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
+    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState,
     HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
     HvfArm64VcpuVirtualTimerState,
 };
@@ -1199,6 +1200,16 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_exception_register_state()
     }
 
+    /// Capture raw EL1 ACTLR and CPACR controls on the primary owner thread.
+    ///
+    /// Complete capture requires macOS 15 and omits feature validation,
+    /// persistence, and a safe restore sequence.
+    pub fn capture_arm64_execution_control_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuExecutionControlRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_execution_control_register_state()
+    }
+
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
     /// This subset omits table memory, feature validation, TLB/cache
@@ -1848,6 +1859,16 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuExceptionRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_exception_register_state()
+    }
+
+    /// Capture raw EL1 ACTLR and CPACR controls on the primary owner thread.
+    ///
+    /// Complete capture requires macOS 15 and omits feature validation,
+    /// persistence, and a safe restore sequence.
+    pub fn capture_arm64_execution_control_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuExecutionControlRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_execution_control_register_state()
     }
 
     /// Capture raw EL1 translation-register state on the primary owner thread.

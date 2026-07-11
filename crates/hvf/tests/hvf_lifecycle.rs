@@ -62,6 +62,19 @@ const EXCEPTION_REGISTER_GUEST_CODE: [u32; 18] = [
     0xd400_0002, // hvc #0
 ];
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXECUTION_CONTROL_TEST_ACTLR_EL1: u64 = 2;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXECUTION_CONTROL_TEST_CPACR_EL1: u64 = 0x0030_0000;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXECUTION_CONTROL_GUEST_CODE: [u32; 6] = [
+    0xd280_0040, // mov x0, #2
+    0xd518_1020, // msr ACTLR_EL1, x0
+    0xd2a0_0600, // mov x0, #0x300000
+    0xd518_1040, // msr CPACR_EL1, x0
+    0xd503_3fdf, // isb
+    0xd400_0002, // hvc #0
+];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const TRANSLATION_TEST_TTBR0_EL1: u64 = 0x1234_5000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const TRANSLATION_TEST_TTBR1_EL1: u64 = 0x5678_9000;
@@ -494,6 +507,69 @@ fn captures_guest_written_arm64_exception_registers_on_runner_thread() {
         assert_eq!(state.far_el1(), EXCEPTION_TEST_FAR_EL1);
         assert_eq!(state.par_el1(), EXCEPTION_TEST_PAR_EL1);
         assert_eq!(state.vbar_el1(), EXCEPTION_TEST_VBAR_EL1);
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn captures_guest_written_arm64_execution_controls_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_code = EXECUTION_CONTROL_GUEST_CODE
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("execution-control guest code should be written");
+
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_entry,
+            })
+            .expect("guest code boot registers should be configured");
+
+        let HvfVcpuExit::Exception(exit) = runner
+            .run_once()
+            .expect("guest execution-control writer should exit through HVC")
+        else {
+            panic!("guest execution-control writer should produce an exception exit");
+        };
+        assert_eq!(
+            exit.decode_hvc()
+                .expect("guest execution-control writer exit should decode as HVC")
+                .immediate(),
+            0
+        );
+
+        let state = runner
+            .capture_arm64_execution_control_register_state()
+            .expect("execution-control state should be captured");
+        assert_eq!(state.actlr_el1(), EXECUTION_CONTROL_TEST_ACTLR_EL1);
+        assert_eq!(state.cpacr_el1(), EXECUTION_CONTROL_TEST_CPACR_EL1);
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -1232,6 +1308,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .capture_arm64_exception_register_state()
         .expect("internal session should capture exception-register state");
     session
+        .capture_arm64_execution_control_register_state()
+        .expect("internal session should capture execution-control state");
+    session
         .capture_arm64_translation_register_state()
         .expect("internal session should capture translation-register state");
     session
@@ -1380,6 +1459,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_exception_register_state()
         .expect("owned session should capture exception-register state");
+    session
+        .capture_arm64_execution_control_register_state()
+        .expect("owned session should capture execution-control state");
     session
         .capture_arm64_translation_register_state()
         .expect("owned session should capture translation-register state");

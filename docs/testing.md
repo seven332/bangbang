@@ -112,6 +112,10 @@ intervening guest exception after changing it, and never claim vector-table
 memory is present. AFSR contents are implementation-defined: current Apple
 Silicon reads AFSR0 as zero after a guest write while preserving the test's
 AFSR1 value.
+Execution-control signed tests require macOS 15 for ACTLR. They must write only
+the Hypervisor.framework-supported `ACTLR_EL1.EnTSO` bit and baseline
+`CPACR_EL1.FPEN`, execute ISB before guest use or exit, and destroy the VM after
+capture instead of treating the changed memory model as a restore round trip.
 
 ## Stability Rules
 
