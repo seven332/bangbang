@@ -1246,7 +1246,7 @@ fn captures_arm64_debug_control_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_arm64_debug_trap_state_on_runner_thread() {
+fn restores_arm64_debug_trap_state_on_runner_thread() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;
 
@@ -1259,20 +1259,32 @@ fn captures_arm64_debug_trap_state_on_runner_thread() {
         let runner = backend
             .start_vcpu_runner()
             .expect("vCPU runner should start");
-        let first = runner
+        let original = runner
             .capture_arm64_debug_trap_state()
-            .expect("first debug-trap state should be captured");
-        let second = runner
+            .expect("original debug-trap state should be captured");
+        runner
+            .restore_arm64_debug_trap_state(&original)
+            .expect("first debug-trap state restore should succeed");
+        let first_recapture = runner
             .capture_arm64_debug_trap_state()
-            .expect("second debug-trap state should be captured");
+            .expect("debug-trap state should be recaptured after first restore");
+        assert_eq!(first_recapture, original);
+        runner
+            .restore_arm64_debug_trap_state(&original)
+            .expect("second debug-trap state restore should succeed");
+        let second_recapture = runner
+            .capture_arm64_debug_trap_state()
+            .expect("debug-trap state should be recaptured after second restore");
+        assert_eq!(second_recapture, original);
 
-        // Exercise both raw host-policy accessors without assuming or logging
-        // default values or treating observation as safe restore policy.
+        // Exercise both accessors without assuming or logging default values.
+        // Reapplying only the captured original keeps this test free of guest
+        // debug activation, guest instructions, and destination-policy claims.
         let _captured_values = [
-            first.trap_debug_exceptions(),
-            first.trap_debug_reg_accesses(),
-            second.trap_debug_exceptions(),
-            second.trap_debug_reg_accesses(),
+            first_recapture.trap_debug_exceptions(),
+            first_recapture.trap_debug_reg_accesses(),
+            second_recapture.trap_debug_exceptions(),
+            second_recapture.trap_debug_reg_accesses(),
         ];
 
         runner.shutdown().expect("runner should shut down");
@@ -2858,9 +2870,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .capture_arm64_debug_control_register_state()
         .expect("internal session should capture debug-control state");
-    session
+    let debug_trap_state = session
         .capture_arm64_debug_trap_state()
         .expect("internal session should capture debug-trap state");
+    session
+        .restore_arm64_debug_trap_state(&debug_trap_state)
+        .expect("internal session should restore debug-trap state");
     session
         .capture_arm64_identification_register_state()
         .expect("internal session should capture identification-register state");
@@ -3095,9 +3110,12 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_debug_control_register_state()
         .expect("owned session should capture debug-control state");
-    session
+    let debug_trap_state = session
         .capture_arm64_debug_trap_state()
         .expect("owned session should capture debug-trap state");
+    session
+        .restore_arm64_debug_trap_state(&debug_trap_state)
+        .expect("owned session should restore debug-trap state");
     session
         .capture_arm64_identification_register_state()
         .expect("owned session should capture identification-register state");

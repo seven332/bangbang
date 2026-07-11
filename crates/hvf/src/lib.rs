@@ -49,7 +49,8 @@ pub use startup::{
 pub use vcpu::{
     ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
     HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
-    HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapState,
+    HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapRestoreError,
+    HvfArm64VcpuDebugTrapRestoreOperation, HvfArm64VcpuDebugTrapState,
     HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
     HvfArm64VcpuGeneralRegisterRestoreError, HvfArm64VcpuGeneralRegisterState,
     HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptRestoreError,
