@@ -341,15 +341,78 @@ impl HvfArm64VcpuBreakpointRegisterState {
     }
 }
 
+/// Detached raw EL1 hardware-watchpoint state captured from one arm64 vCPU.
+///
+/// The implemented count is derived from `ID_AA64DFR0_EL1.WRPs`, and only
+/// that many `DBGWVR<n>_EL1` / `DBGWCR<n>_EL1` pairs are exposed. Watchpoint
+/// values can contain guest data virtual addresses, and the controls can
+/// describe sensitive debug matching and enablement. Treat this observation
+/// as confidential guest state. It is not feature-validated, serialized, or
+/// safe to restore, and capture does not write the registers, enable debugging,
+/// or change Hypervisor.framework debug-register trap policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuWatchpointRegisterState {
+    implemented_watchpoint_count: u8,
+    watchpoint_value_registers: [u64; 16],
+    watchpoint_control_registers: [u64; 16],
+}
+
+impl HvfArm64VcpuWatchpointRegisterState {
+    pub(crate) const fn new(
+        implemented_watchpoint_count: u8,
+        watchpoint_value_registers: [u64; 16],
+        watchpoint_control_registers: [u64; 16],
+    ) -> Self {
+        Self {
+            implemented_watchpoint_count,
+            watchpoint_value_registers,
+            watchpoint_control_registers,
+        }
+    }
+
+    /// Return the number of implemented hardware-watchpoint register pairs.
+    pub const fn implemented_watchpoint_count(&self) -> u8 {
+        self.implemented_watchpoint_count
+    }
+
+    /// Return the implemented `DBGWVR<n>_EL1` values in ascending slot order.
+    pub fn watchpoint_value_registers(&self) -> &[u64] {
+        self.watchpoint_value_registers
+            .get(..usize::from(self.implemented_watchpoint_count))
+            .unwrap_or_default()
+    }
+
+    /// Return the implemented `DBGWCR<n>_EL1` values in ascending slot order.
+    pub fn watchpoint_control_registers(&self) -> &[u64] {
+        self.watchpoint_control_registers
+            .get(..usize::from(self.implemented_watchpoint_count))
+            .unwrap_or_default()
+    }
+
+    /// Return one raw `DBGWVR<n>_EL1` value when `index` is implemented.
+    pub fn watchpoint_value_register(&self, index: u8) -> Option<u64> {
+        self.watchpoint_value_registers()
+            .get(usize::from(index))
+            .copied()
+    }
+
+    /// Return one raw `DBGWCR<n>_EL1` value when `index` is implemented.
+    pub fn watchpoint_control_register(&self, index: u8) -> Option<u64> {
+        self.watchpoint_control_registers()
+            .get(usize::from(index))
+            .copied()
+    }
+}
+
 /// Detached raw EL1 debug-control state captured from one arm64 vCPU.
 ///
 /// `MDCCINT_EL1` and `MDSCR_EL1` control security-sensitive self-hosted debug
 /// behavior. This getter-only value does not include the separately captured
-/// breakpoint comparators, watchpoint comparators, Hypervisor.framework debug
-/// trap configuration, feature or writable-bit validation, or a safe restore
-/// policy. Capturing it does not enable monitor debug, software stepping,
-/// debug exceptions, guest debug-register access, or debug communications-
-/// channel interrupts.
+/// breakpoint and watchpoint comparators, Hypervisor.framework debug trap
+/// configuration, feature or writable-bit validation, or a safe restore policy.
+/// Capturing it does not enable monitor debug, software stepping, debug
+/// exceptions, guest debug-register access, or debug communications-channel
+/// interrupts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuDebugControlRegisterState {
     mdccint_el1: u64,
@@ -897,7 +960,7 @@ impl HvfSystemRegister {
     /// Return the typed `DBGBVR<n>_EL1` identifier for `index` in 0..=15.
     pub const fn debug_breakpoint_value(index: u8) -> Option<Self> {
         let raw = crate::ffi::HV_SYS_REG_DBGBVR0_EL1
-            + index as u16 * crate::ffi::HV_SYS_REG_DEBUG_BREAKPOINT_STRIDE;
+            + index as u16 * crate::ffi::HV_SYS_REG_DEBUG_REGISTER_STRIDE;
         if raw <= crate::ffi::HV_SYS_REG_DBGBVR15_EL1 {
             Some(Self(raw))
         } else {
@@ -908,8 +971,30 @@ impl HvfSystemRegister {
     /// Return the typed `DBGBCR<n>_EL1` identifier for `index` in 0..=15.
     pub const fn debug_breakpoint_control(index: u8) -> Option<Self> {
         let raw = crate::ffi::HV_SYS_REG_DBGBCR0_EL1
-            + index as u16 * crate::ffi::HV_SYS_REG_DEBUG_BREAKPOINT_STRIDE;
+            + index as u16 * crate::ffi::HV_SYS_REG_DEBUG_REGISTER_STRIDE;
         if raw <= crate::ffi::HV_SYS_REG_DBGBCR15_EL1 {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    /// Return the typed `DBGWVR<n>_EL1` identifier for `index` in 0..=15.
+    pub const fn debug_watchpoint_value(index: u8) -> Option<Self> {
+        let raw = crate::ffi::HV_SYS_REG_DBGWVR0_EL1
+            + index as u16 * crate::ffi::HV_SYS_REG_DEBUG_REGISTER_STRIDE;
+        if raw <= crate::ffi::HV_SYS_REG_DBGWVR15_EL1 {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    /// Return the typed `DBGWCR<n>_EL1` identifier for `index` in 0..=15.
+    pub const fn debug_watchpoint_control(index: u8) -> Option<Self> {
+        let raw = crate::ffi::HV_SYS_REG_DBGWCR0_EL1
+            + index as u16 * crate::ffi::HV_SYS_REG_DEBUG_REGISTER_STRIDE;
+        if raw <= crate::ffi::HV_SYS_REG_DBGWCR15_EL1 {
             Some(Self(raw))
         } else {
             None
@@ -1399,6 +1484,44 @@ pub(crate) fn capture_arm64_vcpu_breakpoint_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_watchpoint_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuWatchpointRegisterState, BackendError> {
+    const WRPS_SHIFT: u32 = 20;
+    const WRPS_MASK: u64 = 0xf;
+    const INVALID_WATCHPOINT_INDEX_MESSAGE: &str =
+        "ID_AA64DFR0_EL1 reported an invalid watchpoint register index";
+
+    let id_aa64dfr0_el1 = get_system_register(HvfSystemRegister::ID_AA64DFR0_EL1)?;
+    let implemented_watchpoint_count = ((id_aa64dfr0_el1 >> WRPS_SHIFT) & WRPS_MASK) as u8 + 1;
+    let mut watchpoint_value_registers = [0; 16];
+    let mut watchpoint_control_registers = [0; 16];
+
+    for index in 0..implemented_watchpoint_count {
+        let value_register = HvfSystemRegister::debug_watchpoint_value(index)
+            .ok_or(BackendError::InvalidState(INVALID_WATCHPOINT_INDEX_MESSAGE))?;
+        let value = get_system_register(value_register)?;
+        let value_slot = watchpoint_value_registers
+            .get_mut(usize::from(index))
+            .ok_or(BackendError::InvalidState(INVALID_WATCHPOINT_INDEX_MESSAGE))?;
+        *value_slot = value;
+
+        let control_register = HvfSystemRegister::debug_watchpoint_control(index)
+            .ok_or(BackendError::InvalidState(INVALID_WATCHPOINT_INDEX_MESSAGE))?;
+        let control = get_system_register(control_register)?;
+        let control_slot = watchpoint_control_registers
+            .get_mut(usize::from(index))
+            .ok_or(BackendError::InvalidState(INVALID_WATCHPOINT_INDEX_MESSAGE))?;
+        *control_slot = control;
+    }
+
+    Ok(HvfArm64VcpuWatchpointRegisterState::new(
+        implemented_watchpoint_count,
+        watchpoint_value_registers,
+        watchpoint_control_registers,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_debug_control_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuDebugControlRegisterState, BackendError> {
@@ -1577,7 +1700,8 @@ mod tests {
         capture_arm64_vcpu_simd_fp_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
         capture_arm64_vcpu_translation_register_state_with,
-        capture_arm64_vcpu_virtual_timer_state_with, configure_arm64_boot_registers_with,
+        capture_arm64_vcpu_virtual_timer_state_with,
+        capture_arm64_vcpu_watchpoint_register_state_with, configure_arm64_boot_registers_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
@@ -2158,6 +2282,94 @@ mod tests {
     }
 
     #[test]
+    fn maps_all_arm64_debug_watchpoint_register_slots() {
+        for index in 0_u8..16 {
+            assert_eq!(
+                HvfSystemRegister::debug_watchpoint_value(index)
+                    .expect("watchpoint value slot should be mapped")
+                    .raw(),
+                0x8006 + u16::from(index) * 8
+            );
+            assert_eq!(
+                HvfSystemRegister::debug_watchpoint_control(index)
+                    .expect("watchpoint control slot should be mapped")
+                    .raw(),
+                0x8007 + u16::from(index) * 8
+            );
+        }
+
+        assert_eq!(HvfSystemRegister::debug_watchpoint_value(16), None);
+        assert_eq!(HvfSystemRegister::debug_watchpoint_control(16), None);
+        assert_eq!(HvfSystemRegister::debug_watchpoint_value(u8::MAX), None);
+        assert_eq!(HvfSystemRegister::debug_watchpoint_control(u8::MAX), None);
+    }
+
+    #[test]
+    fn captures_implemented_arm64_watchpoint_register_pairs_in_order() {
+        for implemented_count in [1_u8, 3, 16] {
+            let mut reads = Vec::new();
+            let dfr0 = u64::from(implemented_count - 1) << 20;
+            let state = capture_arm64_vcpu_watchpoint_register_state_with(|register| {
+                reads.push(register);
+                if register == HvfSystemRegister::ID_AA64DFR0_EL1 {
+                    Ok(dfr0)
+                } else {
+                    Ok(0xa00_0000_0000_0000 | u64::from(register.raw()))
+                }
+            })
+            .expect("watchpoint-register capture should succeed");
+
+            let mut expected_reads = vec![HvfSystemRegister::ID_AA64DFR0_EL1];
+            for index in 0..implemented_count {
+                expected_reads.push(
+                    HvfSystemRegister::debug_watchpoint_value(index)
+                        .expect("implemented value slot should be mapped"),
+                );
+                expected_reads.push(
+                    HvfSystemRegister::debug_watchpoint_control(index)
+                        .expect("implemented control slot should be mapped"),
+                );
+            }
+            assert_eq!(reads, expected_reads);
+            assert_eq!(state.implemented_watchpoint_count(), implemented_count);
+            assert_eq!(
+                state.watchpoint_value_registers().len(),
+                usize::from(implemented_count)
+            );
+            assert_eq!(
+                state.watchpoint_control_registers().len(),
+                usize::from(implemented_count)
+            );
+            for index in 0..implemented_count {
+                assert_eq!(
+                    state.watchpoint_value_register(index),
+                    Some(
+                        0xa00_0000_0000_0000
+                            | u64::from(
+                                HvfSystemRegister::debug_watchpoint_value(index)
+                                    .expect("implemented value slot should be mapped")
+                                    .raw()
+                            )
+                    )
+                );
+                assert_eq!(
+                    state.watchpoint_control_register(index),
+                    Some(
+                        0xa00_0000_0000_0000
+                            | u64::from(
+                                HvfSystemRegister::debug_watchpoint_control(index)
+                                    .expect("implemented control slot should be mapped")
+                                    .raw()
+                            )
+                    )
+                );
+            }
+            assert_eq!(state.watchpoint_value_register(implemented_count), None);
+            assert_eq!(state.watchpoint_control_register(implemented_count), None);
+        }
+    }
+
+    #[test]
     fn captures_arm64_debug_control_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -2607,6 +2819,54 @@ mod tests {
             let state = capture_arm64_vcpu_breakpoint_register_state_with(&read_system_register)
                 .expect("breakpoint-register capture retry should succeed");
             assert_eq!(state.implemented_breakpoint_count(), implemented_count);
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_watchpoint_register_capture_stops_after_each_error_and_can_retry() {
+        let implemented_count = 16_u8;
+        let dfr0 = u64::from(implemented_count - 1) << 20;
+        let mut registers = vec![HvfSystemRegister::ID_AA64DFR0_EL1];
+        for index in 0..implemented_count {
+            registers.push(
+                HvfSystemRegister::debug_watchpoint_value(index)
+                    .expect("implemented value slot should be mapped"),
+            );
+            registers.push(
+                HvfSystemRegister::debug_watchpoint_control(index)
+                    .expect("implemented control slot should be mapped"),
+            );
+        }
+
+        for (failed_index, failed_register) in registers.iter().copied().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake watchpoint register read failed",
+                    ))
+                } else if register == HvfSystemRegister::ID_AA64DFR0_EL1 {
+                    Ok(dfr0)
+                } else {
+                    Ok(u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_watchpoint_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake watchpoint register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_watchpoint_register_state_with(&read_system_register)
+                .expect("watchpoint-register capture retry should succeed");
+            assert_eq!(state.implemented_watchpoint_count(), implemented_count);
             assert_eq!(*reads.borrow(), registers);
         }
     }
