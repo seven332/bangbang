@@ -1662,7 +1662,7 @@ baseline. The translation value omits table memory, feature validation,
 TLB/cache maintenance, and an ordered restore path. The exception value omits
 vector-table memory, semantic validation, and safe restore ordering. Signed
 validation leaves the MMU disabled, uses an aligned unused VBAR without an
-intervening guest exception, and accepts implementation-defined AMAIR and AFSR0
+intervening guest exception, and accepts implementation-defined AMAIR and AFSR
 readback after guest writes.
 The SIMD getter uses an explicitly 16-byte-aligned
 HVF output value; in streaming SVE mode, its Q values alias only the low 128

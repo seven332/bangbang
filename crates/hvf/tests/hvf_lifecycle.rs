@@ -485,10 +485,11 @@ fn captures_guest_written_arm64_exception_registers_on_runner_thread() {
             .capture_arm64_exception_register_state()
             .expect("exception-register state should be captured");
         // Auxiliary fault-status contents are implementation-defined. Current
-        // Apple Silicon exposes AFSR0 as read-as-zero/write-ignored, while a
-        // future host may preserve the architecturally valid guest write.
+        // Apple Silicon exposes AFSR0 as read-as-zero/write-ignored and
+        // preserves AFSR1, while another host may expose either behavior for
+        // either register.
         assert!(matches!(state.afsr0_el1(), 0 | EXCEPTION_TEST_AFSR0_EL1));
-        assert_eq!(state.afsr1_el1(), EXCEPTION_TEST_AFSR1_EL1);
+        assert!(matches!(state.afsr1_el1(), 0 | EXCEPTION_TEST_AFSR1_EL1));
         assert_eq!(state.esr_el1(), EXCEPTION_TEST_ESR_EL1);
         assert_eq!(state.far_el1(), EXCEPTION_TEST_FAR_EL1);
         assert_eq!(state.par_el1(), EXCEPTION_TEST_PAR_EL1);
