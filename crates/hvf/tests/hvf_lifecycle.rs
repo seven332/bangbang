@@ -29,6 +29,45 @@ const CORE_SYSTEM_REGISTER_GUEST_CODE: [u32; 9] = [
     0xd400_0002, // hvc #0
 ];
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const TRANSLATION_TEST_TTBR0_EL1: u64 = 0x1234_5000;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const TRANSLATION_TEST_TTBR1_EL1: u64 = 0x5678_9000;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const TRANSLATION_TEST_TCR_EL1: u64 = 0x10;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const TRANSLATION_TEST_MAIR_EL1: u64 = 0xff44_0400;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const TRANSLATION_TEST_AMAIR_EL1_WRITE: u64 = 0x1122_3344_5566_7788;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const TRANSLATION_TEST_CONTEXTIDR_EL1: u64 = 0xa5a5_5a5a;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const TRANSLATION_REGISTER_GUEST_CODE: [u32; 24] = [
+    0xd538_1000, // mrs x0, SCTLR_EL1
+    0xd518_1000, // msr SCTLR_EL1, x0
+    0xd503_3fdf, // isb
+    0xd28a_0000, // mov x0, #0x5000
+    0xf2a2_4680, // movk x0, #0x1234, lsl #16
+    0xd518_2000, // msr TTBR0_EL1, x0
+    0xd292_0000, // mov x0, #0x9000
+    0xf2aa_cf00, // movk x0, #0x5678, lsl #16
+    0xd518_2020, // msr TTBR1_EL1, x0
+    0xd280_0200, // mov x0, #0x10
+    0xd518_2040, // msr TCR_EL1, x0
+    0xd280_8000, // mov x0, #0x400
+    0xf2bf_e880, // movk x0, #0xff44, lsl #16
+    0xd518_a200, // msr MAIR_EL1, x0
+    0xd28e_f100, // mov x0, #0x7788
+    0xf2aa_acc0, // movk x0, #0x5566, lsl #16
+    0xf2c6_6880, // movk x0, #0x3344, lsl #32
+    0xf2e2_2440, // movk x0, #0x1122, lsl #48
+    0xd518_a300, // msr AMAIR_EL1, x0
+    0xd28b_4b40, // mov x0, #0x5a5a
+    0xf2b4_b4a0, // movk x0, #0xa5a5, lsl #16
+    0xd518_d020, // msr CONTEXTIDR_EL1, x0
+    0xd503_3fdf, // isb
+    0xd400_0002, // hvc #0
+];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const THREAD_CONTEXT_TEST_TPIDR_EL0: u64 = 0x1111;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const THREAD_CONTEXT_TEST_TPIDRRO_EL0: u64 = 0x2222;
@@ -351,6 +390,80 @@ fn captures_guest_written_arm64_core_system_registers_on_runner_thread() {
         assert_eq!(state.sp_el1(), CORE_SYSTEM_TEST_SP_EL1);
         assert_eq!(state.elr_el1(), CORE_SYSTEM_TEST_ELR_EL1);
         assert_eq!(state.spsr_el1(), CORE_SYSTEM_TEST_SPSR_EL1);
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn captures_guest_written_arm64_translation_registers_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_code = TRANSLATION_REGISTER_GUEST_CODE
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("translation-register guest code should be written");
+
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_entry,
+            })
+            .expect("guest code boot registers should be configured");
+
+        let HvfVcpuExit::Exception(exit) = runner
+            .run_once()
+            .expect("guest translation-register writer should exit through HVC")
+        else {
+            panic!("guest translation-register writer should produce an exception exit");
+        };
+        assert_eq!(
+            exit.decode_hvc()
+                .expect("guest translation-register writer exit should decode as HVC")
+                .immediate(),
+            0
+        );
+
+        let state = runner
+            .capture_arm64_translation_register_state()
+            .expect("translation-register state should be captured");
+        assert_eq!(state.sctlr_el1() & 1, 0);
+        assert_eq!(state.ttbr0_el1(), TRANSLATION_TEST_TTBR0_EL1);
+        assert_eq!(state.ttbr1_el1(), TRANSLATION_TEST_TTBR1_EL1);
+        assert_eq!(state.tcr_el1(), TRANSLATION_TEST_TCR_EL1);
+        assert_eq!(state.mair_el1(), TRANSLATION_TEST_MAIR_EL1);
+        // AMAIR is implementation-defined. Current Apple Silicon exposes it
+        // as read-as-zero/write-ignored, while a future host may preserve the
+        // architecturally valid guest write.
+        assert!(matches!(
+            state.amair_el1(),
+            0 | TRANSLATION_TEST_AMAIR_EL1_WRITE
+        ));
+        assert_eq!(state.contextidr_el1(), TRANSLATION_TEST_CONTEXTIDR_EL1);
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -1012,6 +1125,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .capture_arm64_core_system_register_state()
         .expect("internal session should capture core system-register state");
     session
+        .capture_arm64_translation_register_state()
+        .expect("internal session should capture translation-register state");
+    session
         .capture_arm64_thread_context_register_state()
         .expect("internal session should capture thread-context register state");
     session
@@ -1154,6 +1270,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_core_system_register_state()
         .expect("owned session should capture core system-register state");
+    session
+        .capture_arm64_translation_register_state()
+        .expect("owned session should capture translation-register state");
     session
         .capture_arm64_thread_context_register_state()
         .expect("owned session should capture thread-context register state");
