@@ -149,6 +149,16 @@ queried maximum SVL as the exact width of every bounded accessor and verify
 redacted `Debug` output without formatting or logging bytes or width. Tests must
 not call any SME setter, enter streaming mode, run guest code, infer effective
 `SMCR_EL1.LEN`, or treat equal bytes as portable or safely restorable state.
+SME P-register signed tests must runtime-resolve the macOS 15.2 getter and may
+read P0-P15 only when an owner-thread `PSTATE.SM` preflight reports streaming
+mode active. They may accept the documented missing-symbol or exact
+`HV_UNSUPPORTED` boundaries, the topical inactive-streaming result, or compare
+two complete same-vCPU captures. Successful captures must preserve the
+separately queried maximum SVL, use exactly one eighth of it for every bounded
+predicate accessor, and verify redacted `Debug` output without formatting or
+logging bytes or widths. Tests must not call any SME setter, enter streaming
+mode, run guest code, infer effective `SMCR_EL1.LEN`, or treat equal predicates
+as portable or safely restorable state.
 SME system-register signed tests require macOS 15.2 and must capture `SMCR_EL1`,
 `SMPRI_EL1`, and `TPIDR2_EL0` twice from one idle real vCPU. They may compare
 same-vCPU results only with fixed failure messages and must verify that `Debug`

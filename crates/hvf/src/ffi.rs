@@ -4,6 +4,8 @@ pub(crate) const SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME configuration queries require macOS 15.2 or newer";
 pub(crate) const SME_STATE_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME state capture requires macOS 15.2 or newer";
+pub(crate) const SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE: &str =
+    "Hypervisor.framework SME P-register capture requires macOS 15.2 or newer";
 pub(crate) const SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME Z-register capture requires macOS 15.2 or newer";
 
@@ -189,7 +191,8 @@ mod imp {
     use super::{
         CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSimdFpValue, HvSysReg,
         HvVcpu, HvVcpuExit, HvVcpuSmeState, SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE,
-        SME_STATE_REQUIRES_MACOS_15_2_MESSAGE, SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
+        SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
+        SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
     };
 
     pub type HvReturn = i32;
@@ -217,9 +220,16 @@ mod imp {
         unsafe extern "C" fn(HvVcpuConfig, HvFeatureReg, *mut u64) -> HvReturn;
     type OsRelease = unsafe extern "C" fn(*mut c_void);
     type HvSmeConfigGetMaxSvlBytes = unsafe extern "C" fn(value: *mut usize) -> HvReturn;
+    type HvSmePReg = u32;
     type HvSmeZReg = u32;
     type HvVcpuGetSmeState =
         unsafe extern "C" fn(vcpu: HvVcpu, sme_state: *mut HvVcpuSmeState) -> HvReturn;
+    type HvVcpuGetSmePReg = unsafe extern "C" fn(
+        vcpu: HvVcpu,
+        reg: HvSmePReg,
+        value: *mut u8,
+        length: usize,
+    ) -> HvReturn;
     type HvVcpuGetSmeZReg = unsafe extern "C" fn(
         vcpu: HvVcpu,
         reg: HvSmeZReg,
@@ -461,6 +471,32 @@ mod imp {
         // signature. Function pointers and dynamic symbol pointers have the same
         // representation on this target, checked above.
         Ok(unsafe { mem::transmute_copy::<*mut c_void, HvVcpuGetSmeState>(&symbol) })
+    }
+
+    fn load_get_sme_p_reg() -> Result<HvVcpuGetSmePReg, BackendError> {
+        // SAFETY: `RTLD_DEFAULT` searches the already loaded process images, and
+        // the symbol name is a NUL-terminated static C string.
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"hv_vcpu_get_sme_p_reg".as_ptr()) };
+        sme_p_reg_getter_from_symbol(symbol)
+    }
+
+    fn sme_p_reg_getter_from_symbol(symbol: *mut c_void) -> Result<HvVcpuGetSmePReg, BackendError> {
+        if mem::size_of::<HvVcpuGetSmePReg>() != mem::size_of::<*mut c_void>() {
+            return Err(BackendError::Hypervisor(
+                DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE.to_string(),
+            ));
+        }
+
+        if symbol.is_null() {
+            return Err(BackendError::Unsupported(
+                SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
+            ));
+        }
+
+        // SAFETY: The requested symbol has the SDK's `hv_vcpu_get_sme_p_reg`
+        // signature. Function pointers and dynamic symbol pointers have the same
+        // representation on this target, checked above.
+        Ok(unsafe { mem::transmute_copy::<*mut c_void, HvVcpuGetSmePReg>(&symbol) })
     }
 
     fn load_get_sme_z_reg() -> Result<HvVcpuGetSmeZReg, BackendError> {
@@ -759,6 +795,32 @@ mod imp {
         Ok(value.into_parts())
     }
 
+    fn get_sme_p_reg_with(
+        get_sme_p_reg: HvVcpuGetSmePReg,
+        vcpu: HvVcpu,
+        reg: HvSmePReg,
+        value: &mut [u8],
+    ) -> Result<(), BackendError> {
+        // SAFETY: The caller owns the current-thread vCPU handle, the dynamically
+        // resolved function has the SDK's exact C ABI, and `value` is a live
+        // writable byte slice whose pointer and full length remain valid for the
+        // duration of the call.
+        unsafe {
+            check(
+                get_sme_p_reg(vcpu, reg, value.as_mut_ptr(), value.len()),
+                "hv_vcpu_get_sme_p_reg",
+            )
+        }
+    }
+
+    pub fn get_sme_p_reg(
+        vcpu: HvVcpu,
+        reg: HvSmePReg,
+        value: &mut [u8],
+    ) -> Result<(), BackendError> {
+        get_sme_p_reg_with(load_get_sme_p_reg()?, vcpu, reg, value)
+    }
+
     fn get_sme_z_reg_with(
         get_sme_z_reg: HvVcpuGetSmeZReg,
         vcpu: HvVcpu,
@@ -906,16 +968,20 @@ mod imp {
             HV_FEATURE_REG_CLIDR_EL1, HV_FEATURE_REG_CTR_EL0, HV_FEATURE_REG_DCZID_EL0, HV_SUCCESS,
             HV_UNSUPPORTED, HvVcpuConfig, HvVcpuConfigOwner, check,
             get_arm64_vcpu_cache_feature_registers_with, get_arm64_vcpu_cache_geometry_with,
-            get_sme_config_max_svl_bytes_with, get_sme_z_reg_with,
-            sme_config_max_svl_bytes_getter_from_symbol, sme_state_getter_from_symbol,
-            sme_z_reg_getter_from_symbol,
+            get_sme_config_max_svl_bytes_with, get_sme_p_reg_with, get_sme_z_reg_with,
+            sme_config_max_svl_bytes_getter_from_symbol, sme_p_reg_getter_from_symbol,
+            sme_state_getter_from_symbol, sme_z_reg_getter_from_symbol,
         };
         use crate::ffi::{
-            SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
+            SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE,
+            SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
             SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
         };
 
         const TEST_MAX_SVL_BYTES: usize = usize::MAX - 0x1234;
+        const TEST_SME_P_BYTES: [u8; 5] = [0xff, 0, 0x13, 0x57, 0x9b];
+        const TEST_SME_P_VCPU: u64 = 0xfedc_ba98_7654_3210;
+        const TEST_SME_P_REG: u32 = 15;
         const TEST_SME_Z_BYTES: [u8; 7] = [0, 1, 0xff, 0x23, 0x45, 0x67, 0x89];
         const TEST_SME_Z_VCPU: u64 = 0x0123_4567_89ab_cdef;
         const TEST_SME_Z_REG: u32 = 31;
@@ -973,6 +1039,16 @@ mod imp {
         static TEST_VCPU_CONFIG_LOCK: Mutex<()> = Mutex::new(());
         static TEST_VCPU_CONFIG_STATE: Mutex<TestVcpuConfigState> =
             Mutex::new(TestVcpuConfigState::new());
+
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+        struct TestSmePCall {
+            vcpu: u64,
+            reg: u32,
+            length: usize,
+        }
+
+        static TEST_SME_P_LOCK: Mutex<()> = Mutex::new(());
+        static TEST_SME_P_CALL: Mutex<Option<TestSmePCall>> = Mutex::new(None);
 
         #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
         struct TestSmeZCall {
@@ -1093,6 +1169,40 @@ mod imp {
             HV_UNSUPPORTED
         }
 
+        fn lock_test_sme_p_call() -> std::sync::MutexGuard<'static, Option<TestSmePCall>> {
+            TEST_SME_P_CALL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        unsafe extern "C" fn test_get_sme_p_reg(
+            vcpu: u64,
+            reg: u32,
+            value: *mut u8,
+            length: usize,
+        ) -> super::HvReturn {
+            *lock_test_sme_p_call() = Some(TestSmePCall { vcpu, reg, length });
+            if length != TEST_SME_P_BYTES.len() {
+                return HV_BAD_ARGUMENT;
+            }
+
+            // SAFETY: The FFI test helper is called only through the production
+            // helper, which supplies a live output slice of `length` bytes.
+            unsafe {
+                ptr::copy_nonoverlapping(TEST_SME_P_BYTES.as_ptr(), value, length);
+            }
+            HV_SUCCESS
+        }
+
+        unsafe extern "C" fn test_get_sme_p_reg_unsupported(
+            _: u64,
+            _: u32,
+            _: *mut u8,
+            _: usize,
+        ) -> super::HvReturn {
+            HV_UNSUPPORTED
+        }
+
         fn lock_test_sme_z_call() -> std::sync::MutexGuard<'static, Option<TestSmeZCall>> {
             TEST_SME_Z_CALL
                 .lock()
@@ -1188,6 +1298,59 @@ mod imp {
                 Err(BackendError::Unsupported(
                     SME_STATE_REQUIRES_MACOS_15_2_MESSAGE
                 ))
+            );
+        }
+
+        #[test]
+        fn missing_sme_p_register_symbol_reports_macos_boundary() {
+            assert_eq!(
+                sme_p_reg_getter_from_symbol(ptr::null_mut()),
+                Err(BackendError::Unsupported(
+                    SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE
+                ))
+            );
+        }
+
+        #[test]
+        fn sme_p_register_getter_preserves_id_length_and_bytes() {
+            let _lock = TEST_SME_P_LOCK
+                .lock()
+                .expect("test SME P-register lock should not be poisoned");
+            *lock_test_sme_p_call() = None;
+            let symbol = test_get_sme_p_reg as *const () as *mut c_void;
+            let getter = sme_p_reg_getter_from_symbol(symbol)
+                .expect("present SME P-register symbol should resolve");
+            let mut value = [0; TEST_SME_P_BYTES.len()];
+
+            assert_eq!(
+                get_sme_p_reg_with(getter, TEST_SME_P_VCPU, TEST_SME_P_REG, &mut value),
+                Ok(())
+            );
+            assert_eq!(value, TEST_SME_P_BYTES);
+            assert_eq!(
+                *lock_test_sme_p_call(),
+                Some(TestSmePCall {
+                    vcpu: TEST_SME_P_VCPU,
+                    reg: TEST_SME_P_REG,
+                    length: TEST_SME_P_BYTES.len(),
+                })
+            );
+        }
+
+        #[test]
+        fn sme_p_register_getter_preserves_unsupported_return() {
+            let mut value = [0; TEST_SME_P_BYTES.len()];
+            let err = get_sme_p_reg_with(
+                test_get_sme_p_reg_unsupported,
+                TEST_SME_P_VCPU,
+                TEST_SME_P_REG,
+                &mut value,
+            )
+            .expect_err("HV_UNSUPPORTED should fail");
+
+            assert_eq!(
+                err.to_string(),
+                "hypervisor error: hv_vcpu_get_sme_p_reg failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)"
             );
         }
 
@@ -1579,6 +1742,10 @@ mod imp {
     }
 
     pub fn get_sme_state(_: HvVcpu) -> Result<(bool, bool), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_sme_p_reg(_: HvVcpu, _: u32, _: &mut [u8]) -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 

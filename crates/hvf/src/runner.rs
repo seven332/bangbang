@@ -27,7 +27,8 @@ use crate::vcpu::{
     HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
     HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
     HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePstate,
+    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate,
     HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
     HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
     HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuThreadContextRegisterState,
@@ -43,8 +44,9 @@ use crate::vcpu::{
     capture_arm64_vcpu_identification_register_state_with,
     capture_arm64_vcpu_pending_interrupt_state_with, capture_arm64_vcpu_physical_timer_state_with,
     capture_arm64_vcpu_pointer_authentication_key_state_with,
-    capture_arm64_vcpu_simd_fp_state_with, capture_arm64_vcpu_sme_pstate_with,
-    capture_arm64_vcpu_sme_system_register_state_with, capture_arm64_vcpu_sme_z_register_state,
+    capture_arm64_vcpu_simd_fp_state_with, capture_arm64_vcpu_sme_p_register_state,
+    capture_arm64_vcpu_sme_pstate_with, capture_arm64_vcpu_sme_system_register_state_with,
+    capture_arm64_vcpu_sme_z_register_state,
     capture_arm64_vcpu_sve_sme_identification_register_state_with,
     capture_arm64_vcpu_system_context_register_state_with,
     capture_arm64_vcpu_thread_context_register_state_with,
@@ -85,6 +87,7 @@ type RunnerState = Arc<Mutex<RunnerHandleState>>;
 pub enum HvfVcpuRunnerError {
     Backend(BackendError),
     Gic(HvfGicError),
+    SmePRegisterCapture(HvfArm64VcpuSmePRegisterCaptureError),
     SmeZRegisterCapture(HvfArm64VcpuSmeZRegisterCaptureError),
     VcpuExitResolve(HvfVcpuExitResolveError),
     MmioDispatch(HvfMmioDispatchError),
@@ -131,6 +134,7 @@ impl fmt::Display for HvfVcpuRunnerError {
         match self {
             Self::Backend(err) => write!(f, "{err}"),
             Self::Gic(err) => write!(f, "{err}"),
+            Self::SmePRegisterCapture(err) => write!(f, "{err}"),
             Self::SmeZRegisterCapture(err) => write!(f, "{err}"),
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
             Self::MmioDispatch(err) => write!(f, "{err}"),
@@ -156,6 +160,7 @@ impl std::error::Error for HvfVcpuRunnerError {
         match self {
             Self::Backend(err) => Some(err),
             Self::Gic(err) => Some(err),
+            Self::SmePRegisterCapture(err) => Some(err),
             Self::SmeZRegisterCapture(err) => Some(err),
             Self::VcpuExitResolve(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
@@ -177,6 +182,12 @@ impl From<BackendError> for HvfVcpuRunnerError {
 impl From<HvfGicError> for HvfVcpuRunnerError {
     fn from(err: HvfGicError) -> Self {
         Self::Gic(err)
+    }
+}
+
+impl From<HvfArm64VcpuSmePRegisterCaptureError> for HvfVcpuRunnerError {
+    fn from(err: HvfArm64VcpuSmePRegisterCaptureError) -> Self {
+        Self::SmePRegisterCapture(err)
     }
 }
 
@@ -323,6 +334,10 @@ enum RunnerCommand {
     CaptureArm64SmePstate {
         admission: InFlightCoreRegisterCapture,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuSmePstate, HvfVcpuRunnerError>>,
+    },
+    CaptureArm64SmePRegisterState {
+        admission: InFlightCoreRegisterCapture,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuSmePRegisterState, HvfVcpuRunnerError>>,
     },
     CaptureArm64SmeZRegisterState {
         admission: InFlightCoreRegisterCapture,
@@ -573,6 +588,25 @@ trait RunnerVcpu {
             "vCPU does not support SME maximum-SVL queries",
         ))
     }
+    fn get_sme_p_register(
+        &mut self,
+        _register: u32,
+        _value: &mut [u8],
+    ) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support SME P-register reads",
+        ))
+    }
+    fn capture_arm64_sme_p_register_state(
+        &mut self,
+    ) -> Result<HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePRegisterCaptureError> {
+        capture_arm64_vcpu_sme_p_register_state(
+            self,
+            |vcpu| vcpu.get_sme_pstate(),
+            |vcpu| vcpu.get_sme_maximum_svl_bytes(),
+            |vcpu, register, value| vcpu.get_sme_p_register(register, value),
+        )
+    }
     fn get_sme_z_register(
         &mut self,
         _register: u32,
@@ -820,6 +854,10 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner.get_sme_maximum_svl_bytes()
     }
 
+    fn get_sme_p_register(&mut self, register: u32, value: &mut [u8]) -> Result<(), BackendError> {
+        self.owner.get_sme_p_register(register, value)
+    }
+
     fn get_sme_z_register(&mut self, register: u32, value: &mut [u8]) -> Result<(), BackendError> {
         self.owner.get_sme_z_register(register, value)
     }
@@ -954,6 +992,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Err(HvfVcpuRunnerError::Backend(_)) => setup.mark_failed(),
             Err(
                 HvfVcpuRunnerError::Gic(_)
+                | HvfVcpuRunnerError::SmePRegisterCapture(_)
                 | HvfVcpuRunnerError::SmeZRegisterCapture(_)
                 | HvfVcpuRunnerError::InvalidState(_)
                 | HvfVcpuRunnerError::UnsupportedSys64 { .. }
@@ -1217,6 +1256,23 @@ impl<'vm> HvfVcpuRunner<'vm> {
     pub fn capture_arm64_sme_pstate(&self) -> Result<HvfArm64VcpuSmePstate, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_sme_pstate_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Capture all streaming SVE P0-P15 contents on the vCPU-owning thread.
+    ///
+    /// The getter-only command requires `PSTATE.SM` to be enabled, sizes every
+    /// register to one eighth of Hypervisor.framework's maximum SVL, and
+    /// publishes no state unless all 16 reads succeed. `Debug` redacts the
+    /// sensitive bytes. It does not change SME state or capture Z, ZA, or ZT0.
+    pub fn capture_arm64_sme_p_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSmePRegisterState, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_sme_p_register_capture(response_sender)?;
 
         response_receiver
             .recv()
@@ -2124,6 +2180,19 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<(), HvfVcpuRunnerError> {
         self.start_core_register_capture(
             |admission, response_sender| RunnerCommand::CaptureArm64SmePstate {
+                admission,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_sme_p_register_capture(
+        &self,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuSmePRegisterState, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_core_register_capture(
+            |admission, response_sender| RunnerCommand::CaptureArm64SmePRegisterState {
                 admission,
                 response_sender,
             },
@@ -3311,6 +3380,19 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::CaptureArm64SmePRegisterState {
+                mut admission,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .capture_arm64_sme_p_register_state()
+                    .map_err(HvfVcpuRunnerError::SmePRegisterCapture);
+                // PSTATE, maximum-SVL, allocation, and all owner-thread P reads
+                // have finished. Restore admission before response send so
+                // receiver failure is not part of the capture lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureArm64SmeZRegisterState {
                 mut admission,
                 response_sender,
@@ -3744,7 +3826,8 @@ mod tests {
         HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
         HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
         HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-        HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePstate,
+        HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
+        HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate,
         HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
         HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
         HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuThreadContextRegisterState,
@@ -4024,6 +4107,35 @@ mod tests {
     struct PanicOnSmePstateCaptureVcpu;
 
     type BlockingSmePstateCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SmePRegisterCaptureRead {
+        Pstate,
+        MaximumSvl,
+        P { register: u32, length: usize },
+    }
+
+    struct SmePRegisterCaptureRecordingVcpu {
+        read_sender: mpsc::Sender<SmePRegisterCaptureRead>,
+        streaming_sve_mode_enabled: bool,
+        maximum_svl_bytes: usize,
+        fail_next_register: Option<u32>,
+    }
+
+    struct BlockingSmePRegisterCaptureVcpu {
+        entered_capture_sender: mpsc::Sender<()>,
+        release_capture_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnSmePRegisterCaptureVcpu;
+
+    type BlockingSmePRegisterCaptureRunner = (
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<(), BackendError>>,
@@ -6083,6 +6195,172 @@ mod tests {
 
         fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
             panic!("fake SME PSTATE capture panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for SmePRegisterCaptureRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+            self.read_sender
+                .send(SmePRegisterCaptureRead::Pstate)
+                .map_err(|_| {
+                    BackendError::InvalidState("fake SME P-register read receiver closed")
+                })?;
+            Ok((self.streaming_sve_mode_enabled, false))
+        }
+
+        fn get_sme_maximum_svl_bytes(&mut self) -> Result<usize, BackendError> {
+            self.read_sender
+                .send(SmePRegisterCaptureRead::MaximumSvl)
+                .map_err(|_| {
+                    BackendError::InvalidState("fake SME P-register read receiver closed")
+                })?;
+            Ok(self.maximum_svl_bytes)
+        }
+
+        fn get_sme_p_register(
+            &mut self,
+            register: u32,
+            value: &mut [u8],
+        ) -> Result<(), BackendError> {
+            self.read_sender
+                .send(SmePRegisterCaptureRead::P {
+                    register,
+                    length: value.len(),
+                })
+                .map_err(|_| {
+                    BackendError::InvalidState("fake SME P-register read receiver closed")
+                })?;
+            if self.fail_next_register == Some(register) {
+                self.fail_next_register = None;
+                return Err(BackendError::InvalidState(
+                    "fake SME P-register capture failed",
+                ));
+            }
+            for (offset, byte) in value.iter_mut().enumerate() {
+                *byte = sme_p_register_test_byte(register, offset);
+            }
+            Ok(())
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingSmePRegisterCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+            self.entered_capture_sender.send(()).map_err(|_| {
+                BackendError::InvalidState("fake SME P-register capture entry receiver closed")
+            })?;
+            self.release_capture_receiver.recv().map_err(|_| {
+                BackendError::InvalidState("fake SME P-register capture release sender closed")
+            })??;
+            Ok((true, false))
+        }
+
+        fn get_sme_maximum_svl_bytes(&mut self) -> Result<usize, BackendError> {
+            Ok(16)
+        }
+
+        fn get_sme_p_register(
+            &mut self,
+            register: u32,
+            value: &mut [u8],
+        ) -> Result<(), BackendError> {
+            for (offset, byte) in value.iter_mut().enumerate() {
+                *byte = sme_p_register_test_byte(register, offset);
+            }
+            Ok(())
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnSmePRegisterCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+            panic!("fake SME P-register capture panic");
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -8889,6 +9167,33 @@ mod tests {
         assert_eq!(state.za_storage_enabled(), za_storage_enabled);
     }
 
+    fn sme_p_register_test_byte(register: u32, offset: usize) -> u8 {
+        register.to_le_bytes()[0].wrapping_mul(13) ^ offset.to_le_bytes()[0]
+    }
+
+    fn assert_sme_p_register_test_state(
+        state: &HvfArm64VcpuSmePRegisterState,
+        maximum_svl_bytes: usize,
+    ) {
+        let predicate_width_bytes = maximum_svl_bytes / 8;
+        assert_eq!(HvfArm64VcpuSmePRegisterState::REGISTER_COUNT, 16);
+        assert_eq!(state.maximum_svl_bytes(), maximum_svl_bytes);
+        assert_eq!(state.predicate_width_bytes(), predicate_width_bytes);
+        for register in 0..HvfArm64VcpuSmePRegisterState::REGISTER_COUNT {
+            let register_id = u32::try_from(register).expect("P-register index should fit in u32");
+            let expected = (0..predicate_width_bytes)
+                .map(|offset| sme_p_register_test_byte(register_id, offset))
+                .collect::<Vec<_>>();
+            assert_eq!(state.p_register(register), Some(expected.as_slice()));
+        }
+        assert_eq!(state.p_register(16), None);
+        assert_eq!(state.p_register(usize::MAX), None);
+        assert_eq!(
+            format!("{state:?}"),
+            "HvfArm64VcpuSmePRegisterState { registers: \"<redacted>\" }"
+        );
+    }
+
     fn sme_z_register_test_byte(register: u32, offset: usize) -> u8 {
         register.to_le_bytes()[0].wrapping_mul(17) ^ offset.to_le_bytes()[0]
     }
@@ -9116,6 +9421,10 @@ mod tests {
             Err(expected.clone())
         );
         assert_eq!(runner.capture_arm64_sme_pstate(), Err(expected.clone()));
+        assert_eq!(
+            runner.capture_arm64_sme_p_register_state(),
+            Err(expected.clone())
+        );
         assert_eq!(
             runner.capture_arm64_sme_z_register_state(),
             Err(expected.clone())
@@ -9835,6 +10144,54 @@ mod tests {
         let (barrier_sender, barrier_receiver) = mpsc::channel();
         let started = spawn_runner_thread(move || {
             Ok(BlockingSmePstateCaptureVcpu {
+                entered_capture_sender,
+                release_capture_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_capture_receiver,
+            release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
+    fn start_sme_p_register_capture_recording_runner(
+        streaming_sve_mode_enabled: bool,
+        maximum_svl_bytes: usize,
+        fail_next_register: Option<u32>,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<SmePRegisterCaptureRead>,
+    ) {
+        let (read_sender, read_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(SmePRegisterCaptureRecordingVcpu {
+                read_sender,
+                streaming_sve_mode_enabled,
+                maximum_svl_bytes,
+                fail_next_register,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            read_receiver,
+        )
+    }
+
+    fn start_blocking_sme_p_register_capture_runner() -> BlockingSmePRegisterCaptureRunner {
+        let (entered_capture_sender, entered_capture_receiver) = mpsc::channel();
+        let (release_capture_sender, release_capture_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingSmePRegisterCaptureVcpu {
                 entered_capture_sender,
                 release_capture_receiver,
                 barrier_sender,
@@ -11185,6 +11542,109 @@ mod tests {
         assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
         runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn captures_arm64_sme_p_registers_on_runner_thread() {
+        let maximum_svl_bytes = 24;
+        let predicate_width_bytes = maximum_svl_bytes / 8;
+        let (runner, read_receiver) =
+            start_sme_p_register_capture_recording_runner(true, maximum_svl_bytes, None);
+
+        let state = runner
+            .capture_arm64_sme_p_register_state()
+            .expect("SME P-register capture should succeed");
+
+        assert_sme_p_register_test_state(&state, maximum_svl_bytes);
+        let mut expected_reads = vec![
+            SmePRegisterCaptureRead::Pstate,
+            SmePRegisterCaptureRead::MaximumSvl,
+        ];
+        expected_reads.extend((0..16).map(|register| SmePRegisterCaptureRead::P {
+            register,
+            length: predicate_width_bytes,
+        }));
+        assert_eq!(read_receiver.try_iter().collect::<Vec<_>>(), expected_reads);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn inactive_arm64_sme_p_register_capture_stops_before_sizing() {
+        let (runner, read_receiver) =
+            start_sme_p_register_capture_recording_runner(false, 24, None);
+
+        assert_eq!(
+            runner.capture_arm64_sme_p_register_state(),
+            Err(HvfVcpuRunnerError::SmePRegisterCapture(
+                HvfArm64VcpuSmePRegisterCaptureError::StreamingSveModeDisabled
+            ))
+        );
+        assert_eq!(
+            read_receiver.try_iter().collect::<Vec<_>>(),
+            [SmePRegisterCaptureRead::Pstate]
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn every_arm64_sme_p_register_failure_can_retry_without_partial_state() {
+        let maximum_svl_bytes = 24;
+        let predicate_width_bytes = maximum_svl_bytes / 8;
+
+        for failed_register in 0..16 {
+            let (runner, read_receiver) = start_sme_p_register_capture_recording_runner(
+                true,
+                maximum_svl_bytes,
+                Some(failed_register),
+            );
+
+            assert_eq!(
+                runner.capture_arm64_sme_p_register_state(),
+                Err(HvfVcpuRunnerError::SmePRegisterCapture(
+                    HvfArm64VcpuSmePRegisterCaptureError::Backend(BackendError::InvalidState(
+                        "fake SME P-register capture failed"
+                    ))
+                ))
+            );
+            let mut expected_failed_reads = vec![
+                SmePRegisterCaptureRead::Pstate,
+                SmePRegisterCaptureRead::MaximumSvl,
+            ];
+            expected_failed_reads.extend((0..=failed_register).map(|register| {
+                SmePRegisterCaptureRead::P {
+                    register,
+                    length: predicate_width_bytes,
+                }
+            }));
+            assert_eq!(
+                read_receiver.try_iter().collect::<Vec<_>>(),
+                expected_failed_reads
+            );
+
+            let state = runner
+                .capture_arm64_sme_p_register_state()
+                .expect("SME P-register capture retry should succeed");
+            assert_sme_p_register_test_state(&state, maximum_svl_bytes);
+            let mut expected_retry_reads = vec![
+                SmePRegisterCaptureRead::Pstate,
+                SmePRegisterCaptureRead::MaximumSvl,
+            ];
+            expected_retry_reads.extend((0..16).map(|register| SmePRegisterCaptureRead::P {
+                register,
+                length: predicate_width_bytes,
+            }));
+            assert_eq!(
+                read_receiver.try_iter().collect::<Vec<_>>(),
+                expected_retry_reads
+            );
+            assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+            runner.shutdown().expect("runner should shut down");
+        }
     }
 
     #[test]
@@ -13487,6 +13947,199 @@ mod tests {
 
         assert_eq!(
             runner.capture_arm64_sme_pstate(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn commands_during_arm64_sme_p_register_capture_are_rejected_without_queueing() {
+        let (runner, entered_capture_receiver, release_capture_sender, _barrier_receiver) =
+            start_blocking_sme_p_register_capture_runner();
+
+        thread::scope(|scope| {
+            let capture = scope.spawn(|| runner.capture_arm64_sme_p_register_state());
+            entered_capture_receiver
+                .recv()
+                .expect("runner should enter fake SME P-register capture");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
+            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_capture_sender
+                .send(Ok(()))
+                .expect("SME P-register capture release should be sent");
+            let state = capture
+                .join()
+                .expect("SME P-register capture thread should join")
+                .expect("SME P-register capture should succeed");
+            assert_sme_p_register_test_state(&state, 16);
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_sme_p_register_capture_admitted_until_command_finishes() {
+        let (runner, entered_capture_receiver, release_capture_sender, barrier_receiver) =
+            start_blocking_sme_p_register_capture_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_sme_p_register_capture(response_sender)
+                .expect("SME P-register capture should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_capture_receiver
+            .recv()
+            .expect("runner should enter fake SME P-register capture");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind capture");
+        release_capture_sender
+            .send(Ok(()))
+            .expect("SME P-register capture release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after capture");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn arm64_sme_p_register_capture_send_failure_releases_admission() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.capture_arm64_sme_p_register_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_sme_p_register_capture_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (capture_response_sender, capture_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_sme_p_register_capture(capture_response_sender)
+            .expect("SME P-register capture should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(capture_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_sme_p_register_capture_panic() {
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnSmePRegisterCaptureVcpu));
+
+        assert_eq!(
+            runner.capture_arm64_sme_p_register_state(),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))

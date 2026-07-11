@@ -49,6 +49,50 @@ fn assert_sme_pstate_capture_supported_or_unavailable(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_sme_p_register_capture_supported_or_unavailable(
+    result: Result<bangbang_hvf::HvfArm64VcpuSmePRegisterState, bangbang_hvf::HvfVcpuRunnerError>,
+) -> Result<Option<bangbang_hvf::HvfArm64VcpuSmePRegisterState>, bangbang_hvf::HvfVcpuRunnerError> {
+    use bangbang_hvf::{HvfArm64VcpuSmePRegisterCaptureError, HvfVcpuRunnerError};
+    use bangbang_runtime::BackendError;
+
+    match result {
+        Ok(state) => Ok(Some(state)),
+        Err(HvfVcpuRunnerError::SmePRegisterCapture(
+            HvfArm64VcpuSmePRegisterCaptureError::StreamingSveModeDisabled,
+        )) => Ok(None),
+        Err(HvfVcpuRunnerError::SmePRegisterCapture(
+            HvfArm64VcpuSmePRegisterCaptureError::Backend(BackendError::Unsupported(message)),
+        )) => {
+            assert!(
+                [
+                    "Hypervisor.framework SME state capture requires macOS 15.2 or newer",
+                    "Hypervisor.framework SME configuration queries require macOS 15.2 or newer",
+                    "Hypervisor.framework SME P-register capture requires macOS 15.2 or newer",
+                ]
+                .contains(&message),
+                "only a documented macOS 15.2 SME availability boundary is accepted"
+            );
+            Ok(None)
+        }
+        Err(HvfVcpuRunnerError::SmePRegisterCapture(
+            HvfArm64VcpuSmePRegisterCaptureError::Backend(BackendError::Hypervisor(message)),
+        )) => {
+            assert!(
+                [
+                    "hv_vcpu_get_sme_state failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)",
+                    "hv_sme_config_get_max_svl_bytes failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)",
+                    "hv_vcpu_get_sme_p_reg failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)",
+                ]
+                .contains(&message.as_str()),
+                "only a documented HV_UNSUPPORTED SME availability result is accepted"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn assert_sme_z_register_capture_supported_or_unavailable(
     result: Result<bangbang_hvf::HvfArm64VcpuSmeZRegisterState, bangbang_hvf::HvfVcpuRunnerError>,
 ) -> Result<Option<bangbang_hvf::HvfArm64VcpuSmeZRegisterState>, bangbang_hvf::HvfVcpuRunnerError> {
@@ -1148,6 +1192,78 @@ fn captures_arm64_sme_pstate_on_runner_thread() {
             assert!(
                 first == second,
                 "SME PSTATE value should remain stable on one idle vCPU"
+            );
+        }
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn captures_arm64_sme_p_registers_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64VcpuSmePRegisterState, HvfBackend};
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let first = assert_sme_p_register_capture_supported_or_unavailable(
+            runner.capture_arm64_sme_p_register_state(),
+        )
+        .expect("first SME P-register capture should succeed or report unavailable");
+        let second = assert_sme_p_register_capture_supported_or_unavailable(
+            runner.capture_arm64_sme_p_register_state(),
+        )
+        .expect("second SME P-register capture should succeed or report unavailable");
+
+        assert!(
+            first.is_some() == second.is_some(),
+            "SME P-register capture availability should remain stable within one vCPU lifetime"
+        );
+        if let (Some(first), Some(second)) = (first, second) {
+            assert!(
+                first.maximum_svl_bytes() == second.maximum_svl_bytes(),
+                "SME maximum streaming vector length should remain stable"
+            );
+            assert!(
+                first.predicate_width_bytes() == second.predicate_width_bytes(),
+                "SME predicate allocation width should remain stable"
+            );
+            assert!(
+                first.p_register(15).is_some() && first.p_register(16).is_none(),
+                "SME P-register capture should contain exactly P0 through P15"
+            );
+            for register in 0..HvfArm64VcpuSmePRegisterState::REGISTER_COUNT {
+                let first_register = first
+                    .p_register(register)
+                    .expect("first capture should contain every P register");
+                let second_register = second
+                    .p_register(register)
+                    .expect("second capture should contain every P register");
+                assert!(
+                    first_register.len() == first.predicate_width_bytes(),
+                    "first capture should retain the exact predicate width"
+                );
+                assert!(
+                    second_register.len() == second.predicate_width_bytes(),
+                    "second capture should retain the exact predicate width"
+                );
+            }
+            assert!(
+                first == second,
+                "SME P-register state should remain stable on one idle vCPU"
+            );
+            assert!(
+                format!("{first:?}").contains("<redacted>"),
+                "SME P-register debug output should remain redacted"
             );
         }
 
@@ -2265,6 +2381,10 @@ fn prepares_internal_hvf_arm64_boot_session() {
     let _sme_pstate =
         assert_sme_pstate_capture_supported_or_unavailable(session.capture_arm64_sme_pstate())
             .expect("internal session SME PSTATE capture should succeed or report unsupported");
+    let _sme_p_registers = assert_sme_p_register_capture_supported_or_unavailable(
+        session.capture_arm64_sme_p_register_state(),
+    )
+    .expect("internal session SME P-register capture should succeed or report unavailable");
     let _sme_z_registers = assert_sme_z_register_capture_supported_or_unavailable(
         session.capture_arm64_sme_z_register_state(),
     )
@@ -2457,6 +2577,10 @@ fn prepares_owned_hvf_arm64_boot_session() {
     let _sme_pstate =
         assert_sme_pstate_capture_supported_or_unavailable(session.capture_arm64_sme_pstate())
             .expect("owned session SME PSTATE capture should succeed or report unsupported");
+    let _sme_p_registers = assert_sme_p_register_capture_supported_or_unavailable(
+        session.capture_arm64_sme_p_register_state(),
+    )
+    .expect("owned session SME P-register capture should succeed or report unavailable");
     let _sme_z_registers = assert_sme_z_register_capture_supported_or_unavailable(
         session.capture_arm64_sme_z_register_state(),
     )

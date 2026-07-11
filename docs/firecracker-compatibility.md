@@ -1686,7 +1686,12 @@ The nineteenth first observes `PSTATE.SM`, then, only while streaming mode is
 active, queries the maximum SVL, fallibly allocates one contiguous `32 * max`
 buffer, and runtime-resolves `hv_vcpu_get_sme_z_reg` for exact Z0-Z31 reads.
 Its detached value exposes bounded maximum-width slices while redacting all
-bytes from `Debug`. The nineteen commands share one command-owned core-register
+bytes from `Debug`. A twentieth performs the same owner-thread streaming-mode
+preflight, requires a non-zero maximum SVL divisible by eight, fallibly
+allocates one contiguous `16 * (max / 8)` buffer, and runtime-resolves
+`hv_vcpu_get_sme_p_reg` for exact P0-P15 reads. Its detached value exposes
+bounded predicate-width slices while redacting all bytes from `Debug`. The
+twenty commands share one command-owned core-register
 admission domain,
 publish no partial state after a read failure, and are exposed by borrowed and
 owned HVF boot sessions for later lease-owned orchestration.
@@ -1695,9 +1700,9 @@ runtime-resolves macOS 15.2+
 `hv_sme_config_get_max_svl_bytes` and publishes the maximum streaming vector
 length, in bytes, that guests may use. It can run before backend or VM creation,
 does not enter the core-register admission domain, and preserves missing-symbol,
-target, and exact HVF failures. This configuration maximum is only a future
-P/ZA buffer-sizing prerequisite and the current conditional Z-register
-allocation width; it is not the effective SVL selected through `SMCR_EL1`,
+target, and exact HVF failures. This configuration maximum is only a future ZA
+buffer-sizing prerequisite and the current conditional Z- and P-register
+allocation basis; it is not the effective SVL selected through `SMCR_EL1`,
 feature metadata, PSTATE, or any Z/P/ZA/ZT0 content.
 Another no-handle `HvfBackend::arm64_vcpu_cache_configuration()` query creates
 and releases a fresh macOS 11+ default vCPU configuration, reads raw `CTR_EL0`,
@@ -1726,9 +1731,10 @@ state; SME PSTATE reveals mutable guest streaming/ZA execution mode; software
 context numbers can identify guest execution contexts; and SME
 system registers include mutable controls plus `TPIDR2_EL0` thread context that
 remains outside the baseline thread-context subset. Streaming Z registers can
-contain sensitive guest execution and cryptographic material. The key, SME Z-
-register, SME system-register, and system-context values redact all raw material
-from `Debug` but provide bounded or named accessors for trusted internal
+contain sensitive guest execution and cryptographic material, as can streaming
+P predicates. The key, SME Z-register, SME P-register, SME system-register, and
+system-context values redact all raw material from `Debug` but provide bounded
+or named accessors for trusted internal
 composition. Identification values
 describe the virtual CPU/HVF view, including bangbang's deterministic MPIDR
 affinity zero; they are not
@@ -1752,7 +1758,16 @@ querying the configuration-wide maximum SVL or allocating memory. It then reads
 Z0 through Z31 into exact maximum-width chunks and publishes only the complete
 value. The maximum is an allocation width, not the effective `SMCR_EL1.LEN`;
 baseline Q registers alias only each Z register's low 128 bits while streaming
-mode is active. P/ZA/ZT0, setters and transitions, byte-layout interpretation,
+mode is active. P predicates are captured separately. ZA/ZT0, setters and
+transitions, byte-layout interpretation,
+feature/destination validation, encrypted persistence, schema, restore
+ordering, orchestration, and multi-vCPU association remain deferred.
+The separate P-register capture likewise preflights `PSTATE.SM`, then requires
+the configuration-wide maximum SVL to be non-zero and divisible by eight. It
+reads P0 through P15 into exact `maximum / 8`-byte chunks and publishes only the
+complete value. The maximum remains an allocation basis rather than the
+effective `SMCR_EL1.LEN`; Z registers are captured separately. ZA/ZT0, setters
+and transitions, byte-layout and inactive-lane interpretation,
 feature/destination validation, encrypted persistence, schema, restore
 ordering, orchestration, and multi-vCPU association remain deferred.
 The separate SME system-register capture uses the macOS 15.2 SDK register ids
@@ -1793,7 +1808,13 @@ availability result, the topical inactive-streaming result, or two complete
 equal maximum-width Z0-Z31 captures from the same idle vCPU. It verifies bounded
 accessors and redacted `Debug` with fixed messages without logging bytes or
 width, calling a setter, entering streaming mode, running guest code, or
-inferring effective SVL or portability. SME system-register validation captures all three registers twice
+inferring effective SVL or portability. SME P-register validation accepts the
+same documented macOS/HVF availability and inactive-streaming outcomes, or two
+complete equal maximum-derived P0-P15 captures from the idle vCPU. It verifies
+the maximum and predicate widths, bounded accessors, and redacted `Debug` with
+fixed messages without logging bytes or widths, calling a setter, entering
+streaming mode, running guest code, or inferring effective SVL or portability.
+SME system-register validation captures all three registers twice
 from the same idle vCPU, compares them only with fixed failure messages, and
 checks redacted `Debug` output. It does not log raw values, write registers,
 query maximum SVL, read Z/P/ZA/ZT0, or run the guest.
@@ -1829,7 +1850,8 @@ The SIMD getter uses an explicitly 16-byte-aligned HVF output value; the
 separate SME PSTATE observation determines whether streaming mode is active,
 where its Q values alias only the low 128 bits of Z registers. The separate
 maximum-width Z capture contains Z0-Z31 only when streaming mode is already
-active; P/ZA/ZT0 remain absent. A separate command
+active; the separate maximum-derived P capture contains P0-P15 under the same
+precondition. ZA/ZT0 remain absent. A separate command
 reads raw `CNTKCTL_EL1`, `CNTP_CTL_EL0`, `CNTP_CVAL_EL0`, and
 `CNTP_TVAL_EL0` in that order, publishes no partial state if any read fails, and
 shares generalized timer admission with every virtual-timer command. Both boot-
@@ -1848,7 +1870,7 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The baseline and optional SVE/SME identification,
-SME PSTATE, SME Z-register, SME system-register, system-context, core system-register,
+SME PSTATE, SME Z-register, SME P-register, SME system-register, system-context, core system-register,
 exception, execution-control, cache-selection, breakpoint, watchpoint,
 debug-control, debug-trap,
 translation,
@@ -2250,13 +2272,16 @@ macOS design work instead of direct implementation:
   A nineteenth conditionally captures all macOS 15.2+ streaming Z0-Z31 bytes at
   the configuration-wide maximum allocation width, after an owner-thread
   `PSTATE.SM` preflight, and redacts the complete buffer from `Debug`.
+  A twentieth conditionally captures all macOS 15.2+ streaming P0-P15 bytes at
+  one eighth of that maximum per predicate, after the same owner-thread
+  preflight, and redacts the complete buffer from `Debug`.
   A separate pre-VM query captures raw default-configuration CTR_EL0,
   CLIDR_EL1, and DCZID_EL0 feature metadata without changing vCPU creation.
   Another independent pre-VM query captures all eight raw data/unified and all
   eight instruction CCSIDR_EL1 values from a fresh default configuration.
   Newer beta-only IDs, broader configuration-time feature manifests, feature
   masking, destination policy, effective SME streaming vector length,
-  P/ZA/ZT0 data,
+  ZA/ZT0 data,
   table and vector memory, optional CPACR and pointer-authentication feature
   validation, cache feature/geometry interpretation and masks, selector
   validation and maintenance, breakpoint and watchpoint control
