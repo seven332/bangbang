@@ -315,6 +315,15 @@ is resource-specific:
   raw `HV_UNSUPPORTED` on SME-incapable hardware. The flags must not be logged,
   persisted, trusted, or restored without feature validation and ordering with
   Q/Z/P/FPSR and conditional ZA/ZT0 contents.
+  The conditionally captured streaming Z0-Z31 bytes are sensitive guest
+  execution and potentially cryptographic state. Capture preflights
+  `PSTATE.SM`, uses the configuration-wide maximum SVL only as an allocation
+  width, and publishes no partial buffer after a getter failure. The detached
+  value redacts all bytes from `Debug`; callers with bounded raw access remain
+  trusted internal code and must not log the contents. Persistence requires
+  confidentiality and integrity protection, effective-SVL and feature policy,
+  coordinated P/ZA/ZT0 and FPSR handling, destination validation, schema,
+  zeroization, and safe transition/restore ordering, none of which exists yet.
   The separately captured raw `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` values
   are mutable SME and thread-context state; `TPIDR2_EL0` can contain sensitive
   guest pointers. Their detached value redacts every register from `Debug`, and
