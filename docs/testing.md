@@ -121,7 +121,7 @@ nontransactional; tests and callers must retry the complete retained value or
 discard the vCPU before any run.
 Core system-register restore tests must likewise verify
 `SP_EL0`/`SP_EL1`/`ELR_EL1`/`SPSR_EL1` capture-order writes, all four failure
-positions, reusable system-register error context, complete retry, 32-way
+positions, reusable system-register error context, complete retry, 33-way
 admission, and lifecycle cleanup. Signed coverage must extend the known-value
 guest-written capture with repeated same-vCPU restore/recapture after the HVC
 exit, use fixed failure messages that do not format raw state, and never run the
@@ -129,7 +129,7 @@ guest after restore or claim the values are portable or validated.
 Translation-register restore tests must verify SCTLR_EL1-then-TTBR0_EL1-then-
 TTBR1_EL1-then-TCR_EL1-then-MAIR_EL1-then-AMAIR_EL1-then-CONTEXTIDR_EL1
 writes, all seven failure positions, the reusable system-register error,
-complete retry, 32-way admission, and lifecycle cleanup. Signed coverage must
+complete retry, 33-way admission, and lifecycle cleanup. Signed coverage must
 leave `SCTLR_EL1.M` clear, write back the original SCTLR value before inert
 TTBR/TCR/attribute/context values and HVC, then repeat same-vCPU
 restore/recapture with fixed messages and no post-restore guest execution.
@@ -140,7 +140,7 @@ TLB/cache maintenance, or a safe MMU transition sequence.
 Exception-register restore tests must verify
 `AFSR0_EL1`/`AFSR1_EL1`/`ESR_EL1`/`FAR_EL1`/`PAR_EL1`/`VBAR_EL1`
 capture-order writes, all six failure positions, the reusable system-register
-error, complete retry, 32-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 33-way admission, and lifecycle cleanup. Signed coverage
 must use an aligned VBAR address, preserve the actual captured AFSR readback,
 repeat same-vCPU restore/recapture with fixed messages, take no guest exception
 or run after restore, and never claim coherent exception semantics or
@@ -149,7 +149,7 @@ Silicon reads AFSR0 as zero after a guest write while preserving the test's
 AFSR1 value.
 Execution-control restore tests require macOS 15 for ACTLR and must verify
 ACTLR-then-CPACR writes, both failure positions, the reusable system-register
-error, complete retry, 32-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 33-way admission, and lifecycle cleanup. Signed coverage
 must write only the Hypervisor.framework-supported `ACTLR_EL1.EnTSO` bit and
 baseline `CPACR_EL1.FPEN`, execute ISB before HVC, then repeat same-vCPU
 restore/recapture with fixed messages and no post-restore guest execution. It
@@ -157,7 +157,7 @@ must not treat equality as destination feature validation or a complete
 transition/ISB policy.
 Cache-selection restore tests must verify the single `CSSELR_EL1` write, the
 one failure with zero completed writes, the value-free reusable system-register
-error, complete retry, 32-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 33-way admission, and lifecycle cleanup. Signed coverage
 must restore and recapture the first complete same-vCPU idle capture twice with
 fixed whole-state messages and no selector logging, CCSIDR query, ISB, cache
 maintenance, or guest run. It must not treat equality as selector validation,
@@ -165,13 +165,13 @@ an atomic cache manifest, destination compatibility, dependent-read ordering,
 or portable snapshot restore.
 Thread-context restore tests must verify TPIDR_EL0-then-TPIDRRO_EL0-then-
 TPIDR_EL1 writes, all three failure positions, the reusable system-register
-error, complete retry, 32-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 33-way admission, and lifecycle cleanup. Signed coverage
 must extend the known guest-written values with repeated same-vCPU
 restore/recapture after HVC, use fixed messages, take no post-restore guest run,
 and never claim pointer validation, portability, or complete context semantics.
 System-context restore tests must verify SCXTNUM_EL0-then-SCXTNUM_EL1 writes,
 both failure positions, the value-free reusable system-register error,
-complete retry, 32-way admission, redacted `Debug`, and lifecycle cleanup.
+complete retry, 33-way admission, redacted `Debug`, and lifecycle cleanup.
 Signed coverage must restore and recapture the first complete same-vCPU idle
 capture twice with fixed messages, take no guest run, log no raw values, and
 never claim interpretation, feature/destination validation, protected
@@ -179,7 +179,7 @@ persistence, wider TPIDR/CONTEXTIDR ordering, rollback, or snapshot semantics.
 Pointer-authentication key restore tests must verify APIA low/high, APIB
 low/high, APDA low/high, APDB low/high, then APGA low/high writes; all ten
 failure positions; value-free reusable system-register error context; complete
-retry; 32-way admission; redacted `Debug`; and lifecycle cleanup. Signed
+retry; 33-way admission; redacted `Debug`; and lifecycle cleanup. Signed
 coverage must use only the existing visibly fake guest-written keys, repeat
 same-vCPU restore/recapture twice after HVC with fixed whole-state messages,
 never enable or execute PAC, never run the guest after restore, and never log
@@ -187,7 +187,7 @@ key material or claim feature/destination validation, protected persistence,
 zeroization, SCTLR enable ordering, rollback, or portable snapshot semantics.
 Baseline SIMD/FP restore tests must verify Q0-through-Q31-then-FPCR-then-FPSR
 writes, all 34 failure positions, the typed SIMD/FP-versus-scalar register and
-completed-prefix context, complete retry, 32-way admission, and lifecycle
+completed-prefix context, complete retry, 33-way admission, and lifecycle
 cleanup. The C shim must compile only for macOS arm64, statically assert the SDK
 vector size, and accept an ordinary 16-byte pointer so stable Rust never guesses
 the by-value vector ABI. Signed coverage must extend the known non-streaming
@@ -309,11 +309,15 @@ and MDSCR_EL1 from an idle real vCPU without hard-coding or logging their raw
 values. They must not call register or debug-trap setters, run guest debug
 instructions, enable monitor debug or software stepping, or treat the two
 fields as complete or safely restorable debug state.
-Debug-trap signed tests must capture both Hypervisor.framework policy booleans
-twice from an idle real vCPU without assuming, comparing, or logging their
-values. They must not call either trap setter, run the vCPU, execute guest/debug
-instructions, activate debug behavior, or treat host TDE/TDA-equivalent policy
-as guest register state or safely restorable configuration.
+Debug-trap restore tests must verify debug-exception-then-debug-register-access
+writes, both failure positions, the typed failed operation and completed
+prefix, value-free errors, complete retry, 33-way admission, and lifecycle
+cleanup. Signed tests must capture the original pair from one idle real vCPU,
+restore and recapture that exact pair twice, and compare whole values without
+assuming or logging either Boolean. They must not manufacture a policy change,
+run the vCPU, execute guest/debug instructions, alter guest controls or
+comparators, activate debug behavior, or treat host TDE/TDA-equivalent policy
+as guest register state or a complete portable debug-restore configuration.
 Physical-timer signed tests require macOS 15 and must create the GIC before the
 vCPU. Guest-written validation must keep CNTP disabled and masked and assert
 writable control bits separately from derived ISTATUS. No test may claim that

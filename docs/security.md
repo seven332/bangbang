@@ -318,6 +318,15 @@ is resource-specific:
   nor supplies ISB/dependent CCSIDR visibility or cache maintenance. After
   failure, retry the complete retained value or discard the vCPU before
   execution.
+  The paired debug-trap restore extends the boundary to Hypervisor.framework's
+  host debug-exception and debug-register-access policies. It accepts only the
+  complete two-Boolean typed capture, writes exception policy then register-
+  access policy, and reports the exact failed operation, completed prefix, and
+  backend source without either value. A partial apply can change whether guest
+  debug behavior exits to the VMM; after failure, retry the complete retained
+  value or discard the vCPU before execution. The primitive provides no wider
+  ordering with guest MDCCINT/MDSCR or comparator state, feature/destination
+  policy, protected persistence, rollback, schema, or public snapshot load.
   The paired pending-interrupt restore applies the same boundary to CPU-level
   IRQ and FIQ injection state. It accepts only the complete typed capture,
   writes IRQ then FIQ, and reports the exact failed interrupt type, completed
@@ -381,11 +390,11 @@ is resource-specific:
   comparators are captured through separate values.
   Hypervisor.framework's separate debug-exception and debug-register-access
   booleans reveal whether guest debug exceptions and documented debug-register
-  accesses exit to the host. Their getter-only capture does not change policy
-  and is separate from guest debug-register contents. Any future restore must
-  treat both host trap settings and guest debug controls as untrusted, validate
-  features and writable/status bits, and coordinate policy and ordering before
-  introducing setters.
+  accesses exit to the host. The bounded pair apply can reapply a complete
+  capture but remains separate from guest debug-register contents. Future
+  composite restore must treat both host trap settings and guest debug controls
+  as untrusted, validate features and writable/status bits, and coordinate
+  policy and ordering before executing the guest.
   Pointer-authentication keys are cryptographic secrets. Their detached value
   uses a custom `Debug` implementation that exposes only a redacted marker.
   Current capture-order apply never formats the value, but does not zero the

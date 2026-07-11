@@ -1337,12 +1337,25 @@ impl HvfArm64BootSession<'_> {
 
     /// Capture Hypervisor.framework debug-trap policy on the primary owner thread.
     ///
-    /// This getter-only host-policy value excludes setters, guest debug-register
-    /// contents, validation, persistence, debug activation, and safe restore.
+    /// Capture reads host policy only. It excludes guest debug-register
+    /// contents, persistence, activation, and wider restore policy.
     pub fn capture_arm64_debug_trap_state(
         &self,
     ) -> Result<HvfArm64VcpuDebugTrapState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_debug_trap_state()
+    }
+
+    /// Restore Hypervisor.framework debug-trap policy on the primary owner thread.
+    ///
+    /// The two policy writes are ordered and nontransactional. Retry the
+    /// complete typed state or discard the vCPU after failure. This primitive
+    /// excludes guest debug-register restore, validation, persistence, wider
+    /// debug ordering, and public snapshot-load behavior.
+    pub fn restore_arm64_debug_trap_state(
+        &self,
+        state: &HvfArm64VcpuDebugTrapState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_debug_trap_state(state)
     }
 
     /// Capture guest-visible arm64 identification registers on the primary
@@ -2342,12 +2355,25 @@ impl OwnedHvfArm64BootSession {
 
     /// Capture Hypervisor.framework debug-trap policy on the primary owner thread.
     ///
-    /// This getter-only host-policy value excludes setters, guest debug-register
-    /// contents, validation, persistence, debug activation, and safe restore.
+    /// Capture reads host policy only. It excludes guest debug-register
+    /// contents, persistence, activation, and wider restore policy.
     pub fn capture_arm64_debug_trap_state(
         &self,
     ) -> Result<HvfArm64VcpuDebugTrapState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_debug_trap_state()
+    }
+
+    /// Restore Hypervisor.framework debug-trap policy on the primary owner thread.
+    ///
+    /// The two policy writes are ordered and nontransactional. Retry the
+    /// complete typed state or discard the vCPU after failure. This primitive
+    /// excludes guest debug-register restore, validation, persistence, wider
+    /// debug ordering, and public snapshot-load behavior.
+    pub fn restore_arm64_debug_trap_state(
+        &self,
+        state: &HvfArm64VcpuDebugTrapState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_debug_trap_state(state)
     }
 
     /// Capture guest-visible arm64 identification registers on the primary

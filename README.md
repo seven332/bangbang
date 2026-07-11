@@ -46,7 +46,8 @@ system-context registers with redacted `Debug` plus ordered nontransactional
 restore of their typed SCXTNUM_EL0/SCXTNUM_EL1 value, raw cache-selection plus
 ordered nontransactional restore of its typed CSSELR_EL1 value,
 hardware-breakpoint,
-hardware-watchpoint, debug-control, raw Hypervisor.framework debug-trap policy,
+hardware-watchpoint, debug-control, raw Hypervisor.framework debug-trap policy
+plus ordered nontransactional restore of its complete two-Boolean value,
 pointer-authentication key state with redacted `Debug` plus ordered
 nontransactional restore of the complete APIA/APIB/APDA/APDB/APGA value, raw
 physical and virtual timer state, CPU-level IRQ/FIQ pending injection

@@ -683,9 +683,11 @@ impl HvfArm64VcpuDebugControlRegisterState {
 /// Detached Hypervisor.framework debug-trap policy captured from one arm64 vCPU.
 ///
 /// These booleans mirror host `MDCR_EL2.TDE`- and `MDCR_EL2.TDA`-equivalent
-/// policy, not guest EL1 debug-register contents. They are observation-only
-/// inputs for later owner-thread orchestration and do not define validation,
-/// setter, persistence, snapshot-schema, or restore behavior.
+/// policy, not guest EL1 debug-register contents. The complete typed value can
+/// be reapplied through an owner-thread primitive, but the two writes are
+/// nontransactional. This value does not define feature or destination policy,
+/// wider debug-state ordering, persistence, a snapshot schema, or public
+/// snapshot-load behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuDebugTrapState {
     trap_debug_exceptions: bool,
@@ -708,6 +710,74 @@ impl HvfArm64VcpuDebugTrapState {
     /// Return whether guest debug-register accesses trap to the host.
     pub const fn trap_debug_reg_accesses(self) -> bool {
         self.trap_debug_reg_accesses
+    }
+}
+
+/// One host debug-trap policy operation in arm64 restore order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfArm64VcpuDebugTrapRestoreOperation {
+    /// Set whether guest debug exceptions trap to the host.
+    DebugExceptions,
+    /// Set whether guest debug-register accesses trap to the host.
+    DebugRegisterAccesses,
+}
+
+/// Failure while restoring one arm64 host debug-trap policy field.
+///
+/// Hypervisor.framework writes the two fields separately and provides no batch
+/// transaction. Operations before [`Self::failed_operation`] have already been
+/// applied when this error is returned. Callers must retry the complete typed
+/// state or discard the vCPU before execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64VcpuDebugTrapRestoreError {
+    failed_operation: HvfArm64VcpuDebugTrapRestoreOperation,
+    completed_writes: usize,
+    source: BackendError,
+}
+
+impl HvfArm64VcpuDebugTrapRestoreError {
+    const fn new(
+        failed_operation: HvfArm64VcpuDebugTrapRestoreOperation,
+        completed_writes: usize,
+        source: BackendError,
+    ) -> Self {
+        Self {
+            failed_operation,
+            completed_writes,
+            source,
+        }
+    }
+
+    /// Return the debug-trap policy operation whose setter failed.
+    pub const fn failed_operation(&self) -> HvfArm64VcpuDebugTrapRestoreOperation {
+        self.failed_operation
+    }
+
+    /// Return the number of policy fields written before the failure.
+    pub const fn completed_writes(&self) -> usize {
+        self.completed_writes
+    }
+}
+
+impl fmt::Display for HvfArm64VcpuDebugTrapRestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let operation_name = match self.failed_operation {
+            HvfArm64VcpuDebugTrapRestoreOperation::DebugExceptions => "debug-exception trap policy",
+            HvfArm64VcpuDebugTrapRestoreOperation::DebugRegisterAccesses => {
+                "debug-register-access trap policy"
+            }
+        };
+        write!(
+            f,
+            "failed to restore arm64 {operation_name} after {} successful writes: {}",
+            self.completed_writes, self.source
+        )
+    }
+}
+
+impl std::error::Error for HvfArm64VcpuDebugTrapRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -2025,8 +2095,16 @@ impl HvfVcpuOwner {
         crate::ffi::get_trap_debug_exceptions(self.handle()?.vcpu)
     }
 
+    pub(crate) fn set_trap_debug_exceptions(&mut self, value: bool) -> Result<(), BackendError> {
+        crate::ffi::set_trap_debug_exceptions(self.handle()?.vcpu, value)
+    }
+
     pub(crate) fn get_trap_debug_reg_accesses(&self) -> Result<bool, BackendError> {
         crate::ffi::get_trap_debug_reg_accesses(self.handle()?.vcpu)
+    }
+
+    pub(crate) fn set_trap_debug_reg_accesses(&mut self, value: bool) -> Result<(), BackendError> {
+        crate::ffi::set_trap_debug_reg_accesses(self.handle()?.vcpu, value)
     }
 
     pub(crate) fn get_sme_pstate(&self) -> Result<(bool, bool), BackendError> {
@@ -2625,6 +2703,30 @@ pub(crate) fn capture_arm64_vcpu_debug_trap_state_with<R: ?Sized>(
     ))
 }
 
+pub(crate) fn restore_arm64_vcpu_debug_trap_state_with<W: ?Sized>(
+    state: &HvfArm64VcpuDebugTrapState,
+    writer: &mut W,
+    set_trap_debug_exceptions: impl FnOnce(&mut W, bool) -> Result<(), BackendError>,
+    set_trap_debug_reg_accesses: impl FnOnce(&mut W, bool) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuDebugTrapRestoreError> {
+    set_trap_debug_exceptions(writer, state.trap_debug_exceptions()).map_err(|source| {
+        HvfArm64VcpuDebugTrapRestoreError::new(
+            HvfArm64VcpuDebugTrapRestoreOperation::DebugExceptions,
+            0,
+            source,
+        )
+    })?;
+    set_trap_debug_reg_accesses(writer, state.trap_debug_reg_accesses()).map_err(|source| {
+        HvfArm64VcpuDebugTrapRestoreError::new(
+            HvfArm64VcpuDebugTrapRestoreOperation::DebugRegisterAccesses,
+            1,
+            source,
+        )
+    })?;
+
+    Ok(())
+}
+
 pub(crate) fn capture_arm64_vcpu_identification_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuIdentificationRegisterState, BackendError> {
@@ -3190,13 +3292,13 @@ mod tests {
 
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters,
-        HvfArm64VcpuSimdFpRestoreRegister, HvfArm64VcpuSmePRegisterCaptureError,
-        HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
-        HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError,
-        HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZt0RegisterCaptureError,
-        HvfArm64VcpuSmeZt0RegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
-        HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
-        capture_arm64_vcpu_breakpoint_register_state_with,
+        HvfArm64VcpuDebugTrapRestoreOperation, HvfArm64VcpuSimdFpRestoreRegister,
+        HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState,
+        HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
+        HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
+        HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState, HvfInterruptType,
+        HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
+        NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_breakpoint_register_state_with,
         capture_arm64_vcpu_cache_selection_register_state_with,
         capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_debug_control_register_state_with,
@@ -3219,7 +3321,7 @@ mod tests {
         capture_arm64_vcpu_watchpoint_register_state_with, configure_arm64_boot_registers_with,
         restore_arm64_vcpu_cache_selection_register_state_with,
         restore_arm64_vcpu_core_system_register_state_with,
-        restore_arm64_vcpu_exception_register_state_with,
+        restore_arm64_vcpu_debug_trap_state_with, restore_arm64_vcpu_exception_register_state_with,
         restore_arm64_vcpu_execution_control_register_state_with,
         restore_arm64_vcpu_general_register_state_with,
         restore_arm64_vcpu_pending_interrupt_state_with,
@@ -3256,6 +3358,23 @@ mod tests {
     enum DebugTrapRead {
         DebugExceptions,
         DebugRegisterAccesses,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DebugTrapWrite {
+        DebugExceptions(bool),
+        DebugRegisterAccesses(bool),
+    }
+
+    impl DebugTrapWrite {
+        const fn operation(self) -> HvfArm64VcpuDebugTrapRestoreOperation {
+            match self {
+                Self::DebugExceptions(_) => HvfArm64VcpuDebugTrapRestoreOperation::DebugExceptions,
+                Self::DebugRegisterAccesses(_) => {
+                    HvfArm64VcpuDebugTrapRestoreOperation::DebugRegisterAccesses
+                }
+            }
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3772,7 +3891,15 @@ mod tests {
             Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
         );
         assert_eq!(
+            vcpu.owner.set_trap_debug_exceptions(true),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
             vcpu.owner.get_trap_debug_reg_accesses(),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.owner.set_trap_debug_reg_accesses(false),
             Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
         );
         assert_eq!(
@@ -4671,6 +4798,41 @@ mod tests {
             );
             assert_eq!(state.trap_debug_exceptions(), trap_debug_exceptions);
             assert_eq!(state.trap_debug_reg_accesses(), trap_debug_reg_accesses);
+        }
+    }
+
+    #[test]
+    fn restores_arm64_debug_trap_state_in_documented_order() {
+        for (trap_debug_exceptions, trap_debug_reg_accesses) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let state = super::HvfArm64VcpuDebugTrapState::new(
+                trap_debug_exceptions,
+                trap_debug_reg_accesses,
+            );
+            let mut writes = Vec::new();
+
+            restore_arm64_vcpu_debug_trap_state_with(
+                &state,
+                &mut writes,
+                |writes, value| {
+                    writes.push(DebugTrapWrite::DebugExceptions(value));
+                    Ok(())
+                },
+                |writes, value| {
+                    writes.push(DebugTrapWrite::DebugRegisterAccesses(value));
+                    Ok(())
+                },
+            )
+            .expect("debug-trap state restore should succeed");
+
+            assert_eq!(
+                writes,
+                [
+                    DebugTrapWrite::DebugExceptions(trap_debug_exceptions),
+                    DebugTrapWrite::DebugRegisterAccesses(trap_debug_reg_accesses),
+                ]
+            );
         }
     }
 
@@ -6372,6 +6534,87 @@ mod tests {
             assert!(state.trap_debug_exceptions());
             assert!(!state.trap_debug_reg_accesses());
             assert_eq!(reads, expected_reads);
+        }
+    }
+
+    #[test]
+    fn arm64_debug_trap_state_restore_stops_after_each_error_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = super::HvfArm64VcpuDebugTrapState::new(true, false);
+        let expected_writes = [
+            DebugTrapWrite::DebugExceptions(true),
+            DebugTrapWrite::DebugRegisterAccesses(false),
+        ];
+
+        for (failed_index, failed_write) in expected_writes.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let mut writes = Vec::new();
+            let error = restore_arm64_vcpu_debug_trap_state_with(
+                &state,
+                &mut writes,
+                |writes, value| {
+                    let write = DebugTrapWrite::DebugExceptions(value);
+                    writes.push(write);
+                    if write == failed_write && fail_next.replace(false) {
+                        Err(BackendError::InvalidState(
+                            "fake debug-trap state restore failed",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |writes, value| {
+                    let write = DebugTrapWrite::DebugRegisterAccesses(value);
+                    writes.push(write);
+                    if write == failed_write && fail_next.replace(false) {
+                        Err(BackendError::InvalidState(
+                            "fake debug-trap state restore failed",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("injected debug-trap state write should fail");
+
+            assert_eq!(error.failed_operation(), failed_write.operation());
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake debug-trap state restore failed".to_string())
+            );
+            let operation_name = match failed_write.operation() {
+                HvfArm64VcpuDebugTrapRestoreOperation::DebugExceptions => {
+                    "debug-exception trap policy"
+                }
+                HvfArm64VcpuDebugTrapRestoreOperation::DebugRegisterAccesses => {
+                    "debug-register-access trap policy"
+                }
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 {operation_name} after {failed_index} successful writes: invalid backend state: fake debug-trap state restore failed"
+                )
+            );
+            assert_eq!(writes, expected_writes[..=failed_index]);
+
+            writes.clear();
+            restore_arm64_vcpu_debug_trap_state_with(
+                &state,
+                &mut writes,
+                |writes, value| {
+                    writes.push(DebugTrapWrite::DebugExceptions(value));
+                    Ok(())
+                },
+                |writes, value| {
+                    writes.push(DebugTrapWrite::DebugRegisterAccesses(value));
+                    Ok(())
+                },
+            )
+            .expect("complete debug-trap state restore retry should succeed");
+            assert_eq!(writes, expected_writes);
         }
     }
 

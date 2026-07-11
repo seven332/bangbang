@@ -51,7 +51,8 @@ access, one-step runner-thread MMIO handling, a run-cancellation boundary,
 baseline and optional SVE/SME guest-visible identification metadata, pointer-
 authentication key-state capture with redacted `Debug`, raw cache-selection
 plus ordered nontransactional restore of its typed CSSELR_EL1 value,
-hardware-breakpoint, hardware-watchpoint, debug-control, debug-trap policy, and
+hardware-breakpoint, hardware-watchpoint, debug-control, debug-trap policy plus
+ordered nontransactional restore of its complete two-Boolean value, and
 physical-timer CNTKCTL/control/CVAL/TVAL capture, a virtual-timer
 mask/offset/control/CVAL boundary, CPU-level IRQ/FIQ pending capture plus
 ordered nontransactional restore of its complete typed value, a bounded
@@ -1701,8 +1702,10 @@ order without writing or enabling debug state. A thirteenth reads
 `DBGWVR<n>_EL1` / `DBGWCR<n>_EL1` pair in ascending order under the same
 observation-only constraints. A fourteenth calls Hypervisor.framework's
 debug-exception trap getter then its debug-register-access trap getter, exposing
-the two host TDE/TDA-equivalent policy booleans without calling either setter. A
-fifteenth reads optional `ID_AA64ZFR0_EL1` then `ID_AA64SMFR0_EL1`
+the two host TDE/TDA-equivalent policy booleans. Its typed value has a paired
+owner-thread restore that calls the matching setters in the same order and
+reports exact value-free partial progress. The fifteenth reads optional
+`ID_AA64ZFR0_EL1` then `ID_AA64SMFR0_EL1`
 compatibility metadata and requires macOS 15.2. A sixteenth calls the macOS
 15.2+ `hv_vcpu_get_sme_state` getter once and returns the guest's `PSTATE.SM`
 streaming-mode and `PSTATE.ZA` storage-enable flags without invoking the setter.
@@ -1730,12 +1733,13 @@ requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
 commands plus the general-, core-system-, exception-register, execution-
-control, cache-selection, thread-context, translation, baseline SIMD/FP,
-pointer-authentication key, and system-context restore operations form a
-thirty-two-operation command-owned core-register admission domain.
+control, cache-selection, debug-trap-policy, thread-context, translation,
+baseline SIMD/FP, pointer-authentication key, and system-context restore
+operations form a thirty-three-operation command-owned core-register admission
+domain.
 Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose all ten restores
+setter failure. Borrowed and owned HVF boot sessions expose all eleven restores
 in this core domain and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
@@ -1916,9 +1920,11 @@ register-access trap booleans are captured through another value and correspond
 to host TDE/TDA-equivalent policy rather than guest EL1 register contents.
 Comparator validation only observes every reported pair on an idle vCPU without
 logging raw values, writes, enablement, trap changes, guest instructions, or
-guest execution. Debug-trap validation observes both booleans twice from an idle
-vCPU without assuming, comparing, or logging values, calling setters,
-activating debug behavior, or executing the guest. Cache-selection validation
+guest execution. Debug-trap validation captures the original pair from an idle
+vCPU, restores and recaptures that exact pair twice, and compares whole values
+without assuming or logging either Boolean, manufacturing a policy change,
+altering guest debug state, activating debug behavior, or executing the guest.
+Cache-selection validation
 captures the selector twice from an idle real vCPU, then restores and
 recaptures the first complete value twice through fixed whole-state messages.
 It does not assume or log a reset value, issue ISB, query CCSIDR, perform cache
@@ -1964,20 +1970,20 @@ derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The baseline and optional SVE/SME identification,
 SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register,
-breakpoint, watchpoint,
-debug-control, debug-trap, and physical-timer
+breakpoint, watchpoint, debug-control, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
 The core system-register, EL1 exception, execution-control, cache-selection,
-thread-context, and translation subsets plus system-context, baseline SIMD/FP,
-and pointer-authentication keys have paired ordered, nontransactional restore
-operations but likewise have no validation, schema, dependent-memory,
-maintenance, feature-transition, SVE/SME alias, or wider ordering policy.
+debug-trap policy, thread-context, and translation subsets plus system-context,
+baseline SIMD/FP, and pointer-authentication keys have paired ordered,
+nontransactional restore operations but likewise have no validation, schema,
+dependent-memory, maintenance, feature-transition, SVE/SME alias, or wider
+ordering policy.
 Identification capture is compatibility metadata rather than mutable restore
-state and defines no feature-mask or destination policy. Debug-control and
-debug-trap capture remain separate and
-define no feature, writable/status-bit, security, setter, trap-coordination,
-synchronization, or restore policy.
+state and defines no feature-mask or destination policy. Guest debug-control
+capture and host debug-trap capture/apply remain separate and define no joint
+feature, writable/status-bit, security, trap-coordination, synchronization, or
+composite restore policy.
 Cache-selection capture-order apply defines no atomic topology manifest,
 selector or destination validation, ISB/dependent CCSIDR visibility,
 maintenance, compatibility, persistence, rollback, schema, or portable restore
@@ -2383,7 +2389,9 @@ macOS design work instead of direct implementation:
   pairs as sensitive observation-only state. A thirteenth reads DFR0 first and
   captures only the implemented hardware-watchpoint value/control pairs under
   the same constraints. A fourteenth captures Hypervisor.framework's two raw
-  host debug-trap policy booleans without invoking either setter. A fifteenth
+  host debug-trap policy booleans and can reapply the complete pair, exception
+  policy first, without defining wider guest-debug ordering or destination
+  policy. A fifteenth
   captures optional macOS 15.2 ZFR0/SMFR0 compatibility metadata separately
   from the stable baseline. A sixteenth captures macOS 15.2+ `PSTATE.SM` and
   `PSTATE.ZA` through one runtime-resolved getter without calling its setter.
@@ -2414,12 +2422,14 @@ macOS design work instead of direct implementation:
   table and vector memory, optional CPACR and pointer-authentication feature
   validation, cache feature/geometry interpretation and masks, selector
   validation and maintenance, breakpoint and watchpoint control
-  validation, debug-trap policy validation/setters, protected key persistence,
-  and wider restore ordering remain outside these subsets. General-register,
-  core-system-register, exception-register, execution-control, and
-  thread-context and pointer-authentication restore report their typed failed register and completed-write
-  count; callers must retry the complete captured value or discard the vCPU
-  before execution.
+  validation, debug-trap destination policy and guest/host ordering, protected
+  key persistence, and remaining wider restore ordering remain outside these
+  subsets. General-register,
+  core-system-register, exception-register, execution-control, thread-context,
+  and pointer-authentication restore report their typed failed register and
+  completed-write count. Debug-trap restore instead reports the exact failed
+  host-policy operation and completed prefix without either Boolean; callers
+  must retry the complete captured value or discard the vCPU before execution.
   The runner can capture raw CNTKCTL_EL1, CNTP_CTL_EL0, CNTP_CVAL_EL0, and
   CNTP_TVAL_EL0 on the owning thread when macOS 15 physical-timer prerequisites
   are met. The absolute and relative views are read sequentially and do not
