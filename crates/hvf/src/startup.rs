@@ -1593,11 +1593,26 @@ impl HvfArm64BootSession<'_> {
     /// Capture CPU-level IRQ/FIQ pending state on the primary vCPU owner thread.
     ///
     /// HVF clears these per-run injection levels after a vCPU run returns.
-    /// This subset excludes GIC/device state and snapshot restore policy.
+    /// This subset has a paired low-level restore but excludes GIC/device state,
+    /// delivery policy, automatic per-run reassertion, and snapshot orchestration.
     pub fn capture_arm64_pending_interrupt_state(
         &self,
     ) -> Result<HvfArm64VcpuPendingInterruptState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_pending_interrupt_state()
+    }
+
+    /// Restore CPU-level IRQ/FIQ pending state on the primary vCPU owner thread.
+    ///
+    /// The IRQ-then-FIQ writes are nontransactional. Retry the complete value
+    /// or discard the session before execution after failure. HVF clears both
+    /// levels after a run; GIC/device composition, delivery/EOI, automatic
+    /// reassertion, persistence, schema, and snapshot orchestration remain
+    /// outside this primitive.
+    pub fn restore_arm64_pending_interrupt_state(
+        &self,
+        state: &HvfArm64VcpuPendingInterruptState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_pending_interrupt_state(state)
     }
 
     /// Capture opaque, versioned GIC device state while the primary runner is
@@ -2583,11 +2598,26 @@ impl OwnedHvfArm64BootSession {
     /// Capture CPU-level IRQ/FIQ pending state on the primary vCPU owner thread.
     ///
     /// HVF clears these per-run injection levels after a vCPU run returns.
-    /// This subset excludes GIC/device state and snapshot restore policy.
+    /// This subset has a paired low-level restore but excludes GIC/device state,
+    /// delivery policy, automatic per-run reassertion, and snapshot orchestration.
     pub fn capture_arm64_pending_interrupt_state(
         &self,
     ) -> Result<HvfArm64VcpuPendingInterruptState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_pending_interrupt_state()
+    }
+
+    /// Restore CPU-level IRQ/FIQ pending state on the primary vCPU owner thread.
+    ///
+    /// The IRQ-then-FIQ writes are nontransactional. Retry the complete value
+    /// or discard the session before execution after failure. HVF clears both
+    /// levels after a run; GIC/device composition, delivery/EOI, automatic
+    /// reassertion, persistence, schema, and snapshot orchestration remain
+    /// outside this primitive.
+    pub fn restore_arm64_pending_interrupt_state(
+        &self,
+        state: &HvfArm64VcpuPendingInterruptState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_pending_interrupt_state(state)
     }
 
     /// Capture opaque, versioned GIC device state while the primary runner is

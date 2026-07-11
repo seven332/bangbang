@@ -49,7 +49,10 @@ impl HvfInterruptType {
 /// Detached CPU-level IRQ/FIQ pending state captured from one arm64 vCPU.
 ///
 /// Hypervisor.framework clears these injection levels after a vCPU run
-/// returns. This value is not GIC/device state or a serialized snapshot schema.
+/// returns. The complete typed value can be reapplied through an owner-thread
+/// primitive before a run, but the two writes are nontransactional. This value
+/// is not GIC/device state, interrupt delivery policy, automatic per-run
+/// reassertion, or a serialized snapshot schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuPendingInterruptState {
     irq_pending: bool,
@@ -72,6 +75,63 @@ impl HvfArm64VcpuPendingInterruptState {
     /// Return whether the CPU FIQ level was pending.
     pub const fn fiq_pending(self) -> bool {
         self.fiq_pending
+    }
+}
+
+/// Failure while restoring one CPU-level arm64 pending-interrupt field.
+///
+/// Hypervisor.framework writes IRQ and FIQ levels separately and provides no
+/// batch transaction. Interrupt types before [`Self::failed_interrupt_type`]
+/// have already been written when this error is returned. Callers must retry
+/// the complete typed state or discard the vCPU before execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64VcpuPendingInterruptRestoreError {
+    failed_interrupt_type: HvfInterruptType,
+    completed_writes: usize,
+    source: BackendError,
+}
+
+impl HvfArm64VcpuPendingInterruptRestoreError {
+    const fn new(
+        failed_interrupt_type: HvfInterruptType,
+        completed_writes: usize,
+        source: BackendError,
+    ) -> Self {
+        Self {
+            failed_interrupt_type,
+            completed_writes,
+            source,
+        }
+    }
+
+    /// Return the pending-interrupt type whose setter failed.
+    pub const fn failed_interrupt_type(&self) -> HvfInterruptType {
+        self.failed_interrupt_type
+    }
+
+    /// Return the number of pending levels written before the failure.
+    pub const fn completed_writes(&self) -> usize {
+        self.completed_writes
+    }
+}
+
+impl fmt::Display for HvfArm64VcpuPendingInterruptRestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let interrupt_name = match self.failed_interrupt_type {
+            HvfInterruptType::Irq => "IRQ",
+            HvfInterruptType::Fiq => "FIQ",
+        };
+        write!(
+            f,
+            "failed to restore arm64 {interrupt_name} pending interrupt after {} successful writes: {}",
+            self.completed_writes, self.source
+        )
+    }
+}
+
+impl std::error::Error for HvfArm64VcpuPendingInterruptRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -3020,6 +3080,25 @@ pub(crate) fn capture_arm64_vcpu_pending_interrupt_state_with(
     ))
 }
 
+pub(crate) fn restore_arm64_vcpu_pending_interrupt_state_with(
+    state: &HvfArm64VcpuPendingInterruptState,
+    mut set_pending_interrupt: impl FnMut(HvfInterruptType, bool) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuPendingInterruptRestoreError> {
+    for (completed_writes, (interrupt_type, pending)) in [
+        (HvfInterruptType::Irq, state.irq_pending()),
+        (HvfInterruptType::Fiq, state.fiq_pending()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        set_pending_interrupt(interrupt_type, pending).map_err(|source| {
+            HvfArm64VcpuPendingInterruptRestoreError::new(interrupt_type, completed_writes, source)
+        })?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn capture_arm64_vcpu_simd_fp_state_with<R: ?Sized>(
     reader: &mut R,
     mut get_simd_fp_register: impl FnMut(&mut R, HvfSimdFpRegister) -> Result<[u8; 16], BackendError>,
@@ -3143,6 +3222,7 @@ mod tests {
         restore_arm64_vcpu_exception_register_state_with,
         restore_arm64_vcpu_execution_control_register_state_with,
         restore_arm64_vcpu_general_register_state_with,
+        restore_arm64_vcpu_pending_interrupt_state_with,
         restore_arm64_vcpu_pointer_authentication_key_state_with,
         restore_arm64_vcpu_simd_fp_state_with,
         restore_arm64_vcpu_system_context_register_state_with,
@@ -5844,6 +5924,85 @@ mod tests {
                 *reads.borrow(),
                 [HvfInterruptType::Irq, HvfInterruptType::Fiq]
             );
+        }
+    }
+
+    fn pending_interrupt_restore_test_state() -> super::HvfArm64VcpuPendingInterruptState {
+        super::HvfArm64VcpuPendingInterruptState::new(true, false)
+    }
+
+    #[test]
+    fn restores_arm64_pending_interrupt_state_in_irq_then_fiq_order() {
+        let state = pending_interrupt_restore_test_state();
+        let mut writes = Vec::new();
+
+        restore_arm64_vcpu_pending_interrupt_state_with(&state, |interrupt_type, pending| {
+            writes.push((interrupt_type, pending));
+            Ok(())
+        })
+        .expect("pending-interrupt restore should succeed");
+
+        assert_eq!(
+            writes,
+            [
+                (HvfInterruptType::Irq, true),
+                (HvfInterruptType::Fiq, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn arm64_pending_interrupt_restore_stops_after_each_error_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = pending_interrupt_restore_test_state();
+        let expected_writes = [
+            (HvfInterruptType::Irq, state.irq_pending()),
+            (HvfInterruptType::Fiq, state.fiq_pending()),
+        ];
+
+        for (failed_index, failed_type) in [HvfInterruptType::Irq, HvfInterruptType::Fiq]
+            .into_iter()
+            .enumerate()
+        {
+            let fail_next = Cell::new(true);
+            let writes = RefCell::new(Vec::new());
+            let set_pending_interrupt = |interrupt_type, pending| {
+                writes.borrow_mut().push((interrupt_type, pending));
+                if interrupt_type == failed_type && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake pending-interrupt restore failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error =
+                restore_arm64_vcpu_pending_interrupt_state_with(&state, &set_pending_interrupt)
+                    .expect_err("injected pending-interrupt write should fail");
+            assert_eq!(error.failed_interrupt_type(), failed_type);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake pending-interrupt restore failed".to_string())
+            );
+            let interrupt_name = match failed_type {
+                HvfInterruptType::Irq => "IRQ",
+                HvfInterruptType::Fiq => "FIQ",
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 {interrupt_name} pending interrupt after {failed_index} successful writes: invalid backend state: fake pending-interrupt restore failed"
+                )
+            );
+            assert_eq!(*writes.borrow(), expected_writes[..=failed_index]);
+
+            writes.borrow_mut().clear();
+            restore_arm64_vcpu_pending_interrupt_state_with(&state, &set_pending_interrupt)
+                .expect("complete pending-interrupt restore retry should succeed");
+            assert_eq!(*writes.borrow(), expected_writes);
         }
     }
 

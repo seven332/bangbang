@@ -53,7 +53,8 @@ authentication key-state capture with redacted `Debug`, raw cache-selection
 plus ordered nontransactional restore of its typed CSSELR_EL1 value,
 hardware-breakpoint, hardware-watchpoint, debug-control, debug-trap policy, and
 physical-timer CNTKCTL/control/CVAL/TVAL capture, a virtual-timer
-mask/offset/control/CVAL boundary, a bounded
+mask/offset/control/CVAL boundary, CPU-level IRQ/FIQ pending capture plus
+ordered nontransactional restore of its complete typed value, a bounded
 internal boot-session run-loop pump, owned internal boot-session handle,
 process-level owned
 startup-session wiring with optional serial capture and boot run-loop supervision
@@ -1620,9 +1621,10 @@ PPI INTIDs before writing `GICR_ISPENDR0` or `GICR_ICPENDR0` through
 converted to FDT PPI cells for the runtime timer node, and MSI/ITS metadata is
 intentionally absent until a later device path needs it.
 Separately, typed owner-thread HVF commands get or set CPU-level IRQ/FIQ pending
-injection levels. Those levels are not GIC state and HVF clears them after a
-vCPU run returns, so setting them is a per-run injection primitive rather than
-durable restore.
+injection levels, capture both in IRQ-then-FIQ order, and reapply the complete
+typed value in that same order. Those levels are not GIC state and HVF clears
+them after a vCPU run returns, so individual mutation and aggregate restore are
+pre-run injection primitives rather than durable delivery state.
 
 This still is not public guest startup. bangbang can now write an internal FDT
 payload, create an internal single-vCPU HVF arm64 boot session, read the primary
@@ -1644,9 +1646,9 @@ vCPU run, resolves a resulting MMIO exit, and dispatches or completes it through
 a caller-provided shared dispatcher. The virtual-timer commands expose HVF's
 explicit mask bit after `HV_EXIT_REASON_VTIMER_ACTIVATED`, its raw
 host-time-relative offset, and raw `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` values; CPU
-IRQ/FIQ commands expose pending injection levels; and GIC PPI
-pending commands can set or clear a validated timer PPI bit on the runner
-thread. The internal boot-session
+IRQ/FIQ commands expose and can reapply complete pending injection levels; and
+GIC PPI pending commands can set or clear a validated timer PPI bit on the
+runner thread. The internal boot-session
 run-loop now handles virtual timer exits by asserting the EL1 virtual timer PPI
 through that runner-thread command. Full timer delivery policy, including how to
 detect EOI/deactivation and unmask the HVF virtual timer, remains future work.
@@ -1734,7 +1736,7 @@ thirty-two-operation command-owned core-register admission domain.
 Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
 setter failure. Borrowed and owned HVF boot sessions expose all ten restores
-and all captures for later lease-owned orchestration.
+in this core domain and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
 `hv_sme_config_get_max_svl_bytes` and publishes the maximum streaming vector
@@ -1985,11 +1987,17 @@ destination validation, zeroization, protected persistence, rollback, or safe
 SCTLR enable ordering. The process snapshot barrier invokes none of these
 captures or restore operations.
 
-A separate failure-atomic command reads CPU IRQ then FIQ pending levels and is
-available through both boot-session forms. It shares generalized interrupt
-admission with individual IRQ/FIQ operations and GIC PPI mutation, but its
-two-field value does not represent distributor, redistributor, CPU-interface,
-or device interrupt state. It has no persistence or restore contract.
+A separate failure-atomic command reads CPU IRQ then FIQ pending levels. Its
+paired owner-thread restore writes the complete typed value in the same order
+through a value-free typed failure that reports the exact interrupt type and
+completed prefix. The two writes are nontransactional, so failure requires a
+complete retry or vCPU discard before execution. Both boot-session forms expose
+capture and restore under generalized interrupt admission with individual
+IRQ/FIQ operations and GIC PPI mutation. HVF clears both injection levels after
+a vCPU run returns, so one apply does not define automatic pre-run reassertion.
+The two-field value does not represent distributor, redistributor, CPU-
+interface, or device interrupt state and has no routing, delivery/EOI,
+persistence, schema, orchestration, or portable restore contract.
 
 Another command captures Hypervisor.framework's stable, versioned opaque GIC
 device-state bytes except GIC CPU system registers. State-object creation,

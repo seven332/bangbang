@@ -2530,7 +2530,7 @@ fn captures_runner_arm64_virtual_timer_state() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_runner_arm64_pending_interrupt_state() {
+fn captures_and_restores_runner_arm64_pending_interrupt_state() {
     use bangbang_hvf::{HvfBackend, HvfInterruptType};
     use bangbang_runtime::VmBackend;
 
@@ -2568,6 +2568,27 @@ fn captures_runner_arm64_pending_interrupt_state() {
             .expect("FIQ-only pending state should be captured");
         assert!(!fiq_only.irq_pending());
         assert!(fiq_only.fiq_pending());
+
+        runner
+            .restore_arm64_pending_interrupt_state(&irq_only)
+            .expect("IRQ-only pending state should be restored");
+        let restored = runner
+            .capture_arm64_pending_interrupt_state()
+            .expect("restored pending-interrupt state should be captured");
+        assert!(
+            restored == irq_only,
+            "restored pending-interrupt state should match its source"
+        );
+        runner
+            .restore_arm64_pending_interrupt_state(&irq_only)
+            .expect("IRQ-only pending state should be restored a second time");
+        let restored_again = runner
+            .capture_arm64_pending_interrupt_state()
+            .expect("twice-restored pending-interrupt state should be captured");
+        assert!(
+            restored_again == irq_only,
+            "twice-restored pending-interrupt state should match its source"
+        );
 
         runner
             .set_pending_interrupt(HvfInterruptType::Irq, false)
@@ -2904,9 +2925,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .capture_arm64_virtual_timer_state()
         .expect("internal session should capture virtual-timer state");
-    session
+    let pending_interrupt_state = session
         .capture_arm64_pending_interrupt_state()
         .expect("internal session should capture pending-interrupt state");
+    session
+        .restore_arm64_pending_interrupt_state(&pending_interrupt_state)
+        .expect("internal session should restore pending-interrupt state");
     assert!(
         !session
             .capture_gic_device_state()
@@ -3138,9 +3162,12 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_virtual_timer_state()
         .expect("owned session should capture virtual-timer state");
-    session
+    let pending_interrupt_state = session
         .capture_arm64_pending_interrupt_state()
         .expect("owned session should capture pending-interrupt state");
+    session
+        .restore_arm64_pending_interrupt_state(&pending_interrupt_state)
+        .expect("owned session should restore pending-interrupt state");
     assert!(
         !session
             .capture_gic_device_state()
