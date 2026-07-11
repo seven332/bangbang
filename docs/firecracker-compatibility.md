@@ -1694,6 +1694,14 @@ does not enter the core-register admission domain, and preserves missing-symbol,
 target, and exact HVF failures. This configuration maximum is only a future
 Z/P/ZA buffer-sizing prerequisite; it is not the effective SVL selected through
 `SMCR_EL1`, feature metadata, PSTATE, or any Z/P/ZA/ZT0 content.
+Another no-handle `HvfBackend::arm64_vcpu_cache_configuration()` query creates
+and releases a fresh macOS 11+ default vCPU configuration, reads raw `CTR_EL0`,
+`CLIDR_EL1`, and `DCZID_EL0` feature values in that order, and publishes only
+the complete detached value. It does not alter the null/default configuration
+used by vCPU creation or enter runner admission. The triple is separate from a
+live guest `CSSELR_EL1` selector and the instruction/data `CCSIDR_EL1` arrays;
+it defines no interpretation, feature mask, destination decision, cache
+maintenance, persistence, schema, or restore behavior.
 TPIDR values can contain
 guest TLS or kernel pointers; translation table bases, context ids, fault
 addresses, and the vector base are sensitive; pointer-authentication keys are
@@ -1777,8 +1785,13 @@ vCPU without assuming, comparing, or logging values, calling setters,
 activating debug behavior, or executing the guest. Cache-selection validation
 only reads the selector twice from an idle real vCPU; it does not assume a reset value, write
 CSSELR, issue ISB, query CCSIDR, perform cache maintenance, or run guest code.
-The selector is not cache topology: CTR/CLIDR/DCZID and instruction/data CCSIDR
-configuration manifests remain separate compatibility work.
+Default-cache-configuration validation queries CTR_EL0/CLIDR_EL1/DCZID_EL0
+twice before constructing a backend or VM and compares only through fixed
+messages without logging raw values. It creates/runs no vCPU, touches no live
+selector, queries no CCSIDR, performs no maintenance, and infers no topology or
+destination policy. The selector is not cache topology: the default feature
+triple is queried separately, while instruction/data CCSIDR geometry remains
+separate compatibility work.
 The SIMD getter uses an explicitly 16-byte-aligned HVF output value; the
 separate SME PSTATE observation determines whether streaming mode is active,
 where its Q values alias only the low 128 bits of Z registers. Neither value
@@ -2200,11 +2213,13 @@ macOS design work instead of direct implementation:
   a separate value whose `Debug` output redacts every register.
   An eighteenth captures raw macOS 15.2+ SCXTNUM_EL0 and SCXTNUM_EL1 in a
   separate value whose `Debug` output redacts both software context numbers.
-  Newer beta-only IDs, configuration-time feature manifests, feature masking,
-  destination policy, maximum SME streaming vector length, streaming
+  A separate pre-VM query captures raw default-configuration CTR_EL0,
+  CLIDR_EL1, and DCZID_EL0 feature metadata without changing vCPU creation.
+  Newer beta-only IDs, broader configuration-time feature manifests, feature
+  masking, destination policy, maximum SME streaming vector length, streaming
   Z/P/ZA/ZT0 data,
   table and vector memory, optional CPACR and pointer-authentication feature
-  validation, cache feature/CCSIDR manifests, selector validation and
+  validation, cache CCSIDR geometry and feature interpretation, selector validation and
   maintenance, breakpoint and watchpoint control
   validation, debug-trap policy validation/setters, protected key persistence,
   and restore ordering remain outside these subsets.

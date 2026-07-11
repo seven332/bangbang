@@ -11,6 +11,7 @@ mod runner;
 mod sme;
 mod startup;
 mod vcpu;
+mod vcpu_config;
 
 pub use backend::HvfBackend;
 pub use exit::{
@@ -59,3 +60,4 @@ pub use vcpu::{
     HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
     HvfSystemRegister, HvfVcpu,
 };
+pub use vcpu_config::HvfArm64VcpuCacheConfiguration;
