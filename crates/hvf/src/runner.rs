@@ -2072,7 +2072,7 @@ impl Drop for InFlightMetadataRead {
     }
 }
 
-/// Command-owned admission for one general or core system-register capture.
+/// Command-owned admission for one core-register capture command.
 struct InFlightCoreRegisterCapture {
     state: Option<RunnerState>,
 }

@@ -1647,9 +1647,9 @@ These commands reject overlapping metadata reads, runs, boot-register setup,
 MMIO dispatches, core-register capture, virtual-timer operations, or generalized
 interrupt operations. The general-register capture command returns only after
 X0-X30, PC, and CPSR have all been read. A second command reads raw `SP_EL0`,
-`SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. A third reads raw
-`TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. A fourth reads all 16 bytes of
-Q0-Q31 in ascending order, then raw FPCR and FPSR. The four commands share one
+`SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. A third reads all 16 bytes of
+Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
+`TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. The four commands share one
 command-owned core-register admission domain, publish no partial state after a
 read failure, and are exposed by borrowed and owned HVF boot sessions for later
 lease-owned orchestration. TPIDR values can contain guest TLS or kernel
@@ -2002,8 +2002,10 @@ macOS design work instead of direct implementation:
   owner-thread command, and can capture a separate raw SP_EL0, SP_EL1, ELR_EL1,
   and SPSR_EL1 subset through another command in the same core-register
   admission domain. A third command captures baseline Q0-Q31, FPCR, and FPSR
-  state under that admission, retaining every 128-bit Q value; streaming
-  SVE/SME state remains outside the subset. It also gets and sets the HVF
+  state under that admission, retaining every 128-bit Q value; a fourth
+  captures raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values while excluding
+  TPIDR2_EL0. Streaming SVE/SME state remains outside these subsets. It also
+  gets and sets the HVF
   virtual-timer mask, raw offset, raw control, and raw CVAL on that owning
   thread and can capture those fields through one serialized command. None of
   these subsets is a complete or portable restore model. The

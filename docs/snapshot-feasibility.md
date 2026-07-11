@@ -85,8 +85,8 @@ has no restore API, input validation, persistence, or snapshot-schema meaning.
 A third core-register command reads all 16 bytes of Q0-Q31 in ascending order,
 then raw FPCR and FPSR, and publishes one immutable baseline SIMD/FP value only
 after all 34 reads succeed. It shares the general/core-system/thread-context
-command-owned admission domain and is exposed through both boot-session forms without
-involving the supervisor lease or public snapshot paths. Hypervisor.framework
+command-owned admission domain and is exposed through both boot-session forms
+without involving the supervisor lease or public snapshot paths. Hypervisor.framework
 aliases Q registers to the low 128 bits of Z registers in streaming SVE mode;
 this subset therefore omits the wider SVE/SME state and defines no restore or
 snapshot-schema contract.
