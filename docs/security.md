@@ -241,8 +241,9 @@ is resource-specific:
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
   ACTLR_EL1/CPACR_EL1 execution controls, raw CSSELR_EL1 cache selection, raw
   hardware-breakpoint and hardware-watchpoint value/control pairs, raw
-  MDCCINT_EL1/MDSCR_EL1 debug controls, raw pointer-authentication keys, raw
-  TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1 values, raw Q0-Q31/FPCR/FPSR values, raw
+  MDCCINT_EL1/MDSCR_EL1 debug controls, raw Hypervisor.framework debug-trap
+  policy, raw pointer-authentication keys, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1
+  values, raw Q0-Q31/FPCR/FPSR values, raw
   physical-timer CNTKCTL/control/CVAL values, raw virtual-timer
   mask/offset/control/CVAL values, raw EL1
   SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
@@ -271,10 +272,14 @@ is resource-specific:
   status. The two-field getter does not enable debug behavior, but it is not a
   safe restore model: raw writes could activate monitor debug, software
   stepping, or debug communications behavior. Breakpoint and watchpoint
-  comparators are captured through separate values, but Hypervisor.framework's
-  debug-exception and debug-register-access trap settings are not. Any future
-  restore must validate features and writable/status bits, coordinate trap
-  policy and ordering, and treat restored debug controls as untrusted.
+  comparators are captured through separate values.
+  Hypervisor.framework's separate debug-exception and debug-register-access
+  booleans reveal whether guest debug exceptions and documented debug-register
+  accesses exit to the host. Their getter-only capture does not change policy
+  and is separate from guest debug-register contents. Any future restore must
+  treat both host trap settings and guest debug controls as untrusted, validate
+  features and writable/status bits, and coordinate policy and ordering before
+  introducing setters.
   Pointer-authentication keys are cryptographic secrets. Their detached value
   uses a custom `Debug` implementation that exposes only a redacted marker, and
   future persistence must protect key confidentiality and integrity. The opaque

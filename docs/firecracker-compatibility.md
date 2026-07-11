@@ -50,9 +50,10 @@ with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary,
 guest-visible identification-register metadata, pointer-authentication
 key-state capture with redacted `Debug`, raw cache-selection, hardware-
-breakpoint, hardware-watchpoint, debug-control, and physical-timer capture, a
-virtual-timer mask/offset/control/CVAL boundary, a bounded internal boot-session
-run-loop pump, owned internal boot-session handle, process-level owned
+breakpoint, hardware-watchpoint, debug-control, debug-trap policy, and physical-
+timer capture, a virtual-timer mask/offset/control/CVAL boundary, a bounded
+internal boot-session run-loop pump, owned internal boot-session handle,
+process-level owned
 startup-session wiring with optional serial capture and boot run-loop supervision
 across bounded step windows with retained internal worker status, process-owned
 virtio-net packet-I/O provider selection with no-op fallback and vmnet-backed
@@ -1669,19 +1670,21 @@ reads every implemented `DBGBVR<n>_EL1` / `DBGBCR<n>_EL1` pair in ascending
 order without writing or enabling debug state. A thirteenth reads
 `ID_AA64DFR0_EL1`, derives `WRPs + 1`, then reads every implemented
 `DBGWVR<n>_EL1` / `DBGWCR<n>_EL1` pair in ascending order under the same
-observation-only constraints. The thirteen commands share one command-owned
-core-register admission domain, publish no partial state after a read failure,
-and are exposed by borrowed and owned HVF boot sessions for later lease-owned
-orchestration.
+observation-only constraints. A fourteenth calls Hypervisor.framework's
+debug-exception trap getter then its debug-register-access trap getter, exposing
+the two host TDE/TDA-equivalent policy booleans without calling either setter.
+The fourteen commands share one command-owned core-register admission domain,
+publish no partial state after a read failure, and are exposed by borrowed and
+owned HVF boot sessions for later lease-owned orchestration.
 TPIDR values can contain
 guest TLS or kernel pointers; translation table bases, context ids, fault
 addresses, and the vector base are sensitive; pointer-authentication keys are
 cryptographic secrets; breakpoint values can reveal guest virtual addresses or
 identities; watchpoint values reveal guest data virtual addresses; comparator
-and debug controls are security-sensitive execution state; and the optional
-SME-era `TPIDR2_EL0` remains outside the baseline. The key value
-redacts all material from `Debug` but provides raw named accessors for trusted
-internal composition. Identification values describe the virtual CPU/HVF view,
+and debug controls plus host debug-trap policy are security-sensitive execution
+state; and the optional SME-era `TPIDR2_EL0` remains outside the baseline. The
+key value redacts all material from `Debug` but provides raw named accessors for
+trusted internal composition. Identification values describe the virtual CPU/HVF view,
 including bangbang's deterministic MPIDR affinity zero; they are not
 physical-host identity or a destination compatibility decision. The stable
 baseline omits macOS 15.2 SVE/SME IDs and newer beta-only IDs. The translation
@@ -1698,12 +1701,15 @@ model or claiming destination portability. Debug-control validation only reads
 both values from an idle real vCPU; it does not enable monitor debug, software
 stepping, debug exceptions, guest debug-register access, or DCC interrupts.
 Breakpoint and watchpoint comparators and their respective DFR0-reported counts
-are captured through separate values; HVF's separate debug-exception and debug-
-register-access trap booleans are not part of any of those values. Comparator
-validation only observes every reported pair on an idle vCPU without logging
-raw values, writes, enablement, trap changes, guest instructions, or guest
-execution. Cache-selection validation only reads the
-selector twice from an idle real vCPU; it does not assume a reset value, write
+are captured through separate values. HVF's separate debug-exception and debug-
+register-access trap booleans are captured through another value and correspond
+to host TDE/TDA-equivalent policy rather than guest EL1 register contents.
+Comparator validation only observes every reported pair on an idle vCPU without
+logging raw values, writes, enablement, trap changes, guest instructions, or
+guest execution. Debug-trap validation observes both booleans twice from an idle
+vCPU without assuming, comparing, or logging values, calling setters,
+activating debug behavior, or executing the guest. Cache-selection validation
+only reads the selector twice from an idle real vCPU; it does not assume a reset value, write
 CSSELR, issue ISB, query CCSIDR, perform cache maintenance, or run guest code.
 The selector is not cache topology: CTR/CLIDR/DCZID and instruction/data CCSIDR
 configuration manifests remain separate compatibility work.
@@ -1726,14 +1732,14 @@ derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The identification, core system-register, exception,
 execution-control, cache-selection, breakpoint, watchpoint, debug-control,
-translation, pointer-authentication, thread-context, baseline SIMD/FP, and
-physical-timer subsets are raw and read-only and likewise have no restore
-validation, snapshot schema, or Firecracker on-disk compatibility.
+debug-trap, translation, pointer-authentication, thread-context, baseline
+SIMD/FP, and physical-timer subsets are raw and read-only and likewise have no
+restore validation, snapshot schema, or Firecracker on-disk compatibility.
 Identification capture is compatibility
 metadata rather than mutable restore state and defines no feature-mask or
-destination policy. Debug-control capture is incomplete and defines no feature,
-writable/status-bit, security, trap-coordination, synchronization, or restore
-policy.
+destination policy. Debug-control and debug-trap capture remain separate and
+define no feature, writable/status-bit, security, setter, trap-coordination,
+synchronization, or restore policy.
 Cache-selection capture defines no topology manifest, selector validation,
 synchronization, maintenance, compatibility, or restore policy.
 Pointer-authentication capture additionally has no feature validation,
@@ -2111,13 +2117,14 @@ macOS design work instead of direct implementation:
   DFR0 first and captures only the implemented hardware-breakpoint value/control
   pairs as sensitive observation-only state. A thirteenth reads DFR0 first and
   captures only the implemented hardware-watchpoint value/control pairs under
-  the same constraints. Stable-baseline
-  optional SVE/SME IDs, newer beta-only IDs, feature masking, destination
+  the same constraints. A fourteenth captures Hypervisor.framework's two raw
+  host debug-trap policy booleans without invoking either setter. Stable-
+  baseline optional SVE/SME IDs, newer beta-only IDs, feature masking, destination
   policy, streaming SVE/SME state, table and vector memory, optional CPACR and
   pointer-authentication feature validation, cache feature/CCSIDR manifests,
   selector validation and maintenance, breakpoint and watchpoint control
-  validation, HVF debug trap configuration, protected key persistence, and
-  restore ordering remain outside these subsets.
+  validation, debug-trap policy validation/setters, protected key persistence,
+  and restore ordering remain outside these subsets.
   The runner can capture raw CNTKCTL_EL1,
   CNTP_CTL_EL0, and CNTP_CVAL_EL0 on the owning thread when macOS 15 physical-
   timer prerequisites are met. It also gets and sets the HVF virtual-timer mask,

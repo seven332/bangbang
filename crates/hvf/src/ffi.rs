@@ -200,6 +200,8 @@ mod imp {
             interrupt_type: HvInterruptType,
             pending: bool,
         ) -> HvReturn;
+        pub fn hv_vcpu_get_trap_debug_exceptions(vcpu: HvVcpu, value: *mut bool) -> HvReturn;
+        pub fn hv_vcpu_get_trap_debug_reg_accesses(vcpu: HvVcpu, value: *mut bool) -> HvReturn;
         pub fn hv_vcpu_get_reg(vcpu: HvVcpu, reg: HvReg, value: *mut u64) -> HvReturn;
         pub fn hv_vcpu_set_reg(vcpu: HvVcpu, reg: HvReg, value: u64) -> HvReturn;
         pub fn hv_vcpu_get_simd_fp_reg(
@@ -424,6 +426,36 @@ mod imp {
         }
     }
 
+    pub fn get_trap_debug_exceptions(vcpu: HvVcpu) -> Result<bool, BackendError> {
+        let mut value = false;
+
+        // SAFETY: The caller owns this current-thread vCPU handle, and `value` is a valid
+        // out-pointer for the duration of the call.
+        unsafe {
+            check(
+                hv_vcpu_get_trap_debug_exceptions(vcpu, &mut value),
+                "hv_vcpu_get_trap_debug_exceptions",
+            )?;
+        }
+
+        Ok(value)
+    }
+
+    pub fn get_trap_debug_reg_accesses(vcpu: HvVcpu) -> Result<bool, BackendError> {
+        let mut value = false;
+
+        // SAFETY: The caller owns this current-thread vCPU handle, and `value` is a valid
+        // out-pointer for the duration of the call.
+        unsafe {
+            check(
+                hv_vcpu_get_trap_debug_reg_accesses(vcpu, &mut value),
+                "hv_vcpu_get_trap_debug_reg_accesses",
+            )?;
+        }
+
+        Ok(value)
+    }
+
     pub fn get_simd_fp_reg(vcpu: HvVcpu, reg: HvSimdFpReg) -> Result<[u8; 16], BackendError> {
         let mut value = HvSimdFpValue::zeroed();
 
@@ -544,6 +576,17 @@ mod imp {
                 "hypervisor error: hv_vcpu_get_reg failed with HV_BAD_ARGUMENT (hv_return_t=0xfae94003)"
             );
         }
+
+        #[test]
+        fn check_displays_debug_trap_operation_hv_return() {
+            let err = check(HV_BAD_ARGUMENT, "hv_vcpu_get_trap_debug_exceptions")
+                .expect_err("HV_BAD_ARGUMENT should fail");
+
+            assert_eq!(
+                err.to_string(),
+                "hypervisor error: hv_vcpu_get_trap_debug_exceptions failed with HV_BAD_ARGUMENT (hv_return_t=0xfae94003)"
+            );
+        }
     }
 }
 
@@ -613,6 +656,14 @@ mod imp {
         _: HvInterruptType,
         _: bool,
     ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_trap_debug_exceptions(_: HvVcpu) -> Result<bool, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_trap_debug_reg_accesses(_: HvVcpu) -> Result<bool, BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 

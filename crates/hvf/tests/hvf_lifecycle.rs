@@ -794,6 +794,42 @@ fn captures_arm64_debug_control_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_arm64_debug_trap_state_on_runner_thread() {
+    use bangbang_hvf::HvfBackend;
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let first = runner
+            .capture_arm64_debug_trap_state()
+            .expect("first debug-trap state should be captured");
+        let second = runner
+            .capture_arm64_debug_trap_state()
+            .expect("second debug-trap state should be captured");
+
+        // Exercise both raw host-policy accessors without assuming or logging
+        // default values or treating observation as safe restore policy.
+        let _captured_values = [
+            first.trap_debug_exceptions(),
+            first.trap_debug_reg_accesses(),
+            second.trap_debug_exceptions(),
+            second.trap_debug_reg_accesses(),
+        ];
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_arm64_identification_registers_on_runner_thread() {
     use bangbang_hvf::{HvfArm64VcpuIdentificationRegisterState, HvfBackend};
     use bangbang_runtime::VmBackend;
@@ -1761,6 +1797,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .capture_arm64_debug_control_register_state()
         .expect("internal session should capture debug-control state");
     session
+        .capture_arm64_debug_trap_state()
+        .expect("internal session should capture debug-trap state");
+    session
         .capture_arm64_identification_register_state()
         .expect("internal session should capture identification-register state");
     session
@@ -1933,6 +1972,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_debug_control_register_state()
         .expect("owned session should capture debug-control state");
+    session
+        .capture_arm64_debug_trap_state()
+        .expect("owned session should capture debug-trap state");
     session
         .capture_arm64_identification_register_state()
         .expect("owned session should capture identification-register state");

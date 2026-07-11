@@ -23,17 +23,18 @@ use crate::psci::{
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
     HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
-    HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuExceptionRegisterState,
-    HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
-    HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
-    HvfArm64VcpuSimdFpState, HvfArm64VcpuThreadContextRegisterState,
-    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
-    HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
-    HvfSystemRegister, HvfVcpuOwner, capture_arm64_vcpu_breakpoint_register_state_with,
+    HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapState,
+    HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
+    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
+    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
+    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+    HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState, HvfInterruptType,
+    HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpuOwner,
+    capture_arm64_vcpu_breakpoint_register_state_with,
     capture_arm64_vcpu_cache_selection_register_state_with,
     capture_arm64_vcpu_core_system_register_state_with,
-    capture_arm64_vcpu_debug_control_register_state_with,
+    capture_arm64_vcpu_debug_control_register_state_with, capture_arm64_vcpu_debug_trap_state_with,
     capture_arm64_vcpu_exception_register_state_with,
     capture_arm64_vcpu_execution_control_register_state_with,
     capture_arm64_vcpu_general_register_state_with,
@@ -290,6 +291,10 @@ enum RunnerCommand {
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError>>,
     },
+    CaptureArm64DebugTrapState {
+        admission: InFlightCoreRegisterCapture,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuDebugTrapState, HvfVcpuRunnerError>>,
+    },
     CaptureArm64IdentificationRegisterState {
         admission: InFlightCoreRegisterCapture,
         response_sender:
@@ -483,6 +488,25 @@ trait RunnerVcpu {
         capture_arm64_vcpu_debug_control_register_state_with(|register| {
             self.read_system_register(register)
         })
+    }
+    fn get_trap_debug_exceptions(&mut self) -> Result<bool, BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support debug-exception trap reads",
+        ))
+    }
+    fn get_trap_debug_reg_accesses(&mut self) -> Result<bool, BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support debug-register-access trap reads",
+        ))
+    }
+    fn capture_arm64_debug_trap_state(
+        &mut self,
+    ) -> Result<HvfArm64VcpuDebugTrapState, BackendError> {
+        capture_arm64_vcpu_debug_trap_state_with(
+            self,
+            |vcpu| vcpu.get_trap_debug_exceptions(),
+            |vcpu| vcpu.get_trap_debug_reg_accesses(),
+        )
     }
     fn capture_arm64_identification_register_state(
         &mut self,
@@ -687,6 +711,14 @@ impl RunnerVcpu for RealRunnerVcpu {
 
     fn read_system_register(&mut self, register: HvfSystemRegister) -> Result<u64, BackendError> {
         self.owner.get_system_register(register)
+    }
+
+    fn get_trap_debug_exceptions(&mut self) -> Result<bool, BackendError> {
+        self.owner.get_trap_debug_exceptions()
+    }
+
+    fn get_trap_debug_reg_accesses(&mut self) -> Result<bool, BackendError> {
+        self.owner.get_trap_debug_reg_accesses()
     }
 
     fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
@@ -1017,6 +1049,22 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_debug_control_register_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Capture raw Hypervisor.framework arm64 debug-trap policy on the owner thread.
+    ///
+    /// The two getter-only booleans report whether guest debug exceptions and
+    /// debug-register accesses trap to the host. Capture does not call either
+    /// setter, activate debug behavior, persist state, or define restore policy.
+    pub fn capture_arm64_debug_trap_state(
+        &self,
+    ) -> Result<HvfArm64VcpuDebugTrapState, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_debug_trap_state_capture(response_sender)?;
 
         response_receiver
             .recv()
@@ -1832,6 +1880,19 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<(), HvfVcpuRunnerError> {
         self.start_core_register_capture(
             |admission, response_sender| RunnerCommand::CaptureArm64DebugControlRegisterState {
+                admission,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_debug_trap_state_capture(
+        &self,
+        response_sender: mpsc::Sender<Result<HvfArm64VcpuDebugTrapState, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_core_register_capture(
+            |admission, response_sender| RunnerCommand::CaptureArm64DebugTrapState {
                 admission,
                 response_sender,
             },
@@ -2939,6 +3000,19 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::CaptureArm64DebugTrapState {
+                mut admission,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .capture_arm64_debug_trap_state()
+                    .map_err(HvfVcpuRunnerError::Backend);
+                // Both owner-thread debug-trap policy reads have finished.
+                // Restore admission before response send so receiver failure
+                // is not part of the capture lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureArm64IdentificationRegisterState {
                 mut admission,
                 response_sender,
@@ -3342,14 +3416,14 @@ mod tests {
     use crate::vcpu::{
         HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
         HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
-        HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuExceptionRegisterState,
-        HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
-        HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
-        HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
-        HvfArm64VcpuSimdFpState, HvfArm64VcpuThreadContextRegisterState,
-        HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
-        HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
-        HvfSystemRegister,
+        HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapState,
+        HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
+        HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
+        HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
+        HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
+        HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+        HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState, HvfInterruptType,
+        HvfRegister, HvfSimdFpRegister, HvfSystemRegister,
     };
 
     const ESR_EC_HVC: u64 = 0x16;
@@ -3578,6 +3652,50 @@ mod tests {
         mpsc::Sender<Result<(), BackendError>>,
         mpsc::Receiver<()>,
     );
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DebugTrapStateRead {
+        DebugExceptions,
+        DebugRegisterAccesses,
+    }
+
+    struct DebugTrapStateCaptureRecordingVcpu {
+        read_sender: mpsc::Sender<DebugTrapStateRead>,
+        fail_next_read: Option<DebugTrapStateRead>,
+        trap_debug_exceptions: bool,
+        trap_debug_reg_accesses: bool,
+    }
+
+    struct BlockingDebugTrapStateCaptureVcpu {
+        entered_capture_sender: mpsc::Sender<()>,
+        release_capture_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnDebugTrapStateCaptureVcpu;
+
+    type BlockingDebugTrapStateCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    impl DebugTrapStateCaptureRecordingVcpu {
+        fn record_read(&mut self, read: DebugTrapStateRead) -> Result<(), BackendError> {
+            self.read_sender.send(read).map_err(|_| {
+                BackendError::InvalidState("fake debug-trap state read receiver closed")
+            })?;
+            if self.fail_next_read == Some(read) {
+                self.fail_next_read = None;
+                Err(BackendError::InvalidState(
+                    "fake debug-trap state capture failed",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     struct IdentificationRegisterCaptureRecordingVcpu {
         read_sender: mpsc::Sender<HvfSystemRegister>,
@@ -5304,6 +5422,128 @@ mod tests {
             _register: HvfSystemRegister,
         ) -> Result<u64, BackendError> {
             panic!("fake debug-control capture panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for DebugTrapStateCaptureRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_trap_debug_exceptions(&mut self) -> Result<bool, BackendError> {
+            self.record_read(DebugTrapStateRead::DebugExceptions)?;
+            Ok(self.trap_debug_exceptions)
+        }
+
+        fn get_trap_debug_reg_accesses(&mut self) -> Result<bool, BackendError> {
+            self.record_read(DebugTrapStateRead::DebugRegisterAccesses)?;
+            Ok(self.trap_debug_reg_accesses)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingDebugTrapStateCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_trap_debug_exceptions(&mut self) -> Result<bool, BackendError> {
+            self.entered_capture_sender.send(()).map_err(|_| {
+                BackendError::InvalidState("fake debug-trap state capture entry receiver closed")
+            })?;
+            self.release_capture_receiver.recv().map_err(|_| {
+                BackendError::InvalidState("fake debug-trap state capture release sender closed")
+            })??;
+            Ok(true)
+        }
+
+        fn get_trap_debug_reg_accesses(&mut self) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnDebugTrapStateCaptureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_trap_debug_exceptions(&mut self) -> Result<bool, BackendError> {
+            panic!("fake debug-trap state capture panic");
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -7538,6 +7778,22 @@ mod tests {
         assert_eq!(state.mdscr_el1(), debug_control_test_value(registers[1]));
     }
 
+    fn debug_trap_state_reads() -> [DebugTrapStateRead; 2] {
+        [
+            DebugTrapStateRead::DebugExceptions,
+            DebugTrapStateRead::DebugRegisterAccesses,
+        ]
+    }
+
+    fn assert_debug_trap_test_state(
+        state: HvfArm64VcpuDebugTrapState,
+        trap_debug_exceptions: bool,
+        trap_debug_reg_accesses: bool,
+    ) {
+        assert_eq!(state.trap_debug_exceptions(), trap_debug_exceptions);
+        assert_eq!(state.trap_debug_reg_accesses(), trap_debug_reg_accesses);
+    }
+
     fn identification_registers() -> [HvfSystemRegister; 11] {
         [
             HvfSystemRegister::MIDR_EL1,
@@ -7754,6 +8010,10 @@ mod tests {
         );
         assert_eq!(
             runner.capture_arm64_debug_control_register_state(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            runner.capture_arm64_debug_trap_state(),
             Err(expected.clone())
         );
         assert_eq!(
@@ -8393,6 +8653,51 @@ mod tests {
         )
     }
 
+    fn start_debug_trap_state_capture_recording_runner(
+        trap_debug_exceptions: bool,
+        trap_debug_reg_accesses: bool,
+        fail_next_read: Option<DebugTrapStateRead>,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<DebugTrapStateRead>) {
+        let (read_sender, read_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(DebugTrapStateCaptureRecordingVcpu {
+                read_sender,
+                fail_next_read,
+                trap_debug_exceptions,
+                trap_debug_reg_accesses,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            read_receiver,
+        )
+    }
+
+    fn start_blocking_debug_trap_state_capture_runner() -> BlockingDebugTrapStateCaptureRunner {
+        let (entered_capture_sender, entered_capture_receiver) = mpsc::channel();
+        let (release_capture_sender, release_capture_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingDebugTrapStateCaptureVcpu {
+                entered_capture_sender,
+                release_capture_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_capture_receiver,
+            release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
     fn start_identification_register_capture_recording_runner(
         fail_next_register: Option<HvfSystemRegister>,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<HvfSystemRegister>) {
@@ -8960,6 +9265,7 @@ mod tests {
         assert_send_sync::<HvfArm64VcpuCacheSelectionRegisterState>();
         assert_send_sync::<HvfArm64VcpuCoreSystemRegisterState>();
         assert_send_sync::<HvfArm64VcpuDebugControlRegisterState>();
+        assert_send_sync::<HvfArm64VcpuDebugTrapState>();
         assert_send_sync::<HvfArm64VcpuExceptionRegisterState>();
         assert_send_sync::<HvfArm64VcpuExecutionControlRegisterState>();
         assert_send_sync::<HvfArm64VcpuGeneralRegisterState>();
@@ -9388,6 +9694,54 @@ mod tests {
                 .expect("debug-control capture retry should succeed");
             assert_debug_control_register_test_state(state);
             assert_eq!(read_receiver.try_iter().collect::<Vec<_>>(), registers);
+            assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn captures_arm64_debug_trap_state_on_runner_thread() {
+        let (runner, read_receiver) =
+            start_debug_trap_state_capture_recording_runner(true, false, None);
+
+        let state = runner
+            .capture_arm64_debug_trap_state()
+            .expect("debug-trap state capture should succeed");
+
+        assert_debug_trap_test_state(state, true, false);
+        assert_eq!(
+            read_receiver.try_iter().collect::<Vec<_>>(),
+            debug_trap_state_reads()
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_arm64_debug_trap_state_capture_can_retry_without_partial_state() {
+        let reads = debug_trap_state_reads();
+
+        for (failed_index, failed_read) in reads.into_iter().enumerate() {
+            let (runner, read_receiver) =
+                start_debug_trap_state_capture_recording_runner(true, false, Some(failed_read));
+
+            assert_eq!(
+                runner.capture_arm64_debug_trap_state(),
+                Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                    "fake debug-trap state capture failed"
+                )))
+            );
+            assert_eq!(
+                read_receiver.try_iter().collect::<Vec<_>>(),
+                reads[..=failed_index]
+            );
+
+            let state = runner
+                .capture_arm64_debug_trap_state()
+                .expect("debug-trap state capture retry should succeed");
+            assert_debug_trap_test_state(state, true, false);
+            assert_eq!(read_receiver.try_iter().collect::<Vec<_>>(), reads);
             assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
             runner.shutdown().expect("runner should shut down");
@@ -11153,6 +11507,199 @@ mod tests {
 
         assert_eq!(
             runner.capture_arm64_debug_control_register_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn commands_during_arm64_debug_trap_state_capture_are_rejected_without_queueing() {
+        let (runner, entered_capture_receiver, release_capture_sender, _barrier_receiver) =
+            start_blocking_debug_trap_state_capture_runner();
+
+        thread::scope(|scope| {
+            let capture = scope.spawn(|| runner.capture_arm64_debug_trap_state());
+            entered_capture_receiver
+                .recv()
+                .expect("runner should enter fake debug-trap state capture");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE);
+            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_capture_sender
+                .send(Ok(()))
+                .expect("debug-trap state capture release should be sent");
+            let state = capture
+                .join()
+                .expect("debug-trap state capture thread should join")
+                .expect("debug-trap state capture should succeed");
+            assert_debug_trap_test_state(state, true, false);
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_debug_trap_state_capture_admitted_until_command_finishes() {
+        let (runner, entered_capture_receiver, release_capture_sender, barrier_receiver) =
+            start_blocking_debug_trap_state_capture_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_debug_trap_state_capture(response_sender)
+                .expect("debug-trap state capture should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_capture_receiver
+            .recv()
+            .expect("runner should enter fake debug-trap state capture");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CORE_REGISTER_CAPTURE_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind capture");
+        release_capture_sender
+            .send(Ok(()))
+            .expect("debug-trap state capture release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after capture");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn arm64_debug_trap_state_capture_send_failure_releases_admission() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.capture_arm64_debug_trap_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_debug_trap_state_capture_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (capture_response_sender, capture_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_debug_trap_state_capture(capture_response_sender)
+            .expect("debug-trap state capture should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(capture_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .core_register_capture_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_debug_trap_state_capture_panic() {
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnDebugTrapStateCaptureVcpu));
+
+        assert_eq!(
+            runner.capture_arm64_debug_trap_state(),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))

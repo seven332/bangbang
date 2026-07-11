@@ -438,6 +438,37 @@ impl HvfArm64VcpuDebugControlRegisterState {
     }
 }
 
+/// Detached Hypervisor.framework debug-trap policy captured from one arm64 vCPU.
+///
+/// These booleans mirror host `MDCR_EL2.TDE`- and `MDCR_EL2.TDA`-equivalent
+/// policy, not guest EL1 debug-register contents. They are observation-only
+/// inputs for later owner-thread orchestration and do not define validation,
+/// setter, persistence, snapshot-schema, or restore behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuDebugTrapState {
+    trap_debug_exceptions: bool,
+    trap_debug_reg_accesses: bool,
+}
+
+impl HvfArm64VcpuDebugTrapState {
+    pub(crate) const fn new(trap_debug_exceptions: bool, trap_debug_reg_accesses: bool) -> Self {
+        Self {
+            trap_debug_exceptions,
+            trap_debug_reg_accesses,
+        }
+    }
+
+    /// Return whether guest debug exceptions trap to the host.
+    pub const fn trap_debug_exceptions(self) -> bool {
+        self.trap_debug_exceptions
+    }
+
+    /// Return whether guest debug-register accesses trap to the host.
+    pub const fn trap_debug_reg_accesses(self) -> bool {
+        self.trap_debug_reg_accesses
+    }
+}
+
 /// Detached arm64 processor identification state captured from one vCPU.
 ///
 /// These guest-visible MIDR, MPIDR, and baseline `ID_AA64*` values describe
@@ -1104,6 +1135,14 @@ impl HvfVcpuOwner {
         crate::ffi::set_pending_interrupt(self.handle()?.vcpu, interrupt_type.raw(), pending)
     }
 
+    pub(crate) fn get_trap_debug_exceptions(&self) -> Result<bool, BackendError> {
+        crate::ffi::get_trap_debug_exceptions(self.handle()?.vcpu)
+    }
+
+    pub(crate) fn get_trap_debug_reg_accesses(&self) -> Result<bool, BackendError> {
+        crate::ffi::get_trap_debug_reg_accesses(self.handle()?.vcpu)
+    }
+
     pub(crate) fn configure_arm64_boot_registers(
         &mut self,
         registers: HvfArm64BootRegisters,
@@ -1534,6 +1573,20 @@ pub(crate) fn capture_arm64_vcpu_debug_control_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_debug_trap_state_with<R: ?Sized>(
+    reader: &mut R,
+    get_trap_debug_exceptions: impl FnOnce(&mut R) -> Result<bool, BackendError>,
+    get_trap_debug_reg_accesses: impl FnOnce(&mut R) -> Result<bool, BackendError>,
+) -> Result<HvfArm64VcpuDebugTrapState, BackendError> {
+    let trap_debug_exceptions = get_trap_debug_exceptions(reader)?;
+    let trap_debug_reg_accesses = get_trap_debug_reg_accesses(reader)?;
+
+    Ok(HvfArm64VcpuDebugTrapState::new(
+        trap_debug_exceptions,
+        trap_debug_reg_accesses,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_identification_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuIdentificationRegisterState, BackendError> {
@@ -1690,7 +1743,7 @@ mod tests {
         capture_arm64_vcpu_cache_selection_register_state_with,
         capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_debug_control_register_state_with,
-        capture_arm64_vcpu_exception_register_state_with,
+        capture_arm64_vcpu_debug_trap_state_with, capture_arm64_vcpu_exception_register_state_with,
         capture_arm64_vcpu_execution_control_register_state_with,
         capture_arm64_vcpu_general_register_state_with,
         capture_arm64_vcpu_identification_register_state_with,
@@ -1709,6 +1762,12 @@ mod tests {
     enum SimdFpRead {
         Q(HvfSimdFpRegister),
         Scalar(HvfRegister),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DebugTrapRead {
+        DebugExceptions,
+        DebugRegisterAccesses,
     }
 
     fn identification_registers() -> [HvfSystemRegister; 11] {
@@ -1918,6 +1977,14 @@ mod tests {
         );
         assert_eq!(
             vcpu.set_pending_interrupt(HvfInterruptType::Fiq, true),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.owner.get_trap_debug_exceptions(),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.owner.get_trap_debug_reg_accesses(),
             Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
         );
         assert_eq!(
@@ -2393,6 +2460,37 @@ mod tests {
         );
         assert_eq!(HvfSystemRegister::MDCCINT_EL1.raw(), 0x8010);
         assert_eq!(HvfSystemRegister::MDSCR_EL1.raw(), 0x8012);
+    }
+
+    #[test]
+    fn captures_arm64_debug_trap_state_in_documented_order() {
+        for (trap_debug_exceptions, trap_debug_reg_accesses) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut reads = Vec::new();
+            let state = capture_arm64_vcpu_debug_trap_state_with(
+                &mut reads,
+                |reads| {
+                    reads.push(DebugTrapRead::DebugExceptions);
+                    Ok(trap_debug_exceptions)
+                },
+                |reads| {
+                    reads.push(DebugTrapRead::DebugRegisterAccesses);
+                    Ok(trap_debug_reg_accesses)
+                },
+            )
+            .expect("debug-trap state capture should succeed");
+
+            assert_eq!(
+                reads,
+                [
+                    DebugTrapRead::DebugExceptions,
+                    DebugTrapRead::DebugRegisterAccesses,
+                ]
+            );
+            assert_eq!(state.trap_debug_exceptions(), trap_debug_exceptions);
+            assert_eq!(state.trap_debug_reg_accesses(), trap_debug_reg_accesses);
+        }
     }
 
     #[test]
@@ -2909,6 +3007,70 @@ mod tests {
                 u64::from(HvfSystemRegister::MDSCR_EL1.raw())
             );
             assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_debug_trap_state_capture_stops_after_each_error_and_can_retry() {
+        let expected_reads = [
+            DebugTrapRead::DebugExceptions,
+            DebugTrapRead::DebugRegisterAccesses,
+        ];
+
+        for (failed_index, failed_read) in expected_reads.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let mut reads = Vec::new();
+
+            let result = capture_arm64_vcpu_debug_trap_state_with(
+                &mut reads,
+                |reads| {
+                    reads.push(DebugTrapRead::DebugExceptions);
+                    if failed_read == DebugTrapRead::DebugExceptions && fail_next.replace(false) {
+                        Err(BackendError::InvalidState(
+                            "fake debug-trap state read failed",
+                        ))
+                    } else {
+                        Ok(true)
+                    }
+                },
+                |reads| {
+                    reads.push(DebugTrapRead::DebugRegisterAccesses);
+                    if failed_read == DebugTrapRead::DebugRegisterAccesses
+                        && fail_next.replace(false)
+                    {
+                        Err(BackendError::InvalidState(
+                            "fake debug-trap state read failed",
+                        ))
+                    } else {
+                        Ok(false)
+                    }
+                },
+            );
+
+            assert_eq!(
+                result,
+                Err(BackendError::InvalidState(
+                    "fake debug-trap state read failed"
+                ))
+            );
+            assert_eq!(reads, expected_reads[..=failed_index]);
+
+            reads.clear();
+            let state = capture_arm64_vcpu_debug_trap_state_with(
+                &mut reads,
+                |reads| {
+                    reads.push(DebugTrapRead::DebugExceptions);
+                    Ok(true)
+                },
+                |reads| {
+                    reads.push(DebugTrapRead::DebugRegisterAccesses);
+                    Ok(false)
+                },
+            )
+            .expect("debug-trap state capture retry should succeed");
+            assert!(state.trap_debug_exceptions());
+            assert!(!state.trap_debug_reg_accesses());
+            assert_eq!(reads, expected_reads);
         }
     }
 
