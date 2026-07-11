@@ -1672,6 +1672,20 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_gic_icc_register_state()
     }
 
+    /// Restore raw EL1 GIC ICC registers on the primary vCPU owner thread.
+    ///
+    /// Apply the compatible opaque GIC blob first. Nine mutable-register writes
+    /// are ordered around a derived `ICC_RPR_EL1` validation and are
+    /// nontransactional; no vCPU run may have been enqueued. Retry the complete
+    /// value or discard the session after a partial failure. This is not a wider
+    /// restore lease, persisted snapshot, or destination policy.
+    pub fn restore_arm64_gic_icc_register_state(
+        &self,
+        state: &HvfArm64GicIccRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_gic_icc_register_state(state)
+    }
+
     /// Run the boot session's primary vCPU once with runner-thread MMIO handling.
     ///
     /// This is runner-loop plumbing. It does not dispatch boot block or
@@ -2713,6 +2727,20 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_gic_icc_register_state()
+    }
+
+    /// Restore raw EL1 GIC ICC registers on the primary vCPU owner thread.
+    ///
+    /// Apply the compatible opaque GIC blob first. Nine mutable-register writes
+    /// are ordered around a derived `ICC_RPR_EL1` validation and are
+    /// nontransactional; no vCPU run may have been enqueued. Retry the complete
+    /// value or discard the session after a partial failure. This is not a wider
+    /// restore lease, persisted snapshot, or destination policy.
+    pub fn restore_arm64_gic_icc_register_state(
+        &self,
+        state: &HvfArm64GicIccRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_gic_icc_register_state(state)
     }
 
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {

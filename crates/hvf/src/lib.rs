@@ -21,10 +21,11 @@ pub use exit::{
     HvfSys64Direction, HvfSys64Exit, HvfSys64Register, HvfVcpuExit, HvfVcpuExitResolveError,
 };
 pub use gic::{
-    HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator,
-    HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata, HvfGicRedistributor, HvfGicRegion,
-    HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicTimerInterrupts,
-    HvfInterruptLineAllocationError,
+    HvfArm64GicIccRegister, HvfArm64GicIccRegisterRestoreError,
+    HvfArm64GicIccRegisterRestoreOperation, HvfArm64GicIccRegisterState, HvfGicDeviceState,
+    HvfGicError, HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata,
+    HvfGicMsiMetadata, HvfGicRedistributor, HvfGicRegion, HvfGicSpiSignalError, HvfGicSpiSignaler,
+    HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
 };
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};

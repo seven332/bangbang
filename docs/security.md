@@ -425,6 +425,17 @@ is resource-specific:
   followed by guest execution: discard the destination or use a future explicit
   recovery policy. The isolated command does not protect the later ICC, timer,
   pending-interrupt, vCPU, and device restore sequence from an intervening run.
+  The separate EL1 GIC ICC restore accepts the complete untrusted ten-register
+  capture, writes its nine architecturally mutable fields, and validates the
+  derived read-only RPR at the original capture position. Getter and setter
+  capabilities are both loaded before mutation. A typed error exposes only the
+  failed register, write-or-validation operation, completed-write count, and
+  backend source—not the captured or observed values. The writes are
+  nontransactional, so any failure requires complete retry or vCPU discard
+  before execution. The command enforces the sticky never-run gate, but trusts
+  the caller to apply a compatible opaque GIC blob first and releases admission
+  on return; it is not destination validation or a lease across the wider
+  restore sequence. Raw ICC values remain sensitive and must not be logged.
   The separate MIDR, MPIDR, PFR, DFR, ISAR, and MMFR baseline plus optional
   ZFR0/SMFR0 capture are read-only virtual-CPU/HVF compatibility metadata rather
   than mutable execution state, but they can fingerprint the exposed processor

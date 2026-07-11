@@ -54,7 +54,8 @@ nontransactional restore of the complete APIA/APIB/APDA/APDB/APGA value, raw
 physical and virtual timer state, CPU-level IRQ/FIQ pending injection
 levels plus ordered nontransactional restore of their complete typed value,
 opaque GIC device state plus runner-owned pre-first-run reapply, and raw EL1
-GIC ICC CPU-interface registers.
+GIC ICC CPU-interface registers plus ordered pre-first-run restore of their nine
+mutable values with derived RPR validation.
 A separate no-handle query exposes the maximum SME streaming vector length used
 for the Z-, P-, and ZA-register allocations. These are internal snapshot feasibility
 primitives only: public snapshot create/load and complete restore, a persistent schema,
