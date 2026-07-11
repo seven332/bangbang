@@ -342,7 +342,17 @@ is resource-specific:
   access remains restricted to trusted internal composition. Persistence
   requires confidentiality, integrity, zeroization, layout and effective-SVL
   policy, feature/destination validation, schema, and transition/restore
-  ordering coordinated with Z/P/FPSR and conditional ZT0, none of which exists.
+  ordering coordinated with Z/P/FPSR and conditional ZT0; none of those
+  persistence or restore policies exists.
+  The conditionally captured SME2 ZT0 register is sensitive guest execution and
+  potentially cryptographic state. Capture preflights `PSTATE.ZA` without
+  requiring `PSTATE.SM` or querying maximum SVL, then writes exactly 64 bytes
+  through a private 16-byte-aligned SDK value and publishes only after success.
+  The detached value redacts every byte from `Debug`; fixed-size raw access
+  remains restricted to trusted internal composition. Persistence requires
+  confidentiality, integrity, zeroization, SME2 feature and destination policy,
+  lane interpretation, schema, and transition/restore ordering coordinated with
+  Z/P/ZA/FPSR, none of which exists yet.
   The separately captured raw `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` values
   are mutable SME and thread-context state; `TPIDR2_EL0` can contain sensitive
   guest pointers. Their detached value redacts every register from `Debug`, and
