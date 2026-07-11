@@ -49,6 +49,25 @@ fn assert_sme_pstate_capture_supported_or_unavailable(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_sme_configuration_supported_or_unavailable(
+    result: Result<bangbang_hvf::HvfArm64SmeConfiguration, bangbang_runtime::BackendError>,
+) -> Result<Option<bangbang_hvf::HvfArm64SmeConfiguration>, bangbang_runtime::BackendError> {
+    use bangbang_runtime::BackendError;
+
+    match result {
+        Ok(configuration) => Ok(Some(configuration)),
+        Err(BackendError::Hypervisor(message)) => {
+            assert_eq!(
+                message,
+                "hv_sme_config_get_max_svl_bytes failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PHYSICAL_TIMER_GUEST_CODE: [u32; 9] = [
     0xd280_0060, // mov x0, #3
     0xd518_e100, // msr CNTKCTL_EL1, x0
@@ -268,6 +287,39 @@ fn test_rtc_mmio_layout() -> bangbang_runtime::rtc::RtcMmioLayout {
         bangbang_runtime::memory::GuestAddress::new(0x4000_1000),
         bangbang_runtime::mmio::MmioRegionId::new(3000),
     )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn queries_arm64_sme_configuration_before_vm_creation() {
+    use bangbang_hvf::HvfBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let first =
+        assert_sme_configuration_supported_or_unavailable(HvfBackend::arm64_sme_configuration())
+            .expect("first SME configuration query should succeed or report unsupported");
+    let second =
+        assert_sme_configuration_supported_or_unavailable(HvfBackend::arm64_sme_configuration())
+            .expect("second SME configuration query should succeed or report unsupported");
+
+    assert!(
+        first.is_some() == second.is_some(),
+        "SME configuration availability should remain stable on one host"
+    );
+    if let (Some(first), Some(second)) = (first, second) {
+        let first_max_svl_bytes = first.max_svl_bytes();
+        let second_max_svl_bytes = second.max_svl_bytes();
+        assert!(
+            first_max_svl_bytes == second_max_svl_bytes,
+            "maximum guest-usable SME SVL should remain stable on one host"
+        );
+        assert!(
+            first == second,
+            "SME configuration should remain stable on one host"
+        );
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

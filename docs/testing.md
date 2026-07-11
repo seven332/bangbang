@@ -126,6 +126,13 @@ and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
 must not hard-code one feature model, enable SVE/SME, enter streaming mode,
 read vector/predicate/matrix state, run the vCPU, or treat equality as a
 destination compatibility policy.
+SME configuration signed tests require macOS 15.2 and must query the maximum
+guest-usable SVL twice before creating a backend or VM. They may compare two
+successful same-host values without formatting or logging the byte length, or
+accept two exact raw `HV_UNSUPPORTED` results. A missing symbol, mixed result,
+or unrelated error must fail. Tests must not infer an effective `SMCR_EL1.LEN`,
+create or run a vCPU, change PSTATE or `SMCR_EL1`, read Z/P/ZA/ZT0 contents, or
+treat stability as feature or destination compatibility policy.
 SME PSTATE signed tests must runtime-resolve the macOS 15.2 getter and call it
 twice on one idle real vCPU. SME-capable hosts may compare same-vCPU results but
 must not assume or log `PSTATE.SM` or `PSTATE.ZA`. A missing pre-15.2 symbol or

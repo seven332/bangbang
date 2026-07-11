@@ -294,6 +294,13 @@ is resource-specific:
   and must not be mistaken for physical-host identity or a trusted destination
   compatibility decision. The optional IDs do not contain or protect streaming
   SVE/SME execution state.
+  The configuration-wide maximum SME streaming vector length is a read-only
+  HVF host capability, not guest data or mutable execution state. It can still
+  contribute to fingerprinting the exposed host capability and must not be
+  logged or persisted without a defined need. The scalar is only a future
+  buffer-sizing bound: it neither proves that a particular vCPU exposes SME nor
+  defines its effective `SMCR_EL1.LEN`, and it must not be trusted as a feature
+  or destination-compatibility decision.
   The separately captured SME `PSTATE.SM` and `PSTATE.ZA` flags are mutable
   guest execution-mode state. They reveal whether streaming mode and ZA storage
   are active, but contain none of the Z/P/ZA/ZT0 data. The getter is resolved at

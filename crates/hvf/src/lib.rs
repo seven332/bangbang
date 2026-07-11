@@ -8,6 +8,7 @@ mod memory;
 mod mmio;
 mod psci;
 mod runner;
+mod sme;
 mod startup;
 mod vcpu;
 
@@ -29,6 +30,7 @@ pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
 pub use runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
+pub use sme::HvfArm64SmeConfiguration;
 pub use startup::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootBlockNotificationDispatch,
     HvfArm64BootBlockNotificationDispatchError, HvfArm64BootBlockNotificationDispatches,
