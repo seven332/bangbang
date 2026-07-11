@@ -266,8 +266,16 @@ is resource-specific:
   order, and reports the failed `HvfSystemRegister`, completed prefix, and
   backend source without values. Stack and exception-return fields must not be
   treated as validated addresses or legal return state. After failure, callers
-  must retry the complete retained value or discard the vCPU before execution;
-  public snapshot load invokes neither restore primitive.
+  must retry the complete retained value or discard the vCPU before execution.
+  The paired EL1 exception-register restore extends that boundary to raw
+  `AFSR0_EL1`, `AFSR1_EL1`, `ESR_EL1`, `FAR_EL1`, `PAR_EL1`, and `VBAR_EL1`.
+  It writes only a complete typed capture in capture order and reports the
+  exact failed register, completed prefix, and backend source without values.
+  AFSR contents can be implementation-defined, report fields are not a
+  validated coherent exception, and address/vector fields are not validated
+  against guest memory. After failure, retry the complete retained value or
+  discard the vCPU before execution. Public snapshot load invokes none of the
+  three restore primitives.
   TPIDR fields can contain guest TLS or kernel pointers, and
   SIMD/FP bytes can contain guest application or cryptographic working data.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
