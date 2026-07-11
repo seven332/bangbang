@@ -27,9 +27,11 @@ use bangbang_api::http::{
     MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest,
     MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
     NetworkInterfacePatchRequest, PmemConfigRequest, PmemConfigResponse, PmemPatchRequest,
-    RequestError, SerialConfigRequest, SnapshotCreateRequest, SnapshotType, TokenBucketRequest,
-    VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
-    api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
+    RequestError, SerialConfigRequest, SnapshotCreateRequest, SnapshotLoadRequest,
+    SnapshotMemoryBackendType as ApiSnapshotMemoryBackendType, SnapshotType as ApiSnapshotType,
+    TokenBucketRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest,
+    VsockConfigResponse, api_request_metric_endpoint, parse_request_with_limit,
+    request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
     BalloonConfig, BalloonConfigInput, BalloonHintingStartInput, BalloonHintingStatus,
@@ -65,6 +67,11 @@ use bangbang_runtime::network::{
 };
 use bangbang_runtime::pmem::{PmemConfig, PmemConfigInput, PmemUpdateInput};
 use bangbang_runtime::serial::{SerialConfigInput, SerialRateLimiterConfig};
+use bangbang_runtime::snapshot::{
+    SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend,
+    SnapshotMemoryBackendType as RuntimeSnapshotMemoryBackendType, SnapshotNetworkOverride,
+    SnapshotType as RuntimeSnapshotType, SnapshotVsockOverride,
+};
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{
     HotUnplugDeviceInput, HotUnplugDeviceKind as RuntimeHotUnplugDeviceKind, VmConfiguration,
@@ -915,7 +922,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
             PatchApiRequest::pmem(pmem_update_input_from_request(config.as_ref())),
         )),
         ApiRequest::PutSnapshotCreate(config) => handle_snapshot_create_request(config, vmm),
-        ApiRequest::PutSnapshotLoad(_) => handle_snapshot_load_request(vmm),
+        ApiRequest::PutSnapshotLoad(config) => handle_snapshot_load_request(config, vmm),
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_put_request(PutApiRequest::vsock(
             vsock_config_input_from_request(config.as_ref()),
         ))),
@@ -997,13 +1004,71 @@ fn record_vm_state_latency(
     }
 }
 
+fn snapshot_type_from_request(snapshot_type: ApiSnapshotType) -> RuntimeSnapshotType {
+    match snapshot_type {
+        ApiSnapshotType::Full => RuntimeSnapshotType::Full,
+        ApiSnapshotType::Diff => RuntimeSnapshotType::Diff,
+    }
+}
+
+fn snapshot_memory_backend_type_from_request(
+    backend_type: ApiSnapshotMemoryBackendType,
+) -> RuntimeSnapshotMemoryBackendType {
+    match backend_type {
+        ApiSnapshotMemoryBackendType::File => RuntimeSnapshotMemoryBackendType::File,
+        ApiSnapshotMemoryBackendType::Uffd => RuntimeSnapshotMemoryBackendType::Uffd,
+    }
+}
+
+fn snapshot_create_input_from_request(request: &SnapshotCreateRequest) -> SnapshotCreateInput {
+    SnapshotCreateInput::new(
+        snapshot_type_from_request(request.snapshot_type()),
+        request.snapshot_path(),
+        request.mem_file_path(),
+    )
+}
+
+fn snapshot_load_input_from_request(request: &SnapshotLoadRequest) -> SnapshotLoadInput {
+    let mem_backend = request.mem_backend();
+    let network_overrides = request
+        .network_overrides()
+        .iter()
+        .map(|network_override| {
+            SnapshotNetworkOverride::new(
+                network_override.iface_id(),
+                network_override.host_dev_name(),
+            )
+        })
+        .collect();
+    let mut input = SnapshotLoadInput::new(
+        request.snapshot_path(),
+        SnapshotMemoryBackend::new(
+            mem_backend.backend_path(),
+            snapshot_memory_backend_type_from_request(mem_backend.backend_type()),
+        ),
+    )
+    .with_track_dirty_pages(request.track_dirty_pages())
+    .with_resume_vm(request.resume_vm())
+    .with_network_overrides(network_overrides)
+    .with_clock_realtime(request.clock_realtime())
+    .with_deprecated_fields_used(request.deprecated_fields_used());
+
+    if let Some(vsock_override) = request.vsock_override() {
+        input = input.with_vsock_override(SnapshotVsockOverride::new(vsock_override.uds_path()));
+    }
+
+    input
+}
+
 fn handle_snapshot_create_request(
     request: SnapshotCreateRequest,
     vmm: &mut impl VmmRequestHandler,
 ) -> HttpResponse {
     let snapshot_type = request.snapshot_type();
     let started = Instant::now();
-    let result = vmm.handle_action(VmmAction::CreateSnapshot);
+    let result = vmm.handle_action(VmmAction::CreateSnapshot(
+        snapshot_create_input_from_request(&request),
+    ));
     if matches!(&result, Err(VmmActionError::SnapshotUnsupported)) {
         record_snapshot_create_latency(
             snapshot_type,
@@ -1014,9 +1079,14 @@ fn handle_snapshot_create_request(
     handle_empty(result)
 }
 
-fn handle_snapshot_load_request(vmm: &mut impl VmmRequestHandler) -> HttpResponse {
+fn handle_snapshot_load_request(
+    request: SnapshotLoadRequest,
+    vmm: &mut impl VmmRequestHandler,
+) -> HttpResponse {
     let started = Instant::now();
-    let result = vmm.handle_action(VmmAction::LoadSnapshot);
+    let result = vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input_from_request(
+        &request,
+    )));
     if matches!(&result, Err(VmmActionError::SnapshotUnsupported)) {
         vmm.record_load_snapshot_latency_us(duration_as_micros_u64(started.elapsed()));
     }
@@ -1024,13 +1094,13 @@ fn handle_snapshot_load_request(vmm: &mut impl VmmRequestHandler) -> HttpRespons
 }
 
 fn record_snapshot_create_latency(
-    snapshot_type: SnapshotType,
+    snapshot_type: ApiSnapshotType,
     duration_us: u64,
     vmm: &mut impl VmmRequestHandler,
 ) {
     match snapshot_type {
-        SnapshotType::Full => vmm.record_full_create_snapshot_latency_us(duration_us),
-        SnapshotType::Diff => vmm.record_diff_create_snapshot_latency_us(duration_us),
+        ApiSnapshotType::Full => vmm.record_full_create_snapshot_latency_us(duration_us),
+        ApiSnapshotType::Diff => vmm.record_diff_create_snapshot_latency_us(duration_us),
     }
 }
 
@@ -6397,6 +6467,71 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_api_to_runtime_conversion_retains_and_redacts_every_field() {
+        let create_request = request_with_body(
+            "PUT",
+            "/snapshot/create",
+            r#"{"snapshot_type":"Diff","snapshot_path":"private-create-state","mem_file_path":"private-create-memory"}"#,
+        );
+        let create = parse_request_with_limit(create_request.as_bytes(), HTTP_MAX_PAYLOAD_SIZE)
+            .expect("snapshot create should parse");
+        let ApiRequest::PutSnapshotCreate(create) = create else {
+            panic!("expected snapshot create request");
+        };
+        let create = snapshot_create_input_from_request(&create);
+        assert_eq!(create.snapshot_type(), RuntimeSnapshotType::Diff);
+        assert_eq!(create.snapshot_path(), Path::new("private-create-state"));
+        assert_eq!(create.mem_file_path(), Path::new("private-create-memory"));
+
+        let load_request = request_with_body(
+            "PUT",
+            "/snapshot/load",
+            r#"{"snapshot_path":"private-load-state","mem_file_path":"private-load-memory","enable_diff_snapshots":true,"resume_vm":true,"network_overrides":[{"iface_id":"private-iface","host_dev_name":"private-host-device"}],"vsock_override":{"uds_path":"private-vsock"},"clock_realtime":true}"#,
+        );
+        let load = parse_request_with_limit(load_request.as_bytes(), HTTP_MAX_PAYLOAD_SIZE)
+            .expect("snapshot load should parse");
+        let ApiRequest::PutSnapshotLoad(load) = load else {
+            panic!("expected snapshot load request");
+        };
+        let load = snapshot_load_input_from_request(&load);
+        assert_eq!(load.snapshot_path(), Path::new("private-load-state"));
+        assert_eq!(
+            load.mem_backend().backend_path(),
+            Path::new("private-load-memory")
+        );
+        assert_eq!(
+            load.mem_backend().backend_type(),
+            RuntimeSnapshotMemoryBackendType::File
+        );
+        assert!(load.track_dirty_pages());
+        assert!(load.resume_vm());
+        assert!(load.deprecated_fields_used());
+        assert!(load.clock_realtime());
+        assert_eq!(load.network_overrides()[0].iface_id(), "private-iface");
+        assert_eq!(
+            load.network_overrides()[0].host_dev_name(),
+            "private-host-device"
+        );
+        assert_eq!(
+            load.vsock_override().map(SnapshotVsockOverride::uds_path),
+            Some(Path::new("private-vsock"))
+        );
+
+        let debug = format!("{create:?} {load:?}");
+        for private in [
+            "private-create-state",
+            "private-create-memory",
+            "private-load-state",
+            "private-load-memory",
+            "private-iface",
+            "private-host-device",
+            "private-vsock",
+        ] {
+            assert!(!debug.contains(private), "runtime Debug leaked {private:?}");
+        }
+    }
+
+    #[test]
     fn returns_fault_for_snapshot_endpoint() {
         let mut vmm = test_controller();
         for (socket_name, request, fault_message) in [
@@ -6405,7 +6540,7 @@ mod tests {
                 request_with_body(
                     "PUT",
                     "/snapshot/create",
-                    r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+                    r#"{"snapshot_type":"Diff","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
                 ),
                 "The requested operation is not supported in Not started state: CreateSnapshot",
             ),
@@ -6414,7 +6549,7 @@ mod tests {
                 request_with_body(
                     "PUT",
                     "/snapshot/load",
-                    r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+                    r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"}}"#,
                 ),
                 "Snapshot and restore are not supported.",
             ),
@@ -6467,7 +6602,7 @@ mod tests {
                 request_with_body(
                     "PUT",
                     "/snapshot/create",
-                    r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+                    r#"{"snapshot_type":"Diff","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
                 ),
                 "The requested operation is not supported in Running state: CreateSnapshot",
             ),
@@ -6476,7 +6611,7 @@ mod tests {
                 request_with_body(
                     "PUT",
                     "/snapshot/load",
-                    r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+                    r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"}}"#,
                 ),
                 "The requested operation is not supported in Running state: LoadSnapshot",
             ),
@@ -7642,11 +7777,11 @@ mod tests {
         for (socket_name, body) in [
             (
                 "scf",
-                r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+                r#"{"snapshot_path":"private-full-state-1254","mem_file_path":"private-full-memory-1254"}"#,
             ),
             (
                 "scd",
-                r#"{"snapshot_type":"Diff","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+                r#"{"snapshot_type":"Diff","snapshot_path":"private-diff-state-1254","mem_file_path":"private-diff-memory-1254"}"#,
             ),
         ] {
             let response = request_over_socket(
@@ -7673,6 +7808,19 @@ mod tests {
                 .is_none(),
             "create requests must not emit load_snapshot"
         );
+        let raw_metrics =
+            fs::read_to_string(&metrics_path).expect("metrics should remain readable");
+        for private_value in [
+            "private-full-state-1254",
+            "private-full-memory-1254",
+            "private-diff-state-1254",
+            "private-diff-memory-1254",
+        ] {
+            assert!(
+                !raw_metrics.contains(private_value),
+                "snapshot create metrics leaked {private_value:?}: {raw_metrics}"
+            );
+        }
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
@@ -7697,7 +7845,7 @@ mod tests {
             &request_with_body(
                 "PUT",
                 "/snapshot/load",
-                r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+                r#"{"snapshot_path":"private-load-state-1254","mem_backend":{"backend_path":"private-load-memory-1254","backend_type":"File"}}"#,
             ),
         );
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
@@ -7739,6 +7887,14 @@ mod tests {
                 .is_none(),
             "load requests must not emit diff snapshot latency"
         );
+        let raw_metrics =
+            fs::read_to_string(&metrics_path).expect("metrics should remain readable");
+        for private_value in ["private-load-state-1254", "private-load-memory-1254"] {
+            assert!(
+                !raw_metrics.contains(private_value),
+                "snapshot load metrics leaked {private_value:?}: {raw_metrics}"
+            );
+        }
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }

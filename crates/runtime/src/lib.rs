@@ -19,6 +19,7 @@ pub mod network;
 pub mod pmem;
 pub mod rtc;
 pub mod serial;
+pub mod snapshot;
 pub mod startup;
 pub(crate) mod token_bucket;
 pub mod virtio_mmio;
@@ -79,8 +80,8 @@ pub enum VmmAction {
     InstanceStart,
     Pause,
     Resume,
-    CreateSnapshot,
-    LoadSnapshot,
+    CreateSnapshot(snapshot::SnapshotCreateInput),
+    LoadSnapshot(snapshot::SnapshotLoadInput),
     FlushMetrics,
     GetBalloon,
     GetBalloonStats,
@@ -155,8 +156,8 @@ impl VmmAction {
             Self::InstanceStart => "InstanceStart",
             Self::Pause => "Pause",
             Self::Resume => "Resume",
-            Self::CreateSnapshot => "CreateSnapshot",
-            Self::LoadSnapshot => "LoadSnapshot",
+            Self::CreateSnapshot(_) => "CreateSnapshot",
+            Self::LoadSnapshot(_) => "LoadSnapshot",
             Self::FlushMetrics => "FlushMetrics",
             Self::GetBalloon => "GetBalloon",
             Self::GetBalloonStats => "GetBalloonStats",
@@ -188,6 +189,52 @@ impl VmmAction {
             Self::PutNetworkInterface(_) => "PutNetworkInterface",
             Self::UpdateNetworkInterface(_) => "UpdateNetworkInterface",
             Self::PutVsock(_) => "PutVsock",
+        }
+    }
+
+    const fn invalidates_snapshot_load_freshness(&self) -> bool {
+        match self {
+            Self::GetMmds
+            | Self::PutBalloon(_)
+            | Self::PutMemoryHotplug(_)
+            | Self::PutEntropy(_)
+            | Self::PutPmem(_)
+            | Self::PutBootSource(_)
+            | Self::PutCpuConfig(_)
+            | Self::PutMachineConfig(_)
+            | Self::PatchMachineConfig(_)
+            | Self::PutMmds(_)
+            | Self::PatchMmds(_)
+            | Self::PutMmdsConfig(_)
+            | Self::PutSerial(_)
+            | Self::PutDrive(_)
+            | Self::PutNetworkInterface(_)
+            | Self::PutVsock(_) => true,
+            Self::GetVmmVersion
+            | Self::GetVmInstanceInfo
+            | Self::GetMachineConfig
+            | Self::GetVmConfig
+            | Self::InstanceStart
+            | Self::Pause
+            | Self::Resume
+            | Self::CreateSnapshot(_)
+            | Self::LoadSnapshot(_)
+            | Self::FlushMetrics
+            | Self::GetBalloon
+            | Self::GetBalloonStats
+            | Self::GetBalloonHintingStatus
+            | Self::PatchBalloon(_)
+            | Self::PatchBalloonStats(_)
+            | Self::PatchBalloonHintingStart(_)
+            | Self::PatchBalloonHintingStop
+            | Self::GetMemoryHotplug
+            | Self::PatchMemoryHotplug(_)
+            | Self::PatchPmem(_)
+            | Self::PutLogger(_)
+            | Self::PutMetrics(_)
+            | Self::UpdateBlockDevice(_)
+            | Self::HotUnplugDevice(_)
+            | Self::UpdateNetworkInterface(_) => false,
         }
     }
 }
@@ -469,6 +516,7 @@ pub struct VmmController {
     logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
     mmds_state: mmds::MmdsStateHandle,
+    snapshot_load_history_fresh: bool,
 }
 
 impl VmmController {
@@ -514,6 +562,7 @@ impl VmmController {
             mmds_state: mmds::MmdsStateHandle::new(mmds::MmdsState::new(
                 mmds_data_store_limit_bytes,
             )),
+            snapshot_load_history_fresh: true,
         }
     }
 
@@ -811,15 +860,90 @@ impl VmmController {
         Ok(VmmData::Empty)
     }
 
-    pub fn preflight_create_snapshot(&self) -> Result<(), VmmActionError> {
+    fn snapshot_mmds_configured(&self) -> Result<bool, VmmActionError> {
+        self.mmds_state
+            .with(|state| state.config().is_some() || state.data_store_present())
+            .map_err(|_| VmmActionError::SnapshotUnsupported)
+    }
+
+    fn snapshot_v1_vm_profile(&self) -> Result<snapshot::SnapshotV1VmProfile, VmmActionError> {
+        let machine_config = self.machine_config;
+        let machine_supported = machine_config.vcpu_count() == 1
+            && !machine_config.smt()
+            && machine_config.cpu_template().is_none()
+            && !machine_config.track_dirty_pages()
+            && machine_config.huge_pages() == machine::MachineConfigHugePages::None;
+        let drive_supported = match self.drive_configs.as_slice() {
+            [drive] => drive.is_root_device() && drive.is_read_only(),
+            _ => false,
+        };
+        let mmds_configured = self.snapshot_mmds_configured()?;
+
+        Ok(snapshot::SnapshotV1VmProfile {
+            machine_supported,
+            drive_supported,
+            network_configured: !self.network_interface_configs.as_slice().is_empty(),
+            vsock_configured: self.vsock_config.is_some(),
+            pmem_configured: !self.pmem_configs.as_slice().is_empty(),
+            balloon_configured: self.balloon_config.is_some(),
+            memory_hotplug_configured: self.memory_hotplug_config.is_some(),
+            entropy_configured: self.entropy_config.is_some(),
+            mmds_configured,
+            serial_supported: self.serial_config == serial::SerialConfig::default(),
+        })
+    }
+
+    fn snapshot_v1_load_profile(&self) -> Result<snapshot::SnapshotV1LoadProfile, VmmActionError> {
+        Ok(snapshot::SnapshotV1LoadProfile {
+            machine_is_default: self.machine_config == machine::MachineConfig::default(),
+            boot_source_configured: self.boot_source_config.is_some(),
+            drive_configured: !self.drive_configs.as_slice().is_empty(),
+            network_configured: !self.network_interface_configs.as_slice().is_empty(),
+            vsock_configured: self.vsock_config.is_some(),
+            pmem_configured: !self.pmem_configs.as_slice().is_empty(),
+            balloon_configured: self.balloon_config.is_some(),
+            memory_hotplug_configured: self.memory_hotplug_config.is_some(),
+            entropy_configured: self.entropy_config.is_some(),
+            mmds_configured: self.snapshot_mmds_configured()?,
+            serial_is_default: self.serial_config == serial::SerialConfig::default(),
+        })
+    }
+
+    pub fn preflight_create_snapshot(
+        &self,
+        input: &snapshot::SnapshotCreateInput,
+    ) -> Result<(), VmmActionError> {
         if self.instance_info.state != InstanceState::Paused {
             return Err(VmmActionError::UnsupportedState {
-                action: VmmAction::CreateSnapshot.name(),
+                action: "CreateSnapshot",
                 state: self.instance_info.state,
             });
         }
 
-        Ok(())
+        snapshot::classify_v1_create_request(input)
+            .map_err(|_| VmmActionError::SnapshotUnsupported)?;
+        snapshot::classify_v1_create_profile(self.snapshot_v1_vm_profile()?)
+            .map_err(|_| VmmActionError::SnapshotUnsupported)
+    }
+
+    pub fn preflight_load_snapshot(
+        &self,
+        input: &snapshot::SnapshotLoadInput,
+    ) -> Result<(), VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "LoadSnapshot",
+                state: self.instance_info.state,
+            });
+        }
+
+        snapshot::classify_v1_load_request(input)
+            .map_err(|_| VmmActionError::SnapshotUnsupported)?;
+        snapshot::classify_v1_load_eligibility(
+            self.snapshot_load_history_fresh,
+            self.snapshot_v1_load_profile()?,
+        )
+        .map_err(|_| VmmActionError::SnapshotUnsupported)
     }
 
     #[track_caller]
@@ -1064,6 +1188,15 @@ impl VmmController {
     }
 
     pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+        let invalidates_snapshot_load_freshness = action.invalidates_snapshot_load_freshness();
+        let result = self.handle_action_inner(action);
+        if result.is_ok() && invalidates_snapshot_load_freshness {
+            self.snapshot_load_history_fresh = false;
+        }
+        result
+    }
+
+    fn handle_action_inner(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         let action_name = action.name();
         match action {
             VmmAction::GetVmmVersion => {
@@ -1097,18 +1230,12 @@ impl VmmController {
             }
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
-            VmmAction::CreateSnapshot => {
-                self.preflight_create_snapshot()?;
+            VmmAction::CreateSnapshot(input) => {
+                self.preflight_create_snapshot(&input)?;
                 Err(VmmActionError::SnapshotUnsupported)
             }
-            VmmAction::LoadSnapshot => {
-                if self.instance_info.state != InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
+            VmmAction::LoadSnapshot(input) => {
+                self.preflight_load_snapshot(&input)?;
                 Err(VmmActionError::SnapshotUnsupported)
             }
             VmmAction::FlushMetrics => {
@@ -1561,11 +1688,55 @@ mod tests {
         },
         pmem::{PmemConfigError, PmemConfigInput, PmemUpdateError, PmemUpdateInput},
         serial::{SerialConfigError, SerialConfigInput, SerialRateLimiterConfig},
+        snapshot::{
+            SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend,
+            SnapshotMemoryBackendType, SnapshotType,
+        },
         vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
     };
 
     fn drive_input(id: &str, path: &str, is_root_device: bool) -> DriveConfigInput {
         DriveConfigInput::new(id, id, path, is_root_device)
+    }
+
+    fn snapshot_create_input(snapshot_type: SnapshotType) -> SnapshotCreateInput {
+        SnapshotCreateInput::new(snapshot_type, "/private/state", "/private/memory")
+    }
+
+    fn snapshot_create_action(snapshot_type: SnapshotType) -> VmmAction {
+        VmmAction::CreateSnapshot(snapshot_create_input(snapshot_type))
+    }
+
+    fn snapshot_load_input() -> SnapshotLoadInput {
+        SnapshotLoadInput::new(
+            "/private/state",
+            SnapshotMemoryBackend::new("/private/memory", SnapshotMemoryBackendType::File),
+        )
+    }
+
+    fn snapshot_load_action() -> VmmAction {
+        VmmAction::LoadSnapshot(snapshot_load_input())
+    }
+
+    fn supported_snapshot_controller() -> VmmController {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutDrive(
+                drive_input("root", "/tmp/rootfs", true).with_is_read_only(true),
+            ))
+            .expect("read-only root drive should be stored");
+        controller
+    }
+
+    fn assert_snapshot_profile_rejected(configure: impl FnOnce(&mut VmmController)) {
+        let mut controller = supported_snapshot_controller();
+        configure(&mut controller);
+        controller.instance_info.state = InstanceState::Paused;
+
+        assert_eq!(
+            controller.preflight_create_snapshot(&snapshot_create_input(SnapshotType::Full)),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
     }
 
     fn network_input(id: &str, host_dev_name: &str) -> NetworkInterfaceConfigInput {
@@ -1983,8 +2154,11 @@ mod tests {
         assert_eq!(VmmAction::InstanceStart.name(), "InstanceStart");
         assert_eq!(VmmAction::Pause.name(), "Pause");
         assert_eq!(VmmAction::Resume.name(), "Resume");
-        assert_eq!(VmmAction::CreateSnapshot.name(), "CreateSnapshot");
-        assert_eq!(VmmAction::LoadSnapshot.name(), "LoadSnapshot");
+        assert_eq!(
+            snapshot_create_action(SnapshotType::Full).name(),
+            "CreateSnapshot"
+        );
+        assert_eq!(snapshot_load_action().name(), "LoadSnapshot");
         assert_eq!(VmmAction::FlushMetrics.name(), "FlushMetrics");
         assert_eq!(VmmAction::GetBalloon.name(), "GetBalloon");
         assert_eq!(VmmAction::GetBalloonStats.name(), "GetBalloonStats");
@@ -2205,13 +2379,13 @@ mod tests {
             .expect("boot source config should be stored");
 
         let err = controller
-            .handle_action(VmmAction::CreateSnapshot)
+            .handle_action(snapshot_create_action(SnapshotType::Diff))
             .expect_err("snapshot create should require paused state");
 
         assert_eq!(
             err,
             VmmActionError::UnsupportedState {
-                action: VmmAction::CreateSnapshot.name(),
+                action: snapshot_create_action(SnapshotType::Diff).name(),
                 state: InstanceState::NotStarted,
             }
         );
@@ -2228,13 +2402,13 @@ mod tests {
         controller.instance_info.state = InstanceState::Running;
 
         let err = controller
-            .handle_action(VmmAction::CreateSnapshot)
+            .handle_action(snapshot_create_action(SnapshotType::Diff))
             .expect_err("snapshot create should require paused state");
 
         assert_eq!(
             err,
             VmmActionError::UnsupportedState {
-                action: VmmAction::CreateSnapshot.name(),
+                action: snapshot_create_action(SnapshotType::Diff).name(),
                 state: InstanceState::Running,
             }
         );
@@ -2248,10 +2422,15 @@ mod tests {
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
             .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutDrive(
+                drive_input("root", "/tmp/rootfs", true).with_is_read_only(true),
+            ))
+            .expect("read-only root drive should be stored");
         controller.instance_info.state = InstanceState::Paused;
 
         let err = controller
-            .handle_action(VmmAction::CreateSnapshot)
+            .handle_action(snapshot_create_action(SnapshotType::Full))
             .expect_err("snapshot create should remain unsupported");
 
         assert_eq!(err, VmmActionError::SnapshotUnsupported);
@@ -2261,14 +2440,15 @@ mod tests {
 
     #[test]
     fn create_snapshot_preflight_matches_controller_state_policy() {
+        let unsupported_input = snapshot_create_input(SnapshotType::Diff);
         for state in [InstanceState::NotStarted, InstanceState::Running] {
             let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
             controller.instance_info.state = state;
 
             assert_eq!(
-                controller.preflight_create_snapshot(),
+                controller.preflight_create_snapshot(&unsupported_input),
                 Err(VmmActionError::UnsupportedState {
-                    action: VmmAction::CreateSnapshot.name(),
+                    action: snapshot_create_action(SnapshotType::Diff).name(),
                     state,
                 })
             );
@@ -2276,9 +2456,17 @@ mod tests {
         }
 
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutDrive(
+                drive_input("root", "/tmp/rootfs", true).with_is_read_only(true),
+            ))
+            .expect("read-only root drive should be stored");
         controller.instance_info.state = InstanceState::Paused;
 
-        assert_eq!(controller.preflight_create_snapshot(), Ok(()));
+        assert_eq!(
+            controller.preflight_create_snapshot(&snapshot_create_input(SnapshotType::Full)),
+            Ok(())
+        );
         assert_eq!(controller.instance_info().state, InstanceState::Paused);
     }
 
@@ -2290,7 +2478,7 @@ mod tests {
             .expect("boot source config should be stored");
 
         let err = controller
-            .handle_action(VmmAction::LoadSnapshot)
+            .handle_action(snapshot_load_action())
             .expect_err("snapshot load should remain unsupported");
 
         assert_eq!(err, VmmActionError::SnapshotUnsupported);
@@ -2307,20 +2495,300 @@ mod tests {
                 .expect("boot source config should be stored");
             controller.instance_info.state = state;
 
+            let unsupported_load = VmmAction::LoadSnapshot(SnapshotLoadInput::new(
+                "/private/state",
+                SnapshotMemoryBackend::new("/private/memory", SnapshotMemoryBackendType::Uffd),
+            ));
             let err = controller
-                .handle_action(VmmAction::LoadSnapshot)
+                .handle_action(unsupported_load.clone())
                 .expect_err("snapshot load should be pre-boot-only");
 
             assert_eq!(
                 err,
                 VmmActionError::UnsupportedState {
-                    action: VmmAction::LoadSnapshot.name(),
+                    action: unsupported_load.name(),
                     state,
                 }
             );
             assert_eq!(controller.instance_info().state, state);
             assert!(controller.boot_source_config().is_some());
         }
+    }
+
+    #[test]
+    fn snapshot_actions_redact_retained_values_in_debug() {
+        let create = VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+            SnapshotType::Full,
+            "/private/action-state",
+            "/private/action-memory",
+        ));
+        let load = VmmAction::LoadSnapshot(
+            SnapshotLoadInput::new(
+                "/private/load-state",
+                SnapshotMemoryBackend::new("/private/load-memory", SnapshotMemoryBackendType::File),
+            )
+            .with_network_overrides(vec![super::snapshot::SnapshotNetworkOverride::new(
+                "private-iface",
+                "private-host-device",
+            )])
+            .with_vsock_override(super::snapshot::SnapshotVsockOverride::new(
+                "/private/vsock",
+            )),
+        );
+        let debug = format!("{create:?} {load:?}");
+
+        for private in [
+            "/private/action-state",
+            "/private/action-memory",
+            "/private/load-state",
+            "/private/load-memory",
+            "private-iface",
+            "private-host-device",
+            "/private/vsock",
+        ] {
+            assert!(!debug.contains(private), "action Debug leaked {private:?}");
+        }
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn successful_vm_configuration_actions_make_snapshot_load_non_fresh() {
+        let actions = vec![
+            VmmAction::GetMmds,
+            VmmAction::PutBalloon(balloon_input(64, false)),
+            VmmAction::PutMemoryHotplug(memory_hotplug_config_input()),
+            VmmAction::PutEntropy(EntropyConfigInput::new()),
+            VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem")),
+            VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")),
+            VmmAction::PutCpuConfig(CpuConfigInput::noop()),
+            VmmAction::PutMachineConfig(MachineConfigInput::new(
+                DEFAULT_VCPU_COUNT,
+                DEFAULT_MEM_SIZE_MIB,
+            )),
+            VmmAction::PatchMachineConfig(MachineConfigPatchInput::new().with_mem_size_mib(256)),
+            VmmAction::PutMmds(mmds_content_input()),
+            VmmAction::PutSerial(SerialConfigInput::new()),
+            VmmAction::PutDrive(drive_input("root", "/tmp/rootfs", true)),
+            VmmAction::PutNetworkInterface(network_input("eth0", "tap0")),
+            VmmAction::PutVsock(vsock_input(MIN_GUEST_CID, "/tmp/vsock")),
+        ];
+
+        for action in actions {
+            let action_name = action.name();
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            assert!(controller.snapshot_load_history_fresh);
+            controller
+                .handle_action(action)
+                .unwrap_or_else(|err| panic!("{action_name} should succeed: {err}"));
+            assert!(
+                !controller.snapshot_load_history_fresh,
+                "{action_name} should invalidate snapshot load"
+            );
+            assert_eq!(
+                controller.preflight_load_snapshot(&snapshot_load_input()),
+                Err(VmmActionError::SnapshotUnsupported),
+                "{action_name} should make load ineligible"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_mmds_config_makes_snapshot_load_non_fresh() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .network_interface_configs
+            .insert(network_input("eth0", "tap0"))
+            .expect("network fixture should insert without an API action");
+
+        controller
+            .handle_action(VmmAction::PutMmdsConfig(mmds_config_input()))
+            .expect("MMDS config should succeed");
+
+        assert!(!controller.snapshot_load_history_fresh);
+        assert_eq!(
+            controller.preflight_load_snapshot(&snapshot_load_input()),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+
+        let mut patch_controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        patch_controller
+            .mmds_state
+            .with_mut(|state| state.put_data(mmds_content_input()))
+            .expect("MMDS fixture should lock")
+            .expect("MMDS fixture should initialize");
+        assert!(patch_controller.snapshot_load_history_fresh);
+        patch_controller
+            .handle_action(VmmAction::PatchMmds(mmds_content_input()))
+            .expect("MMDS patch should succeed");
+        assert!(!patch_controller.snapshot_load_history_fresh);
+    }
+
+    #[test]
+    fn logger_and_metrics_configuration_preserve_snapshot_load_freshness() {
+        let metrics_path = unique_metrics_path("snapshot-load-fresh");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        controller
+            .handle_action(VmmAction::PutLogger(LoggerConfigInput::new()))
+            .expect("logger config should succeed");
+        assert!(controller.snapshot_load_history_fresh);
+        assert_eq!(
+            controller.preflight_load_snapshot(&snapshot_load_input()),
+            Ok(())
+        );
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                metrics_path.clone(),
+            )))
+            .expect("metrics config should succeed");
+        assert!(controller.snapshot_load_history_fresh);
+        assert_eq!(
+            controller.preflight_load_snapshot(&snapshot_load_input()),
+            Ok(())
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn failed_configuration_preserves_snapshot_load_freshness_and_state() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let original_machine = controller.machine_config;
+
+        assert!(matches!(
+            controller.handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(
+                0,
+                DEFAULT_MEM_SIZE_MIB,
+            ))),
+            Err(VmmActionError::MachineConfig(_))
+        ));
+        assert_eq!(controller.machine_config, original_machine);
+        assert!(controller.snapshot_load_history_fresh);
+        assert_eq!(
+            controller.preflight_load_snapshot(&snapshot_load_input()),
+            Ok(())
+        );
+
+        assert!(matches!(
+            controller.handle_action(VmmAction::PutSerial(serial_input(""))),
+            Err(VmmActionError::SerialConfig(_))
+        ));
+        assert_eq!(
+            controller.serial_config,
+            super::serial::SerialConfig::default()
+        );
+        assert!(controller.snapshot_load_history_fresh);
+        assert_eq!(
+            controller.preflight_load_snapshot(&snapshot_load_input()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn failed_mmds_patch_residual_presence_makes_snapshot_load_ineligible() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        assert_eq!(
+            controller.preflight_load_snapshot(&snapshot_load_input()),
+            Ok(())
+        );
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PatchMmds(mmds_content_input())),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::NotInitialized
+            ))
+        );
+        assert!(controller.snapshot_load_history_fresh);
+        assert_eq!(
+            controller.mmds_state.with(MmdsState::data_store_present),
+            Ok(true)
+        );
+        assert_eq!(
+            controller.preflight_load_snapshot(&snapshot_load_input()),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+    }
+
+    #[test]
+    fn controller_native_v1_create_profile_is_fail_closed() {
+        let input = snapshot_create_input(SnapshotType::Full);
+        let mut supported = supported_snapshot_controller();
+        supported.instance_info.state = InstanceState::Paused;
+        assert_eq!(supported.preflight_create_snapshot(&input), Ok(()));
+        assert_eq!(
+            supported.preflight_create_snapshot(&snapshot_create_input(SnapshotType::Diff)),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+
+        let mut no_drive = VmmController::new("demo-1", "0.1.0", "bangbang");
+        no_drive.instance_info.state = InstanceState::Paused;
+        assert_eq!(
+            no_drive.preflight_create_snapshot(&input),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 128)))
+                .expect("two-vCPU machine config should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    drive_input("root", "/tmp/rootfs", true).with_is_read_only(false),
+                ))
+                .expect("writable root should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(drive_input("data", "/tmp/data", false)))
+                .expect("additional drive should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(network_input(
+                    "eth0", "tap0",
+                )))
+                .expect("network should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutVsock(vsock_input(
+                    MIN_GUEST_CID,
+                    "/tmp/vsock",
+                )))
+                .expect("vsock should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem")))
+                .expect("pmem should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutBalloon(balloon_input(64, false)))
+                .expect("balloon should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+                .expect("memory hotplug should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                .expect("entropy should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutMmds(mmds_content_input()))
+                .expect("MMDS data should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutSerial(serial_input("/tmp/serial")))
+                .expect("serial config should be stored");
+        });
     }
 
     #[test]

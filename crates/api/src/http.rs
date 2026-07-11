@@ -16,6 +16,7 @@ const TOKEN_BUCKET_REFILL_TIME_FIELD: &str = "refill_time";
 const MAX_MACHINE_CONFIG_VCPUS: u8 = 32;
 const ARM64_KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
 const ARM64_KVM_REG_SIZE_SHIFT: u32 = 52;
+const SNAPSHOT_VALUE_REDACTED: &str = "<redacted>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiRequest {
@@ -1901,31 +1902,177 @@ struct SnapshotCreateRequestBody {
     mem_file_path: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotCreateRequest {
     snapshot_type: SnapshotType,
+    snapshot_path: String,
+    mem_file_path: String,
 }
 
 impl SnapshotCreateRequest {
-    const fn new(snapshot_type: SnapshotType) -> Self {
-        Self { snapshot_type }
+    fn new(snapshot_type: SnapshotType, snapshot_path: String, mem_file_path: String) -> Self {
+        Self {
+            snapshot_type,
+            snapshot_path,
+            mem_file_path,
+        }
     }
 
-    pub const fn snapshot_type(self) -> SnapshotType {
+    pub const fn snapshot_type(&self) -> SnapshotType {
         self.snapshot_type
+    }
+
+    pub fn snapshot_path(&self) -> &str {
+        &self.snapshot_path
+    }
+
+    pub fn mem_file_path(&self) -> &str {
+        &self.mem_file_path
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl fmt::Debug for SnapshotCreateRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotCreateRequest")
+            .field("snapshot_type", &self.snapshot_type)
+            .field("snapshot_path", &SNAPSHOT_VALUE_REDACTED)
+            .field("mem_file_path", &SNAPSHOT_VALUE_REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum SnapshotMemoryBackendType {
+    File,
+    Uffd,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotMemoryBackend {
+    backend_path: String,
+    backend_type: SnapshotMemoryBackendType,
+}
+
+impl SnapshotMemoryBackend {
+    fn new(backend_path: String, backend_type: SnapshotMemoryBackendType) -> Self {
+        Self {
+            backend_path,
+            backend_type,
+        }
+    }
+
+    pub fn backend_path(&self) -> &str {
+        &self.backend_path
+    }
+
+    pub const fn backend_type(&self) -> SnapshotMemoryBackendType {
+        self.backend_type
+    }
+}
+
+impl fmt::Debug for SnapshotMemoryBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotMemoryBackend")
+            .field("backend_path", &SNAPSHOT_VALUE_REDACTED)
+            .field("backend_type", &self.backend_type)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotNetworkOverride {
+    iface_id: String,
+    host_dev_name: String,
+}
+
+impl SnapshotNetworkOverride {
+    fn new(iface_id: String, host_dev_name: String) -> Self {
+        Self {
+            iface_id,
+            host_dev_name,
+        }
+    }
+
+    pub fn iface_id(&self) -> &str {
+        &self.iface_id
+    }
+
+    pub fn host_dev_name(&self) -> &str {
+        &self.host_dev_name
+    }
+}
+
+impl fmt::Debug for SnapshotNetworkOverride {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotNetworkOverride")
+            .field("iface_id", &SNAPSHOT_VALUE_REDACTED)
+            .field("host_dev_name", &SNAPSHOT_VALUE_REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotVsockOverride {
+    uds_path: String,
+}
+
+impl SnapshotVsockOverride {
+    fn new(uds_path: String) -> Self {
+        Self { uds_path }
+    }
+
+    pub fn uds_path(&self) -> &str {
+        &self.uds_path
+    }
+}
+
+impl fmt::Debug for SnapshotVsockOverride {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotVsockOverride")
+            .field("uds_path", &SNAPSHOT_VALUE_REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotLoadRequest {
+    snapshot_path: String,
+    mem_backend: SnapshotMemoryBackend,
+    track_dirty_pages: bool,
+    resume_vm: bool,
+    network_overrides: Vec<SnapshotNetworkOverride>,
+    vsock_override: Option<SnapshotVsockOverride>,
+    clock_realtime: bool,
     deprecated_fields_used: bool,
 }
 
 impl SnapshotLoadRequest {
-    const fn new(deprecated_fields_used: bool) -> Self {
-        Self {
-            deprecated_fields_used,
-        }
+    pub fn snapshot_path(&self) -> &str {
+        &self.snapshot_path
+    }
+
+    pub const fn mem_backend(&self) -> &SnapshotMemoryBackend {
+        &self.mem_backend
+    }
+
+    pub const fn track_dirty_pages(&self) -> bool {
+        self.track_dirty_pages
+    }
+
+    pub const fn resume_vm(&self) -> bool {
+        self.resume_vm
+    }
+
+    pub fn network_overrides(&self) -> &[SnapshotNetworkOverride] {
+        &self.network_overrides
+    }
+
+    pub const fn vsock_override(&self) -> Option<&SnapshotVsockOverride> {
+        self.vsock_override.as_ref()
+    }
+
+    pub const fn clock_realtime(&self) -> bool {
+        self.clock_realtime
     }
 
     pub const fn deprecated_fields_used(&self) -> bool {
@@ -1933,17 +2080,32 @@ impl SnapshotLoadRequest {
     }
 }
 
-#[derive(Debug, Deserialize)]
-enum SnapshotMemBackendTypeRequestBody {
-    File,
-    Uffd,
+impl fmt::Debug for SnapshotLoadRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotLoadRequest")
+            .field("snapshot_path", &SNAPSHOT_VALUE_REDACTED)
+            .field("mem_backend", &self.mem_backend)
+            .field("track_dirty_pages", &self.track_dirty_pages)
+            .field("resume_vm", &self.resume_vm)
+            .field("network_overrides", &SNAPSHOT_VALUE_REDACTED)
+            .field(
+                "vsock_override",
+                &self
+                    .vsock_override
+                    .as_ref()
+                    .map(|_| SNAPSHOT_VALUE_REDACTED),
+            )
+            .field("clock_realtime", &self.clock_realtime)
+            .field("deprecated_fields_used", &self.deprecated_fields_used)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotMemBackendRequestBody {
     backend_path: String,
-    backend_type: SnapshotMemBackendTypeRequestBody,
+    backend_type: SnapshotMemoryBackendType,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3060,10 +3222,11 @@ fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError
         mem_file_path,
     } = serde_json::from_slice::<SnapshotCreateRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let _ = (snapshot_path, mem_file_path);
 
     Ok(ApiRequest::PutSnapshotCreate(SnapshotCreateRequest::new(
         snapshot_type,
+        snapshot_path,
+        mem_file_path,
     )))
 }
 
@@ -3086,38 +3249,40 @@ fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
     }
 
     let deprecated_fields_used = mem_file_path.is_some() || enable_diff_snapshots;
-
-    let _ = (
-        snapshot_path,
-        mem_file_path,
-        enable_diff_snapshots,
-        track_dirty_pages,
-        resume_vm,
-        clock_realtime,
-    );
-
-    if let Some(mem_backend) = mem_backend {
-        let SnapshotMemBackendRequestBody {
+    let mem_backend = match mem_backend {
+        Some(SnapshotMemBackendRequestBody {
             backend_path,
             backend_type,
-        } = mem_backend;
-        let _ = (backend_path, backend_type);
-    }
-    for network_override in network_overrides {
-        let SnapshotNetworkOverrideRequestBody {
-            iface_id,
-            host_dev_name,
-        } = network_override;
-        let _ = (iface_id, host_dev_name);
-    }
-    if let Some(vsock_override) = vsock_override {
-        let SnapshotVsockOverrideRequestBody { uds_path } = vsock_override;
-        let _ = uds_path;
-    }
+        }) => SnapshotMemoryBackend::new(backend_path, backend_type),
+        None => {
+            let Some(mem_file_path) = mem_file_path else {
+                return Err(RequestError::MalformedRequest);
+            };
+            SnapshotMemoryBackend::new(mem_file_path, SnapshotMemoryBackendType::File)
+        }
+    };
+    let network_overrides = network_overrides
+        .into_iter()
+        .map(
+            |SnapshotNetworkOverrideRequestBody {
+                 iface_id,
+                 host_dev_name,
+             }| SnapshotNetworkOverride::new(iface_id, host_dev_name),
+        )
+        .collect();
+    let vsock_override = vsock_override
+        .map(|SnapshotVsockOverrideRequestBody { uds_path }| SnapshotVsockOverride::new(uds_path));
 
-    Ok(ApiRequest::PutSnapshotLoad(SnapshotLoadRequest::new(
+    Ok(ApiRequest::PutSnapshotLoad(SnapshotLoadRequest {
+        snapshot_path,
+        mem_backend,
+        track_dirty_pages: enable_diff_snapshots || track_dirty_pages,
+        resume_vm,
+        network_overrides,
+        vsock_override,
+        clock_realtime,
         deprecated_fields_used,
-    )))
+    }))
 }
 
 fn parse_memory_hotplug_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -7593,6 +7758,8 @@ mod tests {
                 parse_request(&request),
                 Ok(ApiRequest::PutSnapshotCreate(SnapshotCreateRequest::new(
                     expected_type,
+                    "vmstate".to_string(),
+                    "memory".to_string(),
                 ))),
                 "{body}"
             );
@@ -7631,42 +7798,173 @@ mod tests {
 
     #[test]
     fn parses_valid_snapshot_load_requests() {
-        for (body, deprecated_fields_used) in [
+        for (
+            body,
+            backend_type,
+            deprecated_fields_used,
+            track_dirty_pages,
+            resume_vm,
+            clock_realtime,
+            expected_network_override,
+            expected_vsock_path,
+        ) in [
             (
                 r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+                SnapshotMemoryBackendType::File,
                 false,
+                false,
+                false,
+                false,
+                None,
+                None,
             ),
             (
                 r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"},"enable_diff_snapshots":true,"track_dirty_pages":true,"resume_vm":true,"clock_realtime":true}"#,
+                SnapshotMemoryBackendType::Uffd,
                 true,
+                true,
+                true,
+                true,
+                None,
+                None,
             ),
             (
                 r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"enable_diff_snapshots":false}"#,
+                SnapshotMemoryBackendType::File,
                 false,
+                false,
+                false,
+                false,
+                None,
+                None,
             ),
             (
                 r#"{"snapshot_path":"vmstate","mem_file_path":"memory","resume_vm":true}"#,
+                SnapshotMemoryBackendType::File,
                 true,
+                false,
+                true,
+                false,
+                None,
+                None,
             ),
             (
                 r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"tap0"}],"vsock_override":{"uds_path":"/tmp/v.sock"}}"#,
+                SnapshotMemoryBackendType::File,
                 false,
+                false,
+                false,
+                false,
+                Some(("eth0", "tap0")),
+                Some("/tmp/v.sock"),
             ),
             (
                 r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"tap0","unknown":true}],"vsock_override":{"uds_path":"/tmp/v.sock","unknown":true}}"#,
+                SnapshotMemoryBackendType::File,
                 false,
+                false,
+                false,
+                false,
+                Some(("eth0", "tap0")),
+                Some("/tmp/v.sock"),
             ),
         ] {
             let request = request_with_body("PUT", "/snapshot/load", body);
+            let parsed = parse_request(&request)
+                .unwrap_or_else(|err| panic!("valid snapshot load should parse: {body}: {err}"));
+            let ApiRequest::PutSnapshotLoad(parsed) = parsed else {
+                panic!("expected snapshot load request: {body}");
+            };
 
+            assert_eq!(parsed.snapshot_path(), "vmstate", "{body}");
+            assert_eq!(parsed.mem_backend().backend_path(), "memory", "{body}");
+            assert_eq!(parsed.mem_backend().backend_type(), backend_type, "{body}");
             assert_eq!(
-                parse_request(&request),
-                Ok(ApiRequest::PutSnapshotLoad(SnapshotLoadRequest::new(
-                    deprecated_fields_used
-                ))),
+                parsed.deprecated_fields_used(),
+                deprecated_fields_used,
+                "{body}"
+            );
+            assert_eq!(parsed.track_dirty_pages(), track_dirty_pages, "{body}");
+            assert_eq!(parsed.resume_vm(), resume_vm, "{body}");
+            assert_eq!(parsed.clock_realtime(), clock_realtime, "{body}");
+            assert_eq!(
+                parsed
+                    .network_overrides()
+                    .first()
+                    .map(|value| (value.iface_id(), value.host_dev_name())),
+                expected_network_override,
+                "{body}"
+            );
+            assert_eq!(
+                parsed.vsock_override().map(SnapshotVsockOverride::uds_path),
+                expected_vsock_path,
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn normalizes_snapshot_load_dirty_and_deprecated_fields() {
+        for (body, expected_dirty, expected_deprecated) in [
+            (
+                r#"{"snapshot_path":"state","mem_backend":{"backend_path":"memory","backend_type":"File"},"enable_diff_snapshots":true}"#,
+                true,
+                true,
+            ),
+            (
+                r#"{"snapshot_path":"state","mem_backend":{"backend_path":"memory","backend_type":"File"},"track_dirty_pages":true}"#,
+                true,
+                false,
+            ),
+            (
+                r#"{"snapshot_path":"state","mem_backend":{"backend_path":"memory","backend_type":"File"},"enable_diff_snapshots":false,"track_dirty_pages":false}"#,
+                false,
+                false,
+            ),
+        ] {
+            let parsed = parse_request(&request_with_body("PUT", "/snapshot/load", body))
+                .expect("snapshot load should parse");
+            let ApiRequest::PutSnapshotLoad(parsed) = parsed else {
+                panic!("expected snapshot load request");
+            };
+
+            assert_eq!(parsed.track_dirty_pages(), expected_dirty, "{body}");
+            assert_eq!(
+                parsed.deprecated_fields_used(),
+                expected_deprecated,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_request_debug_redacts_paths_and_override_values() {
+        let create = parse_request(&request_with_body(
+            "PUT",
+            "/snapshot/create",
+            r#"{"snapshot_path":"private-create-state","mem_file_path":"private-create-memory"}"#,
+        ))
+        .expect("snapshot create should parse");
+        let load = parse_request(&request_with_body(
+            "PUT",
+            "/snapshot/load",
+            r#"{"snapshot_path":"private-load-state","mem_backend":{"backend_path":"private-load-memory","backend_type":"File"},"network_overrides":[{"iface_id":"private-iface","host_dev_name":"private-host-device"}],"vsock_override":{"uds_path":"private-vsock"}}"#,
+        ))
+        .expect("snapshot load should parse");
+        let debug = format!("{create:?} {load:?}");
+
+        for private in [
+            "private-create-state",
+            "private-create-memory",
+            "private-load-state",
+            "private-load-memory",
+            "private-iface",
+            "private-host-device",
+            "private-vsock",
+        ] {
+            assert!(!debug.contains(private), "request Debug leaked {private:?}");
+        }
+        assert!(debug.contains(SNAPSHOT_VALUE_REDACTED));
     }
 
     #[test]

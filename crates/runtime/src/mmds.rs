@@ -1700,7 +1700,6 @@ impl MmdsState {
         self.config.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) const fn data_store_present(&self) -> bool {
         self.data_store_present
     }

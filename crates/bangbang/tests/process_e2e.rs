@@ -777,24 +777,62 @@ fn executable_rejects_invalid_logger_level_as_bad_configuration() {
 fn executable_rejects_snapshot_requests_without_mutating() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
+    let logger_path = test_dir.path().join("snapshot-requests.log");
+    let create_state_path = test_dir.path().join("secret-create.vmstate");
+    let create_memory_path = test_dir.path().join("secret-create.mem");
+    let load_state_path = test_dir.path().join("secret-load.vmstate");
+    let load_memory_path = test_dir.path().join("secret-load.mem");
+    let load_vsock_path = test_dir.path().join("secret-load.vsock");
+    let load_iface_id = "secret-load-iface";
+    let load_host_dev_name = "secret-load-host-device";
     let instance_id = test_dir.instance_id();
     let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let logger_body = format!(
+        r#"{{"log_path":{},"level":"Info","module":"bangbang_runtime::api_server"}}"#,
+        json_string(path_text(&logger_path))
+    );
+    let logger_response = http_put_json(&socket_path, "/logger", &logger_body);
+    assert_no_content_response(&logger_response, "PUT /logger before snapshot requests");
+
+    let create_body = format!(
+        r#"{{"snapshot_path":{},"mem_file_path":{}}}"#,
+        json_string(path_text(&create_state_path)),
+        json_string(path_text(&create_memory_path))
+    );
+    let load_body = format!(
+        r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"File"}},"network_overrides":[{{"iface_id":{},"host_dev_name":{}}}],"vsock_override":{{"uds_path":{}}}}}"#,
+        json_string(path_text(&load_state_path)),
+        json_string(path_text(&load_memory_path)),
+        json_string(load_iface_id),
+        json_string(load_host_dev_name),
+        json_string(path_text(&load_vsock_path))
+    );
 
     for (path, body, expected_fault, private_values) in [
         (
             "/snapshot/create",
-            r#"{"snapshot_path":"secret-create.vmstate","mem_file_path":"secret-create.mem"}"#,
+            create_body,
             r#"{"fault_message":"The requested operation is not supported in Not started state: CreateSnapshot"}"#,
-            &["secret-create.vmstate", "secret-create.mem"][..],
+            vec![
+                path_text(&create_state_path),
+                path_text(&create_memory_path),
+            ],
         ),
         (
             "/snapshot/load",
-            r#"{"snapshot_path":"secret-load.vmstate","mem_backend":{"backend_path":"secret-load.mem","backend_type":"File"}}"#,
+            load_body,
             r#"{"fault_message":"Snapshot and restore are not supported."}"#,
-            &["secret-load.vmstate", "secret-load.mem"][..],
+            vec![
+                path_text(&load_state_path),
+                path_text(&load_memory_path),
+                load_iface_id,
+                load_host_dev_name,
+                path_text(&load_vsock_path),
+            ],
         ),
     ] {
-        let response = http_put_json(&socket_path, path, body);
+        let response = http_put_json(&socket_path, path, &body);
 
         assert_bad_request_response(&response, path);
         assert_response_contains(&response, expected_fault, path);
@@ -806,6 +844,20 @@ fn executable_rejects_snapshot_requests_without_mutating() {
         }
     }
 
+    for requested_path in [
+        &create_state_path,
+        &create_memory_path,
+        &load_state_path,
+        &load_memory_path,
+        &load_vsock_path,
+    ] {
+        assert!(
+            !requested_path.exists(),
+            "rejected snapshot request must not create {}",
+            requested_path.display()
+        );
+    }
+
     let instance_info = http_get(&socket_path, "/");
     assert_ok_response(&instance_info, "GET / after rejected snapshots");
     assert_response_contains(
@@ -814,7 +866,43 @@ fn executable_rejects_snapshot_requests_without_mutating() {
         "GET / after rejected snapshots",
     );
 
-    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+    let logger_output =
+        fs::read_to_string(&logger_path).expect("snapshot logger should be readable");
+    assert!(logger_output.contains("\"/snapshot/create\""));
+    assert!(logger_output.contains("\"/snapshot/load\""));
+    for private_value in [
+        path_text(&create_state_path),
+        path_text(&create_memory_path),
+        path_text(&load_state_path),
+        path_text(&load_memory_path),
+        load_iface_id,
+        load_host_dev_name,
+        path_text(&load_vsock_path),
+    ] {
+        assert!(
+            !logger_output.contains(private_value),
+            "snapshot request logging must not include {private_value:?}: {logger_output}"
+        );
+    }
+
+    let output = bangbang.terminate();
+    for private_value in [
+        path_text(&create_state_path),
+        path_text(&create_memory_path),
+        path_text(&load_state_path),
+        path_text(&load_memory_path),
+        load_iface_id,
+        load_host_dev_name,
+        path_text(&load_vsock_path),
+    ] {
+        assert!(
+            !output.stdout.contains(private_value) && !output.stderr.contains(private_value),
+            "snapshot request output must not include {private_value:?}; stdout:\n{}\nstderr:\n{}",
+            output.stdout,
+            output.stderr
+        );
+    }
+    assert_clean_shutdown(output, &socket_path, "bangbang");
 }
 
 #[test]
