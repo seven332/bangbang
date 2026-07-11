@@ -782,6 +782,9 @@ fn executable_rejects_snapshot_requests_without_mutating() {
     let create_memory_path = test_dir.path().join("secret-create.mem");
     let load_state_path = test_dir.path().join("secret-load.vmstate");
     let load_memory_path = test_dir.path().join("secret-load.mem");
+    let load_vsock_path = test_dir.path().join("secret-load.vsock");
+    let load_iface_id = "secret-load-iface";
+    let load_host_dev_name = "secret-load-host-device";
     let instance_id = test_dir.instance_id();
     let bangbang = BangbangProcess::start(&socket_path, &instance_id);
 
@@ -798,9 +801,12 @@ fn executable_rejects_snapshot_requests_without_mutating() {
         json_string(path_text(&create_memory_path))
     );
     let load_body = format!(
-        r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"File"}}}}"#,
+        r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"File"}},"network_overrides":[{{"iface_id":{},"host_dev_name":{}}}],"vsock_override":{{"uds_path":{}}}}}"#,
         json_string(path_text(&load_state_path)),
-        json_string(path_text(&load_memory_path))
+        json_string(path_text(&load_memory_path)),
+        json_string(load_iface_id),
+        json_string(load_host_dev_name),
+        json_string(path_text(&load_vsock_path))
     );
 
     for (path, body, expected_fault, private_values) in [
@@ -808,7 +814,7 @@ fn executable_rejects_snapshot_requests_without_mutating() {
             "/snapshot/create",
             create_body,
             r#"{"fault_message":"The requested operation is not supported in Not started state: CreateSnapshot"}"#,
-            [
+            vec![
                 path_text(&create_state_path),
                 path_text(&create_memory_path),
             ],
@@ -817,7 +823,13 @@ fn executable_rejects_snapshot_requests_without_mutating() {
             "/snapshot/load",
             load_body,
             r#"{"fault_message":"Snapshot and restore are not supported."}"#,
-            [path_text(&load_state_path), path_text(&load_memory_path)],
+            vec![
+                path_text(&load_state_path),
+                path_text(&load_memory_path),
+                load_iface_id,
+                load_host_dev_name,
+                path_text(&load_vsock_path),
+            ],
         ),
     ] {
         let response = http_put_json(&socket_path, path, &body);
@@ -837,6 +849,7 @@ fn executable_rejects_snapshot_requests_without_mutating() {
         &create_memory_path,
         &load_state_path,
         &load_memory_path,
+        &load_vsock_path,
     ] {
         assert!(
             !requested_path.exists(),
@@ -862,6 +875,9 @@ fn executable_rejects_snapshot_requests_without_mutating() {
         path_text(&create_memory_path),
         path_text(&load_state_path),
         path_text(&load_memory_path),
+        load_iface_id,
+        load_host_dev_name,
+        path_text(&load_vsock_path),
     ] {
         assert!(
             !logger_output.contains(private_value),
@@ -875,6 +891,9 @@ fn executable_rejects_snapshot_requests_without_mutating() {
         path_text(&create_memory_path),
         path_text(&load_state_path),
         path_text(&load_memory_path),
+        load_iface_id,
+        load_host_dev_name,
+        path_text(&load_vsock_path),
     ] {
         assert!(
             !output.stdout.contains(private_value) && !output.stderr.contains(private_value),
