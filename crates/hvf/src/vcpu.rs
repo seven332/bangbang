@@ -1017,6 +1017,76 @@ impl fmt::Debug for HvfArm64VcpuSmeZaRegisterState {
     }
 }
 
+/// Error while capturing the SME2 ZT0 register from one arm64 vCPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfArm64VcpuSmeZt0RegisterCaptureError {
+    /// Hypervisor.framework or compile-target failure.
+    Backend(BackendError),
+    /// `PSTATE.ZA` was disabled, so the SDK forbids a ZT0-register read.
+    ZaStorageDisabled,
+}
+
+impl fmt::Display for HvfArm64VcpuSmeZt0RegisterCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(source) => write!(f, "{source}"),
+            Self::ZaStorageDisabled => {
+                f.write_str("cannot capture the SME ZT0 register while ZA storage is disabled")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64VcpuSmeZt0RegisterCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend(source) => Some(source),
+            Self::ZaStorageDisabled => None,
+        }
+    }
+}
+
+impl From<BackendError> for HvfArm64VcpuSmeZt0RegisterCaptureError {
+    fn from(source: BackendError) -> Self {
+        Self::Backend(source)
+    }
+}
+
+/// Detached raw SME2 ZT0-register contents captured from one arm64 vCPU.
+///
+/// Hypervisor.framework exposes ZT0 as a fixed 64-byte register that requires
+/// `PSTATE.ZA` but not `PSTATE.SM`; its size is independent of maximum or
+/// effective SVL. These bytes are sensitive guest execution and potentially
+/// cryptographic state, so `Debug` redacts them. Z, P, ZA, setters, lane
+/// interpretation, persistence, encryption, snapshot schema, and restore
+/// ordering remain outside this getter-only value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64VcpuSmeZt0RegisterState {
+    bytes: [u8; 64],
+}
+
+impl HvfArm64VcpuSmeZt0RegisterState {
+    /// Fixed ZT0-register size defined by the Hypervisor.framework SDK.
+    pub const BYTE_COUNT: usize = 64;
+
+    const fn new(bytes: [u8; Self::BYTE_COUNT]) -> Self {
+        Self { bytes }
+    }
+
+    /// Return the complete fixed-size raw ZT0-register bytes.
+    pub const fn as_bytes(&self) -> &[u8; Self::BYTE_COUNT] {
+        &self.bytes
+    }
+}
+
+impl fmt::Debug for HvfArm64VcpuSmeZt0RegisterState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64VcpuSmeZt0RegisterState")
+            .field("register", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Detached raw SME system-register state captured from one arm64 vCPU.
 ///
 /// Hypervisor.framework exposes `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` on
@@ -1727,6 +1797,10 @@ impl HvfVcpuOwner {
         crate::ffi::get_sme_za_reg(self.handle()?.vcpu, value)
     }
 
+    pub(crate) fn get_sme_zt0_register(&self) -> Result<[u8; 64], BackendError> {
+        crate::ffi::get_sme_zt0_reg(self.handle()?.vcpu)
+    }
+
     pub(crate) fn configure_arm64_boot_registers(
         &mut self,
         registers: HvfArm64BootRegisters,
@@ -2394,6 +2468,20 @@ pub(crate) fn capture_arm64_vcpu_sme_za_register_state<R: ?Sized>(
     )
 }
 
+pub(crate) fn capture_arm64_vcpu_sme_zt0_register_state<R: ?Sized>(
+    reader: &mut R,
+    get_sme_pstate: impl FnOnce(&mut R) -> Result<(bool, bool), BackendError>,
+    get_sme_zt0_register: impl FnOnce(&mut R) -> Result<[u8; 64], BackendError>,
+) -> Result<HvfArm64VcpuSmeZt0RegisterState, HvfArm64VcpuSmeZt0RegisterCaptureError> {
+    let (_, za_storage_enabled) = get_sme_pstate(reader)?;
+    if !za_storage_enabled {
+        return Err(HvfArm64VcpuSmeZt0RegisterCaptureError::ZaStorageDisabled);
+    }
+
+    let bytes = get_sme_zt0_register(reader)?;
+    Ok(HvfArm64VcpuSmeZt0RegisterState::new(bytes))
+}
+
 pub(crate) fn capture_arm64_vcpu_sme_system_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuSmeSystemRegisterState, BackendError> {
@@ -2553,7 +2641,8 @@ mod tests {
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters,
         HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState,
         HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
-        HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState, HvfInterruptType,
+        HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
+        HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState, HvfInterruptType,
         HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
         NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_breakpoint_register_state_with,
         capture_arm64_vcpu_cache_selection_register_state_with,
@@ -2569,7 +2658,7 @@ mod tests {
         capture_arm64_vcpu_simd_fp_state_with, capture_arm64_vcpu_sme_p_register_state_with,
         capture_arm64_vcpu_sme_pstate_with, capture_arm64_vcpu_sme_system_register_state_with,
         capture_arm64_vcpu_sme_z_register_state_with,
-        capture_arm64_vcpu_sme_za_register_state_with,
+        capture_arm64_vcpu_sme_za_register_state_with, capture_arm64_vcpu_sme_zt0_register_state,
         capture_arm64_vcpu_sve_sme_identification_register_state_with,
         capture_arm64_vcpu_system_context_register_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
@@ -2775,6 +2864,44 @@ mod tests {
                     *byte = sme_za_test_byte(offset);
                 }
                 Ok(())
+            },
+        )
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SmeZt0CaptureCall {
+        Pstate,
+        Zt0,
+    }
+
+    struct SmeZt0TestReader {
+        pstate_result: Result<(bool, bool), BackendError>,
+        fail_once: bool,
+        calls: Vec<SmeZt0CaptureCall>,
+    }
+
+    fn sme_zt0_test_byte(offset: usize) -> u8 {
+        offset.to_le_bytes()[0].wrapping_mul(31) ^ 0x6d
+    }
+
+    fn capture_sme_zt0_test_reader(
+        reader: &mut SmeZt0TestReader,
+    ) -> Result<HvfArm64VcpuSmeZt0RegisterState, HvfArm64VcpuSmeZt0RegisterCaptureError> {
+        capture_arm64_vcpu_sme_zt0_register_state(
+            reader,
+            |reader| {
+                reader.calls.push(SmeZt0CaptureCall::Pstate);
+                reader.pstate_result.clone()
+            },
+            |reader| {
+                reader.calls.push(SmeZt0CaptureCall::Zt0);
+                if reader.fail_once {
+                    reader.fail_once = false;
+                    return Err(BackendError::InvalidState(
+                        "fake SME ZT0-register read failed",
+                    ));
+                }
+                Ok(std::array::from_fn(sme_zt0_test_byte))
             },
         )
     }
@@ -4219,6 +4346,120 @@ mod tests {
         assert_eq!(
             HvfArm64VcpuSmeZaRegisterCaptureError::AllocationFailed { size: 4096 }.to_string(),
             "failed to allocate 4096 bytes for SME ZA-register capture"
+        );
+    }
+
+    #[test]
+    fn captures_complete_arm64_sme_zt0_register_for_both_streaming_modes() {
+        for streaming_sve_mode_enabled in [false, true] {
+            let mut reader = SmeZt0TestReader {
+                pstate_result: Ok((streaming_sve_mode_enabled, true)),
+                fail_once: false,
+                calls: Vec::new(),
+            };
+
+            let state = capture_sme_zt0_test_reader(&mut reader)
+                .expect("SME ZT0-register capture should succeed");
+
+            assert_eq!(
+                reader.calls,
+                [SmeZt0CaptureCall::Pstate, SmeZt0CaptureCall::Zt0]
+            );
+            assert_eq!(state.as_bytes(), &std::array::from_fn(sme_zt0_test_byte));
+            assert_eq!(
+                state.as_bytes().len(),
+                HvfArm64VcpuSmeZt0RegisterState::BYTE_COUNT
+            );
+            assert_eq!(state.clone(), state);
+            assert_eq!(
+                format!("{state:?}"),
+                "HvfArm64VcpuSmeZt0RegisterState { register: \"<redacted>\" }"
+            );
+        }
+    }
+
+    #[test]
+    fn inactive_sme_zt0_capture_stops_before_register_read() {
+        for streaming_sve_mode_enabled in [false, true] {
+            let mut reader = SmeZt0TestReader {
+                pstate_result: Ok((streaming_sve_mode_enabled, false)),
+                fail_once: false,
+                calls: Vec::new(),
+            };
+
+            assert_eq!(
+                capture_sme_zt0_test_reader(&mut reader),
+                Err(HvfArm64VcpuSmeZt0RegisterCaptureError::ZaStorageDisabled)
+            );
+            assert_eq!(reader.calls, [SmeZt0CaptureCall::Pstate]);
+        }
+    }
+
+    #[test]
+    fn sme_zt0_capture_preserves_pstate_failure() {
+        let pstate_error = BackendError::InvalidState("fake SME PSTATE read failed");
+        let mut reader = SmeZt0TestReader {
+            pstate_result: Err(pstate_error.clone()),
+            fail_once: false,
+            calls: Vec::new(),
+        };
+
+        assert_eq!(
+            capture_sme_zt0_test_reader(&mut reader),
+            Err(HvfArm64VcpuSmeZt0RegisterCaptureError::Backend(
+                pstate_error
+            ))
+        );
+        assert_eq!(reader.calls, [SmeZt0CaptureCall::Pstate]);
+    }
+
+    #[test]
+    fn failed_sme_zt0_register_capture_publishes_nothing_and_can_retry() {
+        let mut reader = SmeZt0TestReader {
+            pstate_result: Ok((false, true)),
+            fail_once: true,
+            calls: Vec::new(),
+        };
+
+        assert_eq!(
+            capture_sme_zt0_test_reader(&mut reader),
+            Err(HvfArm64VcpuSmeZt0RegisterCaptureError::Backend(
+                BackendError::InvalidState("fake SME ZT0-register read failed")
+            ))
+        );
+        assert_eq!(
+            reader.calls,
+            [SmeZt0CaptureCall::Pstate, SmeZt0CaptureCall::Zt0]
+        );
+
+        reader.calls.clear();
+        let state = capture_sme_zt0_test_reader(&mut reader)
+            .expect("SME ZT0-register capture retry should succeed");
+        assert_eq!(state.as_bytes(), &std::array::from_fn(sme_zt0_test_byte));
+        assert_eq!(
+            reader.calls,
+            [SmeZt0CaptureCall::Pstate, SmeZt0CaptureCall::Zt0]
+        );
+    }
+
+    #[test]
+    fn displays_sme_zt0_capture_errors_and_preserves_backend_source() {
+        use std::error::Error as _;
+
+        let backend = HvfArm64VcpuSmeZt0RegisterCaptureError::Backend(BackendError::InvalidState(
+            "fake SME ZT0 backend failure",
+        ));
+        assert_eq!(
+            backend.to_string(),
+            "invalid backend state: fake SME ZT0 backend failure"
+        );
+        assert_eq!(
+            backend.source().map(ToString::to_string),
+            Some("invalid backend state: fake SME ZT0 backend failure".to_string())
+        );
+        assert_eq!(
+            HvfArm64VcpuSmeZt0RegisterCaptureError::ZaStorageDisabled.to_string(),
+            "cannot capture the SME ZT0 register while ZA storage is disabled"
         );
     }
 

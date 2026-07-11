@@ -30,7 +30,8 @@ identification metadata, mutable SME PSTATE flags, raw SME system registers
 with redacted `Debug`, conditional maximum-width streaming Z0-Z31 contents with
 redacted `Debug`, conditional maximum-derived streaming P0-P15 predicates with
 redacted `Debug`, conditional maximum-SVL-square ZA contents with redacted
-`Debug`, raw system-context registers with redacted `Debug`, raw core,
+`Debug`, conditional fixed-size SME2 ZT0 contents with redacted `Debug`, raw
+system-context registers with redacted `Debug`, raw core,
 EL1 exception, execution-control, cache-selection, hardware-breakpoint,
 hardware-watchpoint, debug-control, raw Hypervisor.framework debug-trap policy,
 translation, and thread-context system-register subsets,
@@ -41,8 +42,8 @@ A separate no-handle query exposes the maximum SME streaming vector length used
 for the Z-, P-, and ZA-register allocations. These are internal snapshot feasibility
 primitives only: public snapshot create/load, restore, a persistent schema,
 remaining vCPU state, EL2 GIC CPU-interface state, effective-SVL interpretation,
-streaming SVE/SME ZT0 data, cache-topology manifests, and complete emulated
-device state remain unsupported.
+SME/SME2 feature and destination policy, setters and transition ordering,
+cache-topology manifests, and complete emulated device state remain unsupported.
 
 ## Process CLI
 
