@@ -114,7 +114,7 @@ nontransactional; tests and callers must retry the complete retained value or
 discard the vCPU before any run.
 Core system-register restore tests must likewise verify
 `SP_EL0`/`SP_EL1`/`ELR_EL1`/`SPSR_EL1` capture-order writes, all four failure
-positions, reusable system-register error context, complete retry, 28-way
+positions, reusable system-register error context, complete retry, 29-way
 admission, and lifecycle cleanup. Signed coverage must extend the known-value
 guest-written capture with repeated same-vCPU restore/recapture after the HVC
 exit, use fixed failure messages that do not format raw state, and never run the
@@ -122,7 +122,7 @@ guest after restore or claim the values are portable or validated.
 Translation-register restore tests must verify SCTLR_EL1-then-TTBR0_EL1-then-
 TTBR1_EL1-then-TCR_EL1-then-MAIR_EL1-then-AMAIR_EL1-then-CONTEXTIDR_EL1
 writes, all seven failure positions, the reusable system-register error,
-complete retry, 28-way admission, and lifecycle cleanup. Signed coverage must
+complete retry, 29-way admission, and lifecycle cleanup. Signed coverage must
 leave `SCTLR_EL1.M` clear, write back the original SCTLR value before inert
 TTBR/TCR/attribute/context values and HVC, then repeat same-vCPU
 restore/recapture with fixed messages and no post-restore guest execution.
@@ -133,7 +133,7 @@ TLB/cache maintenance, or a safe MMU transition sequence.
 Exception-register restore tests must verify
 `AFSR0_EL1`/`AFSR1_EL1`/`ESR_EL1`/`FAR_EL1`/`PAR_EL1`/`VBAR_EL1`
 capture-order writes, all six failure positions, the reusable system-register
-error, complete retry, 28-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 29-way admission, and lifecycle cleanup. Signed coverage
 must use an aligned VBAR address, preserve the actual captured AFSR readback,
 repeat same-vCPU restore/recapture with fixed messages, take no guest exception
 or run after restore, and never claim coherent exception semantics or
@@ -142,7 +142,7 @@ Silicon reads AFSR0 as zero after a guest write while preserving the test's
 AFSR1 value.
 Execution-control restore tests require macOS 15 for ACTLR and must verify
 ACTLR-then-CPACR writes, both failure positions, the reusable system-register
-error, complete retry, 28-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 29-way admission, and lifecycle cleanup. Signed coverage
 must write only the Hypervisor.framework-supported `ACTLR_EL1.EnTSO` bit and
 baseline `CPACR_EL1.FPEN`, execute ISB before HVC, then repeat same-vCPU
 restore/recapture with fixed messages and no post-restore guest execution. It
@@ -150,10 +150,20 @@ must not treat equality as destination feature validation or a complete
 transition/ISB policy.
 Thread-context restore tests must verify TPIDR_EL0-then-TPIDRRO_EL0-then-
 TPIDR_EL1 writes, all three failure positions, the reusable system-register
-error, complete retry, 28-way admission, and lifecycle cleanup. Signed coverage
+error, complete retry, 29-way admission, and lifecycle cleanup. Signed coverage
 must extend the known guest-written values with repeated same-vCPU
 restore/recapture after HVC, use fixed messages, take no post-restore guest run,
 and never claim pointer validation, portability, or complete context semantics.
+Baseline SIMD/FP restore tests must verify Q0-through-Q31-then-FPCR-then-FPSR
+writes, all 34 failure positions, the typed SIMD/FP-versus-scalar register and
+completed-prefix context, complete retry, 29-way admission, and lifecycle
+cleanup. The C shim must compile only for macOS arm64, statically assert the SDK
+vector size, and accept an ordinary 16-byte pointer so stable Rust never guesses
+the by-value vector ABI. Signed coverage must extend the known non-streaming
+guest-written capture with repeated same-vCPU restore/recapture after HVC, fixed
+whole-state messages, and no post-restore guest run. It must not log Q bytes or
+claim feature/destination validation, FPCR/FPSR writable-bit policy, SVE/SME Q/Z
+alias ordering, rollback, or portable snapshot semantics.
 Identification-register signed tests must capture all eleven stable baseline
 values twice within one vCPU lifetime and compare MPIDR with the existing
 owner-thread getter. They must not hard-code one Apple MIDR/feature model,
