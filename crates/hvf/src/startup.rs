@@ -71,7 +71,8 @@ use crate::runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 use crate::vcpu::{
-    HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuExceptionRegisterState,
+    HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState,
+    HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuExceptionRegisterState,
     HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
     HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
     HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
@@ -1211,6 +1212,17 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_execution_control_register_state()
     }
 
+    /// Capture raw EL1 MDCCINT and MDSCR debug controls on the primary owner
+    /// thread.
+    ///
+    /// This getter-only subset excludes comparator and HVF trap state, feature
+    /// validation, persistence, debug activation, and a safe restore sequence.
+    pub fn capture_arm64_debug_control_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_debug_control_register_state()
+    }
+
     /// Capture guest-visible arm64 identification registers on the primary
     /// owner thread.
     ///
@@ -1902,6 +1914,17 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuExecutionControlRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_execution_control_register_state()
+    }
+
+    /// Capture raw EL1 MDCCINT and MDSCR debug controls on the primary owner
+    /// thread.
+    ///
+    /// This getter-only subset excludes comparator and HVF trap state, feature
+    /// validation, persistence, debug activation, and a safe restore sequence.
+    pub fn capture_arm64_debug_control_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuDebugControlRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_debug_control_register_state()
     }
 
     /// Capture guest-visible arm64 identification registers on the primary

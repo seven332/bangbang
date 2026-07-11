@@ -121,6 +121,11 @@ values twice within one vCPU lifetime and compare MPIDR with the existing
 owner-thread getter. They must not hard-code one Apple MIDR/feature model,
 include availability-gated or beta-only IDs, or claim that equal raw values are
 a sufficient destination compatibility policy.
+Debug-control signed tests must remain observation-only: capture MDCCINT_EL1
+and MDSCR_EL1 from an idle real vCPU without hard-coding or logging their raw
+values. They must not call register or debug-trap setters, run guest debug
+instructions, enable monitor debug or software stepping, or treat the two
+fields as complete or safely restorable debug state.
 Physical-timer signed tests require macOS 15 and must create the GIC before the
 vCPU. They must keep CNTP disabled and masked, assert writable control bits
 separately from derived ISTATUS, and avoid claiming that an absolute CVAL can be

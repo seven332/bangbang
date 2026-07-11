@@ -26,14 +26,14 @@ crates/bangbang   VMM process entrypoint and startup CLI
 
 The HVF runner currently exposes owner-thread capture building blocks for
 general registers, guest-visible processor identification metadata, raw core,
-EL1 exception, execution-control, translation, and thread-context
-system-register subsets, pointer-authentication key state with redacted `Debug`,
-baseline SIMD/FP state, raw physical and virtual timer state, CPU-level IRQ/FIQ
-pending injection levels, opaque GIC device state, and raw EL1 GIC ICC
+EL1 exception, execution-control, debug-control, translation, and thread-
+context system-register subsets, pointer-authentication key state with redacted
+`Debug`, baseline SIMD/FP state, raw physical and virtual timer state, CPU-level
+IRQ/FIQ pending injection levels, opaque GIC device state, and raw EL1 GIC ICC
 CPU-interface registers. These are internal snapshot
 feasibility primitives only: public snapshot create/load, restore, a persistent
-schema, remaining vCPU state, EL2 GIC CPU-interface state, and complete emulated
-device state remain unsupported.
+schema, breakpoint/watchpoint and debug-trap state, remaining vCPU state, EL2
+GIC CPU-interface state, and complete emulated device state remain unsupported.
 
 ## Process CLI
 

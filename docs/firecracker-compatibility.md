@@ -49,7 +49,8 @@ boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary,
 guest-visible identification-register metadata, pointer-authentication
-key-state capture with redacted `Debug`, raw physical-timer capture, a
+key-state capture with redacted `Debug`, raw debug-control and physical-timer
+capture, a
 virtual-timer mask/offset/control/CVAL boundary, a bounded internal boot-session
 run-loop pump, owned internal boot-session handle, process-level owned
 startup-session wiring with optional serial capture and boot run-loop supervision
@@ -1660,13 +1661,15 @@ Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
 the low and high halves of APIA, APIB, APDA, APDB, and APGA and publishes five
 128-bit pointer-authentication keys. A ninth reads guest-visible `MIDR_EL1`,
 `MPIDR_EL1`, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 compatibility metadata. The
-nine commands share one command-owned core-register admission domain, publish
-no partial state after a read failure, and are exposed by borrowed and owned HVF
-boot sessions for later lease-owned orchestration. TPIDR values can contain
+last command reads raw `MDCCINT_EL1` then `MDSCR_EL1` without writing either
+register or changing Hypervisor.framework debug trap settings. The ten commands
+share one command-owned core-register admission domain, publish no partial
+state after a read failure, and are exposed by borrowed and owned HVF boot
+sessions for later lease-owned orchestration. TPIDR values can contain
 guest TLS or kernel pointers; translation table bases, context ids, fault
 addresses, and the vector base are sensitive; pointer-authentication keys are
-cryptographic secrets; and the optional SME-era `TPIDR2_EL0` remains outside
-the baseline. The key value
+cryptographic secrets; debug controls are security-sensitive execution state;
+and the optional SME-era `TPIDR2_EL0` remains outside the baseline. The key value
 redacts all material from `Debug` but provides raw named accessors for trusted
 internal composition. Identification values describe the virtual CPU/HVF view,
 including bangbang's deterministic MPIDR affinity zero; they are not
@@ -1681,7 +1684,12 @@ Execution-control validation writes only EnTSO and baseline FPEN, executes ISB,
 and does not cover optional CPACR features. Key validation uses visibly fake
 values and does not enable or execute PAC. Identification validation compares
 two captures and the existing MPIDR getter without hard-coding an Apple CPU
-model or claiming destination portability.
+model or claiming destination portability. Debug-control validation only reads
+both values from an idle real vCPU; it does not enable monitor debug, software
+stepping, debug exceptions, guest debug-register access, or DCC interrupts.
+Breakpoint/watchpoint arrays, implemented-count policy from `ID_AA64DFR0_EL1`,
+and HVF's separate debug-exception and debug-register-access trap booleans are
+not part of the two-field value.
 The SIMD getter uses an explicitly 16-byte-aligned
 HVF output value; in streaming SVE mode, its Q values alias only the low 128
 bits of Z registers and are not complete SVE/SME state. A separate command
@@ -1700,11 +1708,13 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The identification, core system-register, exception,
-execution-control, translation, pointer-authentication, thread-context,
-baseline SIMD/FP, and physical-timer subsets are raw and read-only and likewise
-have no restore validation, snapshot schema, or Firecracker on-disk
+execution-control, debug-control, translation, pointer-authentication, thread-
+context, baseline SIMD/FP, and physical-timer subsets are raw and read-only and
+likewise have no restore validation, snapshot schema, or Firecracker on-disk
 compatibility. Identification capture is compatibility metadata rather than
-mutable restore state and defines no feature-mask or destination policy.
+mutable restore state and defines no feature-mask or destination policy. Debug-
+control capture is incomplete and defines no feature, writable/status-bit,
+security, trap-coordination, synchronization, or restore policy.
 Pointer-authentication capture additionally has no feature validation,
 zeroization, protected persistence, or safe enable ordering. The process
 snapshot barrier invokes none of these captures.
@@ -2074,10 +2084,13 @@ macOS design work instead of direct implementation:
   five 128-bit pointer-authentication keys from all ten APIA/APIB/APDA/APDB/APGA
   halves and redacts them from `Debug`. A ninth captures guest-visible MIDR,
   MPIDR, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 as raw virtual-CPU/HVF
-  compatibility inputs. Stable-baseline optional SVE/SME IDs, newer beta-only
-  IDs, feature masking, destination policy, streaming SVE/SME state, table and
-  vector memory, optional CPACR and pointer-authentication feature validation,
-  protected key persistence, and restore ordering remain outside these subsets.
+  compatibility inputs. A tenth captures raw MDCCINT_EL1 and MDSCR_EL1 as an
+  observation-only, incomplete debug-control subset. Stable-baseline optional
+  SVE/SME IDs, newer beta-only IDs, feature masking, destination policy,
+  streaming SVE/SME state, table and vector memory, optional CPACR and pointer-
+  authentication feature validation, breakpoint/watchpoint arrays, DFR0 debug-
+  resource count policy, HVF debug trap configuration, protected key
+  persistence, and restore ordering remain outside these subsets.
   The runner can capture raw CNTKCTL_EL1,
   CNTP_CTL_EL0, and CNTP_CVAL_EL0 on the owning thread when macOS 15 physical-
   timer prerequisites are met. It also gets and sets the HVF virtual-timer mask,
