@@ -246,7 +246,7 @@ is resource-specific:
   values, raw SME SMCR_EL1/SMPRI_EL1/TPIDR2_EL0 values, raw
   SCXTNUM_EL0/SCXTNUM_EL1 software context numbers, raw
   Q0-Q31/FPCR/FPSR values, raw
-  physical-timer CNTKCTL/control/CVAL values, raw virtual-timer
+  physical-timer CNTKCTL/control/CVAL/TVAL values, raw virtual-timer
   mask/offset/control/CVAL values, raw EL1
   SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
   levels, opaque GIC device-state bytes, and raw EL1 GIC ICC CPU-interface
@@ -317,9 +317,11 @@ is resource-specific:
   Current internal capture commands keep these values in process memory and do
   not write them to logs, metrics, error strings, or persistence. The raw
   virtual-timer offset is tied to HVF's host-time relation, the physical-timer
-  CVAL is an absolute comparator against a continuing count, and control
-  ISTATUS bits are time-sensitive observations rather than writable
-  configuration. These values
+  CVAL is an absolute comparator against a continuing count, and the
+  architecturally signed 32-bit relative TVAL is returned as raw `u64` and
+  changes as that count advances. CVAL and TVAL are read sequentially rather
+  than simultaneously, and control ISTATUS bits are time-sensitive observations
+  rather than writable configuration. These values
   must not be treated as portable or trusted restore data without explicit
   adjustment, writable-bit, and validation policies. The public pause and
   snapshot paths do not invoke any of these capture commands.

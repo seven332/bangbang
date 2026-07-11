@@ -1562,6 +1562,39 @@ fn cancels_runner_before_first_run() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_arm64_physical_timer_tval_on_idle_runner_thread() {
+    use bangbang_hvf::HvfBackend;
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    backend
+        .create_gic()
+        .expect("GIC should be created before the physical-timer vCPU");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let first = runner
+            .capture_arm64_physical_timer_state()
+            .expect("first idle physical-timer state should be captured");
+        let second = runner
+            .capture_arm64_physical_timer_state()
+            .expect("second idle physical-timer state should be captured");
+
+        let _first_tval = first.cntp_tval_el0();
+        let _second_tval = second.cntp_tval_el0();
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_guest_written_arm64_physical_timer_state_on_runner_thread() {
     use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
     use bangbang_runtime::VmBackend;

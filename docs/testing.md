@@ -172,9 +172,14 @@ values. They must not call either trap setter, run the vCPU, execute guest/debug
 instructions, activate debug behavior, or treat host TDE/TDA-equivalent policy
 as guest register state or safely restorable configuration.
 Physical-timer signed tests require macOS 15 and must create the GIC before the
-vCPU. They must keep CNTP disabled and masked, assert writable control bits
-separately from derived ISTATUS, and avoid claiming that an absolute CVAL can be
-restored without elapsed-time and interrupt-delivery policy.
+vCPU. Guest-written validation must keep CNTP disabled and masked and assert
+writable control bits separately from derived ISTATUS. No test may claim that
+an absolute CVAL or relative TVAL can be restored without elapsed-time and
+interrupt-delivery policy. TVAL-only validation must use an idle vCPU with no
+guest execution or timer writes, may only prove that capture and the raw
+accessor succeed, and must not log, format, compare, narrow, sign-extend, assume
+reset state, or assert an exact relationship with the separately timed CVAL
+read.
 Pointer-authentication key signed tests must use visibly non-secret sentinels,
 must not enable or execute PAC instructions, and must assert that debug output
 contains no raw key material. Failure assertions must not format actual key

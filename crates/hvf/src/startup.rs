@@ -1376,7 +1376,8 @@ impl HvfArm64BootSession<'_> {
     /// Capture raw EL1 physical-timer state on the primary owner thread.
     ///
     /// CNTP capture requires macOS 15 and a GIC created before the vCPU. The
-    /// absolute compare value has no portable restore-time adjustment policy.
+    /// absolute CVAL and time-sensitive relative TVAL observations are read
+    /// sequentially and have no portable restore-time adjustment policy.
     pub fn capture_arm64_physical_timer_state(
         &self,
     ) -> Result<HvfArm64VcpuPhysicalTimerState, HvfVcpuRunnerError> {
@@ -2172,7 +2173,8 @@ impl OwnedHvfArm64BootSession {
     /// Capture raw EL1 physical-timer state on the primary owner thread.
     ///
     /// CNTP capture requires macOS 15 and a GIC created before the vCPU. The
-    /// absolute compare value has no portable restore-time adjustment policy.
+    /// absolute CVAL and time-sensitive relative TVAL observations are read
+    /// sequentially and have no portable restore-time adjustment policy.
     pub fn capture_arm64_physical_timer_state(
         &self,
     ) -> Result<HvfArm64VcpuPhysicalTimerState, HvfVcpuRunnerError> {
