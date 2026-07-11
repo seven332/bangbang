@@ -1186,6 +1186,19 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_general_register_state()
     }
 
+    /// Restore X0-X30, PC, and CPSR on the primary vCPU's owner thread.
+    ///
+    /// Writes are ordered but nontransactional. If one setter fails, retry the
+    /// complete typed state or discard the session before guest execution.
+    /// Snapshot schema, validation, and wider-state ordering remain outside
+    /// this runner primitive.
+    pub fn restore_arm64_general_register_state(
+        &self,
+        state: &HvfArm64VcpuGeneralRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_general_register_state(state)
+    }
+
     /// Capture raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values on the primary
     /// vCPU owner thread.
     ///
@@ -2027,6 +2040,19 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuGeneralRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_general_register_state()
+    }
+
+    /// Restore X0-X30, PC, and CPSR on the primary vCPU's owner thread.
+    ///
+    /// Writes are ordered but nontransactional. If one setter fails, retry the
+    /// complete typed state or discard the session before guest execution.
+    /// Snapshot schema, validation, and wider-state ordering remain outside
+    /// this runner primitive.
+    pub fn restore_arm64_general_register_state(
+        &self,
+        state: &HvfArm64VcpuGeneralRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_general_register_state(state)
     }
 
     /// Capture raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values on the primary

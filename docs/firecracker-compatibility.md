@@ -1650,9 +1650,14 @@ run-loop now handles virtual timer exits by asserting the EL1 virtual timer PPI
 through that runner-thread command. Full timer delivery policy, including how to
 detect EOI/deactivation and unmask the HVF virtual timer, remains future work.
 These commands reject overlapping metadata reads, runs, boot-register setup,
-MMIO dispatches, core-register capture, timer operations, or generalized
+MMIO dispatches, core-register operations, timer operations, or generalized
 interrupt operations. The general-register capture command returns only after
-X0-X30, PC, and CPSR have all been read. A second command reads raw `SP_EL0`,
+X0-X30, PC, and CPSR have all been read. The same typed value can be passed to
+a separate owner-thread restore operation, which writes X0-X30, PC, and CPSR
+in architectural order. Hypervisor.framework does not make those 33 writes
+transactional: a typed failure identifies the failed register and completed
+write count, and callers must retry the complete value or discard the vCPU
+before execution. A second capture command reads raw `SP_EL0`,
 `SP_EL1`, `ELR_EL1`, and `SPSR_EL1` in that order. A third reads all 16 bytes of
 Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
 `TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. A fifth reads raw `SCTLR_EL1`,
@@ -1698,10 +1703,12 @@ value exposes the raw square while redacting all bytes and dimensions from
 `Debug`. A twenty-second observes the same `PSTATE.ZA` precondition without
 requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
-Its detached value redacts every byte from `Debug`. The twenty-two commands
-share one command-owned core-register admission domain, publish no partial state
-after a read failure, and are exposed by borrowed and owned HVF boot sessions
-for later lease-owned orchestration.
+Its detached value redacts every byte from `Debug`. The twenty-two capture
+commands and general-register restore form a twenty-three-operation,
+command-owned core-register admission domain. Captures publish no partial state
+after a read failure; restore explicitly may leave a written prefix after a
+setter failure. Borrowed and owned HVF boot sessions expose both general-state
+operations and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
 `hv_sme_config_get_max_svl_bytes` and publishes the maximum streaming vector
@@ -2277,7 +2284,9 @@ macOS design work instead of direct implementation:
   Linux boot-register setup. The current runner skeleton creates a vCPU on a
   dedicated thread, applies that boot-register setup on the owning thread before
   the first run, can capture a detached X0-X30, PC, and CPSR subset through one
-  owner-thread command, and can capture a separate raw SP_EL0, SP_EL1, ELR_EL1,
+  owner-thread command, can reapply that typed value in architectural order
+  through a nontransactional owner-thread restore operation, and can capture a
+  separate raw SP_EL0, SP_EL1, ELR_EL1,
   and SPSR_EL1 subset through another command in the same core-register
   admission domain. A third command captures baseline Q0-Q31, FPCR, and FPSR
   state under that admission, retaining every 128-bit Q value; a fourth
@@ -2330,7 +2339,9 @@ macOS design work instead of direct implementation:
   validation, cache feature/geometry interpretation and masks, selector
   validation and maintenance, breakpoint and watchpoint control
   validation, debug-trap policy validation/setters, protected key persistence,
-  and restore ordering remain outside these subsets.
+  and wider restore ordering remain outside these subsets. General-register
+  restore alone reports its failed register and completed-write count; callers
+  must retry the complete captured value or discard the vCPU before execution.
   The runner can capture raw CNTKCTL_EL1, CNTP_CTL_EL0, CNTP_CVAL_EL0, and
   CNTP_TVAL_EL0 on the owning thread when macOS 15 physical-timer prerequisites
   are met. The absolute and relative views are read sequentially and do not

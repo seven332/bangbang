@@ -251,6 +251,15 @@ is resource-specific:
   SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
   levels, opaque GIC device-state bytes, and raw EL1 GIC ICC CPU-interface
   values are sensitive guest/VMM execution state.
+  The general-register owner-thread restore primitive accepts only the detached
+  typed X0-X30/PC/CPSR value, but that value remains untrusted guest execution
+  state rather than validated snapshot input. Its 33 Hypervisor.framework
+  writes are ordered and nontransactional. A typed error reports only the
+  failed register identifier, completed-write count, and backend source—not
+  register contents. After failure, callers must retry the complete retained
+  value or discard the vCPU before execution; running a partially updated vCPU
+  is outside the supported boundary. Public snapshot load does not invoke this
+  primitive.
   TPIDR fields can contain guest TLS or kernel pointers, and
   SIMD/FP bytes can contain guest application or cryptographic working data.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can

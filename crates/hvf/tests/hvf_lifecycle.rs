@@ -748,6 +748,55 @@ fn captures_configured_arm64_general_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn restores_arm64_general_registers_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::GuestAddress;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let registers = HvfArm64BootRegisters {
+        kernel_entry: GuestAddress::new(0x8028_0000),
+        fdt_address: GuestAddress::new(0x8fe0_0000),
+    };
+
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(registers)
+            .expect("boot registers should be configured");
+
+        let before = runner
+            .capture_arm64_general_register_state()
+            .expect("general-register state should be captured before restore");
+        runner
+            .restore_arm64_general_register_state(&before)
+            .expect("general-register state should be restored");
+        let after = runner
+            .capture_arm64_general_register_state()
+            .expect("general-register state should be recaptured after restore");
+        assert_eq!(after, before);
+
+        runner
+            .restore_arm64_general_register_state(&before)
+            .expect("repeated general-register restore should succeed");
+        let repeated = runner
+            .capture_arm64_general_register_state()
+            .expect("general-register state should be recaptured after repeated restore");
+        assert_eq!(repeated, before);
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_guest_written_arm64_core_system_registers_on_runner_thread() {
     use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
     use bangbang_runtime::VmBackend;
@@ -2551,6 +2600,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
     );
     assert_eq!(register_state.cpsr(), ARM64_LINUX_BOOT_CPSR);
     session
+        .restore_arm64_general_register_state(&register_state)
+        .expect("internal session should restore general-register state");
+    session
         .capture_arm64_core_system_register_state()
         .expect("internal session should capture core system-register state");
     session
@@ -2754,6 +2806,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
         session.boot_registers().kernel_entry.raw_value()
     );
     assert_eq!(register_state.cpsr(), ARM64_LINUX_BOOT_CPSR);
+    session
+        .restore_arm64_general_register_state(&register_state)
+        .expect("owned session should restore general-register state");
     session
         .capture_arm64_core_system_register_state()
         .expect("owned session should capture core system-register state");

@@ -25,7 +25,8 @@ crates/bangbang   VMM process entrypoint and startup CLI
 ```
 
 The HVF runner currently exposes owner-thread capture building blocks for
-general registers, baseline and optional SVE/SME guest-visible processor
+general registers, plus ordered nontransactional restore of the same typed
+X0-X30/PC/CPSR value, baseline and optional SVE/SME guest-visible processor
 identification metadata, mutable SME PSTATE flags, raw SME system registers
 with redacted `Debug`, conditional maximum-width streaming Z0-Z31 contents with
 redacted `Debug`, conditional maximum-derived streaming P0-P15 predicates with
@@ -40,9 +41,9 @@ raw physical and virtual timer state, CPU-level IRQ/FIQ pending injection
 levels, opaque GIC device state, and raw EL1 GIC ICC CPU-interface registers.
 A separate no-handle query exposes the maximum SME streaming vector length used
 for the Z-, P-, and ZA-register allocations. These are internal snapshot feasibility
-primitives only: public snapshot create/load, restore, a persistent schema,
+primitives only: public snapshot create/load and complete restore, a persistent schema,
 remaining vCPU state, EL2 GIC CPU-interface state, effective-SVL interpretation,
-SME/SME2 feature and destination policy, setters and transition ordering,
+SME/SME2 feature and destination policy, other setters and transition ordering,
 cache-topology manifests, and complete emulated device state remain unsupported.
 
 ## Process CLI
