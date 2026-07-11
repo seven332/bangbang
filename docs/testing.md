@@ -140,6 +140,15 @@ the getter's exact raw `HV_UNSUPPORTED` result may be treated as documented
 unavailability; every unrelated error must fail. Tests must not call the setter,
 change PSTATE, query maximum SVL, read Z/P/ZA/ZT0, run guest code, or treat the
 flags as complete or safely restorable SME state.
+SME Z-register signed tests must runtime-resolve the macOS 15.2 getter and may
+read Z0-Z31 only when an owner-thread `PSTATE.SM` preflight reports streaming
+mode active. They may accept the documented missing-symbol or exact
+`HV_UNSUPPORTED` boundaries, the topical inactive-streaming result, or compare
+two complete same-vCPU captures. Successful captures must use the separately
+queried maximum SVL as the exact width of every bounded accessor and verify
+redacted `Debug` output without formatting or logging bytes or width. Tests must
+not call any SME setter, enter streaming mode, run guest code, infer effective
+`SMCR_EL1.LEN`, or treat equal bytes as portable or safely restorable state.
 SME system-register signed tests require macOS 15.2 and must capture `SMCR_EL1`,
 `SMPRI_EL1`, and `TPIDR2_EL0` twice from one idle real vCPU. They may compare
 same-vCPU results only with fixed failure messages and must verify that `Debug`
