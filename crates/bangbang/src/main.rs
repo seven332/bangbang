@@ -1897,7 +1897,7 @@ fn help_text() -> String {
             "      --snapshot-version\n",
             "                         Print the native snapshot data-format version\n",
             "      --describe-snapshot <PATH>\n",
-            "                         Validate a native snapshot and print its format version\n",
+            "                         Validate a native snapshot envelope and print its format version\n",
             "      --start-time-us <MICROS>\n",
             "                         Process start wall-clock time for future metrics\n",
             "      --start-time-cpu-us <MICROS>\n",
@@ -2948,7 +2948,7 @@ mod tests {
         assert!(help.contains("--snapshot-version"));
         assert!(help.contains("--describe-snapshot <PATH>"));
         assert!(help.contains("Print the native snapshot data-format version"));
-        assert!(help.contains("Validate a native snapshot and print its format version"));
+        assert!(help.contains("Validate a native snapshot envelope and print its format version"));
         assert!(help.contains("--start-time-us <MICROS>"));
         assert!(help.contains("--start-time-cpu-us <MICROS>"));
         assert!(help.contains("--parent-cpu-time-us <MICROS>"));

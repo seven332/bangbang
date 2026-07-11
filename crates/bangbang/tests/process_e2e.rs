@@ -4236,6 +4236,10 @@ fn assert_snapshot_describe_failure(
     expected_error: &str,
 ) {
     let socket_path = test_dir.path().join(format!("{case_name}.socket"));
+    let snapshot_file_name = snapshot_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("snapshot fixture file name should be UTF-8");
     let output = BangbangProcess::start_with_extra_args_expect_failure(
         &socket_path,
         &test_dir.instance_id(),
@@ -4250,7 +4254,9 @@ fn assert_snapshot_describe_failure(
     );
     assert!(
         !output.stdout.contains(path_text(snapshot_path))
-            && !output.stderr.contains(path_text(snapshot_path)),
+            && !output.stderr.contains(path_text(snapshot_path))
+            && !output.stdout.contains(snapshot_file_name)
+            && !output.stderr.contains(snapshot_file_name),
         "{case_name} must redact the snapshot path; stdout:\n{}\nstderr:\n{}",
         output.stdout,
         output.stderr
