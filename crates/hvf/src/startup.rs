@@ -78,9 +78,9 @@ use crate::vcpu::{
     HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
     HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
     HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePstate,
-    HvfArm64VcpuSveSmeIdentificationRegisterState, HvfArm64VcpuThreadContextRegisterState,
-    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
-    HvfArm64VcpuWatchpointRegisterState,
+    HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
+    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+    HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1303,6 +1303,17 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_sme_pstate()
     }
 
+    /// Capture raw SME system registers on the primary vCPU owner thread.
+    ///
+    /// This macOS 15.2+ getter-only value contains `SMCR_EL1`, `SMPRI_EL1`,
+    /// and `TPIDR2_EL0`; `Debug` redacts all three. It excludes maximum SVL,
+    /// SVE/SME data, setters, persistence, schema, and restore ordering.
+    pub fn capture_arm64_sme_system_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSmeSystemRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_sme_system_register_state()
+    }
+
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
     /// This subset omits table memory, feature validation, TLB/cache
@@ -1328,7 +1339,8 @@ impl HvfArm64BootSession<'_> {
     /// vCPU owner thread.
     ///
     /// These sensitive software thread-ID values can contain guest pointers.
-    /// This subset omits TPIDR2_EL0, wider system state, and restore policy.
+    /// `TPIDR2_EL0` is captured separately with SME system registers. Wider
+    /// system state and restore policy remain outside this subset.
     pub fn capture_arm64_thread_context_register_state(
         &self,
     ) -> Result<HvfArm64VcpuThreadContextRegisterState, HvfVcpuRunnerError> {
@@ -2073,6 +2085,17 @@ impl OwnedHvfArm64BootSession {
         self.runner.capture_arm64_sme_pstate()
     }
 
+    /// Capture raw SME system registers on the primary vCPU owner thread.
+    ///
+    /// This macOS 15.2+ getter-only value contains `SMCR_EL1`, `SMPRI_EL1`,
+    /// and `TPIDR2_EL0`; `Debug` redacts all three. It excludes maximum SVL,
+    /// SVE/SME data, setters, persistence, schema, and restore ordering.
+    pub fn capture_arm64_sme_system_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuSmeSystemRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_sme_system_register_state()
+    }
+
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
     /// This subset omits table memory, feature validation, TLB/cache
@@ -2098,7 +2121,8 @@ impl OwnedHvfArm64BootSession {
     /// vCPU owner thread.
     ///
     /// These sensitive software thread-ID values can contain guest pointers.
-    /// This subset omits TPIDR2_EL0, wider system state, and restore policy.
+    /// `TPIDR2_EL0` is captured separately with SME system registers. Wider
+    /// system state and restore policy remain outside this subset.
     pub fn capture_arm64_thread_context_register_state(
         &self,
     ) -> Result<HvfArm64VcpuThreadContextRegisterState, HvfVcpuRunnerError> {

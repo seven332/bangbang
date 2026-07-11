@@ -645,6 +645,55 @@ impl HvfArm64VcpuSmePstate {
     }
 }
 
+/// Detached raw SME system-register state captured from one arm64 vCPU.
+///
+/// Hypervisor.framework exposes `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` on
+/// macOS 15.2 and newer. `TPIDR2_EL0` can contain sensitive guest thread
+/// context, so `Debug` redacts every raw value. These mutable observations are
+/// separate from SVE/SME identification metadata, `PSTATE.SM`/`PSTATE.ZA`, the
+/// maximum streaming vector length, and Z/P/ZA/ZT0 contents. This getter-only
+/// value defines no feature validation, persistence, snapshot schema, or safe
+/// restore ordering.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuSmeSystemRegisterState {
+    smcr_el1: u64,
+    smpri_el1: u64,
+    tpidr2_el0: u64,
+}
+
+impl HvfArm64VcpuSmeSystemRegisterState {
+    pub(crate) const fn new(smcr_el1: u64, smpri_el1: u64, tpidr2_el0: u64) -> Self {
+        Self {
+            smcr_el1,
+            smpri_el1,
+            tpidr2_el0,
+        }
+    }
+
+    /// Return the raw `SMCR_EL1` value.
+    pub const fn smcr_el1(self) -> u64 {
+        self.smcr_el1
+    }
+
+    /// Return the raw `SMPRI_EL1` value.
+    pub const fn smpri_el1(self) -> u64 {
+        self.smpri_el1
+    }
+
+    /// Return the raw `TPIDR2_EL0` value.
+    pub const fn tpidr2_el0(self) -> u64 {
+        self.tpidr2_el0
+    }
+}
+
+impl fmt::Debug for HvfArm64VcpuSmeSystemRegisterState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64VcpuSmeSystemRegisterState")
+            .field("registers", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Detached raw EL1 translation-register state captured from one arm64 vCPU.
 ///
 /// This value contains `SCTLR_EL1`, both translation table bases, `TCR_EL1`,
@@ -787,8 +836,9 @@ const fn pointer_authentication_key(low: u64, high: u64) -> u128 {
 ///
 /// These software thread-ID values can contain guest TLS or kernel pointers.
 /// They are sensitive raw observations for later owner-thread orchestration,
-/// not a complete or serialized restorable vCPU state. `TPIDR2_EL0`, wider
-/// system registers, and restore validation remain outside this value.
+/// not a complete or serialized restorable vCPU state. `TPIDR2_EL0` is captured
+/// separately with SME system registers; wider state and restore validation
+/// remain outside this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuThreadContextRegisterState {
     tpidr_el0: u64,
@@ -1021,6 +1071,8 @@ impl HvfSystemRegister {
     pub const SCTLR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SCTLR_EL1);
     pub const ACTLR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ACTLR_EL1);
     pub const CPACR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CPACR_EL1);
+    pub const SMPRI_EL1: Self = Self(crate::ffi::HV_SYS_REG_SMPRI_EL1);
+    pub const SMCR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SMCR_EL1);
     pub const TTBR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_TTBR0_EL1);
     pub const TTBR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_TTBR1_EL1);
     pub const TCR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TCR_EL1);
@@ -1051,6 +1103,7 @@ impl HvfSystemRegister {
     pub const CSSELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CSSELR_EL1);
     pub const TPIDR_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL0);
     pub const TPIDRRO_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDRRO_EL0);
+    pub const TPIDR2_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDR2_EL0);
     pub const CNTP_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_CTL_EL0);
     pub const CNTP_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_CVAL_EL0);
     pub const CNTV_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CTL_EL0);
@@ -1703,6 +1756,18 @@ pub(crate) fn capture_arm64_vcpu_sme_pstate_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_sme_system_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuSmeSystemRegisterState, BackendError> {
+    let smcr_el1 = get_system_register(HvfSystemRegister::SMCR_EL1)?;
+    let smpri_el1 = get_system_register(HvfSystemRegister::SMPRI_EL1)?;
+    let tpidr2_el0 = get_system_register(HvfSystemRegister::TPIDR2_EL0)?;
+
+    Ok(HvfArm64VcpuSmeSystemRegisterState::new(
+        smcr_el1, smpri_el1, tpidr2_el0,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
@@ -1847,6 +1912,7 @@ mod tests {
         capture_arm64_vcpu_physical_timer_state_with,
         capture_arm64_vcpu_pointer_authentication_key_state_with,
         capture_arm64_vcpu_simd_fp_state_with, capture_arm64_vcpu_sme_pstate_with,
+        capture_arm64_vcpu_sme_system_register_state_with,
         capture_arm64_vcpu_sve_sme_identification_register_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
         capture_arm64_vcpu_translation_register_state_with,
@@ -1887,6 +1953,14 @@ mod tests {
         [
             HvfSystemRegister::ID_AA64ZFR0_EL1,
             HvfSystemRegister::ID_AA64SMFR0_EL1,
+        ]
+    }
+
+    fn sme_system_registers() -> [HvfSystemRegister; 3] {
+        [
+            HvfSystemRegister::SMCR_EL1,
+            HvfSystemRegister::SMPRI_EL1,
+            HvfSystemRegister::TPIDR2_EL0,
         ]
     }
 
@@ -2619,6 +2693,51 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_sme_system_register_state_in_documented_order() {
+        let expected_registers = sme_system_registers();
+        let expected_values = [0, u64::MAX, 0x0123_4567_89ab_cdef];
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_sme_system_register_state_with(|register| {
+            reads.push(register);
+            expected_registers
+                .iter()
+                .position(|expected| *expected == register)
+                .map(|index| expected_values[index])
+                .ok_or(BackendError::InvalidState(
+                    "unexpected fake SME system register",
+                ))
+        })
+        .expect("SME system-register capture should succeed");
+
+        assert_eq!(reads, expected_registers);
+        assert_eq!(state.smcr_el1(), expected_values[0]);
+        assert_eq!(state.smpri_el1(), expected_values[1]);
+        assert_eq!(state.tpidr2_el0(), expected_values[2]);
+        assert_eq!(HvfSystemRegister::SMPRI_EL1.raw(), 0xc094);
+        assert_eq!(HvfSystemRegister::SMCR_EL1.raw(), 0xc096);
+        assert_eq!(HvfSystemRegister::TPIDR2_EL0.raw(), 0xde85);
+    }
+
+    #[test]
+    fn arm64_sme_system_register_state_debug_redacts_values() {
+        let state = super::HvfArm64VcpuSmeSystemRegisterState::new(
+            0x0123_4567_89ab_cdef,
+            0xfedc_ba98_7654_3210,
+            0x8877_6655_4433_2211,
+        );
+
+        let debug = format!("{state:?}");
+        assert_eq!(
+            debug,
+            "HvfArm64VcpuSmeSystemRegisterState { registers: \"<redacted>\" }"
+        );
+        assert!(!debug.contains("0123"));
+        assert!(!debug.contains("fedc"));
+        assert!(!debug.contains("8877"));
+    }
+
+    #[test]
     fn captures_arm64_translation_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -3246,6 +3365,51 @@ mod tests {
         assert!(state.streaming_sve_mode_enabled());
         assert!(!state.za_storage_enabled());
         assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn arm64_sme_system_register_capture_stops_after_each_error_and_can_retry() {
+        let registers = sme_system_registers();
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake SME system register read failed",
+                    ))
+                } else {
+                    Ok(0x5e00_0000_0000_0000 | u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_sme_system_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake SME system register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_sme_system_register_state_with(&read_system_register)
+                .expect("SME system-register capture retry should succeed");
+            assert_eq!(
+                state.smcr_el1(),
+                0x5e00_0000_0000_0000 | u64::from(registers[0].raw())
+            );
+            assert_eq!(
+                state.smpri_el1(),
+                0x5e00_0000_0000_0000 | u64::from(registers[1].raw())
+            );
+            assert_eq!(
+                state.tpidr2_el0(),
+                0x5e00_0000_0000_0000 | u64::from(registers[2].raw())
+            );
+            assert_eq!(*reads.borrow(), registers);
+        }
     }
 
     #[test]

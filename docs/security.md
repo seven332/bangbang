@@ -243,7 +243,8 @@ is resource-specific:
   hardware-breakpoint and hardware-watchpoint value/control pairs, raw
   MDCCINT_EL1/MDSCR_EL1 debug controls, raw Hypervisor.framework debug-trap
   policy, raw pointer-authentication keys, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1
-  values, raw Q0-Q31/FPCR/FPSR values, raw
+  values, raw SME SMCR_EL1/SMPRI_EL1/TPIDR2_EL0 values, raw
+  Q0-Q31/FPCR/FPSR values, raw
   physical-timer CNTKCTL/control/CVAL values, raw virtual-timer
   mask/offset/control/CVAL values, raw EL1
   SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
@@ -299,6 +300,13 @@ is resource-specific:
   raw `HV_UNSUPPORTED` on SME-incapable hardware. The flags must not be logged,
   persisted, trusted, or restored without feature validation and ordering with
   Q/Z/P/FPSR and conditional ZA/ZT0 contents.
+  The separately captured raw `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` values
+  are mutable SME and thread-context state; `TPIDR2_EL0` can contain sensitive
+  guest pointers. Their detached value redacts every register from `Debug`, and
+  capture performs no writes, but raw accessors remain restricted to trusted
+  internal composition. The values must not be logged, persisted, trusted, or
+  restored without feature and writable-bit validation, maximum-SVL policy,
+  and ordering with PSTATE plus conditional Z/P/ZA/ZT0 contents.
   Current internal capture commands keep these values in process memory and do
   not write them to logs, metrics, error strings, or persistence. The raw
   virtual-timer offset is tied to HVF's host-time relation, the physical-timer

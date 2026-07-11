@@ -1008,6 +1008,49 @@ fn captures_arm64_sme_pstate_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_arm64_sme_system_registers_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64VcpuSmeSystemRegisterState, HvfBackend};
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let first = runner
+            .capture_arm64_sme_system_register_state()
+            .expect("first SME system-register state should be captured");
+        let second = runner
+            .capture_arm64_sme_system_register_state()
+            .expect("second SME system-register state should be captured");
+
+        let values = |state: HvfArm64VcpuSmeSystemRegisterState| {
+            [state.smcr_el1(), state.smpri_el1(), state.tpidr2_el0()]
+        };
+        assert!(
+            values(first) == values(second),
+            "SME system-register accessors should remain stable within one idle vCPU lifetime"
+        );
+        assert!(
+            first == second,
+            "SME system-register state should remain stable within one idle vCPU lifetime"
+        );
+        assert!(
+            format!("{first:?}").contains("<redacted>"),
+            "SME system-register debug output should remain redacted"
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_guest_written_arm64_translation_registers_on_runner_thread() {
     use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
     use bangbang_runtime::VmBackend;
@@ -1929,6 +1972,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         assert_sme_pstate_capture_supported_or_unavailable(session.capture_arm64_sme_pstate())
             .expect("internal session SME PSTATE capture should succeed or report unsupported");
     session
+        .capture_arm64_sme_system_register_state()
+        .expect("internal session should capture SME system-register state");
+    session
         .capture_arm64_translation_register_state()
         .expect("internal session should capture translation-register state");
     session
@@ -2110,6 +2156,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     let _sme_pstate =
         assert_sme_pstate_capture_supported_or_unavailable(session.capture_arm64_sme_pstate())
             .expect("owned session SME PSTATE capture should succeed or report unsupported");
+    session
+        .capture_arm64_sme_system_register_state()
+        .expect("owned session should capture SME system-register state");
     session
         .capture_arm64_translation_register_state()
         .expect("owned session should capture translation-register state");
