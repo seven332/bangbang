@@ -155,6 +155,82 @@ impl HvfArm64VcpuCoreSystemRegisterState {
     }
 }
 
+/// Detached raw EL1 translation-register state captured from one arm64 vCPU.
+///
+/// This value contains `SCTLR_EL1`, both translation table bases, `TCR_EL1`,
+/// `MAIR_EL1`, `AMAIR_EL1`, and `CONTEXTIDR_EL1`. Table bases can expose guest
+/// physical addresses, and context values can expose guest identifiers. These
+/// are sensitive, unvalidated observations, not a complete or serialized
+/// restorable vCPU state. Table-memory persistence, feature validation,
+/// TLB/cache maintenance, and an ordered restore policy remain outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuTranslationRegisterState {
+    sctlr_el1: u64,
+    ttbr0_el1: u64,
+    ttbr1_el1: u64,
+    tcr_el1: u64,
+    mair_el1: u64,
+    amair_el1: u64,
+    contextidr_el1: u64,
+}
+
+impl HvfArm64VcpuTranslationRegisterState {
+    pub(crate) const fn new(
+        sctlr_el1: u64,
+        ttbr0_el1: u64,
+        ttbr1_el1: u64,
+        tcr_el1: u64,
+        mair_el1: u64,
+        amair_el1: u64,
+        contextidr_el1: u64,
+    ) -> Self {
+        Self {
+            sctlr_el1,
+            ttbr0_el1,
+            ttbr1_el1,
+            tcr_el1,
+            mair_el1,
+            amair_el1,
+            contextidr_el1,
+        }
+    }
+
+    /// Return the raw `SCTLR_EL1` value.
+    pub const fn sctlr_el1(self) -> u64 {
+        self.sctlr_el1
+    }
+
+    /// Return the raw `TTBR0_EL1` value.
+    pub const fn ttbr0_el1(self) -> u64 {
+        self.ttbr0_el1
+    }
+
+    /// Return the raw `TTBR1_EL1` value.
+    pub const fn ttbr1_el1(self) -> u64 {
+        self.ttbr1_el1
+    }
+
+    /// Return the raw `TCR_EL1` value.
+    pub const fn tcr_el1(self) -> u64 {
+        self.tcr_el1
+    }
+
+    /// Return the raw `MAIR_EL1` value.
+    pub const fn mair_el1(self) -> u64 {
+        self.mair_el1
+    }
+
+    /// Return the raw `AMAIR_EL1` value.
+    pub const fn amair_el1(self) -> u64 {
+        self.amair_el1
+    }
+
+    /// Return the raw `CONTEXTIDR_EL1` value.
+    pub const fn contextidr_el1(self) -> u64 {
+        self.contextidr_el1
+    }
+}
+
 /// Detached raw thread-context register state captured from one arm64 vCPU.
 ///
 /// These software thread-ID values can contain guest TLS or kernel pointers.
@@ -337,9 +413,16 @@ pub struct HvfSystemRegister(u16);
 
 impl HvfSystemRegister {
     pub const MPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MPIDR_EL1);
+    pub const SCTLR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SCTLR_EL1);
+    pub const TTBR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_TTBR0_EL1);
+    pub const TTBR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_TTBR1_EL1);
+    pub const TCR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TCR_EL1);
     pub const SPSR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SPSR_EL1);
     pub const ELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ELR_EL1);
     pub const SP_EL0: Self = Self(crate::ffi::HV_SYS_REG_SP_EL0);
+    pub const MAIR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MAIR_EL1);
+    pub const AMAIR_EL1: Self = Self(crate::ffi::HV_SYS_REG_AMAIR_EL1);
+    pub const CONTEXTIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CONTEXTIDR_EL1);
     pub const TPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL1);
     pub const TPIDR_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL0);
     pub const TPIDRRO_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDRRO_EL0);
@@ -758,6 +841,28 @@ pub(crate) fn capture_arm64_vcpu_core_system_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
+    let sctlr_el1 = get_system_register(HvfSystemRegister::SCTLR_EL1)?;
+    let ttbr0_el1 = get_system_register(HvfSystemRegister::TTBR0_EL1)?;
+    let ttbr1_el1 = get_system_register(HvfSystemRegister::TTBR1_EL1)?;
+    let tcr_el1 = get_system_register(HvfSystemRegister::TCR_EL1)?;
+    let mair_el1 = get_system_register(HvfSystemRegister::MAIR_EL1)?;
+    let amair_el1 = get_system_register(HvfSystemRegister::AMAIR_EL1)?;
+    let contextidr_el1 = get_system_register(HvfSystemRegister::CONTEXTIDR_EL1)?;
+
+    Ok(HvfArm64VcpuTranslationRegisterState::new(
+        sctlr_el1,
+        ttbr0_el1,
+        ttbr1_el1,
+        tcr_el1,
+        mair_el1,
+        amair_el1,
+        contextidr_el1,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_thread_context_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuThreadContextRegisterState, BackendError> {
@@ -839,6 +944,7 @@ mod tests {
         capture_arm64_vcpu_general_register_state_with,
         capture_arm64_vcpu_pending_interrupt_state_with, capture_arm64_vcpu_simd_fp_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
+        capture_arm64_vcpu_translation_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with, configure_arm64_boot_registers_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
@@ -1180,6 +1286,65 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_translation_register_state_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_translation_register_state_with(|register| {
+            reads.push(register);
+            Ok(0xa5a5_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("translation-register capture should succeed");
+
+        assert_eq!(
+            reads,
+            [
+                HvfSystemRegister::SCTLR_EL1,
+                HvfSystemRegister::TTBR0_EL1,
+                HvfSystemRegister::TTBR1_EL1,
+                HvfSystemRegister::TCR_EL1,
+                HvfSystemRegister::MAIR_EL1,
+                HvfSystemRegister::AMAIR_EL1,
+                HvfSystemRegister::CONTEXTIDR_EL1,
+            ]
+        );
+        assert_eq!(
+            state.sctlr_el1(),
+            0xa5a5_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_SCTLR_EL1)
+        );
+        assert_eq!(
+            state.ttbr0_el1(),
+            0xa5a5_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_TTBR0_EL1)
+        );
+        assert_eq!(
+            state.ttbr1_el1(),
+            0xa5a5_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_TTBR1_EL1)
+        );
+        assert_eq!(
+            state.tcr_el1(),
+            0xa5a5_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_TCR_EL1)
+        );
+        assert_eq!(
+            state.mair_el1(),
+            0xa5a5_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_MAIR_EL1)
+        );
+        assert_eq!(
+            state.amair_el1(),
+            0xa5a5_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_AMAIR_EL1)
+        );
+        assert_eq!(
+            state.contextidr_el1(),
+            0xa5a5_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_CONTEXTIDR_EL1)
+        );
+        assert_eq!(HvfSystemRegister::SCTLR_EL1.raw(), 0xc080);
+        assert_eq!(HvfSystemRegister::TTBR0_EL1.raw(), 0xc100);
+        assert_eq!(HvfSystemRegister::TTBR1_EL1.raw(), 0xc101);
+        assert_eq!(HvfSystemRegister::TCR_EL1.raw(), 0xc102);
+        assert_eq!(HvfSystemRegister::MAIR_EL1.raw(), 0xc510);
+        assert_eq!(HvfSystemRegister::AMAIR_EL1.raw(), 0xc518);
+        assert_eq!(HvfSystemRegister::CONTEXTIDR_EL1.raw(), 0xc681);
+    }
+
+    #[test]
     fn captures_arm64_pending_interrupt_state_in_irq_then_fiq_order() {
         let mut reads = Vec::new();
 
@@ -1283,6 +1448,55 @@ mod tests {
             assert_eq!(
                 state.spsr_el1(),
                 u64::from(HvfSystemRegister::SPSR_EL1.raw())
+            );
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_translation_register_capture_stops_after_each_error_and_can_retry() {
+        let registers = [
+            HvfSystemRegister::SCTLR_EL1,
+            HvfSystemRegister::TTBR0_EL1,
+            HvfSystemRegister::TTBR1_EL1,
+            HvfSystemRegister::TCR_EL1,
+            HvfSystemRegister::MAIR_EL1,
+            HvfSystemRegister::AMAIR_EL1,
+            HvfSystemRegister::CONTEXTIDR_EL1,
+        ];
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake translation register read failed",
+                    ))
+                } else {
+                    Ok(u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_translation_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake translation register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state = capture_arm64_vcpu_translation_register_state_with(&read_system_register)
+                .expect("translation-register capture retry should succeed");
+            assert_eq!(
+                state.sctlr_el1(),
+                u64::from(HvfSystemRegister::SCTLR_EL1.raw())
+            );
+            assert_eq!(
+                state.contextidr_el1(),
+                u64::from(HvfSystemRegister::CONTEXTIDR_EL1.raw())
             );
             assert_eq!(*reads.borrow(), registers);
         }

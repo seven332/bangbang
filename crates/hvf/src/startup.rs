@@ -73,7 +73,8 @@ use crate::runner::{
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuGeneralRegisterState,
     HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState,
-    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuVirtualTimerState,
+    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+    HvfArm64VcpuVirtualTimerState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1188,6 +1189,16 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_core_system_register_state()
     }
 
+    /// Capture raw EL1 translation-register state on the primary owner thread.
+    ///
+    /// This subset omits table memory, feature validation, TLB/cache
+    /// maintenance, persistence, and a safe restore sequence.
+    pub fn capture_arm64_translation_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuTranslationRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_translation_register_state()
+    }
+
     /// Capture raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary
     /// vCPU owner thread.
     ///
@@ -1817,6 +1828,16 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuCoreSystemRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_core_system_register_state()
+    }
+
+    /// Capture raw EL1 translation-register state on the primary owner thread.
+    ///
+    /// This subset omits table memory, feature validation, TLB/cache
+    /// maintenance, persistence, and a safe restore sequence.
+    pub fn capture_arm64_translation_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuTranslationRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_translation_register_state()
     }
 
     /// Capture raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary
