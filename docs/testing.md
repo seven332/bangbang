@@ -116,6 +116,10 @@ Execution-control signed tests require macOS 15 for ACTLR. They must write only
 the Hypervisor.framework-supported `ACTLR_EL1.EnTSO` bit and baseline
 `CPACR_EL1.FPEN`, execute ISB before guest use or exit, and destroy the VM after
 capture instead of treating the changed memory model as a restore round trip.
+Physical-timer signed tests require macOS 15 and must create the GIC before the
+vCPU. They must keep CNTP disabled and masked, assert writable control bits
+separately from derived ISTATUS, and avoid claiming that an absolute CVAL can be
+restored without elapsed-time and interrupt-delivery policy.
 
 ## Stability Rules
 

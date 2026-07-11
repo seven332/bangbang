@@ -73,7 +73,7 @@ use crate::runner::{
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuExceptionRegisterState,
     HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuSimdFpState,
     HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
     HvfArm64VcpuVirtualTimerState,
 };
@@ -1242,6 +1242,16 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_simd_fp_state()
     }
 
+    /// Capture raw EL1 physical-timer state on the primary owner thread.
+    ///
+    /// CNTP capture requires macOS 15 and a GIC created before the vCPU. The
+    /// absolute compare value has no portable restore-time adjustment policy.
+    pub fn capture_arm64_physical_timer_state(
+        &self,
+    ) -> Result<HvfArm64VcpuPhysicalTimerState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_physical_timer_state()
+    }
+
     /// Capture raw virtual-timer mask, offset, control, and compare state on the
     /// primary vCPU owner thread.
     ///
@@ -1901,6 +1911,16 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuSimdFpState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_simd_fp_state()
+    }
+
+    /// Capture raw EL1 physical-timer state on the primary owner thread.
+    ///
+    /// CNTP capture requires macOS 15 and a GIC created before the vCPU. The
+    /// absolute compare value has no portable restore-time adjustment policy.
+    pub fn capture_arm64_physical_timer_state(
+        &self,
+    ) -> Result<HvfArm64VcpuPhysicalTimerState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_physical_timer_state()
     }
 
     /// Capture raw virtual-timer mask, offset, control, and compare state on the

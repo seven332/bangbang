@@ -9,6 +9,30 @@ const VTIMER_TEST_OFFSET: u64 = 0x1234_5678_9abc_def0;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VTIMER_TEST_COMPARE_VALUE: u64 = 0xfedc_ba98_7654_3210;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PHYSICAL_TIMER_TEST_CNTKCTL_EL1: u64 = 3;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PHYSICAL_TIMER_TEST_CNTP_CTL_EL0: u64 = 2;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PHYSICAL_TIMER_TEST_CNTP_CVAL_EL0: u64 = 0x1234_5678;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PHYSICAL_TIMER_WRITABLE_CONTROL_MASK: u64 = 0b11;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PHYSICAL_TIMER_ISTATUS_MASK: u64 = 0b100;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PHYSICAL_TIMER_DEFINED_CONTROL_MASK: u64 = 0b111;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PHYSICAL_TIMER_GUEST_CODE: [u32; 9] = [
+    0xd280_0060, // mov x0, #3
+    0xd518_e100, // msr CNTKCTL_EL1, x0
+    0xd280_0040, // mov x0, #2
+    0xd51b_e220, // msr CNTP_CTL_EL0, x0
+    0xd28a_cf00, // mov x0, #0x5678
+    0xf2a2_4680, // movk x0, #0x1234, lsl #16
+    0xd51b_e240, // msr CNTP_CVAL_EL0, x0
+    0xd503_3fdf, // isb
+    0xd400_0002, // hvc #0
+];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CORE_SYSTEM_TEST_SP_EL0: u64 = 0x1000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CORE_SYSTEM_TEST_SP_EL1: u64 = 0x2000;
@@ -960,6 +984,84 @@ fn cancels_runner_before_first_run() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_guest_written_arm64_physical_timer_state_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_code = PHYSICAL_TIMER_GUEST_CODE
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("physical-timer guest code should be written");
+
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    backend
+        .create_gic()
+        .expect("GIC should be created before the physical-timer vCPU");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_entry,
+            })
+            .expect("guest code boot registers should be configured");
+
+        let HvfVcpuExit::Exception(exit) = runner
+            .run_once()
+            .expect("guest physical-timer writer should exit through HVC")
+        else {
+            panic!("guest physical-timer writer should produce an exception exit");
+        };
+        assert_eq!(
+            exit.decode_hvc()
+                .expect("guest physical-timer writer exit should decode as HVC")
+                .immediate(),
+            0
+        );
+
+        let state = runner
+            .capture_arm64_physical_timer_state()
+            .expect("physical-timer state should be captured");
+        assert_eq!(state.cntkctl_el1(), PHYSICAL_TIMER_TEST_CNTKCTL_EL1);
+        assert_eq!(
+            state.cntp_ctl_el0() & PHYSICAL_TIMER_WRITABLE_CONTROL_MASK,
+            PHYSICAL_TIMER_TEST_CNTP_CTL_EL0
+        );
+        assert_eq!(
+            state.cntp_ctl_el0() & !PHYSICAL_TIMER_DEFINED_CONTROL_MASK,
+            0
+        );
+        assert!(matches!(
+            state.cntp_ctl_el0() & PHYSICAL_TIMER_ISTATUS_MASK,
+            0 | PHYSICAL_TIMER_ISTATUS_MASK
+        ));
+        assert_eq!(state.cntp_cval_el0(), PHYSICAL_TIMER_TEST_CNTP_CVAL_EL0);
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_runner_arm64_virtual_timer_state() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;
@@ -1320,6 +1422,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .capture_arm64_simd_fp_state()
         .expect("internal session should capture SIMD/FP state");
     session
+        .capture_arm64_physical_timer_state()
+        .expect("internal session should capture physical-timer state");
+    session
         .capture_arm64_virtual_timer_state()
         .expect("internal session should capture virtual-timer state");
     session
@@ -1471,6 +1576,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_simd_fp_state()
         .expect("owned session should capture SIMD/FP state");
+    session
+        .capture_arm64_physical_timer_state()
+        .expect("owned session should capture physical-timer state");
     session
         .capture_arm64_virtual_timer_state()
         .expect("owned session should capture virtual-timer state");

@@ -240,8 +240,9 @@ is resource-specific:
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
   ACTLR_EL1/CPACR_EL1 execution controls, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1
-  values, raw Q0-Q31/FPCR/FPSR values, raw virtual-timer
-  mask/offset/control/CVAL values, raw EL1
+  values, raw Q0-Q31/FPCR/FPSR values, raw physical-timer
+  CNTKCTL/control/CVAL values, raw virtual-timer mask/offset/control/CVAL values,
+  raw EL1
   SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
   levels, opaque GIC device-state bytes, and raw EL1 GIC ICC CPU-interface
   values are sensitive guest/VMM execution state.
@@ -255,9 +256,11 @@ is resource-specific:
   The opaque GIC byte value uses a custom `Debug` implementation that reports
   only its length rather than formatting its contents.
   Current internal capture commands keep these values in process memory and do
-  not write them to logs, metrics, error strings, or persistence. The raw timer
-  offset is tied to HVF's host-time relation, and the control ISTATUS bit is a
-  time-sensitive observation rather than writable configuration. These values
+  not write them to logs, metrics, error strings, or persistence. The raw
+  virtual-timer offset is tied to HVF's host-time relation, the physical-timer
+  CVAL is an absolute comparator against a continuing count, and control
+  ISTATUS bits are time-sensitive observations rather than writable
+  configuration. These values
   must not be treated as portable or trusted restore data without explicit
   adjustment, writable-bit, and validation policies. The public pause and
   snapshot paths do not invoke any of these capture commands.

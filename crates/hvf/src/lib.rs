@@ -46,7 +46,8 @@ pub use startup::{
 pub use vcpu::{
     ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState,
     HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
-    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuPendingInterruptState,
+    HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuSimdFpState,
     HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
     HvfArm64VcpuVirtualTimerState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
     HvfSystemRegister, HvfVcpu,
