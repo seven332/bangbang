@@ -694,6 +694,47 @@ impl fmt::Debug for HvfArm64VcpuSmeSystemRegisterState {
     }
 }
 
+/// Detached raw system-context register state captured from one arm64 vCPU.
+///
+/// Hypervisor.framework exposes `SCXTNUM_EL0` and `SCXTNUM_EL1` on macOS 15.2
+/// and newer. These guest software context numbers can identify execution
+/// contexts, so `Debug` redacts both raw values. They are separate from TPIDR
+/// thread context, `CONTEXTIDR_EL1`, and processor feature metadata. This
+/// getter-only value defines no interpretation, feature validation,
+/// persistence, snapshot schema, or safe restore ordering.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuSystemContextRegisterState {
+    scxtnum_el0: u64,
+    scxtnum_el1: u64,
+}
+
+impl HvfArm64VcpuSystemContextRegisterState {
+    pub(crate) const fn new(scxtnum_el0: u64, scxtnum_el1: u64) -> Self {
+        Self {
+            scxtnum_el0,
+            scxtnum_el1,
+        }
+    }
+
+    /// Return the raw `SCXTNUM_EL0` value.
+    pub const fn scxtnum_el0(self) -> u64 {
+        self.scxtnum_el0
+    }
+
+    /// Return the raw `SCXTNUM_EL1` value.
+    pub const fn scxtnum_el1(self) -> u64 {
+        self.scxtnum_el1
+    }
+}
+
+impl fmt::Debug for HvfArm64VcpuSystemContextRegisterState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64VcpuSystemContextRegisterState")
+            .field("registers", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Detached raw EL1 translation-register state captured from one arm64 vCPU.
 ///
 /// This value contains `SCTLR_EL1`, both translation table bases, `TCR_EL1`,
@@ -702,6 +743,7 @@ impl fmt::Debug for HvfArm64VcpuSmeSystemRegisterState {
 /// are sensitive, unvalidated observations, not a complete or serialized
 /// restorable vCPU state. Table-memory persistence, feature validation,
 /// TLB/cache maintenance, and an ordered restore policy remain outside it.
+/// Optional `SCXTNUM_EL0`/`SCXTNUM_EL1` context is captured separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuTranslationRegisterState {
     sctlr_el1: u64,
@@ -837,8 +879,9 @@ const fn pointer_authentication_key(low: u64, high: u64) -> u128 {
 /// These software thread-ID values can contain guest TLS or kernel pointers.
 /// They are sensitive raw observations for later owner-thread orchestration,
 /// not a complete or serialized restorable vCPU state. `TPIDR2_EL0` is captured
-/// separately with SME system registers; wider state and restore validation
-/// remain outside this value.
+/// separately with SME system registers, while `SCXTNUM_EL0`/`SCXTNUM_EL1` are
+/// captured in a separate system-context value. Wider state and restore
+/// validation remain outside this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuThreadContextRegisterState {
     tpidr_el0: u64,
@@ -1099,11 +1142,13 @@ impl HvfSystemRegister {
     pub const VBAR_EL1: Self = Self(crate::ffi::HV_SYS_REG_VBAR_EL1);
     pub const CONTEXTIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CONTEXTIDR_EL1);
     pub const TPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL1);
+    pub const SCXTNUM_EL1: Self = Self(crate::ffi::HV_SYS_REG_SCXTNUM_EL1);
     pub const CNTKCTL_EL1: Self = Self(crate::ffi::HV_SYS_REG_CNTKCTL_EL1);
     pub const CSSELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CSSELR_EL1);
     pub const TPIDR_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL0);
     pub const TPIDRRO_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDRRO_EL0);
     pub const TPIDR2_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDR2_EL0);
+    pub const SCXTNUM_EL0: Self = Self(crate::ffi::HV_SYS_REG_SCXTNUM_EL0);
     pub const CNTP_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_CTL_EL0);
     pub const CNTP_CVAL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_CVAL_EL0);
     pub const CNTV_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTV_CTL_EL0);
@@ -1768,6 +1813,18 @@ pub(crate) fn capture_arm64_vcpu_sme_system_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_system_context_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuSystemContextRegisterState, BackendError> {
+    let scxtnum_el0 = get_system_register(HvfSystemRegister::SCXTNUM_EL0)?;
+    let scxtnum_el1 = get_system_register(HvfSystemRegister::SCXTNUM_EL1)?;
+
+    Ok(HvfArm64VcpuSystemContextRegisterState::new(
+        scxtnum_el0,
+        scxtnum_el1,
+    ))
+}
+
 pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
@@ -1914,6 +1971,7 @@ mod tests {
         capture_arm64_vcpu_simd_fp_state_with, capture_arm64_vcpu_sme_pstate_with,
         capture_arm64_vcpu_sme_system_register_state_with,
         capture_arm64_vcpu_sve_sme_identification_register_state_with,
+        capture_arm64_vcpu_system_context_register_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
         capture_arm64_vcpu_translation_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with,
@@ -1961,6 +2019,13 @@ mod tests {
             HvfSystemRegister::SMCR_EL1,
             HvfSystemRegister::SMPRI_EL1,
             HvfSystemRegister::TPIDR2_EL0,
+        ]
+    }
+
+    fn system_context_registers() -> [HvfSystemRegister; 2] {
+        [
+            HvfSystemRegister::SCXTNUM_EL0,
+            HvfSystemRegister::SCXTNUM_EL1,
         ]
     }
 
@@ -2738,6 +2803,47 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_system_context_register_state_in_documented_order() {
+        let expected_registers = system_context_registers();
+        let expected_values = [0, u64::MAX];
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_system_context_register_state_with(|register| {
+            reads.push(register);
+            expected_registers
+                .iter()
+                .position(|expected| *expected == register)
+                .map(|index| expected_values[index])
+                .ok_or(BackendError::InvalidState(
+                    "unexpected fake system-context register",
+                ))
+        })
+        .expect("system-context register capture should succeed");
+
+        assert_eq!(reads, expected_registers);
+        assert_eq!(state.scxtnum_el0(), expected_values[0]);
+        assert_eq!(state.scxtnum_el1(), expected_values[1]);
+        assert_eq!(HvfSystemRegister::SCXTNUM_EL0.raw(), 0xde87);
+        assert_eq!(HvfSystemRegister::SCXTNUM_EL1.raw(), 0xc687);
+    }
+
+    #[test]
+    fn arm64_system_context_register_state_debug_redacts_values() {
+        let state = super::HvfArm64VcpuSystemContextRegisterState::new(
+            0x0123_4567_89ab_cdef,
+            0xfedc_ba98_7654_3210,
+        );
+
+        let debug = format!("{state:?}");
+        assert_eq!(
+            debug,
+            "HvfArm64VcpuSystemContextRegisterState { registers: \"<redacted>\" }"
+        );
+        assert!(!debug.contains("0123"));
+        assert!(!debug.contains("fedc"));
+    }
+
+    #[test]
     fn captures_arm64_translation_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -3407,6 +3513,48 @@ mod tests {
             assert_eq!(
                 state.tpidr2_el0(),
                 0x5e00_0000_0000_0000 | u64::from(registers[2].raw())
+            );
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_system_context_register_capture_stops_after_each_error_and_can_retry() {
+        let registers = system_context_registers();
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake system-context register read failed",
+                    ))
+                } else {
+                    Ok(0xc700_0000_0000_0000 | u64::from(register.raw()))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_system_context_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake system-context register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state =
+                capture_arm64_vcpu_system_context_register_state_with(&read_system_register)
+                    .expect("system-context register capture retry should succeed");
+            assert_eq!(
+                state.scxtnum_el0(),
+                0xc700_0000_0000_0000 | u64::from(registers[0].raw())
+            );
+            assert_eq!(
+                state.scxtnum_el1(),
+                0xc700_0000_0000_0000 | u64::from(registers[1].raw())
             );
             assert_eq!(*reads.borrow(), registers);
         }

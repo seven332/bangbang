@@ -27,7 +27,7 @@ crates/bangbang   VMM process entrypoint and startup CLI
 The HVF runner currently exposes owner-thread capture building blocks for
 general registers, baseline and optional SVE/SME guest-visible processor
 identification metadata, mutable SME PSTATE flags, raw SME system registers
-with redacted `Debug`, raw core,
+with redacted `Debug`, raw system-context registers with redacted `Debug`, raw core,
 EL1 exception, execution-control, cache-selection, hardware-breakpoint,
 hardware-watchpoint, debug-control, raw Hypervisor.framework debug-trap policy,
 translation, and thread-context system-register subsets,

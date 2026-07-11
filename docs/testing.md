@@ -139,6 +139,12 @@ same-vCPU results only with fixed failure messages and must verify that `Debug`
 redacts all raw values. They must not log or format those values, write the
 registers, query maximum SVL, read Z/P/ZA/ZT0, run guest code, or treat stable
 readback as a portable or safely restorable SME state.
+System-context signed tests require macOS 15.2 and must capture `SCXTNUM_EL0`
+and `SCXTNUM_EL1` twice from one idle real vCPU. They may compare same-vCPU
+results only with fixed failure messages and must verify that `Debug` redacts
+both raw values. They must not log or format those values, write the registers,
+run guest code, hard-code reset values, or treat stable readback as feature,
+destination-compatibility, or safely restorable state.
 Cache-selection signed tests must capture CSSELR_EL1 from an idle real vCPU
 without hard-coding or validating its architecturally unknown reset value. They
 must not write the selector, query CCSIDR, execute ISB or cache maintenance, run

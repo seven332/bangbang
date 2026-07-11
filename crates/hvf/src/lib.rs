@@ -52,7 +52,8 @@ pub use vcpu::{
     HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
     HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePstate,
     HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
-    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
-    HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState, HvfInterruptType,
-    HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu,
+    HvfArm64VcpuSystemContextRegisterState, HvfArm64VcpuThreadContextRegisterState,
+    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
+    HvfArm64VcpuWatchpointRegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
+    HvfSystemRegister, HvfVcpu,
 };

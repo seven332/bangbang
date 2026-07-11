@@ -1679,7 +1679,9 @@ compatibility metadata and requires macOS 15.2. A sixteenth calls the macOS
 streaming-mode and `PSTATE.ZA` storage-enable flags without invoking the setter.
 A seventeenth reads raw `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` in that order
 on macOS 15.2+ and publishes them through a value whose `Debug` output redacts
-all three registers. The seventeen commands share one command-owned
+all three registers. An eighteenth reads raw `SCXTNUM_EL0` then `SCXTNUM_EL1`
+on macOS 15.2+ and redacts both guest software context numbers from `Debug`.
+The eighteen commands share one command-owned
 core-register admission domain,
 publish no partial state after a read failure, and are exposed by borrowed and
 owned HVF boot sessions for later lease-owned orchestration.
@@ -1689,12 +1691,14 @@ addresses, and the vector base are sensitive; pointer-authentication keys are
 cryptographic secrets; breakpoint values can reveal guest virtual addresses or
 identities; watchpoint values reveal guest data virtual addresses; comparator
 and debug controls plus host debug-trap policy are security-sensitive execution
-state; SME PSTATE reveals mutable guest streaming/ZA execution mode; and SME
+state; SME PSTATE reveals mutable guest streaming/ZA execution mode; software
+context numbers can identify guest execution contexts; and SME
 system registers include mutable controls plus `TPIDR2_EL0` thread context that
-remains outside the baseline thread-context subset. The key and SME system-
-register values redact all raw material from `Debug` but provide named accessors
-for trusted internal composition. Identification values describe the virtual CPU/
-HVF view, including bangbang's deterministic MPIDR affinity zero; they are not
+remains outside the baseline thread-context subset. The key, SME system-
+register, and system-context values redact all raw material from `Debug` but
+provide named accessors for trusted internal composition. Identification values
+describe the virtual CPU/HVF view, including bangbang's deterministic MPIDR
+affinity zero; they are not
 physical-host identity or a destination compatibility decision. The stable
 baseline keeps macOS 15.2 ZFR0/SMFR0 metadata in a separate optional value;
 newer beta-only IDs and configuration-time feature manifests remain omitted.
@@ -1708,6 +1712,10 @@ through the existing owner-thread getter and preserves each raw backend error.
 It performs no writes and defines no writable-bit or feature validation,
 maximum-SVL policy, persistence, schema, or restore ordering with PSTATE and
 the conditionally present Z/P/ZA/ZT0 contents.
+The separate system-context capture uses macOS 15.2 SDK register ids through the
+same owner-thread getter, preserves raw backend errors, and performs no writes.
+It defines no interpretation, feature or destination validation, persistence,
+schema, or restore ordering with TPIDR and `CONTEXTIDR_EL1` state.
 The translation value omits table memory, feature validation, TLB/cache
 maintenance, and an ordered restore path. The exception value omits vector-
 table memory, semantic validation, and safe restore ordering. Signed validation
@@ -1728,7 +1736,11 @@ calls the setter, enters streaming mode, enables ZA, reads Z/P/ZA/ZT0, or runs
 the guest. SME system-register validation captures all three registers twice
 from the same idle vCPU, compares them only with fixed failure messages, and
 checks redacted `Debug` output. It does not log raw values, write registers,
-query maximum SVL, read Z/P/ZA/ZT0, or run the guest. Debug-control validation only
+query maximum SVL, read Z/P/ZA/ZT0, or run the guest.
+System-context validation captures both registers twice from the same idle vCPU,
+compares them only with fixed failure messages, and checks redacted `Debug`
+output. It does not log raw values, write registers, run guest code, hard-code a
+reset value, or infer feature or destination compatibility. Debug-control validation only
 reads both values from an idle real vCPU; it does not enable monitor debug,
 software stepping, debug exceptions, guest debug-register access, or DCC interrupts.
 Breakpoint and watchpoint comparators and their respective DFR0-reported counts
@@ -1763,8 +1775,9 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The baseline and optional SVE/SME identification,
-SME PSTATE, SME system-register, core system-register, exception, execution-
-control, cache-selection, breakpoint, watchpoint, debug-control, debug-trap,
+SME PSTATE, SME system-register, system-context, core system-register,
+exception, execution-control, cache-selection, breakpoint, watchpoint,
+debug-control, debug-trap,
 translation,
 pointer-authentication, thread-context, baseline SIMD/FP, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
@@ -2159,6 +2172,8 @@ macOS design work instead of direct implementation:
   `PSTATE.ZA` through one runtime-resolved getter without calling its setter.
   A seventeenth captures raw macOS 15.2+ SMCR_EL1, SMPRI_EL1, and TPIDR2_EL0 in
   a separate value whose `Debug` output redacts every register.
+  An eighteenth captures raw macOS 15.2+ SCXTNUM_EL0 and SCXTNUM_EL1 in a
+  separate value whose `Debug` output redacts both software context numbers.
   Newer beta-only IDs, configuration-time feature manifests, feature masking,
   destination policy, maximum SME streaming vector length, streaming
   Z/P/ZA/ZT0 data,
