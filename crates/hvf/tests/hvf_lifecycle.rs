@@ -138,6 +138,41 @@ const TRANSLATION_REGISTER_GUEST_CODE: [u32; 24] = [
     0xd400_0002, // hvc #0
 ];
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const POINTER_AUTHENTICATION_TEST_APIA_KEY: u128 = (0x2222_u128 << 64) | 0x1111;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const POINTER_AUTHENTICATION_TEST_APIB_KEY: u128 = (0x4444_u128 << 64) | 0x3333;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const POINTER_AUTHENTICATION_TEST_APDA_KEY: u128 = (0x6666_u128 << 64) | 0x5555;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const POINTER_AUTHENTICATION_TEST_APDB_KEY: u128 = (0x8888_u128 << 64) | 0x7777;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const POINTER_AUTHENTICATION_TEST_APGA_KEY: u128 = (0xaaaa_u128 << 64) | 0x9999;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const POINTER_AUTHENTICATION_KEY_GUEST_CODE: [u32; 22] = [
+    0xd282_2220, // mov x0, #0x1111
+    0xd518_2100, // msr APIAKeyLo_EL1, x0
+    0xd284_4440, // mov x0, #0x2222
+    0xd518_2120, // msr APIAKeyHi_EL1, x0
+    0xd286_6660, // mov x0, #0x3333
+    0xd518_2140, // msr APIBKeyLo_EL1, x0
+    0xd288_8880, // mov x0, #0x4444
+    0xd518_2160, // msr APIBKeyHi_EL1, x0
+    0xd28a_aaa0, // mov x0, #0x5555
+    0xd518_2200, // msr APDAKeyLo_EL1, x0
+    0xd28c_ccc0, // mov x0, #0x6666
+    0xd518_2220, // msr APDAKeyHi_EL1, x0
+    0xd28e_eee0, // mov x0, #0x7777
+    0xd518_2240, // msr APDBKeyLo_EL1, x0
+    0xd291_1100, // mov x0, #0x8888
+    0xd518_2260, // msr APDBKeyHi_EL1, x0
+    0xd293_3320, // mov x0, #0x9999
+    0xd518_2300, // msr APGAKeyLo_EL1, x0
+    0xd295_5540, // mov x0, #0xaaaa
+    0xd518_2320, // msr APGAKeyHi_EL1, x0
+    0xd503_3fdf, // isb
+    0xd400_0002, // hvc #0
+];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const THREAD_CONTEXT_TEST_TPIDR_EL0: u64 = 0x1111;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const THREAD_CONTEXT_TEST_TPIDRRO_EL0: u64 = 0x2222;
@@ -668,6 +703,87 @@ fn captures_guest_written_arm64_translation_registers_on_runner_thread() {
             0 | TRANSLATION_TEST_AMAIR_EL1_WRITE
         ));
         assert_eq!(state.contextidr_el1(), TRANSLATION_TEST_CONTEXTIDR_EL1);
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn captures_guest_written_arm64_pointer_authentication_keys_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_code = POINTER_AUTHENTICATION_KEY_GUEST_CODE
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("pointer-authentication key guest code should be written");
+
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_entry,
+            })
+            .expect("guest code boot registers should be configured");
+
+        let HvfVcpuExit::Exception(exit) = runner
+            .run_once()
+            .expect("guest pointer-authentication key writer should exit through HVC")
+        else {
+            panic!("guest pointer-authentication key writer should produce an exception exit");
+        };
+        assert_eq!(
+            exit.decode_hvc()
+                .expect("guest pointer-authentication key writer should exit through HVC")
+                .immediate(),
+            0
+        );
+
+        let state = runner
+            .capture_arm64_pointer_authentication_key_state()
+            .expect("pointer-authentication key state should be captured");
+        assert!(
+            state.apia_key() == POINTER_AUTHENTICATION_TEST_APIA_KEY,
+            "APIA should match the non-secret test key"
+        );
+        assert!(
+            state.apib_key() == POINTER_AUTHENTICATION_TEST_APIB_KEY,
+            "APIB should match the non-secret test key"
+        );
+        assert!(
+            state.apda_key() == POINTER_AUTHENTICATION_TEST_APDA_KEY,
+            "APDA should match the non-secret test key"
+        );
+        assert!(
+            state.apdb_key() == POINTER_AUTHENTICATION_TEST_APDB_KEY,
+            "APDB should match the non-secret test key"
+        );
+        assert!(
+            state.apga_key() == POINTER_AUTHENTICATION_TEST_APGA_KEY,
+            "APGA should match the non-secret test key"
+        );
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -1416,6 +1532,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .capture_arm64_translation_register_state()
         .expect("internal session should capture translation-register state");
     session
+        .capture_arm64_pointer_authentication_key_state()
+        .expect("internal session should capture pointer-authentication key state");
+    session
         .capture_arm64_thread_context_register_state()
         .expect("internal session should capture thread-context register state");
     session
@@ -1570,6 +1689,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_translation_register_state()
         .expect("owned session should capture translation-register state");
+    session
+        .capture_arm64_pointer_authentication_key_state()
+        .expect("owned session should capture pointer-authentication key state");
     session
         .capture_arm64_thread_context_register_state()
         .expect("owned session should capture thread-context register state");

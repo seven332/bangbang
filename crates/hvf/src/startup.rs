@@ -73,7 +73,8 @@ use crate::runner::{
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuExceptionRegisterState,
     HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
+    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
     HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
     HvfArm64VcpuVirtualTimerState,
 };
@@ -1220,6 +1221,17 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_translation_register_state()
     }
 
+    /// Capture the five raw EL1 pointer-authentication keys on the primary
+    /// owner thread.
+    ///
+    /// Debug formatting is redacted. Feature validation, persistence
+    /// protection, and restore ordering remain outside this getter-only value.
+    pub fn capture_arm64_pointer_authentication_key_state(
+        &self,
+    ) -> Result<HvfArm64VcpuPointerAuthenticationKeyState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_pointer_authentication_key_state()
+    }
+
     /// Capture raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary
     /// vCPU owner thread.
     ///
@@ -1889,6 +1901,17 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuTranslationRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_translation_register_state()
+    }
+
+    /// Capture the five raw EL1 pointer-authentication keys on the primary
+    /// owner thread.
+    ///
+    /// Debug formatting is redacted. Feature validation, persistence
+    /// protection, and restore ordering remain outside this getter-only value.
+    pub fn capture_arm64_pointer_authentication_key_state(
+        &self,
+    ) -> Result<HvfArm64VcpuPointerAuthenticationKeyState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_pointer_authentication_key_state()
     }
 
     /// Capture raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary
