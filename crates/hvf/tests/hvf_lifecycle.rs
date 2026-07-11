@@ -765,6 +765,11 @@ fn captures_guest_written_arm64_pointer_authentication_keys_on_runner_thread() {
             .capture_arm64_pointer_authentication_key_state()
             .expect("pointer-authentication key state should be captured");
         assert!(
+            format!("{state:?}")
+                == "HvfArm64VcpuPointerAuthenticationKeyState { keys: \"<redacted>\" }",
+            "pointer-authentication key Debug output should be fully redacted"
+        );
+        assert!(
             state.apia_key() == POINTER_AUTHENTICATION_TEST_APIA_KEY,
             "APIA should match the non-secret test key"
         );

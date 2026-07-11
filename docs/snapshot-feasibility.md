@@ -118,8 +118,8 @@ Another core-register command reads the low and high halves of APIA, APIB,
 APDA, APDB, and APGA in that order and publishes five 128-bit keys only after
 all ten owner-thread reads succeed. Pointer-authentication keys are
 cryptographic secrets, so the detached value redacts all key material from
-`Debug`; its named accessors remain available only for trusted internal
-composition. It shares the core-register admission domain, and both
+`Debug`; its named accessors are intended only for trusted internal composition.
+It shares the core-register admission domain, and both
 boot-session forms expose capture without involving the supervisor lease or
 public snapshot paths. The value defines no feature/algorithm validation, memory
 zeroization, protected persistence, enable ordering, restore, or schema policy.
