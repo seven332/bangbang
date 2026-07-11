@@ -72,7 +72,8 @@ use crate::runner::{
 };
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState, HvfArm64VcpuVirtualTimerState,
+    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuVirtualTimerState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1187,6 +1188,17 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_core_system_register_state()
     }
 
+    /// Capture raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary
+    /// vCPU owner thread.
+    ///
+    /// These sensitive software thread-ID values can contain guest pointers.
+    /// This subset omits TPIDR2_EL0, wider system state, and restore policy.
+    pub fn capture_arm64_thread_context_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuThreadContextRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_thread_context_register_state()
+    }
+
     /// Capture raw Q0-Q31, FPCR, and FPSR values on the primary vCPU owner
     /// thread.
     ///
@@ -1786,6 +1798,17 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuCoreSystemRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_core_system_register_state()
+    }
+
+    /// Capture raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary
+    /// vCPU owner thread.
+    ///
+    /// These sensitive software thread-ID values can contain guest pointers.
+    /// This subset omits TPIDR2_EL0, wider system state, and restore policy.
+    pub fn capture_arm64_thread_context_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuThreadContextRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_thread_context_register_state()
     }
 
     /// Capture raw Q0-Q31, FPCR, and FPSR values on the primary vCPU owner
