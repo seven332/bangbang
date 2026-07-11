@@ -2144,8 +2144,8 @@ mod tests {
     struct ShortIo {
         inner: Cursor<Vec<u8>>,
         maximum: usize,
-        interrupt_next_read: bool,
-        interrupt_next_write: bool,
+        read_interruptions_remaining: usize,
+        write_interruptions_remaining: usize,
     }
 
     impl ShortIo {
@@ -2153,8 +2153,8 @@ mod tests {
             Self {
                 inner: Cursor::new(Vec::new()),
                 maximum,
-                interrupt_next_read: false,
-                interrupt_next_write: true,
+                read_interruptions_remaining: 0,
+                write_interruptions_remaining: 3,
             }
         }
 
@@ -2162,16 +2162,16 @@ mod tests {
             Self {
                 inner: Cursor::new(bytes),
                 maximum,
-                interrupt_next_read: true,
-                interrupt_next_write: false,
+                read_interruptions_remaining: 3,
+                write_interruptions_remaining: 0,
             }
         }
     }
 
     impl Read for ShortIo {
         fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
-            if self.interrupt_next_read {
-                self.interrupt_next_read = false;
+            if self.read_interruptions_remaining > 0 {
+                self.read_interruptions_remaining -= 1;
                 return Err(Error::from(ErrorKind::Interrupted));
             }
             let length = destination.len().min(self.maximum);
@@ -2181,8 +2181,8 @@ mod tests {
 
     impl Write for ShortIo {
         fn write(&mut self, source: &[u8]) -> io::Result<usize> {
-            if self.interrupt_next_write {
-                self.interrupt_next_write = false;
+            if self.write_interruptions_remaining > 0 {
+                self.write_interruptions_remaining -= 1;
                 return Err(Error::from(ErrorKind::Interrupted));
             }
             let length = source.len().min(self.maximum);
