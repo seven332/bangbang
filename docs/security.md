@@ -243,6 +243,17 @@ is resource-specific:
   untrusted, preserve redaction, and prevent one process from cleaning up or
   overwriting another process's resources. The current boundary is documented
   in [Snapshot Feasibility](snapshot-feasibility.md).
+- Native snapshot inspection treats the entire state file as untrusted binary
+  input. The process opens it nonblocking, accepts only a regular file, caps the
+  complete read at 16 MiB plus the 40-byte envelope overhead, and rechecks the
+  cap while reading. The pure decoder uses checked length conversion and
+  arithmetic, requires exact consumption, validates CRC before semantic
+  compatibility, and publishes no payload or metadata until all checks pass.
+  Command-path and payload debug output is redacted, and read errors retain only
+  `ErrorKind`, not the host path. CRC-64/Jones detects accidental corruption;
+  it is not authentication, and a party that can rewrite the file can recompute
+  it. Future payload schemas must therefore stay memory-safe and fail closed
+  even for checksum-valid attacker-controlled bytes.
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
   ACTLR_EL1/CPACR_EL1 execution controls, raw CSSELR_EL1 cache selection, raw
