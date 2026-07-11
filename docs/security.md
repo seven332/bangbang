@@ -240,8 +240,8 @@ is resource-specific:
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
   ACTLR_EL1/CPACR_EL1 execution controls, raw CSSELR_EL1 cache selection, raw
-  hardware-breakpoint value/control pairs, raw MDCCINT_EL1/MDSCR_EL1 debug
-  controls, raw pointer-authentication keys, raw
+  hardware-breakpoint and hardware-watchpoint value/control pairs, raw
+  MDCCINT_EL1/MDSCR_EL1 debug controls, raw pointer-authentication keys, raw
   TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1 values, raw Q0-Q31/FPCR/FPSR values, raw
   physical-timer CNTKCTL/control/CVAL values, raw virtual-timer
   mask/offset/control/CVAL values, raw EL1
@@ -261,17 +261,18 @@ is resource-specific:
   destination CTR/CLIDR/DCZID/CCSIDR manifest, and define synchronization and
   cache-maintenance policy before dependent cache-size queries.
   Breakpoint value registers can expose guest virtual addresses, Context IDs,
-  or VMIDs, while raw control registers can describe enabled debug behavior.
-  Capture reads only the DFR0-reported implemented prefix and does not log,
-  persist, write, enable, or change trap policy. Future export must protect
-  confidentiality, and future restore must validate destination count,
-  features, control bits, ordering, and host trap policy.
+  or VMIDs. Watchpoint value registers expose guest data virtual addresses, and
+  their controls can encode access type, byte selection, linking, and enabled
+  debug behavior. Each capture reads only its DFR0-reported implemented prefix
+  and does not log, persist, write, enable, or change trap policy. Future export
+  must protect confidentiality, and future restore must validate each
+  destination count, features, control bits, ordering, and host trap policy.
   MDCCINT and MDSCR can reveal security-sensitive guest debugging controls and
   status. The two-field getter does not enable debug behavior, but it is not a
   safe restore model: raw writes could activate monitor debug, software
-  stepping, or debug communications behavior. Breakpoint comparators are
-  captured separately, but watchpoint arrays and Hypervisor.framework's debug-
-  exception and debug-register-access trap settings are not. Any future
+  stepping, or debug communications behavior. Breakpoint and watchpoint
+  comparators are captured through separate values, but Hypervisor.framework's
+  debug-exception and debug-register-access trap settings are not. Any future
   restore must validate features and writable/status bits, coordinate trap
   policy and ordering, and treat restored debug controls as untrusted.
   Pointer-authentication keys are cryptographic secrets. Their detached value
