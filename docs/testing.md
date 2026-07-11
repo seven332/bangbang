@@ -97,12 +97,19 @@ after partial setup failure.
 For owner-thread aggregate captures, also cover exact field order, every read
 failure and retry, forward and reverse admission conflicts, caller abandonment,
 closed command and response channels, queued-command destruction, panic, and
-shutdown. Pending-interrupt signed tests must set known asymmetric IRQ/FIQ
-values without an intervening run, then clear both levels; a run would let HVF
-clear the injection levels and invalidate the round trip. GIC ICC signed tests
-must create the GIC before the vCPU, write architecturally writable EL1 ICC
-values from signed guest code, and assert only fields or masked bits whose
-readback is stable; read-only active-priority values remain host-defined.
+shutdown. Pending-interrupt restore tests must verify IRQ-then-FIQ writes,
+both failure positions, exact value-free failed-type/completed-prefix/source
+context, complete retry, generalized interrupt-operation conflicts, and every
+lifecycle cleanup path. Signed coverage must retain IRQ-only, mutate to
+FIQ-only, restore/recapture the complete IRQ-only value twice through fixed
+messages, then clear and recapture both levels before shutdown. No guest run may
+intervene because HVF would clear the injection levels and invalidate the raw
+round trip. Equality proves neither GIC/device composition, delivery/EOI,
+automatic per-run reassertion, persistence, nor portable snapshot restore.
+GIC ICC signed tests must create the GIC before the vCPU, write architecturally
+writable EL1 ICC values from signed guest code, and assert only fields or masked
+bits whose readback is stable; read-only active-priority values remain host-
+defined.
 General-register restore unit tests must verify X0-X30/PC/CPSR write order,
 every one of the 33 failure positions, exact failed-register and completed-
 write context, complete retry, shared core-operation conflicts, abandonment,

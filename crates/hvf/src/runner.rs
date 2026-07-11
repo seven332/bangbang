@@ -26,10 +26,11 @@ use crate::vcpu::{
     HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapState,
     HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
     HvfArm64VcpuGeneralRegisterRestoreError, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
-    HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
-    HvfArm64VcpuSimdFpRestoreError, HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePRegisterCaptureError,
-    HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate, HvfArm64VcpuSmeSystemRegisterState,
+    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptRestoreError,
+    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
+    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpRestoreError,
+    HvfArm64VcpuSimdFpState, HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState,
+    HvfArm64VcpuSmePstate, HvfArm64VcpuSmeSystemRegisterState,
     HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
     HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
     HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState,
@@ -61,6 +62,7 @@ use crate::vcpu::{
     restore_arm64_vcpu_exception_register_state_with,
     restore_arm64_vcpu_execution_control_register_state_with,
     restore_arm64_vcpu_general_register_state_with,
+    restore_arm64_vcpu_pending_interrupt_state_with,
     restore_arm64_vcpu_pointer_authentication_key_state_with,
     restore_arm64_vcpu_simd_fp_state_with, restore_arm64_vcpu_system_context_register_state_with,
     restore_arm64_vcpu_thread_context_register_state_with,
@@ -101,6 +103,7 @@ pub enum HvfVcpuRunnerError {
     Backend(BackendError),
     Gic(HvfGicError),
     GeneralRegisterRestore(HvfArm64VcpuGeneralRegisterRestoreError),
+    PendingInterruptRestore(HvfArm64VcpuPendingInterruptRestoreError),
     SimdFpRestore(HvfArm64VcpuSimdFpRestoreError),
     SystemRegisterRestore(HvfArm64VcpuSystemRegisterRestoreError),
     SmePRegisterCapture(HvfArm64VcpuSmePRegisterCaptureError),
@@ -153,6 +156,7 @@ impl fmt::Display for HvfVcpuRunnerError {
             Self::Backend(err) => write!(f, "{err}"),
             Self::Gic(err) => write!(f, "{err}"),
             Self::GeneralRegisterRestore(err) => write!(f, "{err}"),
+            Self::PendingInterruptRestore(err) => write!(f, "{err}"),
             Self::SimdFpRestore(err) => write!(f, "{err}"),
             Self::SystemRegisterRestore(err) => write!(f, "{err}"),
             Self::SmePRegisterCapture(err) => write!(f, "{err}"),
@@ -184,6 +188,7 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::Backend(err) => Some(err),
             Self::Gic(err) => Some(err),
             Self::GeneralRegisterRestore(err) => Some(err),
+            Self::PendingInterruptRestore(err) => Some(err),
             Self::SimdFpRestore(err) => Some(err),
             Self::SystemRegisterRestore(err) => Some(err),
             Self::SmePRegisterCapture(err) => Some(err),
@@ -216,6 +221,12 @@ impl From<HvfGicError> for HvfVcpuRunnerError {
 impl From<HvfArm64VcpuGeneralRegisterRestoreError> for HvfVcpuRunnerError {
     fn from(err: HvfArm64VcpuGeneralRegisterRestoreError) -> Self {
         Self::GeneralRegisterRestore(err)
+    }
+}
+
+impl From<HvfArm64VcpuPendingInterruptRestoreError> for HvfVcpuRunnerError {
+    fn from(err: HvfArm64VcpuPendingInterruptRestoreError) -> Self {
+        Self::PendingInterruptRestore(err)
     }
 }
 
@@ -537,6 +548,11 @@ enum RunnerCommand {
         admission: InFlightInterruptOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuPendingInterruptState, HvfVcpuRunnerError>>,
+    },
+    RestoreArm64PendingInterruptState {
+        admission: InFlightInterruptOperation,
+        state: HvfArm64VcpuPendingInterruptState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     CaptureGicDeviceState {
         admission: InFlightInterruptOperation,
@@ -995,6 +1011,14 @@ trait RunnerVcpu {
             self.get_pending_interrupt(interrupt_type)
         })
     }
+    fn restore_arm64_pending_interrupt_state(
+        &mut self,
+        state: &HvfArm64VcpuPendingInterruptState,
+    ) -> Result<(), HvfArm64VcpuPendingInterruptRestoreError> {
+        restore_arm64_vcpu_pending_interrupt_state_with(state, |interrupt_type, pending| {
+            self.set_pending_interrupt(interrupt_type, pending)
+        })
+    }
     fn set_gic_ppi_pending(&mut self, _intid: u32, _pending: bool) -> Result<(), HvfGicError> {
         Err(HvfGicError::InvalidState(
             "vCPU does not support GIC PPI pending control",
@@ -1263,6 +1287,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Err(
                 HvfVcpuRunnerError::Gic(_)
                 | HvfVcpuRunnerError::GeneralRegisterRestore(_)
+                | HvfVcpuRunnerError::PendingInterruptRestore(_)
                 | HvfVcpuRunnerError::SimdFpRestore(_)
                 | HvfVcpuRunnerError::SystemRegisterRestore(_)
                 | HvfVcpuRunnerError::SmePRegisterCapture(_)
@@ -2059,6 +2084,25 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<HvfArm64VcpuPendingInterruptState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_pending_interrupt_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Restore CPU-level IRQ and FIQ pending state on the owner thread.
+    ///
+    /// The IRQ-then-FIQ writes are nontransactional. After an error, retry the
+    /// complete typed state or discard the vCPU before execution. HVF clears
+    /// both levels after a vCPU run returns, so this primitive does not define
+    /// automatic per-run reassertion, GIC/device state, routing, delivery/EOI,
+    /// persistence, or snapshot orchestration.
+    pub fn restore_arm64_pending_interrupt_state(
+        &self,
+        state: &HvfArm64VcpuPendingInterruptState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_pending_interrupt_restore(*state, response_sender)?;
 
         response_receiver
             .recv()
@@ -3335,6 +3379,25 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
     }
 
+    fn start_arm64_pending_interrupt_restore(
+        &self,
+        state: HvfArm64VcpuPendingInterruptState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let admission = {
+            let _state = self.reserve_interrupt_operation(|| Ok(()))?;
+            InFlightInterruptOperation::new(&self.state)
+        };
+
+        self.command_sender
+            .send(RunnerCommand::RestoreArm64PendingInterruptState {
+                admission,
+                state,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
+    }
+
     fn start_gic_device_state_capture(
         &self,
         response_sender: mpsc::Sender<Result<HvfGicDeviceState, HvfVcpuRunnerError>>,
@@ -4447,6 +4510,20 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::RestoreArm64PendingInterruptState {
+                mut admission,
+                state,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .restore_arm64_pending_interrupt_state(&state)
+                    .map_err(HvfVcpuRunnerError::PendingInterruptRestore);
+                // Both owner-thread writes or the first failed write have
+                // finished. Restore admission before responding so receiver
+                // failure is not part of the restore lifetime.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureGicDeviceState {
                 mut admission,
                 response_sender,
@@ -4676,9 +4753,10 @@ mod tests {
         HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapState,
         HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
         HvfArm64VcpuGeneralRegisterRestoreError, HvfArm64VcpuGeneralRegisterState,
-        HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
-        HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
-        HvfArm64VcpuSimdFpRestoreError, HvfArm64VcpuSimdFpRestoreRegister, HvfArm64VcpuSimdFpState,
+        HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptRestoreError,
+        HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
+        HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpRestoreError,
+        HvfArm64VcpuSimdFpRestoreRegister, HvfArm64VcpuSimdFpState,
         HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate,
         HvfArm64VcpuSmeSystemRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
         HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError,
@@ -5561,7 +5639,22 @@ mod tests {
 
     struct PanicOnPendingInterruptVcpu;
 
+    struct BlockingPendingInterruptRestoreVcpu {
+        entered_restore_sender: mpsc::Sender<()>,
+        release_restore_receiver: mpsc::Receiver<Result<(), BackendError>>,
+        barrier_sender: mpsc::Sender<()>,
+    }
+
+    struct PanicOnPendingInterruptRestoreVcpu;
+
     type BlockingPendingInterruptCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), BackendError>>,
+        mpsc::Receiver<()>,
+    );
+
+    type BlockingPendingInterruptRestoreRunner = (
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<(), BackendError>>,
@@ -10871,6 +10964,100 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for BlockingPendingInterruptRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn set_pending_interrupt(
+            &mut self,
+            interrupt_type: HvfInterruptType,
+            _pending: bool,
+        ) -> Result<(), BackendError> {
+            if interrupt_type == HvfInterruptType::Irq {
+                self.entered_restore_sender.send(()).map_err(|_| {
+                    BackendError::InvalidState(
+                        "fake pending-interrupt restore entry receiver closed",
+                    )
+                })?;
+                self.release_restore_receiver.recv().map_err(|_| {
+                    BackendError::InvalidState(
+                        "fake pending-interrupt restore release sender closed",
+                    )
+                })??;
+            }
+
+            Ok(())
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.barrier_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnPendingInterruptRestoreVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn set_pending_interrupt(
+            &mut self,
+            _interrupt_type: HvfInterruptType,
+            _pending: bool,
+        ) -> Result<(), BackendError> {
+            panic!("fake pending-interrupt restore panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for GicDeviceStateRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -12568,6 +12755,10 @@ mod tests {
         assert_eq!(runner.capture_arm64_virtual_timer_state(), Err(expected));
     }
 
+    fn pending_interrupt_restore_test_state() -> HvfArm64VcpuPendingInterruptState {
+        HvfArm64VcpuPendingInterruptState::new(true, false)
+    }
+
     fn assert_interrupt_operations_rejected(
         runner: &HvfVcpuRunner<'_>,
         expected: HvfVcpuRunnerError,
@@ -12590,6 +12781,10 @@ mod tests {
         );
         assert_eq!(
             runner.capture_arm64_pending_interrupt_state(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            runner.restore_arm64_pending_interrupt_state(&pending_interrupt_restore_test_state()),
             Err(expected.clone())
         );
         assert_eq!(runner.capture_gic_device_state(), Err(expected.clone()));
@@ -14396,6 +14591,28 @@ mod tests {
         )
     }
 
+    fn start_blocking_pending_interrupt_restore_runner() -> BlockingPendingInterruptRestoreRunner {
+        let (entered_restore_sender, entered_restore_receiver) = mpsc::channel();
+        let (release_restore_sender, release_restore_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingPendingInterruptRestoreVcpu {
+                entered_restore_sender,
+                release_restore_receiver,
+                barrier_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_restore_receiver,
+            release_restore_sender,
+            barrier_receiver,
+        )
+    }
+
     fn start_gic_device_state_recording_runner(
         fail_next_capture: bool,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<()>) {
@@ -14570,6 +14787,7 @@ mod tests {
         assert_send_sync::<HvfArm64VcpuSmeSystemRegisterState>();
         assert_send_sync::<HvfArm64VcpuSystemContextRegisterState>();
         assert_send_sync::<HvfArm64VcpuSystemRegisterRestoreError>();
+        assert_send_sync::<HvfArm64VcpuPendingInterruptRestoreError>();
         assert_send_sync::<HvfArm64VcpuPendingInterruptState>();
         assert_send_sync::<HvfArm64VcpuPhysicalTimerState>();
         assert_send_sync::<HvfArm64VcpuPointerAuthenticationKeyState>();
@@ -23892,6 +24110,285 @@ mod tests {
 
         assert_eq!(
             runner.capture_arm64_pending_interrupt_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn restores_pending_interrupt_state_on_runner_thread() {
+        let state = pending_interrupt_restore_test_state();
+        let (runner, operation_receiver) =
+            start_pending_interrupt_recording_runner(false, true, None);
+
+        runner
+            .restore_arm64_pending_interrupt_state(&state)
+            .expect("pending-interrupt restore should succeed");
+
+        assert_eq!(
+            operation_receiver.try_iter().collect::<Vec<_>>(),
+            [
+                PendingInterruptOperation::Set(HvfInterruptType::Irq, true),
+                PendingInterruptOperation::Set(HvfInterruptType::Fiq, false),
+            ]
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn pending_interrupt_restore_failures_are_typed_and_retryable() {
+        use std::error::Error as _;
+
+        let state = pending_interrupt_restore_test_state();
+        let expected_operations = [
+            PendingInterruptOperation::Set(HvfInterruptType::Irq, true),
+            PendingInterruptOperation::Set(HvfInterruptType::Fiq, false),
+        ];
+
+        for (failed_index, failed_type) in [HvfInterruptType::Irq, HvfInterruptType::Fiq]
+            .into_iter()
+            .enumerate()
+        {
+            let (runner, operation_receiver) = start_pending_interrupt_recording_runner(
+                false,
+                true,
+                Some(expected_operations[failed_index]),
+            );
+
+            let error = runner
+                .restore_arm64_pending_interrupt_state(&state)
+                .expect_err("injected pending-interrupt restore should fail");
+            let HvfVcpuRunnerError::PendingInterruptRestore(error) = error else {
+                panic!("restore failure should retain its typed context");
+            };
+            assert_eq!(error.failed_interrupt_type(), failed_type);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake pending interrupt operation failed".to_string())
+            );
+            let interrupt_name = match failed_type {
+                HvfInterruptType::Irq => "IRQ",
+                HvfInterruptType::Fiq => "FIQ",
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 {interrupt_name} pending interrupt after {failed_index} successful writes: invalid backend state: fake pending interrupt operation failed"
+                )
+            );
+            assert_eq!(
+                operation_receiver.try_iter().collect::<Vec<_>>(),
+                expected_operations[..=failed_index]
+            );
+
+            runner
+                .restore_arm64_pending_interrupt_state(&state)
+                .expect("complete pending-interrupt restore retry should succeed");
+            assert_eq!(
+                operation_receiver.try_iter().collect::<Vec<_>>(),
+                expected_operations
+            );
+            assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn commands_during_pending_interrupt_restore_are_rejected_without_queueing() {
+        let state = pending_interrupt_restore_test_state();
+        let (runner, entered_restore_receiver, release_restore_sender, _barrier_receiver) =
+            start_blocking_pending_interrupt_restore_runner();
+
+        thread::scope(|scope| {
+            let restore = scope.spawn(|| runner.restore_arm64_pending_interrupt_state(&state));
+            entered_restore_receiver
+                .recv()
+                .expect("runner should enter fake pending-interrupt restore");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_core_register_operations_rejected(&runner, expected.clone());
+            assert_timer_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_restore_sender
+                .send(Ok(()))
+                .expect("pending-interrupt restore release should be sent");
+            restore
+                .join()
+                .expect("pending-interrupt restore thread should join")
+                .expect("pending-interrupt restore should succeed");
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_pending_interrupt_restore_admitted_until_command_finishes() {
+        let state = pending_interrupt_restore_test_state();
+        let (runner, entered_restore_receiver, release_restore_sender, barrier_receiver) =
+            start_blocking_pending_interrupt_restore_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_pending_interrupt_restore(state, response_sender)
+                .expect("pending-interrupt restore should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_restore_receiver
+            .recv()
+            .expect("runner should enter fake pending-interrupt restore");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind restore");
+        release_restore_sender
+            .send(Ok(()))
+            .expect("pending-interrupt restore release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after restore");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn pending_interrupt_restore_send_failure_releases_admission() {
+        let state = pending_interrupt_restore_test_state();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.restore_arm64_pending_interrupt_state(&state),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_pending_interrupt_restore_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (restore_response_sender, restore_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_pending_interrupt_restore(
+                pending_interrupt_restore_test_state(),
+                restore_response_sender,
+            )
+            .expect("pending-interrupt restore should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(restore_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn pending_interrupt_restore_panic_releases_admission() {
+        let state = pending_interrupt_restore_test_state();
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnPendingInterruptRestoreVcpu));
+
+        assert_eq!(
+            runner.restore_arm64_pending_interrupt_state(&state),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))

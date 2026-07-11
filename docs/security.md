@@ -318,6 +318,15 @@ is resource-specific:
   nor supplies ISB/dependent CCSIDR visibility or cache maintenance. After
   failure, retry the complete retained value or discard the vCPU before
   execution.
+  The paired pending-interrupt restore applies the same boundary to CPU-level
+  IRQ and FIQ injection state. It accepts only the complete typed capture,
+  writes IRQ then FIQ, and reports the exact failed interrupt type, completed
+  prefix, and backend source without either Boolean value. The fields affect
+  guest control flow but do not include GIC/device state, routing, delivery, or
+  EOI policy. HVF clears both levels after a vCPU run returns, so the primitive
+  neither persists delivery state nor defines automatic per-run reassertion.
+  After failure, retry the complete retained value or discard the vCPU before
+  execution.
   The paired pointer-authentication restore extends the same boundary to APIA,
   APIB, APDA, APDB, and APGA. It accepts only the complete redacted typed
   capture, writes each low then high half in capture order, and reports the
@@ -339,7 +348,7 @@ is resource-specific:
   validation, FPCR/FPSR writable-bit policy, protected persistence,
   zeroization, rollback, or schema. After failure, retry the complete retained
   value or discard the vCPU before execution. Public snapshot load invokes none
-  of the ten restore primitives.
+  of these restore primitives.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
   expose guest process or kernel context identifiers.
   FAR and PAR can expose guest fault or translation-result addresses, VBAR can
