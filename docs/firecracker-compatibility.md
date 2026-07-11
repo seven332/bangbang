@@ -1667,8 +1667,11 @@ Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
 `TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. A fifth reads raw `SCTLR_EL1`,
 `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1`, `MAIR_EL1`, `AMAIR_EL1`, and
 `CONTEXTIDR_EL1`. A sixth reads raw `AFSR0_EL1`, `AFSR1_EL1`, `ESR_EL1`,
-`FAR_EL1`, `PAR_EL1`, and `VBAR_EL1`. A seventh reads raw `ACTLR_EL1` then
-`CPACR_EL1`; complete capture requires macOS 15 for ACTLR.EnTSO. An eighth reads
+`FAR_EL1`, `PAR_EL1`, and `VBAR_EL1`. Its typed value has a paired owner-thread
+restore that writes the same six fields in capture order and reuses the typed
+system-register failure with exact partial progress. A seventh reads raw
+`ACTLR_EL1` then `CPACR_EL1`; complete capture requires macOS 15 for
+ACTLR.EnTSO. An eighth reads
 the low and high halves of APIA, APIB, APDA, APDB, and APGA and publishes five
 128-bit pointer-authentication keys. A ninth reads guest-visible `MIDR_EL1`,
 `MPIDR_EL1`, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 compatibility metadata. A
@@ -1708,11 +1711,12 @@ value exposes the raw square while redacting all bytes and dimensions from
 requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
-commands plus general- and core-system-register restore form a twenty-four-operation,
+commands plus the general-, core-system-, and exception-register restore
+operations form a twenty-five-operation,
 command-owned core-register admission domain. Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose both paired state
-operations and all captures for later lease-owned orchestration.
+setter failure. Borrowed and owned HVF boot sessions expose all three restores
+and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
 `hv_sme_config_get_max_svl_bytes` and publishes the maximum streaming vector
@@ -1919,14 +1923,15 @@ derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The baseline and optional SVE/SME identification,
 SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register, system-context,
-exception, execution-control, cache-selection, breakpoint, watchpoint,
+execution-control, cache-selection, breakpoint, watchpoint,
 debug-control, debug-trap,
 translation,
 pointer-authentication, thread-context, baseline SIMD/FP, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
-The core system-register subset has a paired ordered, nontransactional restore
-operation but likewise has no validation, schema, or wider ordering policy.
+The core system-register and EL1 exception subsets have paired ordered,
+nontransactional restore operations but likewise have no validation, schema,
+vector-memory, or wider ordering policy.
 Identification capture is compatibility metadata rather than mutable restore
 state and defines no feature-mask or destination policy. Debug-control and
 debug-trap capture remain separate and
@@ -2303,7 +2308,9 @@ macOS design work instead of direct implementation:
   raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1,
   TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 translation state.
   A sixth captures raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and
-  VBAR_EL1 exception state; and a seventh captures raw ACTLR_EL1 and CPACR_EL1
+  VBAR_EL1 exception state and can reapply the same complete typed value in
+  capture order through a nontransactional owner-thread operation. A seventh
+  captures raw ACTLR_EL1 and CPACR_EL1
   execution controls, requiring macOS 15 for ACTLR.EnTSO. An eighth captures
   five 128-bit pointer-authentication keys from all ten APIA/APIB/APDA/APDB/APGA
   halves and redacts them from `Debug`. A ninth captures guest-visible MIDR,
@@ -2347,10 +2354,10 @@ macOS design work instead of direct implementation:
   validation, cache feature/geometry interpretation and masks, selector
   validation and maintenance, breakpoint and watchpoint control
   validation, debug-trap policy validation/setters, protected key persistence,
-  and wider restore ordering remain outside these subsets. General-register and
-  core-system-register restore report their typed failed register and completed-
-  write count; callers must retry the complete captured value or discard the
-  vCPU before execution.
+  and wider restore ordering remain outside these subsets. General-register,
+  core-system-register, and exception-register restore report their typed
+  failed register and completed-write count; callers must retry the complete
+  captured value or discard the vCPU before execution.
   The runner can capture raw CNTKCTL_EL1, CNTP_CTL_EL0, CNTP_CVAL_EL0, and
   CNTP_TVAL_EL0 on the owning thread when macOS 15 physical-timer prerequisites
   are met. The absolute and relative views are read sequentially and do not
