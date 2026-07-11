@@ -339,6 +339,16 @@ mod imp {
         fn os_release(object: *mut c_void);
     }
 
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+    }
+
+    pub fn absolute_time() -> Result<u64, BackendError> {
+        // SAFETY: `mach_absolute_time` takes no arguments and returns the
+        // current monotonic counter without retaining caller-owned state.
+        Ok(unsafe { mach_absolute_time() })
+    }
+
     #[derive(Debug)]
     struct HvVmConfigOwner {
         config: NonNull<c_void>,
@@ -2032,6 +2042,10 @@ mod imp {
         CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSysReg, HvVcpu,
         UNSUPPORTED_TARGET_MESSAGE,
     };
+
+    pub fn absolute_time() -> Result<u64, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
 
     pub fn create_vm() -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))

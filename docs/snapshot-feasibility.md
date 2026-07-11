@@ -215,7 +215,7 @@ ownership on separate threads:
 | --- | --- |
 | Process owner | `ProcessVmm` owns the VMM controller, startup executor, and active `BootRunLoopSupervisor` handle. It serves API requests and commits public instance-state transitions, but it does not own the live boot session after startup. |
 | Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy state, and block and entropy retry schedulers. Device-update commands execute here. |
-| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes HVF operations through commands and can return immutable X0-X30, PC, and CPSR values; guest-visible MIDR, MPIDR, and baseline PFR/DFR/ISAR/MMFR compatibility metadata; optional macOS 15.2 ZFR0/SMFR0 SVE/SME compatibility metadata; mutable macOS 15.2 SME `PSTATE.SM`/`PSTATE.ZA` controls; conditional maximum-width macOS 15.2 streaming Z0-Z31 bytes, maximum-derived P0-P15 predicate bytes, a maximum-SVL-square ZA matrix, and fixed 64-byte SME2 ZT0 contents in separate debug-redacted values; raw macOS 15.2 SMCR_EL1, SMPRI_EL1, and TPIDR2_EL0 values in a debug-redacted value; raw macOS 15.2 SCXTNUM_EL0 and SCXTNUM_EL1 software context numbers in a debug-redacted value with paired ordered restore; raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values with paired ordered restore; raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 values; raw ACTLR_EL1 and CPACR_EL1 values; raw CSSELR_EL1 cache-selection state with paired ordered restore; every DFR0-reported raw DBGBVR/DBGBCR hardware-breakpoint pair; every DFR0-reported raw DBGWVR/DBGWCR hardware-watchpoint pair; raw MDCCINT_EL1 and MDSCR_EL1 debug controls with paired ordered restore; raw Hypervisor.framework debug-exception and debug-register-access trap policy with paired ordered restore; raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1, TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 values with paired ordered restore; raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values with paired ordered restore; raw baseline Q0-Q31, FPCR, and FPSR values with paired ordered restore; raw APIA, APIB, APDA, APDB, and APGA pointer-authentication keys in a debug-redacted value with paired ordered restore; raw physical-timer CNTKCTL, control, CVAL, and TVAL values; raw virtual-timer mask, offset, control, and CVAL values; CPU-level IRQ/FIQ pending values with paired ordered restore; Hypervisor.framework's opaque GIC device-state bytes with paired pre-first-run apply; or raw EL1 GIC ICC CPU-interface values with paired owner-thread capture and pre-first-run restore of nine mutable registers plus derived-RPR validation. The snapshot barrier invokes none of these captures or restore operations, and the remaining architectural/device inventory is not implemented. |
+| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes HVF operations through commands and can return immutable X0-X30, PC, and CPSR values; guest-visible MIDR, MPIDR, and baseline PFR/DFR/ISAR/MMFR compatibility metadata; optional macOS 15.2 ZFR0/SMFR0 SVE/SME compatibility metadata; mutable macOS 15.2 SME `PSTATE.SM`/`PSTATE.ZA` controls; conditional maximum-width macOS 15.2 streaming Z0-Z31 bytes, maximum-derived P0-P15 predicate bytes, a maximum-SVL-square ZA matrix, and fixed 64-byte SME2 ZT0 contents in separate debug-redacted values; raw macOS 15.2 SMCR_EL1, SMPRI_EL1, and TPIDR2_EL0 values in a debug-redacted value; raw macOS 15.2 SCXTNUM_EL0 and SCXTNUM_EL1 software context numbers in a debug-redacted value with paired ordered restore; raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values with paired ordered restore; raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 values; raw ACTLR_EL1 and CPACR_EL1 values; raw CSSELR_EL1 cache-selection state with paired ordered restore; every DFR0-reported raw DBGBVR/DBGBCR hardware-breakpoint pair; every DFR0-reported raw DBGWVR/DBGWCR hardware-watchpoint pair; raw MDCCINT_EL1 and MDSCR_EL1 debug controls with paired ordered restore; raw Hypervisor.framework debug-exception and debug-register-access trap policy with paired ordered restore; raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1, TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 values with paired ordered restore; raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values with paired ordered restore; raw baseline Q0-Q31, FPCR, and FPSR values with paired ordered restore; raw APIA, APIB, APDA, APDB, and APGA pointer-authentication keys in a debug-redacted value with paired ordered restore; raw physical/virtual timers plus a normalized freeze-downtime timer value with paired never-run restore; CPU-level IRQ/FIQ pending values with paired ordered restore; Hypervisor.framework's opaque GIC device-state bytes with paired pre-first-run apply; or raw EL1 GIC ICC CPU-interface values with paired owner-thread capture and pre-first-run restore of nine mutable registers plus derived-RPR validation. The snapshot barrier invokes none of these captures or restore operations, and the remaining architectural/device inventory is not implemented. |
 | Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. The snapshot barrier can temporarily quiesce the block and entropy schedulers. The vmnet interface, vsock listener, retained streams, and their host/kernel buffers remain open for the lifetime of the boot session. A transient vsock polling thread is joined at the end of each vCPU run step. |
 
 A successful public pause has a narrower boundary than a snapshot needs:
@@ -628,6 +628,46 @@ adjustment or control-restore policy. Borrowed and owned boot sessions delegate
 this capture, but the supervisor lease and public snapshot paths do not invoke
 it.
 
+#1261 adds a separate native-HVF timer policy rather than assigning restore
+meaning to either raw capture. One owner-thread command reads physical state,
+then virtual state, then samples `mach_absolute_time()` once. It stores the
+frozen virtual count as `sample - raw_offset` and the full-width physical
+comparator distance as `raw_CNTP_CVAL - sample`, using wrapping `u64`
+arithmetic. Restore samples the destination counter and reconstructs
+`offset = sample - virtual_count` and
+`CNTP_CVAL = sample + physical_compare_delta`. Snapshot downtime therefore
+does not advance either guest timer domain, while both domains resume advancing
+from the destination restore instant. Raw TVAL is not a restore source;
+derived ISTATUS is stripped; control bits outside ENABLE, IMASK, and captured
+ISTATUS fail closed.
+
+The never-run restore preflights every physical and virtual timer getter plus
+the destination counter before its first mutation. It then masks vTimer exits,
+disables both controls, writes CNTKCTL, adjusted physical CVAL, adjusted virtual
+offset, and virtual CVAL, restores physical then virtual ENABLE/IMASK, and
+restores the captured vTimer mask last. The ten writes are nontransactional. A
+value-free error names the failed read/sample/write and completed write prefix;
+a retry restarts at the mask with a fresh sample, otherwise the caller discards
+the destination. Command admission prevents an overlapping runner operation,
+and the sticky run flag rejects restore after even a failed run attempt, but it
+does not supply a lease across other restore commands.
+
+The same policy module classifies native-v1 optional state before future
+composition. It rejects CPACR ZEN or SMEN access, active PSTATE.SM or PSTATE.ZA,
+and any enabled implemented DBGBCR or DBGWCR, in that order and without values
+or comparator indexes. Acceptance is only an inactive-state policy decision;
+it does not make other getter-only SVE/SME/debug captures restorable.
+
+Prepared borrowed and owned boot sessions also have a never-run VMGenID
+replacement primitive. It preloads and range-checks the GIC SPI signaler,
+generates a nonzero 16-byte value distinct from retained metadata, writes all
+16 guest bytes, commits metadata only after that write, and finally calls
+`hv_gic_set_spi(line, true)`. Apple defines each true call as an edge for an
+edge-triggered SPI, so no artificial low transition is sent. A signal failure
+is an explicit post-commit partial stage; retry generates another distinct
+value and signals again, or the caller discards the session. Generation bytes
+are redacted from device and error `Debug` output.
+
 A separate interrupt command captures the CPU-level IRQ then FIQ pending
 injection values and publishes one immutable value only after both owner-thread
 reads succeed. A paired command writes the complete typed value in IRQ-then-FIQ
@@ -758,6 +798,28 @@ mapping. Later work must either prove another supported macOS mechanism, choose
 software tracking for specific memory ranges, or document diff snapshots as a
 platform-limited feature.
 
+### Required native-v1 restore order
+
+The future load orchestrator must hold one exclusive no-run lease and use this
+order only after complete compatibility and optional-state validation:
+
+1. construct validated guest memory, baseline devices, the GIC, and one vCPU;
+2. restore baseline architectural register and data state in its documented
+   dependency order, while active SVE/SME/debug optional state remains rejected;
+3. apply the compatible opaque GIC device blob;
+4. restore and validate the EL1 ICC CPU-interface state;
+5. restore normalized physical and virtual timers, taking timer-PPI state from
+   the compatible GIC image rather than replaying TVAL or ISTATUS;
+6. restore CPU IRQ/FIQ pending injection last among runner-owned state;
+7. replace the guest VMGenID buffer and inject its SPI only after every GIC
+   restore, so the notification cannot be overwritten; and
+8. commit a paused session and permit resume only after every step succeeds.
+
+These are compositional requirements, not an implemented transaction. The
+current commands release their individual admission guards before returning,
+and no public or supervisor path invokes the sequence. VMClock generation and
+time restore remain separate deferred policy.
+
 ## Target Snapshot-Ready Ownership
 
 The target design builds a full internal, exclusive quiescence lease on top of
@@ -886,7 +948,10 @@ tested:
   General, core-system, exception, execution-control, cache-selection,
   debug-control, debug-trap policy, thread-context, translation, system-context, baseline
   SIMD/FP, and pointer-authentication key values also have isolated low-level
-  owner-thread restore operations. CPU-level IRQ/FIQ pending values have a separate paired restore
+  owner-thread restore operations. #1261 additionally supplies normalized
+  physical/virtual timer capture and never-run restore with a freeze-downtime
+  policy, plus a fail-closed inactive SVE/SME/debug classifier. CPU-level
+  IRQ/FIQ pending values have a separate paired restore
   under generalized interrupt admission. None has snapshot validation or
   orchestration.
   Identification metadata still needs masks and destination compatibility
@@ -934,10 +999,10 @@ tested:
   instruction/data CCSIDR geometry are queried separately and do not form one
   atomic manifest with the live selector.
   Remaining system registers and other
-  optional architecture state still need a full inventory; the raw virtual-
-  timer offset, absolute physical-timer comparator, and relative physical-timer
-  value need explicit restore-time adjustment policies;
-  derived ISTATUS observations are not control-restore contracts;
+  optional architecture state still need a full inventory. Raw timer values
+  remain observation-only, while the separate normalized policy strips derived
+  ISTATUS, ignores TVAL, and adjusts host-relative offset/CVAL at restore;
+  timer-PPI delivery and EOI behavior remain part of GIC/run-loop composition;
   pointer-authentication key restore still needs feature validation, protected
   persistence, zeroization, and safe SCTLR enable ordering; and every remaining
   captured field still needs a restore path on the owning thread. The eight
@@ -1003,6 +1068,7 @@ API behavior until all of its prerequisites exist.
 | Runner thread-context register capture and restore (fifth bidirectional subset implemented) | #1176 adds typed immutable raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 state plus one owner-thread capture. #1236 adds ordered owner-thread restore of that complete value through the reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the three writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. TPIDR2 is captured separately with SME system registers, SCXTNUM_EL0/EL1 use the separate system-context value, and CONTEXTIDR_EL1 remains in translation state; address/destination validation, wider context ordering, persistence, schema, rollback, orchestration, and multi-vCPU coordination remain deferred. | Exact three-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written capture/restore/recapture without post-restore guest execution or value logging. |
 | Runner physical-timer capture (raw subset implemented) | #1188 adds typed immutable raw CNTKCTL_EL1, CNTP_CTL_EL0, and CNTP_CVAL_EL0 state plus one failure-atomic owner-thread command; #1212 extends the same value and command with raw CNTP_TVAL_EL0. It generalizes timer admission so physical capture and every virtual-timer operation reject each other. Both boot-session forms expose capture without involving the snapshot lease. CNTP requires macOS 15 and GIC creation before the vCPU; CVAL/TVAL are separately timed absolute/relative views, and elapsed-time adjustment, writable-bit filtering, interrupt delivery, persistence, orchestration, schema, and restore remain deferred. | Exact SDK ids and availability; deterministic four-field order, every failure point and retry, bidirectional timer conflicts, abandonment, channel, queued destruction, unwind, panic, shutdown, signed disabled/masked guest-written capture, and signed idle TVAL observation without raw-value or stability assumptions. |
 | Runner virtual-timer capture (raw subset implemented) | #1166 adds typed immutable mask/offset state and #1168 extends it with raw control/CVAL values. Timer-specific owner-thread get/set commands and one serialized four-field capture share generalized timer admission with physical-timer capture. Both boot-session forms expose capture, but the snapshot lease does not invoke it. CPU pending levels, the opaque GIC device blob, and EL1 ICC state are captured separately; restore-time offset/control policy, orchestration, and restore remain deferred. | Deterministic four-field order, conflict, abandon, channel, panic, and retry tests plus signed known-value capture that safely restores the original stable values and writable control bits. |
+| Native arm64 timer and VMGenID restore policy (internal primitives implemented) | #1261 normalizes virtual count and physical CVAL distance around one host-counter sample, filters writable controls, strips ISTATUS, ignores TVAL, and applies a ten-write never-run restore after complete preflight. It also rejects active native-v1 SVE/SME/debug optional state and replaces the retained 16-byte VMGenID before injecting its edge-rising SPI. Both boot-session forms delegate timer and VMGenID operations, but no cross-step lease, payload schema, supervisor, or public path invokes them. VMClock and timer EOI policy remain deferred. | Wrapping arithmetic and control filtering; every preflight/write failure and completed prefix; fresh-sample retry; all runner conflicts/lifecycle cleanup; random/zero/duplicate/write/signal VMGenID stages and redaction; signed fresh-VM timer restore, armed/masked controls, both session delegates, guest-buffer/metadata equality, and successful SPI injection before run. |
 | Runner pending-interrupt capture and restore (first bidirectional interrupt subset implemented) | #1174 adds typed IRQ/FIQ owner-thread get/set commands and one failure-atomic IRQ-then-FIQ capture. #1248 adds ordered owner-thread restore of that complete value through a dedicated value-free failure with the exact failed type and completed prefix. The two writes are nontransactional, so callers must retry the complete value or discard the vCPU before execution. CPU pending levels and validated GIC PPI mutations share generalized interrupt-operation admission but remain distinct state models. Both boot-session forms expose capture and restore, but the snapshot lease invokes neither. HVF clears both levels after a run, so automatic pre-run reassertion, the separately captured opaque GIC blob and EL1 ICC value, routing, delivery/EOI, persistence, schema, orchestration, and multi-vCPU association remain deferred. | Exact IRQ-then-FIQ read/write order; both read and write failures; typed value-free partial-write context; complete retry; bidirectional conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed IRQ-only restore/recapture twice after a FIQ-only mutation, followed by explicit clear, without a guest run or GIC/delivery claims. |
 | Runner opaque GIC device-state capture and restore (second bidirectional interrupt subset implemented) | #1178 adds a redacted immutable byte value and owner-loop capture for Hypervisor.framework's stable, versioned GIC device blob, with fallible allocation and retained-object cleanup. #1255 adds an independently loaded setter and command-owned pre-first-run apply of the complete value. Both operations share generalized interrupt admission; restore checks the sticky run lifetime atomically, preserves exact HVF failure provenance, and clones no bytes into diagnostics. Both boot-session forms expose capture and apply without involving the snapshot lease. EL1 ICC state is separate; parsing, persistence, compatibility preflight, cross-step lease, schema, orchestration, and multi-vCPU stopping remain deferred. | Capture create/size/data/release order and cleanup; restore exact pointer/`usize` length, empty/no-call and backend failure; sticky run gate; every forward/reverse conflict; abandonment, channels, queued destruction, unwind, panic, shutdown; redacted debug; and signed non-empty same-VM capture/reapply before run without parsing, comparison, logging, or guest execution. |
 | Runner EL1 GIC ICC register capture and restore (third bidirectional interrupt subset implemented) | #1180 adds a typed immutable ten-register value and owner-thread capture for PMR, BPR0, AP0R0, AP1R0, RPR, BPR1, CTLR, SRE, IGRPEN0, and IGRPEN1. #1258 adds a pre-first-run owner command that independently preloads getter and setter capabilities, writes the nine architecturally mutable fields in capture order, and validates the derived read-only RPR at its original position. A typed value-free error distinguishes write from derived-value validation and reports the exact register and completed write prefix. The operation is nontransactional, so callers must retry the complete value or discard the vCPU before execution. It shares generalized interrupt admission and complements, but is not embedded in, the opaque GIC blob; callers apply that compatible blob first without receiving a cross-step lease. Both boot-session forms expose capture and restore without involving the snapshot lease. `ICC_SRE_EL2`, ICH/ICV, destination validation, host-update preflight, persistence, composite orchestration, and multi-vCPU association remain deferred. | Exact SDK ids and ten-position read/write-or-validate order; every capture read failure, every mutable write failure, RPR read failure and mismatch; typed value-free partial-write context; complete retry; sticky never-run gate; bidirectional conflicts, abandonment, channels, queued destruction, unwind, panic, shutdown, and both boot-session delegates; signed guest-written PMR/BPR/SRE/group-enable capture plus same-idle-vCPU opaque-blob/ICC capture, ordered restore, and two exact recaptures without guest execution or value logging. |

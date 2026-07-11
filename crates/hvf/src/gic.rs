@@ -579,12 +579,17 @@ impl HvfGicSpiSignaler {
         self.range
     }
 
+    /// Validate one SPI line without changing its interrupt level.
+    pub fn validate_line(&self, line: GuestInterruptLine) -> Result<(), HvfGicSpiSignalError> {
+        validate_spi_signal_line(self.range, line)
+    }
+
     pub fn set_level(
         &self,
         line: GuestInterruptLine,
         level: bool,
     ) -> Result<(), HvfGicSpiSignalError> {
-        validate_spi_signal_line(self.range, line)?;
+        self.validate_line(line)?;
 
         let api = self.api.lock().map_err(|_| {
             HvfGicSpiSignalError::InvalidState(GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE)
@@ -3105,6 +3110,21 @@ mod tests {
         assert_eq!(signaler.range(), range);
         assert_eq!(api.spi_signals(), vec![(32, true)]);
         assert_eq!(api.calls(), vec!["hv_gic_set_spi"]);
+    }
+
+    #[test]
+    fn spi_signaler_preflights_line_without_calling_hvf() {
+        let api = FakeGicApi::default();
+        let signaler =
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 2 }, api.clone())
+                .expect("valid SPI range should create a signaler");
+
+        signaler
+            .validate_line(line(33))
+            .expect("implemented SPI line should pass preflight");
+
+        assert!(api.calls().is_empty());
+        assert!(api.spi_signals().is_empty());
     }
 
     #[test]

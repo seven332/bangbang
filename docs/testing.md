@@ -374,6 +374,26 @@ guest execution or timer writes, may only prove that capture and the raw
 accessor succeed, and must not log, format, compare, narrow, sign-extend, assume
 reset state, or assert an exact relationship with the separately timed CVAL
 read.
+Normalized timer policy tests are separate from those raw-capture rules. Unit
+tests must pin wrapping virtual-count/physical-distance arithmetic, strip
+ISTATUS, ignore TVAL as a restore source, reject unknown controls, preflight all
+eight destination fields plus the counter before writing, exercise every one of
+the ten write failures and completed prefix, and prove a full retry takes a new
+counter sample. Runner tests must include every admission conflict, abandoned
+responses, cleanup, and sticky rejection after a failed run attempt. Signed
+coverage must destroy the source VM, create the destination GIC before its fresh
+vCPU, restore before any run, and compare stable fields plus the invariant that
+virtual-count advance equals physical-distance decrease. Disabled and armed
+masked writable controls must both be exercised without comparing ISTATUS or
+TVAL and without running a partially restored destination.
+
+VMGenID replacement tests must inject deterministic candidates for random
+failure, all-zero and retained-value normalization, exact 16-byte guest writes,
+metadata commit-after-write, retry, signal ordering, and redaction. Signed
+borrowed and owned boot-session coverage must prove the retained value and
+guest buffer change together and that the real edge-rising SPI injection
+succeeds before first run. A signal failure is a post-commit partial result,
+not a rollback assertion.
 Pointer-authentication key signed tests must use visibly non-secret sentinels,
 must not enable or execute PAC instructions, and must assert that debug output
 contains no raw key material. Failure assertions must not format actual key
@@ -724,7 +744,8 @@ connection exchange through the signed executable, including narrow
 multi-payload stream cases and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, that RTC alarm
-interrupts, VMGenID/VMClock restore signaling, VMClock guest e2e observation,
+interrupts, guest-observed VMGenID restore handling, VMClock restore signaling,
+VMClock guest e2e observation,
 or broader RTC-adjacent time/identity behavior is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 

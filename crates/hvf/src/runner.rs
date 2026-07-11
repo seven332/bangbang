@@ -21,6 +21,12 @@ use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
     PsciCall, PsciCallAction, call_uses_arg0, handle_call as handle_psci_call, not_supported_result,
 };
+use crate::snapshot::{
+    HvfArm64SnapshotTimerPolicyError, HvfArm64SnapshotTimerRestoreError,
+    HvfArm64SnapshotTimerRestoreOperation, HvfArm64SnapshotTimerRestoreValue,
+    HvfArm64SnapshotTimerState, normalize_arm64_snapshot_timer_state,
+    restore_arm64_snapshot_timer_state_with,
+};
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
     HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
@@ -114,6 +120,8 @@ pub enum HvfVcpuRunnerError {
     SmeZRegisterCapture(HvfArm64VcpuSmeZRegisterCaptureError),
     SmeZaRegisterCapture(HvfArm64VcpuSmeZaRegisterCaptureError),
     SmeZt0RegisterCapture(HvfArm64VcpuSmeZt0RegisterCaptureError),
+    SnapshotTimerPolicy(HvfArm64SnapshotTimerPolicyError),
+    SnapshotTimerRestore(HvfArm64SnapshotTimerRestoreError),
     VcpuExitResolve(HvfVcpuExitResolveError),
     MmioDispatch(HvfMmioDispatchError),
     UnsupportedSys64 { exit: HvfSys64Exit },
@@ -169,6 +177,8 @@ impl fmt::Display for HvfVcpuRunnerError {
             Self::SmeZRegisterCapture(err) => write!(f, "{err}"),
             Self::SmeZaRegisterCapture(err) => write!(f, "{err}"),
             Self::SmeZt0RegisterCapture(err) => write!(f, "{err}"),
+            Self::SnapshotTimerPolicy(err) => write!(f, "{err}"),
+            Self::SnapshotTimerRestore(err) => write!(f, "{err}"),
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
             Self::MmioDispatch(err) => write!(f, "{err}"),
             Self::UnsupportedSys64 { exit } => write!(
@@ -203,6 +213,8 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::SmeZRegisterCapture(err) => Some(err),
             Self::SmeZaRegisterCapture(err) => Some(err),
             Self::SmeZt0RegisterCapture(err) => Some(err),
+            Self::SnapshotTimerPolicy(err) => Some(err),
+            Self::SnapshotTimerRestore(err) => Some(err),
             Self::VcpuExitResolve(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
             Self::InvalidState(_)
@@ -286,6 +298,18 @@ impl From<HvfArm64VcpuSmeZt0RegisterCaptureError> for HvfVcpuRunnerError {
     }
 }
 
+impl From<HvfArm64SnapshotTimerPolicyError> for HvfVcpuRunnerError {
+    fn from(err: HvfArm64SnapshotTimerPolicyError) -> Self {
+        Self::SnapshotTimerPolicy(err)
+    }
+}
+
+impl From<HvfArm64SnapshotTimerRestoreError> for HvfVcpuRunnerError {
+    fn from(err: HvfArm64SnapshotTimerRestoreError) -> Self {
+        Self::SnapshotTimerRestore(err)
+    }
+}
+
 impl From<HvfVcpuExitResolveError> for HvfVcpuRunnerError {
     fn from(err: HvfVcpuExitResolveError) -> Self {
         Self::VcpuExitResolve(err)
@@ -366,6 +390,9 @@ enum RunnerCommand {
     },
     ReadMpidrEl1 {
         response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    },
+    ProbeSnapshotRestoreAvailability {
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     CaptureArm64GeneralRegisterState {
         admission: InFlightCoreRegisterOperation,
@@ -564,6 +591,15 @@ enum RunnerCommand {
     CaptureArm64VirtualTimerState {
         admission: InFlightTimerOperation,
         response_sender: mpsc::Sender<Result<HvfArm64VcpuVirtualTimerState, HvfVcpuRunnerError>>,
+    },
+    CaptureArm64SnapshotTimerState {
+        admission: InFlightTimerOperation,
+        response_sender: mpsc::Sender<Result<HvfArm64SnapshotTimerState, HvfVcpuRunnerError>>,
+    },
+    RestoreArm64SnapshotTimerState {
+        admission: InFlightTimerOperation,
+        state: HvfArm64SnapshotTimerState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     GetPendingInterrupt {
         interrupt_type: HvfInterruptType,
@@ -1056,6 +1092,102 @@ trait RunnerVcpu {
             compare_value,
         ))
     }
+    fn snapshot_timer_counter_sample(&mut self) -> Result<u64, BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support snapshot timer counter sampling",
+        ))
+    }
+    fn capture_arm64_snapshot_timer_state(
+        &mut self,
+    ) -> Result<HvfArm64SnapshotTimerState, HvfVcpuRunnerError> {
+        let physical = self
+            .capture_arm64_physical_timer_state()
+            .map_err(HvfVcpuRunnerError::Backend)?;
+        let virtual_timer = self
+            .capture_arm64_virtual_timer_state()
+            .map_err(HvfVcpuRunnerError::Backend)?;
+        let counter_sample = self
+            .snapshot_timer_counter_sample()
+            .map_err(HvfVcpuRunnerError::Backend)?;
+
+        normalize_arm64_snapshot_timer_state(physical, virtual_timer, counter_sample)
+            .map_err(HvfVcpuRunnerError::SnapshotTimerPolicy)
+    }
+    fn restore_arm64_snapshot_timer_state(
+        &mut self,
+        state: &HvfArm64SnapshotTimerState,
+    ) -> Result<(), HvfArm64SnapshotTimerRestoreError> {
+        restore_arm64_snapshot_timer_state_with(
+            state,
+            self,
+            |vcpu, operation| match operation {
+                HvfArm64SnapshotTimerRestoreOperation::ReadCntkctlEl1 => vcpu
+                    .read_system_register(HvfSystemRegister::CNTKCTL_EL1)
+                    .map(|_| ()),
+                HvfArm64SnapshotTimerRestoreOperation::ReadPhysicalControl => vcpu
+                    .read_system_register(HvfSystemRegister::CNTP_CTL_EL0)
+                    .map(|_| ()),
+                HvfArm64SnapshotTimerRestoreOperation::ReadPhysicalCompareValue => vcpu
+                    .read_system_register(HvfSystemRegister::CNTP_CVAL_EL0)
+                    .map(|_| ()),
+                HvfArm64SnapshotTimerRestoreOperation::ReadPhysicalTimerValue => vcpu
+                    .read_system_register(HvfSystemRegister::CNTP_TVAL_EL0)
+                    .map(|_| ()),
+                HvfArm64SnapshotTimerRestoreOperation::ReadVirtualTimerExitMask => {
+                    vcpu.get_vtimer_mask().map(|_| ())
+                }
+                HvfArm64SnapshotTimerRestoreOperation::ReadVirtualTimerOffset => {
+                    vcpu.get_vtimer_offset().map(|_| ())
+                }
+                HvfArm64SnapshotTimerRestoreOperation::ReadVirtualControl => {
+                    vcpu.get_vtimer_control().map(|_| ())
+                }
+                HvfArm64SnapshotTimerRestoreOperation::ReadVirtualCompareValue => {
+                    vcpu.get_vtimer_compare_value().map(|_| ())
+                }
+                _ => Err(BackendError::InvalidState(
+                    "invalid snapshot timer preflight operation",
+                )),
+            },
+            |vcpu| vcpu.snapshot_timer_counter_sample(),
+            |vcpu, operation, value| match (operation, value) {
+                (
+                    HvfArm64SnapshotTimerRestoreOperation::MaskVirtualTimerExits
+                    | HvfArm64SnapshotTimerRestoreOperation::RestoreVirtualTimerExitMask,
+                    HvfArm64SnapshotTimerRestoreValue::Bool(masked),
+                ) => vcpu.set_vtimer_mask(masked),
+                (
+                    HvfArm64SnapshotTimerRestoreOperation::DisableVirtualTimer
+                    | HvfArm64SnapshotTimerRestoreOperation::RestoreVirtualControl,
+                    HvfArm64SnapshotTimerRestoreValue::U64(control),
+                ) => vcpu.set_vtimer_control(control),
+                (
+                    HvfArm64SnapshotTimerRestoreOperation::DisablePhysicalTimer
+                    | HvfArm64SnapshotTimerRestoreOperation::RestorePhysicalControl,
+                    HvfArm64SnapshotTimerRestoreValue::U64(control),
+                ) => vcpu.write_system_register(HvfSystemRegister::CNTP_CTL_EL0, control),
+                (
+                    HvfArm64SnapshotTimerRestoreOperation::WriteCntkctlEl1,
+                    HvfArm64SnapshotTimerRestoreValue::U64(value),
+                ) => vcpu.write_system_register(HvfSystemRegister::CNTKCTL_EL1, value),
+                (
+                    HvfArm64SnapshotTimerRestoreOperation::WritePhysicalCompareValue,
+                    HvfArm64SnapshotTimerRestoreValue::U64(value),
+                ) => vcpu.write_system_register(HvfSystemRegister::CNTP_CVAL_EL0, value),
+                (
+                    HvfArm64SnapshotTimerRestoreOperation::WriteVirtualTimerOffset,
+                    HvfArm64SnapshotTimerRestoreValue::U64(offset),
+                ) => vcpu.set_vtimer_offset(offset),
+                (
+                    HvfArm64SnapshotTimerRestoreOperation::WriteVirtualCompareValue,
+                    HvfArm64SnapshotTimerRestoreValue::U64(value),
+                ) => vcpu.set_vtimer_compare_value(value),
+                _ => Err(BackendError::InvalidState(
+                    "invalid snapshot timer write operation",
+                )),
+            },
+        )
+    }
     fn get_pending_interrupt(
         &mut self,
         _interrupt_type: HvfInterruptType,
@@ -1290,6 +1422,10 @@ impl RunnerVcpu for RealRunnerVcpu {
             .set_system_register(HvfSystemRegister::CNTV_CVAL_EL0, compare_value)
     }
 
+    fn snapshot_timer_counter_sample(&mut self) -> Result<u64, BackendError> {
+        crate::ffi::absolute_time()
+    }
+
     fn get_pending_interrupt(
         &mut self,
         interrupt_type: HvfInterruptType,
@@ -1405,6 +1541,72 @@ impl<'vm> HvfVcpuRunner<'vm> {
         )
     }
 
+    /// Verify that snapshot restore work may still mutate this unrun vCPU.
+    pub(crate) fn ensure_snapshot_restore_available(&self) -> Result<(), HvfVcpuRunnerError> {
+        let state = self.lock_state()?;
+        let Some(thread) = state.thread.as_ref() else {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        };
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if thread.is_finished() {
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.core_register_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.timer_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                TIMER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.interrupt_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.run_started {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUN_ALREADY_STARTED_MESSAGE,
+            ));
+        }
+
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.command_sender
+            .send(RunnerCommand::ProbeSnapshotRestoreAvailability { response_sender })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))?;
+        drop(state);
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))?
+    }
+
     /// Configure the primary arm64 Linux boot-register state on the vCPU-owning runner thread.
     pub fn configure_arm64_boot_registers(
         &self,
@@ -1431,6 +1633,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 | HvfVcpuRunnerError::SmeZRegisterCapture(_)
                 | HvfVcpuRunnerError::SmeZaRegisterCapture(_)
                 | HvfVcpuRunnerError::SmeZt0RegisterCapture(_)
+                | HvfVcpuRunnerError::SnapshotTimerPolicy(_)
+                | HvfVcpuRunnerError::SnapshotTimerRestore(_)
                 | HvfVcpuRunnerError::InvalidState(_)
                 | HvfVcpuRunnerError::UnsupportedSys64 { .. }
                 | HvfVcpuRunnerError::VcpuExitResolve(_)
@@ -2212,6 +2416,39 @@ impl<'vm> HvfVcpuRunner<'vm> {
     ) -> Result<HvfArm64VcpuVirtualTimerState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_virtual_timer_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Capture physical and virtual timers as one normalized snapshot value.
+    ///
+    /// All raw timer reads and the host counter sample execute in one
+    /// owner-thread timer command. The policy freezes guest timer domains,
+    /// strips derived ISTATUS, and ignores TVAL as a restore source.
+    pub fn capture_arm64_snapshot_timer_state(
+        &self,
+    ) -> Result<HvfArm64SnapshotTimerState, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_snapshot_timer_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Apply normalized timer state to a vCPU that has never started a run.
+    ///
+    /// Restore preflights every destination field before its first write, then
+    /// applies the documented nontransactional order. On failure, retry the
+    /// complete method with the same normalized state or discard the vCPU.
+    pub fn restore_arm64_snapshot_timer_state(
+        &self,
+        state: HvfArm64SnapshotTimerState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_snapshot_timer_restore(state, response_sender)?;
 
         response_receiver
             .recv()
@@ -3478,6 +3715,38 @@ impl<'vm> HvfVcpuRunner<'vm> {
         )
     }
 
+    fn start_arm64_snapshot_timer_capture(
+        &self,
+        response_sender: mpsc::Sender<Result<HvfArm64SnapshotTimerState, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_timer_capture(
+            |admission, response_sender| RunnerCommand::CaptureArm64SnapshotTimerState {
+                admission,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_snapshot_timer_restore(
+        &self,
+        state: HvfArm64SnapshotTimerState,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let admission = {
+            let _state = self.reserve_snapshot_timer_restore_operation()?;
+            InFlightTimerOperation::new(&self.state)
+        };
+
+        self.command_sender
+            .send(RunnerCommand::RestoreArm64SnapshotTimerState {
+                admission,
+                state,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
+    }
+
     fn start_timer_capture<T>(
         &self,
         command: impl FnOnce(
@@ -3563,6 +3832,19 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
 
         state.timer_operation_in_flight = true;
+        Ok(state)
+    }
+
+    fn reserve_snapshot_timer_restore_operation(
+        &self,
+    ) -> Result<MutexGuard<'_, RunnerHandleState>, HvfVcpuRunnerError> {
+        let mut state = self.reserve_timer_operation()?;
+        if state.run_started {
+            state.timer_operation_in_flight = false;
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUN_ALREADY_STARTED_MESSAGE,
+            ));
+        }
         Ok(state)
     }
 
@@ -4284,6 +4566,9 @@ fn run_runner_thread<C, V>(
                 let result = vcpu.mpidr_el1().map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::ProbeSnapshotRestoreAvailability { response_sender } => {
+                let _ = response_sender.send(Ok(()));
+            }
             RunnerCommand::CaptureArm64GeneralRegisterState {
                 mut admission,
                 response_sender,
@@ -4819,6 +5104,29 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::CaptureArm64SnapshotTimerState {
+                mut admission,
+                response_sender,
+            } => {
+                let result = vcpu.capture_arm64_snapshot_timer_state();
+                // Every raw read and the counter sample have finished. Release
+                // timer admission before responding, including abandoned calls.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::RestoreArm64SnapshotTimerState {
+                mut admission,
+                state,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .restore_arm64_snapshot_timer_state(&state)
+                    .map_err(HvfVcpuRunnerError::SnapshotTimerRestore);
+                // The final ordered write or first failure has completed.
+                // Admission is command-owned rather than receiver-owned.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::GetPendingInterrupt {
                 interrupt_type,
                 response_sender,
@@ -5095,6 +5403,7 @@ fn shutdown_result(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
@@ -5118,6 +5427,10 @@ mod tests {
         HvfGicError, restore_arm64_gic_icc_register_state_with,
     };
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
+    use crate::snapshot::{
+        HvfArm64SnapshotTimerPolicyError, HvfArm64SnapshotTimerRestoreOperation,
+        HvfArm64SnapshotTimerState,
+    };
     use crate::vcpu::{
         HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
         HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
@@ -6053,6 +6366,35 @@ mod tests {
     }
 
     struct PanicOnVtimerMaskVcpu;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SnapshotTimerCall {
+        ReadSystem(HvfSystemRegister),
+        WriteSystem(HvfSystemRegister, u64),
+        GetMask,
+        SetMask(bool),
+        GetOffset,
+        SetOffset(u64),
+        GetControl,
+        SetControl(u64),
+        GetCompareValue,
+        SetCompareValue(u64),
+        SampleCounter,
+    }
+
+    struct SnapshotTimerRecordingVcpu {
+        cntkctl_el1: u64,
+        physical_control: u64,
+        physical_compare_value: u64,
+        physical_timer_value: u64,
+        virtual_timer_exit_masked: bool,
+        virtual_timer_offset: u64,
+        virtual_control: u64,
+        virtual_compare_value: u64,
+        counter_samples: VecDeque<Result<u64, BackendError>>,
+        run_error: Option<BackendError>,
+        call_sender: mpsc::Sender<SnapshotTimerCall>,
+    }
 
     type BlockingVirtualTimerCaptureRunner = (
         HvfVcpuRunner<'static>,
@@ -11449,6 +11791,149 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for SnapshotTimerRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            if let Some(error) = self.run_error.take() {
+                Err(error)
+            } else {
+                Ok(HvfVcpuExit::Canceled)
+            }
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+        ) -> Result<u64, BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::ReadSystem(register))
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            match register {
+                HvfSystemRegister::CNTKCTL_EL1 => Ok(self.cntkctl_el1),
+                HvfSystemRegister::CNTP_CTL_EL0 => Ok(self.physical_control),
+                HvfSystemRegister::CNTP_CVAL_EL0 => Ok(self.physical_compare_value),
+                HvfSystemRegister::CNTP_TVAL_EL0 => Ok(self.physical_timer_value),
+                _ => Err(BackendError::InvalidState(
+                    "unexpected snapshot timer system-register read",
+                )),
+            }
+        }
+
+        fn write_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::WriteSystem(register, value))
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            match register {
+                HvfSystemRegister::CNTKCTL_EL1 => self.cntkctl_el1 = value,
+                HvfSystemRegister::CNTP_CTL_EL0 => self.physical_control = value,
+                HvfSystemRegister::CNTP_CVAL_EL0 => self.physical_compare_value = value,
+                _ => {
+                    return Err(BackendError::InvalidState(
+                        "unexpected snapshot timer system-register write",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn get_vtimer_mask(&mut self) -> Result<bool, BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::GetMask)
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            Ok(self.virtual_timer_exit_masked)
+        }
+
+        fn set_vtimer_mask(&mut self, masked: bool) -> Result<(), BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::SetMask(masked))
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            self.virtual_timer_exit_masked = masked;
+            Ok(())
+        }
+
+        fn get_vtimer_offset(&mut self) -> Result<u64, BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::GetOffset)
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            Ok(self.virtual_timer_offset)
+        }
+
+        fn set_vtimer_offset(&mut self, offset: u64) -> Result<(), BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::SetOffset(offset))
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            self.virtual_timer_offset = offset;
+            Ok(())
+        }
+
+        fn get_vtimer_control(&mut self) -> Result<u64, BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::GetControl)
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            Ok(self.virtual_control)
+        }
+
+        fn set_vtimer_control(&mut self, control: u64) -> Result<(), BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::SetControl(control))
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            self.virtual_control = control;
+            Ok(())
+        }
+
+        fn get_vtimer_compare_value(&mut self) -> Result<u64, BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::GetCompareValue)
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            Ok(self.virtual_compare_value)
+        }
+
+        fn set_vtimer_compare_value(&mut self, value: u64) -> Result<(), BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::SetCompareValue(value))
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            self.virtual_compare_value = value;
+            Ok(())
+        }
+
+        fn snapshot_timer_counter_sample(&mut self) -> Result<u64, BackendError> {
+            self.call_sender
+                .send(SnapshotTimerCall::SampleCounter)
+                .map_err(|_| BackendError::InvalidState("snapshot timer call receiver closed"))?;
+            self.counter_samples
+                .pop_front()
+                .ok_or(BackendError::InvalidState(
+                    "no fake snapshot timer counter sample remains",
+                ))?
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for BlockingVtimerMaskVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -13805,6 +14290,10 @@ mod tests {
     }
 
     fn assert_timer_operations_rejected(runner: &HvfVcpuRunner<'_>, expected: HvfVcpuRunnerError) {
+        assert_eq!(
+            runner.ensure_snapshot_restore_available(),
+            Err(expected.clone())
+        );
         assert_eq!(runner.get_vtimer_mask(), Err(expected.clone()));
         assert_eq!(runner.set_vtimer_mask(false), Err(expected.clone()));
         assert_eq!(runner.get_vtimer_offset(), Err(expected.clone()));
@@ -13817,7 +14306,23 @@ mod tests {
             runner.capture_arm64_physical_timer_state(),
             Err(expected.clone())
         );
-        assert_eq!(runner.capture_arm64_virtual_timer_state(), Err(expected));
+        assert_eq!(
+            runner.capture_arm64_virtual_timer_state(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            runner.capture_arm64_snapshot_timer_state(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            runner.restore_arm64_snapshot_timer_state(snapshot_timer_restore_test_state()),
+            Err(expected)
+        );
+    }
+
+    fn snapshot_timer_restore_test_state() -> HvfArm64SnapshotTimerState {
+        HvfArm64SnapshotTimerState::try_new(false, 7, 800, 1, 1_100, 2, 250)
+            .expect("snapshot timer test state should be valid")
     }
 
     fn pending_interrupt_restore_test_state() -> HvfArm64VcpuPendingInterruptState {
@@ -15680,6 +16185,37 @@ mod tests {
             HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
                 .expect("runner should be created"),
             operation_receiver,
+        )
+    }
+
+    fn start_snapshot_timer_recording_runner(
+        counter_samples: Vec<Result<u64, BackendError>>,
+        physical_control: u64,
+        virtual_control: u64,
+        run_error: Option<BackendError>,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<SnapshotTimerCall>) {
+        let (call_sender, call_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(SnapshotTimerRecordingVcpu {
+                cntkctl_el1: 0x1234,
+                physical_control,
+                physical_compare_value: 1_250,
+                physical_timer_value: 0xfeed_face,
+                virtual_timer_exit_masked: true,
+                virtual_timer_offset: 600,
+                virtual_control,
+                virtual_compare_value: 900,
+                counter_samples: counter_samples.into(),
+                run_error,
+                call_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            call_receiver,
         )
     }
 
@@ -24855,6 +25391,300 @@ mod tests {
         );
 
         runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn captures_normalized_arm64_snapshot_timer_state_in_one_owner_command() {
+        let (runner, calls) =
+            start_snapshot_timer_recording_runner(vec![Ok(1_000)], 0b111, 0b101, None);
+
+        let state = runner
+            .capture_arm64_snapshot_timer_state()
+            .expect("normalized timer capture should succeed");
+
+        assert!(state.virtual_timer_exit_masked());
+        assert_eq!(state.cntkctl_el1(), 0x1234);
+        assert_eq!(state.virtual_count(), 400);
+        assert_eq!(state.virtual_control(), 1);
+        assert_eq!(state.virtual_compare_value(), 900);
+        assert_eq!(state.physical_control(), 3);
+        assert_eq!(state.physical_compare_delta(), 250);
+        assert_eq!(
+            calls.try_iter().collect::<Vec<_>>(),
+            vec![
+                SnapshotTimerCall::ReadSystem(HvfSystemRegister::CNTKCTL_EL1),
+                SnapshotTimerCall::ReadSystem(HvfSystemRegister::CNTP_CTL_EL0),
+                SnapshotTimerCall::ReadSystem(HvfSystemRegister::CNTP_CVAL_EL0),
+                SnapshotTimerCall::ReadSystem(HvfSystemRegister::CNTP_TVAL_EL0),
+                SnapshotTimerCall::GetMask,
+                SnapshotTimerCall::GetOffset,
+                SnapshotTimerCall::GetControl,
+                SnapshotTimerCall::GetCompareValue,
+                SnapshotTimerCall::SampleCounter,
+            ]
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn snapshot_timer_restore_preflights_and_recaptures_equivalent_state() {
+        let (runner, calls) =
+            start_snapshot_timer_recording_runner(vec![Ok(1_000), Ok(1_000)], 0, 0, None);
+        let state = snapshot_timer_restore_test_state();
+
+        runner
+            .restore_arm64_snapshot_timer_state(state)
+            .expect("normalized timer restore should succeed");
+        assert_eq!(
+            runner
+                .capture_arm64_snapshot_timer_state()
+                .expect("restored timers should be recaptured"),
+            state
+        );
+
+        let calls = calls.try_iter().collect::<Vec<_>>();
+        let expected_restore = vec![
+            SnapshotTimerCall::ReadSystem(HvfSystemRegister::CNTKCTL_EL1),
+            SnapshotTimerCall::ReadSystem(HvfSystemRegister::CNTP_CTL_EL0),
+            SnapshotTimerCall::ReadSystem(HvfSystemRegister::CNTP_CVAL_EL0),
+            SnapshotTimerCall::ReadSystem(HvfSystemRegister::CNTP_TVAL_EL0),
+            SnapshotTimerCall::GetMask,
+            SnapshotTimerCall::GetOffset,
+            SnapshotTimerCall::GetControl,
+            SnapshotTimerCall::GetCompareValue,
+            SnapshotTimerCall::SampleCounter,
+            SnapshotTimerCall::SetMask(true),
+            SnapshotTimerCall::SetControl(0),
+            SnapshotTimerCall::WriteSystem(HvfSystemRegister::CNTP_CTL_EL0, 0),
+            SnapshotTimerCall::WriteSystem(HvfSystemRegister::CNTKCTL_EL1, 7),
+            SnapshotTimerCall::WriteSystem(HvfSystemRegister::CNTP_CVAL_EL0, 1_250),
+            SnapshotTimerCall::SetOffset(200),
+            SnapshotTimerCall::SetCompareValue(1_100),
+            SnapshotTimerCall::WriteSystem(HvfSystemRegister::CNTP_CTL_EL0, 2),
+            SnapshotTimerCall::SetControl(1),
+            SnapshotTimerCall::SetMask(false),
+        ];
+        assert_eq!(
+            calls.get(..expected_restore.len()),
+            Some(expected_restore.as_slice())
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn snapshot_timer_restore_retry_uses_a_fresh_counter_sample() {
+        let (runner, calls) = start_snapshot_timer_recording_runner(
+            vec![
+                Err(BackendError::InvalidState("fake counter sample failed")),
+                Ok(2_000),
+            ],
+            0,
+            0,
+            None,
+        );
+        let state = snapshot_timer_restore_test_state();
+
+        let error = runner
+            .restore_arm64_snapshot_timer_state(state)
+            .expect_err("first counter sample should fail");
+        let HvfVcpuRunnerError::SnapshotTimerRestore(error) = error else {
+            panic!("counter failure should preserve snapshot timer context");
+        };
+        assert_eq!(
+            error.operation(),
+            HvfArm64SnapshotTimerRestoreOperation::SampleCounter
+        );
+        assert_eq!(error.completed_writes(), 0);
+
+        runner
+            .restore_arm64_snapshot_timer_state(state)
+            .expect("complete retry should use the next sample");
+        let calls = calls.try_iter().collect::<Vec<_>>();
+        assert!(calls.contains(&SnapshotTimerCall::WriteSystem(
+            HvfSystemRegister::CNTP_CVAL_EL0,
+            2_250,
+        )));
+        assert!(calls.contains(&SnapshotTimerCall::SetOffset(1_200)));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn snapshot_timer_capture_rejects_unknown_control_bits() {
+        let (runner, _calls) =
+            start_snapshot_timer_recording_runner(vec![Ok(1_000)], 0, 1 << 8, None);
+
+        assert_eq!(
+            runner.capture_arm64_snapshot_timer_state(),
+            Err(HvfVcpuRunnerError::SnapshotTimerPolicy(
+                HvfArm64SnapshotTimerPolicyError::VirtualTimerControl
+            ))
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn snapshot_timer_restore_is_rejected_after_a_failed_run_attempt() {
+        let (runner, calls) = start_snapshot_timer_recording_runner(
+            Vec::new(),
+            0,
+            0,
+            Some(BackendError::InvalidState("fake run failed")),
+        );
+
+        assert_eq!(runner.ensure_snapshot_restore_available(), Ok(()));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake run failed"
+            )))
+        );
+        assert_eq!(
+            runner.ensure_snapshot_restore_available(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUN_ALREADY_STARTED_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.restore_arm64_snapshot_timer_state(snapshot_timer_restore_test_state()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUN_ALREADY_STARTED_MESSAGE
+            ))
+        );
+        assert!(calls.try_iter().next().is_none());
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn abandoned_snapshot_timer_commands_release_admission_after_owner_work() {
+        let (capture_runner, capture_calls) =
+            start_snapshot_timer_recording_runner(vec![Ok(1_000)], 0, 0, None);
+        let (capture_response_sender, capture_response_receiver) = mpsc::channel();
+        drop(capture_response_receiver);
+        capture_runner
+            .start_arm64_snapshot_timer_capture(capture_response_sender)
+            .expect("abandoned snapshot timer capture should queue");
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        capture_runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_sender,
+            })
+            .expect("capture barrier should queue");
+        let _barrier_result = barrier_receiver
+            .recv()
+            .expect("capture barrier should respond");
+        assert_eq!(capture_calls.try_iter().count(), 9);
+        assert!(
+            !capture_runner
+                .state
+                .lock()
+                .expect("capture runner state should be lockable")
+                .timer_operation_in_flight
+        );
+        capture_runner
+            .shutdown()
+            .expect("capture runner should shut down");
+
+        let (restore_runner, restore_calls) =
+            start_snapshot_timer_recording_runner(vec![Ok(1_000)], 0, 0, None);
+        let (restore_response_sender, restore_response_receiver) = mpsc::channel();
+        drop(restore_response_receiver);
+        restore_runner
+            .start_arm64_snapshot_timer_restore(
+                snapshot_timer_restore_test_state(),
+                restore_response_sender,
+            )
+            .expect("abandoned snapshot timer restore should queue");
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        restore_runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_sender,
+            })
+            .expect("restore barrier should queue");
+        let _barrier_result = barrier_receiver
+            .recv()
+            .expect("restore barrier should respond");
+        assert_eq!(restore_calls.try_iter().count(), 19);
+        assert!(
+            !restore_runner
+                .state
+                .lock()
+                .expect("restore runner state should be lockable")
+                .timer_operation_in_flight
+        );
+        restore_runner
+            .shutdown()
+            .expect("restore runner should shut down");
+    }
+
+    #[test]
+    fn snapshot_timer_command_send_failures_release_admission() {
+        let (capture_runner, capture_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+        assert_eq!(
+            capture_runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(capture_unwind_receiver);
+        assert_eq!(
+            capture_runner.capture_arm64_snapshot_timer_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !capture_runner
+                .state
+                .lock()
+                .expect("capture runner state should be lockable")
+                .timer_operation_in_flight
+        );
+        assert_eq!(
+            capture_runner.shutdown(),
+            Err(HvfVcpuRunnerError::ThreadPanicked)
+        );
+
+        let (restore_runner, restore_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnPhysicalTimerCaptureVcpu));
+        assert_eq!(
+            restore_runner.capture_arm64_physical_timer_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(restore_unwind_receiver);
+        assert_eq!(
+            restore_runner.ensure_snapshot_restore_available(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert_eq!(
+            restore_runner.restore_arm64_snapshot_timer_state(snapshot_timer_restore_test_state()),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !restore_runner
+                .state
+                .lock()
+                .expect("restore runner state should be lockable")
+                .timer_operation_in_flight
+        );
+        assert_eq!(
+            restore_runner.shutdown(),
+            Err(HvfVcpuRunnerError::ThreadPanicked)
+        );
     }
 
     #[test]

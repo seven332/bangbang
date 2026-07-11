@@ -53,10 +53,11 @@ use bangbang_runtime::startup::{
     Arm64BootPmemNotificationDispatchError, Arm64BootPmemNotificationDispatches,
     Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResourceParts, Arm64BootResources,
     Arm64BootRtcDeviceConfig as RuntimeArm64BootRtcDeviceConfig, Arm64BootRuntimeResources,
-    Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
-    Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
-    Arm64BootVsockNotificationDispatches, Arm64BootVsockWakeupFdsError,
-    memory_hotplug_status_for_device, update_memory_hotplug_config_for_device,
+    Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig, Arm64BootVmGenIdDevice,
+    Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
+    Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
+    Arm64BootVsockWakeupFdsError, memory_hotplug_status_for_device, replace_arm64_boot_vmgenid,
+    update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -70,6 +71,7 @@ use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
 use crate::runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
+use crate::snapshot::HvfArm64SnapshotTimerState;
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
     HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
@@ -1616,6 +1618,38 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_virtual_timer_state()
     }
 
+    /// Capture normalized physical and virtual timers for native-HVF restore.
+    pub fn capture_arm64_snapshot_timer_state(
+        &self,
+    ) -> Result<HvfArm64SnapshotTimerState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_snapshot_timer_state()
+    }
+
+    /// Restore normalized timers before this session's first vCPU run.
+    pub fn restore_arm64_snapshot_timer_state(
+        &mut self,
+        state: HvfArm64SnapshotTimerState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_snapshot_timer_state(state)
+    }
+
+    /// Replace the retained VMGenID and inject its edge-rising SPI.
+    ///
+    /// Runner and signaler capabilities are preflighted before guest memory is
+    /// changed. A signal failure is reported after memory and host metadata
+    /// have committed; retry the complete method or discard the unrun session.
+    pub fn replace_vmgenid_for_snapshot_restore(
+        &mut self,
+    ) -> Result<(), HvfArm64BootVmGenIdRestoreError> {
+        replace_vmgenid_for_snapshot_restore(
+            &self.runner,
+            self.backend,
+            &mut self.runtime_resources,
+            self.gic,
+            self.vmgenid_interrupt_line,
+        )
+    }
+
     /// Capture CPU-level IRQ/FIQ pending state on the primary vCPU owner thread.
     ///
     /// HVF clears these per-run injection levels after a vCPU run returns.
@@ -2671,6 +2705,38 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuVirtualTimerState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_virtual_timer_state()
+    }
+
+    /// Capture normalized physical and virtual timers for native-HVF restore.
+    pub fn capture_arm64_snapshot_timer_state(
+        &self,
+    ) -> Result<HvfArm64SnapshotTimerState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_snapshot_timer_state()
+    }
+
+    /// Restore normalized timers before this session's first vCPU run.
+    pub fn restore_arm64_snapshot_timer_state(
+        &mut self,
+        state: HvfArm64SnapshotTimerState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner.restore_arm64_snapshot_timer_state(state)
+    }
+
+    /// Replace the retained VMGenID and inject its edge-rising SPI.
+    ///
+    /// Runner and signaler capabilities are preflighted before guest memory is
+    /// changed. A signal failure is reported after memory and host metadata
+    /// have committed; retry the complete method or discard the unrun session.
+    pub fn replace_vmgenid_for_snapshot_restore(
+        &mut self,
+    ) -> Result<(), HvfArm64BootVmGenIdRestoreError> {
+        replace_vmgenid_for_snapshot_restore(
+            &self.runner,
+            &mut self.backend,
+            &mut self.runtime_resources,
+            self.gic,
+            self.vmgenid_interrupt_line,
+        )
     }
 
     /// Capture CPU-level IRQ/FIQ pending state on the primary vCPU owner thread.
@@ -5966,6 +6032,48 @@ fn signal_queue_interrupt(
     signal_device_interrupt(line, DeviceInterruptKind::Queue, signaler)
 }
 
+fn replace_vmgenid_for_snapshot_restore(
+    runner: &HvfVcpuRunner<'_>,
+    backend: &mut HvfBackend,
+    runtime_resources: &mut Arm64BootRuntimeResources,
+    gic: HvfGicMetadata,
+    interrupt_line: GuestInterruptLine,
+) -> Result<(), HvfArm64BootVmGenIdRestoreError> {
+    runner
+        .ensure_snapshot_restore_available()
+        .map_err(|source| HvfArm64BootVmGenIdRestoreError::RunnerPreflight { source })?;
+
+    let signaler = HvfGicSpiSignaler::from_metadata(&gic)
+        .map_err(|source| HvfArm64BootVmGenIdRestoreError::SignalerPreflight { source })?;
+    signaler
+        .validate_line(interrupt_line)
+        .map_err(|source| HvfArm64BootVmGenIdRestoreError::SignalerPreflight { source })?;
+
+    let memory = backend
+        .mapped_guest_memory_mut()
+        .map_err(|source| HvfArm64BootVmGenIdRestoreError::GuestMemory { source })?;
+    replace_vmgenid_and_signal_with(
+        memory,
+        &mut runtime_resources.vmgenid_device,
+        replace_arm64_boot_vmgenid,
+        || signaler.set_level(interrupt_line, true),
+    )
+}
+
+fn replace_vmgenid_and_signal_with(
+    memory: &mut GuestMemory,
+    device: &mut Arm64BootVmGenIdDevice,
+    replace: impl FnOnce(
+        &mut GuestMemory,
+        &mut Arm64BootVmGenIdDevice,
+    ) -> Result<(), Arm64BootVmGenIdReplacementError>,
+    signal: impl FnOnce() -> Result<(), HvfGicSpiSignalError>,
+) -> Result<(), HvfArm64BootVmGenIdRestoreError> {
+    replace(memory, device)
+        .map_err(|source| HvfArm64BootVmGenIdRestoreError::Replacement { source })?;
+    signal().map_err(|source| HvfArm64BootVmGenIdRestoreError::Signal { source })
+}
+
 fn signal_device_interrupt(
     line: GuestInterruptLine,
     kind: DeviceInterruptKind,
@@ -6142,6 +6250,61 @@ impl fmt::Display for HvfArm64BootInterruptLinePurpose {
             Self::SerialDevice => f.write_str("serial device"),
             Self::VmGenIdDevice => f.write_str("VMGenID device"),
             Self::VmClockDevice => f.write_str("VMClock device"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootVmGenIdRestoreError {
+    RunnerPreflight {
+        source: HvfVcpuRunnerError,
+    },
+    SignalerPreflight {
+        source: HvfGicSpiSignalError,
+    },
+    GuestMemory {
+        source: HvfGuestMemoryMappingError,
+    },
+    Replacement {
+        source: Arm64BootVmGenIdReplacementError,
+    },
+    Signal {
+        source: HvfGicSpiSignalError,
+    },
+}
+
+impl fmt::Display for HvfArm64BootVmGenIdRestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RunnerPreflight { source } => {
+                write!(f, "VMGenID restore runner preflight failed: {source}")
+            }
+            Self::SignalerPreflight { source } => {
+                write!(f, "VMGenID restore signaler preflight failed: {source}")
+            }
+            Self::GuestMemory { source } => {
+                write!(f, "VMGenID restore guest-memory access failed: {source}")
+            }
+            Self::Replacement { source } => {
+                write!(f, "VMGenID restore replacement failed: {source}")
+            }
+            Self::Signal { source } => {
+                write!(
+                    f,
+                    "VMGenID restore notification failed after replacement: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootVmGenIdRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RunnerPreflight { source } => Some(source),
+            Self::SignalerPreflight { source } | Self::Signal { source } => Some(source),
+            Self::GuestMemory { source } => Some(source),
+            Self::Replacement { source } => Some(source),
         }
     }
 }
@@ -6634,12 +6797,17 @@ mod tests {
     use bangbang_runtime::entropy::{
         EntropyMmioLayout, VirtioRngEntropySource, VirtioRngEntropySourceError,
     };
-    use bangbang_runtime::fdt::{Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
+    use bangbang_runtime::fdt::{
+        ARM64_FDT_VMGENID_SIZE, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts,
+        Arm64FdtVmGenIdDevice,
+    };
     use bangbang_runtime::interrupt::{
         DeviceInterruptKind, GuestInterruptLine, InterruptSignalError, InterruptSink,
     };
     use bangbang_runtime::machine::MachineConfigInput;
-    use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
+    use bangbang_runtime::memory::{
+        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange, aarch64,
+    };
     use bangbang_runtime::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
         VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
@@ -6670,15 +6838,16 @@ mod tests {
     use bangbang_runtime::rtc::RtcMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::startup::{
-        Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatches,
-        Arm64BootEntropyDeviceConfig, Arm64BootEntropyNotificationDispatches,
-        Arm64BootEntropySource, Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
+        ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonNotificationDispatches,
+        Arm64BootBlockNotificationDispatches, Arm64BootEntropyDeviceConfig,
+        Arm64BootEntropyNotificationDispatches, Arm64BootEntropySource,
+        Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
         Arm64BootMemoryHotplugDeviceConfig, Arm64BootMemoryHotplugNotificationDispatches,
         Arm64BootNetworkNotificationDispatches, Arm64BootNetworkNotificationOutcome,
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
         Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
-        Arm64BootRuntimeResources, Arm64BootVsockNotificationDispatches,
-        update_memory_hotplug_config_for_device,
+        Arm64BootRuntimeResources, Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError,
+        Arm64BootVsockNotificationDispatches, update_memory_hotplug_config_for_device,
     };
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -6705,7 +6874,7 @@ mod tests {
         HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatchError,
         HvfArm64BootPmemNotificationDispatchError, HvfArm64BootRunLoopOutcome,
         HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-        HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig,
+        HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig, HvfArm64BootVmGenIdRestoreError,
         HvfArm64BootVsockNotificationDispatchError, allocate_interrupt_lines,
         collect_balloon_notification_dispatches, collect_block_notification_dispatches,
         collect_entropy_notification_dispatches, collect_memory_hotplug_notification_dispatches,
@@ -6713,8 +6882,8 @@ mod tests {
         dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
         quiesce_limiter_retry_wakeups, record_entropy_dispatch_metrics,
-        record_pmem_dispatch_metrics, run_boot_session_loop, run_boot_session_vcpu_step,
-        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        record_pmem_dispatch_metrics, replace_vmgenid_and_signal_with, run_boot_session_loop,
+        run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
         signal_network_queue_interrupts, signal_pmem_queue_interrupts,
         signal_vsock_queue_interrupts, validate_single_vcpu,
@@ -6723,7 +6892,10 @@ mod tests {
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
         HvfSys64Exit,
     };
-    use crate::gic::{HvfGicInterruptRange, HvfGicMetadata, HvfGicRedistributor, HvfGicRegion};
+    use crate::gic::{
+        HvfGicInterruptRange, HvfGicMetadata, HvfGicRedistributor, HvfGicRegion,
+        HvfGicSpiSignalError,
+    };
     use crate::runner::{HvfVcpuRunStepOutcome, HvfVcpuRunnerError};
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -6731,6 +6903,143 @@ mod tests {
     const TEST_MEMORY_MIB: u64 = 8;
     const ARM64_IMAGE_HEADER_SIZE: usize = 64;
     const ARM64_IMAGE_TEXT_OFFSET_OFFSET: usize = 8;
+
+    fn vmgenid_restore_test_memory_and_device() -> (GuestMemory, Arm64BootVmGenIdDevice) {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(
+                GuestAddress::new(aarch64::SYSTEM_MEM_START),
+                aarch64::SYSTEM_MEM_SIZE,
+            )
+            .expect("VMGenID test range should be valid"),
+        ])
+        .expect("VMGenID test layout should be valid");
+        let memory = GuestMemory::allocate(&layout).expect("VMGenID test memory should allocate");
+        let range = GuestMemoryRange::new(
+            GuestAddress::new(
+                aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE - ARM64_FDT_VMGENID_SIZE,
+            ),
+            ARM64_FDT_VMGENID_SIZE,
+        )
+        .expect("VMGenID device range should be valid");
+        let device = Arm64BootVmGenIdDevice {
+            range,
+            generation_id: [0x11; ARM64_BOOT_VMGENID_SIZE],
+            fdt_device: Arm64FdtVmGenIdDevice {
+                region: Arm64FdtRegion {
+                    base: range.start().raw_value(),
+                    size: range.size(),
+                },
+                interrupt_line: line(127),
+            },
+        };
+        (memory, device)
+    }
+
+    #[test]
+    fn vmgenid_restore_replaces_before_signaling() {
+        let (mut memory, mut device) = vmgenid_restore_test_memory_and_device();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let replacement_calls = Arc::clone(&calls);
+        let signal_calls = Arc::clone(&calls);
+
+        replace_vmgenid_and_signal_with(
+            &mut memory,
+            &mut device,
+            move |memory, device| {
+                replacement_calls
+                    .lock()
+                    .expect("call list should be lockable")
+                    .push("replace");
+                let candidate = [0x22; ARM64_BOOT_VMGENID_SIZE];
+                memory
+                    .write_slice(&candidate, device.range.start())
+                    .map_err(
+                        |source| Arm64BootVmGenIdReplacementError::GuestMemoryWrite { source },
+                    )?;
+                device.generation_id = candidate;
+                Ok(())
+            },
+            move || {
+                signal_calls
+                    .lock()
+                    .expect("call list should be lockable")
+                    .push("signal");
+                Ok(())
+            },
+        )
+        .expect("VMGenID restore stages should succeed");
+
+        assert_eq!(
+            *calls.lock().expect("call list should be lockable"),
+            vec!["replace", "signal"]
+        );
+        assert_eq!(device.generation_id, [0x22; ARM64_BOOT_VMGENID_SIZE]);
+        let mut guest_value = [0; ARM64_BOOT_VMGENID_SIZE];
+        memory
+            .read_slice(&mut guest_value, device.range.start())
+            .expect("replacement VMGenID should read");
+        assert_eq!(guest_value, device.generation_id);
+    }
+
+    #[test]
+    fn vmgenid_restore_replacement_failure_sends_no_signal() {
+        let (mut memory, mut device) = vmgenid_restore_test_memory_and_device();
+        let signal_count = Arc::new(AtomicU64::new(0));
+        let observed_signal_count = Arc::clone(&signal_count);
+
+        let error = replace_vmgenid_and_signal_with(
+            &mut memory,
+            &mut device,
+            |_memory, _device| Err(Arm64BootVmGenIdReplacementError::Random),
+            move || {
+                observed_signal_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("replacement failure should stop before signal");
+
+        assert!(matches!(
+            error,
+            HvfArm64BootVmGenIdRestoreError::Replacement {
+                source: Arm64BootVmGenIdReplacementError::Random
+            }
+        ));
+        assert_eq!(signal_count.load(Ordering::SeqCst), 0);
+        assert_eq!(device.generation_id, [0x11; ARM64_BOOT_VMGENID_SIZE]);
+    }
+
+    #[test]
+    fn vmgenid_restore_signal_failure_reports_committed_replacement() {
+        let (mut memory, mut device) = vmgenid_restore_test_memory_and_device();
+
+        let error = replace_vmgenid_and_signal_with(
+            &mut memory,
+            &mut device,
+            |memory, device| {
+                let candidate = [0x33; ARM64_BOOT_VMGENID_SIZE];
+                memory
+                    .write_slice(&candidate, device.range.start())
+                    .map_err(
+                        |source| Arm64BootVmGenIdReplacementError::GuestMemoryWrite { source },
+                    )?;
+                device.generation_id = candidate;
+                Ok(())
+            },
+            || {
+                Err(HvfGicSpiSignalError::InvalidState(
+                    "fake VMGenID signal failure",
+                ))
+            },
+        )
+        .expect_err("signal failure should preserve partial-stage context");
+
+        assert!(matches!(
+            error,
+            HvfArm64BootVmGenIdRestoreError::Signal { .. }
+        ));
+        assert_eq!(device.generation_id, [0x33; ARM64_BOOT_VMGENID_SIZE]);
+        assert!(!format!("{error:?}").contains("51, 51"));
+    }
 
     fn wait_for_limiter_retry_scheduler_status(
         scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
