@@ -9,18 +9,30 @@ roadmap, not a statement that snapshot create or restore is supported today.
 bangbang recognizes Firecracker-shaped snapshot requests and inspection
 commands, but does not create, load, read, write, or inspect snapshot files.
 
-- `PUT /snapshot/create` and `PUT /snapshot/load` parse request bodies before
-  reaching VMM action policy.
+- `PUT /snapshot/create` and `PUT /snapshot/load` parse and normalize complete
+  request bodies into debug-redacted API and runtime values before reaching VMM
+  action policy. State/memory paths and network/vsock overrides survive
+  dispatch but are not opened, canonicalized, statted, logged, or echoed.
 - Valid create requests are paused-state-only and valid load requests are
   pre-boot-only.
 - Create requests currently return state-policy faults before startup and while
   running, then return the snapshot-specific unsupported fault only after state
   policy reaches a paused instance. Load requests return the snapshot-specific
   unsupported fault before startup and state-policy faults after startup.
-- For a process-owned paused instance, create now crosses a scoped supervisor
+- A native-v1 gate accepts only Full create, File load, no dirty/clock/override
+  options, and a create profile with one vCPU, exactly one read-only root drive,
+  default serial, and no optional devices or MMDS. Rejected paused create
+  profiles return the same unsupported fault before entering the supervisor
+  barrier.
+- An admitted process-owned paused create crosses the scoped supervisor
   command-admission barrier before returning that unsupported fault. The
   lease-owned operation acknowledges quiescence from the block and entropy
   limiter retry schedulers, immediately releases them, and creates no files.
+- Load additionally requires a pristine process except logger/metrics. A
+  successful-action history bit detects explicit-default/no-op configuration,
+  while a live configuration view catches stored state including MMDS presence
+  left by a failed patch. Both paths still return the same unsupported fault and
+  construct no VM.
 - `--snapshot-version` and `--describe-snapshot <PATH>` are recognized as
   first-class CLI commands, but fail before API socket publication or HVF
   startup because bangbang has no supported snapshot data format.

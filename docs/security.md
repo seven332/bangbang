@@ -226,17 +226,23 @@ is resource-specific:
   per-session entropy retry wakeup without sharing limiter state with another
   VM. Metrics may count throttling and limiter retry events, but must not
   include random bytes, descriptor contents, host RNG errors, or host paths.
-- `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
-  snapshot paths before returning unsupported faults, and they do not open or
-  create snapshot state or memory files. A paused create temporarily closes
-  ordinary boot-worker command admission and acknowledges quiescence from its
-  process-local block and entropy limiter retry schedulers; it does not freeze
-  other host resources or expose limiter state. Future snapshot support must
-  treat snapshot paths, memory backend paths, restored guest memory, restored
-  vCPU state, and restored device state as untrusted input, preserve path
-  redaction, and prevent one process from cleaning up or overwriting another
-  process's snapshot resources. The current implementation boundary is
-  documented in [Snapshot Feasibility](snapshot-feasibility.md).
+- `/snapshot/create` and `/snapshot/load` retain complete normalized
+  Firecracker-shaped inputs in typed API/runtime values before returning
+  unsupported faults. Manual `Debug` implementations redact state/memory paths,
+  interface IDs, host device names, and vsock paths even through enclosing
+  request/action enums; action names, errors, logs, and metrics remain
+  value-free. This boundary does not open, canonicalize, stat, or create either
+  artifact. Unsupported request/profile dimensions fail before a create
+  barrier; an admitted paused create temporarily closes ordinary boot-worker
+  command admission and acknowledges process-local block/entropy retry
+  quiescence, but it does not freeze other host resources. Load freshness uses
+  successful configuration history plus current non-logger/metrics state, so
+  explicit defaults and residual MMDS presence fail closed without treating a
+  side-effect-free failed request as configuration. Future snapshot support
+  must continue treating paths and restored guest/vCPU/device state as
+  untrusted, preserve redaction, and prevent one process from cleaning up or
+  overwriting another process's resources. The current boundary is documented
+  in [Snapshot Feasibility](snapshot-feasibility.md).
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
   ACTLR_EL1/CPACR_EL1 execution controls, raw CSSELR_EL1 cache selection, raw

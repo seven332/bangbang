@@ -60,6 +60,7 @@ use bangbang_runtime::serial::{
     SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
     SharedSerialOutputBuffer,
 };
+use bangbang_runtime::snapshot::SnapshotCreateInput;
 use bangbang_runtime::startup::{
     Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
     Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
@@ -988,7 +989,7 @@ where
             VmmAction::InstanceStart => self.start_instance(),
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
-            VmmAction::CreateSnapshot => self.create_snapshot(),
+            VmmAction::CreateSnapshot(input) => self.create_snapshot(input),
             VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::PatchBalloonStats(input) => self.update_balloon_statistics(input),
@@ -1139,8 +1140,8 @@ where
         self.controller.resume_instance()
     }
 
-    fn create_snapshot(&mut self) -> Result<VmmData, VmmActionError> {
-        self.controller.preflight_create_snapshot()?;
+    fn create_snapshot(&mut self, input: SnapshotCreateInput) -> Result<VmmData, VmmActionError> {
+        self.controller.preflight_create_snapshot(&input)?;
         let Some(session) = self.started_session.as_mut() else {
             return Err(VmmActionError::Lifecycle(BackendError::InvalidState(
                 "active session unavailable",
@@ -1150,7 +1151,8 @@ where
         session
             .run_snapshot_create_barrier()
             .map_err(VmmActionError::Lifecycle)?;
-        self.controller.handle_action(VmmAction::CreateSnapshot)
+        self.controller
+            .handle_action(VmmAction::CreateSnapshot(input))
     }
 
     fn update_block_device(&mut self, input: DriveUpdateInput) -> Result<VmmData, VmmActionError> {
@@ -4034,6 +4036,7 @@ mod tests {
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfigInput, SerialOutput, SerialOutputMetrics,
         SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
     };
+    use bangbang_runtime::snapshot::{SnapshotCreateInput, SnapshotType};
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
@@ -5414,6 +5417,23 @@ mod tests {
         )))
         .expect("boot source should configure");
         vmm
+    }
+
+    fn snapshot_profile_vmm(starter: FakeStarter) -> ProcessVmm<FakeStarter> {
+        let mut vmm = configured_vmm(starter);
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("root", "root", "/tmp/rootfs", true).with_is_read_only(true),
+        ))
+        .expect("read-only root drive should configure");
+        vmm
+    }
+
+    fn snapshot_create_action(snapshot_type: SnapshotType) -> VmmAction {
+        VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+            snapshot_type,
+            "/private/state",
+            "/private/memory",
+        ))
     }
 
     #[test]
@@ -8661,9 +8681,9 @@ mod tests {
     fn runtime_snapshot_create_preflight_rejects_without_session_barrier() {
         let mut not_started = configured_vmm(FakeStarter::success(13));
         assert_eq!(
-            not_started.handle_action(VmmAction::CreateSnapshot),
+            not_started.handle_action(snapshot_create_action(SnapshotType::Full)),
             Err(VmmActionError::UnsupportedState {
-                action: VmmAction::CreateSnapshot.name(),
+                action: snapshot_create_action(SnapshotType::Full).name(),
                 state: InstanceState::NotStarted,
             })
         );
@@ -8674,9 +8694,9 @@ mod tests {
             .handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
         assert_eq!(
-            running.handle_action(VmmAction::CreateSnapshot),
+            running.handle_action(snapshot_create_action(SnapshotType::Full)),
             Err(VmmActionError::UnsupportedState {
-                action: VmmAction::CreateSnapshot.name(),
+                action: snapshot_create_action(SnapshotType::Full).name(),
                 state: InstanceState::Running,
             })
         );
@@ -8688,15 +8708,55 @@ mod tests {
     }
 
     #[test]
+    fn runtime_snapshot_create_policy_rejects_without_session_barrier() {
+        let mut diff = snapshot_profile_vmm(FakeStarter::success(15));
+        diff.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        diff.handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+        assert_eq!(
+            diff.handle_action(snapshot_create_action(SnapshotType::Diff)),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        assert_eq!(
+            diff.started_session
+                .as_ref()
+                .expect("session should remain available")
+                .snapshot_create_barrier_count,
+            0
+        );
+
+        let mut unsupported_profile = configured_vmm(FakeStarter::success(16));
+        unsupported_profile
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        unsupported_profile
+            .handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+        assert_eq!(
+            unsupported_profile.handle_action(snapshot_create_action(SnapshotType::Full)),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        assert_eq!(
+            unsupported_profile
+                .started_session
+                .as_ref()
+                .expect("session should remain available")
+                .snapshot_create_barrier_count,
+            0
+        );
+    }
+
+    #[test]
     fn runtime_snapshot_create_runs_session_barrier_before_unsupported_fault() {
-        let mut vmm = configured_vmm(FakeStarter::success(16));
+        let mut vmm = snapshot_profile_vmm(FakeStarter::success(17));
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
         vmm.handle_action(VmmAction::Pause)
             .expect("running instance should pause");
 
         let err = vmm
-            .handle_action(VmmAction::CreateSnapshot)
+            .handle_action(snapshot_create_action(SnapshotType::Full))
             .expect_err("snapshot create should remain unsupported");
 
         assert_eq!(err, VmmActionError::SnapshotUnsupported);
@@ -8711,8 +8771,8 @@ mod tests {
     #[test]
     fn runtime_snapshot_create_barrier_failure_keeps_paused_state() {
         let source = BackendError::Hypervisor("snapshot barrier failed".to_string());
-        let mut vmm = configured_vmm(FakeStarter::success_with_session(
-            FakeSession::with_snapshot_create_barrier_result(17, source.clone()),
+        let mut vmm = snapshot_profile_vmm(FakeStarter::success_with_session(
+            FakeSession::with_snapshot_create_barrier_result(18, source.clone()),
         ));
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
@@ -8720,7 +8780,7 @@ mod tests {
             .expect("running instance should pause");
 
         let err = vmm
-            .handle_action(VmmAction::CreateSnapshot)
+            .handle_action(snapshot_create_action(SnapshotType::Full))
             .expect_err("snapshot barrier should fail before unsupported fault");
 
         assert_eq!(err, VmmActionError::Lifecycle(source));
