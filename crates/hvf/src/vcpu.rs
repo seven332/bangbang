@@ -255,6 +255,115 @@ impl HvfArm64VcpuExecutionControlRegisterState {
     }
 }
 
+/// Detached arm64 processor identification state captured from one vCPU.
+///
+/// These guest-visible MIDR, MPIDR, and baseline `ID_AA64*` values describe
+/// the virtual CPU and Hypervisor.framework feature model. They are raw inputs
+/// for later compatibility checks, not physical-host identity, mutable guest
+/// state, or a destination compatibility decision. Optional SVE/SME and newer
+/// identification registers, persistence, and a serialized schema remain
+/// outside this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuIdentificationRegisterState {
+    midr_el1: u64,
+    mpidr_el1: u64,
+    id_aa64pfr0_el1: u64,
+    id_aa64pfr1_el1: u64,
+    id_aa64dfr0_el1: u64,
+    id_aa64dfr1_el1: u64,
+    id_aa64isar0_el1: u64,
+    id_aa64isar1_el1: u64,
+    id_aa64mmfr0_el1: u64,
+    id_aa64mmfr1_el1: u64,
+    id_aa64mmfr2_el1: u64,
+}
+
+impl HvfArm64VcpuIdentificationRegisterState {
+    pub(crate) const fn new(values: [u64; 11]) -> Self {
+        let [
+            midr_el1,
+            mpidr_el1,
+            id_aa64pfr0_el1,
+            id_aa64pfr1_el1,
+            id_aa64dfr0_el1,
+            id_aa64dfr1_el1,
+            id_aa64isar0_el1,
+            id_aa64isar1_el1,
+            id_aa64mmfr0_el1,
+            id_aa64mmfr1_el1,
+            id_aa64mmfr2_el1,
+        ] = values;
+        Self {
+            midr_el1,
+            mpidr_el1,
+            id_aa64pfr0_el1,
+            id_aa64pfr1_el1,
+            id_aa64dfr0_el1,
+            id_aa64dfr1_el1,
+            id_aa64isar0_el1,
+            id_aa64isar1_el1,
+            id_aa64mmfr0_el1,
+            id_aa64mmfr1_el1,
+            id_aa64mmfr2_el1,
+        }
+    }
+
+    /// Return the raw guest-visible `MIDR_EL1` value.
+    pub const fn midr_el1(self) -> u64 {
+        self.midr_el1
+    }
+
+    /// Return the raw guest-visible `MPIDR_EL1` value.
+    pub const fn mpidr_el1(self) -> u64 {
+        self.mpidr_el1
+    }
+
+    /// Return the raw `ID_AA64PFR0_EL1` value.
+    pub const fn id_aa64pfr0_el1(self) -> u64 {
+        self.id_aa64pfr0_el1
+    }
+
+    /// Return the raw `ID_AA64PFR1_EL1` value.
+    pub const fn id_aa64pfr1_el1(self) -> u64 {
+        self.id_aa64pfr1_el1
+    }
+
+    /// Return the raw `ID_AA64DFR0_EL1` value.
+    pub const fn id_aa64dfr0_el1(self) -> u64 {
+        self.id_aa64dfr0_el1
+    }
+
+    /// Return the raw `ID_AA64DFR1_EL1` value.
+    pub const fn id_aa64dfr1_el1(self) -> u64 {
+        self.id_aa64dfr1_el1
+    }
+
+    /// Return the raw `ID_AA64ISAR0_EL1` value.
+    pub const fn id_aa64isar0_el1(self) -> u64 {
+        self.id_aa64isar0_el1
+    }
+
+    /// Return the raw `ID_AA64ISAR1_EL1` value.
+    pub const fn id_aa64isar1_el1(self) -> u64 {
+        self.id_aa64isar1_el1
+    }
+
+    /// Return the raw `ID_AA64MMFR0_EL1` value.
+    pub const fn id_aa64mmfr0_el1(self) -> u64 {
+        self.id_aa64mmfr0_el1
+    }
+
+    /// Return the raw `ID_AA64MMFR1_EL1` value.
+    pub const fn id_aa64mmfr1_el1(self) -> u64 {
+        self.id_aa64mmfr1_el1
+    }
+
+    /// Return the raw `ID_AA64MMFR2_EL1` value.
+    pub const fn id_aa64mmfr2_el1(self) -> u64 {
+        self.id_aa64mmfr2_el1
+    }
+}
+
 /// Detached raw EL1 translation-register state captured from one arm64 vCPU.
 ///
 /// This value contains `SCTLR_EL1`, both translation table bases, `TCR_EL1`,
@@ -613,7 +722,17 @@ impl HvfSimdFpRegister {
 pub struct HvfSystemRegister(u16);
 
 impl HvfSystemRegister {
+    pub const MIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MIDR_EL1);
     pub const MPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MPIDR_EL1);
+    pub const ID_AA64PFR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64PFR0_EL1);
+    pub const ID_AA64PFR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64PFR1_EL1);
+    pub const ID_AA64DFR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64DFR0_EL1);
+    pub const ID_AA64DFR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64DFR1_EL1);
+    pub const ID_AA64ISAR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64ISAR0_EL1);
+    pub const ID_AA64ISAR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64ISAR1_EL1);
+    pub const ID_AA64MMFR0_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64MMFR0_EL1);
+    pub const ID_AA64MMFR1_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64MMFR1_EL1);
+    pub const ID_AA64MMFR2_EL1: Self = Self(crate::ffi::HV_SYS_REG_ID_AA64MMFR2_EL1);
     pub const SCTLR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SCTLR_EL1);
     pub const ACTLR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ACTLR_EL1);
     pub const CPACR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CPACR_EL1);
@@ -1089,6 +1208,26 @@ pub(crate) fn capture_arm64_vcpu_execution_control_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_identification_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuIdentificationRegisterState, BackendError> {
+    let values = [
+        get_system_register(HvfSystemRegister::MIDR_EL1)?,
+        get_system_register(HvfSystemRegister::MPIDR_EL1)?,
+        get_system_register(HvfSystemRegister::ID_AA64PFR0_EL1)?,
+        get_system_register(HvfSystemRegister::ID_AA64PFR1_EL1)?,
+        get_system_register(HvfSystemRegister::ID_AA64DFR0_EL1)?,
+        get_system_register(HvfSystemRegister::ID_AA64DFR1_EL1)?,
+        get_system_register(HvfSystemRegister::ID_AA64ISAR0_EL1)?,
+        get_system_register(HvfSystemRegister::ID_AA64ISAR1_EL1)?,
+        get_system_register(HvfSystemRegister::ID_AA64MMFR0_EL1)?,
+        get_system_register(HvfSystemRegister::ID_AA64MMFR1_EL1)?,
+        get_system_register(HvfSystemRegister::ID_AA64MMFR2_EL1)?,
+    ];
+
+    Ok(HvfArm64VcpuIdentificationRegisterState::new(values))
+}
+
 pub(crate) fn capture_arm64_vcpu_translation_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuTranslationRegisterState, BackendError> {
@@ -1225,6 +1364,7 @@ mod tests {
         capture_arm64_vcpu_exception_register_state_with,
         capture_arm64_vcpu_execution_control_register_state_with,
         capture_arm64_vcpu_general_register_state_with,
+        capture_arm64_vcpu_identification_register_state_with,
         capture_arm64_vcpu_pending_interrupt_state_with,
         capture_arm64_vcpu_physical_timer_state_with,
         capture_arm64_vcpu_pointer_authentication_key_state_with,
@@ -1239,6 +1379,26 @@ mod tests {
     enum SimdFpRead {
         Q(HvfSimdFpRegister),
         Scalar(HvfRegister),
+    }
+
+    fn identification_registers() -> [HvfSystemRegister; 11] {
+        [
+            HvfSystemRegister::MIDR_EL1,
+            HvfSystemRegister::MPIDR_EL1,
+            HvfSystemRegister::ID_AA64PFR0_EL1,
+            HvfSystemRegister::ID_AA64PFR1_EL1,
+            HvfSystemRegister::ID_AA64DFR0_EL1,
+            HvfSystemRegister::ID_AA64DFR1_EL1,
+            HvfSystemRegister::ID_AA64ISAR0_EL1,
+            HvfSystemRegister::ID_AA64ISAR1_EL1,
+            HvfSystemRegister::ID_AA64MMFR0_EL1,
+            HvfSystemRegister::ID_AA64MMFR1_EL1,
+            HvfSystemRegister::ID_AA64MMFR2_EL1,
+        ]
+    }
+
+    fn identification_test_value(register: HvfSystemRegister) -> u64 {
+        0x1d00_0000_0000_0000 | u64::from(register.raw())
     }
 
     const POINTER_AUTHENTICATION_TEST_HALVES: [u64; 10] = [
@@ -1745,6 +1905,65 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_identification_register_state_in_documented_order() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_identification_register_state_with(|register| {
+            reads.push(register);
+            Ok(identification_test_value(register))
+        })
+        .expect("identification-register capture should succeed");
+
+        let registers = identification_registers();
+        assert_eq!(reads, registers);
+        assert_eq!(state.midr_el1(), identification_test_value(registers[0]));
+        assert_eq!(state.mpidr_el1(), identification_test_value(registers[1]));
+        assert_eq!(
+            state.id_aa64pfr0_el1(),
+            identification_test_value(registers[2])
+        );
+        assert_eq!(
+            state.id_aa64pfr1_el1(),
+            identification_test_value(registers[3])
+        );
+        assert_eq!(
+            state.id_aa64dfr0_el1(),
+            identification_test_value(registers[4])
+        );
+        assert_eq!(
+            state.id_aa64dfr1_el1(),
+            identification_test_value(registers[5])
+        );
+        assert_eq!(
+            state.id_aa64isar0_el1(),
+            identification_test_value(registers[6])
+        );
+        assert_eq!(
+            state.id_aa64isar1_el1(),
+            identification_test_value(registers[7])
+        );
+        assert_eq!(
+            state.id_aa64mmfr0_el1(),
+            identification_test_value(registers[8])
+        );
+        assert_eq!(
+            state.id_aa64mmfr1_el1(),
+            identification_test_value(registers[9])
+        );
+        assert_eq!(
+            state.id_aa64mmfr2_el1(),
+            identification_test_value(registers[10])
+        );
+        assert_eq!(
+            registers.map(HvfSystemRegister::raw),
+            [
+                0xc000, 0xc005, 0xc020, 0xc021, 0xc028, 0xc029, 0xc030, 0xc031, 0xc038, 0xc039,
+                0xc03a,
+            ]
+        );
+    }
+
+    #[test]
     fn captures_arm64_pointer_authentication_keys_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -2054,6 +2273,45 @@ mod tests {
                     .expect("pointer-authentication key capture retry should succeed");
             assert_eq!(state.apia_key(), pointer_authentication_test_key(0));
             assert_eq!(state.apga_key(), pointer_authentication_test_key(4));
+            assert_eq!(*reads.borrow(), registers);
+        }
+    }
+
+    #[test]
+    fn arm64_identification_register_capture_stops_after_each_error_and_can_retry() {
+        let registers = identification_registers();
+
+        for (failed_index, failed_register) in registers.into_iter().enumerate() {
+            let fail_next = Cell::new(true);
+            let reads = RefCell::new(Vec::new());
+            let read_system_register = |register: HvfSystemRegister| {
+                reads.borrow_mut().push(register);
+                if register == failed_register && fail_next.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake identification register read failed",
+                    ))
+                } else {
+                    Ok(identification_test_value(register))
+                }
+            };
+
+            assert_eq!(
+                capture_arm64_vcpu_identification_register_state_with(&read_system_register),
+                Err(BackendError::InvalidState(
+                    "fake identification register read failed"
+                ))
+            );
+            assert_eq!(*reads.borrow(), registers[..=failed_index]);
+
+            reads.borrow_mut().clear();
+            let state =
+                capture_arm64_vcpu_identification_register_state_with(&read_system_register)
+                    .expect("identification-register capture retry should succeed");
+            assert_eq!(state.midr_el1(), identification_test_value(registers[0]));
+            assert_eq!(
+                state.id_aa64mmfr2_el1(),
+                identification_test_value(registers[10])
+            );
             assert_eq!(*reads.borrow(), registers);
         }
     }

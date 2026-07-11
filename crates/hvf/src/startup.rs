@@ -73,10 +73,10 @@ use crate::runner::{
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuExceptionRegisterState,
     HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
-    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
-    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
-    HvfArm64VcpuVirtualTimerState,
+    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
+    HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
+    HvfArm64VcpuSimdFpState, HvfArm64VcpuThreadContextRegisterState,
+    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1211,6 +1211,17 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_execution_control_register_state()
     }
 
+    /// Capture guest-visible arm64 identification registers on the primary
+    /// owner thread.
+    ///
+    /// These raw virtual-CPU/HVF compatibility inputs define no destination
+    /// policy, persistence format, or mutable restore state.
+    pub fn capture_arm64_identification_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuIdentificationRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_identification_register_state()
+    }
+
     /// Capture raw EL1 translation-register state on the primary owner thread.
     ///
     /// This subset omits table memory, feature validation, TLB/cache
@@ -1891,6 +1902,17 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuExecutionControlRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_execution_control_register_state()
+    }
+
+    /// Capture guest-visible arm64 identification registers on the primary
+    /// owner thread.
+    ///
+    /// These raw virtual-CPU/HVF compatibility inputs define no destination
+    /// policy, persistence format, or mutable restore state.
+    pub fn capture_arm64_identification_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuIdentificationRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_identification_register_state()
     }
 
     /// Capture raw EL1 translation-register state on the primary owner thread.
