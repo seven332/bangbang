@@ -1664,7 +1664,9 @@ order. A reusable system-register failure identifies the exact failed register
 and completed-write count; the writes are nontransactional and require the same
 complete-retry-or-discard rule. A third capture reads all 16 bytes of
 Q0-Q31 in ascending order, then raw FPCR and FPSR. A fourth reads raw
-`TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. A fifth reads raw `SCTLR_EL1`,
+`TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. Its typed value has a paired
+owner-thread restore that writes the same three fields in capture order under
+the reusable system-register partial-write contract. A fifth reads raw `SCTLR_EL1`,
 `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1`, `MAIR_EL1`, `AMAIR_EL1`, and
 `CONTEXTIDR_EL1`. A sixth reads raw `AFSR0_EL1`, `AFSR1_EL1`, `ESR_EL1`,
 `FAR_EL1`, `PAR_EL1`, and `VBAR_EL1`. Its typed value has a paired owner-thread
@@ -1712,11 +1714,11 @@ value exposes the raw square while redacting all bytes and dimensions from
 requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
-commands plus the general-, core-system-, exception-register, and execution-
-control restore operations form a twenty-six-operation,
+commands plus the general-, core-system-, exception-register, execution-
+control, and thread-context restore operations form a twenty-seven-operation,
 command-owned core-register admission domain. Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose all four restores
+setter failure. Borrowed and owned HVF boot sessions expose all five restores
 and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
@@ -1927,13 +1929,13 @@ SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register
 cache-selection, breakpoint, watchpoint,
 debug-control, debug-trap,
 translation,
-pointer-authentication, thread-context, baseline SIMD/FP, and physical-timer
+pointer-authentication, baseline SIMD/FP, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
-The core system-register, EL1 exception, and execution-control subsets have
-paired ordered, nontransactional restore operations but likewise have no
-validation, schema, vector-memory, feature-transition, or wider ordering
-policy.
+The core system-register, EL1 exception, execution-control, and thread-context
+subsets have paired ordered, nontransactional restore operations but likewise
+have no validation, schema, vector-memory, feature-transition, or wider
+ordering policy.
 Identification capture is compatibility metadata rather than mutable restore
 state and defines no feature-mask or destination policy. Debug-control and
 debug-trap capture remain separate and
@@ -2306,7 +2308,9 @@ macOS design work instead of direct implementation:
   operation. A third command captures baseline Q0-Q31, FPCR, and FPSR
   state under that admission, retaining every 128-bit Q value; a fourth
   captures raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values while keeping
-  TPIDR2_EL0 in the separate SME system-register subset; and a fifth captures
+  TPIDR2_EL0 in the separate SME system-register subset, and can reapply the
+  complete typed value in capture order without validating guest pointers or
+  composing wider software-context state; and a fifth captures
   raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1,
   TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 translation state.
   A sixth captures raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and
@@ -2359,9 +2363,10 @@ macOS design work instead of direct implementation:
   validation and maintenance, breakpoint and watchpoint control
   validation, debug-trap policy validation/setters, protected key persistence,
   and wider restore ordering remain outside these subsets. General-register,
-  core-system-register, exception-register, and execution-control restore
-  report their typed failed register and completed-write count; callers must
-  retry the complete captured value or discard the vCPU before execution.
+  core-system-register, exception-register, execution-control, and
+  thread-context restore report their typed failed register and completed-write
+  count; callers must retry the complete captured value or discard the vCPU
+  before execution.
   The runner can capture raw CNTKCTL_EL1, CNTP_CTL_EL0, CNTP_CVAL_EL0, and
   CNTP_TVAL_EL0 on the owning thread when macOS 15 physical-timer prerequisites
   are met. The absolute and relative views are read sequentially and do not

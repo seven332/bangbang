@@ -1432,11 +1432,12 @@ const fn pointer_authentication_key(low: u64, high: u64) -> u128 {
 /// Detached raw thread-context register state captured from one arm64 vCPU.
 ///
 /// These software thread-ID values can contain guest TLS or kernel pointers.
-/// They are sensitive raw observations for later owner-thread orchestration,
-/// not a complete or serialized restorable vCPU state. `TPIDR2_EL0` is captured
-/// separately with SME system registers, while `SCXTNUM_EL0`/`SCXTNUM_EL1` are
-/// captured in a separate system-context value. Wider state and restore
-/// validation remain outside this value.
+/// The complete typed value can be reapplied through an owner-thread primitive,
+/// but it is not address- or destination-validated and is not a complete or
+/// serialized restorable vCPU state. `TPIDR2_EL0` is captured separately with
+/// SME system registers, while `SCXTNUM_EL0`/`SCXTNUM_EL1` and
+/// `CONTEXTIDR_EL1` remain separate. Persistence, schema, and wider context
+/// ordering stay outside this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuThreadContextRegisterState {
     tpidr_el0: u64,
@@ -2772,6 +2773,30 @@ pub(crate) fn capture_arm64_vcpu_thread_context_register_state_with(
     ))
 }
 
+pub(crate) fn restore_arm64_vcpu_thread_context_register_state_with(
+    state: &HvfArm64VcpuThreadContextRegisterState,
+    mut set_system_register: impl FnMut(HvfSystemRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+    let mut completed_writes = 0;
+    let mut write_system_register = |register, value| {
+        set_system_register(register, value).map_err(|source| {
+            HvfArm64VcpuSystemRegisterRestoreError::new(register, completed_writes, source)
+        })?;
+        completed_writes += 1;
+        Ok(())
+    };
+
+    for (register, value) in [
+        (HvfSystemRegister::TPIDR_EL0, state.tpidr_el0()),
+        (HvfSystemRegister::TPIDRRO_EL0, state.tpidrro_el0()),
+        (HvfSystemRegister::TPIDR_EL1, state.tpidr_el1()),
+    ] {
+        write_system_register(register, value)?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn capture_arm64_vcpu_physical_timer_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuPhysicalTimerState, BackendError> {
@@ -2880,6 +2905,7 @@ mod tests {
         restore_arm64_vcpu_exception_register_state_with,
         restore_arm64_vcpu_execution_control_register_state_with,
         restore_arm64_vcpu_general_register_state_with,
+        restore_arm64_vcpu_thread_context_register_state_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
@@ -6019,6 +6045,86 @@ mod tests {
             HvfSystemRegister::TPIDR_EL1.raw(),
             crate::ffi::HV_SYS_REG_TPIDR_EL1
         );
+    }
+
+    fn thread_context_restore_test_state() -> super::HvfArm64VcpuThreadContextRegisterState {
+        capture_arm64_vcpu_thread_context_register_state_with(|register| {
+            Ok(0xd900_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("thread-context test state should be captured")
+    }
+
+    fn thread_context_restore_test_entries(
+        state: super::HvfArm64VcpuThreadContextRegisterState,
+    ) -> [(HvfSystemRegister, u64); 3] {
+        [
+            (HvfSystemRegister::TPIDR_EL0, state.tpidr_el0()),
+            (HvfSystemRegister::TPIDRRO_EL0, state.tpidrro_el0()),
+            (HvfSystemRegister::TPIDR_EL1, state.tpidr_el1()),
+        ]
+    }
+
+    #[test]
+    fn restores_arm64_thread_context_register_state_in_capture_order() {
+        let state = thread_context_restore_test_state();
+        let expected = thread_context_restore_test_entries(state);
+        let mut writes = Vec::new();
+
+        restore_arm64_vcpu_thread_context_register_state_with(&state, |register, value| {
+            writes.push((register, value));
+            Ok(())
+        })
+        .expect("thread-context restore should succeed");
+
+        assert_eq!(writes, expected);
+    }
+
+    #[test]
+    fn every_arm64_thread_context_restore_failure_stops_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = thread_context_restore_test_state();
+        let expected = thread_context_restore_test_entries(state);
+
+        for (failed_index, (failed_register, _)) in expected.iter().copied().enumerate() {
+            let fail_once = Cell::new(true);
+            let writes = RefCell::new(Vec::new());
+            let write_system_register = |register, value| {
+                writes.borrow_mut().push((register, value));
+                if register == failed_register && fail_once.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake thread-context restore failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error = restore_arm64_vcpu_thread_context_register_state_with(
+                &state,
+                &write_system_register,
+            )
+            .expect_err("injected thread-context write should fail");
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake thread-context restore failed".to_string())
+            );
+            assert_eq!(*writes.borrow(), expected[..=failed_index]);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 system register id {} after {failed_index} successful writes: invalid backend state: fake thread-context restore failed",
+                    failed_register.raw()
+                )
+            );
+
+            writes.borrow_mut().clear();
+            restore_arm64_vcpu_thread_context_register_state_with(&state, &write_system_register)
+                .expect("complete thread-context restore retry should succeed");
+            assert_eq!(*writes.borrow(), expected);
+        }
     }
 
     #[test]

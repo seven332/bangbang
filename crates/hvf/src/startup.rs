@@ -1454,12 +1454,28 @@ impl HvfArm64BootSession<'_> {
     ///
     /// These sensitive software thread-ID values can contain guest pointers.
     /// `TPIDR2_EL0` is captured separately with SME system registers, while
-    /// `SCXTNUM_EL0`/`SCXTNUM_EL1` use a separate system-context value. Wider
-    /// system state and restore policy remain outside this subset.
+    /// `SCXTNUM_EL0`/`SCXTNUM_EL1` use a separate system-context value. The
+    /// complete typed value has a paired low-level restore, but wider context,
+    /// validation, and snapshot policy remain outside this subset.
     pub fn capture_arm64_thread_context_register_state(
         &self,
     ) -> Result<HvfArm64VcpuThreadContextRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_thread_context_register_state()
+    }
+
+    /// Restore raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary
+    /// vCPU owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. Pointer validation, wider context ordering, and schema
+    /// remain outside this runner primitive.
+    pub fn restore_arm64_thread_context_register_state(
+        &self,
+        state: &HvfArm64VcpuThreadContextRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_thread_context_register_state(state)
     }
 
     /// Capture raw Q0-Q31, FPCR, and FPSR values on the primary vCPU owner
@@ -2350,12 +2366,28 @@ impl OwnedHvfArm64BootSession {
     ///
     /// These sensitive software thread-ID values can contain guest pointers.
     /// `TPIDR2_EL0` is captured separately with SME system registers, while
-    /// `SCXTNUM_EL0`/`SCXTNUM_EL1` use a separate system-context value. Wider
-    /// system state and restore policy remain outside this subset.
+    /// `SCXTNUM_EL0`/`SCXTNUM_EL1` use a separate system-context value. The
+    /// complete typed value has a paired low-level restore, but wider context,
+    /// validation, and snapshot policy remain outside this subset.
     pub fn capture_arm64_thread_context_register_state(
         &self,
     ) -> Result<HvfArm64VcpuThreadContextRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_thread_context_register_state()
+    }
+
+    /// Restore raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values on the primary
+    /// vCPU owner thread.
+    ///
+    /// Writes follow capture order but are nontransactional. If one setter
+    /// fails, retry the complete typed state or discard the session before
+    /// guest execution. Pointer validation, wider context ordering, and schema
+    /// remain outside this runner primitive.
+    pub fn restore_arm64_thread_context_register_state(
+        &self,
+        state: &HvfArm64VcpuThreadContextRegisterState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .restore_arm64_thread_context_register_state(state)
     }
 
     /// Capture raw Q0-Q31, FPCR, and FPSR values on the primary vCPU owner
