@@ -898,6 +898,125 @@ impl fmt::Debug for HvfArm64VcpuSmeZRegisterState {
     }
 }
 
+/// Error while capturing the SME ZA matrix contents from one arm64 vCPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfArm64VcpuSmeZaRegisterCaptureError {
+    /// Hypervisor.framework or compile-target failure.
+    Backend(BackendError),
+    /// `PSTATE.ZA` was disabled, so the SDK forbids a ZA-register read.
+    ZaStorageDisabled,
+    /// Hypervisor.framework reported a zero maximum streaming vector length.
+    ZeroMaximumSvl,
+    /// The maximum-SVL square byte count overflowed `usize`.
+    CaptureSizeOverflow {
+        /// Maximum streaming vector length returned by Hypervisor.framework.
+        maximum_svl_bytes: usize,
+    },
+    /// The complete private capture buffer could not be allocated.
+    AllocationFailed {
+        /// Requested allocation size in bytes.
+        size: usize,
+    },
+}
+
+impl fmt::Display for HvfArm64VcpuSmeZaRegisterCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(source) => write!(f, "{source}"),
+            Self::ZaStorageDisabled => {
+                f.write_str("cannot capture the SME ZA register while ZA storage is disabled")
+            }
+            Self::ZeroMaximumSvl => {
+                f.write_str("Hypervisor.framework reported a zero maximum streaming vector length")
+            }
+            Self::CaptureSizeOverflow { maximum_svl_bytes } => write!(
+                f,
+                "SME ZA-register capture size overflows for maximum SVL {maximum_svl_bytes} bytes"
+            ),
+            Self::AllocationFailed { size } => {
+                write!(
+                    f,
+                    "failed to allocate {size} bytes for SME ZA-register capture"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64VcpuSmeZaRegisterCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend(source) => Some(source),
+            Self::ZaStorageDisabled
+            | Self::ZeroMaximumSvl
+            | Self::CaptureSizeOverflow { .. }
+            | Self::AllocationFailed { .. } => None,
+        }
+    }
+}
+
+impl From<BackendError> for HvfArm64VcpuSmeZaRegisterCaptureError {
+    fn from(source: BackendError) -> Self {
+        Self::Backend(source)
+    }
+}
+
+/// Detached raw SME ZA matrix contents captured from one arm64 vCPU.
+///
+/// Hypervisor.framework requires exactly the square of its maximum streaming
+/// vector length in bytes. That allocation size is not an effective-SVL, row,
+/// tile, or active-lane interpretation. ZA bytes are sensitive guest execution
+/// and potentially cryptographic state, so `Debug` redacts them. Z, P, ZT0,
+/// setters, persistence, encryption, snapshot schema, and restore ordering
+/// remain outside this getter-only value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64VcpuSmeZaRegisterState {
+    maximum_svl_bytes: usize,
+    bytes: Box<[u8]>,
+}
+
+impl HvfArm64VcpuSmeZaRegisterState {
+    fn new(maximum_svl_bytes: usize, bytes: Vec<u8>) -> Self {
+        debug_assert_eq!(
+            bytes.len(),
+            maximum_svl_bytes * maximum_svl_bytes,
+            "SME ZA-register capture buffer must preserve the complete matrix"
+        );
+        Self {
+            maximum_svl_bytes,
+            bytes: bytes.into_boxed_slice(),
+        }
+    }
+
+    /// Return the maximum streaming vector length reported by HVF.
+    pub const fn maximum_svl_bytes(&self) -> usize {
+        self.maximum_svl_bytes
+    }
+
+    /// Return the complete raw ZA-register bytes without layout interpretation.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Return the complete ZA-register capture size in bytes.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Return whether the complete ZA-register capture contains no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl fmt::Debug for HvfArm64VcpuSmeZaRegisterState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64VcpuSmeZaRegisterState")
+            .field("register", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Detached raw SME system-register state captured from one arm64 vCPU.
 ///
 /// Hypervisor.framework exposes `SMCR_EL1`, `SMPRI_EL1`, and `TPIDR2_EL0` on
@@ -1604,6 +1723,10 @@ impl HvfVcpuOwner {
         crate::ffi::get_sme_z_reg(self.handle()?.vcpu, register, value)
     }
 
+    pub(crate) fn get_sme_za_register(&self, value: &mut [u8]) -> Result<(), BackendError> {
+        crate::ffi::get_sme_za_reg(self.handle()?.vcpu, value)
+    }
+
     pub(crate) fn configure_arm64_boot_registers(
         &mut self,
         registers: HvfArm64BootRegisters,
@@ -2213,6 +2336,64 @@ pub(crate) fn capture_arm64_vcpu_sme_z_register_state<R: ?Sized>(
     )
 }
 
+fn allocate_arm64_vcpu_sme_za_register_bytes(
+    size: usize,
+) -> Result<Vec<u8>, HvfArm64VcpuSmeZaRegisterCaptureError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| HvfArm64VcpuSmeZaRegisterCaptureError::AllocationFailed { size })?;
+    bytes.resize(size, 0);
+    Ok(bytes)
+}
+
+pub(crate) fn capture_arm64_vcpu_sme_za_register_state_with<R: ?Sized>(
+    reader: &mut R,
+    get_sme_pstate: impl FnOnce(&mut R) -> Result<(bool, bool), BackendError>,
+    get_maximum_svl_bytes: impl FnOnce(&mut R) -> Result<usize, BackendError>,
+    allocate: impl FnOnce(usize) -> Result<Vec<u8>, HvfArm64VcpuSmeZaRegisterCaptureError>,
+    get_sme_za_register: impl FnOnce(&mut R, &mut [u8]) -> Result<(), BackendError>,
+) -> Result<HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError> {
+    let (_, za_storage_enabled) = get_sme_pstate(reader)?;
+    if !za_storage_enabled {
+        return Err(HvfArm64VcpuSmeZaRegisterCaptureError::ZaStorageDisabled);
+    }
+
+    let maximum_svl_bytes = get_maximum_svl_bytes(reader)?;
+    if maximum_svl_bytes == 0 {
+        return Err(HvfArm64VcpuSmeZaRegisterCaptureError::ZeroMaximumSvl);
+    }
+    let capture_size = maximum_svl_bytes
+        .checked_mul(maximum_svl_bytes)
+        .ok_or(HvfArm64VcpuSmeZaRegisterCaptureError::CaptureSizeOverflow { maximum_svl_bytes })?;
+    let mut bytes = allocate(capture_size)?;
+    if bytes.len() != capture_size {
+        return Err(HvfArm64VcpuSmeZaRegisterCaptureError::AllocationFailed { size: capture_size });
+    }
+
+    get_sme_za_register(reader, &mut bytes)?;
+
+    Ok(HvfArm64VcpuSmeZaRegisterState::new(
+        maximum_svl_bytes,
+        bytes,
+    ))
+}
+
+pub(crate) fn capture_arm64_vcpu_sme_za_register_state<R: ?Sized>(
+    reader: &mut R,
+    get_sme_pstate: impl FnOnce(&mut R) -> Result<(bool, bool), BackendError>,
+    get_maximum_svl_bytes: impl FnOnce(&mut R) -> Result<usize, BackendError>,
+    get_sme_za_register: impl FnOnce(&mut R, &mut [u8]) -> Result<(), BackendError>,
+) -> Result<HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError> {
+    capture_arm64_vcpu_sme_za_register_state_with(
+        reader,
+        get_sme_pstate,
+        get_maximum_svl_bytes,
+        allocate_arm64_vcpu_sme_za_register_bytes,
+        get_sme_za_register,
+    )
+}
+
 pub(crate) fn capture_arm64_vcpu_sme_system_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuSmeSystemRegisterState, BackendError> {
@@ -2371,7 +2552,8 @@ mod tests {
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters,
         HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState,
-        HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState, HvfInterruptType,
+        HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
+        HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState, HvfInterruptType,
         HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
         NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_breakpoint_register_state_with,
         capture_arm64_vcpu_cache_selection_register_state_with,
@@ -2387,6 +2569,7 @@ mod tests {
         capture_arm64_vcpu_simd_fp_state_with, capture_arm64_vcpu_sme_p_register_state_with,
         capture_arm64_vcpu_sme_pstate_with, capture_arm64_vcpu_sme_system_register_state_with,
         capture_arm64_vcpu_sme_z_register_state_with,
+        capture_arm64_vcpu_sme_za_register_state_with,
         capture_arm64_vcpu_sve_sme_identification_register_state_with,
         capture_arm64_vcpu_system_context_register_state_with,
         capture_arm64_vcpu_thread_context_register_state_with,
@@ -2528,6 +2711,68 @@ mod tests {
                 }
                 for (offset, byte) in value.iter_mut().enumerate() {
                     *byte = sme_z_test_byte(register, offset);
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SmeZaCaptureCall {
+        Pstate,
+        MaximumSvl,
+        Za { length: usize },
+    }
+
+    struct SmeZaTestReader {
+        pstate_result: Result<(bool, bool), BackendError>,
+        maximum_svl_result: Result<usize, BackendError>,
+        fail_once: bool,
+        calls: Vec<SmeZaCaptureCall>,
+    }
+
+    impl SmeZaTestReader {
+        fn active(maximum_svl_bytes: usize) -> Self {
+            Self {
+                pstate_result: Ok((false, true)),
+                maximum_svl_result: Ok(maximum_svl_bytes),
+                fail_once: false,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    fn sme_za_test_byte(offset: usize) -> u8 {
+        offset.to_le_bytes()[0].wrapping_mul(19) ^ 0xa5
+    }
+
+    fn capture_sme_za_test_reader(
+        reader: &mut SmeZaTestReader,
+        allocate: impl FnOnce(usize) -> Result<Vec<u8>, HvfArm64VcpuSmeZaRegisterCaptureError>,
+    ) -> Result<HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError> {
+        capture_arm64_vcpu_sme_za_register_state_with(
+            reader,
+            |reader| {
+                reader.calls.push(SmeZaCaptureCall::Pstate);
+                reader.pstate_result.clone()
+            },
+            |reader| {
+                reader.calls.push(SmeZaCaptureCall::MaximumSvl);
+                reader.maximum_svl_result.clone()
+            },
+            allocate,
+            |reader, value| {
+                reader.calls.push(SmeZaCaptureCall::Za {
+                    length: value.len(),
+                });
+                if reader.fail_once {
+                    reader.fail_once = false;
+                    return Err(BackendError::InvalidState(
+                        "fake SME ZA-register read failed",
+                    ));
+                }
+                for (offset, byte) in value.iter_mut().enumerate() {
+                    *byte = sme_za_test_byte(offset);
                 }
                 Ok(())
             },
@@ -3745,6 +3990,235 @@ mod tests {
         assert_eq!(
             HvfArm64VcpuSmeZRegisterCaptureError::AllocationFailed { size: 4096 }.to_string(),
             "failed to allocate 4096 bytes for SME Z-register capture"
+        );
+    }
+
+    #[test]
+    fn captures_complete_arm64_sme_za_register_without_streaming_mode() {
+        let maximum_svl_bytes = 3;
+        let capture_size = maximum_svl_bytes * maximum_svl_bytes;
+        let allocation_size = Cell::new(None);
+        let mut reader = SmeZaTestReader::active(maximum_svl_bytes);
+
+        let state = capture_sme_za_test_reader(&mut reader, |size| {
+            allocation_size.set(Some(size));
+            Ok(vec![0; size])
+        })
+        .expect("SME ZA-register capture should succeed");
+
+        assert_eq!(allocation_size.get(), Some(capture_size));
+        assert_eq!(
+            reader.calls,
+            [
+                SmeZaCaptureCall::Pstate,
+                SmeZaCaptureCall::MaximumSvl,
+                SmeZaCaptureCall::Za {
+                    length: capture_size
+                }
+            ]
+        );
+        let expected = (0..capture_size).map(sme_za_test_byte).collect::<Vec<_>>();
+        assert_eq!(state.maximum_svl_bytes(), maximum_svl_bytes);
+        assert_eq!(state.as_bytes(), expected);
+        assert_eq!(state.len(), capture_size);
+        assert!(!state.is_empty());
+        assert_eq!(state.clone(), state);
+        assert_eq!(
+            format!("{state:?}"),
+            "HvfArm64VcpuSmeZaRegisterState { register: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
+    fn inactive_sme_za_capture_stops_before_sizing_or_allocation() {
+        for streaming_sve_mode_enabled in [false, true] {
+            let mut reader = SmeZaTestReader {
+                pstate_result: Ok((streaming_sve_mode_enabled, false)),
+                maximum_svl_result: Ok(3),
+                fail_once: false,
+                calls: Vec::new(),
+            };
+
+            assert_eq!(
+                capture_sme_za_test_reader(&mut reader, |_| {
+                    panic!("inactive SME ZA capture must not allocate")
+                }),
+                Err(HvfArm64VcpuSmeZaRegisterCaptureError::ZaStorageDisabled)
+            );
+            assert_eq!(reader.calls, [SmeZaCaptureCall::Pstate]);
+        }
+    }
+
+    #[test]
+    fn sme_za_capture_preserves_pstate_and_maximum_errors() {
+        let pstate_error = BackendError::InvalidState("fake SME PSTATE read failed");
+        let mut pstate_reader = SmeZaTestReader {
+            pstate_result: Err(pstate_error.clone()),
+            maximum_svl_result: Ok(3),
+            fail_once: false,
+            calls: Vec::new(),
+        };
+        assert_eq!(
+            capture_sme_za_test_reader(&mut pstate_reader, |_| {
+                panic!("failed SME PSTATE must not allocate")
+            }),
+            Err(HvfArm64VcpuSmeZaRegisterCaptureError::Backend(pstate_error))
+        );
+        assert_eq!(pstate_reader.calls, [SmeZaCaptureCall::Pstate]);
+
+        let maximum_error = BackendError::InvalidState("fake maximum-SVL query failed");
+        let mut maximum_reader = SmeZaTestReader {
+            pstate_result: Ok((false, true)),
+            maximum_svl_result: Err(maximum_error.clone()),
+            fail_once: false,
+            calls: Vec::new(),
+        };
+        assert_eq!(
+            capture_sme_za_test_reader(&mut maximum_reader, |_| {
+                panic!("failed maximum-SVL query must not allocate")
+            }),
+            Err(HvfArm64VcpuSmeZaRegisterCaptureError::Backend(
+                maximum_error
+            ))
+        );
+        assert_eq!(
+            maximum_reader.calls,
+            [SmeZaCaptureCall::Pstate, SmeZaCaptureCall::MaximumSvl]
+        );
+    }
+
+    #[test]
+    fn sme_za_capture_rejects_zero_overflow_and_allocation_failures() {
+        let mut zero_reader = SmeZaTestReader::active(0);
+        assert_eq!(
+            capture_sme_za_test_reader(&mut zero_reader, |_| {
+                panic!("zero maximum SVL must not allocate")
+            }),
+            Err(HvfArm64VcpuSmeZaRegisterCaptureError::ZeroMaximumSvl)
+        );
+        assert_eq!(
+            zero_reader.calls,
+            [SmeZaCaptureCall::Pstate, SmeZaCaptureCall::MaximumSvl]
+        );
+
+        let overflowing_maximum = usize::MAX;
+        let mut overflow_reader = SmeZaTestReader::active(overflowing_maximum);
+        assert_eq!(
+            capture_sme_za_test_reader(&mut overflow_reader, |_| {
+                panic!("overflowing SME ZA capture must not allocate")
+            }),
+            Err(HvfArm64VcpuSmeZaRegisterCaptureError::CaptureSizeOverflow {
+                maximum_svl_bytes: overflowing_maximum
+            })
+        );
+        assert_eq!(
+            overflow_reader.calls,
+            [SmeZaCaptureCall::Pstate, SmeZaCaptureCall::MaximumSvl]
+        );
+
+        let maximum_svl_bytes = 4;
+        let capture_size = maximum_svl_bytes * maximum_svl_bytes;
+        let mut allocation_reader = SmeZaTestReader::active(maximum_svl_bytes);
+        assert_eq!(
+            capture_sme_za_test_reader(&mut allocation_reader, |size| {
+                assert_eq!(size, capture_size);
+                Err(HvfArm64VcpuSmeZaRegisterCaptureError::AllocationFailed { size })
+            }),
+            Err(HvfArm64VcpuSmeZaRegisterCaptureError::AllocationFailed { size: capture_size })
+        );
+        assert_eq!(
+            allocation_reader.calls,
+            [SmeZaCaptureCall::Pstate, SmeZaCaptureCall::MaximumSvl]
+        );
+
+        let mut short_reader = SmeZaTestReader::active(maximum_svl_bytes);
+        assert_eq!(
+            capture_sme_za_test_reader(&mut short_reader, |size| Ok(vec![0; size - 1])),
+            Err(HvfArm64VcpuSmeZaRegisterCaptureError::AllocationFailed { size: capture_size })
+        );
+        assert_eq!(
+            short_reader.calls,
+            [SmeZaCaptureCall::Pstate, SmeZaCaptureCall::MaximumSvl]
+        );
+    }
+
+    #[test]
+    fn failed_sme_za_register_capture_publishes_nothing_and_can_retry() {
+        let maximum_svl_bytes = 3;
+        let capture_size = maximum_svl_bytes * maximum_svl_bytes;
+        let mut reader = SmeZaTestReader::active(maximum_svl_bytes);
+        reader.fail_once = true;
+
+        assert_eq!(
+            capture_sme_za_test_reader(&mut reader, |size| Ok(vec![0; size])),
+            Err(HvfArm64VcpuSmeZaRegisterCaptureError::Backend(
+                BackendError::InvalidState("fake SME ZA-register read failed")
+            ))
+        );
+        assert_eq!(
+            reader.calls,
+            [
+                SmeZaCaptureCall::Pstate,
+                SmeZaCaptureCall::MaximumSvl,
+                SmeZaCaptureCall::Za {
+                    length: capture_size
+                }
+            ]
+        );
+
+        reader.calls.clear();
+        let state = capture_sme_za_test_reader(&mut reader, |size| Ok(vec![0; size]))
+            .expect("SME ZA-register capture retry should succeed");
+        assert_eq!(state.maximum_svl_bytes(), maximum_svl_bytes);
+        assert_eq!(state.len(), capture_size);
+        assert_eq!(
+            reader.calls,
+            [
+                SmeZaCaptureCall::Pstate,
+                SmeZaCaptureCall::MaximumSvl,
+                SmeZaCaptureCall::Za {
+                    length: capture_size
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn displays_sme_za_capture_errors_and_preserves_backend_source() {
+        use std::error::Error as _;
+
+        let backend = HvfArm64VcpuSmeZaRegisterCaptureError::Backend(BackendError::InvalidState(
+            "fake SME ZA backend failure",
+        ));
+        assert_eq!(
+            backend.to_string(),
+            "invalid backend state: fake SME ZA backend failure"
+        );
+        assert_eq!(
+            backend.source().map(ToString::to_string),
+            Some("invalid backend state: fake SME ZA backend failure".to_string())
+        );
+        assert_eq!(
+            HvfArm64VcpuSmeZaRegisterCaptureError::ZaStorageDisabled.to_string(),
+            "cannot capture the SME ZA register while ZA storage is disabled"
+        );
+        assert_eq!(
+            HvfArm64VcpuSmeZaRegisterCaptureError::ZeroMaximumSvl.to_string(),
+            "Hypervisor.framework reported a zero maximum streaming vector length"
+        );
+        assert_eq!(
+            HvfArm64VcpuSmeZaRegisterCaptureError::CaptureSizeOverflow {
+                maximum_svl_bytes: usize::MAX
+            }
+            .to_string(),
+            format!(
+                "SME ZA-register capture size overflows for maximum SVL {} bytes",
+                usize::MAX
+            )
+        );
+        assert_eq!(
+            HvfArm64VcpuSmeZaRegisterCaptureError::AllocationFailed { size: 4096 }.to_string(),
+            "failed to allocate 4096 bytes for SME ZA-register capture"
         );
     }
 

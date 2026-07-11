@@ -159,6 +159,16 @@ predicate accessor, and verify redacted `Debug` output without formatting or
 logging bytes or widths. Tests must not call any SME setter, enter streaming
 mode, run guest code, infer effective `SMCR_EL1.LEN`, or treat equal predicates
 as portable or safely restorable state.
+SME ZA-register signed tests must runtime-resolve the macOS 15.2 getter and may
+read the matrix only when an owner-thread `PSTATE.ZA` preflight reports storage
+enabled; streaming mode is not a prerequisite. They may accept the documented
+missing-symbol or exact `HV_UNSUPPORTED` boundaries, the topical inactive-ZA
+result, or compare two complete same-vCPU captures. Successful captures must
+preserve the separately queried maximum SVL, use its exact checked square as
+the raw byte length, and verify redacted `Debug` output without formatting or
+logging bytes or dimensions. Tests must not call an SME setter, enable ZA or
+streaming mode, run guest code, infer row/tile or effective-SVL semantics, or
+treat equal matrices as portable or safely restorable state.
 SME system-register signed tests require macOS 15.2 and must capture `SMCR_EL1`,
 `SMPRI_EL1`, and `TPIDR2_EL0` twice from one idle real vCPU. They may compare
 same-vCPU results only with fixed failure messages and must verify that `Debug`
