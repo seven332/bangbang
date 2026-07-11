@@ -59,11 +59,14 @@ mutable values with derived RPR validation.
 A separate no-handle query exposes the maximum SME streaming vector length used
 for the Z-, P-, and ZA-register allocations. These are internal snapshot
 feasibility primitives only. bangbang now has a bounded native-v1 outer state
-envelope and read-only version inspection, but public snapshot create/load and
-complete restore, a concrete state payload schema, remaining vCPU state, EL2 GIC
-CPU-interface state, effective-SVL interpretation, SME/SME2 feature and
-destination policy, remaining setters and transition ordering, cache-topology
-manifests, and complete emulated device state remain unsupported.
+envelope, read-only version inspection, and internal handle-level guest-memory
+image/binding primitives that stream full GPA ranges into or out of anonymous
+memory. No process or API path emits those artifacts. Public snapshot
+create/load, no-clobber publication, complete restore, a composite VM-state
+payload schema, remaining vCPU state, EL2 GIC CPU-interface state,
+effective-SVL interpretation, SME/SME2 feature and destination policy,
+remaining setters and transition ordering, cache-topology manifests, and
+complete emulated device state remain unsupported.
 
 ## Process CLI
 
