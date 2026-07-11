@@ -255,6 +255,29 @@ impl HvfArm64VcpuExecutionControlRegisterState {
     }
 }
 
+/// Detached raw EL1 cache-size selection state captured from one arm64 vCPU.
+///
+/// `CSSELR_EL1` selects the cache level and type observed by a subsequent
+/// `CCSIDR_EL1` read; it is not cache topology itself. Reset and unsupported
+/// selector encodings can be architecturally unknown. This getter-only value
+/// does not validate the selector, capture cache feature/size metadata, issue
+/// synchronization or maintenance, or provide a portable restore policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuCacheSelectionRegisterState {
+    csselr_el1: u64,
+}
+
+impl HvfArm64VcpuCacheSelectionRegisterState {
+    pub(crate) const fn new(csselr_el1: u64) -> Self {
+        Self { csselr_el1 }
+    }
+
+    /// Return the raw `CSSELR_EL1` value.
+    pub const fn csselr_el1(self) -> u64 {
+        self.csselr_el1
+    }
+}
+
 /// Detached raw EL1 debug-control state captured from one arm64 vCPU.
 ///
 /// `MDCCINT_EL1` and `MDSCR_EL1` control security-sensitive self-hosted debug
@@ -798,6 +821,7 @@ impl HvfSystemRegister {
     pub const CONTEXTIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CONTEXTIDR_EL1);
     pub const TPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL1);
     pub const CNTKCTL_EL1: Self = Self(crate::ffi::HV_SYS_REG_CNTKCTL_EL1);
+    pub const CSSELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_CSSELR_EL1);
     pub const TPIDR_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDR_EL0);
     pub const TPIDRRO_EL0: Self = Self(crate::ffi::HV_SYS_REG_TPIDRRO_EL0);
     pub const CNTP_CTL_EL0: Self = Self(crate::ffi::HV_SYS_REG_CNTP_CTL_EL0);
@@ -1243,6 +1267,14 @@ pub(crate) fn capture_arm64_vcpu_execution_control_register_state_with(
     ))
 }
 
+pub(crate) fn capture_arm64_vcpu_cache_selection_register_state_with(
+    mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
+) -> Result<HvfArm64VcpuCacheSelectionRegisterState, BackendError> {
+    let csselr_el1 = get_system_register(HvfSystemRegister::CSSELR_EL1)?;
+
+    Ok(HvfArm64VcpuCacheSelectionRegisterState::new(csselr_el1))
+}
+
 pub(crate) fn capture_arm64_vcpu_debug_control_register_state_with(
     mut get_system_register: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
 ) -> Result<HvfArm64VcpuDebugControlRegisterState, BackendError> {
@@ -1407,7 +1439,8 @@ mod tests {
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfInterruptType,
         HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
-        NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_core_system_register_state_with,
+        NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_cache_selection_register_state_with,
+        capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_debug_control_register_state_with,
         capture_arm64_vcpu_exception_register_state_with,
         capture_arm64_vcpu_execution_control_register_state_with,
@@ -1894,6 +1927,24 @@ mod tests {
     }
 
     #[test]
+    fn captures_arm64_cache_selection_register_state() {
+        let mut reads = Vec::new();
+
+        let state = capture_arm64_vcpu_cache_selection_register_state_with(|register| {
+            reads.push(register);
+            Ok(0xca5e_0000_0000_0000 | u64::from(register.raw()))
+        })
+        .expect("cache-selection capture should succeed");
+
+        assert_eq!(reads, [HvfSystemRegister::CSSELR_EL1]);
+        assert_eq!(
+            state.csselr_el1(),
+            0xca5e_0000_0000_0000 | u64::from(crate::ffi::HV_SYS_REG_CSSELR_EL1)
+        );
+        assert_eq!(HvfSystemRegister::CSSELR_EL1.raw(), 0xd000);
+    }
+
+    #[test]
     fn captures_arm64_debug_control_register_state_in_documented_order() {
         let mut reads = Vec::new();
 
@@ -2264,6 +2315,39 @@ mod tests {
             );
             assert_eq!(*reads.borrow(), registers);
         }
+    }
+
+    #[test]
+    fn arm64_cache_selection_register_capture_failure_can_retry() {
+        let fail_next = Cell::new(true);
+        let reads = RefCell::new(Vec::new());
+        let read_system_register = |register: HvfSystemRegister| {
+            reads.borrow_mut().push(register);
+            if fail_next.replace(false) {
+                Err(BackendError::InvalidState(
+                    "fake cache-selection register read failed",
+                ))
+            } else {
+                Ok(u64::from(register.raw()))
+            }
+        };
+
+        assert_eq!(
+            capture_arm64_vcpu_cache_selection_register_state_with(&read_system_register),
+            Err(BackendError::InvalidState(
+                "fake cache-selection register read failed"
+            ))
+        );
+        assert_eq!(*reads.borrow(), [HvfSystemRegister::CSSELR_EL1]);
+
+        reads.borrow_mut().clear();
+        let state = capture_arm64_vcpu_cache_selection_register_state_with(&read_system_register)
+            .expect("cache-selection capture retry should succeed");
+        assert_eq!(
+            state.csselr_el1(),
+            u64::from(HvfSystemRegister::CSSELR_EL1.raw())
+        );
+        assert_eq!(*reads.borrow(), [HvfSystemRegister::CSSELR_EL1]);
     }
 
     #[test]

@@ -71,13 +71,14 @@ use crate::runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 use crate::vcpu::{
-    HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState,
-    HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuExceptionRegisterState,
-    HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
-    HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
-    HvfArm64VcpuSimdFpState, HvfArm64VcpuThreadContextRegisterState,
-    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState,
+    HvfArm64BootRegisters, HvfArm64VcpuCacheSelectionRegisterState,
+    HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuDebugControlRegisterState,
+    HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
+    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
+    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
+    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+    HvfArm64VcpuVirtualTimerState,
 };
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -1212,6 +1213,17 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_execution_control_register_state()
     }
 
+    /// Capture raw EL1 CSSELR cache-size selection state on the primary owner
+    /// thread.
+    ///
+    /// This getter-only value is not cache topology and omits feature metadata,
+    /// selector validation, synchronization, maintenance, and restore policy.
+    pub fn capture_arm64_cache_selection_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuCacheSelectionRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_cache_selection_register_state()
+    }
+
     /// Capture raw EL1 MDCCINT and MDSCR debug controls on the primary owner
     /// thread.
     ///
@@ -1914,6 +1926,17 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64VcpuExecutionControlRegisterState, HvfVcpuRunnerError> {
         self.runner.capture_arm64_execution_control_register_state()
+    }
+
+    /// Capture raw EL1 CSSELR cache-size selection state on the primary owner
+    /// thread.
+    ///
+    /// This getter-only value is not cache topology and omits feature metadata,
+    /// selector validation, synchronization, maintenance, and restore policy.
+    pub fn capture_arm64_cache_selection_register_state(
+        &self,
+    ) -> Result<HvfArm64VcpuCacheSelectionRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_cache_selection_register_state()
     }
 
     /// Capture raw EL1 MDCCINT and MDSCR debug controls on the primary owner

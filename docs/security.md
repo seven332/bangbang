@@ -239,11 +239,11 @@ is resource-specific:
   documented in [Snapshot Feasibility](snapshot-feasibility.md).
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
-  ACTLR_EL1/CPACR_EL1 execution controls, raw MDCCINT_EL1/MDSCR_EL1 debug
-  controls, raw pointer-authentication keys, raw TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1
-  values, raw Q0-Q31/FPCR/FPSR values, raw physical-timer
-  CNTKCTL/control/CVAL values, raw virtual-timer mask/offset/control/CVAL values,
-  raw EL1
+  ACTLR_EL1/CPACR_EL1 execution controls, raw CSSELR_EL1 cache selection, raw
+  MDCCINT_EL1/MDSCR_EL1 debug controls, raw pointer-authentication keys, raw
+  TPIDR_EL0/TPIDRRO_EL0/TPIDR_EL1 values, raw Q0-Q31/FPCR/FPSR values, raw
+  physical-timer CNTKCTL/control/CVAL values, raw virtual-timer
+  mask/offset/control/CVAL values, raw EL1
   SCTLR/TTBR0/TTBR1/TCR/MAIR/AMAIR/CONTEXTIDR values, CPU IRQ/FIQ pending
   levels, opaque GIC device-state bytes, and raw EL1 GIC ICC CPU-interface
   values are sensitive guest/VMM execution state.
@@ -254,6 +254,11 @@ is resource-specific:
   FAR and PAR can expose guest fault or translation-result addresses, VBAR can
   expose a guest kernel vector address, and syndrome/fault fields can reveal
   guest execution details.
+  CSSELR records the guest's current cache-size query selector but does not
+  contain cache topology. Capture does not change it or query CCSIDR. A future
+  restore must treat selector bits as untrusted, validate them against a
+  destination CTR/CLIDR/DCZID/CCSIDR manifest, and define synchronization and
+  cache-maintenance policy before dependent cache-size queries.
   MDCCINT and MDSCR can reveal security-sensitive guest debugging controls and
   status. The two-field getter does not enable debug behavior, but it is not a
   safe restore model: raw writes could activate monitor debug, software

@@ -72,6 +72,7 @@ pub(crate) const HV_SYS_REG_VBAR_EL1: HvSysReg = 0xc600;
 pub(crate) const HV_SYS_REG_CONTEXTIDR_EL1: HvSysReg = 0xc681;
 pub(crate) const HV_SYS_REG_TPIDR_EL1: HvSysReg = 0xc684;
 pub(crate) const HV_SYS_REG_CNTKCTL_EL1: HvSysReg = 0xc708;
+pub(crate) const HV_SYS_REG_CSSELR_EL1: HvSysReg = 0xd000;
 pub(crate) const HV_SYS_REG_TPIDR_EL0: HvSysReg = 0xde82;
 pub(crate) const HV_SYS_REG_TPIDRRO_EL0: HvSysReg = 0xde83;
 pub(crate) const HV_SYS_REG_CNTP_CTL_EL0: HvSysReg = 0xdf11;

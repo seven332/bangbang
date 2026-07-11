@@ -44,12 +44,13 @@ pub use startup::{
     HvfArm64BootVsockNotificationDispatches, OwnedHvfArm64BootSession,
 };
 pub use vcpu::{
-    ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState,
-    HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuExceptionRegisterState,
-    HvfArm64VcpuExecutionControlRegisterState, HvfArm64VcpuGeneralRegisterState,
-    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuPendingInterruptState,
-    HvfArm64VcpuPhysicalTimerState, HvfArm64VcpuPointerAuthenticationKeyState,
-    HvfArm64VcpuSimdFpState, HvfArm64VcpuThreadContextRegisterState,
-    HvfArm64VcpuTranslationRegisterState, HvfArm64VcpuVirtualTimerState, HvfInterruptType,
-    HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu,
+    ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfArm64VcpuCacheSelectionRegisterState,
+    HvfArm64VcpuCoreSystemRegisterState, HvfArm64VcpuDebugControlRegisterState,
+    HvfArm64VcpuExceptionRegisterState, HvfArm64VcpuExecutionControlRegisterState,
+    HvfArm64VcpuGeneralRegisterState, HvfArm64VcpuIdentificationRegisterState,
+    HvfArm64VcpuPendingInterruptState, HvfArm64VcpuPhysicalTimerState,
+    HvfArm64VcpuPointerAuthenticationKeyState, HvfArm64VcpuSimdFpState,
+    HvfArm64VcpuThreadContextRegisterState, HvfArm64VcpuTranslationRegisterState,
+    HvfArm64VcpuVirtualTimerState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
+    HvfSystemRegister, HvfVcpu,
 };
