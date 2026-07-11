@@ -991,12 +991,12 @@ fn captures_arm64_sme_pstate_on_runner_thread() {
                 second.streaming_sve_mode_enabled(),
                 second.za_storage_enabled(),
             );
-            assert_eq!(
-                first_values, second_values,
+            assert!(
+                first_values == second_values,
                 "SME PSTATE should remain stable on one idle vCPU"
             );
-            assert_eq!(
-                first, second,
+            assert!(
+                first == second,
                 "SME PSTATE value should remain stable on one idle vCPU"
             );
         }
