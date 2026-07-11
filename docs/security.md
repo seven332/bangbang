@@ -292,6 +292,13 @@ is resource-specific:
   and must not be mistaken for physical-host identity or a trusted destination
   compatibility decision. The optional IDs do not contain or protect streaming
   SVE/SME execution state.
+  The separately captured SME `PSTATE.SM` and `PSTATE.ZA` flags are mutable
+  guest execution-mode state. They reveal whether streaming mode and ZA storage
+  are active, but contain none of the Z/P/ZA/ZT0 data. The getter is resolved at
+  runtime for the macOS 15.2 boundary, never calls the setter, and preserves
+  raw `HV_UNSUPPORTED` on SME-incapable hardware. The flags must not be logged,
+  persisted, trusted, or restored without feature validation and ordering with
+  Q/Z/P/FPSR and conditional ZA/ZT0 contents.
   Current internal capture commands keep these values in process memory and do
   not write them to logs, metrics, error strings, or persistence. The raw
   virtual-timer offset is tied to HVF's host-time relation, the physical-timer
