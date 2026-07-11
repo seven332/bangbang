@@ -158,6 +158,14 @@ values only through fixed failure messages and must not format or log raw
 registers. Tests must not create or run a vCPU, read or write `CSSELR_EL1`,
 query instruction/data CCSIDR values, perform cache maintenance, or treat the
 triple as a complete cache topology or destination-compatibility policy.
+Default vCPU cache-geometry signed tests must query all eight data/unified and
+all eight instruction CCSIDR values twice before creating a backend or VM. They
+may compare same-host arrays only through fixed failure messages and must not
+format or log raw values. Tests must not create or run a vCPU, read or write
+`CSSELR_EL1`, use the live system-register CCSIDR path, issue ISB, perform cache
+maintenance, assume which array entries describe implemented levels, combine
+the result atomically with the feature triple, or infer topology or destination
+compatibility.
 Cache-selection signed tests must capture CSSELR_EL1 from an idle real vCPU
 without hard-coding or validating its architecturally unknown reset value. They
 must not write the selector, query CCSIDR, execute ISB or cache maintenance, run

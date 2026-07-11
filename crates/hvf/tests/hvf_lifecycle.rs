@@ -354,6 +354,30 @@ fn queries_arm64_default_vcpu_cache_configuration_before_vm_creation() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn queries_arm64_default_vcpu_cache_geometry_before_vm_creation() {
+    use bangbang_hvf::HvfBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let first = HvfBackend::arm64_vcpu_cache_geometry()
+        .expect("first default vCPU cache geometry query should succeed");
+    let second = HvfBackend::arm64_vcpu_cache_geometry()
+        .expect("second default vCPU cache geometry query should succeed");
+
+    assert!(
+        first.data_or_unified_ccsidr_el1() == second.data_or_unified_ccsidr_el1()
+            && first.instruction_ccsidr_el1() == second.instruction_ccsidr_el1(),
+        "default vCPU CCSIDR accessors should remain stable on one host"
+    );
+    assert!(
+        first == second,
+        "default vCPU cache geometry should remain stable on one host"
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn creates_and_destroys_hvf_vcpu() {
     use bangbang_hvf::{HvfBackend, HvfRegister, HvfSystemRegister};
     use bangbang_runtime::BackendError;

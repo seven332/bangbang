@@ -263,11 +263,13 @@ is resource-specific:
   restore must treat selector bits as untrusted, validate them against a
   destination cache manifest, and define synchronization and cache-maintenance
   policy before dependent cache-size queries. The separately queried default
-  vCPU configuration's raw CTR_EL0, CLIDR_EL1, and DCZID_EL0 values are
-  read-only feature metadata, not guest execution state, but can fingerprint
-  the exposed virtual CPU model. They must not be logged or persisted without
-  a defined need and are not trusted topology or destination policy without the
-  corresponding instruction/data CCSIDR values, interpretation, and masks.
+  vCPU configuration's raw CTR_EL0, CLIDR_EL1, and DCZID_EL0 values and its
+  independent eight-entry data/unified and instruction CCSIDR arrays are
+  read-only metadata, not guest execution state, but can fingerprint the
+  exposed virtual CPU model. They must not be logged or persisted without a
+  defined need. The independent queries are not one atomic manifest, and even
+  together they are not trusted topology or destination policy without cache-
+  level interpretation, masks, and validation.
   Breakpoint value registers can expose guest virtual addresses, Context IDs,
   or VMIDs. Watchpoint value registers expose guest data virtual addresses, and
   their controls can encode access type, byte selection, linking, and enabled
