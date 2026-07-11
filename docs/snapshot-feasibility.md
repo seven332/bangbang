@@ -6,8 +6,10 @@ roadmap, not a statement that snapshot create or restore is supported today.
 
 ## Current Status
 
-bangbang recognizes Firecracker-shaped snapshot requests and inspection
-commands, but does not create, load, read, write, or inspect snapshot files.
+bangbang recognizes Firecracker-shaped snapshot requests and now implements a
+bangbang-native outer state envelope plus read-only version inspection. It does
+not create, load, or write VM snapshot artifacts and has no concrete VM-state
+payload schema yet.
 
 - `PUT /snapshot/create` and `PUT /snapshot/load` parse and normalize complete
   request bodies into debug-redacted API and runtime values before reaching VMM
@@ -33,9 +35,46 @@ commands, but does not create, load, read, write, or inspect snapshot files.
   while a live configuration view catches stored state including MMDS presence
   left by a failed patch. Both paths still return the same unsupported fault and
   construct no VM.
-- `--snapshot-version` and `--describe-snapshot <PATH>` are recognized as
-  first-class CLI commands, but fail before API socket publication or HVF
-  startup because bangbang has no supported snapshot data format.
+- `--snapshot-version` prints `v1.0.0`. `--describe-snapshot <PATH>` opens a
+  bounded regular file with the same nonblocking, path-redacted startup-file
+  policy, fully validates the native envelope and CRC, and prints its embedded
+  version. Both commands exit before fd-table setup, API socket publication,
+  signal setup, or HVF startup.
+
+## Native V1 State Envelope
+
+The implemented outer envelope is bangbang-owned and deliberately does not
+claim Firecracker bitcode or on-disk compatibility. All numeric fields are
+little-endian. The fixed header is 32 bytes, followed by one opaque payload and
+an 8-byte integrity trailer:
+
+| Offset | Width | Field | Native-v1 rule |
+| ---: | ---: | --- | --- |
+| 0 | 8 | magic | ASCII `BANGSNAP` |
+| 8 | 2 | version major | `1` |
+| 10 | 2 | version minor | `0` |
+| 12 | 2 | version patch | `0` |
+| 14 | 2 | architecture | `1` means arm64 |
+| 16 | 4 | guest page size | `4096` bytes |
+| 20 | 4 | reserved flags | must be zero |
+| 24 | 8 | payload length | exact opaque byte count |
+| 32 | variable | payload | at most 16 MiB |
+| final 8 | 8 | CRC64 | CRC-64/Jones over header and payload |
+
+The current decoder accepts only exact version `1.0.0`, arm64, a 4096-byte
+guest-memory granule, zero reserved flags, and an exact total file length. It
+checks conversion and length arithmetic, the 16 MiB payload policy, truncation
+or trailing bytes, and CRC before publishing metadata or a borrowed payload.
+Unknown versions and incompatible architecture/page-size values fail through
+distinct typed errors. Diagnostics expose only stable metadata and byte counts;
+payload bytes and host paths remain redacted.
+
+CRC-64/Jones detects accidental corruption. It does not authenticate a
+snapshot: an actor able to rewrite the state file can also recompute the CRC,
+so every future payload decoder must remain safe for attacker-controlled input.
+The payload is intentionally opaque in this slice. GPA ranges, memory-file
+identity and offsets, HVF/device/composite schemas, and state publication belong
+to later delivery slices.
 
 ## Current Ownership and Pause Boundary
 
@@ -656,9 +695,10 @@ snapshot state unless a later design proves otherwise.
 | API transaction and detached captured-state bundle | Coordinated by the process owner only after snapshot readiness is acknowledged. It may own an immutable captured bundle, but never the live boot session or runner-owned HVF handles. |
 | vmnet, vsock, disks, and other host resources | Represented by explicit configuration or restore metadata according to later resource policy, not by serializing live host handles. |
 
-Exact register inventories, GIC and device schemas, guest-memory file layout,
-snapshot format, dirty tracking, and the duration of the lease during file I/O
-remain separate design decisions.
+Exact register inventories, GIC and device payload schemas, guest-memory file
+layout/publication, dirty tracking, and the duration of the lease during file
+I/O remain separate design decisions. The fixed native outer envelope is
+implemented independently of them.
 
 ### Failure and terminal precedence
 
@@ -840,11 +880,12 @@ API behavior until all of its prerequisites exist.
 | External resource policy | Define disk, vmnet, and vsock metadata, buffering boundary, disconnect/reconnect behavior, and restore overrides. | Resource-policy unit/process tests and focused signed network/vsock coverage. |
 | Snapshot create orchestration | Hold the lease across the agreed capture boundary, assemble the versioned state, publish files transactionally, and release to ordinary pause. | API and process e2e tests plus signed HVF create/resume coverage. |
 
-Snapshot load/restore, file-format compatibility, dirty tracking, minimum macOS
-GIC support, and data-format inspection remain their own issue-sized areas. A
-restore-path e2e should land only after a minimal versioned create/load pair
-exists.
+Snapshot load/restore, concrete payload-schema compatibility, dirty tracking,
+minimum macOS GIC support, and artifact publication remain their own issue-sized
+areas. A restore-path e2e should land only after a minimal versioned create/load
+pair exists.
 
 Until those areas land, bangbang should continue reporting snapshot create,
-snapshot load, snapshot version, and snapshot inspection as recognized
-unsupported behavior.
+snapshot load, and all persistence/restore behavior as recognized unsupported.
+Native envelope version reporting and read-only inspection are the implemented
+exception; neither command creates or restores a VM.

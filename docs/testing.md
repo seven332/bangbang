@@ -414,6 +414,14 @@ the `bangbang` process boundary:
 cargo test -p bangbang --test process_e2e --all-features --locked
 ```
 
+The process suite covers native snapshot inspection without starting HVF. It
+checks exact `v1.0.0` output for `--snapshot-version` and a valid
+`--describe-snapshot`, plus missing, non-regular, oversized, malformed,
+truncated, trailing/inconsistent-length, corrupt, unsupported-version,
+incompatible-architecture, and incompatible-page-size files. Fixtures use
+unique temporary paths; failures must use the bad-configuration exit code,
+publish no API socket, and expose neither path nor payload sentinels.
+
 Run the same process-level e2e test against a signed `bangbang` executable:
 
 ```sh

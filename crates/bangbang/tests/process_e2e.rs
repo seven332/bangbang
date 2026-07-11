@@ -20,6 +20,11 @@ use support::{
 
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
+use bangbang_runtime::snapshot_format::{
+    NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES, NATIVE_V1_SNAPSHOT_VERSION, SNAPSHOT_ENVELOPE_HEADER_BYTES,
+    SNAPSHOT_ENVELOPE_INTEGRITY_BYTES, encode_snapshot_envelope,
+};
+use crc64::crc64;
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BAD_SYSCALL_EXIT_CODE: i32 = 148;
@@ -698,47 +703,146 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
 }
 
 #[test]
-fn executable_rejects_snapshot_inspection_commands_before_socket_publication() {
-    for (name, args, private_value) in [
-        ("snapshot-version", &["--snapshot-version"][..], None),
+fn executable_reports_native_snapshot_versions_before_socket_publication() {
+    let test_dir = TestDir::new();
+    let expected = format!("v{NATIVE_V1_SNAPSHOT_VERSION}\n");
+
+    let version_socket = test_dir.path().join("snapshot-version.socket");
+    let output = BangbangProcess::run_with_extra_args_expect_successful_exit(
+        &version_socket,
+        &test_dir.instance_id(),
+        &["--snapshot-version"],
+    );
+    assert_eq!(output.stdout, expected);
+    assert_eq!(output.stderr, "");
+    assert!(!version_socket.exists());
+
+    let snapshot_path = test_dir.path().join("valid.vmstate");
+    fs::write(
+        &snapshot_path,
+        encode_snapshot_envelope(b"opaque-state").expect("snapshot fixture should encode"),
+    )
+    .expect("snapshot fixture should be written");
+    let describe_socket = test_dir.path().join("describe-snapshot.socket");
+    let output = BangbangProcess::run_with_extra_args_expect_successful_exit(
+        &describe_socket,
+        &test_dir.instance_id(),
+        &["--describe-snapshot", path_text(&snapshot_path)],
+    );
+    assert_eq!(output.stdout, expected);
+    assert_eq!(output.stderr, "");
+    assert!(!describe_socket.exists());
+}
+
+#[test]
+fn executable_rejects_unreadable_non_regular_and_oversized_snapshot_files() {
+    let test_dir = TestDir::new();
+
+    assert_snapshot_describe_failure(
+        &test_dir,
+        "missing",
+        &test_dir.path().join("private-missing.vmstate"),
+        "failed to read snapshot state file: NotFound",
+    );
+
+    let directory_path = test_dir.path().join("private-directory.vmstate");
+    fs::create_dir(&directory_path).expect("snapshot fixture directory should be created");
+    assert_snapshot_describe_failure(
+        &test_dir,
+        "directory",
+        &directory_path,
+        "snapshot state file must be a regular file",
+    );
+
+    let oversized_path = test_dir.path().join("private-oversized.vmstate");
+    let oversized_file =
+        fs::File::create(&oversized_path).expect("oversized snapshot fixture should be created");
+    oversized_file
+        .set_len(
+            u64::try_from(NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES)
+                .expect("snapshot file limit should fit u64")
+                + 1,
+        )
+        .expect("oversized snapshot fixture should be sized");
+    assert_snapshot_describe_failure(
+        &test_dir,
+        "oversized",
+        &oversized_path,
+        "snapshot state file exceeds",
+    );
+}
+
+#[test]
+fn executable_rejects_malformed_corrupt_and_incompatible_snapshot_files() {
+    let test_dir = TestDir::new();
+    let valid =
+        encode_snapshot_envelope(b"private-guest-state").expect("snapshot fixture should encode");
+
+    let mut invalid_magic = valid.clone();
+    invalid_magic[0] ^= 0xff;
+
+    let truncated = valid[..valid.len() - 1].to_vec();
+
+    let mut trailing = valid.clone();
+    trailing.push(0);
+
+    let mut inconsistent = valid.clone();
+    inconsistent[24..32].copy_from_slice(&0_u64.to_le_bytes());
+
+    let mut corrupt = valid.clone();
+    corrupt[SNAPSHOT_ENVELOPE_HEADER_BYTES] ^= 0xff;
+
+    let mut overflow = valid.clone();
+    overflow[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+
+    let unsupported_version = snapshot_fixture_with_u16(10, 1);
+    let incompatible_architecture = snapshot_fixture_with_u16(14, 2);
+    let incompatible_page_size = snapshot_fixture_with_u32(16, 16_384);
+
+    for (name, bytes, expected) in [
         (
-            "describe-snapshot",
-            &["--describe-snapshot", "secret-snapshot.vmstate"][..],
-            Some("secret-snapshot.vmstate"),
+            "invalid-magic",
+            invalid_magic,
+            "snapshot envelope magic is invalid",
+        ),
+        ("truncated", truncated, "snapshot envelope is truncated"),
+        ("trailing", trailing, "snapshot envelope has trailing data"),
+        (
+            "inconsistent-length",
+            inconsistent,
+            "snapshot envelope has trailing data",
+        ),
+        (
+            "corrupt",
+            corrupt,
+            "snapshot envelope CRC-64/Jones integrity check failed",
+        ),
+        (
+            "overflow",
+            overflow,
+            "snapshot envelope payload length overflows",
+        ),
+        (
+            "unsupported-version",
+            unsupported_version,
+            "snapshot format version 1.1.0 is unsupported",
+        ),
+        (
+            "incompatible-architecture",
+            incompatible_architecture,
+            "snapshot architecture identifier 2 is incompatible",
+        ),
+        (
+            "incompatible-page-size",
+            incompatible_page_size,
+            "snapshot guest page size 16384 is incompatible",
         ),
     ] {
-        let test_dir = TestDir::new();
-        let socket_path = test_dir.path().join(format!("{name}.socket"));
-        let instance_id = test_dir.instance_id();
-
-        let output =
-            BangbangProcess::start_with_extra_args_expect_failure(&socket_path, &instance_id, args);
-
-        assert_bad_configuration_exit_code(&output, name);
-        assert!(
-            output
-                .stderr
-                .contains("bangbang: Snapshot and restore are not supported."),
-            "{name} should report snapshot unsupported; stderr:\n{}",
-            output.stderr
-        );
-        assert!(
-            !output.stdout.contains("status: API server listening"),
-            "{name} must not report API readiness; stdout:\n{}",
-            output.stdout
-        );
-        if let Some(private_value) = private_value {
-            assert!(
-                !output.stdout.contains(private_value) && !output.stderr.contains(private_value),
-                "{name} failure must not echo private argument value {private_value:?}; stdout:\n{}\nstderr:\n{}",
-                output.stdout,
-                output.stderr
-            );
-        }
-        assert!(
-            !socket_path.exists(),
-            "{name} must fail before publishing the API socket"
-        );
+        let snapshot_path = test_dir
+            .path()
+            .join(format!("private-{name}-snapshot.vmstate"));
+        fs::write(&snapshot_path, bytes).expect("snapshot fixture should be written");
+        assert_snapshot_describe_failure(&test_dir, name, &snapshot_path, expected);
     }
 }
 
@@ -4123,6 +4227,78 @@ fn assert_bad_configuration_exit_code(output: &support::CompletedProcess, case_n
         output.stdout,
         output.stderr
     );
+}
+
+fn assert_snapshot_describe_failure(
+    test_dir: &TestDir,
+    case_name: &str,
+    snapshot_path: &std::path::Path,
+    expected_error: &str,
+) {
+    let socket_path = test_dir.path().join(format!("{case_name}.socket"));
+    let snapshot_file_name = snapshot_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("snapshot fixture file name should be UTF-8");
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &test_dir.instance_id(),
+        &["--describe-snapshot", path_text(snapshot_path)],
+    );
+
+    assert_bad_configuration_exit_code(&output, case_name);
+    assert!(
+        output.stderr.contains(expected_error),
+        "{case_name} should report {expected_error:?}; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains(path_text(snapshot_path))
+            && !output.stderr.contains(path_text(snapshot_path))
+            && !output.stdout.contains(snapshot_file_name)
+            && !output.stderr.contains(snapshot_file_name),
+        "{case_name} must redact the snapshot path; stdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("private-guest-state")
+            && !output.stderr.contains("private-guest-state"),
+        "{case_name} must redact snapshot payload bytes; stdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening")
+            && !output.stdout.contains("status: VM running without API"),
+        "{case_name} must exit before startup readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !socket_path.exists(),
+        "{case_name} must not publish the API socket"
+    );
+}
+
+fn snapshot_fixture_with_u16(offset: usize, value: u16) -> Vec<u8> {
+    let mut encoded =
+        encode_snapshot_envelope(b"private-guest-state").expect("snapshot fixture should encode");
+    replace_snapshot_field_and_checksum(&mut encoded, offset, &value.to_le_bytes());
+    encoded
+}
+
+fn snapshot_fixture_with_u32(offset: usize, value: u32) -> Vec<u8> {
+    let mut encoded =
+        encode_snapshot_envelope(b"private-guest-state").expect("snapshot fixture should encode");
+    replace_snapshot_field_and_checksum(&mut encoded, offset, &value.to_le_bytes());
+    encoded
+}
+
+fn replace_snapshot_field_and_checksum(encoded: &mut [u8], offset: usize, value: &[u8]) {
+    encoded[offset..offset + value.len()].copy_from_slice(value);
+    let checksum_offset = encoded.len() - SNAPSHOT_ENVELOPE_INTEGRITY_BYTES;
+    let checksum = crc64(0, &encoded[..checksum_offset]);
+    encoded[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
 }
 
 fn assert_instance_info_matches(

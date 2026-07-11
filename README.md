@@ -57,11 +57,13 @@ opaque GIC device state plus runner-owned pre-first-run reapply, and raw EL1
 GIC ICC CPU-interface registers plus ordered pre-first-run restore of their nine
 mutable values with derived RPR validation.
 A separate no-handle query exposes the maximum SME streaming vector length used
-for the Z-, P-, and ZA-register allocations. These are internal snapshot feasibility
-primitives only: public snapshot create/load and complete restore, a persistent schema,
-remaining vCPU state, EL2 GIC CPU-interface state, effective-SVL interpretation,
-SME/SME2 feature and destination policy, remaining setters and transition ordering,
-cache-topology manifests, and complete emulated device state remain unsupported.
+for the Z-, P-, and ZA-register allocations. These are internal snapshot
+feasibility primitives only. bangbang now has a bounded native-v1 outer state
+envelope and read-only version inspection, but public snapshot create/load and
+complete restore, a concrete state payload schema, remaining vCPU state, EL2 GIC
+CPU-interface state, effective-SVL interpretation, SME/SME2 feature and
+destination policy, remaining setters and transition ordering, cache-topology
+manifests, and complete emulated device state remain unsupported.
 
 ## Process CLI
 
@@ -104,6 +106,11 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
   `bangbang_runtime::vmm_action`, and `bangbang_runtime::boot_timer`.
 - `--no-api` requires `--config-file <PATH>`, starts from that configuration
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
+- `--snapshot-version` prints the supported bangbang-native snapshot envelope
+  version (`v1.0.0`) and exits before startup.
+- `--describe-snapshot <PATH>` reads a bounded regular native state file,
+  validates its complete envelope and CRC, prints its embedded version, and
+  exits before startup. It does not accept Firecracker state files.
 - `--help`, `-h`, `--version`, and `-V` are supported.
 
 The API socket is an unauthenticated local control interface. bangbang restricts

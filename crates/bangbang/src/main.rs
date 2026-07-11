@@ -36,6 +36,10 @@ use vmm::{ProcessSessionExitDecision, ProcessVmm, VmmRequestHandler};
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics, SharedSignalMetrics};
 use bangbang_runtime::mmds::MmdsContentInput;
+use bangbang_runtime::snapshot_format::{
+    NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES, NATIVE_V1_SNAPSHOT_VERSION, SnapshotEnvelopeMetadata,
+    SnapshotFormatError, inspect_snapshot_envelope,
+};
 use bangbang_runtime::{VmmAction, VmmActionError};
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
@@ -71,8 +75,14 @@ fn run() -> Result<(), ProcessError> {
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        Command::SnapshotVersion | Command::DescribeSnapshot => {
-            return Err(snapshot_unsupported_error());
+        Command::SnapshotVersion => {
+            println!("v{NATIVE_V1_SNAPSHOT_VERSION}");
+            return Ok(());
+        }
+        Command::DescribeSnapshot(path) => {
+            let metadata = describe_snapshot(path.as_str())?;
+            println!("v{}", metadata.version());
+            return Ok(());
         }
         Command::Run(config) => {
             let config = *config;
@@ -668,10 +678,33 @@ fn metadata_content_input(metadata_file: &str) -> Result<MmdsContentInput, Metad
     Ok(MmdsContentInput::new(value))
 }
 
+fn describe_snapshot(path: &str) -> Result<SnapshotEnvelopeMetadata, ProcessError> {
+    let contents = read_limited_regular_file(path, NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES)
+        .map_err(|err| match err {
+            StartupFileReadError::Read(kind) => SnapshotInspectionError::Read(kind),
+            StartupFileReadError::NotRegular => SnapshotInspectionError::NotRegular,
+            StartupFileReadError::TooLarge => SnapshotInspectionError::TooLarge,
+        })
+        .map_err(ProcessError::SnapshotInspection)?;
+
+    inspect_snapshot_envelope(&contents)
+        .map_err(SnapshotInspectionError::Format)
+        .map_err(ProcessError::SnapshotInspection)
+}
+
 fn read_limited_regular_utf8_file(
     path: &str,
     max_bytes: usize,
 ) -> Result<String, StartupFileReadError> {
+    let contents = read_limited_regular_file(path, max_bytes)?;
+    String::from_utf8(contents)
+        .map_err(|_| StartupFileReadError::Read(std::io::ErrorKind::InvalidData))
+}
+
+fn read_limited_regular_file(
+    path: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, StartupFileReadError> {
     let max_bytes_u64 = max_bytes as u64;
 
     // Keep special files such as FIFOs from hanging startup before file-type validation.
@@ -699,8 +732,7 @@ fn read_limited_regular_utf8_file(
         return Err(StartupFileReadError::TooLarge);
     }
 
-    String::from_utf8(contents)
-        .map_err(|_| StartupFileReadError::Read(std::io::ErrorKind::InvalidData))
+    Ok(contents)
 }
 
 fn parse_process_args<I>(args: I) -> Result<Args, ProcessError>
@@ -849,6 +881,7 @@ enum ProcessError {
     ProcessExitNotification(std::io::ErrorKind),
     ProcessSessionTerminal,
     SignalHandler(std::io::ErrorKind),
+    SnapshotInspection(SnapshotInspectionError),
     StartupConfiguration(VmmActionError),
     StartupTime(StartupTimeClockError),
 }
@@ -867,6 +900,7 @@ impl ProcessError {
             Self::ProcessExitNotification(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessSessionTerminal => ProcessExitCode::ProcessFailure,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
+            Self::SnapshotInspection(_) => ProcessExitCode::BadConfiguration,
             Self::StartupConfiguration(_) => ProcessExitCode::BadConfiguration,
             Self::StartupTime(_) => ProcessExitCode::ProcessFailure,
         }
@@ -902,6 +936,7 @@ impl fmt::Display for ProcessError {
             Self::SignalHandler(kind) => {
                 write!(f, "shutdown signal handling failed: {kind:?}")
             }
+            Self::SnapshotInspection(err) => write!(f, "snapshot inspection error: {err}"),
             Self::StartupConfiguration(err) => {
                 write!(f, "startup configuration error: {err}")
             }
@@ -927,6 +962,30 @@ enum StartupFileReadError {
     NotRegular,
     TooLarge,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotInspectionError {
+    Read(std::io::ErrorKind),
+    NotRegular,
+    TooLarge,
+    Format(SnapshotFormatError),
+}
+
+impl fmt::Display for SnapshotInspectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(kind) => write!(f, "failed to read snapshot state file: {kind:?}"),
+            Self::NotRegular => f.write_str("snapshot state file must be a regular file"),
+            Self::TooLarge => write!(
+                f,
+                "snapshot state file exceeds {NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES} byte size limit"
+            ),
+            Self::Format(err) => write!(f, "invalid snapshot state file: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotInspectionError {}
 
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigFileError {
@@ -1251,10 +1310,29 @@ struct Args {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
-    DescribeSnapshot,
+    DescribeSnapshot(SnapshotInspectionPath),
     SnapshotVersion,
     Version,
     Run(Box<StartupConfig>),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SnapshotInspectionPath(String);
+
+impl SnapshotInspectionPath {
+    fn new(path: String) -> Self {
+        Self(path)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SnapshotInspectionPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1474,7 +1552,7 @@ impl Args {
         let mut parent_cpu_time_us_seen = false;
         let mut show_level_seen = false;
         let mut show_log_origin_seen = false;
-        let mut describe_snapshot_seen = false;
+        let mut describe_snapshot_path = None;
         let mut snapshot_version_seen = false;
         let mut start_time_cpu_us_seen = false;
         let mut start_time_us_seen = false;
@@ -1650,14 +1728,14 @@ impl Args {
                     index += 1;
                 }
                 value_arg if is_value_arg(value_arg, "--describe-snapshot") => {
-                    if describe_snapshot_seen {
+                    if describe_snapshot_path.is_some() {
                         return Err(ArgsError::argument_parsing(
                             "duplicate argument: --describe-snapshot",
                         ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--describe-snapshot")?;
                     validate_describe_snapshot_path(&value)?;
-                    describe_snapshot_seen = true;
+                    describe_snapshot_path = Some(SnapshotInspectionPath::new(value));
                     index += consumed;
                 }
                 "--snapshot-version" => {
@@ -1730,9 +1808,9 @@ impl Args {
             });
         }
 
-        if describe_snapshot_seen {
+        if let Some(path) = describe_snapshot_path {
             return Ok(Self {
-                command: Command::DescribeSnapshot,
+                command: Command::DescribeSnapshot(path),
             });
         }
 
@@ -1817,9 +1895,9 @@ fn help_text() -> String {
             "      --show-level       Include level in minimal logger action lines\n",
             "      --show-log-origin  Include callsite origin in minimal logger action lines\n",
             "      --snapshot-version\n",
-            "                         Recognized, but snapshot data formats are unsupported\n",
+            "                         Print the native snapshot data-format version\n",
             "      --describe-snapshot <PATH>\n",
-            "                         Recognized, but snapshot files are unsupported\n",
+            "                         Validate a native snapshot envelope and print its format version\n",
             "      --start-time-us <MICROS>\n",
             "                         Process start wall-clock time for future metrics\n",
             "      --start-time-cpu-us <MICROS>\n",
@@ -1999,10 +2077,6 @@ fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
     .find_map(|(prefix, name)| arg.starts_with(prefix).then_some(name))
 }
 
-fn snapshot_unsupported_error() -> ProcessError {
-    ProcessError::BadConfiguration(VmmActionError::SnapshotUnsupported.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -2026,6 +2100,10 @@ mod tests {
     use bangbang_runtime::network::{NetworkInterfaceConfigError, NetworkInterfaceConfigInput};
     use bangbang_runtime::pmem::{PmemConfigError, PmemConfigInput};
     use bangbang_runtime::serial::SerialRateLimiterConfig;
+    use bangbang_runtime::snapshot_format::{
+        NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES, NATIVE_V1_SNAPSHOT_VERSION, SnapshotFormatError,
+        encode_snapshot_envelope,
+    };
     use bangbang_runtime::startup::Arm64BootResources;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
 
@@ -2038,8 +2116,9 @@ mod tests {
 
     use super::{
         ApiServerError, Args, Command, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID,
-        HTTP_MAX_PAYLOAD_SIZE, MAX_INSTANCE_ID_LEN, ProcessError, ProcessExitCode, StartupConfig,
-        StartupTimeClock, StartupTimeConfig, parse_process_args,
+        HTTP_MAX_PAYLOAD_SIZE, MAX_INSTANCE_ID_LEN, ProcessError, ProcessExitCode,
+        SnapshotInspectionPath, StartupConfig, StartupTimeClock, StartupTimeConfig,
+        parse_process_args,
     };
 
     #[derive(Debug, Clone)]
@@ -2439,6 +2518,17 @@ mod tests {
         ))
     }
 
+    fn unique_snapshot_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bangbang-main-test-{}-{nanos}-{name}.vmstate",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn process_exit_code_values_match_firecracker_contract() {
         assert_eq!(ProcessExitCode::ProcessFailure.value(), 1);
@@ -2526,6 +2616,96 @@ mod tests {
         let err = ProcessError::Metadata(super::MetadataFileError::Malformed);
 
         assert_eq!(err.exit_code(), ProcessExitCode::BadConfiguration);
+    }
+
+    #[test]
+    fn snapshot_inspection_error_maps_to_bad_configuration_without_path() {
+        let private_path = unique_snapshot_path("private-missing");
+        let err = super::describe_snapshot(private_path.to_str().expect("UTF-8 path"))
+            .expect_err("missing snapshot should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::SnapshotInspection(super::SnapshotInspectionError::Read(
+                ErrorKind::NotFound
+            ))
+        );
+        assert_eq!(err.exit_code(), ProcessExitCode::BadConfiguration);
+        assert_eq!(
+            err.to_string(),
+            "snapshot inspection error: failed to read snapshot state file: NotFound"
+        );
+        assert!(!err.to_string().contains("private-missing"));
+        assert!(!format!("{err:?}").contains("private-missing"));
+    }
+
+    #[test]
+    fn snapshot_inspection_accepts_valid_native_v1_file() {
+        let snapshot_path = unique_snapshot_path("valid");
+        let encoded =
+            encode_snapshot_envelope(b"opaque-state").expect("snapshot fixture should encode");
+        fs::write(&snapshot_path, encoded).expect("snapshot fixture should be written");
+
+        let metadata = super::describe_snapshot(snapshot_path.to_str().expect("UTF-8 path"))
+            .expect("valid snapshot should inspect");
+
+        assert_eq!(metadata.version(), NATIVE_V1_SNAPSHOT_VERSION);
+        assert_eq!(metadata.payload_length(), 12);
+        fs::remove_file(snapshot_path).expect("snapshot fixture should clean up");
+    }
+
+    #[test]
+    fn snapshot_inspection_rejects_non_regular_and_oversized_files() {
+        let directory_path = unique_snapshot_path("directory");
+        fs::create_dir(&directory_path).expect("snapshot fixture directory should be created");
+        let err = super::describe_snapshot(directory_path.to_str().expect("UTF-8 path"))
+            .expect_err("snapshot directory should fail");
+        assert_eq!(
+            err,
+            ProcessError::SnapshotInspection(super::SnapshotInspectionError::NotRegular)
+        );
+        fs::remove_dir(directory_path).expect("snapshot fixture directory should clean up");
+
+        let oversized_path = unique_snapshot_path("oversized");
+        let file = fs::File::create(&oversized_path).expect("snapshot fixture should be created");
+        file.set_len(
+            u64::try_from(NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES)
+                .expect("snapshot file limit should fit u64")
+                + 1,
+        )
+        .expect("snapshot fixture should be sized");
+        let err = super::describe_snapshot(oversized_path.to_str().expect("UTF-8 path"))
+            .expect_err("oversized snapshot should fail");
+        assert_eq!(
+            err,
+            ProcessError::SnapshotInspection(super::SnapshotInspectionError::TooLarge)
+        );
+        fs::remove_file(oversized_path).expect("snapshot fixture should clean up");
+    }
+
+    #[test]
+    fn snapshot_inspection_maps_format_errors_without_payload() {
+        let snapshot_path = unique_snapshot_path("corrupt-private-payload");
+        let mut encoded = encode_snapshot_envelope(b"private-guest-state")
+            .expect("snapshot fixture should encode");
+        let payload_byte = encoded
+            .get_mut(bangbang_runtime::snapshot_format::SNAPSHOT_ENVELOPE_HEADER_BYTES)
+            .expect("snapshot fixture payload should exist");
+        *payload_byte ^= 0xff;
+        fs::write(&snapshot_path, encoded).expect("snapshot fixture should be written");
+
+        let err = super::describe_snapshot(snapshot_path.to_str().expect("UTF-8 path"))
+            .expect_err("corrupt snapshot should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::SnapshotInspection(super::SnapshotInspectionError::Format(
+                SnapshotFormatError::IntegrityMismatch
+            ))
+        );
+        assert!(!err.to_string().contains("private-guest-state"));
+        assert!(!err.to_string().contains("corrupt-private-payload"));
+        fs::remove_file(snapshot_path).expect("snapshot fixture should clean up");
     }
 
     #[test]
@@ -2767,7 +2947,8 @@ mod tests {
         assert!(help.contains("--show-level"));
         assert!(help.contains("--snapshot-version"));
         assert!(help.contains("--describe-snapshot <PATH>"));
-        assert!(help.contains("snapshot data formats are unsupported"));
+        assert!(help.contains("Print the native snapshot data-format version"));
+        assert!(help.contains("Validate a native snapshot envelope and print its format version"));
         assert!(help.contains("--start-time-us <MICROS>"));
         assert!(help.contains("--start-time-cpu-us <MICROS>"));
         assert!(help.contains("--parent-cpu-time-us <MICROS>"));
@@ -2823,7 +3004,12 @@ mod tests {
         let args = parse(&["--describe-snapshot", "/tmp/snapshot.vmstate"])
             .expect("describe-snapshot arg should parse");
 
-        assert_eq!(args.command, Command::DescribeSnapshot);
+        assert_eq!(
+            args.command,
+            Command::DescribeSnapshot(SnapshotInspectionPath::new(
+                "/tmp/snapshot.vmstate".to_string()
+            ))
+        );
     }
 
     #[test]
@@ -2831,7 +3017,22 @@ mod tests {
         let args = parse(&["--describe-snapshot=/tmp/snapshot.vmstate"])
             .expect("describe-snapshot equals arg should parse");
 
-        assert_eq!(args.command, Command::DescribeSnapshot);
+        assert_eq!(
+            args.command,
+            Command::DescribeSnapshot(SnapshotInspectionPath::new(
+                "/tmp/snapshot.vmstate".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn describe_snapshot_command_debug_redacts_path() {
+        let args = parse(&["--describe-snapshot", "/tmp/private-snapshot.vmstate"])
+            .expect("describe-snapshot arg should parse");
+        let debug = format!("{args:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("private-snapshot.vmstate"));
     }
 
     #[test]
