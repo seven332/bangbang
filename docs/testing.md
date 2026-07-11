@@ -121,6 +121,11 @@ values twice within one vCPU lifetime and compare MPIDR with the existing
 owner-thread getter. They must not hard-code one Apple MIDR/feature model,
 include availability-gated or beta-only IDs, or claim that equal raw values are
 a sufficient destination compatibility policy.
+SVE/SME identification signed tests require macOS 15.2 and must capture ZFR0
+and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
+must not hard-code one feature model, enable SVE/SME, enter streaming mode,
+read vector/predicate/matrix state, run the vCPU, or treat equality as a
+destination compatibility policy.
 Cache-selection signed tests must capture CSSELR_EL1 from an idle real vCPU
 without hard-coding or validating its architecturally unknown reset value. They
 must not write the selector, query CCSIDR, execute ISB or cache maintenance, run

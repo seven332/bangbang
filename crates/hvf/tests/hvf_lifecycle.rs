@@ -888,6 +888,45 @@ fn captures_arm64_identification_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_arm64_sve_sme_identification_registers_on_runner_thread() {
+    use bangbang_hvf::{HvfArm64VcpuSveSmeIdentificationRegisterState, HvfBackend};
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let first = runner
+            .capture_arm64_sve_sme_identification_register_state()
+            .expect("first SVE/SME identification state should be captured");
+        let second = runner
+            .capture_arm64_sve_sme_identification_register_state()
+            .expect("second SVE/SME identification state should be captured");
+
+        let values = |state: HvfArm64VcpuSveSmeIdentificationRegisterState| {
+            [state.id_aa64zfr0_el1(), state.id_aa64smfr0_el1()]
+        };
+        assert!(
+            values(first) == values(second),
+            "SVE/SME identification accessors should remain stable within one vCPU lifetime"
+        );
+        assert!(
+            first == second,
+            "SVE/SME identification state should remain stable within one vCPU lifetime"
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_guest_written_arm64_translation_registers_on_runner_thread() {
     use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit};
     use bangbang_runtime::VmBackend;
@@ -1803,6 +1842,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .capture_arm64_identification_register_state()
         .expect("internal session should capture identification-register state");
     session
+        .capture_arm64_sve_sme_identification_register_state()
+        .expect("internal session should capture SVE/SME identification state");
+    session
         .capture_arm64_translation_register_state()
         .expect("internal session should capture translation-register state");
     session
@@ -1978,6 +2020,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_identification_register_state()
         .expect("owned session should capture identification-register state");
+    session
+        .capture_arm64_sve_sme_identification_register_state()
+        .expect("owned session should capture SVE/SME identification state");
     session
         .capture_arm64_translation_register_state()
         .expect("owned session should capture translation-register state");
