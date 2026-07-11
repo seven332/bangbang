@@ -282,8 +282,16 @@ is resource-specific:
   model, while CPACR can expose optional feature controls; neither is validated
   against a destination or accompanied by a guest ISB transition. After
   failure, retry the complete retained value or discard the vCPU before
-  execution. Public snapshot load invokes none of the four restore primitives.
-  TPIDR fields can contain guest TLS or kernel pointers, and
+  execution.
+  The paired thread-context restore extends the same boundary to raw
+  `TPIDR_EL0`, `TPIDRRO_EL0`, and `TPIDR_EL1`. It accepts only the complete
+  typed capture, writes the three fields in capture order, and reports the
+  exact failed register, completed prefix, and backend source without values.
+  TPIDR fields can contain guest TLS or kernel pointers and are not validated
+  against destination memory or coordinated with separately captured TPIDR2,
+  SCXTNUM, or CONTEXTIDR state. After failure, retry the complete retained
+  value or discard the vCPU before execution. Public snapshot load invokes
+  none of the five restore primitives.
   SIMD/FP bytes can contain guest application or cryptographic working data.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
   expose guest process or kernel context identifiers.
