@@ -649,12 +649,12 @@ impl HvfArm64VcpuWatchpointRegisterState {
 /// Detached raw EL1 debug-control state captured from one arm64 vCPU.
 ///
 /// `MDCCINT_EL1` and `MDSCR_EL1` control security-sensitive self-hosted debug
-/// behavior. This getter-only value does not include the separately captured
-/// breakpoint and watchpoint comparators, Hypervisor.framework debug trap
-/// configuration, feature or writable-bit validation, or a safe restore policy.
-/// Capturing it does not enable monitor debug, software stepping, debug
-/// exceptions, guest debug-register access, or debug communications-channel
-/// interrupts.
+/// behavior. The complete typed value can be reapplied through an owner-thread
+/// primitive, but the two writes are nontransactional. This value does not
+/// include the separately captured breakpoint/watchpoint comparators or
+/// Hypervisor.framework debug-trap policy and defines no feature/writable-bit
+/// or destination validation, wider debug ordering, persistence, snapshot
+/// schema, or safe complete restore policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuDebugControlRegisterState {
     mdccint_el1: u64,
@@ -2689,6 +2689,29 @@ pub(crate) fn capture_arm64_vcpu_debug_control_register_state_with(
     ))
 }
 
+pub(crate) fn restore_arm64_vcpu_debug_control_register_state_with(
+    state: &HvfArm64VcpuDebugControlRegisterState,
+    mut set_system_register: impl FnMut(HvfSystemRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+    let mut completed_writes = 0;
+    let mut write_system_register = |register, value| {
+        set_system_register(register, value).map_err(|source| {
+            HvfArm64VcpuSystemRegisterRestoreError::new(register, completed_writes, source)
+        })?;
+        completed_writes += 1;
+        Ok(())
+    };
+
+    for (register, value) in [
+        (HvfSystemRegister::MDCCINT_EL1, state.mdccint_el1()),
+        (HvfSystemRegister::MDSCR_EL1, state.mdscr_el1()),
+    ] {
+        write_system_register(register, value)?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn capture_arm64_vcpu_debug_trap_state_with<R: ?Sized>(
     reader: &mut R,
     get_trap_debug_exceptions: impl FnOnce(&mut R) -> Result<bool, BackendError>,
@@ -3321,6 +3344,7 @@ mod tests {
         capture_arm64_vcpu_watchpoint_register_state_with, configure_arm64_boot_registers_with,
         restore_arm64_vcpu_cache_selection_register_state_with,
         restore_arm64_vcpu_core_system_register_state_with,
+        restore_arm64_vcpu_debug_control_register_state_with,
         restore_arm64_vcpu_debug_trap_state_with, restore_arm64_vcpu_exception_register_state_with,
         restore_arm64_vcpu_execution_control_register_state_with,
         restore_arm64_vcpu_general_register_state_with,
@@ -4768,6 +4792,85 @@ mod tests {
         );
         assert_eq!(HvfSystemRegister::MDCCINT_EL1.raw(), 0x8010);
         assert_eq!(HvfSystemRegister::MDSCR_EL1.raw(), 0x8012);
+    }
+
+    fn debug_control_restore_test_state() -> super::HvfArm64VcpuDebugControlRegisterState {
+        super::HvfArm64VcpuDebugControlRegisterState::new(
+            0xd06c_0000_0000_8010,
+            0xd06c_0000_0000_8012,
+        )
+    }
+
+    fn debug_control_restore_test_entries(
+        state: super::HvfArm64VcpuDebugControlRegisterState,
+    ) -> [(HvfSystemRegister, u64); 2] {
+        [
+            (HvfSystemRegister::MDCCINT_EL1, state.mdccint_el1()),
+            (HvfSystemRegister::MDSCR_EL1, state.mdscr_el1()),
+        ]
+    }
+
+    #[test]
+    fn restores_arm64_debug_control_register_state_in_capture_order() {
+        let state = debug_control_restore_test_state();
+        let expected = debug_control_restore_test_entries(state);
+        let mut writes = Vec::new();
+
+        restore_arm64_vcpu_debug_control_register_state_with(&state, |register, value| {
+            writes.push((register, value));
+            Ok(())
+        })
+        .expect("debug-control restore should succeed");
+
+        assert_eq!(writes, expected);
+    }
+
+    #[test]
+    fn every_arm64_debug_control_restore_failure_stops_and_can_retry() {
+        use std::error::Error as _;
+
+        let state = debug_control_restore_test_state();
+        let expected = debug_control_restore_test_entries(state);
+
+        for (failed_index, (failed_register, _)) in expected.iter().copied().enumerate() {
+            let fail_once = Cell::new(true);
+            let writes = RefCell::new(Vec::new());
+            let write_system_register = |register, value| {
+                writes.borrow_mut().push((register, value));
+                if register == failed_register && fail_once.replace(false) {
+                    Err(BackendError::InvalidState(
+                        "fake debug-control restore failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error = restore_arm64_vcpu_debug_control_register_state_with(
+                &state,
+                &write_system_register,
+            )
+            .expect_err("injected debug-control write should fail");
+            assert_eq!(error.failed_register(), failed_register);
+            assert_eq!(error.completed_writes(), failed_index);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                Some("invalid backend state: fake debug-control restore failed".to_string())
+            );
+            assert_eq!(*writes.borrow(), expected[..=failed_index]);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to restore arm64 system register id {} after {failed_index} successful writes: invalid backend state: fake debug-control restore failed",
+                    failed_register.raw()
+                )
+            );
+
+            writes.borrow_mut().clear();
+            restore_arm64_vcpu_debug_control_register_state_with(&state, &write_system_register)
+                .expect("complete debug-control restore retry should succeed");
+            assert_eq!(*writes.borrow(), expected);
+        }
     }
 
     #[test]

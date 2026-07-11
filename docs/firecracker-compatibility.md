@@ -51,8 +51,9 @@ access, one-step runner-thread MMIO handling, a run-cancellation boundary,
 baseline and optional SVE/SME guest-visible identification metadata, pointer-
 authentication key-state capture with redacted `Debug`, raw cache-selection
 plus ordered nontransactional restore of its typed CSSELR_EL1 value,
-hardware-breakpoint, hardware-watchpoint, debug-control, debug-trap policy plus
-ordered nontransactional restore of its complete two-Boolean value, and
+hardware-breakpoint, hardware-watchpoint, debug-control plus ordered
+nontransactional restore of its typed MDCCINT_EL1/MDSCR_EL1 value, debug-trap
+policy plus ordered nontransactional restore of its complete two-Boolean value, and
 physical-timer CNTKCTL/control/CVAL/TVAL capture, a virtual-timer
 mask/offset/control/CVAL boundary, CPU-level IRQ/FIQ pending capture plus
 ordered nontransactional restore of its complete typed value, a bounded
@@ -1690,8 +1691,10 @@ five 128-bit pointer-authentication keys. Its redacted typed value has a paired
 owner-thread restore that writes the same ten halves in capture order through
 the reusable system-register partial-write contract. A ninth reads guest-visible `MIDR_EL1`,
 `MPIDR_EL1`, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 compatibility metadata. A
-tenth reads raw `MDCCINT_EL1` then `MDSCR_EL1` without writing either register
-or changing Hypervisor.framework debug trap settings. An eleventh reads raw
+tenth reads raw `MDCCINT_EL1` then `MDSCR_EL1`; its typed value has a paired
+owner-thread restore that writes both registers in capture order through the
+reusable system-register partial-write contract without changing the separately
+owned Hypervisor.framework debug-trap settings. An eleventh reads raw
 `CSSELR_EL1`; its typed value has a paired owner-thread restore that writes the
 same selector through the reusable system-register partial-write contract
 without consuming its selected `CCSIDR_EL1` view. A twelfth reads
@@ -1733,13 +1736,13 @@ requiring `PSTATE.SM`, then runtime-resolves `hv_vcpu_get_sme_zt0_reg` and
 publishes its fixed 64 bytes only after the single aligned SDK read succeeds.
 Its detached value redacts every byte from `Debug`. The twenty-two capture
 commands plus the general-, core-system-, exception-register, execution-
-control, cache-selection, debug-trap-policy, thread-context, translation,
+control, cache-selection, debug-control, debug-trap-policy, thread-context, translation,
 baseline SIMD/FP, pointer-authentication key, and system-context restore
-operations form a thirty-three-operation command-owned core-register admission
+operations form a thirty-four-operation command-owned core-register admission
 domain.
 Captures publish no partial state
 after a read failure; restores explicitly may leave a written prefix after a
-setter failure. Borrowed and owned HVF boot sessions expose all eleven restores
+setter failure. Borrowed and owned HVF boot sessions expose all twelve restores
 in this core domain and all captures for later lease-owned orchestration.
 Separately, a no-handle `HvfBackend::arm64_sme_configuration()` query
 runtime-resolves macOS 15.2+
@@ -1911,9 +1914,11 @@ System-context validation captures both registers twice from the same idle
 vCPU, compares them only with fixed failure messages, and checks redacted
 `Debug` output. It then restores and recaptures the complete first value twice
 without logging raw values, running guest code, hard-coding a reset value, or
-inferring feature or destination compatibility. Debug-control validation only
-reads both values from an idle real vCPU; it does not enable monitor debug,
-software stepping, debug exceptions, guest debug-register access, or DCC interrupts.
+inferring feature or destination compatibility. Debug-control validation
+captures the original pair from an idle real vCPU, restores and recaptures that
+exact pair twice, and compares whole values without assuming or logging either
+register, manufacturing a control change, altering comparator or host trap
+state, enabling debug behavior, or executing the guest.
 Breakpoint and watchpoint comparators and their respective DFR0-reported counts
 are captured through separate values. HVF's separate debug-exception and debug-
 register-access trap booleans are captured through another value and correspond
@@ -1970,18 +1975,18 @@ derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
 or control-restore policy. The baseline and optional SVE/SME identification,
 SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register,
-breakpoint, watchpoint, debug-control, and physical-timer
+breakpoint, watchpoint, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore
 validation, snapshot schema, or Firecracker on-disk compatibility.
 The core system-register, EL1 exception, execution-control, cache-selection,
-debug-trap policy, thread-context, and translation subsets plus system-context,
+debug-control, debug-trap policy, thread-context, and translation subsets plus system-context,
 baseline SIMD/FP, and pointer-authentication keys have paired ordered,
 nontransactional restore operations but likewise have no validation, schema,
 dependent-memory, maintenance, feature-transition, SVE/SME alias, or wider
 ordering policy.
 Identification capture is compatibility metadata rather than mutable restore
 state and defines no feature-mask or destination policy. Guest debug-control
-capture and host debug-trap capture/apply remain separate and define no joint
+capture/apply and host debug-trap capture/apply remain separate and define no joint
 feature, writable/status-bit, security, trap-coordination, synchronization, or
 composite restore policy.
 Cache-selection capture-order apply defines no atomic topology manifest,
@@ -2382,8 +2387,9 @@ macOS design work instead of direct implementation:
   the same low/high capture order without feature/destination validation,
   protected persistence, zeroization, or SCTLR enable ordering. A ninth captures guest-visible MIDR,
   MPIDR, PFR0/1, DFR0/1, ISAR0/1, and MMFR0/1/2 as raw virtual-CPU/HVF
-  compatibility inputs. A tenth captures raw MDCCINT_EL1 and MDSCR_EL1 as an
-  observation-only, incomplete debug-control subset. An eleventh captures raw
+  compatibility inputs. A tenth captures raw MDCCINT_EL1 and MDSCR_EL1 and can
+  reapply the complete typed pair in capture order without defining writable-bit,
+  destination, or wider debug-policy validation. An eleventh captures raw
   CSSELR_EL1 as cache-size selection state, not cache topology. A twelfth reads
   DFR0 first and captures only the implemented hardware-breakpoint value/control
   pairs as sensitive observation-only state. A thirteenth reads DFR0 first and
@@ -2422,12 +2428,13 @@ macOS design work instead of direct implementation:
   table and vector memory, optional CPACR and pointer-authentication feature
   validation, cache feature/geometry interpretation and masks, selector
   validation and maintenance, breakpoint and watchpoint control
-  validation, debug-trap destination policy and guest/host ordering, protected
+  validation, debug-control writable/status-bit and destination policy,
+  debug-trap destination policy and guest/host ordering, protected
   key persistence, and remaining wider restore ordering remain outside these
   subsets. General-register,
-  core-system-register, exception-register, execution-control, thread-context,
-  and pointer-authentication restore report their typed failed register and
-  completed-write count. Debug-trap restore instead reports the exact failed
+  core-system-register, exception-register, execution-control, debug-control,
+  thread-context, and pointer-authentication restore report their typed failed
+  register and completed-write count. Debug-trap restore instead reports the exact failed
   host-policy operation and completed prefix without either Boolean; callers
   must retry the complete captured value or discard the vCPU before execution.
   The runner can capture raw CNTKCTL_EL1, CNTP_CTL_EL0, CNTP_CVAL_EL0, and
