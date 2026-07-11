@@ -13,8 +13,8 @@ use crate::exit::{
     HvfVcpuExit, HvfVcpuExitResolveError,
 };
 use crate::gic::{
-    HvfGicDeviceState, HvfGicError, HvfGicPpiPendingWriter, HvfGicStateSnapshotter,
-    validate_gic_ppi_pending_intid,
+    HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicIccRegisterReader,
+    HvfGicPpiPendingWriter, HvfGicStateSnapshotter, validate_gic_ppi_pending_intid,
 };
 use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
@@ -306,6 +306,10 @@ enum RunnerCommand {
         admission: InFlightInterruptOperation,
         response_sender: mpsc::Sender<Result<HvfGicDeviceState, HvfVcpuRunnerError>>,
     },
+    CaptureArm64GicIccRegisterState {
+        admission: InFlightInterruptOperation,
+        response_sender: mpsc::Sender<Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError>>,
+    },
     SetGicPpiPending {
         intid: u32,
         pending: bool,
@@ -476,6 +480,13 @@ trait RunnerVcpu {
             "vCPU does not support GIC device-state capture",
         ))
     }
+    fn capture_arm64_gic_icc_register_state(
+        &mut self,
+    ) -> Result<HvfArm64GicIccRegisterState, HvfGicError> {
+        Err(HvfGicError::InvalidState(
+            "vCPU does not support GIC ICC register-state capture",
+        ))
+    }
     fn destroy(&mut self) -> Result<(), BackendError>;
 }
 
@@ -483,6 +494,7 @@ struct RealRunnerVcpu {
     owner: HvfVcpuOwner,
     gic_ppi_pending_writer: Option<HvfGicPpiPendingWriter>,
     gic_state_snapshotter: Option<HvfGicStateSnapshotter>,
+    gic_icc_register_reader: Option<HvfGicIccRegisterReader>,
 }
 
 impl RealRunnerVcpu {
@@ -497,6 +509,7 @@ impl RealRunnerVcpu {
             owner,
             gic_ppi_pending_writer: None,
             gic_state_snapshotter: None,
+            gic_icc_register_reader: None,
         })
     }
 }
@@ -628,6 +641,23 @@ impl RunnerVcpu for RealRunnerVcpu {
             ))?;
 
         snapshotter.capture()
+    }
+
+    fn capture_arm64_gic_icc_register_state(
+        &mut self,
+    ) -> Result<HvfArm64GicIccRegisterState, HvfGicError> {
+        let vcpu = self.owner.raw_vcpu()?;
+        if self.gic_icc_register_reader.is_none() {
+            self.gic_icc_register_reader = Some(HvfGicIccRegisterReader::new()?);
+        }
+        let reader = self
+            .gic_icc_register_reader
+            .as_ref()
+            .ok_or(HvfGicError::InvalidState(
+                "GIC ICC register reader was not initialized",
+            ))?;
+
+        reader.capture(vcpu)
     }
 
     fn destroy(&mut self) -> Result<(), BackendError> {
@@ -947,6 +977,23 @@ impl<'vm> HvfVcpuRunner<'vm> {
     pub fn capture_gic_device_state(&self) -> Result<HvfGicDeviceState, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_gic_device_state_capture(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Capture the arm64 EL1 GIC ICC CPU-interface registers on the owner thread.
+    ///
+    /// The command captures all ten EL1 ICC values exposed by the macOS 15
+    /// Hypervisor.framework API and serializes them with other runner-managed
+    /// interrupt/GIC operations. It covers only this current single vCPU and
+    /// excludes `ICC_SRE_EL2`, ICH/ICV state, restore, and snapshot persistence.
+    pub fn capture_arm64_gic_icc_register_state(
+        &self,
+    ) -> Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_gic_icc_register_state_capture(response_sender)?;
 
         response_receiver
             .recv()
@@ -1771,6 +1818,23 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
     }
 
+    fn start_arm64_gic_icc_register_state_capture(
+        &self,
+        response_sender: mpsc::Sender<Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let admission = {
+            let _state = self.reserve_interrupt_operation(|| Ok(()))?;
+            InFlightInterruptOperation::new(&self.state)
+        };
+
+        self.command_sender
+            .send(RunnerCommand::CaptureArm64GicIccRegisterState {
+                admission,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
+    }
+
     fn start_interrupt_operation<T>(
         &self,
         validate: impl FnOnce() -> Result<(), HvfVcpuRunnerError>,
@@ -2477,6 +2541,18 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::CaptureArm64GicIccRegisterState {
+                mut admission,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .capture_arm64_gic_icc_register_state()
+                    .map_err(HvfVcpuRunnerError::Gic);
+                // Every owner-thread ICC read has finished. Restore admission
+                // before response send so receiver failure is not cleanup.
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::SetGicPpiPending {
                 intid,
                 pending,
@@ -2673,7 +2749,7 @@ mod tests {
         HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfSys64Direction, HvfSys64Exit,
         HvfSys64Register, HvfVcpuExit, HvfVcpuExitResolveError,
     };
-    use crate::gic::{HvfGicDeviceState, HvfGicError};
+    use crate::gic::{HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError};
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
     use crate::vcpu::{
         HvfArm64BootRegisters, HvfArm64VcpuCoreSystemRegisterState,
@@ -2708,6 +2784,8 @@ mod tests {
     const PSCI_RET_SUCCESS: u64 = 0;
     const PSCI_RET_NOT_SUPPORTED: u64 = u64::MAX;
     const GIC_DEVICE_STATE_TEST_BYTES: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+    const GIC_ICC_REGISTER_STATE_TEST_VALUES: [u64; 10] =
+        [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9];
 
     struct FakeVcpu {
         entered_run_sender: mpsc::Sender<()>,
@@ -2932,6 +3010,26 @@ mod tests {
         HvfVcpuRunner<'static>,
         mpsc::Receiver<()>,
         mpsc::Sender<Result<Vec<u8>, HvfGicError>>,
+        mpsc::Receiver<()>,
+    );
+
+    struct GicIccRegisterStateRecordingVcpu {
+        fail_next_capture: bool,
+        capture_sender: mpsc::Sender<()>,
+    }
+
+    struct BlockingGicIccRegisterStateVcpu {
+        entered_capture_sender: mpsc::Sender<()>,
+        release_capture_receiver: mpsc::Receiver<Result<[u64; 10], HvfGicError>>,
+        barrier_sender: Option<mpsc::Sender<()>>,
+    }
+
+    struct PanicOnGicIccRegisterStateVcpu;
+
+    type BlockingGicIccRegisterStateCaptureRunner = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<[u64; 10], HvfGicError>>,
         mpsc::Receiver<()>,
     );
 
@@ -4429,6 +4527,138 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for GicIccRegisterStateRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn capture_arm64_gic_icc_register_state(
+            &mut self,
+        ) -> Result<HvfArm64GicIccRegisterState, HvfGicError> {
+            self.capture_sender
+                .send(())
+                .map_err(|_| HvfGicError::InvalidState("fake GIC ICC capture receiver closed"))?;
+            if self.fail_next_capture {
+                self.fail_next_capture = false;
+                Err(HvfGicError::InvalidState(
+                    "fake GIC ICC register-state capture failed",
+                ))
+            } else {
+                Ok(HvfArm64GicIccRegisterState::new(
+                    GIC_ICC_REGISTER_STATE_TEST_VALUES,
+                ))
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingGicIccRegisterStateVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn capture_arm64_gic_icc_register_state(
+            &mut self,
+        ) -> Result<HvfArm64GicIccRegisterState, HvfGicError> {
+            self.entered_capture_sender.send(()).map_err(|_| {
+                HvfGicError::InvalidState("fake GIC ICC capture entry receiver closed")
+            })?;
+            let values = self.release_capture_receiver.recv().map_err(|_| {
+                HvfGicError::InvalidState("fake GIC ICC capture release sender closed")
+            })??;
+            Ok(HvfArm64GicIccRegisterState::new(values))
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            if let Some(sender) = &self.barrier_sender {
+                sender
+                    .send(())
+                    .map_err(|_| BackendError::InvalidState("fake barrier receiver closed"))?;
+            }
+            Ok(0x8000_0000)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnGicIccRegisterStateVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn capture_arm64_gic_icc_register_state(
+            &mut self,
+        ) -> Result<HvfArm64GicIccRegisterState, HvfGicError> {
+            panic!("fake GIC ICC register-state capture panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for GicPpiPendingRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -5031,8 +5261,25 @@ mod tests {
             Err(expected.clone())
         );
         assert_eq!(runner.capture_gic_device_state(), Err(expected.clone()));
+        assert_eq!(
+            runner.capture_arm64_gic_icc_register_state(),
+            Err(expected.clone())
+        );
         assert_eq!(runner.set_gic_ppi_pending(27), Err(expected.clone()));
         assert_eq!(runner.clear_gic_ppi_pending(27), Err(expected));
+    }
+
+    fn assert_gic_icc_register_test_state(state: HvfArm64GicIccRegisterState) {
+        assert_eq!(state.pmr_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[0]);
+        assert_eq!(state.bpr0_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[1]);
+        assert_eq!(state.ap0r0_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[2]);
+        assert_eq!(state.ap1r0_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[3]);
+        assert_eq!(state.rpr_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[4]);
+        assert_eq!(state.bpr1_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[5]);
+        assert_eq!(state.ctlr_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[6]);
+        assert_eq!(state.sre_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[7]);
+        assert_eq!(state.igrpen0_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[8]);
+        assert_eq!(state.igrpen1_el1(), GIC_ICC_REGISTER_STATE_TEST_VALUES[9]);
     }
 
     fn shared_dispatcher_with_region() -> Arc<Mutex<MmioDispatcher>> {
@@ -5617,6 +5864,48 @@ mod tests {
         )
     }
 
+    fn start_gic_icc_register_state_recording_runner(
+        fail_next_capture: bool,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<()>) {
+        let (capture_sender, capture_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(GicIccRegisterStateRecordingVcpu {
+                fail_next_capture,
+                capture_sender,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            capture_receiver,
+        )
+    }
+
+    fn start_blocking_gic_icc_register_state_capture_runner()
+    -> BlockingGicIccRegisterStateCaptureRunner {
+        let (entered_capture_sender, entered_capture_receiver) = mpsc::channel();
+        let (release_capture_sender, release_capture_receiver) = mpsc::channel();
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingGicIccRegisterStateVcpu {
+                entered_capture_sender,
+                release_capture_receiver,
+                barrier_sender: Some(barrier_sender),
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_capture_receiver,
+            release_capture_sender,
+            barrier_receiver,
+        )
+    }
+
     fn start_gic_ppi_pending_recording_runner(
         fail_next_operation: bool,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(u32, bool)>) {
@@ -5699,6 +5988,7 @@ mod tests {
         assert_send_sync::<HvfArm64VcpuThreadContextRegisterState>();
         assert_send_sync::<HvfArm64VcpuVirtualTimerState>();
         assert_send_sync::<HvfGicDeviceState>();
+        assert_send_sync::<HvfArm64GicIccRegisterState>();
         assert_send_sync::<HvfInterruptType>();
     }
 
@@ -7939,6 +8229,234 @@ mod tests {
 
         assert_eq!(
             runner.capture_gic_device_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn captures_arm64_gic_icc_register_state_on_runner_thread() {
+        let (runner, capture_receiver) = start_gic_icc_register_state_recording_runner(false);
+
+        let state = runner
+            .capture_arm64_gic_icc_register_state()
+            .expect("GIC ICC register-state capture should succeed");
+
+        assert_gic_icc_register_test_state(state);
+        assert_eq!(capture_receiver.try_iter().count(), 1);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_gic_icc_register_state_capture_can_be_retried_without_stale_admission() {
+        let (runner, capture_receiver) = start_gic_icc_register_state_recording_runner(true);
+
+        assert_eq!(
+            runner.capture_arm64_gic_icc_register_state(),
+            Err(HvfVcpuRunnerError::Gic(HvfGicError::InvalidState(
+                "fake GIC ICC register-state capture failed"
+            )))
+        );
+        assert_eq!(capture_receiver.try_iter().count(), 1);
+
+        let state = runner
+            .capture_arm64_gic_icc_register_state()
+            .expect("GIC ICC register-state capture retry should succeed");
+        assert_gic_icc_register_test_state(state);
+        assert_eq!(capture_receiver.try_iter().count(), 1);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn commands_during_gic_icc_register_state_capture_are_rejected_without_queueing() {
+        let (runner, entered_capture_receiver, release_capture_sender, _barrier_receiver) =
+            start_blocking_gic_icc_register_state_capture_runner();
+
+        thread::scope(|scope| {
+            let capture = scope.spawn(|| runner.capture_arm64_gic_icc_register_state());
+            entered_capture_receiver
+                .recv()
+                .expect("runner should enter fake GIC ICC register-state capture");
+
+            let expected =
+                HvfVcpuRunnerError::InvalidState(super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE);
+            assert_interrupt_operations_rejected(&runner, expected.clone());
+            assert_core_register_captures_rejected(&runner, expected.clone());
+            assert_vtimer_operations_rejected(&runner, expected.clone());
+            assert_eq!(runner.run_once(), Err(expected.clone()));
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(expected.clone())
+            );
+            assert_eq!(runner.mpidr_el1(), Err(expected.clone()));
+            assert_eq!(runner.cancel(), Err(expected.clone()));
+            assert_eq!(runner.shutdown(), Err(expected));
+
+            release_capture_sender
+                .send(Ok(GIC_ICC_REGISTER_STATE_TEST_VALUES))
+                .expect("GIC ICC register-state capture release should be sent");
+            let state = capture
+                .join()
+                .expect("GIC ICC register-state capture thread should join")
+                .expect("GIC ICC register-state capture should succeed");
+            assert_gic_icc_register_test_state(state);
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn caller_unwind_keeps_gic_icc_register_state_capture_admitted_until_command_finishes() {
+        let (runner, entered_capture_receiver, release_capture_sender, barrier_receiver) =
+            start_blocking_gic_icc_register_state_capture_runner();
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (response_sender, _response_receiver) = mpsc::channel();
+            runner
+                .start_arm64_gic_icc_register_state_capture(response_sender)
+                .expect("GIC ICC register-state capture should be admitted");
+            panic!("fake caller unwind");
+        }));
+        assert!(unwind_result.is_err());
+        entered_capture_receiver
+            .recv()
+            .expect("runner should enter fake GIC ICC register-state capture");
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        let (barrier_response_sender, barrier_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::ReadMpidrEl1 {
+                response_sender: barrier_response_sender,
+            })
+            .expect("test barrier should queue behind capture");
+        release_capture_sender
+            .send(Ok(GIC_ICC_REGISTER_STATE_TEST_VALUES))
+            .expect("GIC ICC register-state capture release should be sent");
+        barrier_receiver
+            .recv()
+            .expect("runner should enter the command queued after capture");
+        assert_eq!(
+            barrier_response_receiver
+                .recv()
+                .expect("barrier response should be sent"),
+            Ok(0x8000_0000)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn gic_icc_register_state_capture_send_failure_releases_admission() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(
+            runner.capture_arm64_gic_icc_register_state(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::COMMAND_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn queued_gic_icc_register_state_capture_destruction_releases_admission() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(move || {
+            Ok(BlockingPanicOnRunVcpu {
+                entered_run_sender,
+                release_run_receiver,
+            })
+        });
+
+        let (run_response_sender, run_response_receiver) = mpsc::channel();
+        runner
+            .command_sender
+            .send(super::RunnerCommand::RunOnce {
+                response_sender: run_response_sender,
+            })
+            .expect("raw panic command should be sent");
+        entered_run_receiver
+            .recv()
+            .expect("runner should enter the blocking panic command");
+
+        let (capture_response_sender, capture_response_receiver) = mpsc::channel();
+        runner
+            .start_arm64_gic_icc_register_state_capture(capture_response_sender)
+            .expect("GIC ICC register-state capture should queue behind the panic command");
+        assert!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+
+        release_run_sender
+            .send(())
+            .expect("blocking panic command should be released");
+        assert!(run_response_receiver.recv().is_err());
+        assert!(capture_response_receiver.recv().is_err());
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert!(
+            !runner
+                .state
+                .lock()
+                .expect("runner state should be lockable")
+                .interrupt_operation_in_flight
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn gic_icc_register_state_capture_panic_releases_admission() {
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnGicIccRegisterStateVcpu));
+
+        assert_eq!(
+            runner.capture_arm64_gic_icc_register_state(),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))

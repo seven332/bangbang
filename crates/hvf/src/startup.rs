@@ -63,8 +63,8 @@ use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
 use crate::backend::HvfBackend;
 use crate::gic::{
-    HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator, HvfGicMetadata,
-    HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
+    HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator,
+    HvfGicMetadata, HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
 use crate::runner::{
@@ -1241,6 +1241,16 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_gic_device_state()
     }
 
+    /// Capture raw EL1 GIC ICC registers on the primary vCPU owner thread.
+    ///
+    /// This per-vCPU value complements the opaque GIC device blob but is not a
+    /// restored or persisted snapshot. EL2 ICC, ICH, and ICV state are omitted.
+    pub fn capture_arm64_gic_icc_register_state(
+        &self,
+    ) -> Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_gic_icc_register_state()
+    }
+
     /// Run the boot session's primary vCPU once with runner-thread MMIO handling.
     ///
     /// This is runner-loop plumbing. It does not dispatch boot block or
@@ -1860,6 +1870,16 @@ impl OwnedHvfArm64BootSession {
     /// bangbang snapshot schema or validated restore input.
     pub fn capture_gic_device_state(&self) -> Result<HvfGicDeviceState, HvfVcpuRunnerError> {
         self.runner.capture_gic_device_state()
+    }
+
+    /// Capture raw EL1 GIC ICC registers on the primary vCPU owner thread.
+    ///
+    /// This per-vCPU value complements the opaque GIC device blob but is not a
+    /// restored or persisted snapshot. EL2 ICC, ICH, and ICV state are omitted.
+    pub fn capture_arm64_gic_icc_register_state(
+        &self,
+    ) -> Result<HvfArm64GicIccRegisterState, HvfVcpuRunnerError> {
+        self.runner.capture_arm64_gic_icc_register_state()
     }
 
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {

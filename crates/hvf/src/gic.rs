@@ -26,6 +26,28 @@ const FIRST_PPI_INTID: u32 = 16;
 const FIRST_SPI_INTID: u32 = 32;
 const HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0: u32 = 0x10200;
 const HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0: u32 = 0x10280;
+const HV_GIC_ICC_REG_PMR_EL1: u16 = 0xc230;
+const HV_GIC_ICC_REG_BPR0_EL1: u16 = 0xc643;
+const HV_GIC_ICC_REG_AP0R0_EL1: u16 = 0xc644;
+const HV_GIC_ICC_REG_AP1R0_EL1: u16 = 0xc648;
+const HV_GIC_ICC_REG_RPR_EL1: u16 = 0xc65b;
+const HV_GIC_ICC_REG_BPR1_EL1: u16 = 0xc663;
+const HV_GIC_ICC_REG_CTLR_EL1: u16 = 0xc664;
+const HV_GIC_ICC_REG_SRE_EL1: u16 = 0xc665;
+const HV_GIC_ICC_REG_IGRPEN0_EL1: u16 = 0xc666;
+const HV_GIC_ICC_REG_IGRPEN1_EL1: u16 = 0xc667;
+const ARM64_GIC_EL1_ICC_REGISTERS: [u16; 10] = [
+    HV_GIC_ICC_REG_PMR_EL1,
+    HV_GIC_ICC_REG_BPR0_EL1,
+    HV_GIC_ICC_REG_AP0R0_EL1,
+    HV_GIC_ICC_REG_AP1R0_EL1,
+    HV_GIC_ICC_REG_RPR_EL1,
+    HV_GIC_ICC_REG_BPR1_EL1,
+    HV_GIC_ICC_REG_CTLR_EL1,
+    HV_GIC_ICC_REG_SRE_EL1,
+    HV_GIC_ICC_REG_IGRPEN0_EL1,
+    HV_GIC_ICC_REG_IGRPEN1_EL1,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfGicRegion {
@@ -114,6 +136,74 @@ impl fmt::Debug for HvfGicDeviceState {
         f.debug_struct("HvfGicDeviceState")
             .field("len", &self.bytes.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Detached raw EL1 GIC ICC register state captured from one arm64 vCPU.
+///
+/// This value contains every EL1 ICC CPU-interface register exposed by
+/// Hypervisor.framework on macOS 15. The values are sensitive, unvalidated
+/// execution state for later owner-thread orchestration, not a complete or
+/// serialized snapshot schema. `ICC_SRE_EL2`, ICH/ICV virtualization state,
+/// restore validation, and multi-vCPU association remain outside this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64GicIccRegisterState {
+    values: [u64; ARM64_GIC_EL1_ICC_REGISTERS.len()],
+}
+
+impl HvfArm64GicIccRegisterState {
+    pub(crate) const fn new(values: [u64; ARM64_GIC_EL1_ICC_REGISTERS.len()]) -> Self {
+        Self { values }
+    }
+
+    /// Return the raw `ICC_PMR_EL1` value.
+    pub const fn pmr_el1(self) -> u64 {
+        self.values[0]
+    }
+
+    /// Return the raw `ICC_BPR0_EL1` value.
+    pub const fn bpr0_el1(self) -> u64 {
+        self.values[1]
+    }
+
+    /// Return the raw `ICC_AP0R0_EL1` value.
+    pub const fn ap0r0_el1(self) -> u64 {
+        self.values[2]
+    }
+
+    /// Return the raw `ICC_AP1R0_EL1` value.
+    pub const fn ap1r0_el1(self) -> u64 {
+        self.values[3]
+    }
+
+    /// Return the raw `ICC_RPR_EL1` value.
+    pub const fn rpr_el1(self) -> u64 {
+        self.values[4]
+    }
+
+    /// Return the raw `ICC_BPR1_EL1` value.
+    pub const fn bpr1_el1(self) -> u64 {
+        self.values[5]
+    }
+
+    /// Return the raw `ICC_CTLR_EL1` value.
+    pub const fn ctlr_el1(self) -> u64 {
+        self.values[6]
+    }
+
+    /// Return the raw `ICC_SRE_EL1` value.
+    pub const fn sre_el1(self) -> u64 {
+        self.values[7]
+    }
+
+    /// Return the raw `ICC_IGRPEN0_EL1` value.
+    pub const fn igrpen0_el1(self) -> u64 {
+        self.values[8]
+    }
+
+    /// Return the raw `ICC_IGRPEN1_EL1` value.
+    pub const fn igrpen1_el1(self) -> u64 {
+        self.values[9]
     }
 }
 
@@ -512,6 +602,10 @@ pub(crate) struct HvfGicStateSnapshotter {
     capture: Box<dyn HvfGicStateCapture>,
 }
 
+pub(crate) struct HvfGicIccRegisterReader {
+    api: Box<dyn HvfGicIccRegisterApi>,
+}
+
 trait HvfGicStateCapture: fmt::Debug {
     fn capture(&self) -> Result<HvfGicDeviceState, HvfGicError>;
 }
@@ -523,6 +617,10 @@ trait HvfGicStateApi: fmt::Debug {
     fn state_size(&self, state: &Self::State) -> Result<usize, HvfGicError>;
     fn copy_state(&self, state: &Self::State, data: &mut [u8]) -> Result<(), HvfGicError>;
     fn release_state(&self, state: Self::State);
+}
+
+trait HvfGicIccRegisterApi: fmt::Debug {
+    fn get_icc_reg(&self, vcpu: crate::ffi::HvVcpu, register: u16) -> Result<u64, HvfGicError>;
 }
 
 impl HvfGicStateSnapshotter {
@@ -548,6 +646,41 @@ impl HvfGicStateSnapshotter {
 impl fmt::Debug for HvfGicStateSnapshotter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HvfGicStateSnapshotter")
+            .finish_non_exhaustive()
+    }
+}
+
+impl HvfGicIccRegisterReader {
+    pub(crate) fn new() -> Result<Self, HvfGicError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Ok(Self {
+                api: Box::new(LoadedHvfGicIccRegisterApi::load()?),
+            })
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        Err(HvfGicError::Unsupported(
+            crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+        ))
+    }
+
+    pub(crate) fn capture(
+        &self,
+        vcpu: crate::ffi::HvVcpu,
+    ) -> Result<HvfArm64GicIccRegisterState, HvfGicError> {
+        capture_arm64_gic_icc_register_state_with_api(self.api.as_ref(), vcpu)
+    }
+
+    #[cfg(test)]
+    fn with_api(api: impl HvfGicIccRegisterApi + 'static) -> Self {
+        Self { api: Box::new(api) }
+    }
+}
+
+impl fmt::Debug for HvfGicIccRegisterReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicIccRegisterReader")
             .finish_non_exhaustive()
     }
 }
@@ -1051,6 +1184,18 @@ fn capture_gic_device_state_with_api<Api: HvfGicStateApi + ?Sized>(
     Ok(HvfGicDeviceState::new(bytes))
 }
 
+fn capture_arm64_gic_icc_register_state_with_api<Api: HvfGicIccRegisterApi + ?Sized>(
+    api: &Api,
+    vcpu: crate::ffi::HvVcpu,
+) -> Result<HvfArm64GicIccRegisterState, HvfGicError> {
+    let mut values = [0; ARM64_GIC_EL1_ICC_REGISTERS.len()];
+    for (value, register) in values.iter_mut().zip(ARM64_GIC_EL1_ICC_REGISTERS) {
+        *value = api.get_icc_reg(vcpu, register)?;
+    }
+
+    Ok(HvfArm64GicIccRegisterState::new(values))
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_real_gic() -> Result<HvfGicMetadata, HvfGicError> {
     let api = LoadedHvfGicApi::load()?;
@@ -1083,6 +1228,7 @@ mod dynamic {
     type HvGicStateCreate = unsafe extern "C" fn() -> *mut c_void;
     type HvGicStateGetSize = unsafe extern "C" fn(*mut c_void, *mut usize) -> HvReturn;
     type HvGicStateGetData = unsafe extern "C" fn(*mut c_void, *mut c_void) -> HvReturn;
+    type HvGicGetIccReg = unsafe extern "C" fn(u64, u16, *mut u64) -> HvReturn;
     type HvGicGetSize = unsafe extern "C" fn(*mut usize) -> HvReturn;
     type HvGicGetSpiRange = unsafe extern "C" fn(*mut u32, *mut u32) -> HvReturn;
     type HvGicGetIntid = unsafe extern "C" fn(u16, *mut u32) -> HvReturn;
@@ -1109,6 +1255,11 @@ mod dynamic {
     pub(super) struct LoadedHvfGicStateCaptureApi {
         _library: DynamicLibrary,
         symbols: HvfGicStateCaptureSymbols,
+    }
+
+    pub(super) struct LoadedHvfGicIccRegisterApi {
+        _library: DynamicLibrary,
+        symbols: HvfGicIccRegisterSymbols,
     }
 
     struct DynamicLibrary {
@@ -1152,6 +1303,11 @@ mod dynamic {
         state_get_size: HvGicStateGetSize,
         state_get_data: HvGicStateGetData,
         os_release: OsRelease,
+    }
+
+    #[derive(Clone, Copy)]
+    struct HvfGicIccRegisterSymbols {
+        get_icc_reg: HvGicGetIccReg,
     }
 
     impl LoadedHvfGicApi {
@@ -1230,6 +1386,18 @@ mod dynamic {
         }
     }
 
+    impl LoadedHvfGicIccRegisterApi {
+        pub(super) fn load() -> Result<Self, HvfGicError> {
+            let library = DynamicLibrary::open(HYPERVISOR_FRAMEWORK_PATH)?;
+            let symbols = HvfGicIccRegisterSymbols::load(library.handle())?;
+
+            Ok(Self {
+                _library: library,
+                symbols,
+            })
+        }
+    }
+
     impl fmt::Debug for LoadedHvfGicPpiPendingApi {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("LoadedHvfGicPpiPendingApi")
@@ -1240,6 +1408,13 @@ mod dynamic {
     impl fmt::Debug for LoadedHvfGicStateCaptureApi {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("LoadedHvfGicStateCaptureApi")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl fmt::Debug for LoadedHvfGicIccRegisterApi {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("LoadedHvfGicIccRegisterApi")
                 .finish_non_exhaustive()
         }
     }
@@ -1377,6 +1552,14 @@ mod dynamic {
                     c"os_release",
                     "os_release",
                 )?,
+            })
+        }
+    }
+
+    impl HvfGicIccRegisterSymbols {
+        fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
+            Ok(Self {
+                get_icc_reg: load_symbol(library, c"hv_gic_get_icc_reg", "hv_gic_get_icc_reg")?,
             })
         }
     }
@@ -1600,6 +1783,22 @@ mod dynamic {
         }
     }
 
+    impl super::HvfGicIccRegisterApi for LoadedHvfGicIccRegisterApi {
+        fn get_icc_reg(&self, vcpu: crate::ffi::HvVcpu, register: u16) -> Result<u64, HvfGicError> {
+            let mut value = 0;
+            // SAFETY: `vcpu` is a live current-thread vCPU id, `register` is
+            // one of the SDK's `hv_gic_icc_reg_t` values, and `value` is a
+            // valid out-pointer for the duration of this loaded ABI call.
+            unsafe {
+                crate::ffi::check(
+                    (self.symbols.get_icc_reg)(vcpu, register, &mut value),
+                    "hv_gic_get_icc_reg",
+                )?
+            };
+            Ok(value)
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::ffi::c_void;
@@ -1648,8 +1847,8 @@ mod dynamic {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use dynamic::{
-    LoadedHvfGicApi, LoadedHvfGicPpiPendingApi, LoadedHvfGicSpiSignalApi,
-    LoadedHvfGicStateCaptureApi,
+    LoadedHvfGicApi, LoadedHvfGicIccRegisterApi, LoadedHvfGicPpiPendingApi,
+    LoadedHvfGicSpiSignalApi, LoadedHvfGicStateCaptureApi,
 };
 
 #[cfg(test)]
@@ -1667,9 +1866,10 @@ mod tests {
     use bangbang_runtime::interrupt::{GuestInterruptLine, GuestInterruptLineError, InterruptSink};
 
     use super::{
-        GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE, GicConfigGuard, HV_GIC_INT_EL1_PHYSICAL_TIMER,
-        HV_GIC_INT_EL1_VIRTUAL_TIMER, HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0,
-        HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, HvfGicApi, HvfGicDeviceState, HvfGicError,
+        ARM64_GIC_EL1_ICC_REGISTERS, GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE, GicConfigGuard,
+        HV_GIC_INT_EL1_PHYSICAL_TIMER, HV_GIC_INT_EL1_VIRTUAL_TIMER,
+        HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0, HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, HvfGicApi,
+        HvfGicDeviceState, HvfGicError, HvfGicIccRegisterApi, HvfGicIccRegisterReader,
         HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata,
         HvfGicParameters, HvfGicPpiPendingWriter, HvfGicRegion, HvfGicSpiSignalError,
         HvfGicSpiSignaler, HvfGicStateApi, HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
@@ -1680,6 +1880,111 @@ mod tests {
     const REDIST_REGION_SIZE: u64 = 0x2_0000;
     const REDIST_SIZE: u64 = 0x2_0000;
     const ALIGNMENT: u64 = 0x1_0000;
+
+    #[test]
+    fn captures_all_arm64_gic_icc_registers_in_sdk_order() {
+        let api = FakeGicIccRegisterApi::default();
+        let reader = HvfGicIccRegisterReader::with_api(api.clone());
+
+        let state = reader
+            .capture(7)
+            .expect("arm64 GIC ICC register state should be captured");
+
+        assert_eq!(
+            state.pmr_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[0])
+        );
+        assert_eq!(
+            state.bpr0_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[1])
+        );
+        assert_eq!(
+            state.ap0r0_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[2])
+        );
+        assert_eq!(
+            state.ap1r0_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[3])
+        );
+        assert_eq!(
+            state.rpr_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[4])
+        );
+        assert_eq!(
+            state.bpr1_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[5])
+        );
+        assert_eq!(
+            state.ctlr_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[6])
+        );
+        assert_eq!(
+            state.sre_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[7])
+        );
+        assert_eq!(
+            state.igrpen0_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[8])
+        );
+        assert_eq!(
+            state.igrpen1_el1(),
+            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[9])
+        );
+        assert_eq!(
+            api.calls(),
+            ARM64_GIC_EL1_ICC_REGISTERS
+                .map(|register| (7, register))
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn every_arm64_gic_icc_read_failure_is_atomic_and_retryable() {
+        for (failed_index, failed_register) in ARM64_GIC_EL1_ICC_REGISTERS.into_iter().enumerate() {
+            let api = FakeGicIccRegisterApi::default().with_failure(failed_register);
+            let reader = HvfGicIccRegisterReader::with_api(api.clone());
+
+            assert_eq!(
+                reader.capture(11),
+                Err(HvfGicError::Backend(BackendError::Hypervisor(format!(
+                    "injected ICC register 0x{failed_register:x} failure"
+                ))))
+            );
+            assert_eq!(api.calls().len(), failed_index + 1);
+            assert_eq!(api.calls().last(), Some(&(11, failed_register)));
+
+            let state = reader
+                .capture(11)
+                .expect("ICC capture should restart cleanly after a failed read");
+            assert_eq!(
+                state.pmr_el1(),
+                fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[0])
+            );
+            assert_eq!(
+                &api.calls()[failed_index + 1..],
+                &ARM64_GIC_EL1_ICC_REGISTERS.map(|register| (11, register))
+            );
+        }
+    }
+
+    #[test]
+    fn arm64_gic_icc_capture_preserves_backend_error_source() {
+        let failed_register = ARM64_GIC_EL1_ICC_REGISTERS[0];
+        let reader = HvfGicIccRegisterReader::with_api(
+            FakeGicIccRegisterApi::default().with_failure(failed_register),
+        );
+
+        let err = reader
+            .capture(7)
+            .expect_err("injected ICC read failure should propagate");
+
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some(format!(
+                "hypervisor error: injected ICC register 0x{failed_register:x} failure"
+            ))
+        );
+    }
 
     #[test]
     fn captures_opaque_gic_device_state_and_releases_object() {
@@ -2886,6 +3191,65 @@ mod tests {
 
     fn line(value: u32) -> GuestInterruptLine {
         GuestInterruptLine::new(value).expect("test interrupt line should be valid")
+    }
+
+    fn fake_icc_value(register: u16) -> u64 {
+        0xa5a5_0000_0000_0000 | u64::from(register)
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FakeGicIccRegisterApi {
+        state: Arc<Mutex<FakeGicIccRegisterApiState>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeGicIccRegisterApiState {
+        calls: Vec<(crate::ffi::HvVcpu, u16)>,
+        fail_next_register: Option<u16>,
+    }
+
+    impl FakeGicIccRegisterApi {
+        fn with_failure(self, register: u16) -> Self {
+            self.state
+                .lock()
+                .expect("fake GIC ICC API should be lockable")
+                .fail_next_register = Some(register);
+            self
+        }
+
+        fn calls(&self) -> Vec<(crate::ffi::HvVcpu, u16)> {
+            self.state
+                .lock()
+                .expect("fake GIC ICC API should be lockable")
+                .calls
+                .clone()
+        }
+    }
+
+    impl HvfGicIccRegisterApi for FakeGicIccRegisterApi {
+        fn get_icc_reg(&self, vcpu: crate::ffi::HvVcpu, register: u16) -> Result<u64, HvfGicError> {
+            let should_fail = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("fake GIC ICC API should be lockable");
+                state.calls.push((vcpu, register));
+                if state.fail_next_register == Some(register) {
+                    state.fail_next_register = None;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if should_fail {
+                Err(HvfGicError::Backend(BackendError::Hypervisor(format!(
+                    "injected ICC register 0x{register:x} failure"
+                ))))
+            } else {
+                Ok(fake_icc_value(register))
+            }
+        }
     }
 
     #[derive(Debug, Clone)]

@@ -1685,7 +1685,17 @@ expose the redacted immutable value. The bytes are not parsed or persisted,
 have no restore validation or bangbang/Firecracker schema, and can still become
 incompatible after a host software update. The command does not quiesce
 device-side SPI producers. The process snapshot barrier invokes none of these
-captures; multi-vCPU stopping and ICC/ICH/ICV capture remain future work.
+captures.
+
+A companion failure-atomic command captures the ten EL1 ICC CPU-interface
+registers exposed by Hypervisor.framework: PMR, BPR0, AP0R0, AP1R0, RPR, BPR1,
+CTLR, SRE, IGRPEN0, and IGRPEN1. All reads execute on the vCPU owner thread and
+share generalized interrupt admission with CPU pending, GIC PPI, and opaque GIC
+device-state operations. Both boot-session forms expose the fixed typed value.
+It is per-vCPU and separate from the VM-scoped opaque blob; neither value is
+persisted or restored. The process snapshot barrier invokes neither command,
+and `ICC_SRE_EL2`, ICH/ICV, compatible restore ordering, and multi-vCPU
+association remain future work.
 
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared
@@ -2022,6 +2032,8 @@ macOS design work instead of direct implementation:
   thread and can capture those fields through one serialized command. It can
   also capture Hypervisor.framework's stable, versioned opaque GIC device blob
   except CPU system registers while the current single-vCPU runner is stopped.
+  A companion owner-thread command captures all ten EL1 ICC CPU-interface
+  registers exposed by the current SDK as a separate per-vCPU value.
   None of these subsets is a complete or portable restore model. The
   runner explicitly dispatches one resolved MMIO access through a shared runtime
   dispatcher on the owning thread, runs once and handles a resulting
