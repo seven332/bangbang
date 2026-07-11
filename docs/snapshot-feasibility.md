@@ -119,18 +119,19 @@ APDA, APDB, and APGA in that order and publishes five 128-bit keys only after
 all ten owner-thread reads succeed. Pointer-authentication keys are
 cryptographic secrets, so the detached value redacts all key material from
 `Debug`; its named accessors remain available only for trusted internal
-composition. It shares the core-register admission domain, and both boot-
-session forms expose capture without involving the supervisor lease or public
-snapshot paths. The value defines no feature/algorithm validation, memory
+composition. It shares the core-register admission domain, and both
+boot-session forms expose capture without involving the supervisor lease or
+public snapshot paths. The value defines no feature/algorithm validation, memory
 zeroization, protected persistence, enable ordering, restore, or schema policy.
 Signed coverage uses visibly fake keys and never enables or executes PAC.
 
 Another core-register command reads all 16 bytes of Q0-Q31 in ascending order,
 then raw FPCR and FPSR, and publishes one immutable baseline SIMD/FP value only
 after all 34 reads succeed. It shares the general/core-system/exception/
-execution-control/translation/pointer-authentication/thread-context command-
-owned admission domain and is exposed through both boot-session forms without involving the supervisor
-lease or public snapshot paths. Hypervisor.framework aliases Q registers to the
+execution-control/translation/pointer-authentication/thread-context
+command-owned admission domain and is exposed through both boot-session forms
+without involving the supervisor lease or public snapshot paths.
+Hypervisor.framework aliases Q registers to the
 low 128 bits of Z registers in streaming SVE mode; this subset therefore omits
 the wider SVE/SME state and defines no restore or snapshot-schema contract.
 
@@ -139,8 +140,8 @@ Another core-register command reads raw `TPIDR_EL0`, `TPIDRRO_EL0`, and
 reads succeed. These software thread-ID fields can contain guest TLS or kernel
 pointers. The command shares failure-atomic admission with the general,
 stack/exception-return, exception-report, execution-control, translation,
-pointer-authentication, and SIMD/FP captures and is exposed through both boot-
-session forms. It omits
+pointer-authentication, and SIMD/FP captures and is exposed through both
+boot-session forms. It omits
 `TPIDR2_EL0`, wider system state, validation, persistence, and restore; the
 supervisor lease and public snapshot paths do not invoke it.
 
@@ -392,10 +393,10 @@ tested:
   Remaining system registers, SVE/SME, and other optional architecture state
   still need a full inventory; the raw virtual-timer offset and absolute
   physical-timer comparator need explicit restore-time adjustment policies;
-  derived ISTATUS observations are not control-restore contracts; pointer-
-  authentication keys need feature validation, protected persistence, and safe
-  enable ordering; and every captured field still needs a restore path on the
-  owning thread.
+  derived ISTATUS observations are not control-restore contracts;
+  pointer-authentication keys need feature validation, protected persistence,
+  and safe enable ordering; and every captured field still needs a restore path
+  on the owning thread.
 - Interrupt-controller state: #1178 captures Apple's stable, versioned opaque
   GIC device blob except CPU system registers, and #1180 captures all ten EL1
   ICC registers exposed by the current SDK. `ICC_SRE_EL2`, ICH/ICV inventory,

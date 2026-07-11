@@ -48,9 +48,10 @@ backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary,
-pointer-authentication key-state capture with redacted `Debug`, raw physical-
-timer capture, a virtual-timer mask/offset/control/CVAL boundary, a bounded internal boot-session
-run-loop pump, owned internal boot-session handle, process-level owned
+pointer-authentication key-state capture with redacted `Debug`, raw
+physical-timer capture, a virtual-timer mask/offset/control/CVAL boundary, a
+bounded internal boot-session run-loop pump, owned internal boot-session handle,
+process-level owned
 startup-session wiring with optional serial capture and boot run-loop supervision
 across bounded step windows with retained internal worker status, process-owned
 virtio-net packet-I/O provider selection with no-op fallback and vmnet-backed
