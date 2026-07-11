@@ -142,6 +142,11 @@ and MDSCR_EL1 from an idle real vCPU without hard-coding or logging their raw
 values. They must not call register or debug-trap setters, run guest debug
 instructions, enable monitor debug or software stepping, or treat the two
 fields as complete or safely restorable debug state.
+Debug-trap signed tests must capture both Hypervisor.framework policy booleans
+twice from an idle real vCPU without assuming, comparing, or logging their
+values. They must not call either trap setter, run the vCPU, execute guest/debug
+instructions, activate debug behavior, or treat host TDE/TDA-equivalent policy
+as guest register state or safely restorable configuration.
 Physical-timer signed tests require macOS 15 and must create the GIC before the
 vCPU. They must keep CNTP disabled and masked, assert writable control bits
 separately from derived ISTATUS, and avoid claiming that an absolute CVAL can be
