@@ -82,6 +82,15 @@ signed executable/HVF coverage in dedicated integration targets.
 
 For guest memory, address, and range logic, cover exact-fit success, one-past
 failure, overflow failure, overlapping ranges, and no-partial-mutation behavior.
+Native snapshot memory tests additionally pin both binary headers and CRC
+golden bytes; preserve discontiguous, adjacent, and dynamically inserted region
+boundaries; cross every fixed I/O chunk boundary; reject malformed counts,
+lengths, offsets, alignment, ordering, overlap, identity, and integrity; and
+inject short, interrupted, zero-progress, seek, allocation, and guest-access
+failures. Length-preflight tests must prove zero-position restoration before a
+rejection, while late truncation/growth tests prove the final trailer/EOF guard
+and that partial anonymous memory never escapes. Run the focused module with
+`cargo test -p bangbang-runtime snapshot_memory --locked`.
 
 For process, socket, and multi-bangbang behavior, cover unique resource names,
 stale socket handling, shutdown cleanup, replacement races, and concurrent runs

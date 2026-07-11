@@ -13,7 +13,7 @@ const SNAPSHOT_ARCHITECTURE_OFFSET: usize = 14;
 const SNAPSHOT_GUEST_PAGE_SIZE_OFFSET: usize = 16;
 const SNAPSHOT_RESERVED_FLAGS_OFFSET: usize = 20;
 const SNAPSHOT_PAYLOAD_LENGTH_OFFSET: usize = 24;
-const NATIVE_V1_ARM64_ARCHITECTURE_ID: u16 = 1;
+pub(crate) const NATIVE_V1_ARM64_ARCHITECTURE_ID: u16 = 1;
 const NATIVE_V1_RESERVED_FLAGS: u32 = 0;
 const REDACTED: &str = "<redacted>";
 
@@ -43,7 +43,7 @@ pub struct SnapshotFormatVersion {
 }
 
 impl SnapshotFormatVersion {
-    const fn new(major: u16, minor: u16, patch: u16) -> Self {
+    pub(crate) const fn new(major: u16, minor: u16, patch: u16) -> Self {
         Self {
             major,
             minor,

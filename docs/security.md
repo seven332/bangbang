@@ -254,6 +254,18 @@ is resource-specific:
   it is not authentication, and a party that can rewrite the file can recompute
   it. Future payload schemas must therefore stay memory-safe and fail closed
   even for checksum-valid attacker-controlled bytes.
+- Native guest-memory bindings and images are also untrusted. The binding caps
+  metadata at 4,096 exact GPA ranges / 98,376 encoded bytes and memory data at
+  the current 1,022-GiB arm64 policy, checks every conversion, alignment,
+  overlap, sum, absolute offset, and file length, and allocates no guest memory
+  until a seekable input reports the state-bound exact length and header
+  identity. Streaming uses one fallible 1 MiB buffer; partially initialized
+  anonymous memory is never returned. Handle errors retain only a fixed stage
+  and `ErrorKind`; image IDs, checksums, guest bytes, and host paths stay out of
+  diagnostics. The random image ID and CRC detect mismatched or accidentally
+  corrupt pairs but do not authenticate an actor able to rewrite both files.
+  These helpers open, truncate, flush, sync, publish, and clean no path; future
+  publication must add no-clobber ownership and replacement-safe cleanup.
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
   ACTLR_EL1/CPACR_EL1 execution controls, raw CSSELR_EL1 cache selection, raw

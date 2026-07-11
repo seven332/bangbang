@@ -21,6 +21,7 @@ pub mod rtc;
 pub mod serial;
 pub mod snapshot;
 pub mod snapshot_format;
+pub mod snapshot_memory;
 pub mod startup;
 pub(crate) mod token_bucket;
 pub mod virtio_mmio;
