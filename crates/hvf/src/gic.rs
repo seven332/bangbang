@@ -1867,7 +1867,10 @@ mod tests {
 
     use super::{
         ARM64_GIC_EL1_ICC_REGISTERS, GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE, GicConfigGuard,
-        HV_GIC_INT_EL1_PHYSICAL_TIMER, HV_GIC_INT_EL1_VIRTUAL_TIMER,
+        HV_GIC_ICC_REG_AP0R0_EL1, HV_GIC_ICC_REG_AP1R0_EL1, HV_GIC_ICC_REG_BPR0_EL1,
+        HV_GIC_ICC_REG_BPR1_EL1, HV_GIC_ICC_REG_CTLR_EL1, HV_GIC_ICC_REG_IGRPEN0_EL1,
+        HV_GIC_ICC_REG_IGRPEN1_EL1, HV_GIC_ICC_REG_PMR_EL1, HV_GIC_ICC_REG_RPR_EL1,
+        HV_GIC_ICC_REG_SRE_EL1, HV_GIC_INT_EL1_PHYSICAL_TIMER, HV_GIC_INT_EL1_VIRTUAL_TIMER,
         HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0, HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, HvfGicApi,
         HvfGicDeviceState, HvfGicError, HvfGicIccRegisterApi, HvfGicIccRegisterReader,
         HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata,
@@ -1890,45 +1893,21 @@ mod tests {
             .capture(7)
             .expect("arm64 GIC ICC register state should be captured");
 
-        assert_eq!(
-            state.pmr_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[0])
-        );
-        assert_eq!(
-            state.bpr0_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[1])
-        );
-        assert_eq!(
-            state.ap0r0_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[2])
-        );
-        assert_eq!(
-            state.ap1r0_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[3])
-        );
-        assert_eq!(
-            state.rpr_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[4])
-        );
-        assert_eq!(
-            state.bpr1_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[5])
-        );
-        assert_eq!(
-            state.ctlr_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[6])
-        );
-        assert_eq!(
-            state.sre_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[7])
-        );
+        assert_eq!(state.pmr_el1(), fake_icc_value(HV_GIC_ICC_REG_PMR_EL1));
+        assert_eq!(state.bpr0_el1(), fake_icc_value(HV_GIC_ICC_REG_BPR0_EL1));
+        assert_eq!(state.ap0r0_el1(), fake_icc_value(HV_GIC_ICC_REG_AP0R0_EL1));
+        assert_eq!(state.ap1r0_el1(), fake_icc_value(HV_GIC_ICC_REG_AP1R0_EL1));
+        assert_eq!(state.rpr_el1(), fake_icc_value(HV_GIC_ICC_REG_RPR_EL1));
+        assert_eq!(state.bpr1_el1(), fake_icc_value(HV_GIC_ICC_REG_BPR1_EL1));
+        assert_eq!(state.ctlr_el1(), fake_icc_value(HV_GIC_ICC_REG_CTLR_EL1));
+        assert_eq!(state.sre_el1(), fake_icc_value(HV_GIC_ICC_REG_SRE_EL1));
         assert_eq!(
             state.igrpen0_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[8])
+            fake_icc_value(HV_GIC_ICC_REG_IGRPEN0_EL1)
         );
         assert_eq!(
             state.igrpen1_el1(),
-            fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[9])
+            fake_icc_value(HV_GIC_ICC_REG_IGRPEN1_EL1)
         );
         assert_eq!(
             api.calls(),
@@ -1956,10 +1935,7 @@ mod tests {
             let state = reader
                 .capture(11)
                 .expect("ICC capture should restart cleanly after a failed read");
-            assert_eq!(
-                state.pmr_el1(),
-                fake_icc_value(ARM64_GIC_EL1_ICC_REGISTERS[0])
-            );
+            assert_eq!(state.pmr_el1(), fake_icc_value(HV_GIC_ICC_REG_PMR_EL1));
             assert_eq!(
                 &api.calls()[failed_index + 1..],
                 &ARM64_GIC_EL1_ICC_REGISTERS.map(|register| (11, register))
