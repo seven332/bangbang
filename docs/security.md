@@ -821,6 +821,15 @@ the guest entry, context, registers, memory contents, and host pointers remain
 redacted. An entry is accepted only when four-byte aligned and contained in the
 already mapped guest RAM.
 
+Public `InstanceStart` now exposes the same topology for counts through
+`min(32, host_max)`; it does not add another owner or capacity authority. A
+capacity or later construction failure publishes no partial session and cannot
+commit `Running`. Public pause returns only after the aggregate active snapshot
+drains, and process shutdown, guest off/reset, SIGINT/SIGTERM, or a runner fault
+all converge on the same aggregate stop/join and reverse owner teardown. Signed
+dual-process tests keep sockets, serial paths, and lifecycle controls isolated;
+faults continue to redact host paths and guest/HVF values.
+
 Online peers may hold the shared MMIO dispatcher while the boot worker handles
 another member's completed step. Runtime notification dispatch therefore waits
 for that short owner critical section under the existing guest-memory then

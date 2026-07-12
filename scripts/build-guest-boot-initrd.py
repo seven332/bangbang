@@ -16,6 +16,10 @@ BLOCK_WRITE_MARKER = b"BANGBANG_BLOCK_WRITE_OK"
 BLOCK_WRITE_SECTOR_SIZE = 512
 ROOTFS_READ_MARKER = b"BANGBANG_ROOTFS_READ_OK"
 SMP_SECONDARY_MARKER = b"BANGBANG_SECONDARY_CPU_OK\n"
+SMP_PROGRESS_READY_MARKER = b"BBSMPREADY\n"
+SMP_PROGRESS_CPU0_TOKEN = b"\xa5"
+SMP_PROGRESS_CPU1_TOKEN = b"\xd3"
+SMP_PROGRESS_CHILD_STACK_SIZE = 4096
 ROOTFS_OS_RELEASE_READ_SIZE = 256
 CMDLINE_BEGIN_MARKER = b"BANGBANG_CMDLINE_BEGIN\n"
 CMDLINE_END_MARKER = b"BANGBANG_CMDLINE_END\n"
@@ -39,7 +43,9 @@ ELF_HEADER_SIZE = 0x40
 ELF_PROGRAM_HEADER_SIZE = 0x38
 
 AT_FDCWD_U64 = (1 << 64) - 100
+AARCH64_COND_EQ = 0
 AARCH64_COND_NE = 1
+AARCH64_COND_MI = 4
 LINUX_MOUNT_FLAG_RDONLY = 1
 LINUX_OPEN_FLAG_RDWR = 2
 LINUX_AARCH64_SYSCALL_MOUNT = 40
@@ -50,7 +56,11 @@ LINUX_AARCH64_SYSCALL_FSYNC = 82
 LINUX_AARCH64_SYSCALL_EXIT = 93
 LINUX_AARCH64_SYSCALL_REBOOT = 142
 LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY = 122
+LINUX_AARCH64_SYSCALL_SCHED_YIELD = 124
 LINUX_AARCH64_SYSCALL_GETCPU = 168
+LINUX_AARCH64_SYSCALL_CLONE = 220
+LINUX_CLONE_VM = 0x100
+LINUX_SIGCHLD = 17
 LINUX_REBOOT_MAGIC1 = 0xFEE1DEAD
 LINUX_REBOOT_MAGIC2 = 0x28121969
 LINUX_REBOOT_CMD_RESTART = 0x01234567
@@ -111,6 +121,16 @@ def ldr_u32(destination: int, base: int) -> bytes:
     return struct.pack("<I", instruction)
 
 
+def ldar_u32(destination: int, base: int) -> bytes:
+    instruction = 0x88DFFC00 | (base << 5) | destination
+    return struct.pack("<I", instruction)
+
+
+def stlr_u32(source: int, base: int) -> bytes:
+    instruction = 0x889FFC00 | (base << 5) | source
+    return struct.pack("<I", instruction)
+
+
 def branch_to_self() -> bytes:
     return struct.pack("<I", 0x14000000)
 
@@ -120,6 +140,7 @@ class Aarch64CodeBuilder:
         self._data = bytearray()
         self._labels: dict[str, int] = {}
         self._conditional_branches: list[tuple[int, str, int]] = []
+        self._unconditional_branches: list[tuple[int, str]] = []
 
     def emit(self, data: bytes) -> None:
         if len(data) % 4 != 0:
@@ -138,6 +159,11 @@ class Aarch64CodeBuilder:
         self._conditional_branches.append((offset, label, condition))
         self.emit(bytes(4))
 
+    def branch(self, label: str) -> None:
+        offset = len(self._data)
+        self._unconditional_branches.append((offset, label))
+        self.emit(bytes(4))
+
     def build(self) -> bytes:
         data = bytearray(self._data)
         for offset, label, condition in self._conditional_branches:
@@ -152,6 +178,19 @@ class Aarch64CodeBuilder:
             if not -(1 << 18) <= immediate < (1 << 18):
                 raise RuntimeError("AArch64 conditional branch target is out of range")
             instruction = 0x54000000 | ((immediate & 0x7FFFF) << 5) | condition
+            data[offset : offset + 4] = struct.pack("<I", instruction)
+        for offset, label in self._unconditional_branches:
+            try:
+                target = self._labels[label]
+            except KeyError as err:
+                raise RuntimeError(f"unknown AArch64 label: {label}") from err
+            delta = target - offset
+            if delta % 4 != 0:
+                raise RuntimeError("AArch64 branch target is not aligned")
+            immediate = delta // 4
+            if not -(1 << 25) <= immediate < (1 << 25):
+                raise RuntimeError("AArch64 branch target is out of range")
+            instruction = 0x14000000 | (immediate & 0x3FFFFFF)
             data[offset : offset + 4] = struct.pack("<I", instruction)
         return bytes(data)
 
@@ -526,6 +565,206 @@ def build_smp_init_elf() -> bytes:
     return build_guest_elf(code, data)
 
 
+def smp_progress_init_data(code_size: int) -> list[tuple[str, bytes]]:
+    data = [
+        ("cpu0_affinity_mask", struct.pack("<Q", 1 << 0)),
+        ("cpu1_affinity_mask", struct.pack("<Q", 1 << 1)),
+        ("cpu0_observed", bytes(4)),
+        ("cpu1_observed", bytes(4)),
+        ("cpu1_ready", bytes(4)),
+        ("start", bytes(4)),
+        ("ready_marker", SMP_PROGRESS_READY_MARKER),
+        ("cpu0_token", SMP_PROGRESS_CPU0_TOKEN),
+        ("cpu1_token", SMP_PROGRESS_CPU1_TOKEN),
+    ]
+    stack_offset = ELF_CODE_OFFSET + code_size + sum(len(value) for _name, value in data)
+    data.append(("stack_padding", bytes((-stack_offset) % 16)))
+    data.append(("child_stack", bytes(SMP_PROGRESS_CHILD_STACK_SIZE)))
+    return data
+
+
+def smp_progress_init_addresses(code_size: int) -> dict[str, int]:
+    addresses: dict[str, int] = {}
+    data_offset = ELF_CODE_OFFSET + code_size
+    for name, data in smp_progress_init_data(code_size):
+        addresses[name] = ELF_BASE_VADDR + data_offset
+        data_offset += len(data)
+    return addresses
+
+
+def emit_smp_progress_affinity_check(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    affinity_mask: str,
+    observed_cpu: str,
+    expected_cpu: int,
+) -> None:
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 0),
+                movz_64(1, 8),
+                mov_imm_64(2, addresses[affinity_mask]),
+                movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, addresses[observed_cpu]),
+                movz_64(1, 0),
+                movz_64(2, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_GETCPU),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(mov_imm_64(1, addresses[observed_cpu]))
+    code.emit(ldr_u32(0, 1))
+    code.emit(cmp_imm_64(0, expected_cpu))
+    code.branch_cond("failure", AARCH64_COND_NE)
+
+
+def emit_smp_progress_loop(
+    code: Aarch64CodeBuilder,
+    *,
+    label: str,
+    token_address: int,
+) -> None:
+    code.label(label)
+    code.emit(write_syscall(1, token_address, 1))
+    code.emit(
+        b"".join(
+            (
+                movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_YIELD),
+                svc_0(),
+            )
+        )
+    )
+    code.branch(label)
+
+
+def build_smp_progress_init_code(addresses: dict[str, int]) -> bytes:
+    code = Aarch64CodeBuilder()
+    emit_smp_progress_affinity_check(
+        code,
+        addresses,
+        affinity_mask="cpu0_affinity_mask",
+        observed_cpu="cpu0_observed",
+        expected_cpu=0,
+    )
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, LINUX_CLONE_VM | LINUX_SIGCHLD),
+                mov_imm_64(
+                    1,
+                    addresses["child_stack"] + SMP_PROGRESS_CHILD_STACK_SIZE,
+                ),
+                movz_64(2, 0),
+                movz_64(3, 0),
+                movz_64(4, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_CLONE),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_MI)
+    code.branch_cond("child", AARCH64_COND_EQ)
+
+    code.label("parent_wait_ready")
+    code.emit(mov_imm_64(1, addresses["cpu1_ready"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(cmp_imm_64(0, 1))
+    code.branch_cond("parent_wait_ready", AARCH64_COND_NE)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["ready_marker"],
+            len(SMP_PROGRESS_READY_MARKER),
+        )
+    )
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 1),
+                mov_imm_64(1, addresses["start"]),
+                stlr_u32(0, 1),
+            )
+        )
+    )
+    emit_smp_progress_loop(
+        code,
+        label="cpu0_progress",
+        token_address=addresses["cpu0_token"],
+    )
+
+    code.label("child")
+    emit_smp_progress_affinity_check(
+        code,
+        addresses,
+        affinity_mask="cpu1_affinity_mask",
+        observed_cpu="cpu1_observed",
+        expected_cpu=1,
+    )
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 1),
+                mov_imm_64(1, addresses["cpu1_ready"]),
+                stlr_u32(0, 1),
+            )
+        )
+    )
+    code.label("child_wait_start")
+    code.emit(mov_imm_64(1, addresses["start"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(cmp_imm_64(0, 1))
+    code.branch_cond("child_wait_start", AARCH64_COND_NE)
+    emit_smp_progress_loop(
+        code,
+        label="cpu1_progress",
+        token_address=addresses["cpu1_token"],
+    )
+
+    code.label("failure")
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 1),
+                movz_64(8, LINUX_AARCH64_SYSCALL_EXIT),
+                svc_0(),
+                branch_to_self(),
+            )
+        )
+    )
+    return code.build()
+
+
+def build_smp_progress_init_elf() -> bytes:
+    placeholder_addresses = {
+        name: ELF_BASE_VADDR for name, _data in smp_progress_init_data(0)
+    }
+    code_size = len(build_smp_progress_init_code(placeholder_addresses))
+    addresses = smp_progress_init_addresses(code_size)
+    code = build_smp_progress_init_code(addresses)
+    if len(code) != code_size:
+        raise RuntimeError("guest SMP progress init code size changed after address assignment")
+    if addresses["child_stack"] % 16 != 0:
+        raise RuntimeError("guest SMP progress child stack is not 16-byte aligned")
+
+    data = b"".join(data for _name, data in smp_progress_init_data(code_size))
+    return build_guest_elf(code, data)
+
+
 def build_reboot_syscall_init_elf(command: int) -> bytes:
     code = b"".join(
         (
@@ -617,6 +856,7 @@ def cpio_entry(
 def build_initrd() -> bytes:
     guest_init = build_guest_init_elf()
     smp_init = build_smp_init_elf()
+    smp_progress_init = build_smp_progress_init_elf()
     poweroff_init = build_poweroff_init_elf()
     reboot_init = build_reboot_init_elf()
     archive = b"".join(
@@ -650,7 +890,13 @@ def build_initrd() -> bytes:
                 mode=S_IFREG | 0o755,
                 data=smp_init,
             ),
-            cpio_entry(name="TRAILER!!!", ino=9, mode=0, nlink=1),
+            cpio_entry(
+                name="smp-progress-init",
+                ino=9,
+                mode=S_IFREG | 0o755,
+                data=smp_progress_init,
+            ),
+            cpio_entry(name="TRAILER!!!", ino=10, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -783,6 +1029,53 @@ def validate_smp_init_entry(entries: dict[str, dict[str, object]]) -> None:
         raise RuntimeError("guest initrd smp-init payload does not contain SVC #0")
 
 
+def validate_smp_progress_init_entry(entries: dict[str, dict[str, object]]) -> None:
+    entry = required_entry(entries, "smp-progress-init")
+    if file_type(entry["mode"]) != S_IFREG:
+        raise RuntimeError("guest initrd smp-progress-init entry is not a regular file")
+    payload = bytes(entry["payload"])
+    if not payload.startswith(b"\x7fELF"):
+        raise RuntimeError("guest initrd smp-progress-init payload is not an ELF file")
+    if len(payload) < SMP_PROGRESS_CHILD_STACK_SIZE:
+        raise RuntimeError("guest initrd smp-progress-init payload omits the child stack")
+    if (
+        SMP_PROGRESS_READY_MARKER
+        + SMP_PROGRESS_CPU0_TOKEN
+        + SMP_PROGRESS_CPU1_TOKEN
+        not in payload
+    ):
+        raise RuntimeError(
+            "guest initrd smp-progress-init payload omits the ready marker or progress tokens"
+        )
+    affinity_masks = struct.pack("<Q", 1 << 0) + struct.pack("<Q", 1 << 1)
+    if affinity_masks not in payload:
+        raise RuntimeError(
+            "guest initrd smp-progress-init payload omits ordered CPU0/CPU1 affinity masks"
+        )
+    for syscall, description in (
+        (LINUX_AARCH64_SYSCALL_CLONE, "clone"),
+        (LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY, "sched_setaffinity"),
+        (LINUX_AARCH64_SYSCALL_SCHED_YIELD, "sched_yield"),
+        (LINUX_AARCH64_SYSCALL_GETCPU, "getcpu"),
+    ):
+        if movz_64(8, syscall) not in payload:
+            raise RuntimeError(
+                f"guest initrd smp-progress-init payload does not load {description}"
+            )
+    if mov_imm_64(0, LINUX_CLONE_VM | LINUX_SIGCHLD) not in payload:
+        raise RuntimeError("guest initrd smp-progress-init payload omits clone flags")
+    if ldar_u32(0, 1) not in payload or stlr_u32(0, 1) not in payload:
+        raise RuntimeError(
+            "guest initrd smp-progress-init payload omits acquire/release coordination"
+        )
+    if cmp_imm_64(0, 0) not in payload or cmp_imm_64(0, 1) not in payload:
+        raise RuntimeError(
+            "guest initrd smp-progress-init payload does not verify CPU0 and CPU1"
+        )
+    if svc_0() not in payload:
+        raise RuntimeError("guest initrd smp-progress-init payload does not contain SVC #0")
+
+
 def validate_initrd(data: bytes) -> None:
     if not data:
         raise RuntimeError("guest initrd is empty")
@@ -801,6 +1094,7 @@ def validate_initrd(data: bytes) -> None:
         "poweroff-init",
         "reboot-init",
         "smp-init",
+        "smp-progress-init",
         CPIO_TRAILER,
     ]
     if names != expected_names:
@@ -873,6 +1167,7 @@ def validate_initrd(data: bytes) -> None:
         command_description="restart",
     )
     validate_smp_init_entry(entries)
+    validate_smp_progress_init_entry(entries)
 
 
 def default_output_path() -> Path:

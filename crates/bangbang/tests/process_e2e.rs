@@ -36,7 +36,8 @@ const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 const SIGXCPU_EXIT_CODE: i32 = 154;
 const SIGHUP_EXIT_CODE: i32 = 156;
 const SIGILL_EXIT_CODE: i32 = 157;
-const MULTI_VCPU_STARTUP_ERROR: &str = "HVF arm64 boot session supports exactly 1 vCPU, got 2";
+const LEGACY_MULTI_VCPU_STARTUP_ERROR: &str =
+    "HVF arm64 boot session supports exactly 1 vCPU, got 2";
 
 #[test]
 fn executable_prints_help_and_exits_before_socket_publication() {
@@ -1644,7 +1645,7 @@ fn executable_no_api_config_file_balloon_free_page_reporting_fails_before_socket
 }
 
 #[test]
-fn executable_rejects_multi_vcpu_instance_start_without_stopping() {
+fn executable_multi_vcpu_instance_start_reaches_backend_without_stopping() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let kernel_path = test_dir.path().join("private-vmlinux");
@@ -1672,53 +1673,57 @@ fn executable_rejects_multi_vcpu_instance_start_without_stopping() {
     assert_bad_request_response(&start_response, "PUT /actions multi-vCPU start");
     assert_response_contains(
         &start_response,
-        MULTI_VCPU_STARTUP_ERROR,
+        "failed to start microVM",
         "PUT /actions multi-vCPU start",
     );
     assert!(
+        !start_response.contains(LEGACY_MULTI_VCPU_STARTUP_ERROR),
+        "multi-vCPU startup must pass the removed public capability gate; response:\n{start_response}"
+    );
+    assert!(
         !start_response.contains(kernel_path_text),
-        "multi-vCPU startup rejection should not echo the private kernel path; response:\n{start_response}"
+        "multi-vCPU backend failure should not echo the private kernel path; response:\n{start_response}"
     );
     assert!(
         !kernel_path.exists(),
-        "multi-vCPU startup rejection should happen before touching the kernel path"
+        "missing multi-vCPU kernel fixture should remain absent"
     );
 
     let instance_info = http_get(&socket_path, "/");
-    assert_ok_response(&instance_info, "GET / after rejected multi-vCPU start");
+    assert_ok_response(&instance_info, "GET / after failed multi-vCPU start");
     assert_response_contains(
         &instance_info,
         r#""state":"Not started""#,
-        "GET / after rejected multi-vCPU start",
+        "GET / after failed multi-vCPU start",
     );
 
     let machine_config = http_get(&socket_path, "/machine-config");
     assert_ok_response(
         &machine_config,
-        "GET /machine-config after rejected multi-vCPU start",
+        "GET /machine-config after failed multi-vCPU start",
     );
     assert_response_contains(
         &machine_config,
         r#""vcpu_count":2"#,
-        "GET /machine-config after rejected multi-vCPU start",
+        "GET /machine-config after failed multi-vCPU start",
     );
 
     let output = bangbang.terminate();
     assert!(
         !output.stdout.contains(kernel_path_text),
-        "multi-vCPU startup rejection should not write the private kernel path to stdout; stdout:\n{}",
+        "multi-vCPU backend failure should not write the private kernel path to stdout; stdout:\n{}",
         output.stdout
     );
     assert!(
         !output.stderr.contains(kernel_path_text),
-        "multi-vCPU startup rejection should not write the private kernel path to stderr; stderr:\n{}",
+        "multi-vCPU backend failure should not write the private kernel path to stderr; stderr:\n{}",
         output.stderr
     );
     assert_clean_shutdown(output, &socket_path, "bangbang");
 }
 
 #[test]
-fn executable_config_file_multi_vcpu_startup_failure_does_not_publish_socket() {
+fn executable_config_file_multi_vcpu_backend_failure_does_not_publish_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let (config_path, kernel_path) = write_multi_vcpu_startup_config(&test_dir);
@@ -1730,16 +1735,16 @@ fn executable_config_file_multi_vcpu_startup_failure_does_not_publish_socket() {
         &["--config-file", path_text(&config_path)],
     );
 
-    assert_multi_vcpu_startup_failure(
+    assert_multi_vcpu_backend_failure(
         &output,
         &socket_path,
         &kernel_path,
-        "config-file multi-vCPU startup failure",
+        "config-file multi-vCPU backend failure",
     );
 }
 
 #[test]
-fn executable_no_api_config_file_multi_vcpu_startup_failure_does_not_publish_socket() {
+fn executable_no_api_config_file_multi_vcpu_backend_failure_does_not_publish_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let (config_path, kernel_path) = write_multi_vcpu_startup_config(&test_dir);
@@ -1751,11 +1756,11 @@ fn executable_no_api_config_file_multi_vcpu_startup_failure_does_not_publish_soc
         &["--config-file", path_text(&config_path), "--no-api"],
     );
 
-    assert_multi_vcpu_startup_failure(
+    assert_multi_vcpu_backend_failure(
         &output,
         &socket_path,
         &kernel_path,
-        "no-api config-file multi-vCPU startup failure",
+        "no-api config-file multi-vCPU backend failure",
     );
 }
 
@@ -3925,7 +3930,7 @@ fn assert_metadata_failure(
     );
 }
 
-fn assert_multi_vcpu_startup_failure(
+fn assert_multi_vcpu_backend_failure(
     output: &support::CompletedProcess,
     socket_path: &std::path::Path,
     kernel_path: &std::path::Path,
@@ -3961,8 +3966,8 @@ fn assert_multi_vcpu_startup_failure(
         output.stderr
     );
     assert!(
-        output.stderr.contains(MULTI_VCPU_STARTUP_ERROR),
-        "{case_name} stderr should describe the HVF single-vCPU startup limit; stderr:\n{}",
+        !output.stderr.contains(LEGACY_MULTI_VCPU_STARTUP_ERROR),
+        "{case_name} must pass the removed public capability gate; stderr:\n{}",
         output.stderr
     );
     let kernel_path_text = path_text(kernel_path);
@@ -3978,7 +3983,7 @@ fn assert_multi_vcpu_startup_failure(
     );
     assert!(
         !kernel_path.exists(),
-        "{case_name} should fail before touching the kernel path"
+        "{case_name} missing kernel fixture should remain absent"
     );
 }
 
