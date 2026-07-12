@@ -1,24 +1,41 @@
-//! Minimal PSCI-over-HVC responder for the single-vCPU arm64 boot path.
+//! PSCI-over-HVC decoding and secondary-vCPU power-state coordination.
 
 const PSCI_VERSION: u64 = 0x8400_0000;
+const PSCI_CPU_OFF: u64 = 0x8400_0002;
+const PSCI_CPU_ON_32: u64 = 0x8400_0003;
+const PSCI_AFFINITY_INFO_32: u64 = 0x8400_0004;
 const PSCI_MIGRATE_INFO_TYPE: u64 = 0x8400_0006;
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 const PSCI_FEATURES: u64 = 0x8400_000a;
+const PSCI_CPU_ON_64: u64 = 0xc400_0003;
+const PSCI_AFFINITY_INFO_64: u64 = 0xc400_0004;
 const PSCI_VERSION_0_2: u64 = 0x0000_0002;
-const PSCI_RET_SUCCESS: u64 = 0;
-const PSCI_RET_NOT_SUPPORTED: u64 = u64::MAX;
 const PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED: u64 = 2;
+const PSCI_MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
+const PSCI_MPIDR_32_RESERVED_MASK: u64 = 0xff00_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PsciCall {
     function_id: u64,
     arg0: u64,
+    arg1: u64,
+    arg2: u64,
 }
 
 impl PsciCall {
     pub(crate) const fn new(function_id: u64, arg0: u64) -> Self {
-        Self { function_id, arg0 }
+        Self::from_arguments(function_id, [arg0, 0, 0])
+    }
+
+    pub(crate) const fn from_arguments(function_id: u64, arguments: [u64; 3]) -> Self {
+        let [arg0, arg1, arg2] = arguments;
+        Self {
+            function_id,
+            arg0,
+            arg1,
+            arg2,
+        }
     }
 }
 
@@ -26,11 +43,42 @@ pub(crate) const fn call_uses_arg0(function_id: u64) -> bool {
     matches!(function_id, PSCI_FEATURES)
 }
 
-pub(crate) const fn not_supported_result() -> PsciCallResult {
-    PsciCallResult {
-        return_value: PSCI_RET_NOT_SUPPORTED,
-        action: PsciCallAction::Return,
+pub(crate) const fn coordinated_call_argument_count(function_id: u64) -> usize {
+    match function_id {
+        PSCI_CPU_ON_32 | PSCI_CPU_ON_64 => 3,
+        PSCI_AFFINITY_INFO_32 | PSCI_AFFINITY_INFO_64 => 2,
+        PSCI_FEATURES => 1,
+        _ => 0,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciStatus {
+    Success,
+    NotSupported,
+    InvalidParameters,
+    AlreadyOn,
+    OnPending,
+    InternalFailure,
+}
+
+impl PsciStatus {
+    pub(crate) const fn return_value(self) -> u64 {
+        let signed = match self {
+            Self::Success => 0_i32,
+            Self::NotSupported => -1,
+            Self::InvalidParameters => -2,
+            Self::AlreadyOn => -4,
+            Self::OnPending => -5,
+            Self::InternalFailure => -6,
+        };
+
+        (signed as u32) as u64
+    }
+}
+
+pub(crate) const fn not_supported_result() -> PsciCallResult {
+    PsciCallResult::returned(PsciStatus::NotSupported.return_value())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +95,20 @@ pub(crate) struct PsciCallResult {
 }
 
 impl PsciCallResult {
+    const fn returned(return_value: u64) -> Self {
+        Self {
+            return_value,
+            action: PsciCallAction::Return,
+        }
+    }
+
+    const fn terminal(return_value: u64, action: PsciCallAction) -> Self {
+        Self {
+            return_value,
+            action,
+        }
+    }
+
     pub(crate) const fn return_value(self) -> u64 {
         self.return_value
     }
@@ -57,129 +119,1067 @@ impl PsciCallResult {
 }
 
 pub(crate) const fn handle_call(call: PsciCall) -> PsciCallResult {
-    let (return_value, action) = match call.function_id {
-        PSCI_VERSION => (PSCI_VERSION_0_2, PsciCallAction::Return),
-        PSCI_MIGRATE_INFO_TYPE => (
-            PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED,
-            PsciCallAction::Return,
-        ),
-        PSCI_SYSTEM_OFF => (PSCI_RET_SUCCESS, PsciCallAction::SystemOff),
-        PSCI_SYSTEM_RESET => (PSCI_RET_SUCCESS, PsciCallAction::SystemReset),
-        PSCI_FEATURES => {
-            if supports_function(call.arg0) {
-                (PSCI_RET_SUCCESS, PsciCallAction::Return)
-            } else {
-                (PSCI_RET_NOT_SUPPORTED, PsciCallAction::Return)
-            }
+    match call.function_id {
+        PSCI_VERSION => PsciCallResult::returned(PSCI_VERSION_0_2),
+        PSCI_MIGRATE_INFO_TYPE => {
+            PsciCallResult::returned(PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED)
         }
-        _ => (PSCI_RET_NOT_SUPPORTED, PsciCallAction::Return),
-    };
-
-    PsciCallResult {
-        return_value,
-        action,
+        PSCI_SYSTEM_OFF => PsciCallResult::terminal(
+            PsciStatus::Success.return_value(),
+            PsciCallAction::SystemOff,
+        ),
+        PSCI_SYSTEM_RESET => PsciCallResult::terminal(
+            PsciStatus::Success.return_value(),
+            PsciCallAction::SystemReset,
+        ),
+        PSCI_FEATURES => {
+            let status = if supports_legacy_function(call.arg0) {
+                PsciStatus::Success
+            } else {
+                PsciStatus::NotSupported
+            };
+            PsciCallResult::returned(status.return_value())
+        }
+        PSCI_CPU_OFF => not_supported_result(),
+        _ => not_supported_result(),
     }
 }
 
-const fn supports_function(function_id: u64) -> bool {
+const fn supports_legacy_function(function_id: u64) -> bool {
     matches!(
         function_id,
         PSCI_VERSION | PSCI_MIGRATE_INFO_TYPE | PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET | PSCI_FEATURES
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PsciCallingConvention {
+    Smc32,
+    Smc64,
+}
+
+impl PsciCallingConvention {
+    const fn narrow(self, value: u64) -> u64 {
+        match self {
+            Self::Smc32 => (value as u32) as u64,
+            Self::Smc64 => value,
+        }
+    }
+
+    const fn target_mpidr(self, value: u64) -> Option<u64> {
+        let value = self.narrow(value);
+        let has_reserved_bits = match self {
+            Self::Smc32 => value & PSCI_MPIDR_32_RESERVED_MASK != 0,
+            Self::Smc64 => value & !PSCI_MPIDR_AFFINITY_MASK != 0,
+        };
+        if has_reserved_bits { None } else { Some(value) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PsciCpuOnRequest {
+    target_mpidr: u64,
+    entry_point: u64,
+    context_id: u64,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
+)]
+impl PsciCpuOnRequest {
+    #[cfg(test)]
+    const fn new(target_mpidr: u64, entry_point: u64, context_id: u64) -> Self {
+        Self {
+            target_mpidr,
+            entry_point,
+            context_id,
+        }
+    }
+
+    pub(crate) const fn target_mpidr(self) -> u64 {
+        self.target_mpidr
+    }
+
+    pub(crate) const fn entry_point(self) -> u64 {
+        self.entry_point
+    }
+
+    pub(crate) const fn context_id(self) -> u64 {
+        self.context_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PsciAffinityInfoRequest {
+    target_mpidr: u64,
+    lowest_affinity_level: u64,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
+)]
+impl PsciAffinityInfoRequest {
+    #[cfg(test)]
+    const fn new(target_mpidr: u64, lowest_affinity_level: u64) -> Self {
+        Self {
+            target_mpidr,
+            lowest_affinity_level,
+        }
+    }
+
+    pub(crate) const fn target_mpidr(self) -> u64 {
+        self.target_mpidr
+    }
+
+    pub(crate) const fn lowest_affinity_level(self) -> u64 {
+        self.lowest_affinity_level
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciCoordinatorRequest {
+    CpuOn(PsciCpuOnRequest),
+    AffinityInfo(PsciAffinityInfoRequest),
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "constructed by the later multi-vCPU scheduler slice"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciCoordinatorResponse {
+    CpuOn(PsciCpuOnResponse),
+    AffinityInfo(PsciAffinityInfoResponse),
+}
+
+impl PsciCoordinatorResponse {
+    pub(crate) const fn return_value(self) -> u64 {
+        match self {
+            Self::CpuOn(response) => response.status().return_value(),
+            Self::AffinityInfo(response) => response.return_value(),
+        }
+    }
+}
+
+pub(crate) const fn response_matches_request(
+    request: PsciCoordinatorRequest,
+    response: PsciCoordinatorResponse,
+) -> bool {
+    matches!(
+        (request, response),
+        (
+            PsciCoordinatorRequest::CpuOn(_),
+            PsciCoordinatorResponse::CpuOn(_)
+        ) | (
+            PsciCoordinatorRequest::AffinityInfo(_),
+            PsciCoordinatorResponse::AffinityInfo(_)
+        )
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciCoordinatedDispatch {
+    Immediate(PsciCallResult),
+    Coordinate(PsciCoordinatorRequest),
+}
+
+pub(crate) const fn handle_coordinated_call(call: PsciCall) -> PsciCoordinatedDispatch {
+    let convention = match call.function_id {
+        PSCI_CPU_ON_32 | PSCI_AFFINITY_INFO_32 => Some(PsciCallingConvention::Smc32),
+        PSCI_CPU_ON_64 | PSCI_AFFINITY_INFO_64 => Some(PsciCallingConvention::Smc64),
+        _ => None,
+    };
+
+    match (call.function_id, convention) {
+        (PSCI_CPU_ON_32 | PSCI_CPU_ON_64, Some(convention)) => {
+            let Some(target_mpidr) = convention.target_mpidr(call.arg0) else {
+                return PsciCoordinatedDispatch::Immediate(PsciCallResult::returned(
+                    PsciStatus::InvalidParameters.return_value(),
+                ));
+            };
+            PsciCoordinatedDispatch::Coordinate(PsciCoordinatorRequest::CpuOn(PsciCpuOnRequest {
+                target_mpidr,
+                entry_point: convention.narrow(call.arg1),
+                context_id: convention.narrow(call.arg2),
+            }))
+        }
+        (PSCI_AFFINITY_INFO_32 | PSCI_AFFINITY_INFO_64, Some(convention)) => {
+            let Some(target_mpidr) = convention.target_mpidr(call.arg0) else {
+                return PsciCoordinatedDispatch::Immediate(PsciCallResult::returned(
+                    PsciStatus::InvalidParameters.return_value(),
+                ));
+            };
+            PsciCoordinatedDispatch::Coordinate(PsciCoordinatorRequest::AffinityInfo(
+                PsciAffinityInfoRequest {
+                    target_mpidr,
+                    lowest_affinity_level: convention.narrow(call.arg1),
+                },
+            ))
+        }
+        _ => PsciCoordinatedDispatch::Immediate(handle_call(call)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciCpuPowerState {
+    On,
+    Off,
+    OnPending,
+}
+
+impl PsciCpuPowerState {
+    const fn affinity_info_value(self) -> u64 {
+        match self {
+            Self::On => 0,
+            Self::Off => 1,
+            Self::OnPending => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciCpuOnResponse {
+    Success,
+    InvalidTarget,
+    InvalidAddress,
+    AlreadyOn,
+    OnPending,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "constructed by the later capability profile slice"
+        )
+    )]
+    Unsupported,
+    InternalFailure,
+}
+
+impl PsciCpuOnResponse {
+    pub(crate) const fn status(self) -> PsciStatus {
+        match self {
+            Self::Success => PsciStatus::Success,
+            Self::InvalidTarget | Self::InvalidAddress => PsciStatus::InvalidParameters,
+            Self::AlreadyOn => PsciStatus::AlreadyOn,
+            Self::OnPending => PsciStatus::OnPending,
+            Self::Unsupported => PsciStatus::NotSupported,
+            Self::InternalFailure => PsciStatus::InternalFailure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PsciCpuOnToken(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PsciCpuOnWork {
+    token: PsciCpuOnToken,
+    target_index: usize,
+    request: PsciCpuOnRequest,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
+)]
+impl PsciCpuOnWork {
+    pub(crate) const fn token(self) -> PsciCpuOnToken {
+        self.token
+    }
+
+    pub(crate) const fn target_index(self) -> usize {
+        self.target_index
+    }
+
+    pub(crate) const fn request(self) -> PsciCpuOnRequest {
+        self.request
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciCpuOnBegin {
+    Complete(PsciCpuOnResponse),
+    Pending(PsciCpuOnWork),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciAffinityInfoResponse {
+    State(PsciCpuPowerState),
+    InvalidTarget,
+    InvalidLevel,
+}
+
+impl PsciAffinityInfoResponse {
+    pub(crate) const fn return_value(self) -> u64 {
+        match self {
+            Self::State(state) => state.affinity_info_value(),
+            Self::InvalidTarget | Self::InvalidLevel => {
+                PsciStatus::InvalidParameters.return_value()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciCpuPowerError {
+    InvalidTopology,
+    DuplicateMpidr { mpidr: u64 },
+    InvalidMpidr { mpidr: u64 },
+    TokenExhausted,
+    UnknownTransaction { token: PsciCpuOnToken },
+    InvalidTransactionPhase { token: PsciCpuOnToken },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PsciCpuOnPhase {
+    AwaitingTargetSetup,
+    AwaitingCallerCompletion {
+        response: PsciCpuOnResponse,
+        target_configured: bool,
+    },
+    CallerCompleted,
+    CallerAbandoned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PsciCpuOnTransaction {
+    work: PsciCpuOnWork,
+    phase: PsciCpuOnPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PsciCpuState {
+    mpidr: u64,
+    power: PsciCpuPowerState,
+    transaction: Option<PsciCpuOnTransaction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PsciCpuPowerCoordinator {
+    cpus: Vec<PsciCpuState>,
+    next_token: u64,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
+)]
+impl PsciCpuPowerCoordinator {
+    pub(crate) fn new(mpidrs: &[u64]) -> Result<Self, PsciCpuPowerError> {
+        if mpidrs.is_empty() {
+            return Err(PsciCpuPowerError::InvalidTopology);
+        }
+
+        let mut cpus = Vec::new();
+        cpus.try_reserve_exact(mpidrs.len())
+            .map_err(|_| PsciCpuPowerError::InvalidTopology)?;
+        for (index, mpidr) in mpidrs.iter().copied().enumerate() {
+            if mpidr & !PSCI_MPIDR_AFFINITY_MASK != 0 {
+                return Err(PsciCpuPowerError::InvalidMpidr { mpidr });
+            }
+            if cpus.iter().any(|cpu: &PsciCpuState| cpu.mpidr == mpidr) {
+                return Err(PsciCpuPowerError::DuplicateMpidr { mpidr });
+            }
+            cpus.push(PsciCpuState {
+                mpidr,
+                power: if index == 0 {
+                    PsciCpuPowerState::On
+                } else {
+                    PsciCpuPowerState::Off
+                },
+                transaction: None,
+            });
+        }
+
+        Ok(Self {
+            cpus,
+            next_token: 1,
+        })
+    }
+
+    pub(crate) fn power_state(&self, index: usize) -> Option<PsciCpuPowerState> {
+        self.cpus.get(index).map(|cpu| cpu.power)
+    }
+
+    pub(crate) fn begin_cpu_on(
+        &mut self,
+        request: PsciCpuOnRequest,
+        entry_is_valid: impl FnOnce(u64) -> bool,
+    ) -> Result<PsciCpuOnBegin, PsciCpuPowerError> {
+        let Some(target_index) = self
+            .cpus
+            .iter()
+            .position(|cpu| cpu.mpidr == request.target_mpidr)
+        else {
+            return Ok(PsciCpuOnBegin::Complete(PsciCpuOnResponse::InvalidTarget));
+        };
+
+        if request.entry_point & 0b11 != 0 || !entry_is_valid(request.entry_point) {
+            return Ok(PsciCpuOnBegin::Complete(PsciCpuOnResponse::InvalidAddress));
+        }
+
+        let target = self
+            .cpus
+            .get(target_index)
+            .ok_or(PsciCpuPowerError::InvalidTopology)?;
+        match target.power {
+            PsciCpuPowerState::On => {
+                return Ok(PsciCpuOnBegin::Complete(PsciCpuOnResponse::AlreadyOn));
+            }
+            PsciCpuPowerState::OnPending => {
+                return Ok(PsciCpuOnBegin::Complete(PsciCpuOnResponse::OnPending));
+            }
+            PsciCpuPowerState::Off if target.transaction.is_some() => {
+                return Ok(PsciCpuOnBegin::Complete(PsciCpuOnResponse::InternalFailure));
+            }
+            PsciCpuPowerState::Off => {}
+        }
+
+        let token = PsciCpuOnToken(self.next_token);
+        self.next_token = self
+            .next_token
+            .checked_add(1)
+            .ok_or(PsciCpuPowerError::TokenExhausted)?;
+        let work = PsciCpuOnWork {
+            token,
+            target_index,
+            request,
+        };
+        let target = self
+            .cpus
+            .get_mut(target_index)
+            .ok_or(PsciCpuPowerError::InvalidTopology)?;
+        target.power = PsciCpuPowerState::OnPending;
+        target.transaction = Some(PsciCpuOnTransaction {
+            work,
+            phase: PsciCpuOnPhase::AwaitingTargetSetup,
+        });
+
+        Ok(PsciCpuOnBegin::Pending(work))
+    }
+
+    pub(crate) fn finish_target_setup(
+        &mut self,
+        token: PsciCpuOnToken,
+        configured: bool,
+    ) -> Result<PsciCpuOnResponse, PsciCpuPowerError> {
+        let target = self.target_for_transaction_mut(token)?;
+        let Some(mut transaction) = target.transaction else {
+            return Err(PsciCpuPowerError::UnknownTransaction { token });
+        };
+        if transaction.phase != PsciCpuOnPhase::AwaitingTargetSetup {
+            return Err(PsciCpuPowerError::InvalidTransactionPhase { token });
+        }
+
+        let response = if configured {
+            PsciCpuOnResponse::Success
+        } else {
+            target.power = PsciCpuPowerState::Off;
+            PsciCpuOnResponse::InternalFailure
+        };
+        transaction.phase = PsciCpuOnPhase::AwaitingCallerCompletion {
+            response,
+            target_configured: configured,
+        };
+        target.transaction = Some(transaction);
+        Ok(response)
+    }
+
+    pub(crate) fn caller_completion(
+        &self,
+        token: PsciCpuOnToken,
+    ) -> Result<PsciCpuOnResponse, PsciCpuPowerError> {
+        let transaction = self.transaction(token)?;
+        match transaction.phase {
+            PsciCpuOnPhase::AwaitingCallerCompletion { response, .. } => Ok(response),
+            PsciCpuOnPhase::AwaitingTargetSetup
+            | PsciCpuOnPhase::CallerCompleted
+            | PsciCpuOnPhase::CallerAbandoned => {
+                Err(PsciCpuPowerError::InvalidTransactionPhase { token })
+            }
+        }
+    }
+
+    pub(crate) fn commit_caller_completion(
+        &mut self,
+        token: PsciCpuOnToken,
+    ) -> Result<(), PsciCpuPowerError> {
+        let target = self.target_for_transaction_mut(token)?;
+        let Some(mut transaction) = target.transaction else {
+            return Err(PsciCpuPowerError::UnknownTransaction { token });
+        };
+        let PsciCpuOnPhase::AwaitingCallerCompletion {
+            target_configured, ..
+        } = transaction.phase
+        else {
+            return Err(PsciCpuPowerError::InvalidTransactionPhase { token });
+        };
+
+        if target_configured {
+            transaction.phase = PsciCpuOnPhase::CallerCompleted;
+            target.transaction = Some(transaction);
+        } else {
+            target.transaction = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abandon_caller_completion(
+        &mut self,
+        token: PsciCpuOnToken,
+    ) -> Result<(), PsciCpuPowerError> {
+        let target = self.target_for_transaction_mut(token)?;
+        let Some(mut transaction) = target.transaction else {
+            return Err(PsciCpuPowerError::UnknownTransaction { token });
+        };
+        match transaction.phase {
+            PsciCpuOnPhase::AwaitingTargetSetup => {
+                target.power = PsciCpuPowerState::Off;
+                target.transaction = None;
+            }
+            PsciCpuOnPhase::AwaitingCallerCompletion {
+                target_configured: true,
+                ..
+            } => {
+                transaction.phase = PsciCpuOnPhase::CallerAbandoned;
+                target.transaction = Some(transaction);
+            }
+            PsciCpuOnPhase::AwaitingCallerCompletion {
+                target_configured: false,
+                ..
+            } => {
+                target.transaction = None;
+            }
+            PsciCpuOnPhase::CallerCompleted | PsciCpuOnPhase::CallerAbandoned => {
+                return Err(PsciCpuPowerError::InvalidTransactionPhase { token });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_target_entered(
+        &mut self,
+        token: PsciCpuOnToken,
+    ) -> Result<(), PsciCpuPowerError> {
+        let target = self.target_for_transaction_mut(token)?;
+        let Some(transaction) = target.transaction else {
+            return Err(PsciCpuPowerError::UnknownTransaction { token });
+        };
+        if !matches!(
+            transaction.phase,
+            PsciCpuOnPhase::CallerCompleted | PsciCpuOnPhase::CallerAbandoned
+        ) {
+            return Err(PsciCpuPowerError::InvalidTransactionPhase { token });
+        }
+
+        target.power = PsciCpuPowerState::On;
+        target.transaction = None;
+        Ok(())
+    }
+
+    pub(crate) fn affinity_info(
+        &self,
+        request: PsciAffinityInfoRequest,
+    ) -> PsciAffinityInfoResponse {
+        if request.lowest_affinity_level != 0 {
+            return PsciAffinityInfoResponse::InvalidLevel;
+        }
+        self.cpus
+            .iter()
+            .find(|cpu| cpu.mpidr == request.target_mpidr)
+            .map_or(PsciAffinityInfoResponse::InvalidTarget, |cpu| {
+                PsciAffinityInfoResponse::State(cpu.power)
+            })
+    }
+
+    fn transaction(
+        &self,
+        token: PsciCpuOnToken,
+    ) -> Result<PsciCpuOnTransaction, PsciCpuPowerError> {
+        self.cpus
+            .iter()
+            .filter_map(|cpu| cpu.transaction)
+            .find(|transaction| transaction.work.token == token)
+            .ok_or(PsciCpuPowerError::UnknownTransaction { token })
+    }
+
+    fn target_for_transaction_mut(
+        &mut self,
+        token: PsciCpuOnToken,
+    ) -> Result<&mut PsciCpuState, PsciCpuPowerError> {
+        self.cpus
+            .iter_mut()
+            .find(|cpu| {
+                cpu.transaction
+                    .is_some_and(|transaction| transaction.work.token == token)
+            })
+            .ok_or(PsciCpuPowerError::UnknownTransaction { token })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        PSCI_AFFINITY_INFO_32, PSCI_AFFINITY_INFO_64, PSCI_CPU_OFF, PSCI_CPU_ON_32, PSCI_CPU_ON_64,
         PSCI_FEATURES, PSCI_MIGRATE_INFO_TYPE, PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED,
-        PSCI_RET_NOT_SUPPORTED, PSCI_RET_SUCCESS, PSCI_SYSTEM_OFF, PSCI_SYSTEM_RESET, PSCI_VERSION,
-        PSCI_VERSION_0_2, PsciCall, PsciCallAction, call_uses_arg0, handle_call,
-        not_supported_result,
+        PSCI_SYSTEM_OFF, PSCI_SYSTEM_RESET, PSCI_VERSION, PSCI_VERSION_0_2,
+        PsciAffinityInfoRequest, PsciAffinityInfoResponse, PsciCall, PsciCallAction,
+        PsciCoordinatedDispatch, PsciCoordinatorRequest, PsciCpuOnBegin, PsciCpuOnRequest,
+        PsciCpuOnResponse, PsciCpuPowerCoordinator, PsciCpuPowerError, PsciCpuPowerState,
+        PsciStatus, call_uses_arg0, coordinated_call_argument_count, handle_call,
+        handle_coordinated_call, not_supported_result,
     };
 
+    fn coordinator() -> PsciCpuPowerCoordinator {
+        PsciCpuPowerCoordinator::new(&[0, 1, 0x0000_0002_0000_0003])
+            .expect("topology should be valid")
+    }
+
+    fn secondary_request() -> PsciCpuOnRequest {
+        PsciCpuOnRequest::new(1, 0x8020_0000, 0xfeed_face_cafe_beef)
+    }
+
+    fn pending_work(coordinator: &mut PsciCpuPowerCoordinator) -> super::PsciCpuOnWork {
+        let PsciCpuOnBegin::Pending(work) = coordinator
+            .begin_cpu_on(secondary_request(), |_| true)
+            .expect("CPU_ON should be modeled")
+        else {
+            panic!("secondary should start pending");
+        };
+        work
+    }
+
     #[test]
-    fn returns_psci_version_0_2() {
+    fn encodes_all_psci_statuses_as_zero_extended_signed_32_bit_values() {
+        for (status, expected) in [
+            (PsciStatus::Success, 0x0000_0000),
+            (PsciStatus::NotSupported, 0xffff_ffff),
+            (PsciStatus::InvalidParameters, 0xffff_fffe),
+            (PsciStatus::AlreadyOn, 0xffff_fffc),
+            (PsciStatus::OnPending, 0xffff_fffb),
+            (PsciStatus::InternalFailure, 0xffff_fffa),
+        ] {
+            assert_eq!(status.return_value(), expected);
+        }
+    }
+
+    #[test]
+    fn preserves_legacy_psci_version_migration_and_terminal_actions() {
         assert_eq!(
             handle_call(PsciCall::new(PSCI_VERSION, 0)).return_value(),
             PSCI_VERSION_0_2
         );
-    }
-
-    #[test]
-    fn returns_trusted_os_migration_not_required_for_migrate_info_type() {
         assert_eq!(
             handle_call(PsciCall::new(PSCI_MIGRATE_INFO_TYPE, 0)).return_value(),
             PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED
         );
+
+        let off = handle_call(PsciCall::new(PSCI_SYSTEM_OFF, 0));
+        assert_eq!(off.return_value(), PsciStatus::Success.return_value());
+        assert_eq!(off.action(), PsciCallAction::SystemOff);
+        let reset = handle_call(PsciCall::new(PSCI_SYSTEM_RESET, 0));
+        assert_eq!(reset.return_value(), PsciStatus::Success.return_value());
+        assert_eq!(reset.action(), PsciCallAction::SystemReset);
     }
 
     #[test]
-    fn reports_features_for_supported_functions() {
-        for function_id in [
-            PSCI_VERSION,
-            PSCI_MIGRATE_INFO_TYPE,
-            PSCI_SYSTEM_OFF,
-            PSCI_SYSTEM_RESET,
-            PSCI_FEATURES,
-        ] {
+    fn legacy_features_and_cpu_power_calls_stay_unsupported() {
+        for function_id in [PSCI_CPU_OFF, PSCI_CPU_ON_32, PSCI_CPU_ON_64] {
             assert_eq!(
                 handle_call(PsciCall::new(PSCI_FEATURES, function_id)).return_value(),
-                PSCI_RET_SUCCESS
+                PsciStatus::NotSupported.return_value()
+            );
+            assert_eq!(
+                handle_call(PsciCall::new(function_id, 0)).return_value(),
+                PsciStatus::NotSupported.return_value()
             );
         }
     }
 
     #[test]
-    fn identifies_calls_that_use_arg0() {
+    fn identifies_legacy_and_coordinated_argument_counts() {
         assert!(call_uses_arg0(PSCI_FEATURES));
-        assert!(!call_uses_arg0(PSCI_VERSION));
-        assert!(!call_uses_arg0(PSCI_MIGRATE_INFO_TYPE));
-        assert!(!call_uses_arg0(PSCI_SYSTEM_OFF));
-        assert!(!call_uses_arg0(PSCI_SYSTEM_RESET));
-        assert!(!call_uses_arg0(0x8400_0003));
+        assert!(!call_uses_arg0(PSCI_CPU_ON_32));
+        assert_eq!(coordinated_call_argument_count(PSCI_VERSION), 0);
+        assert_eq!(coordinated_call_argument_count(PSCI_FEATURES), 1);
+        assert_eq!(coordinated_call_argument_count(PSCI_AFFINITY_INFO_64), 2);
+        assert_eq!(coordinated_call_argument_count(PSCI_CPU_ON_32), 3);
     }
 
     #[test]
-    fn builds_not_supported_result() {
+    fn builds_spec_shaped_not_supported_result() {
         let result = not_supported_result();
-
-        assert_eq!(result.return_value(), PSCI_RET_NOT_SUPPORTED);
+        assert_eq!(
+            result.return_value(),
+            PsciStatus::NotSupported.return_value()
+        );
         assert_eq!(result.action(), PsciCallAction::Return);
     }
 
     #[test]
-    fn classifies_system_off_as_terminal_action() {
-        let result = handle_call(PsciCall::new(PSCI_SYSTEM_OFF, 0));
-
-        assert_eq!(result.return_value(), PSCI_RET_SUCCESS);
-        assert_eq!(result.action(), PsciCallAction::SystemOff);
+    fn parses_cpu_on_32_with_argument_truncation() {
+        let call = PsciCall::from_arguments(
+            PSCI_CPU_ON_32,
+            [
+                0xabcd_ef00_0000_0001,
+                0xffff_ffff_8020_0000,
+                0xfeed_face_cafe_beef,
+            ],
+        );
+        let PsciCoordinatedDispatch::Coordinate(PsciCoordinatorRequest::CpuOn(request)) =
+            handle_coordinated_call(call)
+        else {
+            panic!("CPU_ON32 should coordinate");
+        };
+        assert_eq!(request.target_mpidr(), 1);
+        assert_eq!(request.entry_point(), 0x8020_0000);
+        assert_eq!(request.context_id(), 0xcafe_beef);
     }
 
     #[test]
-    fn classifies_system_reset_as_terminal_action() {
-        let result = handle_call(PsciCall::new(PSCI_SYSTEM_RESET, 0));
-
-        assert_eq!(result.return_value(), PSCI_RET_SUCCESS);
-        assert_eq!(result.action(), PsciCallAction::SystemReset);
+    fn parses_cpu_on_64_with_aff3_and_full_width_arguments() {
+        let request = PsciCpuOnRequest::new(
+            0x0000_00ab_0000_0003,
+            0x0000_0001_8020_0000,
+            0xfeed_face_cafe_beef,
+        );
+        let PsciCoordinatedDispatch::Coordinate(PsciCoordinatorRequest::CpuOn(parsed)) =
+            handle_coordinated_call(PsciCall::from_arguments(
+                PSCI_CPU_ON_64,
+                [
+                    request.target_mpidr(),
+                    request.entry_point(),
+                    request.context_id(),
+                ],
+            ))
+        else {
+            panic!("CPU_ON64 should coordinate");
+        };
+        assert_eq!(parsed, request);
     }
 
     #[test]
-    fn reports_not_supported_for_unsupported_features() {
-        for function_id in [0x8400_0001, 0x8400_0003, 0xc400_0003, 0xffff_ffff] {
+    fn rejects_width_specific_reserved_target_bits_without_coordinator_work() {
+        for call in [
+            PsciCall::from_arguments(PSCI_CPU_ON_32, [0xff00_0001, 0x8000, 0]),
+            PsciCall::from_arguments(PSCI_CPU_ON_64, [1 << 40, 0x8000, 0]),
+            PsciCall::from_arguments(PSCI_AFFINITY_INFO_64, [1 << 63, 0, 0]),
+        ] {
+            let PsciCoordinatedDispatch::Immediate(result) = handle_coordinated_call(call) else {
+                panic!("reserved target bits should fail immediately");
+            };
             assert_eq!(
-                handle_call(PsciCall::new(PSCI_FEATURES, function_id)).return_value(),
-                PSCI_RET_NOT_SUPPORTED
+                result.return_value(),
+                PsciStatus::InvalidParameters.return_value()
             );
         }
     }
 
     #[test]
-    fn returns_not_supported_for_unsupported_calls() {
-        for function_id in [0x8400_0001, 0x8400_0002, 0x8400_0003, 0xc400_0003] {
+    fn parses_affinity_info_widths_and_levels() {
+        for (function_id, target, level, expected_target, expected_level) in [
+            (
+                PSCI_AFFINITY_INFO_32,
+                0xffff_ffff_0000_0001,
+                0xffff_ffff_0000_0002,
+                1,
+                2,
+            ),
+            (
+                PSCI_AFFINITY_INFO_64,
+                0x0000_0002_0000_0003,
+                3,
+                0x0000_0002_0000_0003,
+                3,
+            ),
+        ] {
+            let PsciCoordinatedDispatch::Coordinate(PsciCoordinatorRequest::AffinityInfo(request)) =
+                handle_coordinated_call(PsciCall::from_arguments(function_id, [target, level, 0]))
+            else {
+                panic!("AFFINITY_INFO should coordinate");
+            };
+            assert_eq!(request.target_mpidr(), expected_target);
+            assert_eq!(request.lowest_affinity_level(), expected_level);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_power_topologies() {
+        assert_eq!(
+            PsciCpuPowerCoordinator::new(&[]),
+            Err(PsciCpuPowerError::InvalidTopology)
+        );
+        assert_eq!(
+            PsciCpuPowerCoordinator::new(&[0, 0]),
+            Err(PsciCpuPowerError::DuplicateMpidr { mpidr: 0 })
+        );
+        assert_eq!(
+            PsciCpuPowerCoordinator::new(&[0, 1 << 40]),
+            Err(PsciCpuPowerError::InvalidMpidr { mpidr: 1 << 40 })
+        );
+    }
+
+    #[test]
+    fn initializes_primary_on_and_secondaries_off() {
+        let coordinator = coordinator();
+        assert_eq!(coordinator.power_state(0), Some(PsciCpuPowerState::On));
+        assert_eq!(coordinator.power_state(1), Some(PsciCpuPowerState::Off));
+        assert_eq!(coordinator.power_state(2), Some(PsciCpuPowerState::Off));
+        assert_eq!(coordinator.power_state(3), None);
+    }
+
+    #[test]
+    fn begin_cpu_on_validates_before_mutating_state() {
+        let mut coordinator = coordinator();
+        for (request, response) in [
+            (
+                PsciCpuOnRequest::new(99, 0x8020_0000, 0),
+                PsciCpuOnResponse::InvalidTarget,
+            ),
+            (
+                PsciCpuOnRequest::new(1, 0x8020_0002, 0),
+                PsciCpuOnResponse::InvalidAddress,
+            ),
+            (
+                PsciCpuOnRequest::new(1, 0x8020_0000, 0),
+                PsciCpuOnResponse::InvalidAddress,
+            ),
+        ] {
+            let entry_is_valid = request.entry_point() != 0x8020_0000;
             assert_eq!(
-                handle_call(PsciCall::new(function_id, 0)).return_value(),
-                PSCI_RET_NOT_SUPPORTED
+                coordinator
+                    .begin_cpu_on(request, |_| entry_is_valid)
+                    .expect("validation should not fail the model"),
+                PsciCpuOnBegin::Complete(response)
+            );
+            assert_eq!(coordinator.power_state(1), Some(PsciCpuPowerState::Off));
+        }
+    }
+
+    #[test]
+    fn cpu_on_reports_already_on_and_on_pending() {
+        let mut coordinator = coordinator();
+        assert_eq!(
+            coordinator
+                .begin_cpu_on(PsciCpuOnRequest::new(0, 0x8000, 0), |_| true)
+                .expect("primary query should be modeled"),
+            PsciCpuOnBegin::Complete(PsciCpuOnResponse::AlreadyOn)
+        );
+        let work = pending_work(&mut coordinator);
+        assert_eq!(work.target_index(), 1);
+        assert_eq!(work.request(), secondary_request());
+        assert_eq!(
+            coordinator.power_state(1),
+            Some(PsciCpuPowerState::OnPending)
+        );
+        assert_eq!(
+            coordinator
+                .begin_cpu_on(secondary_request(), |_| true)
+                .expect("repeat should be modeled"),
+            PsciCpuOnBegin::Complete(PsciCpuOnResponse::OnPending)
+        );
+    }
+
+    #[test]
+    fn successful_transaction_requires_caller_commit_before_target_entry() {
+        let mut coordinator = coordinator();
+        let work = pending_work(&mut coordinator);
+        assert_eq!(
+            coordinator.finish_target_setup(work.token(), true),
+            Ok(PsciCpuOnResponse::Success)
+        );
+        assert_eq!(
+            coordinator.caller_completion(work.token()),
+            Ok(PsciCpuOnResponse::Success)
+        );
+        assert_eq!(
+            coordinator.mark_target_entered(work.token()),
+            Err(PsciCpuPowerError::InvalidTransactionPhase {
+                token: work.token()
+            })
+        );
+        coordinator
+            .commit_caller_completion(work.token())
+            .expect("caller should commit");
+        assert_eq!(
+            coordinator.power_state(1),
+            Some(PsciCpuPowerState::OnPending)
+        );
+        coordinator
+            .mark_target_entered(work.token())
+            .expect("configured target should enter");
+        assert_eq!(coordinator.power_state(1), Some(PsciCpuPowerState::On));
+    }
+
+    #[test]
+    fn target_setup_failure_rolls_back_and_completion_can_be_retried() {
+        let mut coordinator = coordinator();
+        let work = pending_work(&mut coordinator);
+        assert_eq!(
+            coordinator.finish_target_setup(work.token(), false),
+            Ok(PsciCpuOnResponse::InternalFailure)
+        );
+        assert_eq!(coordinator.power_state(1), Some(PsciCpuPowerState::Off));
+        assert_eq!(
+            coordinator.caller_completion(work.token()),
+            Ok(PsciCpuOnResponse::InternalFailure)
+        );
+        assert_eq!(
+            coordinator.caller_completion(work.token()),
+            Ok(PsciCpuOnResponse::InternalFailure)
+        );
+        coordinator
+            .commit_caller_completion(work.token())
+            .expect("failure response should commit");
+        assert_eq!(
+            coordinator.caller_completion(work.token()),
+            Err(PsciCpuPowerError::UnknownTransaction {
+                token: work.token()
+            })
+        );
+        assert!(matches!(
+            coordinator
+                .begin_cpu_on(secondary_request(), |_| true)
+                .expect("target should be reusable"),
+            PsciCpuOnBegin::Pending(_)
+        ));
+    }
+
+    #[test]
+    fn abandonment_rolls_back_unconfigured_target() {
+        let mut coordinator = coordinator();
+        let work = pending_work(&mut coordinator);
+        coordinator
+            .abandon_caller_completion(work.token())
+            .expect("unconfigured request should abandon");
+        assert_eq!(coordinator.power_state(1), Some(PsciCpuPowerState::Off));
+        assert_eq!(
+            coordinator.finish_target_setup(work.token(), true),
+            Err(PsciCpuPowerError::UnknownTransaction {
+                token: work.token()
+            })
+        );
+    }
+
+    #[test]
+    fn abandonment_preserves_configured_target_until_entry() {
+        let mut coordinator = coordinator();
+        let work = pending_work(&mut coordinator);
+        coordinator
+            .finish_target_setup(work.token(), true)
+            .expect("target setup should finish");
+        coordinator
+            .abandon_caller_completion(work.token())
+            .expect("configured request should abandon caller");
+        assert_eq!(
+            coordinator.power_state(1),
+            Some(PsciCpuPowerState::OnPending)
+        );
+        coordinator
+            .mark_target_entered(work.token())
+            .expect("abandoned caller should not undo entered target");
+        assert_eq!(coordinator.power_state(1), Some(PsciCpuPowerState::On));
+    }
+
+    #[test]
+    fn stale_and_duplicate_transitions_are_mutation_free() {
+        let mut coordinator = coordinator();
+        let work = pending_work(&mut coordinator);
+        let stale = super::PsciCpuOnToken(99);
+        assert_eq!(
+            coordinator.finish_target_setup(stale, true),
+            Err(PsciCpuPowerError::UnknownTransaction { token: stale })
+        );
+        assert_eq!(
+            coordinator.power_state(1),
+            Some(PsciCpuPowerState::OnPending)
+        );
+        coordinator
+            .finish_target_setup(work.token(), true)
+            .expect("first setup should finish");
+        assert_eq!(
+            coordinator.finish_target_setup(work.token(), true),
+            Err(PsciCpuPowerError::InvalidTransactionPhase {
+                token: work.token()
+            })
+        );
+        assert_eq!(
+            coordinator.caller_completion(work.token()),
+            Ok(PsciCpuOnResponse::Success)
+        );
+    }
+
+    #[test]
+    fn affinity_info_reports_every_level_zero_state() {
+        let mut coordinator = coordinator();
+        assert_eq!(
+            coordinator.affinity_info(PsciAffinityInfoRequest::new(0, 0)),
+            PsciAffinityInfoResponse::State(PsciCpuPowerState::On)
+        );
+        assert_eq!(
+            coordinator.affinity_info(PsciAffinityInfoRequest::new(1, 0)),
+            PsciAffinityInfoResponse::State(PsciCpuPowerState::Off)
+        );
+        let work = pending_work(&mut coordinator);
+        assert_eq!(
+            coordinator.affinity_info(PsciAffinityInfoRequest::new(1, 0)),
+            PsciAffinityInfoResponse::State(PsciCpuPowerState::OnPending)
+        );
+        coordinator
+            .finish_target_setup(work.token(), true)
+            .expect("target setup should finish");
+        coordinator
+            .commit_caller_completion(work.token())
+            .expect("caller should complete");
+        coordinator
+            .mark_target_entered(work.token())
+            .expect("target should enter");
+        assert_eq!(
+            coordinator.affinity_info(PsciAffinityInfoRequest::new(1, 0)),
+            PsciAffinityInfoResponse::State(PsciCpuPowerState::On)
+        );
+    }
+
+    #[test]
+    fn affinity_info_rejects_unknown_targets_and_higher_levels() {
+        let coordinator = coordinator();
+        for (request, expected) in [
+            (
+                PsciAffinityInfoRequest::new(99, 0),
+                PsciAffinityInfoResponse::InvalidTarget,
+            ),
+            (
+                PsciAffinityInfoRequest::new(1, 1),
+                PsciAffinityInfoResponse::InvalidLevel,
+            ),
+        ] {
+            let response = coordinator.affinity_info(request);
+            assert_eq!(response, expected);
+            assert_eq!(
+                response.return_value(),
+                PsciStatus::InvalidParameters.return_value()
             );
         }
+    }
+
+    #[test]
+    fn cpu_on_response_keeps_invalid_address_typed_but_psci_0_2_compatible() {
+        assert_eq!(
+            PsciCpuOnResponse::InvalidAddress.status(),
+            PsciStatus::InvalidParameters
+        );
+        assert_eq!(
+            PsciCpuOnResponse::InvalidTarget.status(),
+            PsciStatus::InvalidParameters
+        );
+        assert_eq!(
+            PsciCpuOnResponse::Unsupported.status(),
+            PsciStatus::NotSupported
+        );
     }
 }

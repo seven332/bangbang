@@ -28,6 +28,26 @@ pub struct HvfArm64BootRegisters {
     pub fdt_address: GuestAddress,
 }
 
+/// Guest entry state used to initialize an off secondary arm64 vCPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HvfArm64SecondaryBootRegisters {
+    entry_point: GuestAddress,
+    context_id: u64,
+}
+
+impl HvfArm64SecondaryBootRegisters {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the later multi-vCPU scheduler slice")
+    )]
+    pub(crate) const fn new(entry_point: GuestAddress, context_id: u64) -> Self {
+        Self {
+            entry_point,
+            context_id,
+        }
+    }
+}
+
 /// One ARM interrupt level exposed by Hypervisor.framework.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HvfInterruptType {
@@ -2157,6 +2177,15 @@ impl HvfVcpuOwner {
         })
     }
 
+    pub(crate) fn configure_arm64_secondary_boot_registers(
+        &mut self,
+        registers: HvfArm64SecondaryBootRegisters,
+    ) -> Result<(), BackendError> {
+        configure_arm64_secondary_boot_registers_with(registers, |register, value| {
+            self.set_register(register, value)
+        })
+    }
+
     pub(crate) fn mmio_operation(
         &self,
         access: HvfResolvedMmioAccess,
@@ -2427,6 +2456,27 @@ fn configure_arm64_boot_registers_with(
         (HvfRegister::X2, 0),
         (HvfRegister::X3, 0),
         (HvfRegister::CPSR, ARM64_LINUX_BOOT_CPSR),
+    ] {
+        set_register(register, value)?;
+    }
+
+    Ok(())
+}
+
+fn configure_arm64_secondary_boot_registers_with(
+    registers: HvfArm64SecondaryBootRegisters,
+    mut set_register: impl FnMut(HvfRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    // PC is the logical publication boundary. HVF does not provide an atomic
+    // register batch, so a caller must keep this vCPU fail-closed after any
+    // setup failure and retry the complete retained value or discard it.
+    for (register, value) in [
+        (HvfRegister::X0, registers.context_id),
+        (HvfRegister::X1, 0),
+        (HvfRegister::X2, 0),
+        (HvfRegister::X3, 0),
+        (HvfRegister::CPSR, ARM64_LINUX_BOOT_CPSR),
+        (HvfRegister::PC, registers.entry_point.raw_value()),
     ] {
         set_register(register, value)?;
     }
@@ -3323,13 +3373,14 @@ mod tests {
 
     use super::{
         ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters,
-        HvfArm64VcpuDebugTrapRestoreOperation, HvfArm64VcpuSimdFpRestoreRegister,
-        HvfArm64VcpuSmePRegisterCaptureError, HvfArm64VcpuSmePRegisterState,
-        HvfArm64VcpuSmeZRegisterCaptureError, HvfArm64VcpuSmeZRegisterState,
-        HvfArm64VcpuSmeZaRegisterCaptureError, HvfArm64VcpuSmeZaRegisterState,
-        HvfArm64VcpuSmeZt0RegisterCaptureError, HvfArm64VcpuSmeZt0RegisterState, HvfInterruptType,
-        HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner,
-        NO_VCPU_EXIT_MESSAGE, capture_arm64_vcpu_breakpoint_register_state_with,
+        HvfArm64SecondaryBootRegisters, HvfArm64VcpuDebugTrapRestoreOperation,
+        HvfArm64VcpuSimdFpRestoreRegister, HvfArm64VcpuSmePRegisterCaptureError,
+        HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmeZRegisterCaptureError,
+        HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZaRegisterCaptureError,
+        HvfArm64VcpuSmeZaRegisterState, HvfArm64VcpuSmeZt0RegisterCaptureError,
+        HvfArm64VcpuSmeZt0RegisterState, HvfInterruptType, HvfRegister, HvfSimdFpRegister,
+        HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
+        capture_arm64_vcpu_breakpoint_register_state_with,
         capture_arm64_vcpu_cache_selection_register_state_with,
         capture_arm64_vcpu_core_system_register_state_with,
         capture_arm64_vcpu_debug_control_register_state_with,
@@ -3350,6 +3401,7 @@ mod tests {
         capture_arm64_vcpu_translation_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with,
         capture_arm64_vcpu_watchpoint_register_state_with, configure_arm64_boot_registers_with,
+        configure_arm64_secondary_boot_registers_with,
         restore_arm64_vcpu_cache_selection_register_state_with,
         restore_arm64_vcpu_core_system_register_state_with,
         restore_arm64_vcpu_debug_control_register_state_with,
@@ -3811,6 +3863,13 @@ mod tests {
         }
     }
 
+    fn secondary_boot_registers() -> HvfArm64SecondaryBootRegisters {
+        HvfArm64SecondaryBootRegisters::new(
+            GuestAddress::new(0x0000_0001_8028_0000),
+            0xfeed_face_cafe_beef,
+        )
+    }
+
     fn fake_vcpu(
         exit: *mut crate::ffi::HvVcpuExit,
         exit_available: bool,
@@ -4017,6 +4076,65 @@ mod tests {
                 (HvfRegister::X0, 0x8fe0_0000),
             ]
         );
+    }
+
+    #[test]
+    fn arm64_secondary_boot_register_setup_publishes_pc_last() {
+        let mut writes = Vec::new();
+
+        configure_arm64_secondary_boot_registers_with(
+            secondary_boot_registers(),
+            |register, value| {
+                writes.push((register, value));
+                Ok(())
+            },
+        )
+        .expect("secondary boot register setup should succeed");
+
+        assert_eq!(
+            writes,
+            vec![
+                (HvfRegister::X0, 0xfeed_face_cafe_beef),
+                (HvfRegister::X1, 0),
+                (HvfRegister::X2, 0),
+                (HvfRegister::X3, 0),
+                (HvfRegister::CPSR, ARM64_LINUX_BOOT_CPSR),
+                (HvfRegister::PC, 0x0000_0001_8028_0000),
+            ]
+        );
+    }
+
+    #[test]
+    fn arm64_secondary_boot_register_setup_stops_at_every_failure_position() {
+        let expected = [
+            (HvfRegister::X0, 0xfeed_face_cafe_beef),
+            (HvfRegister::X1, 0),
+            (HvfRegister::X2, 0),
+            (HvfRegister::X3, 0),
+            (HvfRegister::CPSR, ARM64_LINUX_BOOT_CPSR),
+            (HvfRegister::PC, 0x0000_0001_8028_0000),
+        ];
+
+        for failed_index in 0..expected.len() {
+            let mut writes = Vec::new();
+            let result = configure_arm64_secondary_boot_registers_with(
+                secondary_boot_registers(),
+                |register, value| {
+                    writes.push((register, value));
+                    if writes.len() - 1 == failed_index {
+                        Err(BackendError::InvalidState("fake secondary setup failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            assert_eq!(
+                result,
+                Err(BackendError::InvalidState("fake secondary setup failed"))
+            );
+            assert_eq!(writes, expected[..=failed_index]);
+        }
     }
 
     #[test]

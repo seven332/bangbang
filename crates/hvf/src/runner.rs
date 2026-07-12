@@ -19,7 +19,10 @@ use crate::gic::{
 };
 use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
-    PsciCall, PsciCallAction, call_uses_arg0, handle_call as handle_psci_call, not_supported_result,
+    PsciCall, PsciCallAction, PsciCoordinatedDispatch, PsciCoordinatorRequest,
+    PsciCoordinatorResponse, call_uses_arg0, coordinated_call_argument_count,
+    handle_call as handle_psci_call, handle_coordinated_call, not_supported_result,
+    response_matches_request,
 };
 use crate::snapshot::{
     HvfArm64SnapshotOptionalStateRejection, HvfArm64SnapshotTimerPolicyError,
@@ -32,7 +35,7 @@ use crate::snapshot_bundle::{
     HVF_SNAPSHOT_V1_GIC_DEVICE_STATE_MAX_BYTES, HvfSnapshotV1InterruptState, HvfSnapshotV1VcpuState,
 };
 use crate::vcpu::{
-    HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
+    HvfArm64BootRegisters, HvfArm64SecondaryBootRegisters, HvfArm64VcpuBreakpointRegisterState,
     HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
     HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapRestoreError,
     HvfArm64VcpuDebugTrapState, HvfArm64VcpuExceptionRegisterState,
@@ -110,6 +113,13 @@ const MMIO_DISPATCHER_BUSY_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is 
 const MMIO_DISPATCHER_POISONED_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is poisoned";
 const COMMAND_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner command channel is closed";
 const RESPONSE_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner response channel is closed";
+const PSCI_CALL_PENDING_MESSAGE: &str = "vCPU runner has a deferred PSCI call pending";
+const PSCI_CALL_NOT_PENDING_MESSAGE: &str = "vCPU runner has no deferred PSCI call pending";
+const PSCI_CALL_TOKEN_MISMATCH_MESSAGE: &str = "deferred PSCI call token does not match";
+const PSCI_CALL_RESPONSE_MISMATCH_MESSAGE: &str =
+    "deferred PSCI response does not match the request";
+const PSCI_COMPLETION_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has PSCI completion in flight";
+const PSCI_CALL_TOKEN_EXHAUSTED_MESSAGE: &str = "deferred PSCI call token space is exhausted";
 const ARM64_INSTRUCTION_SIZE: u64 = 4;
 
 type CancelVcpu = Arc<dyn Fn(crate::ffi::HvVcpu) -> Result<(), BackendError> + Send + Sync>;
@@ -452,6 +462,23 @@ pub enum HvfVcpuRunStepOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct HvfVcpuPsciCallToken {
+    vcpu: crate::ffi::HvVcpu,
+    sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HvfVcpuCoordinatedRunStepOutcome {
+    Handled(HvfVcpuRunStepOutcome),
+    Psci {
+        exit: HvfHvcExit,
+        function_id: u64,
+        token: HvfVcpuPsciCallToken,
+        request: PsciCoordinatorRequest,
+    },
+}
+
 impl fmt::Display for HvfVcpuRunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -709,9 +736,61 @@ struct RunnerHandleState {
     core_register_operation_in_flight: bool,
     timer_operation_in_flight: bool,
     interrupt_operation_in_flight: bool,
+    psci_completion_in_flight: bool,
+    pending_psci_call: Option<HvfVcpuPsciCallToken>,
     boot_register_setup_failed: bool,
     boot_registers_configured: bool,
     run_started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunnerThreadPendingPsciCall {
+    token: HvfVcpuPsciCallToken,
+    request: PsciCoordinatorRequest,
+    written_response: Option<PsciCoordinatorResponse>,
+}
+
+#[derive(Debug)]
+struct RunnerThreadPsciState {
+    vcpu: crate::ffi::HvVcpu,
+    next_token: u64,
+    pending: Option<RunnerThreadPendingPsciCall>,
+}
+
+impl RunnerThreadPsciState {
+    const fn new(vcpu: crate::ffi::HvVcpu) -> Self {
+        Self {
+            vcpu,
+            next_token: 1,
+            pending: None,
+        }
+    }
+
+    fn begin(
+        &mut self,
+        request: PsciCoordinatorRequest,
+    ) -> Result<HvfVcpuPsciCallToken, HvfVcpuRunnerError> {
+        if self.pending.is_some() {
+            return Err(HvfVcpuRunnerError::InvalidState(PSCI_CALL_PENDING_MESSAGE));
+        }
+        let next_token = self
+            .next_token
+            .checked_add(1)
+            .ok_or(HvfVcpuRunnerError::InvalidState(
+                PSCI_CALL_TOKEN_EXHAUSTED_MESSAGE,
+            ))?;
+        let token = HvfVcpuPsciCallToken {
+            vcpu: self.vcpu,
+            sequence: self.next_token,
+        };
+        self.next_token = next_token;
+        self.pending = Some(RunnerThreadPendingPsciCall {
+            token,
+            request,
+            written_response: None,
+        });
+        Ok(token)
+    }
 }
 
 enum RunnerCommand {
@@ -723,12 +802,25 @@ enum RunnerCommand {
         registers: HvfArm64BootRegisters,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
+    ConfigureArm64SecondaryBootRegisters {
+        registers: HvfArm64SecondaryBootRegisters,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
     RunOnce {
         response_sender: mpsc::Sender<Result<HvfVcpuExit, HvfVcpuRunnerError>>,
     },
     RunOnceAndHandleMmio {
         dispatcher: SharedMmioDispatcher,
         response_sender: mpsc::Sender<Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>>,
+    },
+    RunOnceAndHandleMmioCoordinated {
+        dispatcher: SharedMmioDispatcher,
+        response_sender: mpsc::Sender<Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError>>,
+    },
+    CompletePsciCall {
+        token: HvfVcpuPsciCallToken,
+        response: PsciCoordinatorResponse,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     DispatchMmioAccess {
         access: HvfResolvedMmioAccess,
@@ -1016,6 +1108,14 @@ trait RunnerVcpu {
         &mut self,
         registers: HvfArm64BootRegisters,
     ) -> Result<(), BackendError>;
+    fn configure_arm64_secondary_boot_registers(
+        &mut self,
+        _registers: HvfArm64SecondaryBootRegisters,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support secondary boot register setup",
+        ))
+    }
     fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError>;
     fn dispatch_mmio_access(
         &mut self,
@@ -2058,6 +2158,14 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner.configure_arm64_boot_registers(registers)
     }
 
+    fn configure_arm64_secondary_boot_registers(
+        &mut self,
+        registers: HvfArm64SecondaryBootRegisters,
+    ) -> Result<(), BackendError> {
+        self.owner
+            .configure_arm64_secondary_boot_registers(registers)
+    }
+
     fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
         self.owner.run_once()
     }
@@ -2372,6 +2480,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if thread.is_finished() {
             return Err(HvfVcpuRunnerError::ChannelClosed(
                 COMMAND_CHANNEL_CLOSED_MESSAGE,
@@ -2438,38 +2547,27 @@ impl<'vm> HvfVcpuRunner<'vm> {
         let result = response_receiver
             .recv()
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
-        match &result {
-            Ok(()) => setup.mark_configured(),
-            Err(HvfVcpuRunnerError::Backend(_)) => setup.mark_failed(),
-            Err(
-                HvfVcpuRunnerError::Gic(_)
-                | HvfVcpuRunnerError::GicIccRegisterRestore(_)
-                | HvfVcpuRunnerError::DebugTrapRestore(_)
-                | HvfVcpuRunnerError::GeneralRegisterRestore(_)
-                | HvfVcpuRunnerError::PendingInterruptRestore(_)
-                | HvfVcpuRunnerError::SimdFpRestore(_)
-                | HvfVcpuRunnerError::SystemRegisterRestore(_)
-                | HvfVcpuRunnerError::SmePRegisterCapture(_)
-                | HvfVcpuRunnerError::SmeZRegisterCapture(_)
-                | HvfVcpuRunnerError::SmeZaRegisterCapture(_)
-                | HvfVcpuRunnerError::SmeZt0RegisterCapture(_)
-                | HvfVcpuRunnerError::SnapshotTimerPolicy(_)
-                | HvfVcpuRunnerError::SnapshotTimerRestore(_)
-                | HvfVcpuRunnerError::SnapshotOptionalState(_)
-                | HvfVcpuRunnerError::SnapshotRestoreCompatibility(_)
-                | HvfVcpuRunnerError::SnapshotCapture { .. }
-                | HvfVcpuRunnerError::SnapshotRestore { .. }
-                | HvfVcpuRunnerError::InvalidState(_)
-                | HvfVcpuRunnerError::UnsupportedSys64 { .. }
-                | HvfVcpuRunnerError::VcpuExitResolve(_)
-                | HvfVcpuRunnerError::MmioDispatch(_)
-                | HvfVcpuRunnerError::MpidrAffinity { .. }
-                | HvfVcpuRunnerError::MpidrAffinityCleanup { .. }
-                | HvfVcpuRunnerError::ThreadSpawn(_)
-                | HvfVcpuRunnerError::ChannelClosed(_)
-                | HvfVcpuRunnerError::ThreadPanicked,
-            ) => {}
-        }
+        record_boot_register_setup_result(&mut setup, &result);
+
+        result
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the later multi-vCPU scheduler slice")
+    )]
+    pub(crate) fn configure_arm64_secondary_boot_registers(
+        &self,
+        registers: HvfArm64SecondaryBootRegisters,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let mut setup =
+            self.start_arm64_secondary_boot_register_setup(registers, response_sender)?;
+
+        let result = response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+        record_boot_register_setup_result(&mut setup, &result);
 
         result
     }
@@ -2494,6 +2592,53 @@ impl<'vm> HvfVcpuRunner<'vm> {
         response_receiver
             .recv()
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the later multi-vCPU scheduler slice")
+    )]
+    pub(crate) fn run_once_and_handle_mmio_coordinated(
+        &self,
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+    ) -> Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_run =
+            self.start_run_once_and_handle_mmio_coordinated(dispatcher, response_sender)?;
+
+        let outcome = response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))??;
+        if let HvfVcpuCoordinatedRunStepOutcome::Psci { token, .. } = outcome {
+            let mut state = self.lock_state()?;
+            if state.pending_psci_call.is_some() {
+                return Err(HvfVcpuRunnerError::InvalidState(PSCI_CALL_PENDING_MESSAGE));
+            }
+            state.pending_psci_call = Some(token);
+        }
+
+        Ok(outcome)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the later multi-vCPU scheduler slice")
+    )]
+    pub(crate) fn complete_psci_call(
+        &self,
+        token: HvfVcpuPsciCallToken,
+        response: PsciCoordinatorResponse,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let mut completion = self.start_psci_completion(token, response, response_sender)?;
+
+        let result = response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+        if result.is_ok() {
+            completion.mark_completed();
+        }
+        result
     }
 
     /// Dispatch one resolved HVF MMIO access on the vCPU-owning runner thread.
@@ -3553,6 +3698,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 core_register_operation_in_flight: false,
                 timer_operation_in_flight: false,
                 interrupt_operation_in_flight: false,
+                psci_completion_in_flight: false,
+                pending_psci_call: None,
                 boot_register_setup_failed: false,
                 boot_registers_configured: false,
                 run_started: false,
@@ -3566,7 +3713,53 @@ impl<'vm> HvfVcpuRunner<'vm> {
         registers: HvfArm64BootRegisters,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     ) -> Result<InFlightBootRegisterSetup, HvfVcpuRunnerError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.reserve_boot_register_setup()?;
+        state.boot_register_setup_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::ConfigureArm64BootRegisters {
+                registers,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.boot_register_setup_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightBootRegisterSetup::new(&self.state))
+    }
+
+    fn start_arm64_secondary_boot_register_setup(
+        &self,
+        registers: HvfArm64SecondaryBootRegisters,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<InFlightBootRegisterSetup, HvfVcpuRunnerError> {
+        let mut state = self.reserve_boot_register_setup()?;
+        state.boot_register_setup_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::ConfigureArm64SecondaryBootRegisters {
+                registers,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.boot_register_setup_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightBootRegisterSetup::new(&self.state))
+    }
+
+    fn reserve_boot_register_setup(
+        &self,
+    ) -> Result<MutexGuard<'_, RunnerHandleState>, HvfVcpuRunnerError> {
+        let state = self.lock_state()?;
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
         }
@@ -3575,6 +3768,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -3618,23 +3812,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE,
             ));
         }
-
-        state.boot_register_setup_in_flight = true;
-        if self
-            .command_sender
-            .send(RunnerCommand::ConfigureArm64BootRegisters {
-                registers,
-                response_sender,
-            })
-            .is_err()
-        {
-            state.boot_register_setup_in_flight = false;
-            return Err(HvfVcpuRunnerError::ChannelClosed(
-                COMMAND_CHANNEL_CLOSED_MESSAGE,
-            ));
-        }
-
-        Ok(InFlightBootRegisterSetup::new(&self.state))
+        Ok(state)
     }
 
     fn start_run_once(
@@ -3649,6 +3827,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
             return Err(HvfVcpuRunnerError::InvalidState(
                 MPIDR_NOT_CONFIGURED_MESSAGE,
             ));
+        }
+        if state.pending_psci_call.is_some() {
+            return Err(HvfVcpuRunnerError::InvalidState(PSCI_CALL_PENDING_MESSAGE));
         }
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
@@ -3720,6 +3901,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 MPIDR_NOT_CONFIGURED_MESSAGE,
             ));
         }
+        if state.pending_psci_call.is_some() {
+            return Err(HvfVcpuRunnerError::InvalidState(PSCI_CALL_PENDING_MESSAGE));
+        }
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -3779,6 +3963,162 @@ impl<'vm> HvfVcpuRunner<'vm> {
         Ok(InFlightRun::new(&self.state))
     }
 
+    fn start_run_once_and_handle_mmio_coordinated(
+        &self,
+        dispatcher: SharedMmioDispatcher,
+        response_sender: mpsc::Sender<Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightRun, HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() || state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if !state.mpidr_configured {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MPIDR_NOT_CONFIGURED_MESSAGE,
+            ));
+        }
+        if state.pending_psci_call.is_some() {
+            return Err(HvfVcpuRunnerError::InvalidState(PSCI_CALL_PENDING_MESSAGE));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.core_register_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.timer_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                TIMER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.interrupt_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_FAILED_MESSAGE,
+            ));
+        }
+
+        state.in_flight_runs = 1;
+        if self
+            .command_sender
+            .send(RunnerCommand::RunOnceAndHandleMmioCoordinated {
+                dispatcher,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.in_flight_runs = 0;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        state.run_started = true;
+        Ok(InFlightRun::new(&self.state))
+    }
+
+    fn start_psci_completion(
+        &self,
+        token: HvfVcpuPsciCallToken,
+        response: PsciCoordinatorResponse,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<InFlightPsciCompletion, HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() || state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.psci_completion_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                PSCI_COMPLETION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        match state.pending_psci_call {
+            None => {
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    PSCI_CALL_NOT_PENDING_MESSAGE,
+                ));
+            }
+            Some(pending) if pending != token => {
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    PSCI_CALL_TOKEN_MISMATCH_MESSAGE,
+                ));
+            }
+            Some(_) => {}
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.core_register_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.timer_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                TIMER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.interrupt_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+
+        state.psci_completion_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::CompletePsciCall {
+                token,
+                response,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.psci_completion_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightPsciCompletion::new(&self.state, token))
+    }
+
     fn start_mmio_dispatch(
         &self,
         access: HvfResolvedMmioAccess,
@@ -3794,6 +4134,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -3869,6 +4210,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if state.mpidr_configured {
             return Err(HvfVcpuRunnerError::InvalidState(
                 MPIDR_ALREADY_CONFIGURED_MESSAGE,
@@ -3949,6 +4291,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -4036,6 +4379,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -4088,6 +4432,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if state.run_started {
             return Err(HvfVcpuRunnerError::InvalidState(
                 RUN_ALREADY_STARTED_MESSAGE,
@@ -4664,6 +5009,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -4906,6 +5252,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -5165,6 +5512,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        ensure_no_pending_psci_call(&state)?;
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -5320,6 +5668,14 @@ fn lock_runner_state(
         .map_err(|_| HvfVcpuRunnerError::InvalidState(RUNNER_STATE_POISONED_MESSAGE))
 }
 
+fn ensure_no_pending_psci_call(state: &RunnerHandleState) -> Result<(), HvfVcpuRunnerError> {
+    if state.pending_psci_call.is_some() {
+        Err(HvfVcpuRunnerError::InvalidState(PSCI_CALL_PENDING_MESSAGE))
+    } else {
+        Ok(())
+    }
+}
+
 impl Drop for HvfVcpuRunner<'_> {
     fn drop(&mut self) {
         let _ = self.shutdown();
@@ -5339,6 +5695,8 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.core_register_operation_in_flight,
                 state.timer_operation_in_flight,
                 state.interrupt_operation_in_flight,
+                state.psci_completion_in_flight,
+                state.pending_psci_call,
                 state.boot_register_setup_failed,
                 state.boot_registers_configured,
                 state.run_started,
@@ -5356,6 +5714,8 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 core_register_operation_in_flight,
                 timer_operation_in_flight,
                 interrupt_operation_in_flight,
+                psci_completion_in_flight,
+                pending_psci_call,
                 boot_register_setup_failed,
                 boot_registers_configured,
                 run_started,
@@ -5379,6 +5739,8 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                     "interrupt_operation_in_flight",
                     &interrupt_operation_in_flight,
                 )
+                .field("psci_completion_in_flight", &psci_completion_in_flight)
+                .field("pending_psci_call", &pending_psci_call)
                 .field("boot_register_setup_failed", &boot_register_setup_failed)
                 .field("boot_registers_configured", &boot_registers_configured)
                 .field("run_started", &run_started)
@@ -5387,6 +5749,48 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 .debug_struct("HvfVcpuRunner")
                 .field("state", &RUNNER_STATE_POISONED_MESSAGE)
                 .finish_non_exhaustive(),
+        }
+    }
+}
+
+fn record_boot_register_setup_result(
+    setup: &mut InFlightBootRegisterSetup,
+    result: &Result<(), HvfVcpuRunnerError>,
+) {
+    if result.is_ok() {
+        setup.mark_configured();
+    } else if matches!(result, Err(HvfVcpuRunnerError::Backend(_))) {
+        setup.mark_failed();
+    }
+}
+
+struct InFlightPsciCompletion {
+    state: RunnerState,
+    token: HvfVcpuPsciCallToken,
+    completed: bool,
+}
+
+impl InFlightPsciCompletion {
+    fn new(state: &RunnerState, token: HvfVcpuPsciCallToken) -> Self {
+        Self {
+            state: Arc::clone(state),
+            token,
+            completed: false,
+        }
+    }
+
+    fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for InFlightPsciCompletion {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.psci_completion_in_flight = false;
+            if self.completed && state.pending_psci_call == Some(self.token) {
+                state.pending_psci_call = None;
+            }
         }
     }
 }
@@ -5672,6 +6076,8 @@ fn run_runner_thread<C, V>(
         return;
     }
 
+    let mut psci_state = RunnerThreadPsciState::new(vcpu_id);
+
     while let Ok(command) = command_receiver.recv() {
         match command {
             RunnerCommand::ConfigureMpidrEl1 {
@@ -5690,6 +6096,15 @@ fn run_runner_thread<C, V>(
                     .map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::ConfigureArm64SecondaryBootRegisters {
+                registers,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .configure_arm64_secondary_boot_registers(registers)
+                    .map_err(HvfVcpuRunnerError::Backend);
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::RunOnce { response_sender } => {
                 let result = vcpu.run_once().map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
@@ -5700,6 +6115,33 @@ fn run_runner_thread<C, V>(
             } => {
                 let result = run_once_and_handle_mmio_on_runner_thread(&mut vcpu, &dispatcher);
                 let _ = response_sender.send(result);
+            }
+            RunnerCommand::RunOnceAndHandleMmioCoordinated {
+                dispatcher,
+                response_sender,
+            } => {
+                let result = run_once_and_handle_mmio_coordinated_on_runner_thread(
+                    &mut vcpu,
+                    &dispatcher,
+                    &mut psci_state,
+                );
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::CompletePsciCall {
+                token,
+                response,
+                response_sender,
+            } => {
+                let result = complete_psci_call_on_runner_thread(
+                    &mut vcpu,
+                    &mut psci_state,
+                    token,
+                    response,
+                );
+                let sent = response_sender.send(result.clone()).is_ok();
+                if sent && result.is_ok() {
+                    psci_state.pending = None;
+                }
             }
             RunnerCommand::DispatchMmioAccess {
                 access,
@@ -6440,6 +6882,40 @@ fn run_once_and_handle_mmio_on_runner_thread(
     }
 }
 
+fn run_once_and_handle_mmio_coordinated_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    dispatcher: &SharedMmioDispatcher,
+    psci_state: &mut RunnerThreadPsciState,
+) -> Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError> {
+    let outcome = match vcpu.run_once().map_err(HvfVcpuRunnerError::Backend)? {
+        HvfVcpuExit::Canceled => HvfVcpuRunStepOutcome::Canceled,
+        HvfVcpuExit::VtimerActivated => HvfVcpuRunStepOutcome::VtimerActivated,
+        HvfVcpuExit::Unknown { reason } => HvfVcpuRunStepOutcome::Unknown { reason },
+        HvfVcpuExit::Exception(exit) => {
+            if let Ok(hvc) = exit.decode_hvc() {
+                return handle_coordinated_hvc_on_runner_thread(vcpu, hvc, psci_state);
+            }
+            if let Ok(sys64) = exit.decode_sys64() {
+                return handle_sys64_on_runner_thread(vcpu, sys64)
+                    .map(HvfVcpuCoordinatedRunStepOutcome::Handled);
+            }
+
+            let access = exit
+                .decode_mmio_access()
+                .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
+            let mut dispatcher = lock_shared_mmio_dispatcher(dispatcher)?;
+            let access = access
+                .resolve(dispatcher.bus())
+                .map_err(|source| HvfVcpuExitResolveError::MmioResolve { source })?;
+            let outcome = vcpu.dispatch_mmio_access(access, &mut dispatcher)?;
+            advance_arm64_pc(vcpu)?;
+            HvfVcpuRunStepOutcome::Mmio { access, outcome }
+        }
+    };
+
+    Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(outcome))
+}
+
 fn handle_sys64_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     exit: HvfSys64Exit,
@@ -6503,22 +6979,113 @@ fn handle_hvc_on_runner_thread(
     vcpu.write_register(HvfRegister::X0, return_value)
         .map_err(HvfVcpuRunnerError::Backend)?;
 
+    Ok(psci_call_result_outcome(exit, function_id, result))
+}
+
+fn handle_coordinated_hvc_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    exit: HvfHvcExit,
+    psci_state: &mut RunnerThreadPsciState,
+) -> Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError> {
+    let function_id = vcpu
+        .read_register(HvfRegister::X0)
+        .map_err(HvfVcpuRunnerError::Backend)?;
+    let dispatch = if exit.immediate() == 0 {
+        let mut arguments = [0; 3];
+        for (argument, register) in arguments
+            .iter_mut()
+            .zip([HvfRegister::X1, HvfRegister::X2, HvfRegister::X3])
+            .take(coordinated_call_argument_count(function_id))
+        {
+            *argument = vcpu
+                .read_register(register)
+                .map_err(HvfVcpuRunnerError::Backend)?;
+        }
+        handle_coordinated_call(PsciCall::from_arguments(function_id, arguments))
+    } else {
+        PsciCoordinatedDispatch::Immediate(not_supported_result())
+    };
+
+    match dispatch {
+        PsciCoordinatedDispatch::Immediate(result) => {
+            vcpu.write_register(HvfRegister::X0, result.return_value())
+                .map_err(HvfVcpuRunnerError::Backend)?;
+            Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                psci_call_result_outcome(exit, function_id, result),
+            ))
+        }
+        PsciCoordinatedDispatch::Coordinate(request) => {
+            let token = psci_state.begin(request)?;
+            Ok(HvfVcpuCoordinatedRunStepOutcome::Psci {
+                exit,
+                function_id,
+                token,
+                request,
+            })
+        }
+    }
+}
+
+fn complete_psci_call_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    psci_state: &mut RunnerThreadPsciState,
+    token: HvfVcpuPsciCallToken,
+    response: PsciCoordinatorResponse,
+) -> Result<(), HvfVcpuRunnerError> {
+    let Some(pending) = psci_state.pending.as_mut() else {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_NOT_PENDING_MESSAGE,
+        ));
+    };
+    if pending.token != token {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_TOKEN_MISMATCH_MESSAGE,
+        ));
+    }
+    if !response_matches_request(pending.request, response) {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_RESPONSE_MISMATCH_MESSAGE,
+        ));
+    }
+    if let Some(written_response) = pending.written_response {
+        return if written_response == response {
+            Ok(())
+        } else {
+            Err(HvfVcpuRunnerError::InvalidState(
+                PSCI_CALL_RESPONSE_MISMATCH_MESSAGE,
+            ))
+        };
+    }
+
+    vcpu.write_register(HvfRegister::X0, response.return_value())
+        .map_err(HvfVcpuRunnerError::Backend)?;
+    pending.written_response = Some(response);
+    Ok(())
+}
+
+const fn psci_call_result_outcome(
+    exit: HvfHvcExit,
+    function_id: u64,
+    result: crate::psci::PsciCallResult,
+) -> HvfVcpuRunStepOutcome {
+    let return_value = result.return_value();
+
     match result.action() {
-        PsciCallAction::Return => Ok(HvfVcpuRunStepOutcome::Hvc {
+        PsciCallAction::Return => HvfVcpuRunStepOutcome::Hvc {
             exit,
             function_id,
             return_value,
-        }),
-        PsciCallAction::SystemOff => Ok(HvfVcpuRunStepOutcome::GuestShutdown {
+        },
+        PsciCallAction::SystemOff => HvfVcpuRunStepOutcome::GuestShutdown {
             exit,
             function_id,
             return_value,
-        }),
-        PsciCallAction::SystemReset => Ok(HvfVcpuRunStepOutcome::GuestReset {
+        },
+        PsciCallAction::SystemReset => HvfVcpuRunStepOutcome::GuestReset {
             exit,
             function_id,
             return_value,
-        }),
+        },
     }
 }
 
@@ -6580,8 +7147,9 @@ mod tests {
 
     use super::{
         CancelVcpu, HvfArm64SnapshotV1CaptureStage, HvfArm64SnapshotV1Restore,
-        HvfArm64SnapshotV1RestoreStage, HvfVcpuMpidrAffinityStage, HvfVcpuRunStepOutcome,
-        HvfVcpuRunner, HvfVcpuRunnerError, RunnerVcpu, spawn_runner_thread,
+        HvfArm64SnapshotV1RestoreStage, HvfVcpuCoordinatedRunStepOutcome,
+        HvfVcpuMpidrAffinityStage, HvfVcpuPsciCallToken, HvfVcpuRunStepOutcome, HvfVcpuRunner,
+        HvfVcpuRunnerError, RunnerVcpu, spawn_runner_thread,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -6594,12 +7162,16 @@ mod tests {
         HvfGicError, restore_arm64_gic_icc_register_state_with,
     };
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
+    use crate::psci::{
+        PsciAffinityInfoResponse, PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOnBegin,
+        PsciCpuOnResponse, PsciCpuPowerCoordinator, PsciCpuPowerState,
+    };
     use crate::snapshot::{
         HvfArm64SnapshotOptionalStateRejection, HvfArm64SnapshotTimerPolicyError,
         HvfArm64SnapshotTimerRestoreOperation, HvfArm64SnapshotTimerState,
     };
     use crate::vcpu::{
-        HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
+        HvfArm64BootRegisters, HvfArm64SecondaryBootRegisters, HvfArm64VcpuBreakpointRegisterState,
         HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
         HvfArm64VcpuDebugControlRegisterState, HvfArm64VcpuDebugTrapRestoreError,
         HvfArm64VcpuDebugTrapRestoreOperation, HvfArm64VcpuDebugTrapState,
@@ -6644,12 +7216,14 @@ mod tests {
     const ESR_ISS_SF: u64 = 1 << 15;
     const PSCI_VERSION: u64 = 0x8400_0000;
     const PSCI_CPU_ON: u64 = 0x8400_0003;
+    const PSCI_CPU_ON_64: u64 = 0xc400_0003;
+    const PSCI_AFFINITY_INFO: u64 = 0x8400_0004;
     const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
     const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
     const PSCI_FEATURES: u64 = 0x8400_000a;
     const PSCI_VERSION_0_2: u64 = 0x0000_0002;
     const PSCI_RET_SUCCESS: u64 = 0;
-    const PSCI_RET_NOT_SUPPORTED: u64 = u64::MAX;
+    const PSCI_RET_NOT_SUPPORTED: u64 = 0xffff_ffff;
     const GIC_DEVICE_STATE_TEST_BYTES: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
     const GIC_ICC_REGISTER_STATE_TEST_VALUES: [u64; 10] =
         [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9];
@@ -8179,6 +8753,19 @@ mod tests {
         x0: u64,
         x1: Result<u64, BackendError>,
         register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
+    }
+
+    struct CoordinatedPsciRecordingVcpu {
+        run_once_result: Result<HvfVcpuExit, BackendError>,
+        registers: [u64; 4],
+        register_read_sender: mpsc::Sender<HvfRegister>,
+        register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
+        fail_next_x0_write: bool,
+    }
+
+    struct SecondaryConfigureRecordingVcpu {
+        configured_sender: mpsc::Sender<HvfArm64SecondaryBootRegisters>,
+        fail_next_setup: bool,
     }
 
     struct Sys64RunStepRecordingVcpu {
@@ -14811,6 +15398,113 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for CoordinatedPsciRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            self.run_once_result.clone()
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            let _ = self.register_read_sender.send(register);
+            match register {
+                HvfRegister::X0 => Ok(self.registers[0]),
+                HvfRegister::X1 => Ok(self.registers[1]),
+                HvfRegister::X2 => Ok(self.registers[2]),
+                HvfRegister::X3 => Ok(self.registers[3]),
+                _ => Err(BackendError::InvalidState("unexpected fake register read")),
+            }
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            if register != HvfRegister::X0 {
+                return Err(BackendError::InvalidState("unexpected fake register write"));
+            }
+            self.register_write_sender
+                .send((register, value))
+                .map_err(|_| BackendError::InvalidState("fake register write receiver closed"))?;
+            if self.fail_next_x0_write {
+                self.fail_next_x0_write = false;
+                return Err(BackendError::InvalidState(
+                    "fake deferred PSCI completion write failed",
+                ));
+            }
+            self.registers[0] = value;
+            Ok(())
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for SecondaryConfigureRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Err(BackendError::InvalidState(
+                "primary setup should not be used",
+            ))
+        }
+
+        fn configure_arm64_secondary_boot_registers(
+            &mut self,
+            registers: HvfArm64SecondaryBootRegisters,
+        ) -> Result<(), BackendError> {
+            self.configured_sender
+                .send(registers)
+                .map_err(|_| BackendError::InvalidState("fake setup receiver closed"))?;
+            if self.fail_next_setup {
+                self.fail_next_setup = false;
+                Err(BackendError::InvalidState("fake secondary setup failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for Sys64RunStepRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -16270,6 +16964,59 @@ mod tests {
             HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
                 .expect("runner should be created"),
             register_write_receiver,
+        )
+    }
+
+    fn start_coordinated_psci_run_step_recording_runner(
+        function_id: u64,
+        arguments: [u64; 3],
+        hvc_immediate: u16,
+        fail_next_x0_write: bool,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<HvfRegister>,
+        mpsc::Receiver<(HvfRegister, u64)>,
+    ) {
+        let (register_read_sender, register_read_receiver) = mpsc::channel();
+        let (register_write_sender, register_write_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(CoordinatedPsciRecordingVcpu {
+                run_once_result: Ok(hvc_exception_exit(hvc_immediate)),
+                registers: [function_id, arguments[0], arguments[1], arguments[2]],
+                register_read_sender,
+                register_write_sender,
+                fail_next_x0_write,
+            })
+        })
+        .expect("fake coordinated PSCI runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            register_read_receiver,
+            register_write_receiver,
+        )
+    }
+
+    fn start_secondary_configure_recording_runner(
+        fail_next_setup: bool,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<HvfArm64SecondaryBootRegisters>,
+    ) {
+        let (configured_sender, configured_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(SecondaryConfigureRecordingVcpu {
+                configured_sender,
+                fail_next_setup,
+            })
+        })
+        .expect("fake secondary configuration runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            configured_receiver,
         )
     }
 
@@ -31074,6 +31821,414 @@ mod tests {
 
             runner.shutdown().expect("runner should shut down");
         }
+    }
+
+    #[test]
+    fn coordinated_cpu_on_captures_x1_through_x3_without_writing_caller_x0() {
+        let arguments = [1, 0x0000_0001_8020_0000, 0xfeed_face_cafe_beef];
+        let (runner, register_read_receiver, register_write_receiver) =
+            start_coordinated_psci_run_step_recording_runner(PSCI_CPU_ON_64, arguments, 0, false);
+
+        let outcome = runner
+            .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+            .expect("CPU_ON should defer to the coordinator");
+        let HvfVcpuCoordinatedRunStepOutcome::Psci {
+            exit,
+            function_id,
+            token: _,
+            request: PsciCoordinatorRequest::CpuOn(request),
+        } = outcome
+        else {
+            panic!("CPU_ON should return typed coordinator work");
+        };
+        assert_eq!(exit, hvc_exit(0));
+        assert_eq!(function_id, PSCI_CPU_ON_64);
+        assert_eq!(request.target_mpidr(), arguments[0]);
+        assert_eq!(request.entry_point(), arguments[1]);
+        assert_eq!(request.context_id(), arguments[2]);
+        assert_eq!(
+            register_read_receiver.try_iter().collect::<Vec<_>>(),
+            vec![
+                HvfRegister::X0,
+                HvfRegister::X1,
+                HvfRegister::X2,
+                HvfRegister::X3,
+            ]
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_PENDING_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_PENDING_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.run_once_and_handle_mmio_coordinated(shared_dispatcher()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_PENDING_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_PENDING_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.capture_arm64_general_register_state(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_PENDING_MESSAGE
+            ))
+        );
+
+        runner
+            .shutdown()
+            .expect("abandoned deferred caller should still shut down");
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn coordinated_affinity_info_reads_only_x1_and_x2() {
+        let (runner, register_read_receiver, register_write_receiver) =
+            start_coordinated_psci_run_step_recording_runner(
+                PSCI_AFFINITY_INFO,
+                [1, 0, 0xdead_beef],
+                0,
+                false,
+            );
+
+        let HvfVcpuCoordinatedRunStepOutcome::Psci {
+            token,
+            request: PsciCoordinatorRequest::AffinityInfo(request),
+            ..
+        } = runner
+            .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+            .expect("AFFINITY_INFO should defer")
+        else {
+            panic!("AFFINITY_INFO should return typed coordinator work");
+        };
+        assert_eq!(request.target_mpidr(), 1);
+        assert_eq!(request.lowest_affinity_level(), 0);
+        assert_eq!(
+            register_read_receiver.try_iter().collect::<Vec<_>>(),
+            vec![HvfRegister::X0, HvfRegister::X1, HvfRegister::X2]
+        );
+        runner
+            .complete_psci_call(
+                token,
+                PsciCoordinatorResponse::AffinityInfo(PsciAffinityInfoResponse::State(
+                    crate::psci::PsciCpuPowerState::Off,
+                )),
+            )
+            .expect("affinity response should complete");
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("affinity response should write X0"),
+            (HvfRegister::X0, 1)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn deferred_psci_completion_retries_x0_write_without_repeating_run() {
+        let (runner, _, register_write_receiver) = start_coordinated_psci_run_step_recording_runner(
+            PSCI_CPU_ON,
+            [1, 0x8020_0000, 0x1234],
+            0,
+            true,
+        );
+        let HvfVcpuCoordinatedRunStepOutcome::Psci { token, .. } = runner
+            .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+            .expect("CPU_ON should defer")
+        else {
+            panic!("CPU_ON should return coordinator work");
+        };
+        let response = PsciCoordinatorResponse::CpuOn(PsciCpuOnResponse::Success);
+
+        assert_eq!(
+            runner.complete_psci_call(token, response),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake deferred PSCI completion write failed"
+            )))
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("failed completion should attempt X0"),
+            (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_PENDING_MESSAGE
+            ))
+        );
+
+        runner
+            .complete_psci_call(token, response)
+            .expect("same completion should retry successfully");
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("completion retry should write X0"),
+            (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+        assert_eq!(
+            runner.complete_psci_call(token, response),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_NOT_PENDING_MESSAGE
+            ))
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn deferred_psci_completion_rejects_stale_token_and_wrong_response_kind() {
+        let (runner, _, register_write_receiver) = start_coordinated_psci_run_step_recording_runner(
+            PSCI_CPU_ON,
+            [1, 0x8020_0000, 0],
+            0,
+            false,
+        );
+        let HvfVcpuCoordinatedRunStepOutcome::Psci { token, .. } = runner
+            .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+            .expect("CPU_ON should defer")
+        else {
+            panic!("CPU_ON should return coordinator work");
+        };
+        let stale = HvfVcpuPsciCallToken {
+            vcpu: token.vcpu,
+            sequence: token.sequence + 1,
+        };
+
+        assert_eq!(
+            runner.complete_psci_call(
+                stale,
+                PsciCoordinatorResponse::CpuOn(PsciCpuOnResponse::Success),
+            ),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_TOKEN_MISMATCH_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.complete_psci_call(
+                token,
+                PsciCoordinatorResponse::AffinityInfo(PsciAffinityInfoResponse::InvalidTarget),
+            ),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_RESPONSE_MISMATCH_MESSAGE
+            ))
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        runner
+            .complete_psci_call(
+                token,
+                PsciCoordinatorResponse::CpuOn(PsciCpuOnResponse::OnPending),
+            )
+            .expect("matching response should complete");
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("matching response should write X0"),
+            (HvfRegister::X0, 0xffff_fffb)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn coordinated_immediate_and_nonzero_hvc_calls_do_not_read_extra_arguments() {
+        for (function_id, immediate, return_value) in [
+            (PSCI_VERSION, 0, PSCI_VERSION_0_2),
+            (PSCI_CPU_ON, 1, PSCI_RET_NOT_SUPPORTED),
+        ] {
+            let (runner, register_read_receiver, register_write_receiver) =
+                start_coordinated_psci_run_step_recording_runner(
+                    function_id,
+                    [1, 2, 3],
+                    immediate,
+                    false,
+                );
+            assert_eq!(
+                runner.run_once_and_handle_mmio_coordinated(shared_dispatcher()),
+                Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                    HvfVcpuRunStepOutcome::Hvc {
+                        exit: hvc_exit(immediate),
+                        function_id,
+                        return_value,
+                    }
+                ))
+            );
+            assert_eq!(
+                register_read_receiver.try_iter().collect::<Vec<_>>(),
+                vec![HvfRegister::X0]
+            );
+            assert_eq!(
+                register_write_receiver
+                    .recv()
+                    .expect("immediate response should write X0"),
+                (HvfRegister::X0, return_value)
+            );
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn secondary_boot_register_setup_runs_on_owner_and_retries_complete_value() {
+        let registers = HvfArm64SecondaryBootRegisters::new(
+            GuestAddress::new(0x0000_0001_8020_0000),
+            0xfeed_face_cafe_beef,
+        );
+        let (runner, configured_receiver) = start_secondary_configure_recording_runner(true);
+
+        assert_eq!(
+            runner.configure_arm64_secondary_boot_registers(registers),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake secondary setup failed"
+            )))
+        );
+        assert_eq!(
+            configured_receiver
+                .recv()
+                .expect("owner should receive failed setup"),
+            registers
+        );
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::BOOT_REGISTER_SETUP_FAILED_MESSAGE
+            ))
+        );
+
+        runner
+            .configure_arm64_secondary_boot_registers(registers)
+            .expect("complete secondary setup retry should succeed");
+        assert_eq!(
+            configured_receiver
+                .recv()
+                .expect("owner should receive complete retry"),
+            registers
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        assert_eq!(
+            runner.configure_arm64_secondary_boot_registers(registers),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUN_ALREADY_STARTED_MESSAGE
+            ))
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn psci_cpu_on_transaction_sequences_target_setup_before_caller_completion() {
+        let entry_point = 0x8020_0000;
+        let context_id = 0xfeed_face;
+        let (caller, _, caller_write_receiver) = start_coordinated_psci_run_step_recording_runner(
+            PSCI_CPU_ON,
+            [1, entry_point, context_id],
+            0,
+            false,
+        );
+        let (target, target_setup_receiver) = start_secondary_configure_recording_runner(false);
+        let mut coordinator =
+            PsciCpuPowerCoordinator::new(&[0, 1]).expect("power topology should build");
+
+        let HvfVcpuCoordinatedRunStepOutcome::Psci {
+            token: runner_token,
+            request: PsciCoordinatorRequest::CpuOn(request),
+            ..
+        } = caller
+            .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+            .expect("caller should return coordinator work")
+        else {
+            panic!("CPU_ON should return typed coordinator work");
+        };
+        let PsciCpuOnBegin::Pending(work) = coordinator
+            .begin_cpu_on(request, |entry| entry == entry_point)
+            .expect("power transition should begin")
+        else {
+            panic!("off secondary should produce target work");
+        };
+        assert_eq!(
+            coordinator.power_state(work.target_index()),
+            Some(PsciCpuPowerState::OnPending)
+        );
+        assert_eq!(
+            caller_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        let target_registers = HvfArm64SecondaryBootRegisters::new(
+            GuestAddress::new(work.request().entry_point()),
+            work.request().context_id(),
+        );
+        target
+            .configure_arm64_secondary_boot_registers(target_registers)
+            .expect("target owner should install entry state");
+        assert_eq!(
+            target_setup_receiver
+                .recv()
+                .expect("target owner should receive entry state"),
+            target_registers
+        );
+        let response = coordinator
+            .finish_target_setup(work.token(), true)
+            .expect("target setup should prepare caller success");
+        assert_eq!(
+            coordinator.caller_completion(work.token()),
+            Ok(PsciCpuOnResponse::Success)
+        );
+        caller
+            .complete_psci_call(runner_token, PsciCoordinatorResponse::CpuOn(response))
+            .expect("caller owner should commit X0 only after target setup");
+        assert_eq!(
+            caller_write_receiver
+                .recv()
+                .expect("caller completion should write X0"),
+            (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+        coordinator
+            .commit_caller_completion(work.token())
+            .expect("model should record caller completion");
+        assert_eq!(
+            coordinator.power_state(work.target_index()),
+            Some(PsciCpuPowerState::OnPending)
+        );
+        coordinator
+            .mark_target_entered(work.token())
+            .expect("target entry should finish power transition");
+        assert_eq!(
+            coordinator.power_state(work.target_index()),
+            Some(PsciCpuPowerState::On)
+        );
+
+        caller.shutdown().expect("caller should shut down");
+        target.shutdown().expect("target should shut down");
     }
 
     #[test]
