@@ -1592,6 +1592,16 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_runners(
+        runners: Vec<HvfVcpuRunner<'vm>>,
+        mpidrs: Vec<u64>,
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+        online_indexes: &[usize],
+    ) -> Result<Self, HvfVcpuRunCoordinatorError> {
+        Self::from_parts(runners, mpidrs, dispatcher, online_indexes)
+    }
+
     /// Return a cloneable topology-wide wakeup/pause/stop handle.
     pub fn control(&self) -> HvfVcpuRunControl {
         self.inner.control()

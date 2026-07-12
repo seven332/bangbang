@@ -595,8 +595,58 @@ impl<'vm> Deref for HvfArm64BootVcpuSession<'vm> {
 
 #[cfg(test)]
 mod tests {
-    use super::barrier_cpu_on_admission;
-    use crate::coordinator::HvfVcpuRunControlReason;
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioDispatcher;
+
+    use super::{HvfArm64BootVcpuSession, barrier_cpu_on_admission};
+    use crate::HvfVcpuRunStepOutcome;
+    use crate::coordinator::{HvfVcpuRunControlReason, HvfVcpuRunCoordinator, HvfVcpuRunEvent};
+    use crate::psci::{PsciCpuPowerCoordinator, PsciStatus};
+    use crate::runner::tests::{
+        start_coordinated_psci_run_step_recording_runner,
+        start_secondary_configure_recording_runner,
+    };
+    use crate::vcpu::{HvfArm64SecondaryBootRegisters, HvfRegister};
+
+    const PSCI_CPU_ON_64: u64 = 0xc400_0003;
+    const SECONDARY_ENTRY: u64 = 0x8020_0000;
+    const SECONDARY_CONTEXT: u64 = 0xfeed_face_cafe_beef;
+
+    type CpuOnSessionFixture = (
+        HvfArm64BootVcpuSession<'static>,
+        mpsc::Receiver<HvfRegister>,
+        mpsc::Receiver<(HvfRegister, u64)>,
+        mpsc::Receiver<HvfArm64SecondaryBootRegisters>,
+    );
+
+    fn cpu_on_session(fail_secondary_setup: bool) -> CpuOnSessionFixture {
+        let (primary, reads, writes) = start_coordinated_psci_run_step_recording_runner(
+            PSCI_CPU_ON_64,
+            [1, SECONDARY_ENTRY, SECONDARY_CONTEXT],
+            0,
+            false,
+        );
+        let (secondary, configured) =
+            start_secondary_configure_recording_runner(fail_secondary_setup);
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let coordinator = HvfVcpuRunCoordinator::from_test_runners(
+            vec![primary, secondary],
+            vec![0, 1],
+            dispatcher,
+            &[0],
+        )
+        .expect("test coordinator should build");
+        let power =
+            PsciCpuPowerCoordinator::new(&[0, 1]).expect("test power topology should build");
+        (
+            HvfArm64BootVcpuSession::new(coordinator, power),
+            reads,
+            writes,
+            configured,
+        )
+    }
 
     #[test]
     fn barrier_policy_admits_rejects_or_abandons_cpu_on_by_reason() {
@@ -616,5 +666,94 @@ mod tests {
             barrier_cpu_on_admission(HvfVcpuRunControlReason::Shutdown),
             None
         );
+    }
+
+    #[test]
+    fn cpu_on_session_configures_and_admits_target_before_success() {
+        let (mut session, reads, writes, configured) = cpu_on_session(false);
+
+        let outcome = session
+            .run_step(|entry| entry == SECONDARY_ENTRY)
+            .expect("CPU_ON should complete through the session adapter");
+
+        assert!(matches!(
+            outcome,
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_CPU_ON_64,
+                return_value: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            reads.try_iter().collect::<Vec<_>>(),
+            vec![
+                HvfRegister::X0,
+                HvfRegister::X1,
+                HvfRegister::X2,
+                HvfRegister::X3,
+            ]
+        );
+        assert_eq!(
+            configured
+                .recv()
+                .expect("secondary setup should be observed"),
+            HvfArm64SecondaryBootRegisters::new(
+                GuestAddress::new(SECONDARY_ENTRY),
+                SECONDARY_CONTEXT,
+            )
+        );
+        assert_eq!(
+            writes.recv().expect("caller completion should be observed"),
+            (HvfRegister::X0, 0)
+        );
+        let HvfVcpuRunEvent::Member(target) = session
+            .coordinator
+            .receive_event()
+            .expect("admitted target should complete")
+        else {
+            panic!("expected target member completion");
+        };
+        assert_eq!(target.index(), 1);
+        assert!(matches!(
+            target.result(),
+            Ok(crate::coordinator::HvfVcpuRunMemberOutcome::Handled(
+                HvfVcpuRunStepOutcome::Canceled
+            ))
+        ));
+        session.shutdown().expect("test session should shut down");
+    }
+
+    #[test]
+    fn cpu_on_session_reports_internal_failure_without_target_admission() {
+        let (mut session, _reads, writes, configured) = cpu_on_session(true);
+
+        let outcome = session
+            .run_step(|entry| entry == SECONDARY_ENTRY)
+            .expect("setup failure should return a PSCI response");
+
+        assert!(matches!(
+            outcome,
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_CPU_ON_64,
+                return_value,
+                ..
+            } if return_value == PsciStatus::InternalFailure.return_value()
+        ));
+        assert_eq!(
+            configured
+                .recv()
+                .expect("failed secondary setup should be observed"),
+            HvfArm64SecondaryBootRegisters::new(
+                GuestAddress::new(SECONDARY_ENTRY),
+                SECONDARY_CONTEXT,
+            )
+        );
+        assert_eq!(
+            writes
+                .recv()
+                .expect("caller failure response should be observed"),
+            (HvfRegister::X0, PsciStatus::InternalFailure.return_value())
+        );
+        session.shutdown().expect("test session should shut down");
     }
 }

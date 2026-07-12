@@ -7265,7 +7265,7 @@ fn shutdown_result(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -17098,7 +17098,7 @@ mod tests {
         )
     }
 
-    fn start_coordinated_psci_run_step_recording_runner(
+    pub(crate) fn start_coordinated_psci_run_step_recording_runner(
         function_id: u64,
         arguments: [u64; 3],
         hvc_immediate: u16,
@@ -17129,7 +17129,7 @@ mod tests {
         )
     }
 
-    fn start_secondary_configure_recording_runner(
+    pub(crate) fn start_secondary_configure_recording_runner(
         fail_next_setup: bool,
     ) -> (
         HvfVcpuRunner<'static>,
