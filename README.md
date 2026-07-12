@@ -64,40 +64,36 @@ inject its edge-rising SPI after replacement. A separate no-handle query
 exposes the maximum SME streaming vector length used for the Z-, P-, and
 ZA-register allocations.
 
-These are internal snapshot feasibility primitives only. bangbang now has a
-bounded native-v1 outer state envelope, guest-memory image/binding I/O, and two
-`BANGCMT\0` record kinds: the original memory-only kind and a composite kind
-that binds memory to an exact five-component `BANGHVF\0` payload. The composite
-payload contains the accepted machine profile, a same-default-configuration
-CPU/cache and fixed-platform compatibility manifest, restorable one-vCPU
-state, normalized timer/interrupt/GIC state, and the nested `BANGDEV\0`
-read-only-root device profile. PL031 RTC metadata records an explicit fresh-RTC
-reconstruction policy; it does not claim RTC register continuity.
+These primitives back a deliberately narrow public native-v1 snapshot path on
+macOS Apple Silicon. `PUT /snapshot/create` supports only `Full` snapshots from
+a paused VM with one vCPU, exactly one regular read-only root drive, default
+serial, and no optional devices or MMDS. It writes a bounded kind-2
+`BANGCMT\0` pair whose state file binds the complete memory image to an exact
+five-component `BANGHVF\0` payload and nested `BANGDEV\0` device profile.
 
-A private supervisor operation can hold paused-worker admission and block/
-entropy retry quiescence, capture all four runner ownership domains in one
-aggregate command, preflight the state encoding, and stream guest memory in
-cooperatively cancellable 1 MiB chunks. It returns no partial bundle and leaves
-the source session paused, retryable, and resumable. A private process create
-transaction now preflights both final paths and private owner-only staging
-files, streams that capture directly into the publisher-owned memory inode,
-requires the producer writer to close, and commits the exact kind-2 record with
-memory durable first and state published last as the marker. The fixed-size
-pre-publish check matches header identity, lengths, and stored checksum to the
-codec-produced binding; the loader still performs authoritative full CRC and
-GPA validation.
+Create preflights both final namespaces, streams the paused aggregate capture
+directly into an owner-only staging inode, and publishes memory durable first
+and state last as the commit marker without replacing existing entries. A
+successful request returns `204 No Content` and leaves the source paused and
+usable. Failures clean private staging where safe; a late failure can leave a
+typed memory-only orphan, and a state-directory sync failure after publication
+is treated as committed but durability-uncertain.
 
-The matching private load path now validates a committed kind-2 pair, prepares
-and installs the baseline devices without kernel/FDT boot writes, constructs a
-fresh HVF VM/GIC/vCPU runner, and restores the complete native-v1 state under
-one never-run owner-thread command. Destination CPU IDs, MPIDR, cache manifest,
-inactive SVE/SME/debug state, fixed platform layout, and GIC metadata must match.
-VMGenID is replaced and signaled before the restored session is handed to an
-initially paused process worker. `resume_vm` is returned as explicit caller
-intent and never silently executed. Both create and load transactions remain
-private: public snapshot create/load, optional-device state, EL2 GIC CPU-
-interface state, cross-host portability, and a public fresh-process restore
-entrypoint remain unsupported.
+`PUT /snapshot/load` accepts the matching committed pair only in a pristine
+fresh process, except that logger and metrics configuration are allowed. It
+supports a `File` memory backend (or the deprecated sole `mem_file_path` alias),
+constructs a fresh HVF VM/GIC/vCPU, restores the exact local native state,
+replaces and signals VMGenID, and first commits the session as `Paused`.
+`resume_vm: true` then uses the ordinary resume path; otherwise resume later
+with `PATCH /vm`. The external root backing must still match the captured
+regular-file identity. Snapshot files and guest state are untrusted and
+confidential, so keep artifacts and the API socket in operator-owned private
+directories.
+
+This is not Firecracker snapshot-file compatibility or a portable migration
+format. `Diff`, UFFD, dirty tracking, clock adjustment, restore overrides,
+writable or additional drives, optional devices, active SVE/SME/debug state,
+EL2 GIC CPU-interface state, and cross-host portability remain unsupported.
 
 ## Process CLI
 
@@ -215,8 +211,39 @@ Record a pre-boot drive:
 curl --unix-socket /tmp/bangbang.socket \
   -X PUT http://localhost/drives/rootfs \
   -H 'Content-Type: application/json' \
-  -d '{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true}'
+  -d '{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true,"is_read_only":true}'
 ```
+
+Create a supported full native-v1 snapshot after the VM is paused:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket \
+  -X PATCH http://localhost/vm \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"Paused"}'
+
+curl --unix-socket /tmp/bangbang.socket \
+  -X PUT http://localhost/snapshot/create \
+  -H 'Content-Type: application/json' \
+  -d '{"snapshot_type":"Full","snapshot_path":"/private/snapshot.state","mem_file_path":"/private/snapshot.memory"}'
+```
+
+Load that pair into a fresh `bangbang` process and leave it paused:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket \
+  -X PUT http://localhost/snapshot/load \
+  -H 'Content-Type: application/json' \
+  -d '{"snapshot_path":"/private/snapshot.state","mem_backend":{"backend_path":"/private/snapshot.memory","backend_type":"File"},"resume_vm":false}'
+
+curl --unix-socket /tmp/bangbang.socket \
+  -X PATCH http://localhost/vm \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"Resumed"}'
+```
+
+The destination must be pristine apart from optional logger/metrics setup, and
+the captured read-only root backing must still satisfy the recorded identity.
 
 Record a pre-boot network interface:
 

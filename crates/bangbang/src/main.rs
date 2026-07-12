@@ -2090,7 +2090,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::balloon::BalloonConfigInput;
-    use bangbang_runtime::block::DriveConfigInput;
+    use bangbang_runtime::block::{DriveConfig, DriveConfigInput};
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
@@ -2099,7 +2099,9 @@ mod tests {
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::network::{NetworkInterfaceConfigError, NetworkInterfaceConfigInput};
     use bangbang_runtime::pmem::{PmemConfigError, PmemConfigInput};
-    use bangbang_runtime::serial::SerialRateLimiterConfig;
+    use bangbang_runtime::serial::{SerialConfig, SerialRateLimiterConfig};
+    use bangbang_runtime::snapshot::SnapshotLoadInput;
+    use bangbang_runtime::snapshot_artifact::{SnapshotArtifactPaths, SnapshotPublicationOutcome};
     use bangbang_runtime::snapshot_format::{
         NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES, NATIVE_V1_SNAPSHOT_VERSION, SnapshotFormatError,
         encode_snapshot_envelope,
@@ -2109,9 +2111,10 @@ mod tests {
 
     use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
-        ApiRequestMetricParseFailure, GetApiRequest, InstanceStartExecutor, PatchApiRequest,
+        ApiRequestMetricParseFailure, GetApiRequest, InstanceStartExecutor,
+        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError, PatchApiRequest,
         ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, PutApiRequest,
-        VmmRequestHandler,
+        SnapshotV1LoadSuccess, VmmRequestHandler,
     };
 
     use super::{
@@ -2132,6 +2135,24 @@ mod tests {
             _controller: &bangbang_runtime::VmmController,
         ) -> Result<Self::Session, BackendError> {
             Ok(())
+        }
+
+        fn publish_snapshot_v1(
+            &mut self,
+            _session: &mut Self::Session,
+            _drive_config: &DriveConfig,
+            _serial_config: &SerialConfig,
+            _paths: &SnapshotArtifactPaths,
+        ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
+            Err(NativeV1SnapshotPublicationError::SessionUnavailable)
+        }
+
+        fn load_snapshot_v1(
+            &mut self,
+            _controller: &bangbang_runtime::VmmController,
+            _input: &SnapshotLoadInput,
+        ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
+            Err(NativeV1SnapshotLoadError::ProcessTerminal)
         }
     }
 
@@ -2155,6 +2176,24 @@ mod tests {
                     "failed to assemble arm64 boot resources: {source}"
                 ))
             })
+        }
+
+        fn publish_snapshot_v1(
+            &mut self,
+            _session: &mut Self::Session,
+            _drive_config: &DriveConfig,
+            _serial_config: &SerialConfig,
+            _paths: &SnapshotArtifactPaths,
+        ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
+            Err(NativeV1SnapshotPublicationError::SessionUnavailable)
+        }
+
+        fn load_snapshot_v1(
+            &mut self,
+            _controller: &bangbang_runtime::VmmController,
+            _input: &SnapshotLoadInput,
+        ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
+            Err(NativeV1SnapshotLoadError::ProcessTerminal)
         }
     }
 
@@ -2234,6 +2273,24 @@ mod tests {
             Ok(TestProcessExitSession {
                 signal: self.signal.clone(),
             })
+        }
+
+        fn publish_snapshot_v1(
+            &mut self,
+            _session: &mut Self::Session,
+            _drive_config: &DriveConfig,
+            _serial_config: &SerialConfig,
+            _paths: &SnapshotArtifactPaths,
+        ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
+            Err(NativeV1SnapshotPublicationError::SessionUnavailable)
+        }
+
+        fn load_snapshot_v1(
+            &mut self,
+            _controller: &bangbang_runtime::VmmController,
+            _input: &SnapshotLoadInput,
+        ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
+            Err(NativeV1SnapshotLoadError::ProcessTerminal)
         }
     }
 

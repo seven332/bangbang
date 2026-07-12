@@ -1069,7 +1069,10 @@ fn handle_snapshot_create_request(
     let result = vmm.handle_action(VmmAction::CreateSnapshot(
         snapshot_create_input_from_request(&request),
     ));
-    if matches!(&result, Err(VmmActionError::SnapshotUnsupported)) {
+    if matches!(
+        &result,
+        Ok(_) | Err(VmmActionError::SnapshotUnsupported | VmmActionError::SnapshotCreate(_))
+    ) {
         record_snapshot_create_latency(
             snapshot_type,
             duration_as_micros_u64(started.elapsed()),
@@ -1087,7 +1090,10 @@ fn handle_snapshot_load_request(
     let result = vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input_from_request(
         &request,
     )));
-    if matches!(&result, Err(VmmActionError::SnapshotUnsupported)) {
+    if matches!(
+        &result,
+        Ok(_) | Err(VmmActionError::SnapshotUnsupported | VmmActionError::SnapshotLoad(_))
+    ) {
         vmm.record_load_snapshot_latency_us(duration_as_micros_u64(started.elapsed()));
     }
     handle_empty(result)
@@ -2102,6 +2108,9 @@ mod tests {
     use bangbang_runtime::block::DriveUpdateError;
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
+    use bangbang_runtime::memory::{
+        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
+    };
     use bangbang_runtime::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus,
         MemoryHotplugStatusError, MemoryHotplugUpdateError,
@@ -2109,12 +2118,21 @@ mod tests {
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
+    use bangbang_runtime::serial::SerialConfig;
+    use bangbang_runtime::snapshot::{SnapshotLoadInput, SnapshotV1ControllerCommit};
+    use bangbang_runtime::snapshot_artifact::{
+        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+    };
+    use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
+    use bangbang_runtime::snapshot_memory::write_snapshot_memory_image;
     use bangbang_runtime::startup::Arm64BootResources;
-    use bangbang_runtime::{BackendError, VmmActionError};
+    use bangbang_runtime::{BackendError, VmmActionError, VmmController};
 
     use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
-        InstanceStartExecutor, ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm,
+        InstanceStartExecutor, NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
+        NativeV1SnapshotPublicationProducerError, ProcessSessionDiagnostics,
+        ProcessSessionExitStatus, ProcessVmm, SnapshotV1LoadSuccess,
     };
 
     use super::*;
@@ -2125,6 +2143,7 @@ mod tests {
     struct TestInstanceStarter {
         result: Result<TestSession, BackendError>,
         assemble_boot_resources: bool,
+        snapshot_operations_succeed: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -2375,6 +2394,7 @@ mod tests {
             Self {
                 result: Ok(TestSession::without_boot_run_loop_status()),
                 assemble_boot_resources: false,
+                snapshot_operations_succeed: false,
             }
         }
 
@@ -2382,6 +2402,7 @@ mod tests {
             Self {
                 result: Ok(TestSession::with_boot_run_loop_status(status)),
                 assemble_boot_resources: false,
+                snapshot_operations_succeed: false,
             }
         }
 
@@ -2389,6 +2410,7 @@ mod tests {
             Self {
                 result: Ok(TestSession::with_process_exit_signal(signal)),
                 assemble_boot_resources: false,
+                snapshot_operations_succeed: false,
             }
         }
 
@@ -2400,6 +2422,7 @@ mod tests {
                     plugged_size_mib,
                 )),
                 assemble_boot_resources: false,
+                snapshot_operations_succeed: false,
             }
         }
 
@@ -2407,6 +2430,7 @@ mod tests {
             Self {
                 result: Err(BackendError::InvalidState("test startup failed")),
                 assemble_boot_resources: false,
+                snapshot_operations_succeed: false,
             }
         }
 
@@ -2414,6 +2438,15 @@ mod tests {
             Self {
                 result: Ok(TestSession::without_boot_run_loop_status()),
                 assemble_boot_resources: true,
+                snapshot_operations_succeed: false,
+            }
+        }
+
+        const fn snapshot_success() -> Self {
+            Self {
+                result: Ok(TestSession::without_boot_run_loop_status()),
+                assemble_boot_resources: false,
+                snapshot_operations_succeed: true,
             }
         }
     }
@@ -2439,6 +2472,69 @@ mod tests {
             }
 
             self.result.clone()
+        }
+
+        fn publish_snapshot_v1(
+            &mut self,
+            _session: &mut Self::Session,
+            _drive_config: &DriveConfig,
+            _serial_config: &SerialConfig,
+            paths: &SnapshotArtifactPaths,
+        ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
+            if !self.snapshot_operations_succeed {
+                return Err(NativeV1SnapshotPublicationError::SessionUnavailable);
+            }
+            let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+                .map_err(|_| NativeV1SnapshotPublicationError::ConfigurationUnavailable)?;
+            let layout = GuestMemoryLayout::new(vec![range])
+                .map_err(|_| NativeV1SnapshotPublicationError::ConfigurationUnavailable)?;
+            let memory = GuestMemory::allocate(&layout)
+                .map_err(|_| NativeV1SnapshotPublicationError::ConfigurationUnavailable)?;
+
+            publish_snapshot_artifacts_with(paths, |mut writer| {
+                let binding =
+                    write_snapshot_memory_image(&memory, &mut writer).map_err(|source| {
+                        NativeV1SnapshotPublicationProducerError::Capture(
+                            crate::vmm::NativeV1SnapshotCaptureError::MemoryWrite { source },
+                        )
+                    })?;
+                SnapshotCommitRecord::try_new_composite(
+                    binding,
+                    b"fake-api-native-v1-state".to_vec(),
+                )
+                .map_err(|_| NativeV1SnapshotPublicationProducerError::NonCompositeCommit)
+            })
+            .map_err(Box::new)
+            .map_err(NativeV1SnapshotPublicationError::Transaction)
+        }
+
+        fn load_snapshot_v1(
+            &mut self,
+            _controller: &VmmController,
+            _input: &SnapshotLoadInput,
+        ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
+            if !self.snapshot_operations_succeed {
+                return Err(NativeV1SnapshotLoadError::ProcessTerminal);
+            }
+            let drive =
+                DriveConfigInput::new("root", "root", "/private/fake-api-restored-root", true)
+                    .with_is_read_only(true)
+                    .validate()
+                    .map_err(|_| {
+                        NativeV1SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                            "fake snapshot drive configuration failed",
+                        ))
+                    })?;
+            let commit = SnapshotV1ControllerCommit::try_new(
+                MachineConfig::default(),
+                drive,
+                _input.resume_vm(),
+            )
+            .map_err(NativeV1SnapshotLoadError::ControllerCommitAllocation)?;
+            Ok(SnapshotV1LoadSuccess::new(
+                TestSession::without_boot_run_loop_status(),
+                commit,
+            ))
         }
     }
 
@@ -2556,7 +2652,12 @@ mod tests {
 
     fn read_metrics_json(path: &Path) -> serde_json::Value {
         let output = fs::read_to_string(path).expect("metrics output should be readable");
-        serde_json::from_str(output.trim_end()).expect("metrics output should be JSON")
+        let latest = output
+            .lines()
+            .rev()
+            .find(|line| !line.is_empty())
+            .expect("metrics output should contain a JSON line");
+        serde_json::from_str(latest).expect("latest metrics output should be JSON")
     }
 
     fn assert_metric(metrics: &serde_json::Value, group: &str, field: &str, expected: u64) {
@@ -6675,6 +6776,168 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_snapshot_create_returns_no_content_and_preserves_committed_pair_on_collision() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::snapshot_success());
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body(
+                    "PUT",
+                    "/boot-source",
+                    r#"{"kernel_image_path":"/tmp/snapshot-vmlinux"}"#,
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body(
+                    "PUT",
+                    "/drives/root",
+                    r#"{"drive_id":"root","path_on_host":"/tmp/snapshot-root","is_root_device":true,"is_read_only":true}"#,
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let metrics_path =
+            unique_socket_path("snapshot-public-create-metrics").with_extension("out");
+        let metrics_body = serde_json::json!({"metrics_path": metrics_path}).to_string();
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PUT", "/metrics", &metrics_body).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        assert!(
+            put_action_over_socket(&mut vmm, "sps", "InstanceStart")
+                .starts_with("HTTP/1.1 204 No Content\r\n")
+        );
+        assert!(
+            request_over_socket(
+                &mut vmm,
+                "spp",
+                &request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#),
+            )
+            .starts_with("HTTP/1.1 204 No Content\r\n")
+        );
+
+        let state_path = unique_socket_path("snapshot-public-state").with_extension("state");
+        let memory_path = unique_socket_path("snapshot-public-memory").with_extension("memory");
+        let body = serde_json::json!({
+            "snapshot_path": state_path,
+            "mem_file_path": memory_path,
+        })
+        .to_string();
+        let request = request_with_body("PUT", "/snapshot/create", &body);
+        let response = request_over_socket(&mut vmm, "spc", &request);
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(state_path.exists());
+        assert!(memory_path.exists());
+        let state_before = fs::read(&state_path).expect("committed state should read");
+        let memory_before = fs::read(&memory_path).expect("committed memory should read");
+
+        let flush = put_action_over_socket(&mut vmm, "spf", "FlushMetrics");
+        assert!(flush.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let metrics = read_metrics_json(&metrics_path);
+        assert_latency_metric_present(&metrics, "full_create_snapshot");
+        let raw_metrics =
+            fs::read_to_string(&metrics_path).expect("metrics should remain readable");
+        assert!(!raw_metrics.contains(state_path.to_string_lossy().as_ref()));
+        assert!(!raw_metrics.contains(memory_path.to_string_lossy().as_ref()));
+
+        let collision = request_over_socket(&mut vmm, "spx", &request);
+        assert!(collision.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(collision.contains("failed to create snapshot"));
+        assert!(!collision.contains(state_path.to_string_lossy().as_ref()));
+        assert!(!collision.contains(memory_path.to_string_lossy().as_ref()));
+        let fault_flush = put_action_over_socket(&mut vmm, "spx-f", "FlushMetrics");
+        assert!(fault_flush.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let fault_metrics = read_metrics_json(&metrics_path);
+        assert_latency_metric_present(&fault_metrics, "full_create_snapshot");
+        assert_eq!(
+            fs::read(&state_path).expect("state should remain readable"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("memory should remain readable"),
+            memory_before
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Paused
+        );
+
+        fs::remove_file(state_path).expect("state fixture should clean up");
+        fs::remove_file(memory_path).expect("memory fixture should clean up");
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn public_snapshot_load_commits_paused_and_honors_resume_and_deprecated_alias() {
+        let mut paused = test_controller_with_starter(TestInstanceStarter::snapshot_success());
+        let paused_response = request_over_socket(
+            &mut paused,
+            "slp",
+            &request_with_body(
+                "PUT",
+                "/snapshot/load",
+                r#"{"snapshot_path":"private-paused-state","mem_backend":{"backend_path":"private-paused-memory","backend_type":"File"}}"#,
+            ),
+        );
+        assert!(paused_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            paused.instance_info().state,
+            bangbang_runtime::InstanceState::Paused
+        );
+
+        let mut resumed = test_controller_with_starter(TestInstanceStarter::snapshot_success());
+        let metrics_path = unique_socket_path("snapshot-public-load-metrics").with_extension("out");
+        let metrics_body = serde_json::json!({"metrics_path": metrics_path}).to_string();
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PUT", "/metrics", &metrics_body).as_bytes(),
+                &mut resumed,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let resumed_response = request_over_socket(
+            &mut resumed,
+            "slr",
+            &request_with_body(
+                "PUT",
+                "/snapshot/load",
+                r#"{"snapshot_path":"private-resumed-state","mem_file_path":"private-resumed-memory","resume_vm":true}"#,
+            ),
+        );
+        assert!(resumed_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            resumed.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+
+        let flush = put_action_over_socket(&mut resumed, "slf", "FlushMetrics");
+        assert!(flush.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let metrics = read_metrics_json(&metrics_path);
+        assert_metric(&metrics, "deprecated_api", "deprecated_http_api_calls", 1);
+        assert_latency_metric_present(&metrics, "load_snapshot");
+        let raw_metrics =
+            fs::read_to_string(&metrics_path).expect("metrics should remain readable");
+        assert!(!raw_metrics.contains("private-resumed-state"));
+        assert!(!raw_metrics.contains("private-resumed-memory"));
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
     #[test]
     fn not_started_state_accepts_noop_cpu_config_without_mutating() {
         let mut vmm = test_controller();
@@ -7826,7 +8089,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_metrics_records_snapshot_load_latency_on_snapshot_fault() {
+    fn configured_metrics_records_snapshot_load_latency_on_execution_fault() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let metrics_path = unique_socket_path("sll").with_extension("metrics");
         let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
@@ -7849,7 +8112,11 @@ mod tests {
             ),
         );
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains("Snapshot and restore are not supported."));
+        assert!(response.contains(
+            "failed to load snapshot: hypervisor error: native-v1 load process is terminal"
+        ));
+        assert!(!response.contains("private-load-state-1254"));
+        assert!(!response.contains("private-load-memory-1254"));
 
         assert_eq!(
             handle_request_bytes(

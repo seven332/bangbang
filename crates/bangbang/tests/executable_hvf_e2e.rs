@@ -120,6 +120,13 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
     const DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-multistream=1";
     const GUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+    const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
+    const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
+    const SNAPSHOT_GUEST_UART_ADDRESS: u64 = 0x4000_2000;
+    const SNAPSHOT_GUEST_VMGENID_ADDRESS: u64 = bangbang_runtime::memory::aarch64::SYSTEM_MEM_START
+        + bangbang_runtime::memory::aarch64::SYSTEM_MEM_SIZE
+        - bangbang_runtime::fdt::ARM64_FDT_VMCLOCK_SIZE
+        - bangbang_runtime::fdt::ARM64_FDT_VMGENID_SIZE;
 
     #[derive(Clone, Copy)]
     enum DirectRootfsMmdsContentSource {
@@ -4092,6 +4099,416 @@ mod macos_arm64 {
             !socket_path.exists(),
             "guest reset no-api path must leave the API socket absent"
         );
+    }
+
+    #[test]
+    fn signed_executable_creates_and_restores_native_v1_snapshot_across_processes() {
+        let test_dir = TestDir::new();
+        let source_socket = test_dir.path().join("source.socket");
+        let paused_socket = test_dir.path().join("paused.socket");
+        let resumed_socket = test_dir.path().join("resumed.socket");
+        let kernel_path = test_dir.path().join("snapshot-guest.image");
+        let root_path = test_dir.path().join("snapshot-root.img");
+        let state_path = test_dir.path().join("snapshot.state");
+        let memory_path = test_dir.path().join("snapshot.memory");
+        let source_metrics = test_dir.path().join("source.metrics");
+        let paused_metrics = test_dir.path().join("paused.metrics");
+        let instance_id = test_dir.instance_id();
+
+        fs::write(&kernel_path, snapshot_continuity_guest_image())
+            .expect("snapshot continuity guest image should be written");
+        create_zeroed_block_backing(&root_path);
+
+        let source =
+            BangbangProcess::start(&source_socket, &format!("{instance_id}-snapshot-source"));
+        let machine = http_put_json(
+            &source_socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":16}"#,
+        );
+        assert_no_content_response(&machine, "PUT source /machine-config");
+        let boot = http_put_json(
+            &source_socket,
+            "/boot-source",
+            &format!(
+                r#"{{"kernel_image_path":{}}}"#,
+                json_string(path_text(&kernel_path))
+            ),
+        );
+        assert_no_content_response(&boot, "PUT source /boot-source");
+        let drive = http_put_json(
+            &source_socket,
+            "/drives/root",
+            &format!(
+                r#"{{"drive_id":"root","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+                json_string(path_text(&root_path))
+            ),
+        );
+        assert_no_content_response(&drive, "PUT source /drives/root");
+        let metrics = http_put_json(
+            &source_socket,
+            "/metrics",
+            &format!(
+                r#"{{"metrics_path":{}}}"#,
+                json_string(path_text(&source_metrics))
+            ),
+        );
+        assert_no_content_response(&metrics, "PUT source /metrics");
+        let start = http_put_json(
+            &source_socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(&start, "PUT source InstanceStart");
+
+        wait_for_uart_write_count(
+            &source_socket,
+            &source_metrics,
+            1,
+            GUEST_EXECUTION_TIMEOUT,
+            "source snapshot guest readiness",
+        );
+        let pause = http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        assert_no_content_response(&pause, "PATCH source /vm Paused");
+
+        let create_body = format!(
+            r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+            json_string(path_text(&state_path)),
+            json_string(path_text(&memory_path))
+        );
+        let create = http_json_with_io_timeout(
+            &source_socket,
+            "PUT",
+            "/snapshot/create",
+            &create_body,
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_no_content_response(&create, "PUT source /snapshot/create");
+        assert!(state_path.is_file(), "snapshot state marker should exist");
+        assert!(memory_path.is_file(), "snapshot memory image should exist");
+        assert_no_snapshot_staging(test_dir.path());
+        let state_before = fs::read(&state_path).expect("snapshot state should read");
+        let memory_before = fs::read(&memory_path).expect("snapshot memory should read");
+
+        let collision = http_json_with_io_timeout(
+            &source_socket,
+            "PUT",
+            "/snapshot/create",
+            &create_body,
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_bad_request_response(&collision, "colliding PUT source /snapshot/create");
+        assert_response_contains(
+            &collision,
+            "failed to create snapshot",
+            "colliding PUT source /snapshot/create",
+        );
+        assert!(!collision.contains(path_text(&state_path)));
+        assert!(!collision.contains(path_text(&memory_path)));
+        assert_eq!(
+            fs::read(&state_path).expect("state should remain readable"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("memory should remain readable"),
+            memory_before
+        );
+        assert_no_snapshot_staging(test_dir.path());
+
+        let source_output = source.terminate();
+        assert_clean_shutdown(source_output, &source_socket, "snapshot source");
+
+        let paused = BangbangProcess::start(
+            &paused_socket,
+            &format!("{instance_id}-snapshot-paused-destination"),
+        );
+        let metrics = http_put_json(
+            &paused_socket,
+            "/metrics",
+            &format!(
+                r#"{{"metrics_path":{}}}"#,
+                json_string(path_text(&paused_metrics))
+            ),
+        );
+        assert_no_content_response(&metrics, "PUT paused destination /metrics");
+
+        let unsupported_state = test_dir.path().join("private-uffd-state");
+        let unsupported_memory = test_dir.path().join("private-uffd-memory");
+        let unsupported_load = http_json_with_io_timeout(
+            &paused_socket,
+            "PUT",
+            "/snapshot/load",
+            &format!(
+                r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"Uffd"}}}}"#,
+                json_string(path_text(&unsupported_state)),
+                json_string(path_text(&unsupported_memory))
+            ),
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_bad_request_response(&unsupported_load, "unsupported UFFD snapshot load");
+        assert_response_contains(
+            &unsupported_load,
+            "Snapshot and restore are not supported.",
+            "unsupported UFFD snapshot load",
+        );
+        assert!(!unsupported_load.contains(path_text(&unsupported_state)));
+        assert!(!unsupported_load.contains(path_text(&unsupported_memory)));
+
+        let missing_state = test_dir.path().join("private-missing-state");
+        let missing_memory = test_dir.path().join("private-missing-memory");
+        let missing_load = http_json_with_io_timeout(
+            &paused_socket,
+            "PUT",
+            "/snapshot/load",
+            &format!(
+                r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"File"}}}}"#,
+                json_string(path_text(&missing_state)),
+                json_string(path_text(&missing_memory))
+            ),
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_bad_request_response(&missing_load, "missing public snapshot load");
+        assert_response_contains(
+            &missing_load,
+            "failed to load snapshot",
+            "missing public snapshot load",
+        );
+        assert!(!missing_load.contains(path_text(&missing_state)));
+        assert!(!missing_load.contains(path_text(&missing_memory)));
+
+        let load_paused_body = snapshot_load_body(&state_path, &memory_path, false);
+        let load_paused = http_json_with_io_timeout(
+            &paused_socket,
+            "PUT",
+            "/snapshot/load",
+            &load_paused_body,
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_no_content_response(&load_paused, "PUT paused destination /snapshot/load");
+        let paused_info = http_get(&paused_socket, "/");
+        assert_ok_response(&paused_info, "GET paused destination state");
+        assert_response_contains(
+            &paused_info,
+            r#""state":"Paused""#,
+            "GET paused destination state",
+        );
+        let resume = http_json(&paused_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        assert_no_content_response(&resume, "PATCH paused destination /vm Resumed");
+        let paused_output = paused.wait_for_exit_with_timeout(
+            GUEST_EXECUTION_TIMEOUT,
+            "restored guest VMGenID change after explicit resume",
+        );
+        assert_clean_shutdown(
+            paused_output,
+            &paused_socket,
+            "explicitly resumed snapshot destination",
+        );
+
+        let resumed = BangbangProcess::start(
+            &resumed_socket,
+            &format!("{instance_id}-snapshot-auto-destination"),
+        );
+        let load_resumed_body = snapshot_load_body(&state_path, &memory_path, true);
+        let load_resumed = http_json_with_io_timeout(
+            &resumed_socket,
+            "PUT",
+            "/snapshot/load",
+            &load_resumed_body,
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_no_content_response(
+            &load_resumed,
+            "PUT automatic destination /snapshot/load resume_vm",
+        );
+        let resumed_output = resumed.wait_for_exit_with_timeout(
+            GUEST_EXECUTION_TIMEOUT,
+            "restored guest VMGenID change after automatic resume",
+        );
+        assert_clean_shutdown(
+            resumed_output,
+            &resumed_socket,
+            "automatically resumed snapshot destination",
+        );
+
+        assert_eq!(
+            fs::read(&state_path).expect("final snapshot state should read"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("final snapshot memory should read"),
+            memory_before
+        );
+        assert_no_snapshot_staging(test_dir.path());
+    }
+
+    #[test]
+    fn snapshot_continuity_guest_image_has_expected_header_and_control_flow() {
+        let image = snapshot_continuity_guest_image();
+        assert_eq!(read_test_u32(&image, 0), 0x1400_0010);
+        assert_eq!(read_test_u32(&image, 4), 0xd503_201f);
+        assert_eq!(read_test_u64(&image, 8), 0);
+        assert_eq!(
+            read_test_u64(&image, 16),
+            u64::try_from(image.len()).expect("guest image length should fit u64")
+        );
+        assert_eq!(read_test_u32(&image, 56), SNAPSHOT_GUEST_IMAGE_MAGIC);
+        assert_eq!(read_test_u32(&image, 64 + (9 * 4)), 0x5400_0061);
+        assert_eq!(read_test_u32(&image, 64 + (11 * 4)), 0x54ff_ff80);
+        assert_eq!(read_test_u32(&image, 64 + (16 * 4)), 0xd400_0002);
+        assert_eq!(read_test_u32(&image, 64 + (17 * 4)), 0x1400_0000);
+        assert_eq!(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0x801f_eff0);
+    }
+
+    fn snapshot_load_body(state_path: &Path, memory_path: &Path, resume_vm: bool) -> String {
+        format!(
+            r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"File"}},"resume_vm":{resume_vm}}}"#,
+            json_string(path_text(state_path)),
+            json_string(path_text(memory_path))
+        )
+    }
+
+    fn wait_for_uart_write_count(
+        socket_path: &Path,
+        metrics_path: &Path,
+        expected: u64,
+        timeout: Duration,
+        context: &str,
+    ) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let flush = http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
+            assert_no_content_response(&flush, context);
+            if latest_uart_write_count(metrics_path).is_some_and(|count| count >= expected) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let metrics = fs::read_to_string(metrics_path)
+                    .unwrap_or_else(|err| format!("<metrics unavailable: {err}>"));
+                panic!(
+                    "{context} did not observe uart.write_count >= {expected} within {timeout:?}; metrics:\n{metrics}"
+                );
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn latest_uart_write_count(path: &Path) -> Option<u64> {
+        let output = fs::read_to_string(path).ok()?;
+        output.lines().rev().find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("uart")?
+                .get("write_count")?
+                .as_u64()
+        })
+    }
+
+    fn assert_no_snapshot_staging(directory: &Path) {
+        let staging = fs::read_dir(directory)
+            .expect("snapshot directory should remain readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(".bangbang-snapshot-memory-")
+                    || name.starts_with(".bangbang-snapshot-state-")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            staging.is_empty(),
+            "snapshot staging entries remain: {staging:?}"
+        );
+    }
+
+    fn snapshot_continuity_guest_image() -> Vec<u8> {
+        assert_eq!(SNAPSHOT_GUEST_VMGENID_ADDRESS >> 32, 0);
+        assert_eq!(SNAPSHOT_GUEST_UART_ADDRESS >> 32, 0);
+        let instructions = [
+            aarch64_movz_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0), 0),
+            aarch64_movk_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 16), 16),
+            aarch64_ldp_x(2, 3, 1),
+            aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
+            aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
+            aarch64_movz_x(7, u16::from(b'R'), 0),
+            aarch64_strb_w(7, 4),
+            aarch64_ldp_x(5, 6, 1),
+            aarch64_cmp_x(5, 2),
+            0x5400_0061, // b.ne changed (three instructions forward)
+            aarch64_cmp_x(6, 3),
+            0x54ff_ff80, // b.eq compare (four instructions backward)
+            aarch64_movz_x(7, u16::from(b'C'), 0),
+            aarch64_strb_w(7, 4),
+            aarch64_movz_x(0, 0x0008, 0),
+            aarch64_movk_x(0, 0x8400, 16),
+            0xd400_0002, // hvc #0 (PSCI_SYSTEM_OFF)
+            0x1400_0000, // b . if the host unexpectedly returns
+        ];
+
+        let mut image = vec![0; SNAPSHOT_GUEST_IMAGE_HEADER_SIZE];
+        write_test_u32(&mut image, 0, 0x1400_0010); // branch from header to offset 64
+        write_test_u32(&mut image, 4, 0xd503_201f); // nop
+        write_test_u64(&mut image, 8, 0); // text_offset
+        write_test_u32(&mut image, 56, SNAPSHOT_GUEST_IMAGE_MAGIC);
+        image.extend(instructions.into_iter().flat_map(u32::to_le_bytes));
+        let image_size = u64::try_from(image.len()).expect("guest image length should fit u64");
+        write_test_u64(&mut image, 16, image_size);
+        image
+    }
+
+    fn aarch64_movz_x(register: u32, immediate: u16, shift: u32) -> u32 {
+        assert!(register <= 30);
+        assert!(shift <= 48 && shift.is_multiple_of(16));
+        0xd280_0000 | ((shift / 16) << 21) | (u32::from(immediate) << 5) | register
+    }
+
+    fn aarch64_movk_x(register: u32, immediate: u16, shift: u32) -> u32 {
+        assert!(register <= 30);
+        assert!(shift <= 48 && shift.is_multiple_of(16));
+        0xf280_0000 | ((shift / 16) << 21) | (u32::from(immediate) << 5) | register
+    }
+
+    fn aarch64_ldp_x(first: u32, second: u32, base: u32) -> u32 {
+        assert!(first <= 30 && second <= 30 && base <= 30);
+        0xa940_0000 | (second << 10) | (base << 5) | first
+    }
+
+    fn aarch64_cmp_x(left: u32, right: u32) -> u32 {
+        assert!(left <= 30 && right <= 30);
+        0xeb00_001f | (right << 16) | (left << 5)
+    }
+
+    fn aarch64_strb_w(source: u32, base: u32) -> u32 {
+        assert!(source <= 30 && base <= 30);
+        0x3900_0000 | (base << 5) | source
+    }
+
+    fn low_u16(value: u64, shift: u32) -> u16 {
+        u16::try_from((value >> shift) & u64::from(u16::MAX))
+            .expect("masked immediate should fit u16")
+    }
+
+    fn write_test_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_test_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn read_test_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("u32 test range should fit"),
+        )
+    }
+
+    fn read_test_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("u64 test range should fit"),
+        )
     }
 
     fn env_path(name: &str) -> PathBuf {

@@ -139,27 +139,25 @@ pub(crate) trait InstanceStartExecutor {
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError>;
 
-    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
-        MetricsDiagnostics::default()
-    }
-}
+    fn publish_snapshot_v1(
+        &mut self,
+        session: &mut Self::Session,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        paths: &SnapshotArtifactPaths,
+    ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError>;
 
-#[allow(
-    dead_code,
-    reason = "native-v1 process load remains internal until public API enablement"
-)]
-pub(crate) trait SnapshotLoadExecutor: InstanceStartExecutor {
     fn load_snapshot_v1(
         &mut self,
         controller: &VmmController,
         input: &SnapshotLoadInput,
     ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError>;
+
+    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
+        MetricsDiagnostics::default()
+    }
 }
 
-#[allow(
-    dead_code,
-    reason = "native-v1 process create remains internal until public API enablement"
-)]
 pub(crate) trait SnapshotCreateSession: ProcessSessionDiagnostics {
     fn publish_native_v1_snapshot(
         &mut self,
@@ -172,10 +170,6 @@ pub(crate) trait SnapshotCreateSession: ProcessSessionDiagnostics {
 type NativeV1SnapshotPublicationTransactionError =
     SnapshotPublicationTransactionError<NativeV1SnapshotPublicationProducerError>;
 
-#[allow(
-    dead_code,
-    reason = "native-v1 process create remains internal until public API enablement"
-)]
 pub(crate) enum NativeV1SnapshotPublicationProducerError {
     Capture(NativeV1SnapshotCaptureError),
     NonCompositeCommit,
@@ -210,10 +204,6 @@ impl std::error::Error for NativeV1SnapshotPublicationProducerError {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "native-v1 process create remains internal until public API enablement"
-)]
 #[derive(Debug)]
 pub(crate) enum NativeV1SnapshotPublicationError {
     Preflight(VmmActionError),
@@ -247,21 +237,22 @@ impl std::error::Error for NativeV1SnapshotPublicationError {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "native-v1 process load remains internal until public API enablement"
-)]
+fn native_v1_snapshot_publication_action_error(
+    error: NativeV1SnapshotPublicationError,
+) -> VmmActionError {
+    match error {
+        NativeV1SnapshotPublicationError::Preflight(source) => source,
+        error => VmmActionError::SnapshotCreate(BackendError::Hypervisor(error.to_string())),
+    }
+}
+
 pub(crate) struct SnapshotV1LoadSuccess<S> {
     session: S,
     controller_commit: SnapshotV1ControllerCommit,
 }
 
-#[allow(
-    dead_code,
-    reason = "native-v1 process load remains internal until public API enablement"
-)]
 impl<S> SnapshotV1LoadSuccess<S> {
-    const fn new(session: S, controller_commit: SnapshotV1ControllerCommit) -> Self {
+    pub(crate) const fn new(session: S, controller_commit: SnapshotV1ControllerCommit) -> Self {
         Self {
             session,
             controller_commit,
@@ -282,10 +273,6 @@ impl<S> fmt::Debug for SnapshotV1LoadSuccess<S> {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "native-v1 process load remains internal until public API enablement"
-)]
 #[derive(Debug)]
 pub(crate) enum NativeV1SnapshotLoadError {
     Preflight(VmmActionError),
@@ -301,10 +288,6 @@ pub(crate) enum NativeV1SnapshotLoadError {
     },
 }
 
-#[allow(
-    dead_code,
-    reason = "native-v1 process load remains internal until public API enablement"
-)]
 impl NativeV1SnapshotLoadError {
     const fn disposition(&self) -> HvfSnapshotV1RestoreDisposition {
         match self {
@@ -359,6 +342,21 @@ impl std::error::Error for NativeV1SnapshotLoadError {
     }
 }
 
+fn native_v1_snapshot_load_action_error(error: NativeV1SnapshotLoadError) -> VmmActionError {
+    match error {
+        NativeV1SnapshotLoadError::Preflight(source) => source,
+        error => VmmActionError::SnapshotLoad(BackendError::Hypervisor(error.to_string())),
+    }
+}
+
+fn native_v1_snapshot_resume_action_error(error: VmmActionError) -> VmmActionError {
+    let source = match error {
+        VmmActionError::Lifecycle(source) => source,
+        _ => BackendError::InvalidState("restored snapshot resume failed before state commit"),
+    };
+    VmmActionError::SnapshotLoad(source)
+}
+
 pub(crate) trait ProcessSessionDiagnostics {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         MetricsDiagnostics::default()
@@ -372,6 +370,7 @@ pub(crate) trait ProcessSessionDiagnostics {
         Err(BackendError::InvalidState("active session unavailable"))
     }
 
+    #[cfg(test)]
     fn run_snapshot_create_barrier(&mut self) -> Result<(), BackendError> {
         Err(BackendError::InvalidState("active session unavailable"))
     }
@@ -1224,6 +1223,7 @@ where
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
             VmmAction::CreateSnapshot(input) => self.create_snapshot(input),
+            VmmAction::LoadSnapshot(input) => self.load_snapshot(input),
             VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::PatchBalloonStats(input) => self.update_balloon_statistics(input),
@@ -1375,18 +1375,20 @@ where
     }
 
     fn create_snapshot(&mut self, input: SnapshotCreateInput) -> Result<VmmData, VmmActionError> {
-        self.controller.preflight_create_snapshot(&input)?;
-        let Some(session) = self.started_session.as_mut() else {
-            return Err(VmmActionError::Lifecycle(BackendError::InvalidState(
-                "active session unavailable",
-            )));
-        };
+        self.publish_native_v1_snapshot(&input)
+            .map_err(native_v1_snapshot_publication_action_error)?;
+        Ok(VmmData::Empty)
+    }
 
-        session
-            .run_snapshot_create_barrier()
-            .map_err(VmmActionError::Lifecycle)?;
-        self.controller
-            .handle_action(VmmAction::CreateSnapshot(input))
+    fn load_snapshot(&mut self, input: SnapshotLoadInput) -> Result<VmmData, VmmActionError> {
+        let resume_requested = self
+            .restore_native_v1_snapshot(&input)
+            .map_err(native_v1_snapshot_load_action_error)?;
+        if resume_requested {
+            self.resume_instance()
+                .map_err(native_v1_snapshot_resume_action_error)?;
+        }
+        Ok(VmmData::Empty)
     }
 
     fn update_block_device(&mut self, input: DriveUpdateInput) -> Result<VmmData, VmmActionError> {
@@ -1690,13 +1692,9 @@ where
 
 impl<S> ProcessVmm<S>
 where
-    S: SnapshotLoadExecutor,
+    S: InstanceStartExecutor,
 {
-    /// Internal Slice 7 load seam. Public action dispatch remains unsupported.
-    #[allow(
-        dead_code,
-        reason = "native-v1 process load remains internal until public API enablement"
-    )]
+    /// Restores one admitted native-v1 pair and commits the session paused.
     pub(crate) fn restore_native_v1_snapshot(
         &mut self,
         input: &SnapshotLoadInput,
@@ -1727,13 +1725,8 @@ where
 impl<S> ProcessVmm<S>
 where
     S: InstanceStartExecutor,
-    S::Session: SnapshotCreateSession,
 {
-    /// Internal Slice 8a create seam. Public action dispatch remains unsupported.
-    #[allow(
-        dead_code,
-        reason = "native-v1 process create remains internal until public API enablement"
-    )]
+    /// Publishes one admitted paused source as a native-v1 composite pair.
     pub(crate) fn publish_native_v1_snapshot(
         &mut self,
         input: &SnapshotCreateInput,
@@ -1752,9 +1745,9 @@ where
             return Err(NativeV1SnapshotPublicationError::SessionUnavailable);
         };
 
-        let outcome = session
-            .publish_native_v1_snapshot(&drive_config, &serial_config, &paths)
-            .map_err(NativeV1SnapshotPublicationError::Transaction)?;
+        let outcome =
+            self.starter
+                .publish_snapshot_v1(session, &drive_config, &serial_config, &paths)?;
         debug_assert_eq!(
             self.controller.instance_info().state,
             bangbang_runtime::InstanceState::Paused
@@ -1960,15 +1953,18 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         Ok(supervisor)
     }
 
-    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
-        self.active_serial_output
-            .as_ref()
-            .map(|output| MetricsDiagnostics::new().with_serial_output_metrics(output.metrics()))
-            .unwrap_or_default()
+    fn publish_snapshot_v1(
+        &mut self,
+        session: &mut Self::Session,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        paths: &SnapshotArtifactPaths,
+    ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
+        session
+            .publish_native_v1_snapshot(drive_config, serial_config, paths)
+            .map_err(NativeV1SnapshotPublicationError::Transaction)
     }
-}
 
-impl SnapshotLoadExecutor for HvfInstanceStartExecutor {
     fn load_snapshot_v1(
         &mut self,
         controller: &VmmController,
@@ -2017,6 +2013,13 @@ impl SnapshotLoadExecutor for HvfInstanceStartExecutor {
         self.serial_output = serial_output_buffer;
         self.active_serial_output = Some(serial_output);
         Ok(SnapshotV1LoadSuccess::new(supervisor, controller_commit))
+    }
+
+    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
+        self.active_serial_output
+            .as_ref()
+            .map(|output| MetricsDiagnostics::new().with_serial_output_metrics(output.metrics()))
+            .unwrap_or_default()
     }
 }
 
@@ -2166,10 +2169,6 @@ pub(crate) trait NativeV1SnapshotCaptureSession: BootRunLoopSession {
         state: Self::DetachedState,
     ) -> Result<Self::SnapshotBundle, NativeV1SnapshotCaptureError>;
 
-    #[allow(
-        dead_code,
-        reason = "native-v1 process create remains internal until public API enablement"
-    )]
     fn native_v1_snapshot_commit_record(bundle: Self::SnapshotBundle) -> SnapshotCommitRecord;
 }
 
@@ -4480,10 +4479,6 @@ where
         .map_err(native_snapshot_capture_error_from_boot_run_loop_command)
     }
 
-    #[allow(
-        dead_code,
-        reason = "native-v1 process create remains internal until public API enablement"
-    )]
     fn publish_native_v1_snapshot(
         &self,
         drive_config: &DriveConfig,
@@ -4506,10 +4501,6 @@ where
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "native-v1 process create remains internal until public API enablement"
-)]
 fn require_native_v1_composite_record(
     record: SnapshotCommitRecord,
 ) -> Result<SnapshotCommitRecord, NativeV1SnapshotPublicationProducerError> {
@@ -4660,6 +4651,7 @@ where
         BootRunLoopSupervisor::resume(self)
     }
 
+    #[cfg(test)]
     fn run_snapshot_create_barrier(&mut self) -> Result<(), BackendError> {
         self.run_snapshot_quiesced(|session| {
             let _auxiliary_quiescence = session.quiesce_snapshot_auxiliary_work()?;
@@ -4984,8 +4976,8 @@ mod tests {
         PreparedNetworkDevices,
     };
     use bangbang_runtime::serial::{
-        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfigInput, SerialOutput, SerialOutputMetrics,
-        SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
+        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialConfigInput, SerialOutput,
+        SerialOutputMetrics, SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
     };
     use bangbang_runtime::snapshot::{
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
@@ -5006,7 +4998,9 @@ mod tests {
     };
     use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
     use bangbang_runtime::vsock::VsockConfigInput;
-    use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmController};
+    use bangbang_runtime::{
+        BackendError, InstanceState, VmmAction, VmmActionError, VmmController, VmmData,
+    };
 
     use crate::host_network::vmnet::{
         VmnetError, VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceDescriptor,
@@ -5033,8 +5027,8 @@ mod tests {
         NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
         NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
         ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessSessionDiagnostics, ProcessVmm, ProcessVmnetPacketIoBackendFactory,
-        SnapshotCreateSession, SnapshotLoadExecutor, SnapshotV1LoadSuccess,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm,
+        ProcessVmnetPacketIoBackendFactory, SnapshotCreateSession, SnapshotV1LoadSuccess,
         default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
         process_vmnet_packet_io_provider_from_configs, require_native_v1_composite_record,
     };
@@ -5486,6 +5480,7 @@ mod tests {
             }
         }
 
+        #[cfg(test)]
         fn run_snapshot_create_barrier(&mut self) -> Result<(), BackendError> {
             self.snapshot_create_barrier_count += 1;
             match self.snapshot_create_barrier_result.clone() {
@@ -5692,6 +5687,24 @@ mod tests {
             })
         }
 
+        fn publish_snapshot_v1(
+            &mut self,
+            _session: &mut Self::Session,
+            _drive_config: &DriveConfig,
+            _serial_config: &SerialConfig,
+            _paths: &SnapshotArtifactPaths,
+        ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
+            Err(NativeV1SnapshotPublicationError::SessionUnavailable)
+        }
+
+        fn load_snapshot_v1(
+            &mut self,
+            _controller: &VmmController,
+            _input: &SnapshotLoadInput,
+        ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
+            Err(NativeV1SnapshotLoadError::ProcessTerminal)
+        }
+
         fn metrics_diagnostics(&self) -> MetricsDiagnostics {
             self.diagnostics.clone()
         }
@@ -5707,6 +5720,7 @@ mod tests {
     struct FakeStarter {
         result: FakeStartResult,
         calls: usize,
+        snapshot_publication_failure: bool,
     }
 
     impl FakeStarter {
@@ -5718,13 +5732,20 @@ mod tests {
             Self {
                 result: FakeStartResult::Success(Box::new(session)),
                 calls: 0,
+                snapshot_publication_failure: false,
             }
+        }
+
+        fn with_snapshot_publication_failure(mut self) -> Self {
+            self.snapshot_publication_failure = true;
+            self
         }
 
         const fn failure(source: BackendError) -> Self {
             Self {
                 result: FakeStartResult::Failure(source),
                 calls: 0,
+                snapshot_publication_failure: false,
             }
         }
     }
@@ -5742,11 +5763,35 @@ mod tests {
                 FakeStartResult::Failure(source) => Err(source.clone()),
             }
         }
+
+        fn publish_snapshot_v1(
+            &mut self,
+            session: &mut Self::Session,
+            drive_config: &DriveConfig,
+            serial_config: &SerialConfig,
+            paths: &SnapshotArtifactPaths,
+        ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
+            if self.snapshot_publication_failure {
+                return Err(NativeV1SnapshotPublicationError::ConfigurationUnavailable);
+            }
+            session
+                .publish_native_v1_snapshot(drive_config, serial_config, paths)
+                .map_err(NativeV1SnapshotPublicationError::Transaction)
+        }
+
+        fn load_snapshot_v1(
+            &mut self,
+            _controller: &VmmController,
+            _input: &SnapshotLoadInput,
+        ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
+            Err(NativeV1SnapshotLoadError::ProcessTerminal)
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FakeSnapshotLoadResult {
         Success,
+        ResumeFailure,
         Terminal,
     }
 
@@ -5777,9 +5822,17 @@ mod tests {
                 "fake snapshot loader does not support ordinary start",
             ))
         }
-    }
 
-    impl SnapshotLoadExecutor for FakeSnapshotLoadStarter {
+        fn publish_snapshot_v1(
+            &mut self,
+            _session: &mut Self::Session,
+            _drive_config: &DriveConfig,
+            _serial_config: &SerialConfig,
+            _paths: &SnapshotArtifactPaths,
+        ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
+            Err(NativeV1SnapshotPublicationError::SessionUnavailable)
+        }
+
         fn load_snapshot_v1(
             &mut self,
             controller: &VmmController,
@@ -5802,7 +5855,16 @@ mod tests {
                 input.resume_vm(),
             )
             .expect("fake controller commit should allocate");
-            Ok(SnapshotV1LoadSuccess::new(FakeSession::new(77), commit))
+            let session = match self.result {
+                FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
+                    77,
+                    BackendError::Hypervisor("private-resume-sentinel".to_owned()),
+                ),
+                FakeSnapshotLoadResult::Success | FakeSnapshotLoadResult::Terminal => {
+                    FakeSession::new(77)
+                }
+            };
+            Ok(SnapshotV1LoadSuccess::new(session, commit))
         }
     }
 
@@ -6783,6 +6845,105 @@ mod tests {
     }
 
     #[test]
+    fn public_native_v1_load_commits_one_paused_session() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("public load should retain one session");
+        assert_eq!(session.id, 77);
+        assert_eq!(session.resume_count, 0);
+        assert_eq!(vmm.drive_configs()[0].drive_id(), "root");
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
+            Err(VmmActionError::UnsupportedState {
+                action: "LoadSnapshot",
+                state: InstanceState::Paused,
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn public_native_v1_load_resumes_only_after_paused_commit() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(true))),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("resumed load should retain its session")
+                .resume_count,
+            1
+        );
+    }
+
+    #[test]
+    fn public_native_v1_resume_failure_returns_load_error_and_stays_paused() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::ResumeFailure);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(true))),
+            Err(VmmActionError::SnapshotLoad(BackendError::Hypervisor(
+                "private-resume-sentinel".to_owned()
+            )))
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("failed resume should retain the paused session")
+                .resume_count,
+            1
+        );
+        assert_eq!(vmm.process_exit_status(), ProcessSessionExitStatus::Running);
+    }
+
+    #[test]
+    fn public_terminal_native_v1_load_error_latches_process() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Terminal);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
+            Err(VmmActionError::SnapshotLoad(BackendError::Hypervisor(
+                "native-v1 load process is terminal".to_owned()
+            )))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(
+            vmm.process_exit_status(),
+            ProcessSessionExitStatus::Terminal
+        );
+    }
+
+    #[test]
     fn terminal_native_v1_load_failure_latches_process_without_controller_commit() {
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Terminal);
         let calls = starter.calls();
@@ -7669,6 +7830,8 @@ mod tests {
             | VmmActionError::PmemUpdate(_)
             | VmmActionError::PmemUnsupported
             | VmmActionError::SerialConfig(_)
+            | VmmActionError::SnapshotCreate(_)
+            | VmmActionError::SnapshotLoad(_)
             | VmmActionError::SnapshotUnsupported
             | VmmActionError::VsockConfig(_) => {
                 panic!("vmnet start failure should propagate as hypervisor startup error");
@@ -10190,8 +10353,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_snapshot_create_runs_session_barrier_before_unsupported_fault() {
-        let mut vmm = snapshot_profile_vmm(FakeStarter::success(17));
+    fn runtime_snapshot_create_execution_failure_is_typed_and_keeps_paused_state() {
+        let mut vmm =
+            snapshot_profile_vmm(FakeStarter::success(17).with_snapshot_publication_failure());
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
         vmm.handle_action(VmmAction::Pause)
@@ -10199,39 +10363,21 @@ mod tests {
 
         let err = vmm
             .handle_action(snapshot_create_action(SnapshotType::Full))
-            .expect_err("snapshot create should remain unsupported");
+            .expect_err("snapshot publication failure should reach public action");
 
-        assert_eq!(err, VmmActionError::SnapshotUnsupported);
+        assert_eq!(
+            err,
+            VmmActionError::SnapshotCreate(BackendError::Hypervisor(
+                "native-v1 publication configuration is unavailable".to_owned()
+            ))
+        );
         assert_eq!(vmm.instance_info().state, InstanceState::Paused);
         let session = vmm
             .started_session
             .as_ref()
             .expect("started session should remain available");
-        assert_eq!(session.snapshot_create_barrier_count, 1);
-    }
-
-    #[test]
-    fn runtime_snapshot_create_barrier_failure_keeps_paused_state() {
-        let source = BackendError::Hypervisor("snapshot barrier failed".to_string());
-        let mut vmm = snapshot_profile_vmm(FakeStarter::success_with_session(
-            FakeSession::with_snapshot_create_barrier_result(18, source.clone()),
-        ));
-        vmm.handle_action(VmmAction::InstanceStart)
-            .expect("startup should succeed");
-        vmm.handle_action(VmmAction::Pause)
-            .expect("running instance should pause");
-
-        let err = vmm
-            .handle_action(snapshot_create_action(SnapshotType::Full))
-            .expect_err("snapshot barrier should fail before unsupported fault");
-
-        assert_eq!(err, VmmActionError::Lifecycle(source));
-        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
-        let session = vmm
-            .started_session
-            .as_ref()
-            .expect("started session should remain available");
-        assert_eq!(session.snapshot_create_barrier_count, 1);
+        assert_eq!(session.snapshot_create_barrier_count, 0);
+        assert_eq!(session.native_snapshot_publication_count, 0);
     }
 
     #[cfg(target_os = "macos")]
@@ -10331,11 +10477,14 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn public_snapshot_create_remains_unsupported_and_does_not_publish() {
-        let directory = TempSnapshotDirectory::new("public-create-unsupported");
+    fn public_snapshot_create_publishes_composite_pair_without_legacy_barrier() {
+        let directory = TempSnapshotDirectory::new("public-create-success");
         let paths = directory.paths();
         let input = SnapshotCreateInput::new(SnapshotType::Full, paths.state(), paths.memory());
-        let mut vmm = snapshot_profile_vmm(FakeStarter::success(22));
+        let barrier_error = BackendError::Hypervisor("legacy-barrier-must-not-run".to_owned());
+        let mut vmm = snapshot_profile_vmm(FakeStarter::success_with_session(
+            FakeSession::with_snapshot_create_barrier_result(22, barrier_error),
+        ));
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
         vmm.handle_action(VmmAction::Pause)
@@ -10343,17 +10492,17 @@ mod tests {
 
         assert_eq!(
             vmm.handle_action(VmmAction::CreateSnapshot(input)),
-            Err(VmmActionError::SnapshotUnsupported)
+            Ok(VmmData::Empty)
         );
         let session = vmm
             .started_session
             .as_ref()
             .expect("source session should remain retained");
-        assert_eq!(session.snapshot_create_barrier_count, 1);
-        assert_eq!(session.native_snapshot_publication_count, 0);
-        assert_eq!(session.native_snapshot_producer_count, 0);
-        assert!(!paths.state().exists());
-        assert!(!paths.memory().exists());
+        assert_eq!(session.snapshot_create_barrier_count, 0);
+        assert_eq!(session.native_snapshot_publication_count, 1);
+        assert_eq!(session.native_snapshot_producer_count, 1);
+        let artifacts = load_snapshot_artifacts(&paths).expect("public pair should validate");
+        assert_eq!(artifacts.record().kind(), SnapshotCommitKind::Composite);
         directory.assert_no_staging();
     }
 

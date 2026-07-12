@@ -119,11 +119,11 @@ memory streaming. Cancellation is checked between fixed stages and 1 MiB
 chunks. Failure returns no binding or bundle, publishes no final state marker,
 and drops the consumed writer and auxiliary guard before admission release.
 Supervisor shutdown signals cancellation before joining, but Rust cannot
-forcibly preempt an arbitrary blocking `write`; the surface therefore remains
-limited to controlled internal regular-file/test writers and is not wired to a
-public request path. In the private create transaction, the writer names no path
-and the publisher owns cleanup of its private staging entry. A partially written
-staging inode is never interpreted as committed state.
+forcibly preempt an arbitrary blocking `write`; the public request path therefore
+supplies only a publisher-owned regular staging file, never an arbitrary caller
+writer. The capture writer names no path and the publisher owns cleanup of its
+private staging entry. A partially written staging inode is never interpreted
+as committed state.
 
 PL031 RTC is represented by fixed MMIO metadata and an explicit fresh-device
 policy. No mutable RTC register or alarm state is persisted, so no continuity
@@ -156,7 +156,7 @@ as live handles; the supported serial policy creates a new empty buffer and
 metrics owner. Source VMGenID bytes are not encoded as reusable identity and
 must be replaced and signaled through the separate never-run restore stage.
 
-The private native-v1 loader completes bundle, platform, memory, cache, root,
+The native-v1 loader completes bundle, platform, memory, cache, root,
 and baseline-device validation before creating an HVF VM. Runtime installation
 consumes the validated block and UART owners, creates a fresh RTC, and leaves
 the loaded guest bytes untouched; it does not reload a kernel, rewrite an FDT,
@@ -176,9 +176,11 @@ opaque bytes, identities, or guest contents.
 
 The restored session is handed to a worker whose pause gate is closed before it
 can receive the session. Controller and process ownership commit only after
-that handoff, always as `Paused`; the retained `resume_vm` bit is intent and is
-not executed by this slice. Public snapshot create/load actions still invoke no
-artifact loader or restore transaction and remain unsupported.
+that handoff, always as `Paused`. Public `PUT /snapshot/load` reaches this
+transaction only after pristine-request and committed-pair validation;
+`resume_vm: true` then uses the ordinary resume path. Public create likewise
+uses the production publisher/capture transaction only after paused-profile and
+namespace preflight.
 
 ## macOS Isolation Design Boundaries
 
@@ -316,19 +318,19 @@ is resource-specific:
   VM. Metrics may count throttling and limiter retry events, but must not
   include random bytes, descriptor contents, host RNG errors, or host paths.
 - `/snapshot/create` and `/snapshot/load` retain complete normalized
-  Firecracker-shaped inputs in typed API/runtime values before returning
-  unsupported faults. Manual `Debug` implementations redact state/memory paths,
+  Firecracker-shaped inputs in typed API/runtime values before capability
+  preflight or execution. Manual `Debug` implementations redact state/memory paths,
   interface IDs, host device names, and vsock paths even through enclosing
   request/action enums; action names, errors, logs, and metrics remain
-  value-free. This boundary does not open, canonicalize, stat, or create either
-  artifact. Unsupported request/profile dimensions fail before a create
-  barrier; an admitted paused create temporarily closes ordinary boot-worker
-  command admission and acknowledges process-local block/entropy retry
-  quiescence, but it does not freeze other host resources. Load freshness uses
+  value-free. Unsupported request/profile dimensions fail before artifact I/O;
+  an admitted paused create opens only preflighted namespaces, temporarily
+  closes ordinary boot-worker command admission, and acknowledges process-local
+  block/entropy retry quiescence through complete capture and memory streaming.
+  Load freshness uses
   successful configuration history plus current non-logger/metrics state, so
   explicit defaults and residual MMDS presence fail closed without treating a
-  side-effect-free failed request as configuration. Future snapshot support
-  must continue treating paths and restored guest/vCPU/device state as
+  side-effect-free failed request as configuration. Snapshot execution treats
+  paths and restored guest/vCPU/device state as
   untrusted, preserve redaction, and prevent one process from cleaning up or
   overwriting another process's resources. The current boundary is documented
   in [Snapshot Feasibility](snapshot-feasibility.md).
@@ -355,8 +357,8 @@ is resource-specific:
   corrupt pairs but do not authenticate an actor able to rewrite both files.
   The handle-level codec itself opens no path. The internal artifact layer can
   compose it with either memory-only or composite commit kind. The private
-  process create seam now composes complete capture with final publication;
-  public snapshot paths invoke neither private transaction.
+  process create seam composes complete capture with final publication, and the
+  admitted public snapshot paths invoke the production create/load transactions.
 - Internal native snapshot publication treats both final paths and all existing
   directory entries as untrusted. It opens each parent once, anchors later
   operations to that descriptor, rejects exact aliases, preflights final names
@@ -411,8 +413,8 @@ is resource-specific:
   failed register identifier, completed-write count, and backend source—not
   register contents. After failure, callers must retry the complete retained
   value or discard the vCPU before execution; running a partially updated vCPU
-  is outside the supported boundary. Public snapshot load does not invoke this
-  primitive.
+  is outside the supported boundary. Public snapshot load uses the validated
+  aggregate restore command rather than invoking this standalone primitive.
   The paired core system-register restore has the same trust and partial-write
   boundary for raw `SP_EL0`, `SP_EL1`, `ELR_EL1`, and `SPSR_EL1`. It accepts
   only the complete typed capture today, writes the four fields in capture
@@ -518,8 +520,9 @@ is resource-specific:
   this primitive provides no wider Z/P/ZA/ZT0 ordering, feature or destination
   validation, FPCR/FPSR writable-bit policy, protected persistence,
   zeroization, rollback, or schema. After failure, retry the complete retained
-  value or discard the vCPU before execution. Public snapshot load invokes none
-  of these restore primitives.
+  value or discard the vCPU before execution. Public snapshot load reaches the
+  validated aggregate restore command only after exact native-v1 compatibility
+  checks; it does not call these standalone primitives independently.
   TTBR fields expose guest physical table addresses, while CONTEXTIDR can
   expose guest process or kernel context identifiers.
   FAR and PAR can expose guest fault or translation-result addresses, VBAR can
@@ -671,8 +674,8 @@ is resource-specific:
   ordered nontransactional write sequence. A failed apply may have changed the
   never-run destination; callers must retry the complete value with a fresh
   sample or discard it. Individual command admission is not a cross-step
-  restore lease. The public pause and snapshot paths do not invoke any of these
-  capture or restore commands.
+  restore lease. Public snapshot create/load use the aggregate native-v1
+  capture/restore commands rather than these raw standalone operations.
   Native-v1 optional-state classification also fails closed when CPACR enables
   SVE/SME access, PSTATE.SM/ZA is active, or an implemented breakpoint or
   watchpoint is enabled. Category-only rejections expose no register value,

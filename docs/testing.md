@@ -155,8 +155,9 @@ It also proves cancellation emits no bundle, leaves `Paused`, and permits a
 fresh capture and resume. Process/supervisor publication tests additionally
 prove path/profile preflight before content capture, direct staging-writer
 streaming, required kind 2, writer closure before commit, cancellation cleanup
-and fresh retry, terminal worker panic, unchanged paused controller state, and
-that public create still publishes nothing. Run these focused surfaces with
+and fresh retry, terminal worker panic, unchanged paused controller state,
+public create publication/collision behavior, public load paused/resume
+ordering, and retryable versus terminal failures. Run these focused surfaces with
 `cargo test -p bangbang-hvf snapshot_v1 --lib --locked` and
 `cargo test -p bangbang native_v1_ --locked`.
 
@@ -575,6 +576,25 @@ kernel, deterministic tiny initrd, and generated direct-boot ext4 rootfs,
 starts `bangbang` as a child process, configures the VM through the Unix-socket
 API or a Firecracker-shaped config file depending on the scenario, and waits for
 the guest to write deterministic markers to host-observable outputs. The
+native-v1 snapshot scenario uses a test-only arm64 Image with a valid Linux
+header and no rootfs dependency for guest control flow. The guest saves both
+halves of VMGenID, writes one UART readiness byte, and loops at the captured PC.
+The host polls public `FlushMetrics` until `uart.write_count` changes, pauses and
+creates through `/snapshot/create`, checks public collision/no-clobber
+redaction, and terminates the source. Two fresh signed processes load the same
+immutable pair: one remains paused until public `PATCH /vm`, and one uses
+`resume_vm: true`. Guest PSCI `SYSTEM_OFF` is reachable only after a changed
+VMGenID is observed, so clean process exit proves VMGenID replacement and
+continuation from captured register/memory state without a fixed readiness
+sleep. Run just this proof with:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  macos_arm64::signed_executable_creates_and_restores_native_v1_snapshot_across_processes \
+  --exact
+```
+
+The
 tiny-initrd scenarios write `BANGBANG_BLOCK_WRITE_OK` to scratch block backing
 files and include API/config-file coverage for configured serial output files.
 The API-request, API-enabled config-file, and no-api config-file scenarios
@@ -815,8 +835,7 @@ connection exchange through the signed executable, including narrow
 multi-payload stream cases and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, that RTC alarm
-interrupts, guest-observed VMGenID restore handling, VMClock restore signaling,
-VMClock guest e2e observation,
+interrupts, VMClock restore signaling, VMClock guest e2e observation,
 or broader RTC-adjacent time/identity behavior is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 
