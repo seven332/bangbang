@@ -24,6 +24,15 @@ crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
 ```
 
+On supported macOS Apple Silicon hosts, the public machine configuration accepts
+`vcpu_count` from 1 through 32 and HVF startup admits the host-limited subset
+`1..=min(32, host_max)`. Counts above the runtime host maximum fail before a
+session is retained or the instance becomes `Running`. Public pause/resume uses
+a topology-wide active-run barrier for every online vCPU. SMT, non-`None` CPU
+templates, CPU hotplug beyond the current CPU_ON subset, reboot-in-place, and
+cross-host CPU portability remain unsupported. The native-v1 snapshot profile
+below remains restricted to exactly one vCPU.
+
 The HVF runner currently exposes owner-thread capture building blocks for
 general registers, plus ordered nontransactional restore of the same typed
 X0-X30/PC/CPSR value, raw core system registers plus ordered nontransactional

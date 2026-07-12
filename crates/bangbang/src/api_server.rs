@@ -2434,6 +2434,14 @@ mod tests {
             }
         }
 
+        fn failure_with(source: BackendError) -> Self {
+            Self {
+                result: Err(source),
+                assemble_boot_resources: false,
+                snapshot_operations_succeed: false,
+            }
+        }
+
         const fn boot_resource_assembler() -> Self {
             Self {
                 result: Ok(TestSession::without_boot_run_loop_status()),
@@ -4127,6 +4135,64 @@ mod tests {
             Path::new("/tmp/original-vmlinux")
         );
         assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn returns_stable_multi_vcpu_capacity_fault_without_partial_commit() {
+        let private_kernel_path = "/private/api-capacity-kernel";
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::failure_with(
+            BackendError::Hypervisor(
+                "HVF vCPU topology count 2 exceeds host maximum 1".to_string(),
+            ),
+        ));
+        let machine_response = request_over_socket(
+            &mut vmm,
+            "capacity-machine",
+            &request_with_body(
+                "PUT",
+                "/machine-config",
+                r#"{"vcpu_count":2,"mem_size_mib":128}"#,
+            ),
+        );
+        assert!(machine_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let boot_response = request_over_socket(
+            &mut vmm,
+            "capacity-boot",
+            &request_with_body(
+                "PUT",
+                "/boot-source",
+                &format!(r#"{{"kernel_image_path":"{private_kernel_path}"}}"#),
+            ),
+        );
+        assert!(boot_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        for request_id in ["capacity-start", "capacity-retry"] {
+            let response = put_action_over_socket(&mut vmm, request_id, "InstanceStart");
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(
+                r#"{"fault_message":"failed to start microVM: hypervisor error: HVF vCPU topology count 2 exceeds host maximum 1"}"#
+            ));
+            assert!(!response.contains(private_kernel_path));
+        }
+
+        let instance_info = request_over_socket(
+            &mut vmm,
+            "capacity-state",
+            "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(instance_info.contains(r#""state":"Not started""#));
+        let machine_config = request_over_socket(
+            &mut vmm,
+            "capacity-machine-get",
+            "GET /machine-config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(machine_config.contains(r#""vcpu_count":2"#));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+        assert!(!vmm.has_started_session());
     }
 
     #[test]

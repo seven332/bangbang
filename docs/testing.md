@@ -92,7 +92,13 @@ internal vCPUs, verifies FDT CPU nodes and PSCI enable methods for MPIDRs
 `[0, 1]`, pins PID 1 to CPU1 with raw `sched_setaffinity`, confirms `getcpu == 1`,
 and only then writes `BANGBANG_SECONDARY_CPU_OK`. Use deadline/marker
 synchronization and the signed wrapper; do not add a fixed sleep. Public process
-startup and native-v1 multi-vCPU acceptance remain separate negative gates.
+startup is covered separately by the signed executable target. Its generated
+`/smp-progress-init` verifies CPU0 and CPU1 affinity, gates progress until both
+are ready, then emits distinct non-ASCII one-byte tokens from each pinned role.
+The public test pauses one two-vCPU process, uses both token streams from an
+isolated peer as an event-driven observation window, requires the paused serial
+bytes to stay exact, and requires both streams to resume. Native-v1 multi-vCPU
+acceptance remains a separate negative gate.
 
 For virtio-pmem changes, unit tests should cover MMIO registration, FDT
 metadata, config-space `start`/`size`, deterministic multi-device layout,
@@ -723,6 +729,11 @@ The `guest_boot` runner also generates a deterministic tiny initrd under
 own `/init`, so a rootfs drive is not required for the minimal guest boot
 integration test. It also contains `/smp-init`, whose raw arm64 syscalls pin PID
 1 to CPU1 and verify the observed CPU before emitting its deterministic marker.
+The separate `/smp-progress-init` clones a shared-VM child, pins and verifies the
+parent on CPU0 and child on CPU1, releases them only after both are ready, and
+emits distinct non-ASCII one-byte progress tokens with a cooperative yield after
+each write. Token counts are safe to observe independently without multi-byte
+UART interleaving or fixed sleeps.
 The baseline test succeeds when the guest emits `BANGBANG_BOOT_OK` on the
 internal serial console. The same signed target also includes a raw
 virtio-block read scenario: the test configures one temporary drive whose first

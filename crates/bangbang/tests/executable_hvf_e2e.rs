@@ -104,8 +104,12 @@ mod macos_arm64 {
         ),
     ];
     const GUEST_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
+    const GUEST_SMP_PROGRESS_BOOT_ARGS: &str =
+        "console=ttyS0 reboot=k panic=1 rdinit=/smp-progress-init";
     const GUEST_POWEROFF_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init";
     const GUEST_RESET_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/reboot-init";
+    const SMP_PROGRESS_CPU0_TOKEN: u8 = 0xa5;
+    const SMP_PROGRESS_CPU1_TOKEN: u8 = 0xd3;
     const DIRECT_ROOTFS_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
     const ROOTFS_BOOT_TIMER_BOOT_ARGS: &str =
@@ -149,6 +153,12 @@ mod macos_arm64 {
         mmds_config_body: &'a str,
         boot_args: &'a str,
         success_marker: &'a [u8],
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SmpProgressCounts {
+        cpu0: usize,
+        cpu1: usize,
     }
 
     #[test]
@@ -939,6 +949,167 @@ mod macos_arm64 {
             "rejected vsock update must not leave replacement socket path {}",
             replacement_vsock_path.display()
         );
+    }
+
+    #[test]
+    fn signed_executable_runs_and_pauses_two_isolated_public_smp_guests() {
+        let test_dir = TestDir::new();
+        let socket_a = test_dir.path().join("smp-a.socket");
+        let socket_b = test_dir.path().join("smp-b.socket");
+        let serial_a = test_dir.path().join("smp-a.serial");
+        let serial_b = test_dir.path().join("smp-b.serial");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let base_instance_id = test_dir.instance_id();
+        let instance_a = format!("{base_instance_id}-smp-a");
+        let instance_b = format!("{base_instance_id}-smp-b");
+
+        create_empty_file(&serial_a);
+        create_empty_file(&serial_b);
+        let mut process_a = BangbangProcess::start(&socket_a, &instance_a);
+        let mut process_b = BangbangProcess::start(&socket_b, &instance_b);
+        configure_public_smp_progress(
+            &socket_a,
+            &kernel_path,
+            &initrd_path,
+            &serial_a,
+            "process A",
+        );
+        configure_public_smp_progress(
+            &socket_b,
+            &kernel_path,
+            &initrd_path,
+            &serial_b,
+            "process B",
+        );
+
+        let initial_target = SmpProgressCounts { cpu0: 2, cpu1: 2 };
+        let _initial_a = wait_for_smp_progress_or_collect(
+            &serial_a,
+            initial_target,
+            &mut process_a,
+            &mut process_b,
+            "initial process A progress",
+        );
+        let _initial_b = wait_for_smp_progress_or_collect(
+            &serial_b,
+            initial_target,
+            &mut process_a,
+            &mut process_b,
+            "initial process B progress",
+        );
+
+        for (socket, context) in [(&socket_a, "process A"), (&socket_b, "process B")] {
+            let state = http_get(socket, "/");
+            assert_ok_response(&state, &format!("GET / for {context}"));
+            assert_response_contains(
+                &state,
+                r#""state":"Running""#,
+                &format!("GET / for {context}"),
+            );
+            let machine = http_get(socket, "/machine-config");
+            assert_response_contains(
+                &machine,
+                r#""vcpu_count":2"#,
+                &format!("GET /machine-config for {context}"),
+            );
+            let repeated_start =
+                http_put_json(socket, "/actions", r#"{"action_type":"InstanceStart"}"#);
+            assert_bad_request_response(
+                &repeated_start,
+                &format!("repeated InstanceStart for {context}"),
+            );
+            assert_response_contains(
+                &repeated_start,
+                r#"{"fault_message":"The requested operation is not supported in Running state: InstanceStart"}"#,
+                &format!("repeated InstanceStart for {context}"),
+            );
+        }
+
+        let pause = http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        assert_no_content_response(&pause, "PATCH process A /vm Paused");
+        let duplicate_pause = http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        assert_bad_request_response(&duplicate_pause, "duplicate process A pause");
+        assert_response_contains(
+            &duplicate_pause,
+            r#"{"fault_message":"The requested operation is not supported in Paused state: Pause"}"#,
+            "duplicate process A pause",
+        );
+        let paused_state = http_get(&socket_a, "/");
+        assert_response_contains(
+            &paused_state,
+            r#""state":"Paused""#,
+            "GET process A after pause",
+        );
+        let peer_state = http_get(&socket_b, "/");
+        assert_response_contains(
+            &peer_state,
+            r#""state":"Running""#,
+            "GET process B while process A is paused",
+        );
+
+        let paused_bytes = fs::read(&serial_a).expect("paused process A serial should read");
+        let peer_before = smp_progress_counts(&serial_b)
+            .expect("running process B progress should remain readable");
+        let peer_target = SmpProgressCounts {
+            cpu0: peer_before.cpu0 + 2,
+            cpu1: peer_before.cpu1 + 2,
+        };
+        let _peer_after = wait_for_smp_progress_or_collect(
+            &serial_b,
+            peer_target,
+            &mut process_a,
+            &mut process_b,
+            "process B progress while process A is paused",
+        );
+        assert_eq!(
+            fs::read(&serial_a).expect("paused process A serial should remain readable"),
+            paused_bytes,
+            "process A serial bytes must remain unchanged while both process B vCPUs progress"
+        );
+
+        let paused_counts = smp_progress_counts(&serial_a)
+            .expect("paused process A progress should remain readable");
+        let resume = http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        assert_no_content_response(&resume, "PATCH process A /vm Resumed");
+        let duplicate_resume = http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        assert_bad_request_response(&duplicate_resume, "duplicate process A resume");
+        assert_response_contains(
+            &duplicate_resume,
+            r#"{"fault_message":"The requested operation is not supported in Running state: Resume"}"#,
+            "duplicate process A resume",
+        );
+        let resumed_target = SmpProgressCounts {
+            cpu0: paused_counts.cpu0 + 2,
+            cpu1: paused_counts.cpu1 + 2,
+        };
+        let _resumed_counts = wait_for_smp_progress_or_collect(
+            &serial_a,
+            resumed_target,
+            &mut process_a,
+            &mut process_b,
+            "resumed process A progress",
+        );
+
+        let output_a = process_a.interrupt();
+        assert!(
+            !output_a.stdout.contains(path_text(&serial_b))
+                && !output_a.stderr.contains(path_text(&serial_b)),
+            "process A diagnostics must not expose process B serial path; stdout:\n{}\nstderr:\n{}",
+            output_a.stdout,
+            output_a.stderr
+        );
+        assert_clean_shutdown(output_a, &socket_a, "public SMP process A after SIGINT");
+
+        let output_b = process_b.terminate();
+        assert!(
+            !output_b.stdout.contains(path_text(&serial_a))
+                && !output_b.stderr.contains(path_text(&serial_a)),
+            "process B diagnostics must not expose process A serial path; stdout:\n{}\nstderr:\n{}",
+            output_b.stdout,
+            output_b.stderr
+        );
+        assert_clean_shutdown(output_b, &socket_b, "public SMP process B after SIGTERM");
     }
 
     #[test]
@@ -3956,6 +4127,7 @@ mod macos_arm64 {
             &config_path,
             &kernel_path,
             &initrd_path,
+            2,
             GUEST_POWEROFF_BOOT_ARGS,
         );
 
@@ -3993,6 +4165,7 @@ mod macos_arm64 {
             &config_path,
             &kernel_path,
             &initrd_path,
+            1,
             GUEST_POWEROFF_BOOT_ARGS,
         );
 
@@ -4035,6 +4208,7 @@ mod macos_arm64 {
             &config_path,
             &kernel_path,
             &initrd_path,
+            2,
             GUEST_RESET_BOOT_ARGS,
         );
 
@@ -4072,6 +4246,7 @@ mod macos_arm64 {
             &config_path,
             &kernel_path,
             &initrd_path,
+            1,
             GUEST_RESET_BOOT_ARGS,
         );
 
@@ -4529,6 +4704,7 @@ mod macos_arm64 {
         config_path: &Path,
         kernel_path: &Path,
         initrd_path: &Path,
+        vcpu_count: u8,
         boot_args: &str,
     ) {
         let kernel_path_json = json_string(path_text(kernel_path));
@@ -4536,7 +4712,7 @@ mod macos_arm64 {
         let boot_args_json = json_string(boot_args);
         let config = format!(
             r#"{{
-                "machine-config": {{"vcpu_count": 1, "mem_size_mib": 256}},
+                "machine-config": {{"vcpu_count": {vcpu_count}, "mem_size_mib": 256}},
                 "boot-source": {{
                     "kernel_image_path": {kernel_path_json},
                     "initrd_path": {initrd_path_json},
@@ -4545,6 +4721,47 @@ mod macos_arm64 {
             }}"#
         );
         fs::write(config_path, config).expect("guest stop config file should be written");
+    }
+
+    fn configure_public_smp_progress(
+        socket_path: &Path,
+        kernel_path: &Path,
+        initrd_path: &Path,
+        serial_path: &Path,
+        context: &str,
+    ) {
+        let machine = http_put_json(
+            socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":2,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(&machine, &format!("PUT {context} /machine-config"));
+        let boot = http_put_json(
+            socket_path,
+            "/boot-source",
+            &format!(
+                r#"{{"kernel_image_path":{},"initrd_path":{},"boot_args":{}}}"#,
+                json_string(path_text(kernel_path)),
+                json_string(path_text(initrd_path)),
+                json_string(GUEST_SMP_PROGRESS_BOOT_ARGS),
+            ),
+        );
+        assert_no_content_response(&boot, &format!("PUT {context} /boot-source"));
+        let serial = http_put_json(
+            socket_path,
+            "/serial",
+            &format!(
+                r#"{{"serial_out_path":{}}}"#,
+                json_string(path_text(serial_path))
+            ),
+        );
+        assert_no_content_response(&serial, &format!("PUT {context} /serial"));
+        let start = http_put_json(
+            socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(&start, &format!("PUT {context} InstanceStart"));
     }
 
     fn create_zeroed_block_backing(path: &Path) {
@@ -4925,6 +5142,88 @@ mod macos_arm64 {
              level=Info origin=crates/runtime/src/logger.rs:3 action=FlushMetrics\n",
             LoggerPrefixExpectation::LevelOrigin,
         );
+    }
+
+    fn smp_progress_counts(path: &Path) -> Result<SmpProgressCounts, String> {
+        read_smp_progress_counts(path)
+    }
+
+    fn read_smp_progress_counts(path: &Path) -> Result<SmpProgressCounts, String> {
+        let bytes = fs::read(path)
+            .map_err(|err| format!("failed to read SMP progress {}: {err}", path.display()))?;
+        Ok(SmpProgressCounts {
+            cpu0: bytes
+                .iter()
+                .filter(|byte| **byte == SMP_PROGRESS_CPU0_TOKEN)
+                .count(),
+            cpu1: bytes
+                .iter()
+                .filter(|byte| **byte == SMP_PROGRESS_CPU1_TOKEN)
+                .count(),
+        })
+    }
+
+    fn wait_for_smp_progress_counts(
+        path: &Path,
+        target: SmpProgressCounts,
+        timeout: Duration,
+    ) -> Result<SmpProgressCounts, String> {
+        let file = fs::File::open(path).map_err(|err| {
+            format!(
+                "failed to open SMP progress serial output {}: {err}",
+                path.display()
+            )
+        })?;
+        let kqueue = Kqueue::new()?;
+        kqueue.watch_writes(&file)?;
+        let started_at = Instant::now();
+
+        loop {
+            let counts = read_smp_progress_counts(path)?;
+            if counts.cpu0 >= target.cpu0 && counts.cpu1 >= target.cpu1 {
+                return Ok(counts);
+            }
+
+            let Some(remaining) = timeout.checked_sub(started_at.elapsed()) else {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for CPU0/CPU1 SMP progress counts {target:?} in {}",
+                    path.display()
+                ));
+            };
+            kqueue.wait_for_write(remaining)?;
+        }
+    }
+
+    fn wait_for_smp_progress_or_collect(
+        path: &Path,
+        target: SmpProgressCounts,
+        first: &mut BangbangProcess,
+        second: &mut BangbangProcess,
+        context: &str,
+    ) -> SmpProgressCounts {
+        match wait_for_smp_progress_counts(path, target, GUEST_EXECUTION_TIMEOUT) {
+            Ok(counts) => counts,
+            Err(err) => {
+                let serial_tail = match fs::read(path) {
+                    Ok(bytes) => {
+                        let start = bytes.len().saturating_sub(512);
+                        format!("{:02x?}", &bytes[start..])
+                    }
+                    Err(read_err) => format!("<failed to read serial tail: {read_err}>"),
+                };
+                let first_output = first.force_stop_and_collect();
+                let second_output = second.force_stop_and_collect();
+                panic!(
+                    "{context} failed: {err}; serial tail: {serial_tail}; first status: {:?}\nfirst stdout:\n{}\nfirst stderr:\n{}\nsecond status: {:?}\nsecond stdout:\n{}\nsecond stderr:\n{}",
+                    first_output.status,
+                    first_output.stdout,
+                    first_output.stderr,
+                    second_output.status,
+                    second_output.stdout,
+                    second_output.stderr
+                );
+            }
+        }
     }
 
     fn wait_for_file_prefix_marker(
