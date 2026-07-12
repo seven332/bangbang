@@ -993,7 +993,7 @@ where
 
         {
             let mut state = self.shared.lock_state()?;
-            if activate_offline && !state.pending_events.is_empty() {
+            if !state.pending_events.is_empty() {
                 return Ok(admissions);
             }
             if !matches!(state.phase, CoordinatorPhase::Running) {
@@ -2316,6 +2316,29 @@ mod tests {
                 .members[1]
                 .online
         );
+        assert!(batch.calls().is_empty());
+    }
+
+    #[test]
+    fn pending_empty_wakeup_blocks_internal_member_resubmission() {
+        let members = fake_members(1);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        let _wakeup = coordinator
+            .control()
+            .request_wakeup()
+            .expect("idle wakeup should start")
+            .wait()
+            .expect("idle wakeup should complete");
+
+        assert!(
+            coordinator
+                .submit_indexes(&[0], false)
+                .expect("pending wakeup should defer internal resubmission")
+                .is_empty()
+        );
+        assert!(members[0].pending_tokens().is_empty());
         assert!(batch.calls().is_empty());
     }
 
