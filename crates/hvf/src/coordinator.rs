@@ -496,12 +496,21 @@ impl CoordinatorShared {
 }
 
 /// Wait handle completed only after every run in a control snapshot responds.
+///
+/// For a non-empty snapshot, the thread that owns the corresponding
+/// [`HvfVcpuRunCoordinator`] must keep calling
+/// [`HvfVcpuRunCoordinator::receive_event`] while a separate control requester
+/// waits on this handle.
 pub struct HvfVcpuRunBarrierWaiter {
     receiver: mpsc::Receiver<Result<HvfVcpuRunBarrierReport, HvfVcpuRunCoordinatorError>>,
 }
 
 impl HvfVcpuRunBarrierWaiter {
     /// Wait for exact per-member barrier acknowledgements.
+    ///
+    /// Do not call this on the coordinator-owning thread while the snapshot is
+    /// active: that thread must continue driving completion collection through
+    /// [`HvfVcpuRunCoordinator::receive_event`].
     pub fn wait(self) -> Result<HvfVcpuRunBarrierReport, HvfVcpuRunCoordinatorError> {
         self.receiver
             .recv()
@@ -1418,6 +1427,9 @@ impl<'topology, 'vm> HvfVcpuRunCoordinator<'topology, 'vm> {
     }
 
     /// Wait for the next member, barrier, or fully drained terminal event.
+    ///
+    /// Calling this method drives completion collection for pending control
+    /// waiters as well as ordinary run events.
     pub fn receive_event(&mut self) -> Result<HvfVcpuRunEvent, HvfVcpuRunCoordinatorError> {
         self.inner.receive_event()
     }
