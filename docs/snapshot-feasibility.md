@@ -12,10 +12,11 @@ guest-memory image/binding I/O, memory-only and composite commit records, an
 exact five-component native-HVF state payload, and an internal macOS no-clobber
 two-file publisher/loader. A private supervisor operation can capture one
 accepted paused native-v1 source into a complete in-memory state bundle plus a
-caller-owned memory output. A separate internal process load seam can consume a
-committed kind-2 pair, build a fresh initially paused destination, and return
-the `resume_vm` request as explicit caller intent. No public API path invokes
-final artifact publication or loading.
+publisher-owned memory output. An internal process create seam now publishes
+that capture as one exact kind-2 pair, and a separate internal process load seam
+can consume the pair, build a fresh initially paused destination, and return the
+`resume_vm` request as explicit caller intent. No public API path invokes either
+transaction.
 
 - `PUT /snapshot/create` and `PUT /snapshot/load` parse and normalize complete
   request bodies into debug-redacted API and runtime values before reaching VMM
@@ -51,9 +52,10 @@ final artifact publication or loading.
   memory image from exact `GuestMemory` regions, and load a validated image into
   newly allocated anonymous memory through already-open seekable handles. A
   separate internal path layer can publish that image with either validated
-  commit kind and load the committed pair. The private capture path creates a
-  composite commit but deliberately does not call the publisher; public
-  snapshot create/load invokes neither layer.
+  commit kind and load the committed pair. The private create transaction now
+  supplies the publisher-owned staging writer to the complete capture and
+  returns its composite commit; public snapshot create/load invokes neither
+  transaction.
 
 ## Native V1 State Envelope
 
@@ -180,9 +182,21 @@ mode `0600`. Publication uses directory-relative
 directory synchronization are unsupported rather than receiving a
 replace-capable fallback.
 
+The generalized publisher creates both staging entries only after all path,
+directory, alias, and final-absence preflights, then invokes one synchronous
+producer with a pathless, non-cloneable memory writer. The producer returns the
+exact backend-neutral commit record for those bytes. Writer drop closes its
+descriptor before setting a publisher-observed close proof; a retained or
+forgotten writer fails immediately before verification, sync, or rename. A
+fixed-size check compares observed position/length, memory header identity and
+data length, and the stored checksum trailer with the trusted codec-produced
+binding. It does not recompute the full CRC or validate GPA ranges; the loader
+remains authoritative for both.
+
 The ordered boundary is:
 
-1. create both private files, write the complete memory image and state record,
+1. create both private files, run the producer, require its writer-close proof,
+   verify its memory output against the returned record, write the state record,
    and call `sync_all` on both files;
 2. publish memory exclusively and synchronize its destination directory;
 3. publish state exclusively as the only commit marker and synchronize its
@@ -258,8 +272,10 @@ releasing snapshot admission, and leaves the source paused for retry or resume.
 Supervisor shutdown signals cancellation before joining the worker. An
 individual blocking OS write cannot be forcibly preempted, which is one reason
 the operation remains restricted to controlled internal writers. The operation
-does not open request paths, stage final names, call the publisher, reconstruct
-a VM, or mutate the source session.
+does not itself open request paths or mutate the source session. The private
+process create seam composes it synchronously inside the publisher callback;
+the worker consumes and drops the staging writer before releasing its guard or
+replying, so no writer alias remains when publication verification begins.
 
 ## Current Ownership and Pause Boundary
 
@@ -961,9 +977,10 @@ snapshot state unless a later design proves otherwise.
 The native-v1 baseline register inventory, GIC/device payload schemas, capture
 ownership, and lease duration through synchronous memory output are now fixed
 by the private composite capture. Dirty tracking, optional resources, final
-create-side artifact orchestration, and public enablement remain separate design
-decisions. The publisher remains independently implemented and is not called by
-capture; the private restore consumes already committed artifacts.
+public routing, and optional-resource policy remain separate design decisions.
+The internal process owner now composes the independently implemented publisher
+and capture through one close-proven staging writer; the private restore
+consumes the resulting committed artifacts.
 
 ### Failure and terminal precedence
 
@@ -990,13 +1007,9 @@ capture; the private restore consumes already committed artifacts.
 
 Public snapshot success still requires these current prerequisites:
 
-- create-side artifact orchestration that opens controlled staging outputs,
-  invokes the private composite capture, passes the resulting kind-2 record to
-  the existing memory-first/state-last publisher, and maps every orphan or
-  durability-uncertain outcome without exposing paths or partial state;
-- public load routing and response/latency semantics around the implemented
-  private destination compatibility, construction, restore, cleanup, and paused
-  commit boundary;
+- public create/load routing and response/latency semantics around the
+  implemented private publication and destination restore boundaries, including
+  post-commit `resume_vm` handling;
 - explicit external-resource and override policy for every profile beyond one
   read-only root block device and default serial, plus optional-device state;
 - a dirty-page strategy before `Diff` can be admitted; and
@@ -1167,9 +1180,10 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Native-v1 baseline device profile (internal state and preflight implemented) | #1268 adds an exact standalone `BANGDEV\0` v1 profile capped at 16 KiB for one read-only root virtio-block device, complete healthy virtio-mmio registers, one queue and active cursors, guest-visible interrupt status, frozen limiter/retry time, UART registers with fresh-default output, and canonical VMGenID/VMClock metadata without reusable generation bytes. Capture joins process-owned drive/serial configuration with one quiesced worker observation; load preflight validates mapped non-overlapping rings and cursors, reopens the root regular file read-only/no-follow with exact descriptor stat identity, and builds drop-safe block/serial resources off-side. #1270 nests this exact value in the composite bundle, and #1272 installs it without boot writes and performs post-GIC VMGenID replacement. | Deterministic codec/header/EOF/bounds/redaction; transport no-partial-restore; queue mapping/cursor/retry; injected-time limiter and scheduler tests; real-file identity/no-follow and fresh-serial preflight; no-boot-write installation; runtime/HVF ownership; signed distinct-destination continuity. |
 | EL2 GIC CPU registers and remaining emulated-device state | Inventory `ICC_SRE_EL2` plus ICH/ICV ownership and add stable state models for optional MMIO devices outside the native-v1 baseline. | Per-device round-trip unit tests and signed HVF EL2 CPU-interface/device-state coverage if nested virtualization is enabled. |
 | Full guest-memory image I/O (internal primitives implemented) | #1263 defines the native-v1 fixed memory header and state-authoritative GPA binding, preserves exact discontiguous/dynamic region boundaries and canonical absolute offsets, streams full bytes through a fallible 1 MiB buffer with CRC-64/Jones, and anonymously loads only after seek-observed length, pair identity, trailer, binding checksum, and EOF validation. #1270 adds cooperative stage/chunk cancellation and holds immutable capture ownership through this copy; public success remains deferred. | Golden header/binding/CRC bytes; exact maximum metadata; multi-region and chunk-boundary round trips; malformed layout/length/identity/integrity; short/interrupted/failing I/O and seek races; cancellation before fixed stages and successive chunks; allocation/access failure and partial-owner drop; full process and signed capture coverage. |
-| No-clobber artifact commit boundary (internal primitive implemented) | #1264 adds the fixed memory-only commit record, directory-fd-anchored macOS staging, exclusive memory-first/state-last publication with file and directory barriers, typed orphan and committed-uncertain outcomes, and the inverse state-first committed-pair loader. #1270 preserves kind 1 exactly and adds bounded kind 2 for binding plus opaque complete state. Destination directories are trusted; published finals are never cleanup targets; no public VMM/API path invokes the publisher. | Exact codec bytes and malformed inputs for both kinds; same/cross-directory success; all final file types and aliases; ordered failure injection; late collisions; observed staging replacement; cleanup failure; corruption/mismatch; redaction; and coordinated multiprocess contention. |
+| No-clobber artifact commit boundary (internal primitive implemented) | #1264 adds the fixed memory-only commit record, directory-fd-anchored macOS staging, exclusive memory-first/state-last publication with file and directory barriers, typed orphan and committed-uncertain outcomes, and the inverse state-first committed-pair loader. #1270 preserves kind 1 exactly and adds bounded kind 2 for binding plus opaque complete state. #1274 adds a generic typed producer over a pathless staging writer, enforced writer-close proof, and fixed-size record/output matching while preserving kind 1. Destination directories are trusted; published finals are never cleanup targets; no public VMM/API path invokes the publisher. | Exact codec bytes and malformed inputs for both kinds; callback ordering/skip/panic/error/retention/forget and retry; output mismatch; same/cross-directory success; all final file types and aliases; ordered failure injection; late collisions; observed staging replacement; cleanup failure; corruption; redaction; and coordinated multiprocess contention. |
 | Native-v1 composite bundle and private capture (internal implemented) | #1270 adds the exact five-component `BANGHVF\0` profile, atomic default-vCPU cache manifest, bounded GIC capture, one aggregate four-domain runner command, explicit fresh-RTC policy, and a supervisor-owned capture that holds paused admission and auxiliary quiescence through encoding and cancellable memory streaming. It returns a detached kind-2 bundle, publishes no final path, and leaves recoverable source sessions paused, retryable, and resumable. Public create/load and optional devices remain deferred. | Kind-1 preservation and kind-2/component golden/malformed/cross-validation/redaction tests; exact runner capture order, conflicts, abandonment, and cleanup; supervisor order/cancellation/retry/drop tests; full memory decode plus real signed capture and retained source-owner reuse. |
 | Native-v1 private load and paused restore (internal implemented) | #1272 loads a committed kind-2 pair, cross-validates the fixed platform and destination cache manifest, installs the read-only-root/UART/fresh-RTC runtime without kernel or FDT writes, creates a fresh VM/GIC/runner, validates destination CPU/MPIDR/optional state, and restores architecture, opaque GIC, ICC, normalized timers, and pending levels in one never-run command. It then replaces/signals VMGenID, transfers the session to an initially paused worker, commits controller state as `Paused`, and returns `resume_vm` as intent. Failures retain value-free cleanup evidence and become terminal only when cleanup is incomplete. The public `LoadSnapshot` action remains unsupported. | Platform/install unit tests; exact aggregate validation/restore order, source/destination optional-state rejection, sticky never-run admission, paused worker start, controller intent/terminal tests, strict redaction/lints, and a signed disk-artifact distinct-destination continuation with VMGenID replacement. |
+| Native-v1 private composite publication (internal implemented) | #1274 adds a process create seam that derives both final paths from typed input after exact paused/profile preflight, then lets the concrete supervisor stream the complete capture directly into publisher-owned staging and return a required kind-2 record. Capture failure or cancellation removes only private staging and leaves recoverable sources paused; worker panic remains terminal. The public `CreateSnapshot` action still runs only its existing barrier and returns unsupported without file I/O. | Runtime callback/close/output/ordering/failure tests; ProcessVmm preflight/config/no-mutation/public-isolation tests; supervisor collision/cancellation/retry/panic tests; and signed production publication followed by distinct-destination load/restore/continuation. |
 | External resource policy | Define disk, vmnet, and vsock metadata, buffering boundary, disconnect/reconnect behavior, and restore overrides. | Resource-policy unit/process tests and focused signed network/vsock coverage. |
 | Public snapshot create orchestration | Open controlled staging outputs, invoke the implemented private capture, pass its kind-2 record through the documented memory-first/state-last publisher, and map publication outcomes without changing unsupported load behavior. | API and process e2e tests plus signed final-artifact create/source-resume coverage. |
 

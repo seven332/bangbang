@@ -854,6 +854,82 @@ pub fn load_snapshot_memory_image<R: Read + Seek>(
     load_snapshot_memory_image_with_allocator(binding, reader, GuestMemory::allocate)
 }
 
+/// Verifies fixed output evidence against a trusted codec-produced binding.
+///
+/// This checks positions, length, the complete fixed header, and the stored
+/// integrity trailer without allocating guest memory or re-reading the data.
+/// Full CRC and GPA-range validation remains the responsibility of
+/// [`load_snapshot_memory_image`].
+pub(crate) fn verify_snapshot_memory_image_output<R: Read + Seek>(
+    binding: &SnapshotMemoryBinding,
+    reader: &mut R,
+) -> Result<(), SnapshotMemoryLoadError> {
+    let position = reader
+        .stream_position()
+        .map_err(|source| SnapshotMemoryLoadError::Io {
+            stage: SnapshotMemoryIoStage::FinalPosition,
+            kind: source.kind(),
+        })?;
+    if position != binding.file_length {
+        return Err(SnapshotMemoryLoadError::PositionMismatch {
+            stage: SnapshotMemoryIoStage::FinalPosition,
+            expected: binding.file_length,
+            actual: position,
+        });
+    }
+
+    let rewind = reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| SnapshotMemoryLoadError::Io {
+            stage: SnapshotMemoryIoStage::Rewind,
+            kind: source.kind(),
+        })?;
+    if rewind != 0 {
+        return Err(SnapshotMemoryLoadError::PositionMismatch {
+            stage: SnapshotMemoryIoStage::Rewind,
+            expected: 0,
+            actual: rewind,
+        });
+    }
+    preflight_input(reader, binding.file_length)?;
+
+    let mut header = [0_u8; SNAPSHOT_MEMORY_IMAGE_HEADER_BYTES];
+    read_exact_stage(reader, &mut header, SnapshotMemoryIoStage::Header)?;
+    validate_image_header(&header, binding)?;
+
+    let trailer_offset = binding
+        .file_length
+        .checked_sub(SNAPSHOT_MEMORY_IMAGE_INTEGRITY_BYTES as u64)
+        .ok_or(SnapshotMemoryLoadError::InvalidHeader)?;
+    reader
+        .seek(SeekFrom::Start(trailer_offset))
+        .map_err(|source| SnapshotMemoryLoadError::Io {
+            stage: SnapshotMemoryIoStage::Trailer,
+            kind: source.kind(),
+        })?;
+    let mut trailer = [0_u8; SNAPSHOT_MEMORY_IMAGE_INTEGRITY_BYTES];
+    read_exact_stage(reader, &mut trailer, SnapshotMemoryIoStage::Trailer)?;
+    require_observed_end(reader)?;
+    let final_position =
+        reader
+            .stream_position()
+            .map_err(|source| SnapshotMemoryLoadError::Io {
+                stage: SnapshotMemoryIoStage::FinalPosition,
+                kind: source.kind(),
+            })?;
+    if final_position != binding.file_length {
+        return Err(SnapshotMemoryLoadError::PositionMismatch {
+            stage: SnapshotMemoryIoStage::FinalPosition,
+            expected: binding.file_length,
+            actual: final_position,
+        });
+    }
+    if u64::from_le_bytes(trailer) != binding.checksum {
+        return Err(SnapshotMemoryLoadError::BindingChecksumMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn write_snapshot_memory_image_with_id<W: Write + Seek>(
     memory: &GuestMemory,

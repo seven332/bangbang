@@ -2,10 +2,13 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
-use std::io;
+use std::fs::File;
 #[cfg(target_os = "macos")]
-use std::io::{Read, Seek, Write};
+use std::io::Read;
+use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::memory::GuestMemory;
 use crate::snapshot_commit::{SnapshotCommitError, SnapshotCommitRecord};
@@ -13,9 +16,11 @@ use crate::snapshot_commit::{SnapshotCommitError, SnapshotCommitRecord};
 use crate::snapshot_commit::{decode_snapshot_commit_envelope, encode_snapshot_commit_envelope};
 #[cfg(target_os = "macos")]
 use crate::snapshot_format::NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES;
-use crate::snapshot_memory::{SnapshotMemoryLoadError, SnapshotMemoryWriteError};
+use crate::snapshot_memory::{
+    SnapshotMemoryLoadError, SnapshotMemoryWriteError, write_snapshot_memory_image,
+};
 #[cfg(target_os = "macos")]
-use crate::snapshot_memory::{load_snapshot_memory_image, write_snapshot_memory_image};
+use crate::snapshot_memory::{load_snapshot_memory_image, verify_snapshot_memory_image_output};
 
 const REDACTED: &str = "<redacted>";
 
@@ -55,6 +60,72 @@ impl fmt::Debug for SnapshotArtifactPaths {
     }
 }
 
+/// A pathless, move-only writer for one private memory staging inode.
+///
+/// The producer must let this value drop before returning success. Publication
+/// verifies that close proof before reading, synchronizing, or renaming the
+/// staging inode.
+pub struct SnapshotMemoryStagingWriter {
+    file: Option<File>,
+    closed: Arc<AtomicBool>,
+}
+
+impl SnapshotMemoryStagingWriter {
+    fn new(file: File, closed: Arc<AtomicBool>) -> Self {
+        Self {
+            file: Some(file),
+            closed,
+        }
+    }
+
+    /// Explicitly closes the staging-writer alias.
+    pub fn close(mut self) {
+        self.close_file();
+    }
+
+    fn close_file(&mut self) {
+        drop(self.file.take());
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn file_mut(&mut self) -> io::Result<&mut File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+}
+
+impl Write for SnapshotMemoryStagingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.file_mut()?.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file_mut()?.flush()
+    }
+}
+
+impl Seek for SnapshotMemoryStagingWriter {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.file_mut()?.seek(position)
+    }
+}
+
+impl Drop for SnapshotMemoryStagingWriter {
+    fn drop(&mut self) {
+        self.close_file();
+    }
+}
+
+impl fmt::Debug for SnapshotMemoryStagingWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotMemoryStagingWriter")
+            .field("staging", &REDACTED)
+            .field("closed", &self.file.is_none())
+            .finish()
+    }
+}
+
 /// One member of a snapshot artifact pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotArtifactKind {
@@ -87,6 +158,8 @@ pub enum SnapshotPublicationStage {
     MemoryStagingCreate,
     StateStagingCreate,
     MemoryWrite,
+    MemoryWriterClose,
+    MemoryWriteVerify,
     StateEncode,
     StateWrite,
     StateWriteVerify,
@@ -116,6 +189,8 @@ impl fmt::Display for SnapshotPublicationStage {
             Self::MemoryStagingCreate => "memory staging creation",
             Self::StateStagingCreate => "state staging creation",
             Self::MemoryWrite => "memory staging write",
+            Self::MemoryWriterClose => "memory staging writer close",
+            Self::MemoryWriteVerify => "memory staging verification",
             Self::StateEncode => "state commit encoding",
             Self::StateWrite => "state staging write",
             Self::StateWriteVerify => "state staging verification",
@@ -161,8 +236,10 @@ pub enum SnapshotPublicationFailure {
     FinalAlreadyExists { artifact: SnapshotArtifactKind },
     RandomnessUnavailable { artifact: SnapshotArtifactKind },
     StagingChanged { artifact: SnapshotArtifactKind },
+    StagingWriterRetained,
     Io(io::ErrorKind),
     MemoryWrite(SnapshotMemoryWriteError),
+    MemoryVerify(SnapshotMemoryLoadError),
     Commit(SnapshotCommitError),
 }
 
@@ -187,8 +264,14 @@ impl fmt::Display for SnapshotPublicationFailure {
             Self::StagingChanged { artifact } => {
                 write!(f, "{artifact} private staging entry changed")
             }
+            Self::StagingWriterRetained => {
+                f.write_str("snapshot memory staging writer remained open")
+            }
             Self::Io(kind) => write!(f, "filesystem operation failed with {kind:?}"),
             Self::MemoryWrite(source) => write!(f, "snapshot memory write failed: {source}"),
+            Self::MemoryVerify(source) => {
+                write!(f, "snapshot memory staging verification failed: {source}")
+            }
             Self::Commit(source) => write!(f, "snapshot commit encoding failed: {source}"),
         }
     }
@@ -198,6 +281,7 @@ impl std::error::Error for SnapshotPublicationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MemoryWrite(source) => Some(source),
+            Self::MemoryVerify(source) => Some(source),
             Self::Commit(source) => Some(source),
             Self::UnsupportedPlatform
             | Self::InvalidFinalPath { .. }
@@ -205,6 +289,7 @@ impl std::error::Error for SnapshotPublicationFailure {
             | Self::FinalAlreadyExists { .. }
             | Self::RandomnessUnavailable { .. }
             | Self::StagingChanged { .. }
+            | Self::StagingWriterRetained
             | Self::Io(_) => None,
         }
     }
@@ -260,6 +345,125 @@ impl fmt::Display for SnapshotPublicationError {
 impl std::error::Error for SnapshotPublicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.failure)
+    }
+}
+
+/// A content-producer failure before either final artifact was published.
+pub struct SnapshotPublicationProducerError<E> {
+    source: E,
+    memory_cleanup: Option<SnapshotStagingCleanup>,
+    state_cleanup: Option<SnapshotStagingCleanup>,
+}
+
+impl<E> SnapshotPublicationProducerError<E> {
+    fn new(source: E) -> Self {
+        Self {
+            source,
+            memory_cleanup: None,
+            state_cleanup: None,
+        }
+    }
+
+    /// Returns the typed producer failure to a trusted caller.
+    pub const fn source(&self) -> &E {
+        &self.source
+    }
+
+    /// Returns the explicit memory-staging cleanup disposition.
+    pub const fn memory_cleanup(&self) -> Option<SnapshotStagingCleanup> {
+        self.memory_cleanup
+    }
+
+    /// Returns the explicit state-staging cleanup disposition.
+    pub const fn state_cleanup(&self) -> Option<SnapshotStagingCleanup> {
+        self.state_cleanup
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        E,
+        Option<SnapshotStagingCleanup>,
+        Option<SnapshotStagingCleanup>,
+    ) {
+        (self.source, self.memory_cleanup, self.state_cleanup)
+    }
+}
+
+impl<E> fmt::Debug for SnapshotPublicationProducerError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotPublicationProducerError")
+            .field("source", &REDACTED)
+            .field("memory_cleanup", &self.memory_cleanup)
+            .field("state_cleanup", &self.state_cleanup)
+            .finish()
+    }
+}
+
+impl<E> fmt::Display for SnapshotPublicationProducerError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("snapshot artifact content producer failed")
+    }
+}
+
+impl<E> std::error::Error for SnapshotPublicationProducerError<E> {}
+
+/// Failure from either publication infrastructure or its typed content producer.
+pub enum SnapshotPublicationTransactionError<E> {
+    /// Publication infrastructure or validation failed.
+    Publication(SnapshotPublicationError),
+    /// The producer failed before either final name became visible.
+    Producer(SnapshotPublicationProducerError<E>),
+}
+
+impl<E> From<SnapshotPublicationError> for SnapshotPublicationTransactionError<E> {
+    fn from(source: SnapshotPublicationError) -> Self {
+        Self::Publication(source)
+    }
+}
+
+impl<E> SnapshotPublicationTransactionError<E> {
+    /// Returns the infrastructure failure, when publication itself failed.
+    pub const fn publication(&self) -> Option<&SnapshotPublicationError> {
+        match self {
+            Self::Publication(source) => Some(source),
+            Self::Producer(_) => None,
+        }
+    }
+
+    /// Returns the typed producer failure, when content preparation failed.
+    pub const fn producer(&self) -> Option<&SnapshotPublicationProducerError<E>> {
+        match self {
+            Self::Publication(_) => None,
+            Self::Producer(source) => Some(source),
+        }
+    }
+}
+
+impl<E> fmt::Debug for SnapshotPublicationTransactionError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Publication(source) => f.debug_tuple("Publication").field(source).finish(),
+            Self::Producer(source) => f.debug_tuple("Producer").field(source).finish(),
+        }
+    }
+}
+
+impl<E> fmt::Display for SnapshotPublicationTransactionError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Publication(source) => write!(f, "{source}"),
+            Self::Producer(source) => write!(f, "{source}"),
+        }
+    }
+}
+
+impl<E: 'static> std::error::Error for SnapshotPublicationTransactionError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Publication(source) => Some(source),
+            Self::Producer(source) => Some(source),
+        }
     }
 }
 
@@ -460,17 +664,52 @@ pub fn publish_snapshot_artifacts(
     paths: &SnapshotArtifactPaths,
     memory: &GuestMemory,
 ) -> Result<SnapshotPublicationOutcome, SnapshotPublicationError> {
+    match publish_snapshot_artifacts_with(paths, |mut writer| {
+        let binding = write_snapshot_memory_image(memory, &mut writer)?;
+        Ok::<_, SnapshotMemoryWriteError>(SnapshotCommitRecord::new(binding))
+    }) {
+        Ok(outcome) => Ok(outcome),
+        Err(SnapshotPublicationTransactionError::Publication(source)) => Err(source),
+        Err(SnapshotPublicationTransactionError::Producer(source)) => {
+            let (source, memory_cleanup, state_cleanup) = source.into_parts();
+            let mut error = publication_error(
+                SnapshotPublicationStage::MemoryWrite,
+                SnapshotArtifactVisibility::NoFinalArtifact,
+                SnapshotPublicationFailure::MemoryWrite(source),
+            );
+            error.memory_cleanup = memory_cleanup;
+            error.state_cleanup = state_cleanup;
+            Err(error)
+        }
+    }
+}
+
+/// Publishes caller-produced memory and state content through one no-clobber transaction.
+///
+/// The producer receives a pathless writer for the private memory staging
+/// inode and must return the exact record that binds its output. The writer
+/// must be dropped before producer success; publication verifies that close
+/// proof before any synchronization or rename.
+pub fn publish_snapshot_artifacts_with<E, F>(
+    paths: &SnapshotArtifactPaths,
+    producer: F,
+) -> Result<SnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<SnapshotCommitRecord, E>,
+{
     #[cfg(target_os = "macos")]
     {
-        publish_snapshot_artifacts_macos(paths, memory)
+        publish_snapshot_artifacts_macos_with(paths, producer)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (paths, memory);
-        Err(publication_error(
-            SnapshotPublicationStage::PlatformCheck,
-            SnapshotArtifactVisibility::NoFinalArtifact,
-            SnapshotPublicationFailure::UnsupportedPlatform,
+        let _ = (paths, producer);
+        Err(SnapshotPublicationTransactionError::Publication(
+            publication_error(
+                SnapshotPublicationStage::PlatformCheck,
+                SnapshotArtifactVisibility::NoFinalArtifact,
+                SnapshotPublicationFailure::UnsupportedPlatform,
+            ),
         ))
     }
 }
@@ -518,7 +757,7 @@ fn load_error(
 mod macos;
 
 #[cfg(target_os = "macos")]
-use macos::{load_snapshot_artifacts_macos, publish_snapshot_artifacts_macos};
+use macos::{load_snapshot_artifacts_macos, publish_snapshot_artifacts_macos_with};
 
 #[cfg(test)]
 mod tests;

@@ -5,7 +5,7 @@ use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange};
 #[cfg(target_os = "macos")]
 use std::fs;
 #[cfg(target_os = "macos")]
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "macos")]
@@ -29,6 +29,28 @@ fn paths_and_load_results_redact_host_paths_and_memory() {
     assert!(!debug.contains("sentinel"));
     assert!(!debug.contains("state.snap"));
     assert!(!debug.contains("memory.snap"));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn generalized_publication_rejects_platform_without_invoking_producer() {
+    let paths = SnapshotArtifactPaths::new("state.snap", "memory.snap");
+    let called = std::cell::Cell::new(false);
+    let error = publish_snapshot_artifacts_with::<std::io::Error, _>(&paths, |_writer| {
+        called.set(true);
+        Err(std::io::Error::other("producer must not run"))
+    })
+    .expect_err("non-macOS publication should reject at platform preflight");
+
+    assert!(!called.get());
+    assert_eq!(
+        error
+            .publication()
+            .expect("platform rejection should be a publication failure")
+            .stage(),
+        SnapshotPublicationStage::PlatformCheck
+    );
+    assert!(error.producer().is_none());
 }
 
 #[cfg(target_os = "macos")]
@@ -66,6 +88,334 @@ fn publishes_and_loads_same_directory_pair() {
         .read_slice(&mut actual, GuestAddress::new(0x4000))
         .expect("loaded memory should be readable");
     assert_eq!(actual, test_bytes());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn producer_publishes_exact_composite_record_after_staging_creation() {
+    use crate::snapshot_commit::SnapshotCommitKind;
+
+    let directory = TestDirectory::new("producer-composite");
+    let paths = directory.paths("state.snap", "memory.snap");
+    let calls = std::cell::Cell::new(0_u8);
+
+    let outcome = publish_snapshot_artifacts_with(&paths, |mut writer| {
+        calls.set(calls.get() + 1);
+        assert_eq!(staging_entry_count(&directory.path), 2);
+        let binding = write_snapshot_memory_image(&test_memory(), &mut writer)
+            .expect("producer memory should write");
+        let record = SnapshotCommitRecord::try_new_composite(binding, b"composite-state".to_vec())
+            .expect("composite record should validate");
+        Ok::<_, io::Error>(record)
+    })
+    .expect("composite producer should publish");
+
+    assert_eq!(calls.get(), 1);
+    assert_eq!(outcome.record().kind(), SnapshotCommitKind::Composite);
+    assert_eq!(
+        outcome.record().composite_state(),
+        Some(b"composite-state".as_slice())
+    );
+    let loaded = load_snapshot_artifacts(&paths).expect("composite pair should load");
+    assert_eq!(loaded.record(), outcome.record());
+    assert_no_staging(&directory.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn producer_is_not_called_before_private_staging_is_ready() {
+    for (index, stage) in [
+        SnapshotPublicationStage::StatePathValidation,
+        SnapshotPublicationStage::MemoryPathValidation,
+        SnapshotPublicationStage::StateDirectoryOpen,
+        SnapshotPublicationStage::MemoryDirectoryOpen,
+        SnapshotPublicationStage::AliasCheck,
+        SnapshotPublicationStage::StateFinalPreflight,
+        SnapshotPublicationStage::MemoryFinalPreflight,
+        SnapshotPublicationStage::MemoryStagingCreate,
+        SnapshotPublicationStage::StateStagingCreate,
+        SnapshotPublicationStage::MemoryWrite,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let directory = TestDirectory::new(&format!("producer-not-called-{index}"));
+        let paths = directory.paths("state.snap", "memory.snap");
+        let calls = std::cell::Cell::new(0_u8);
+        let (result, _) = macos::with_publication_failure(stage, || {
+            publish_snapshot_artifacts_with(&paths, |mut writer| {
+                calls.set(calls.get() + 1);
+                let binding = write_snapshot_memory_image(&test_memory(), &mut writer)
+                    .expect("fixture memory should write");
+                Ok::<_, io::Error>(SnapshotCommitRecord::new(binding))
+            })
+        });
+
+        let error = result.expect_err("injected pre-producer stage should fail");
+        assert_eq!(
+            error
+                .publication()
+                .expect("stage injection should be a publication failure")
+                .stage(),
+            stage
+        );
+        assert_eq!(calls.get(), 0);
+        assert_no_staging(&directory.path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn producer_explicit_close_satisfies_publication_gate() {
+    let directory = TestDirectory::new("producer-explicit-close");
+    let paths = directory.paths("state.snap", "memory.snap");
+
+    publish_snapshot_artifacts_with(&paths, |mut writer| {
+        let binding = write_snapshot_memory_image(&test_memory(), &mut writer)
+            .expect("producer memory should write");
+        writer.close();
+        Ok::<_, io::Error>(SnapshotCommitRecord::new(binding))
+    })
+    .expect("explicitly closed producer should publish");
+
+    load_snapshot_artifacts(&paths).expect("explicit-close pair should load");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn retained_or_forgotten_success_writer_never_publishes() {
+    let retained_directory = TestDirectory::new("producer-retained");
+    let retained_paths = retained_directory.paths("state.snap", "memory.snap");
+    let retained = std::cell::RefCell::new(None);
+    let record = test_memory_only_record();
+    let error = publish_snapshot_artifacts_with(&retained_paths, |writer| {
+        *retained.borrow_mut() = Some(writer);
+        Ok::<_, io::Error>(record)
+    })
+    .expect_err("retained writer should reject publication");
+    let publication = error
+        .publication()
+        .expect("retained writer should be a publication failure");
+    assert_eq!(
+        publication.stage(),
+        SnapshotPublicationStage::MemoryWriterClose
+    );
+    assert!(matches!(
+        publication.failure(),
+        SnapshotPublicationFailure::StagingWriterRetained
+    ));
+    assert!(!retained_paths.state().exists());
+    assert!(!retained_paths.memory().exists());
+    assert_no_staging(&retained_directory.path);
+    drop(retained.borrow_mut().take());
+
+    let forgotten_directory = TestDirectory::new("producer-forgotten");
+    let forgotten_paths = forgotten_directory.paths("state.snap", "memory.snap");
+    let record = test_memory_only_record();
+    let error = publish_snapshot_artifacts_with(&forgotten_paths, |writer| {
+        std::mem::forget(writer);
+        Ok::<_, io::Error>(record)
+    })
+    .expect_err("forgotten writer should reject publication");
+    assert!(matches!(
+        error.publication().map(SnapshotPublicationError::failure),
+        Some(SnapshotPublicationFailure::StagingWriterRetained)
+    ));
+    assert!(!forgotten_paths.state().exists());
+    assert!(!forgotten_paths.memory().exists());
+    assert_no_staging(&forgotten_directory.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn producer_error_owns_writer_without_leaking_diagnostics_or_staging_name() {
+    struct ProducerFailure {
+        _writer: SnapshotMemoryStagingWriter,
+        private: &'static str,
+    }
+
+    let directory = TestDirectory::new("producer-error-writer");
+    let paths = directory.paths("private-state-sentinel", "private-memory-sentinel");
+    let error = publish_snapshot_artifacts_with(&paths, |writer| {
+        Err::<SnapshotCommitRecord, _>(ProducerFailure {
+            _writer: writer,
+            private: "private-producer-sentinel",
+        })
+    })
+    .expect_err("producer failure should abort publication");
+
+    let producer = error
+        .producer()
+        .expect("typed producer error should be retained");
+    assert_eq!(producer.source().private, "private-producer-sentinel");
+    assert_eq!(
+        producer.memory_cleanup(),
+        Some(SnapshotStagingCleanup::Removed)
+    );
+    assert_eq!(
+        producer.state_cleanup(),
+        Some(SnapshotStagingCleanup::Removed)
+    );
+    let diagnostics = format!("{error:?} {error}");
+    assert!(!diagnostics.contains("private-producer-sentinel"));
+    assert!(!diagnostics.contains("private-state-sentinel"));
+    assert!(!diagnostics.contains("private-memory-sentinel"));
+    let diagnostic_source = std::error::Error::source(&error)
+        .expect("transaction should expose only its redacted producer wrapper");
+    assert!(diagnostic_source.source().is_none());
+    assert_no_staging(&directory.path);
+
+    publish_snapshot_artifacts_with(&paths, |mut writer| {
+        let binding = write_snapshot_memory_image(&test_memory(), &mut writer)
+            .expect("retry memory should write");
+        Ok::<_, io::Error>(SnapshotCommitRecord::new(binding))
+    })
+    .expect("producer failure should leave the final names retryable");
+    load_snapshot_artifacts(&paths).expect("retry pair should load");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn producer_error_remains_primary_when_staging_cleanup_fails() {
+    for (index, (cleanup_stage, artifact)) in [
+        (
+            SnapshotPublicationStage::MemoryStagingCleanup,
+            SnapshotArtifactKind::Memory,
+        ),
+        (
+            SnapshotPublicationStage::StateStagingCleanup,
+            SnapshotArtifactKind::State,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let directory = TestDirectory::new(&format!("producer-cleanup-failure-{index}"));
+        let paths = directory.paths("state.snap", "memory.snap");
+        let (result, _) = macos::with_publication_failure(cleanup_stage, || {
+            publish_snapshot_artifacts_with(&paths, |_writer| {
+                Err::<SnapshotCommitRecord, _>("typed producer sentinel")
+            })
+        });
+        let error = result.expect_err("producer failure should remain primary");
+        let producer = error
+            .producer()
+            .expect("typed producer failure should be retained");
+
+        assert_eq!(producer.source(), &"typed producer sentinel");
+        let disposition = match artifact {
+            SnapshotArtifactKind::State => producer.state_cleanup(),
+            SnapshotArtifactKind::Memory => producer.memory_cleanup(),
+        };
+        let other_disposition = match artifact {
+            SnapshotArtifactKind::State => producer.memory_cleanup(),
+            SnapshotArtifactKind::Memory => producer.state_cleanup(),
+        };
+        assert_eq!(
+            disposition,
+            Some(SnapshotStagingCleanup::Failed(io::ErrorKind::Other))
+        );
+        assert_eq!(other_disposition, Some(SnapshotStagingCleanup::Removed));
+        assert!(!paths.state().exists());
+        assert!(!paths.memory().exists());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn producer_panic_unwinds_staging_without_publishing_and_allows_retry() {
+    let directory = TestDirectory::new("producer-panic");
+    let paths = directory.paths("state.snap", "memory.snap");
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = publish_snapshot_artifacts_with::<io::Error, _>(&paths, |_writer| {
+            panic!("private producer panic sentinel")
+        });
+    }));
+
+    assert!(panic.is_err());
+    assert!(!paths.state().exists());
+    assert!(!paths.memory().exists());
+    assert_no_staging(&directory.path);
+
+    publish_snapshot_artifacts_with(&paths, |mut writer| {
+        let binding = write_snapshot_memory_image(&test_memory(), &mut writer)
+            .expect("retry memory should write");
+        Ok::<_, io::Error>(SnapshotCommitRecord::new(binding))
+    })
+    .expect("panic unwind should leave final names retryable");
+    load_snapshot_artifacts(&paths).expect("retry pair should load");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn producer_output_mismatch_fails_before_any_final_publication() {
+    for (name, operation) in [
+        ("empty", ProducerMismatch::ReturnOtherBindingWithoutWrite),
+        ("extra", ProducerMismatch::AppendTrailingByte),
+        ("identity", ProducerMismatch::ReturnOtherBindingAfterWrite),
+        (
+            "data-length",
+            ProducerMismatch::ReturnDifferentLengthBindingAfterWrite,
+        ),
+        ("trailer", ProducerMismatch::CorruptTrailer),
+    ] {
+        let directory = TestDirectory::new(&format!("producer-mismatch-{name}"));
+        let paths = directory.paths("state.snap", "memory.snap");
+        let error = publish_snapshot_artifacts_with(&paths, |mut writer| {
+            let record = match operation {
+                ProducerMismatch::ReturnOtherBindingWithoutWrite => test_memory_only_record(),
+                ProducerMismatch::AppendTrailingByte => {
+                    let binding = write_snapshot_memory_image(&test_memory(), &mut writer)
+                        .expect("fixture memory should write");
+                    writer
+                        .write_all(&[0xaa])
+                        .expect("extra fixture byte should write");
+                    SnapshotCommitRecord::new(binding)
+                }
+                ProducerMismatch::ReturnOtherBindingAfterWrite => {
+                    write_snapshot_memory_image(&test_memory(), &mut writer)
+                        .expect("fixture memory should write");
+                    test_memory_only_record()
+                }
+                ProducerMismatch::ReturnDifferentLengthBindingAfterWrite => {
+                    write_snapshot_memory_image(&test_memory(), &mut writer)
+                        .expect("fixture memory should write");
+                    test_memory_only_record_with_bytes(TEST_MEMORY_BYTES * 2)
+                }
+                ProducerMismatch::CorruptTrailer => {
+                    let binding = write_snapshot_memory_image(&test_memory(), &mut writer)
+                        .expect("fixture memory should write");
+                    let trailer = binding
+                        .file_length()
+                        .checked_sub(8)
+                        .expect("fixture should contain a trailer");
+                    writer
+                        .seek(SeekFrom::Start(trailer))
+                        .expect("fixture trailer should seek");
+                    writer
+                        .write_all(&(binding.checksum() ^ u64::MAX).to_le_bytes())
+                        .expect("fixture trailer should overwrite");
+                    writer
+                        .seek(SeekFrom::End(0))
+                        .expect("fixture should return to end");
+                    SnapshotCommitRecord::new(binding)
+                }
+            };
+            Ok::<_, io::Error>(record)
+        })
+        .expect_err("mismatched producer output should fail");
+
+        assert_eq!(
+            error
+                .publication()
+                .expect("mismatch should be a publication failure")
+                .stage(),
+            SnapshotPublicationStage::MemoryWriteVerify
+        );
+        assert!(!paths.state().exists());
+        assert!(!paths.memory().exists());
+        assert_no_staging(&directory.path);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -501,6 +851,8 @@ fn every_pre_memory_publication_stage_failure_leaves_no_final() {
         SnapshotPublicationStage::MemoryStagingCreate,
         SnapshotPublicationStage::StateStagingCreate,
         SnapshotPublicationStage::MemoryWrite,
+        SnapshotPublicationStage::MemoryWriterClose,
+        SnapshotPublicationStage::MemoryWriteVerify,
         SnapshotPublicationStage::StateEncode,
         SnapshotPublicationStage::StateWrite,
         SnapshotPublicationStage::StateWriteVerify,
@@ -1162,6 +1514,52 @@ fn test_bytes() -> Vec<u8> {
     (0..TEST_MEMORY_BYTES)
         .map(|value| u8::try_from(value % 251).expect("fixture byte should fit"))
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum ProducerMismatch {
+    ReturnOtherBindingWithoutWrite,
+    AppendTrailingByte,
+    ReturnOtherBindingAfterWrite,
+    ReturnDifferentLengthBindingAfterWrite,
+    CorruptTrailer,
+}
+
+#[cfg(target_os = "macos")]
+fn test_memory_only_record() -> SnapshotCommitRecord {
+    test_memory_only_record_with_bytes(TEST_MEMORY_BYTES)
+}
+
+#[cfg(target_os = "macos")]
+fn test_memory_only_record_with_bytes(bytes: usize) -> SnapshotCommitRecord {
+    let layout = GuestMemoryLayout::new(vec![
+        GuestMemoryRange::new(
+            GuestAddress::new(0x4000),
+            u64::try_from(bytes).expect("fixture size should fit u64"),
+        )
+        .expect("fixture range should be valid"),
+    ])
+    .expect("fixture layout should be valid");
+    let memory = GuestMemory::allocate(&layout).expect("fixture memory should allocate");
+    let mut output = Cursor::new(Vec::new());
+    let binding = write_snapshot_memory_image(&memory, &mut output)
+        .expect("fixture memory record should encode");
+    SnapshotCommitRecord::new(binding)
+}
+
+#[cfg(target_os = "macos")]
+fn staging_entry_count(directory: &Path) -> usize {
+    fs::read_dir(directory)
+        .expect("directory should read")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".bangbang-snapshot-")
+        })
+        .count()
 }
 
 #[cfg(target_os = "macos")]

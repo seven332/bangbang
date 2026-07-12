@@ -108,9 +108,14 @@ collisions, observed staging replacement, cleanup failure precedence,
 memory-only orphans, committed-but-durability-uncertain state, state-first
 loading, bounded/nonregular inputs, swapped/truncated/extended/corrupt pairs,
 diagnostic redaction, and coordinated multiprocess contention with exactly one
-durable winner. Failure hooks may prove an observed replacement is refused, but
-must not claim atomic source identity against a hostile directory writer. Run
-the focused surface with
+durable winner. Generic-producer coverage additionally proves both staging
+entries precede one callback, earlier failures skip it, ordinary drop and
+explicit close satisfy the close proof, retained/forgotten/error-owned writers
+never publish, panic and typed producer failure clean staging and permit retry,
+and short/extra/wrong-identity/wrong-length/wrong-trailer output cannot commit.
+The lightweight verifier is not a substitute for loader CRC/GPA validation.
+Failure hooks may prove an observed replacement is refused, but must not claim
+atomic source identity against a hostile directory writer. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_artifact --locked`.
 
 Native-v1 device-profile tests pin the fixed `BANGDEV\0` header and an exact
@@ -147,7 +152,11 @@ unwind, panic, and shutdown. The process-level fake capture session proves the
 outer order from auxiliary quiescence through state preflight, chunked memory,
 bundle construction, writer drop, auxiliary release, and admission release.
 It also proves cancellation emits no bundle, leaves `Paused`, and permits a
-fresh capture and resume. Run these focused surfaces with
+fresh capture and resume. Process/supervisor publication tests additionally
+prove path/profile preflight before content capture, direct staging-writer
+streaming, required kind 2, writer closure before commit, cancellation cleanup
+and fresh retry, terminal worker panic, unchanged paused controller state, and
+that public create still publishes nothing. Run these focused surfaces with
 `cargo test -p bangbang-hvf snapshot_v1 --lib --locked` and
 `cargo test -p bangbang native_v1_ --locked`.
 
@@ -496,15 +505,18 @@ scripts/run-integration-tests.sh --test executable_hvf_e2e
 ```
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
-vCPU/read-only-root session, captures the complete non-memory state and memory
-image under limiter quiescence, decodes and validates both the kind-2 bundle and
-nested device state without logging raw values, and repeats capture with a
-fresh image identity. The guest first leaves non-default serial scratch state;
+vCPU/read-only-root session and gives the production generalized publisher two
+absent final paths. Its producer captures the complete non-memory state and
+streams memory directly to the publisher staging writer under limiter
+quiescence, returns kind 2, and proves durable memory-first/state-last commit
+with no staging residue. The test loads that pair through the production loader,
+decodes and validates the bundle and nested device state without logging raw
+values, and repeats capture with a fresh image identity. The guest first leaves
+non-default serial scratch state;
 after both captures, the original source continues from its retained PC to the
 next fixed HVC and the runner owner remains usable before shutdown. After source
-shutdown, the test writes the captured state and memory as distinct disk
-artifacts, reloads them through the production loader, constructs a fresh
-destination VM, and verifies pre-run vCPU/ICC/pending/device state, normalized
+shutdown, the already loaded production-published pair constructs a fresh
+destination VM and verifies pre-run vCPU/ICC/pending/device state, normalized
 timer equivalence, VMGenID replacement, absent boot-origin metadata, and
 continuation from the captured PC. Opaque GIC bytes are asserted nonempty and
 bounded after recapture rather than byte-equal because Hypervisor.framework's
