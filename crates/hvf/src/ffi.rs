@@ -231,6 +231,7 @@ mod imp {
 
     type HvCacheType = u32;
     type HvFeatureReg = u32;
+    type HvVmGetMaxVcpuCount = unsafe extern "C" fn(max_vcpu_count: *mut u32) -> HvReturn;
     type HvVcpuConfigCreate = unsafe extern "C" fn() -> HvVcpuConfig;
     type HvVcpuConfigGetCcsidrEl1SysRegValues =
         unsafe extern "C" fn(HvVcpuConfig, HvCacheType, *mut u64) -> HvReturn;
@@ -270,6 +271,7 @@ mod imp {
         pub fn hv_vm_config_create() -> HvVmConfig;
         pub fn hv_vm_config_get_max_ipa_size(ipa_bit_length: *mut u32) -> HvReturn;
         pub fn hv_vm_config_set_ipa_size(config: HvVmConfig, ipa_bit_length: u32) -> HvReturn;
+        pub fn hv_vm_get_max_vcpu_count(max_vcpu_count: *mut u32) -> HvReturn;
         pub fn hv_vm_create(config: HvVmConfig) -> HvReturn;
         pub fn hv_vm_destroy() -> HvReturn;
         pub fn hv_vm_map(
@@ -771,6 +773,27 @@ mod imp {
         unsafe { check(hv_vm_create(config.as_ptr()), "hv_vm_create") }
     }
 
+    fn get_max_vcpu_count_with(
+        get_max_vcpu_count: HvVmGetMaxVcpuCount,
+    ) -> Result<u32, BackendError> {
+        let mut max_vcpu_count = 0;
+
+        // SAFETY: `max_vcpu_count` is a valid writable `u32` out-pointer for the
+        // duration of the call, and the injected function has the SDK's exact ABI.
+        unsafe {
+            check(
+                get_max_vcpu_count(&mut max_vcpu_count),
+                "hv_vm_get_max_vcpu_count",
+            )?;
+        }
+
+        Ok(max_vcpu_count)
+    }
+
+    pub fn get_max_vcpu_count() -> Result<u32, BackendError> {
+        get_max_vcpu_count_with(hv_vm_get_max_vcpu_count)
+    }
+
     pub fn destroy_vm() -> Result<(), BackendError> {
         // SAFETY: Destroys the process-local VM after vCPUs have been destroyed.
         unsafe { check(hv_vm_destroy(), "hv_vm_destroy") }
@@ -1181,11 +1204,12 @@ mod imp {
             HV_FEATURE_REG_CLIDR_EL1, HV_FEATURE_REG_CTR_EL0, HV_FEATURE_REG_DCZID_EL0, HV_SUCCESS,
             HV_UNSUPPORTED, HvVcpuConfig, HvVcpuConfigOwner, check,
             get_arm64_vcpu_cache_feature_registers_with, get_arm64_vcpu_cache_geometry_with,
-            get_arm64_vcpu_cache_manifest_with, get_sme_config_max_svl_bytes_with,
-            get_sme_p_reg_with, get_sme_z_reg_with, get_sme_za_reg_with, get_sme_zt0_reg_with,
-            sme_config_max_svl_bytes_getter_from_symbol, sme_p_reg_getter_from_symbol,
-            sme_state_getter_from_symbol, sme_z_reg_getter_from_symbol,
-            sme_za_reg_getter_from_symbol, sme_zt0_reg_getter_from_symbol,
+            get_arm64_vcpu_cache_manifest_with, get_max_vcpu_count_with,
+            get_sme_config_max_svl_bytes_with, get_sme_p_reg_with, get_sme_z_reg_with,
+            get_sme_za_reg_with, get_sme_zt0_reg_with, sme_config_max_svl_bytes_getter_from_symbol,
+            sme_p_reg_getter_from_symbol, sme_state_getter_from_symbol,
+            sme_z_reg_getter_from_symbol, sme_za_reg_getter_from_symbol,
+            sme_zt0_reg_getter_from_symbol,
         };
         use crate::ffi::{
             SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE,
@@ -1543,6 +1567,53 @@ mod imp {
             _: *mut super::HvSmeZt0Value,
         ) -> super::HvReturn {
             HV_UNSUPPORTED
+        }
+
+        unsafe extern "C" fn test_get_max_vcpu_count_success(max_vcpu_count: *mut u32) -> i32 {
+            // SAFETY: The production helper supplies a live `u32` out-pointer.
+            unsafe { *max_vcpu_count = 17 };
+            HV_SUCCESS
+        }
+
+        unsafe extern "C" fn test_get_max_vcpu_count_failure(max_vcpu_count: *mut u32) -> i32 {
+            // Write a sentinel to prove a failed result is not returned as success.
+            // SAFETY: The production helper supplies a live `u32` out-pointer.
+            unsafe { *max_vcpu_count = u32::MAX };
+            HV_DENIED
+        }
+
+        unsafe extern "C" fn test_get_max_vcpu_count_unknown_failure(_: *mut u32) -> i32 {
+            0x1234_5678
+        }
+
+        #[test]
+        fn max_vcpu_count_returns_successful_value() {
+            assert_eq!(
+                get_max_vcpu_count_with(test_get_max_vcpu_count_success),
+                Ok(17)
+            );
+        }
+
+        #[test]
+        fn max_vcpu_count_preserves_exact_hvf_failure() {
+            let err = get_max_vcpu_count_with(test_get_max_vcpu_count_failure)
+                .expect_err("HV_DENIED should fail");
+
+            assert_eq!(
+                err.to_string(),
+                "hypervisor error: hv_vm_get_max_vcpu_count failed with HV_DENIED (hv_return_t=0xfae94007)"
+            );
+        }
+
+        #[test]
+        fn max_vcpu_count_preserves_unknown_raw_hvf_failure() {
+            let err = get_max_vcpu_count_with(test_get_max_vcpu_count_unknown_failure)
+                .expect_err("unknown status should fail");
+
+            assert_eq!(
+                err.to_string(),
+                "hypervisor error: hv_vm_get_max_vcpu_count failed with hv_return_t=0x12345678"
+            );
         }
 
         #[test]
@@ -2153,6 +2224,10 @@ mod imp {
     }
 
     pub fn create_vm() -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_max_vcpu_count() -> Result<u32, BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 

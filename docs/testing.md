@@ -55,6 +55,17 @@ must run through
 `com.apple.security.hypervisor` entitlement. Do not add real HVF tests to the
 unsigned workspace test path.
 
+Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` scenario
+that creates one VM and GIC before two permanent owner-thread runners, proves
+their exact ordered MPIDRs are `[0, 1]`, cancels both before their first bounded
+run, shuts them down in full, and destroys the VM. The scenario proves capacity,
+affinity ownership, cancellation, and cleanup only; Linux SMP enumeration,
+PSCI secondary startup, concurrent execution, FDT activation, and public
+multi-vCPU startup require their later dedicated signed gates. Unit tests must
+inject count, host-capacity, allocation, owner-start, affinity write/readback,
+channel, cancel, and shutdown failures and assert reverse cleanup plus primary
+error precedence without entering unsigned HVF.
+
 For virtio-pmem changes, unit tests should cover MMIO registration, FDT
 metadata, config-space `start`/`size`, deterministic multi-device layout,
 queue parsing/completion, shadow writeback, and cleanup/error paths. Signed HVF

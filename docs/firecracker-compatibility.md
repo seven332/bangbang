@@ -1638,6 +1638,18 @@ typed value in that same order. Those levels are not GIC state and HVF clears
 them after a vCPU run returns, so individual mutation and aggregate restore are
 pre-run injection primitives rather than durable delivery state.
 
+The HVF backend also has an internal ordered vCPU-topology prerequisite. It
+queries `hv_vm_get_max_vcpu_count`, rejects requests outside both the portable
+`1..=32` ceiling and the current host maximum before starting an owner, and can
+create affinities `0..vcpu_count` only after one VM and its GIC exist. Every
+idle vCPU stays on a permanent owner thread, writes and reads back its MPIDR
+there before publication, and participates in topology-wide cancellation and
+reverse-order shutdown. Construction returns no successful prefix; a later
+owner or affinity failure shuts down every retained owner and preserves both
+the primary failure and indexed cleanup failures. This primitive is not wired
+to FDT, PSCI, the boot session, or public `InstanceStart`, so the documented
+public startup limit remains exactly one vCPU and native-v1 remains one-vCPU.
+
 This still is not public guest startup. bangbang can now write an internal FDT
 payload, create an internal single-vCPU HVF arm64 boot session, read the primary
 runner-owned vCPU `MPIDR_EL1` for boot metadata, allocate deterministic block
