@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fmt;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -421,7 +420,7 @@ struct MemberState {
     online: bool,
     active: Option<HvfVcpuRunToken>,
     next_generation: u64,
-    cancellation_debts: VecDeque<u64>,
+    cancellation_debt: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -697,7 +696,10 @@ fn record_cancellation_debts(
                 member_count,
             },
         )?;
-        member.cancellation_debts.push_back(token.generation());
+        // HVF promises a pending next-run exit, not a counted queue. Keep the
+        // earliest unresolved generation so repeated controls cannot require
+        // cancellation acknowledgements the framework never promised.
+        member.cancellation_debt.get_or_insert(token.generation());
     }
     Ok(())
 }
@@ -812,7 +814,7 @@ where
                 online: false,
                 active: None,
                 next_generation: 1,
-                cancellation_debts: VecDeque::new(),
+                cancellation_debt: None,
             })
             .collect::<Vec<_>>();
         for index in online_indexes.iter().copied() {
@@ -1032,11 +1034,10 @@ where
 
                 let absorbed_cancellation = if member_result.is_canceled()
                     && member
-                        .cancellation_debts
-                        .front()
-                        .is_some_and(|debt| *debt <= generation)
+                        .cancellation_debt
+                        .is_some_and(|debt| debt <= generation)
                 {
-                    let _ = member.cancellation_debts.pop_front();
+                    member.cancellation_debt = None;
                     true
                 } else {
                     false
@@ -1142,7 +1143,7 @@ where
                 MEMBER_NOT_IDLE_MESSAGE,
             ));
         }
-        if !online && !member.cancellation_debts.is_empty() {
+        if !online && member.cancellation_debt.is_some() {
             return Err(HvfVcpuRunCoordinatorError::InvalidState(
                 OFFLINE_CANCELLATION_DEBT_MESSAGE,
             ));
@@ -2158,6 +2159,56 @@ mod tests {
         assert!(matches!(event, HvfVcpuRunEvent::Member(_)));
         assert_eq!(coordinator.set_online(0, false), Ok(()));
         assert_eq!(batch.calls(), vec![vec![0]]);
+    }
+
+    #[test]
+    fn repeated_control_while_debt_is_pending_does_not_create_phantom_debt() {
+        let members = fake_members(1);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        coordinator
+            .dispatch_online()
+            .expect("first generation should dispatch");
+
+        let first_waiter = coordinator
+            .control()
+            .request_wakeup()
+            .expect("first wakeup should start");
+        assert!(matches!(
+            coordinator
+                .process_completion(members[0].completion(1, progressed()))
+                .expect("normal race completion should process"),
+            Some(HvfVcpuRunEvent::Barrier(_))
+        ));
+        first_waiter
+            .wait()
+            .expect("first wakeup barrier should complete");
+
+        assert_eq!(coordinator.dispatch_online(), Ok(1));
+        let second_waiter = coordinator
+            .control()
+            .request_wakeup()
+            .expect("second wakeup should start while debt remains");
+        assert!(matches!(
+            coordinator
+                .process_completion(members[0].completion(2, canceled()))
+                .expect("one canceled completion should settle coalesced exit state"),
+            Some(HvfVcpuRunEvent::Barrier(_))
+        ));
+        second_waiter
+            .wait()
+            .expect("second wakeup barrier should complete");
+
+        assert_eq!(coordinator.dispatch_online(), Ok(1));
+        assert!(matches!(
+            coordinator
+                .process_completion(members[0].completion(3, progressed()))
+                .expect("next ordinary completion should publish"),
+            Some(HvfVcpuRunEvent::Member(_))
+        ));
+        assert_eq!(coordinator.set_online(0, false), Ok(()));
+        assert_eq!(batch.calls(), vec![vec![0], vec![0]]);
     }
 
     #[test]
