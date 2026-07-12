@@ -1,3 +1,4 @@
+use std::fmt;
 use std::time::{Duration, Instant};
 
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
@@ -177,6 +178,65 @@ impl TokenBucket {
         self.last_update = snapshot.last_update;
     }
 
+    pub(crate) fn persisted_state_at(
+        &self,
+        config: TokenBucketConfig,
+        now: Instant,
+    ) -> Result<PersistedTokenBucketState, PersistedTokenBucketStateError> {
+        let refill_time_nanos = config
+            .refill_time()
+            .checked_mul(NANOS_PER_MILLISECOND)
+            .ok_or(PersistedTokenBucketStateError::DisabledConfiguration)?;
+        if !config.is_enabled() {
+            return Err(PersistedTokenBucketStateError::DisabledConfiguration);
+        }
+        if self.size != config.size() || self.refill_time_nanos != refill_time_nanos {
+            return Err(PersistedTokenBucketStateError::ConfigurationMismatch);
+        }
+        if self.budget > self.size {
+            return Err(PersistedTokenBucketStateError::BudgetOutOfBounds);
+        }
+        if self.one_time_burst > config.one_time_burst().unwrap_or(0) {
+            return Err(PersistedTokenBucketStateError::BurstOutOfBounds);
+        }
+
+        let age = now
+            .checked_duration_since(self.last_update)
+            .ok_or(PersistedTokenBucketStateError::CaptureTimeBeforeLastUpdate)?;
+        let age_nanos = u64::try_from(age.as_nanos())
+            .map_err(|_| PersistedTokenBucketStateError::AgeOutOfBounds)?;
+
+        Ok(PersistedTokenBucketState::new(
+            config,
+            self.budget,
+            self.one_time_burst,
+            age_nanos,
+        ))
+    }
+
+    pub(crate) fn from_persisted_state_at(
+        state: PersistedTokenBucketState,
+        now: Instant,
+    ) -> Result<Self, PersistedTokenBucketStateError> {
+        let config = state.config();
+        let mut bucket = Self::new_at(config, now)
+            .ok_or(PersistedTokenBucketStateError::DisabledConfiguration)?;
+        if state.budget() > config.size() {
+            return Err(PersistedTokenBucketStateError::BudgetOutOfBounds);
+        }
+        if state.one_time_burst() > config.one_time_burst().unwrap_or(0) {
+            return Err(PersistedTokenBucketStateError::BurstOutOfBounds);
+        }
+        let last_update = now
+            .checked_sub(Duration::from_nanos(state.age_nanos()))
+            .ok_or(PersistedTokenBucketStateError::RestoreTimeUnderflow)?;
+
+        bucket.budget = state.budget();
+        bucket.one_time_burst = state.one_time_burst();
+        bucket.last_update = last_update;
+        Ok(bucket)
+    }
+
     fn replenish_at(&mut self, now: Instant) {
         if now <= self.last_update {
             return;
@@ -248,11 +308,99 @@ pub(crate) struct TokenBucketSnapshot {
     last_update: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PersistedTokenBucketState {
+    config: TokenBucketConfig,
+    budget: u64,
+    one_time_burst: u64,
+    age_nanos: u64,
+}
+
+impl PersistedTokenBucketState {
+    pub(crate) const fn new(
+        config: TokenBucketConfig,
+        budget: u64,
+        one_time_burst: u64,
+        age_nanos: u64,
+    ) -> Self {
+        Self {
+            config,
+            budget,
+            one_time_burst,
+            age_nanos,
+        }
+    }
+
+    pub(crate) const fn config(self) -> TokenBucketConfig {
+        self.config
+    }
+
+    pub(crate) const fn budget(self) -> u64 {
+        self.budget
+    }
+
+    pub(crate) const fn one_time_burst(self) -> u64 {
+        self.one_time_burst
+    }
+
+    pub(crate) const fn age_nanos(self) -> u64 {
+        self.age_nanos
+    }
+}
+
+impl fmt::Debug for PersistedTokenBucketState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PersistedTokenBucketState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistedTokenBucketStateError {
+    DisabledConfiguration,
+    ConfigurationMismatch,
+    BudgetOutOfBounds,
+    BurstOutOfBounds,
+    CaptureTimeBeforeLastUpdate,
+    AgeOutOfBounds,
+    RestoreTimeUnderflow,
+}
+
+impl fmt::Display for PersistedTokenBucketStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DisabledConfiguration => {
+                f.write_str("persisted token bucket configuration is disabled")
+            }
+            Self::ConfigurationMismatch => {
+                f.write_str("persisted token bucket configuration does not match runtime state")
+            }
+            Self::BudgetOutOfBounds => {
+                f.write_str("persisted token bucket budget is out of bounds")
+            }
+            Self::BurstOutOfBounds => f.write_str("persisted token bucket burst is out of bounds"),
+            Self::CaptureTimeBeforeLastUpdate => {
+                f.write_str("persisted token bucket capture time precedes its last update")
+            }
+            Self::AgeOutOfBounds => f.write_str("persisted token bucket age is out of bounds"),
+            Self::RestoreTimeUnderflow => {
+                f.write_str("persisted token bucket age cannot be represented at restore time")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PersistedTokenBucketStateError {}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{TokenBucket, TokenBucketConfig, TokenBucketReduction};
+    use super::{
+        PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
+        TokenBucketReduction,
+    };
 
     #[test]
     fn consumes_burst_budget_and_refills_by_time() {
@@ -339,6 +487,71 @@ mod tests {
             bucket
                 .reduce_allow_overconsumption_with_retry_at(8, now + Duration::from_millis(100))
                 .is_allowed()
+        );
+    }
+
+    #[test]
+    fn persisted_state_freezes_bucket_age_across_restore_downtime() {
+        let capture_origin = Instant::now();
+        let config = TokenBucketConfig::new(4, Some(2), 100);
+        let mut source = TokenBucket::new_at(config, capture_origin)
+            .expect("persisted source bucket should be enabled");
+        assert!(source.reduce_at(2, capture_origin));
+        assert!(source.reduce_at(3, capture_origin));
+        let capture_now = capture_origin + Duration::from_millis(25);
+
+        let state = source
+            .persisted_state_at(config, capture_now)
+            .expect("persisted state should capture");
+        assert_eq!(state.budget(), 1);
+        assert_eq!(state.one_time_burst(), 0);
+        assert_eq!(state.age_nanos(), 25_000_000);
+
+        let restore_now = capture_origin + Duration::from_secs(10);
+        let mut restored = TokenBucket::from_persisted_state_at(state, restore_now)
+            .expect("persisted state should restore");
+        let recaptured = restored
+            .persisted_state_at(config, restore_now)
+            .expect("restored state should recapture");
+        assert_eq!(recaptured, state);
+        assert!(restored.reduce_at(2, restore_now));
+        assert_eq!(
+            restored.reduce_with_retry_at(1, restore_now),
+            TokenBucketReduction::Throttled {
+                retry_after: Duration::from_millis(25),
+            }
+        );
+    }
+
+    #[test]
+    fn persisted_state_rejects_invalid_budget_burst_and_time() {
+        let now = Instant::now();
+        let config = TokenBucketConfig::new(4, Some(2), 100);
+
+        for (state, expected) in [
+            (
+                PersistedTokenBucketState::new(config, 5, 0, 0),
+                PersistedTokenBucketStateError::BudgetOutOfBounds,
+            ),
+            (
+                PersistedTokenBucketState::new(config, 4, 3, 0),
+                PersistedTokenBucketStateError::BurstOutOfBounds,
+            ),
+        ] {
+            assert_eq!(
+                TokenBucket::from_persisted_state_at(state, now)
+                    .expect_err("invalid persisted bucket should fail"),
+                expected
+            );
+        }
+
+        let future_bucket = TokenBucket::new_at(config, now + Duration::from_nanos(1))
+            .expect("future bucket should build");
+        assert_eq!(
+            future_bucket
+                .persisted_state_at(config, now)
+                .expect_err("capture before last update should fail"),
+            PersistedTokenBucketStateError::CaptureTimeBeforeLastUpdate
         );
     }
 }

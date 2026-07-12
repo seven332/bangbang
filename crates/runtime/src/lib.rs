@@ -22,6 +22,7 @@ pub mod serial;
 pub mod snapshot;
 pub mod snapshot_artifact;
 pub mod snapshot_commit;
+pub mod snapshot_device;
 pub mod snapshot_format;
 pub mod snapshot_memory;
 pub mod startup;

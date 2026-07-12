@@ -7,14 +7,15 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bangbang_hvf::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
     HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugDeviceConfig,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-    HvfArm64BootTimerDeviceConfig, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
+    HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootTimerDeviceConfig, HvfVcpuRunnerError,
+    OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -57,10 +58,11 @@ use bangbang_runtime::network::{
 use bangbang_runtime::pmem::{PmemMmioLayout, PmemUpdateInput};
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
-    SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
+    SerialConfig, SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
     SharedSerialOutputBuffer,
 };
 use bangbang_runtime::snapshot::SnapshotCreateInput;
+use bangbang_runtime::snapshot_device::SnapshotV1DeviceState;
 use bangbang_runtime::startup::{
     Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
     Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
@@ -90,8 +92,6 @@ use bangbang_runtime::InstanceInfo;
 use bangbang_runtime::boot::BootSourceConfig;
 #[cfg(test)]
 use bangbang_runtime::machine::MachineConfig;
-#[cfg(test)]
-use bangbang_runtime::serial::SerialConfig;
 
 const DEFAULT_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x5000_0000);
 const DEFAULT_BLOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1);
@@ -1673,6 +1673,19 @@ impl<S, P> ProcessHvfBootSession<S, P> {
             packet_io,
             mmds_metrics,
         }
+    }
+}
+
+impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
+    fn capture_snapshot_v1_device_state_at(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<SnapshotV1DeviceState, HvfArm64BootSnapshotV1DeviceCaptureError> {
+        self.session
+            .capture_snapshot_v1_device_state_at(drive_config, serial_config, guard, now)
     }
 }
 
@@ -3661,6 +3674,37 @@ where
         if stop_requested || was_paused || worker.is_finished() {
             let _ = worker.join();
         }
+    }
+}
+
+impl
+    BootRunLoopSupervisor<
+        ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider>,
+    >
+{
+    #[expect(
+        dead_code,
+        reason = "native-v1 composite capture will consume this supervisor seam in parent slice 6"
+    )]
+    pub(crate) fn capture_snapshot_v1_device_state(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+    ) -> Result<SnapshotV1DeviceState, BackendError> {
+        let drive_config = drive_config.clone();
+        let serial_config = serial_config.clone();
+        self.run_snapshot_quiesced(move |session| {
+            let guard = session.quiesce_snapshot_auxiliary_work()?;
+            let now = Instant::now();
+            session
+                .capture_snapshot_v1_device_state_at(&drive_config, &serial_config, &guard, now)
+                .map_err(|error| {
+                    BackendError::Hypervisor(format!(
+                        "failed to capture native-v1 device state: {error}"
+                    ))
+                })
+        })
+        .map_err(lifecycle_error_from_boot_run_loop_command)
     }
 }
 

@@ -91,6 +91,33 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | macOS sandboxing | Deferred feasible macOS work | Do not claim production containment until a sandbox profile and resource policy are designed and tested. |
 | Launcher or resource broker | Deferred feasible macOS work | Keep host-path and shared-resource isolation as operator responsibility until a separate broker owns privileged preparation and cleanup. |
 
+## Native Snapshot Device Boundary
+
+The internal native-v1 device profile is untrusted input even when its outer
+state file passed length and CRC checks; CRC detects accidental corruption and
+is not authentication. The standalone `BANGDEV\0` decoder caps the complete
+value at 16 KiB, bounds every string before allocation, requires exact schema
+and EOF, and keeps paths, IDs, stat identity, guest addresses, features,
+cursors, limiter values, and VMGenID bytes out of diagnostics.
+
+The supported root disk remains an operator-managed external resource. Capture
+and load open the final path read-only with nonblocking, close-on-exec, and
+no-follow flags, require a regular file, derive identity from the opened
+descriptor, and compare device/inode, length, mode, mtime, and ctime. Load
+retains that exact descriptor after preflight, so a later pathname replacement
+does not retarget the prepared device. This is a same-host compatibility check,
+not content authentication: an actor allowed to mutate the already-open inode
+can still alter guest-visible disk contents, and parent-directory symlink or
+mount policy remains part of the operator-owned filesystem boundary.
+
+Device preparation is deliberately off-side and drop-safe. It may read loaded
+guest memory and open the root backing, but it does not modify guest memory,
+an MMIO dispatcher, an HVF VM, controller state, or retry schedulers. UART
+output bytes, locks, metrics, files, and limiter clocks are never deserialized
+as live handles; the supported serial policy creates a new empty buffer and
+metrics owner. Source VMGenID bytes are not encoded as reusable identity and
+must be replaced and signaled through the separate never-run restore stage.
+
 ## macOS Isolation Design Boundaries
 
 The current isolation boundary is one macOS process running as the invoking host

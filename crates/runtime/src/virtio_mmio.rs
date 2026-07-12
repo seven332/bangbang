@@ -78,6 +78,19 @@ impl VirtioMmioDeviceRegisters {
         }
     }
 
+    pub(crate) const fn with_runtime_state(
+        mut self,
+        feature_selectors: [u32; 2],
+        driver_features: u64,
+        status: u32,
+    ) -> Self {
+        self.device_features_select = feature_selectors[0];
+        self.driver_features_select = feature_selectors[1];
+        self.driver_features = driver_features;
+        self.status = status;
+        self
+    }
+
     pub const fn device_id(self) -> u32 {
         self.device_id
     }
@@ -746,6 +759,24 @@ impl VirtioMmioQueueState {
         }
     }
 
+    pub(crate) const fn from_parts(
+        max_size: u16,
+        size: u16,
+        ready: bool,
+        descriptor_table: GuestAddress,
+        driver_ring: GuestAddress,
+        device_ring: GuestAddress,
+    ) -> Self {
+        Self {
+            max_size,
+            size,
+            ready,
+            descriptor_table,
+            driver_ring,
+            device_ring,
+        }
+    }
+
     pub const fn max_size(self) -> u16 {
         self.max_size
     }
@@ -1144,6 +1175,143 @@ impl fmt::Display for VirtioMmioQueueNotificationError {
 }
 
 impl std::error::Error for VirtioMmioQueueNotificationError {}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioMmioTransportState {
+    device: VirtioMmioDeviceRegisters,
+    queue_select: u32,
+    queues: Vec<VirtioMmioQueueState>,
+    pending_notifications: Vec<bool>,
+    interrupt_status: DeviceInterruptStatus,
+    device_activated: bool,
+}
+
+impl VirtioMmioTransportState {
+    pub(crate) fn from_parts(
+        device: VirtioMmioDeviceRegisters,
+        queue_select: u32,
+        queues: Vec<VirtioMmioQueueState>,
+        pending_notifications: Vec<bool>,
+        interrupt_status: DeviceInterruptStatus,
+        device_activated: bool,
+    ) -> Self {
+        Self {
+            device,
+            queue_select,
+            queues,
+            pending_notifications,
+            interrupt_status,
+            device_activated,
+        }
+    }
+
+    pub const fn device_registers(&self) -> &VirtioMmioDeviceRegisters {
+        &self.device
+    }
+
+    pub const fn queue_select(&self) -> u32 {
+        self.queue_select
+    }
+
+    pub fn queues(&self) -> &[VirtioMmioQueueState] {
+        &self.queues
+    }
+
+    pub fn pending_notifications(&self) -> &[bool] {
+        &self.pending_notifications
+    }
+
+    pub const fn interrupt_status(&self) -> DeviceInterruptStatus {
+        self.interrupt_status
+    }
+
+    pub const fn is_device_activated(&self) -> bool {
+        self.device_activated
+    }
+}
+
+impl fmt::Debug for VirtioMmioTransportState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VirtioMmioTransportState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtioMmioTransportStateError {
+    DeviceIdentityMismatch,
+    AvailableFeaturesMismatch,
+    UnsupportedFeatureSelector,
+    UnsupportedDriverFeatures,
+    MissingVersionOneDriverFeature,
+    UnhealthyDeviceStatus,
+    ActivationMismatch,
+    QueueCountMismatch,
+    QueueSelectorOutOfBounds,
+    QueueMaxSizeMismatch,
+    InvalidQueueSize,
+    ReadyQueueWithoutSize,
+    QueueStateBeforeFeaturesOk,
+    UnalignedQueueAddress,
+    NotificationCountMismatch,
+    NotificationBeforeActivation,
+}
+
+impl fmt::Display for VirtioMmioTransportStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceIdentityMismatch => {
+                f.write_str("persisted virtio-mmio device identity does not match")
+            }
+            Self::AvailableFeaturesMismatch => {
+                f.write_str("persisted virtio-mmio available features do not match")
+            }
+            Self::UnsupportedFeatureSelector => {
+                f.write_str("persisted virtio-mmio feature selector is unsupported")
+            }
+            Self::UnsupportedDriverFeatures => {
+                f.write_str("persisted virtio-mmio driver features are unsupported")
+            }
+            Self::MissingVersionOneDriverFeature => {
+                f.write_str("persisted virtio-mmio driver features omit version 1")
+            }
+            Self::UnhealthyDeviceStatus => {
+                f.write_str("persisted virtio-mmio device status is not a reachable healthy state")
+            }
+            Self::ActivationMismatch => {
+                f.write_str("persisted virtio-mmio activation state is inconsistent")
+            }
+            Self::QueueCountMismatch => {
+                f.write_str("persisted virtio-mmio queue count does not match")
+            }
+            Self::QueueSelectorOutOfBounds => {
+                f.write_str("persisted virtio-mmio queue selector is out of bounds")
+            }
+            Self::QueueMaxSizeMismatch => {
+                f.write_str("persisted virtio-mmio queue maximum size does not match")
+            }
+            Self::InvalidQueueSize => f.write_str("persisted virtio-mmio queue size is invalid"),
+            Self::ReadyQueueWithoutSize => {
+                f.write_str("persisted virtio-mmio ready queue has no configured size")
+            }
+            Self::QueueStateBeforeFeaturesOk => f.write_str(
+                "persisted virtio-mmio queue state exists before feature negotiation completed",
+            ),
+            Self::UnalignedQueueAddress => {
+                f.write_str("persisted virtio-mmio queue address is unaligned")
+            }
+            Self::NotificationCountMismatch => {
+                f.write_str("persisted virtio-mmio notification count does not match")
+            }
+            Self::NotificationBeforeActivation => f.write_str(
+                "persisted virtio-mmio queue notification exists before device activation",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioMmioTransportStateError {}
 
 pub trait VirtioMmioDeviceConfigHandler: fmt::Debug + Send {
     fn read_device_config(
@@ -1630,6 +1798,47 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
 
     pub fn mark_interrupt_pending(&mut self, kind: DeviceInterruptKind) {
         self.interrupts.mark_pending(kind);
+    }
+
+    pub fn transport_state(&self) -> VirtioMmioTransportState {
+        VirtioMmioTransportState::from_parts(
+            self.device,
+            self.queues.queue_select,
+            self.queues.queues.clone(),
+            self.queue_notifications.pending_notifications.clone(),
+            self.interrupts.pending_status,
+            self.device_activated,
+        )
+    }
+
+    pub(crate) fn restore_transport_state(
+        &mut self,
+        state: &VirtioMmioTransportState,
+        activation_is_active: bool,
+    ) -> Result<(), VirtioMmioTransportStateError> {
+        self.validate_transport_state(state, activation_is_active)?;
+
+        self.device = state.device;
+        self.queues = VirtioMmioQueueRegisters {
+            queue_select: state.queue_select,
+            queues: state.queues.clone(),
+        };
+        self.queue_notifications = VirtioMmioQueueNotificationRegisters {
+            pending_notifications: state.pending_notifications.clone(),
+        };
+        self.interrupts = VirtioMmioInterruptRegisters {
+            pending_status: state.interrupt_status,
+        };
+        self.device_activated = state.device_activated;
+        Ok(())
+    }
+
+    pub(crate) fn validate_transport_state(
+        &self,
+        state: &VirtioMmioTransportState,
+        activation_is_active: bool,
+    ) -> Result<(), VirtioMmioTransportStateError> {
+        validate_transport_state(self, state, activation_is_active)
     }
 
     pub fn read_access(
@@ -2621,6 +2830,130 @@ fn register_write_value(data: MmioAccessBytes) -> Result<u32, VirtioMmioRegister
     Ok(u32::from_le_bytes(bytes))
 }
 
+fn validate_transport_state<C, A>(
+    handler: &VirtioMmioRegisterHandler<C, A>,
+    state: &VirtioMmioTransportState,
+    activation_is_active: bool,
+) -> Result<(), VirtioMmioTransportStateError> {
+    if state.device.device_id != handler.device.device_id
+        || state.device.vendor_id != handler.device.vendor_id
+    {
+        return Err(VirtioMmioTransportStateError::DeviceIdentityMismatch);
+    }
+    if state.device.device_features != handler.device.device_features {
+        return Err(VirtioMmioTransportStateError::AvailableFeaturesMismatch);
+    }
+    if state.device.device_features_select > VIRTIO_MMIO_FEATURE_SELECTOR_MAX
+        || state.device.driver_features_select > VIRTIO_MMIO_FEATURE_SELECTOR_MAX
+    {
+        return Err(VirtioMmioTransportStateError::UnsupportedFeatureSelector);
+    }
+    if state.device.driver_features & !state.device.device_features != 0 {
+        return Err(VirtioMmioTransportStateError::UnsupportedDriverFeatures);
+    }
+    if !is_reachable_healthy_status(state.device.status) {
+        return Err(VirtioMmioTransportStateError::UnhealthyDeviceStatus);
+    }
+    if status_has_features_ok(state.device.status)
+        && state.device.driver_features & VIRTIO_MMIO_VERSION_1_FEATURE == 0
+    {
+        return Err(VirtioMmioTransportStateError::MissingVersionOneDriverFeature);
+    }
+    if !status_has_driver(state.device.status) && state.device.driver_features != 0 {
+        return Err(VirtioMmioTransportStateError::UnsupportedDriverFeatures);
+    }
+
+    let status_is_active = state.device.status == VIRTIO_DEVICE_DRIVER_OK_STATUS;
+    if state.device_activated != status_is_active || state.device_activated != activation_is_active
+    {
+        return Err(VirtioMmioTransportStateError::ActivationMismatch);
+    }
+
+    if state.queues.len() != handler.queues.queues.len() {
+        return Err(VirtioMmioTransportStateError::QueueCountMismatch);
+    }
+    let queue_select = usize::try_from(state.queue_select)
+        .map_err(|_| VirtioMmioTransportStateError::QueueSelectorOutOfBounds)?;
+    if queue_select >= state.queues.len() {
+        return Err(VirtioMmioTransportStateError::QueueSelectorOutOfBounds);
+    }
+
+    for (queue_index, (queue, expected)) in state
+        .queues
+        .iter()
+        .zip(handler.queues.queues.iter())
+        .enumerate()
+    {
+        if queue.max_size != expected.max_size {
+            return Err(VirtioMmioTransportStateError::QueueMaxSizeMismatch);
+        }
+        validate_queue_max_size(queue_index, queue.max_size)
+            .map_err(|_| VirtioMmioTransportStateError::QueueMaxSizeMismatch)?;
+        if queue.size != 0 {
+            let queue_index = u32::try_from(queue_index)
+                .map_err(|_| VirtioMmioTransportStateError::QueueCountMismatch)?;
+            validate_queue_size(queue_index, u32::from(queue.size), queue.max_size)
+                .map_err(|_| VirtioMmioTransportStateError::InvalidQueueSize)?;
+        }
+        if queue.ready && queue.size == 0 {
+            return Err(VirtioMmioTransportStateError::ReadyQueueWithoutSize);
+        }
+        for kind in [
+            QueueAddressKind::DescriptorTable,
+            QueueAddressKind::DriverRing,
+            QueueAddressKind::DeviceRing,
+        ] {
+            let queue_index = u32::try_from(queue_index)
+                .map_err(|_| VirtioMmioTransportStateError::QueueCountMismatch)?;
+            validate_queue_address(queue_index, kind, queue.address(kind))
+                .map_err(|_| VirtioMmioTransportStateError::UnalignedQueueAddress)?;
+        }
+        if !status_has_features_ok(state.device.status)
+            && (queue.size != 0
+                || queue.ready
+                || queue.descriptor_table.raw_value() != 0
+                || queue.driver_ring.raw_value() != 0
+                || queue.device_ring.raw_value() != 0)
+        {
+            return Err(VirtioMmioTransportStateError::QueueStateBeforeFeaturesOk);
+        }
+    }
+
+    if state.pending_notifications.len() != state.queues.len() {
+        return Err(VirtioMmioTransportStateError::NotificationCountMismatch);
+    }
+    if !state.device_activated
+        && state
+            .pending_notifications
+            .iter()
+            .copied()
+            .any(|is_pending| is_pending)
+    {
+        return Err(VirtioMmioTransportStateError::NotificationBeforeActivation);
+    }
+
+    Ok(())
+}
+
+const fn is_reachable_healthy_status(status: u32) -> bool {
+    status == VIRTIO_DEVICE_STATUS_INIT
+        || status == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        || status == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER
+        || status
+            == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                | VIRTIO_DEVICE_STATUS_DRIVER
+                | VIRTIO_DEVICE_STATUS_FEATURES_OK
+        || status == VIRTIO_DEVICE_DRIVER_OK_STATUS
+}
+
+const fn status_has_driver(status: u32) -> bool {
+    status & VIRTIO_DEVICE_STATUS_DRIVER != 0
+}
+
+const fn status_has_features_ok(status: u32) -> bool {
+    status & VIRTIO_DEVICE_STATUS_FEATURES_OK != 0
+}
+
 fn feature_word(features: u64, selector: u32) -> Result<u32, VirtioMmioRegisterStateError> {
     match selector {
         0 => Ok((features & u64::from(u32::MAX)) as u32),
@@ -2809,7 +3142,7 @@ mod tests {
         VirtioMmioQueueNotificationError, VirtioMmioQueueNotificationRegisters,
         VirtioMmioQueueRegisterError, VirtioMmioQueueRegisters, VirtioMmioQueueState,
         VirtioMmioRegister, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
-        VirtioMmioRegisterStateError, decode_virtio_mmio_access,
+        VirtioMmioRegisterStateError, VirtioMmioTransportStateError, decode_virtio_mmio_access,
     };
     use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatusError};
     use crate::memory::GuestAddress;
@@ -5131,5 +5464,77 @@ mod tests {
             "unsupported virtio-mmio write register offset 0xc"
         );
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn transport_state_restores_without_replaying_activation() {
+        let mut source = VirtioMmioRegisterHandler::new(2, 1 << 5, &[256])
+            .expect("source transport should build");
+        source
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("acknowledge should write");
+        source
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("driver should write");
+        source
+            .write_register(VirtioMmioRegister::DriverFeaturesSel, 1)
+            .expect("driver feature selector should write");
+        source
+            .write_register(VirtioMmioRegister::DriverFeatures, 1)
+            .expect("version 1 should negotiate");
+        source
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("feature negotiation should complete");
+        for (register, value) in [
+            (VirtioMmioRegister::QueueNum, 8),
+            (VirtioMmioRegister::QueueDescLow, 0x1000),
+            (VirtioMmioRegister::QueueDriverLow, 0x2000),
+            (VirtioMmioRegister::QueueDeviceLow, 0x3000),
+            (VirtioMmioRegister::QueueReady, 1),
+        ] {
+            source
+                .write_register(register, value)
+                .expect("queue register should write");
+        }
+        source
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("driver-ok should activate");
+        source.mark_interrupt_pending(DeviceInterruptKind::Config);
+        let state = source.transport_state();
+
+        let mut restored = VirtioMmioRegisterHandler::new(2, 1 << 5, &[256])
+            .expect("restored transport should build");
+        restored
+            .restore_transport_state(&state, true)
+            .expect("transport state should restore");
+
+        assert_eq!(restored.transport_state(), state);
+        assert!(restored.is_device_activated());
+        assert_eq!(
+            format!("{state:?}"),
+            "VirtioMmioTransportState { state: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
+    fn failed_transport_restore_does_not_mutate_handler() {
+        let source =
+            VirtioMmioRegisterHandler::new(2, 0, &[256]).expect("source transport should build");
+        let mut invalid = source.transport_state();
+        invalid.device.status = VIRTIO_DEVICE_STATUS_FAILED;
+        let mut target =
+            VirtioMmioRegisterHandler::new(2, 0, &[256]).expect("target transport should build");
+        let before = target.transport_state();
+
+        assert_eq!(
+            target
+                .restore_transport_state(&invalid, false)
+                .expect_err("failed state should reject"),
+            VirtioMmioTransportStateError::UnhealthyDeviceStatus
+        );
+        assert_eq!(target.transport_state(), before);
     }
 }

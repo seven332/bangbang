@@ -66,6 +66,13 @@ for the Z-, P-, and ZA-register allocations. These are internal snapshot
 feasibility primitives only. bangbang now has a bounded native-v1 outer state
 envelope, read-only version inspection, internal guest-memory image/binding
 I/O, and a macOS-only no-clobber two-file publisher plus committed-pair loader.
+It also has an internal, standalone `BANGDEV\0` native-v1 device profile capped
+at 16 KiB for exactly one read-only root virtio-block device, drained transport
+and queue state, frozen limiter/retry time, UART registers with a fresh default
+output policy, and mandatory VMGenID/VMClock topology. A staged preflight
+reopens the root file read-only with no-follow semantics, verifies its retained
+descriptor identity, validates queue ranges against loaded memory, and builds
+drop-safe block/serial resources without installing them into a VM.
 The publisher writes private owner-only files in each destination directory,
 makes memory durable first, and publishes state last as the commit marker. No
 process or API path invokes these internal artifact primitives. Public snapshot
@@ -73,7 +80,7 @@ create/load wiring, complete restore, a composite VM-state
 payload schema, remaining vCPU state, EL2 GIC CPU-interface state,
 effective-SVL interpretation, SME/SME2 feature and destination policy,
 remaining setters and transition ordering, cache-topology manifests, and
-complete emulated device state, and cross-step restore leasing remain
+prepared-device installation, optional-device state, and cross-step restore leasing remain
 unsupported.
 
 ## Process CLI

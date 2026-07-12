@@ -438,6 +438,40 @@ impl VirtqueueAvailableRing {
         self
     }
 
+    pub(crate) fn descriptor_table_range(
+        &self,
+    ) -> Result<GuestMemoryRange, VirtqueueDescriptorChainError> {
+        descriptor_table_range(self.descriptor_table, self.queue_size)
+    }
+
+    pub(crate) fn available_ring_range(
+        &self,
+    ) -> Result<GuestMemoryRange, VirtqueueAvailableRingError> {
+        available_ring_range(self.available_ring, self.queue_size)
+    }
+
+    pub(crate) fn validate_mapped(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<(), VirtqueueAvailableRingError> {
+        validate_descriptor_table_range(memory, self.descriptor_table, self.queue_size)
+            .map_err(|source| VirtqueueAvailableRingError::DescriptorTable { source })?;
+        validate_available_ring_range(memory, self.available_ring, self.queue_size)
+    }
+
+    pub(crate) fn available_index(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<u16, VirtqueueAvailableRingError> {
+        validate_available_ring_range(memory, self.available_ring, self.queue_size)?;
+        let address = available_ring_offset_address(
+            self.available_ring,
+            self.queue_size,
+            VIRTQUEUE_AVAILABLE_RING_IDX_OFFSET,
+        )?;
+        read_available_ring_u16(memory, self.available_ring, self.queue_size, address)
+    }
+
     pub fn used_event(&self, memory: &GuestMemory) -> Result<u16, VirtqueueAvailableRingError> {
         validate_available_ring_range(memory, self.available_ring, self.queue_size)?;
 
@@ -581,6 +615,31 @@ impl VirtqueueUsedRing {
 
     pub const fn next_used(&self) -> u16 {
         self.next_used
+    }
+
+    pub(crate) fn used_ring_range(&self) -> Result<GuestMemoryRange, VirtqueueUsedRingError> {
+        used_ring_range(self.used_ring, self.queue_size)
+    }
+
+    pub(crate) fn validate_mapped(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<(), VirtqueueUsedRingError> {
+        validate_used_ring_range(memory, self.used_ring, self.queue_size)
+    }
+
+    pub(crate) fn used_index(&self, memory: &GuestMemory) -> Result<u16, VirtqueueUsedRingError> {
+        validate_used_ring_range(memory, self.used_ring, self.queue_size)?;
+        let address = used_ring_offset_address(
+            self.used_ring,
+            self.queue_size,
+            VIRTQUEUE_USED_RING_IDX_OFFSET,
+        )?;
+        read_u16(memory, address).map_err(|source| VirtqueueUsedRingError::UsedRingAccess {
+            used_ring: self.used_ring,
+            queue_size: self.queue_size,
+            source,
+        })
     }
 
     pub fn publish_used_element(
@@ -1182,13 +1241,7 @@ fn validate_descriptor_table_range(
     descriptor_table: GuestAddress,
     queue_size: u16,
 ) -> Result<(), VirtqueueDescriptorChainError> {
-    let table_size = u64::from(queue_size) * VIRTQUEUE_DESCRIPTOR_SIZE_U64;
-    let table_range = GuestMemoryRange::new(descriptor_table, table_size).map_err(|_| {
-        VirtqueueDescriptorChainError::DescriptorTableRangeOverflow {
-            descriptor_table,
-            queue_size,
-        }
-    })?;
+    let table_range = descriptor_table_range(descriptor_table, queue_size)?;
 
     memory
         .validate_mapped_range(table_range)
@@ -1203,18 +1256,25 @@ fn validate_descriptor_table_range(
     Ok(())
 }
 
+fn descriptor_table_range(
+    descriptor_table: GuestAddress,
+    queue_size: u16,
+) -> Result<GuestMemoryRange, VirtqueueDescriptorChainError> {
+    let table_size = u64::from(queue_size) * VIRTQUEUE_DESCRIPTOR_SIZE_U64;
+    GuestMemoryRange::new(descriptor_table, table_size).map_err(|_| {
+        VirtqueueDescriptorChainError::DescriptorTableRangeOverflow {
+            descriptor_table,
+            queue_size,
+        }
+    })
+}
+
 fn validate_available_ring_range(
     memory: &GuestMemory,
     available_ring: GuestAddress,
     queue_size: u16,
 ) -> Result<(), VirtqueueAvailableRingError> {
-    let ring_size = available_ring_size(available_ring, queue_size)?;
-    let ring_range = GuestMemoryRange::new(available_ring, ring_size).map_err(|_| {
-        VirtqueueAvailableRingError::AvailableRingRangeOverflow {
-            available_ring,
-            queue_size,
-        }
-    })?;
+    let ring_range = available_ring_range(available_ring, queue_size)?;
 
     memory.validate_mapped_range(ring_range).map_err(|source| {
         VirtqueueAvailableRingError::AvailableRingAccess {
@@ -1227,18 +1287,25 @@ fn validate_available_ring_range(
     Ok(())
 }
 
+fn available_ring_range(
+    available_ring: GuestAddress,
+    queue_size: u16,
+) -> Result<GuestMemoryRange, VirtqueueAvailableRingError> {
+    let ring_size = available_ring_size(available_ring, queue_size)?;
+    GuestMemoryRange::new(available_ring, ring_size).map_err(|_| {
+        VirtqueueAvailableRingError::AvailableRingRangeOverflow {
+            available_ring,
+            queue_size,
+        }
+    })
+}
+
 fn validate_used_ring_range(
     memory: &GuestMemory,
     used_ring: GuestAddress,
     queue_size: u16,
 ) -> Result<(), VirtqueueUsedRingError> {
-    let ring_size = used_ring_size(used_ring, queue_size)?;
-    let ring_range = GuestMemoryRange::new(used_ring, ring_size).map_err(|_| {
-        VirtqueueUsedRingError::UsedRingRangeOverflow {
-            used_ring,
-            queue_size,
-        }
-    })?;
+    let ring_range = used_ring_range(used_ring, queue_size)?;
 
     memory.validate_mapped_range(ring_range).map_err(|source| {
         VirtqueueUsedRingError::UsedRingAccess {
@@ -1249,6 +1316,19 @@ fn validate_used_ring_range(
     })?;
 
     Ok(())
+}
+
+fn used_ring_range(
+    used_ring: GuestAddress,
+    queue_size: u16,
+) -> Result<GuestMemoryRange, VirtqueueUsedRingError> {
+    let ring_size = used_ring_size(used_ring, queue_size)?;
+    GuestMemoryRange::new(used_ring, ring_size).map_err(|_| {
+        VirtqueueUsedRingError::UsedRingRangeOverflow {
+            used_ring,
+            queue_size,
+        }
+    })
 }
 
 fn validate_descriptor_index(
