@@ -113,6 +113,10 @@ const MMIO_DISPATCHER_BUSY_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is 
 const MMIO_DISPATCHER_POISONED_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is poisoned";
 const COMMAND_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner command channel is closed";
 const RESPONSE_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner response channel is closed";
+const RUN_COMPLETION_TOKEN_MISMATCH_MESSAGE: &str =
+    "vCPU runner completion token does not match the submitted run";
+const DUPLICATE_BATCH_CANCEL_MEMBER_MESSAGE: &str =
+    "vCPU batch cancellation contains a duplicate runner";
 const PSCI_CALL_PENDING_MESSAGE: &str = "vCPU runner has a deferred PSCI call pending";
 const PSCI_CALL_NOT_PENDING_MESSAGE: &str = "vCPU runner has no deferred PSCI call pending";
 const PSCI_CALL_TOKEN_MISMATCH_MESSAGE: &str = "deferred PSCI call token does not match";
@@ -479,6 +483,58 @@ pub(crate) enum HvfVcpuCoordinatedRunStepOutcome {
     },
 }
 
+/// Coordinator-issued identity for one bounded run command.
+///
+/// The topology coordinator owns token construction. The runner carries the
+/// value through its owner thread without interpreting topology identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct HvfVcpuRunToken {
+    member_index: usize,
+    generation: u64,
+}
+
+impl HvfVcpuRunToken {
+    pub(crate) const fn new(member_index: usize, generation: u64) -> Self {
+        Self {
+            member_index,
+            generation,
+        }
+    }
+
+    pub(crate) const fn member_index(self) -> usize {
+        self.member_index
+    }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+/// Identified completion published by one owner-thread bounded run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HvfVcpuRunCompletion {
+    token: HvfVcpuRunToken,
+    result: Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError>,
+}
+
+impl HvfVcpuRunCompletion {
+    pub(crate) const fn new(
+        token: HvfVcpuRunToken,
+        result: Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError>,
+    ) -> Self {
+        Self { token, result }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        HvfVcpuRunToken,
+        Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError>,
+    ) {
+        (self.token, self.result)
+    }
+}
+
 impl fmt::Display for HvfVcpuRunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -723,6 +779,37 @@ impl fmt::Debug for HvfVcpuRunCancelHandle {
     }
 }
 
+pub(crate) fn cancel_vcpu_run_batch_with(
+    handles: &[HvfVcpuRunCancelHandle],
+    cancel_vcpus: impl FnOnce(&mut [crate::ffi::HvVcpu]) -> Result<(), BackendError>,
+) -> Result<(), HvfVcpuRunnerError> {
+    if handles.is_empty() {
+        return Ok(());
+    }
+    for (index, handle) in handles.iter().enumerate() {
+        if handles
+            .iter()
+            .take(index)
+            .any(|candidate| Arc::ptr_eq(&candidate.state, &handle.state))
+        {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                DUPLICATE_BATCH_CANCEL_MEMBER_MESSAGE,
+            ));
+        }
+    }
+
+    // Keep every state lock until the one aggregate HVF request returns so no
+    // concurrent shutdown can destroy a raw id in the submitted slice.
+    let mut state_guards = Vec::with_capacity(handles.len());
+    for handle in handles {
+        state_guards.push(prepare_cancel(&handle.state)?);
+    }
+    let mut vcpus = handles.iter().map(|handle| handle.vcpu).collect::<Vec<_>>();
+    let result = cancel_vcpus(&mut vcpus).map_err(HvfVcpuRunnerError::Backend);
+    drop(state_guards);
+    result
+}
+
 #[derive(Debug)]
 struct RunnerHandleState {
     thread: Option<JoinHandle<()>>,
@@ -814,8 +901,11 @@ enum RunnerCommand {
         response_sender: mpsc::Sender<Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>>,
     },
     RunOnceAndHandleMmioCoordinated {
+        admission: InFlightRun,
+        state: RunnerState,
+        token: HvfVcpuRunToken,
         dispatcher: SharedMmioDispatcher,
-        response_sender: mpsc::Sender<Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError>>,
+        completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
     },
     CompletePsciCall {
         token: HvfVcpuPsciCallToken,
@@ -2552,10 +2642,6 @@ impl<'vm> HvfVcpuRunner<'vm> {
         result
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the later multi-vCPU scheduler slice")
-    )]
     pub(crate) fn configure_arm64_secondary_boot_registers(
         &self,
         registers: HvfArm64SecondaryBootRegisters,
@@ -2602,28 +2688,32 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         dispatcher: Arc<Mutex<MmioDispatcher>>,
     ) -> Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError> {
-        let (response_sender, response_receiver) = mpsc::channel();
-        let _in_flight_run =
-            self.start_run_once_and_handle_mmio_coordinated(dispatcher, response_sender)?;
+        let token = HvfVcpuRunToken::new(0, 0);
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        self.submit_run_once_and_handle_mmio_coordinated(token, dispatcher, completion_sender)?;
 
-        let outcome = response_receiver
+        let completion = completion_receiver
             .recv()
-            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))??;
-        if let HvfVcpuCoordinatedRunStepOutcome::Psci { token, .. } = outcome {
-            let mut state = self.lock_state()?;
-            if state.pending_psci_call.is_some() {
-                return Err(HvfVcpuRunnerError::InvalidState(PSCI_CALL_PENDING_MESSAGE));
-            }
-            state.pending_psci_call = Some(token);
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+        let (actual_token, result) = completion.into_parts();
+        if actual_token != token {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUN_COMPLETION_TOKEN_MISMATCH_MESSAGE,
+            ));
         }
 
-        Ok(outcome)
+        result
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the later multi-vCPU scheduler slice")
-    )]
+    pub(crate) fn submit_run_once_and_handle_mmio_coordinated(
+        &self,
+        token: HvfVcpuRunToken,
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+        completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_run_once_and_handle_mmio_coordinated(token, dispatcher, completion_sender)
+    }
+
     pub(crate) fn complete_psci_call(
         &self,
         token: HvfVcpuPsciCallToken,
@@ -3965,9 +4055,10 @@ impl<'vm> HvfVcpuRunner<'vm> {
 
     fn start_run_once_and_handle_mmio_coordinated(
         &self,
+        token: HvfVcpuRunToken,
         dispatcher: SharedMmioDispatcher,
-        response_sender: mpsc::Sender<Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError>>,
-    ) -> Result<InFlightRun, HvfVcpuRunnerError> {
+        completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
+    ) -> Result<(), HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -4020,22 +4111,24 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
 
         state.in_flight_runs = 1;
-        if self
-            .command_sender
-            .send(RunnerCommand::RunOnceAndHandleMmioCoordinated {
-                dispatcher,
-                response_sender,
-            })
-            .is_err()
-        {
+        let command = RunnerCommand::RunOnceAndHandleMmioCoordinated {
+            admission: InFlightRun::new(&self.state),
+            state: Arc::clone(&self.state),
+            token,
+            dispatcher,
+            completion_sender,
+        };
+        if let Err(err) = self.command_sender.send(command) {
             state.in_flight_runs = 0;
+            drop(state);
+            drop(err.0);
             return Err(HvfVcpuRunnerError::ChannelClosed(
                 COMMAND_CHANNEL_CLOSED_MESSAGE,
             ));
         }
 
         state.run_started = true;
-        Ok(InFlightRun::new(&self.state))
+        Ok(())
     }
 
     fn start_psci_completion(
@@ -6117,15 +6210,34 @@ fn run_runner_thread<C, V>(
                 let _ = response_sender.send(result);
             }
             RunnerCommand::RunOnceAndHandleMmioCoordinated {
+                admission,
+                state,
+                token,
                 dispatcher,
-                response_sender,
+                completion_sender,
             } => {
-                let result = run_once_and_handle_mmio_coordinated_on_runner_thread(
-                    &mut vcpu,
-                    &dispatcher,
-                    &mut psci_state,
-                );
-                let _ = response_sender.send(result);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let result = run_once_and_handle_mmio_coordinated_on_runner_thread(
+                        &mut vcpu,
+                        &dispatcher,
+                        &mut psci_state,
+                    );
+                    record_coordinated_psci_pending(&state, result)
+                }));
+                match result {
+                    Ok(result) => {
+                        drop(admission);
+                        let _ = completion_sender.send(HvfVcpuRunCompletion::new(token, result));
+                    }
+                    Err(payload) => {
+                        drop(admission);
+                        let _ = completion_sender.send(HvfVcpuRunCompletion::new(
+                            token,
+                            Err(HvfVcpuRunnerError::ThreadPanicked),
+                        ));
+                        std::panic::resume_unwind(payload);
+                    }
+                }
             }
             RunnerCommand::CompletePsciCall {
                 token,
@@ -6916,6 +7028,24 @@ fn run_once_and_handle_mmio_coordinated_on_runner_thread(
     Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(outcome))
 }
 
+fn record_coordinated_psci_pending(
+    state: &RunnerState,
+    result: Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError>,
+) -> Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError> {
+    let Ok(HvfVcpuCoordinatedRunStepOutcome::Psci { token, .. }) = &result else {
+        return result;
+    };
+
+    let mut state = lock_runner_state(state)?;
+    if state.pending_psci_call.is_some() {
+        return Err(HvfVcpuRunnerError::InvalidState(PSCI_CALL_PENDING_MESSAGE));
+    }
+    state.pending_psci_call = Some(*token);
+    drop(state);
+
+    result
+}
+
 fn handle_sys64_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     exit: HvfSys64Exit,
@@ -7148,8 +7278,9 @@ mod tests {
     use super::{
         CancelVcpu, HvfArm64SnapshotV1CaptureStage, HvfArm64SnapshotV1Restore,
         HvfArm64SnapshotV1RestoreStage, HvfVcpuCoordinatedRunStepOutcome,
-        HvfVcpuMpidrAffinityStage, HvfVcpuPsciCallToken, HvfVcpuRunStepOutcome, HvfVcpuRunner,
-        HvfVcpuRunnerError, RunnerVcpu, spawn_runner_thread,
+        HvfVcpuMpidrAffinityStage, HvfVcpuPsciCallToken, HvfVcpuRunCompletion,
+        HvfVcpuRunStepOutcome, HvfVcpuRunToken, HvfVcpuRunner, HvfVcpuRunnerError, RunnerVcpu,
+        cancel_vcpu_run_batch_with, spawn_runner_thread,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -19105,6 +19236,221 @@ mod tests {
         assert_send_sync::<HvfArm64GicIccRegisterRestoreOperation>();
         assert_send_sync::<HvfArm64GicIccRegisterState>();
         assert_send_sync::<HvfInterruptType>();
+    }
+
+    #[test]
+    fn coordinated_run_submission_returns_before_identified_completion() {
+        let (runner, entered_run_receiver, destroyed_receiver) = start_fake_runner();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        let token = HvfVcpuRunToken::new(2, 41);
+
+        runner
+            .submit_run_once_and_handle_mmio_coordinated(
+                token,
+                shared_dispatcher(),
+                completion_sender,
+            )
+            .expect("coordinated run should submit without waiting");
+        entered_run_receiver
+            .recv()
+            .expect("owner thread should enter the submitted run");
+        assert_eq!(
+            completion_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        let (overlap_sender, _overlap_receiver) = mpsc::channel();
+        assert_eq!(
+            runner.submit_run_once_and_handle_mmio_coordinated(
+                HvfVcpuRunToken::new(2, 42),
+                shared_dispatcher(),
+                overlap_sender,
+            ),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUN_IN_FLIGHT_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.set_gic_ppi_pending(27),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUN_IN_FLIGHT_MESSAGE
+            ))
+        );
+
+        runner.cancel().expect("cancel should release fake run");
+        let completion = completion_receiver
+            .recv()
+            .expect("identified completion should be published");
+        let (actual_token, result) = completion.into_parts();
+        assert_eq!(actual_token, token);
+        assert_eq!(
+            result,
+            Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                HvfVcpuRunStepOutcome::Canceled
+            ))
+        );
+
+        let (next_sender, next_receiver) = mpsc::channel();
+        let next_token = HvfVcpuRunToken::new(2, 42);
+        runner
+            .submit_run_once_and_handle_mmio_coordinated(
+                next_token,
+                shared_dispatcher(),
+                next_sender,
+            )
+            .expect("completion should release run admission");
+        entered_run_receiver
+            .recv()
+            .expect("owner thread should enter the replacement run");
+        runner
+            .cancel()
+            .expect("cancel should release replacement run");
+        let (actual_token, result) = next_receiver
+            .recv()
+            .expect("replacement completion should be published")
+            .into_parts();
+        assert_eq!(actual_token, next_token);
+        assert_eq!(
+            result,
+            Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                HvfVcpuRunStepOutcome::Canceled
+            ))
+        );
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn dropped_coordinated_completion_receiver_does_not_leak_run_admission() {
+        let (runner, entered_run_receiver, destroyed_receiver) = start_fake_runner();
+        let (completion_sender, completion_receiver) = mpsc::channel::<HvfVcpuRunCompletion>();
+
+        runner
+            .submit_run_once_and_handle_mmio_coordinated(
+                HvfVcpuRunToken::new(0, 1),
+                shared_dispatcher(),
+                completion_sender,
+            )
+            .expect("coordinated run should submit");
+        drop(completion_receiver);
+        entered_run_receiver
+            .recv()
+            .expect("owner thread should enter the submitted run");
+
+        runner
+            .shutdown()
+            .expect("shutdown should cancel, drain, and join the owner");
+        assert_eq!(
+            runner
+                .state
+                .lock()
+                .expect("runner state should lock")
+                .in_flight_runs,
+            0
+        );
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn coordinated_run_panic_publishes_identified_failure_before_owner_unwind() {
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        let token = HvfVcpuRunToken::new(3, 17);
+
+        runner
+            .submit_run_once_and_handle_mmio_coordinated(
+                token,
+                shared_dispatcher(),
+                completion_sender,
+            )
+            .expect("panicking coordinated run should submit");
+        let (actual_token, result) = completion_receiver
+            .recv()
+            .expect("panic should publish an identified failure")
+            .into_parts();
+        assert_eq!(actual_token, token);
+        assert_eq!(result, Err(HvfVcpuRunnerError::ThreadPanicked));
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn batch_cancel_holds_all_runner_states_for_one_ordered_call() {
+        let (first, _first_entered, first_destroyed) = start_fake_runner();
+        let (second, _second_entered, second_destroyed) = start_fake_runner();
+        let handles = vec![first.run_cancel_handle(), second.run_cancel_handle()];
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_for_call = Arc::clone(&release);
+
+        thread::scope(|scope| {
+            let batch = scope.spawn(move || {
+                cancel_vcpu_run_batch_with(&handles, |vcpus| {
+                    entered_sender
+                        .send(vcpus.to_vec())
+                        .map_err(|_| BackendError::InvalidState("batch observer closed"))?;
+                    let (released, released_changed) = &*release_for_call;
+                    let mut released = released
+                        .lock()
+                        .map_err(|_| BackendError::InvalidState("batch release lock poisoned"))?;
+                    while !*released {
+                        released = released_changed.wait(released).map_err(|_| {
+                            BackendError::InvalidState("batch release lock poisoned")
+                        })?;
+                    }
+                    Ok(())
+                })
+            });
+
+            assert_eq!(
+                entered_receiver
+                    .recv()
+                    .expect("batch call should expose one raw-id slice"),
+                vec![7, 7]
+            );
+            assert!(first.state.try_lock().is_err());
+            assert!(second.state.try_lock().is_err());
+            let (released, released_changed) = &*release;
+            *released.lock().expect("batch release lock should lock") = true;
+            released_changed.notify_one();
+            assert_eq!(batch.join().expect("batch thread should join"), Ok(()));
+        });
+
+        first.shutdown().expect("first runner should shut down");
+        second.shutdown().expect("second runner should shut down");
+        first_destroyed
+            .recv()
+            .expect("first fake vCPU should be destroyed");
+        second_destroyed
+            .recv()
+            .expect("second fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn batch_cancel_rejects_duplicate_runner_handles_before_calling_backend() {
+        let (runner, _entered_run_receiver, destroyed_receiver) = start_fake_runner();
+        let handle = runner.run_cancel_handle();
+        let mut called = false;
+
+        assert_eq!(
+            cancel_vcpu_run_batch_with(&[handle.clone(), handle], |_| {
+                called = true;
+                Ok(())
+            }),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::DUPLICATE_BATCH_CANCEL_MEMBER_MESSAGE
+            ))
+        );
+        assert!(!called);
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
     }
 
     #[test]

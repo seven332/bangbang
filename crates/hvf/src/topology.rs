@@ -1,8 +1,11 @@
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::machine::MAX_SUPPORTED_VCPUS;
+use bangbang_runtime::mmio::MmioDispatcher;
 
+use crate::coordinator::{HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError};
 use crate::runner::{HvfVcpuMpidrAffinityStage, HvfVcpuRunner, HvfVcpuRunnerError};
 
 const MAX_ORDERED_MPIDR: u64 = MAX_SUPPORTED_VCPUS as u64 - 1;
@@ -299,6 +302,24 @@ impl<'vm> HvfVcpuTopology<'vm> {
     /// Return exact owner-thread-verified MPIDRs in topology order.
     pub fn mpidrs(&self) -> &[u64] {
         &self.mpidrs
+    }
+
+    /// Borrow this ordered topology through a concurrent bounded-run coordinator.
+    ///
+    /// `online_indexes` is software power state only. Offline members retain
+    /// their permanent owner threads but are neither submitted nor canceled.
+    /// The exclusive borrow prevents two coordinators from driving the same
+    /// owner set concurrently.
+    pub fn run_coordinator<'topology>(
+        &'topology mut self,
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+        online_indexes: &[usize],
+    ) -> Result<HvfVcpuRunCoordinator<'topology, 'vm>, HvfVcpuRunCoordinatorError> {
+        HvfVcpuRunCoordinator::new(self, dispatcher, online_indexes)
+    }
+
+    pub(crate) fn runners(&self) -> &[HvfVcpuRunner<'vm>] {
+        &self.runners
     }
 
     /// Request cancellation from every topology member.

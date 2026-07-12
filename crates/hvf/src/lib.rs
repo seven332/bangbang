@@ -1,6 +1,7 @@
 //! Hypervisor.framework backend.
 
 mod backend;
+mod coordinator;
 mod exit;
 mod ffi;
 mod gic;
@@ -18,6 +19,11 @@ mod vcpu;
 mod vcpu_config;
 
 pub use backend::HvfBackend;
+pub use coordinator::{
+    HvfVcpuCoordinatorWork, HvfVcpuRunBarrierReport, HvfVcpuRunBarrierWaiter, HvfVcpuRunControl,
+    HvfVcpuRunControlReason, HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError, HvfVcpuRunEvent,
+    HvfVcpuRunMemberOutcome, HvfVcpuRunMemberResult, HvfVcpuRunTerminalReport,
+};
 pub use exit::{
     HvfExceptionExit, HvfHvcDecodeError, HvfHvcExit, HvfMmioAccess, HvfMmioAccessSize,
     HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth,

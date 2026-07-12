@@ -48,6 +48,8 @@ backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary,
+an ordered owner-thread vCPU topology with an internal concurrent bounded-run
+coordinator and active-only batch cancellation,
 baseline and optional SVE/SME guest-visible identification metadata, pointer-
 authentication key-state capture with redacted `Debug`, raw cache-selection
 plus ordered nontransactional restore of its typed CSSELR_EL1 value,
@@ -79,7 +81,7 @@ broader device-backed feature negotiation,
 device-backed runner-loop MMIO scheduling, complete device emulation,
 full Firecracker metrics counters, full logger integration beyond API request
 method/path, action, and boot-timer events,
-multi-vCPU setup, full PSCI behavior, or successful actions beyond owned `InstanceStart`
+public multi-vCPU setup, full PSCI behavior, or successful actions beyond owned `InstanceStart`
 startup with an internal boot run loop across bounded step windows and runtime
 `FlushMetrics` yet. Minimal startup metrics flushing writes the first metrics
 line when startup metrics are configured, and periodic metrics flushing uses the
@@ -112,6 +114,34 @@ wiring, Linux SMP boot, and public activation remain later capability gates.
 Firecracker delegates equivalent PSCI 0.2 secondary-power behavior to KVM;
 bangbang must coordinate it explicitly above Hypervisor.framework's per-vCPU
 owner threads.
+
+## Internal Concurrent vCPU Run Coordination
+
+The ordered HVF topology can now be borrowed through an internal concurrent
+bounded-run coordinator. It submits one identified generation to every online,
+idle member before collecting completions, keeps one shared MMIO dispatcher,
+accepts out-of-order owner-thread results, and routes indexed boot-register,
+deferred PSCI, and GIC PPI operations without exposing the topology's runner
+storage or raw HVF vCPU identifiers. Each vCPU remains permanently owned by its
+original runner thread.
+
+Wakeup, pause, stop, and shutdown requests freeze submission, snapshot only the
+currently active generations, issue one slice-level `hv_vcpus_exit`, and publish
+their barrier only after every member in that exact snapshot acknowledges.
+Concurrent reasons coalesce as shutdown/stop, pause, then wakeup. A successful
+exit request records per-member cancellation debt so a normal-completion race
+cannot turn a delayed cancellation into false guest progress on the next run.
+Offline members are never submitted or included in the cancellation slice.
+Runner failures and terminal guest results use the same peer-drain path and a
+stable topology-indexed precedence independent of completion arrival order.
+
+Signed lifecycle coverage runs two real vCPUs against separate guest entry
+points. Each writes a shared-memory flag and waits for its peer before the host
+issues one active-only stop barrier; both identified runs must return
+`Canceled`, and the complete create/run/cancel/shutdown/VM teardown sequence is
+repeated. This is an internal execution prerequisite only. Public startup still
+accepts exactly one vCPU, native-v1 snapshot capture/restore remains a one-vCPU
+profile, and PSCI/FDT/Linux SMP session wiring remains deferred.
 
 ## Firecracker Model Alignment
 

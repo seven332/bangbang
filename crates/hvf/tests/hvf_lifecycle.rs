@@ -2456,6 +2456,200 @@ fn owns_and_cleans_ordered_two_vcpu_topology() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn concurrently_runs_and_batch_cancels_two_vcpus() {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use bangbang_hvf::{
+        HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuRunControlReason,
+        HvfVcpuRunEvent, HvfVcpuRunMemberOutcome, HvfVcpuRunStepOutcome,
+    };
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+    use bangbang_runtime::mmio::MmioDispatcher;
+
+    const SECOND_ENTRY_OFFSET: u64 = 0x100;
+    const FLAGS_OFFSET: u64 = 0x2000;
+    const PEER_FLAG_OFFSET: u32 = 8;
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+    const MOV_W1_ONE: u32 = 0x5280_0021;
+    const STR_W1_X0: u32 = 0xb900_0001;
+    const DMB_ISH: u32 = 0xd503_3bbf;
+    const ADD_X2_X0_PEER: u32 = 0x9100_2002;
+    const SUB_X2_X0_PEER: u32 = 0xd100_2002;
+    const LDR_W3_X2: u32 = 0xb940_0043;
+    const CBZ_W3_PREVIOUS: u32 = 0x34ff_ffe3;
+    const SPIN_FOREVER: u32 = 0x1400_0000;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+
+    for iteration in 0..2 {
+        let mut backend = HvfBackend::new();
+        let layout =
+            aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+                .expect("guest memory layout should be valid");
+        let mut memory =
+            GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+        let first_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+        let second_entry = first_entry
+            .checked_add(SECOND_ENTRY_OFFSET)
+            .expect("second guest entry should fit");
+        let first_flag = first_entry
+            .checked_add(FLAGS_OFFSET)
+            .expect("first handshake flag should fit");
+        let second_flag = first_flag
+            .checked_add(u64::from(PEER_FLAG_OFFSET))
+            .expect("second handshake flag should fit");
+        let first_code = [
+            MOV_W1_ONE,
+            STR_W1_X0,
+            DMB_ISH,
+            ADD_X2_X0_PEER,
+            LDR_W3_X2,
+            CBZ_W3_PREVIOUS,
+            SPIN_FOREVER,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+        let second_code = [
+            MOV_W1_ONE,
+            STR_W1_X0,
+            DMB_ISH,
+            SUB_X2_X0_PEER,
+            LDR_W3_X2,
+            CBZ_W3_PREVIOUS,
+            SPIN_FOREVER,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+        memory
+            .write_slice(&first_code, first_entry)
+            .expect("first guest handshake should be written");
+        memory
+            .write_slice(&second_code, second_entry)
+            .expect("second guest handshake should be written");
+        memory
+            .write_slice(&[0; 16], first_flag)
+            .expect("guest handshake flags should be zeroed");
+        let dram_region = memory
+            .regions()
+            .first()
+            .expect("guest DRAM should contain one region");
+        assert_eq!(dram_region.range().start(), first_entry);
+        let first_flag_host = dram_region
+            .host_address()
+            .as_ptr()
+            .cast::<u8>()
+            .wrapping_add(FLAGS_OFFSET as usize)
+            .cast::<u32>();
+        let second_flag_host = first_flag_host.wrapping_add(2);
+
+        backend.create_vm().expect("VM should be created");
+        backend
+            .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+            .expect("guest handshake memory should be mapped");
+        backend
+            .create_gic()
+            .expect("GIC should be created before the vCPU topology");
+        {
+            let mut topology = backend
+                .start_vcpu_topology(2)
+                .expect("host should support a two-vCPU topology");
+            let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+            let mut coordinator = topology
+                .run_coordinator(dispatcher, &[0, 1])
+                .expect("two-vCPU coordinator should start");
+            coordinator
+                .configure_arm64_boot_registers(
+                    0,
+                    HvfArm64BootRegisters {
+                        kernel_entry: first_entry,
+                        fdt_address: first_flag,
+                    },
+                )
+                .expect("first guest entry should be configured");
+            coordinator
+                .configure_arm64_boot_registers(
+                    1,
+                    HvfArm64BootRegisters {
+                        kernel_entry: second_entry,
+                        fdt_address: second_flag,
+                    },
+                )
+                .expect("second guest entry should be configured");
+            assert_eq!(
+                coordinator.dispatch_online(),
+                Ok(2),
+                "iteration {iteration} should submit both vCPUs before collection"
+            );
+
+            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+            loop {
+                // SAFETY: both aligned pointers remain inside the mapped DRAM
+                // region owned by `backend`; volatile reads observe guest writes
+                // while both vCPU owner threads are running.
+                let flags = unsafe {
+                    (
+                        std::ptr::read_volatile(first_flag_host),
+                        std::ptr::read_volatile(second_flag_host),
+                    )
+                };
+                if flags == (1, 1) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "iteration {iteration} timed out waiting for both guest handshake flags; observed {flags:?}"
+                );
+                std::thread::yield_now();
+            }
+
+            let waiter = coordinator
+                .control()
+                .request_stop()
+                .expect("one active-only batch stop should start");
+            let event = coordinator
+                .receive_event()
+                .expect("both canceled generations should drain");
+            let HvfVcpuRunEvent::Barrier(report) = event else {
+                panic!("iteration {iteration} should complete a stop barrier");
+            };
+            assert_eq!(report.reason(), HvfVcpuRunControlReason::Stop);
+            assert_eq!(
+                report
+                    .acknowledgements()
+                    .iter()
+                    .map(|result| result.index())
+                    .collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            assert!(report.acknowledgements().iter().all(|result| matches!(
+                result.result(),
+                Ok(HvfVcpuRunMemberOutcome::Handled(
+                    HvfVcpuRunStepOutcome::Canceled
+                ))
+            )));
+            assert_eq!(waiter.wait(), Ok(report));
+
+            coordinator
+                .shutdown()
+                .expect("coordinator should shut down every owner");
+            coordinator
+                .shutdown()
+                .expect("coordinator shutdown should be idempotent");
+        }
+        backend
+            .destroy_vm()
+            .expect("VM teardown should unmap guest memory after owner shutdown");
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_arm64_physical_timer_tval_on_idle_runner_thread() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;
