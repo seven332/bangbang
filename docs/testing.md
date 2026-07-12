@@ -66,6 +66,19 @@ inject count, host-capacity, allocation, owner-start, affinity write/readback,
 channel, cancel, and shutdown failures and assert reverse cleanup plus primary
 error precedence without entering unsigned HVF.
 
+Validation for internal PSCI secondary-power changes remains unit-test-only
+until the later multi-vCPU boot slice connects them. Tests must cover both CPU_ON calling
+conventions, exact X1-X3 reads and 32-bit truncation, MPIDR reserved-bit
+validation, all `OFF`/`ON_PENDING`/`ON` transitions and affinity results,
+already-on/on-pending/invalid-target/invalid-entry/internal-failure responses,
+stale transaction rejection, target setup success and rollback, retryable
+caller X0 completion, response abandonment, and unchanged public CPU_ON
+rejection. Target owner-thread tests must preserve context in X0, clear X1-X3,
+apply the Linux boot PSTATE, write PC last, stop at every injected failure, and
+require a complete retry while the target remains fail-closed. These tests do
+not claim atomic HVF register rollback, target execution, concurrent runners,
+Linux SMP boot, FDT activation, or public multi-vCPU support.
+
 For virtio-pmem changes, unit tests should cover MMIO registration, FDT
 metadata, config-space `start`/`size`, deterministic multi-device layout,
 queue parsing/completion, shadow writeback, and cleanup/error paths. Signed HVF

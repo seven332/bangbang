@@ -92,6 +92,27 @@ recorded as pre-boot VM state and applied during startup preparation. Runtime
 virtio-block device through the process-owned boot session, but public
 block-device attachment, boot selection changes, and hotplug remain deferred.
 
+## Internal PSCI Secondary-Power Groundwork
+
+The HVF backend now has an internal, crate-private PSCI coordination boundary
+for later multi-vCPU work. It decodes `CPU_ON32`, `CPU_ON64`,
+`AFFINITY_INFO32`, and `AFFINITY_INFO64` with their architectural X1-X3 width
+rules; models boot CPU `ON` and secondary `OFF`/`ON_PENDING`/`ON` states; and
+separates target owner-thread register setup from retryable caller X0
+completion. Secondary setup retains the PSCI context in target X0 and writes
+the entry PC last as a logical publication boundary. HVF register writes are
+not atomic, so a failed setup remains fail-closed and must be retried in full
+or discarded.
+
+This machinery is not connected to the public boot session yet. Public startup
+still accepts exactly one vCPU, the existing run path still returns
+`NOT_SUPPORTED` for `CPU_ON` and advertises no CPU_ON feature, and successful
+`CPU_OFF` remains unsupported. Concurrent scheduling, multi-vCPU FDT/session
+wiring, Linux SMP boot, and public activation remain later capability gates.
+Firecracker delegates equivalent PSCI 0.2 secondary-power behavior to KVM;
+bangbang must coordinate it explicitly above Hypervisor.framework's per-vCPU
+owner threads.
+
 ## Firecracker Model Alignment
 
 bangbang should follow Firecracker's process model: one `bangbang` process
