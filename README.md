@@ -33,6 +33,15 @@ templates, CPU hotplug beyond the current CPU_ON subset, reboot-in-place, and
 cross-host CPU portability remain unsupported. The native-v1 snapshot profile
 below remains restricted to exactly one vCPU.
 
+Firecracker-shaped `PUT /cpu-config` input is fully syntax-validated. Empty
+custom templates remain successful no-ops; non-empty KVM capability,
+KVM vCPU-init feature, arm register modifier, and mixed requests are reduced to
+category-only runtime actions and rejected with stable value-redacted arm64 HVF
+faults. Deprecated non-`None` machine `cpu_template` names are likewise rejected
+as Firecracker AWS/Linux CPU policies rather than HVF profiles. bangbang does
+not retain or apply their raw masks, and accepted empty/`None` input adds no CPU
+section to `GET /vm/config`.
+
 The HVF runner currently exposes owner-thread capture building blocks for
 general registers, plus ordered nontransactional restore of the same typed
 X0-X30/PC/CPSR value, raw core system registers plus ordered nontransactional

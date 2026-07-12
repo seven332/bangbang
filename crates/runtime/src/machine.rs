@@ -301,7 +301,10 @@ impl fmt::Display for MachineConfigError {
             }
             Self::SmtNotSupported => f.write_str("machine smt is not supported"),
             Self::UnsupportedCpuTemplate { cpu_template } => {
-                write!(f, "machine cpu_template {cpu_template} is not supported")
+                write!(
+                    f,
+                    "machine cpu_template {cpu_template} is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"
+                )
             }
             Self::DirtyPageTrackingNotSupported => {
                 f.write_str("machine track_dirty_pages is not supported")
@@ -397,6 +400,34 @@ mod tests {
             assert_eq!(
                 input.validate().expect_err("input should be invalid"),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_all_non_none_cpu_templates_as_deprecated_platform_policies() {
+        for cpu_template in [
+            MachineConfigCpuTemplate::C3,
+            MachineConfigCpuTemplate::T2,
+            MachineConfigCpuTemplate::T2S,
+            MachineConfigCpuTemplate::T2CL,
+            MachineConfigCpuTemplate::T2A,
+            MachineConfigCpuTemplate::V1N1,
+        ] {
+            let error = MachineConfigInput::new(1, 128)
+                .with_cpu_template(cpu_template)
+                .validate()
+                .expect_err("non-None CPU template should be platform-limited");
+
+            assert_eq!(
+                error,
+                MachineConfigError::UnsupportedCpuTemplate { cpu_template }
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "machine cpu_template {cpu_template} is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"
+                )
             );
         }
     }
@@ -499,7 +530,7 @@ mod tests {
                 cpu_template: MachineConfigCpuTemplate::V1N1,
             }
             .to_string(),
-            "machine cpu_template V1N1 is not supported"
+            "machine cpu_template V1N1 is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"
         );
         assert_eq!(
             MachineConfigError::DirtyPageTrackingNotSupported.to_string(),

@@ -541,6 +541,19 @@ is resource-specific:
   defined need. The independent queries are not one atomic manifest, and even
   together they are not trusted topology or destination policy without cache-
   level interpretation, masks, and validation.
+  Firecracker-shaped custom CPU-template values have a narrower control-plane
+  boundary. The HTTP/config-file parser validates KVM capability identifiers,
+  KVM vCPU-init feature indexes, arm register identifiers, and bitmaps, then
+  discards every raw value and retains only a singleton or mixed category.
+  Runtime actions, `Debug`, platform errors, logs, `GET /vm/config`, backend
+  construction, and snapshots therefore receive no modifier values. Empty
+  input stores nothing. Non-empty categories fail before mutation or VM
+  construction because Hypervisor.framework exposes feature/cache queries but
+  no equivalent contract for setting the created guest feature view. Existing
+  live general/system-register setters are execution-state primitives and must
+  not be repurposed as arbitrary CPU feature masks. Any future writable subset
+  requires a separate Apple API, destination feature-view, atomicity,
+  persistence, and snapshot-policy review.
   Breakpoint value registers can expose guest virtual addresses, Context IDs,
   or VMIDs. Watchpoint value registers expose guest data virtual addresses, and
   their controls can encode access type, byte selection, linking, and enabled

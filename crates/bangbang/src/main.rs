@@ -5107,7 +5107,7 @@ mod tests {
         let config_path = unique_config_path("cpu-config");
         fs::write(
             &config_path,
-            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{"kvm_capabilities":["1"]}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}}"#,
         )
         .expect("config file should be written");
         let mut vmm = ProcessVmm::with_starter(
@@ -5124,11 +5124,24 @@ mod tests {
         .expect_err("unsupported cpu-config should fail");
 
         assert!(matches!(
-            err,
+            &err,
             ProcessError::ConfigFile(super::ConfigFileError::Apply(
-                bangbang_runtime::VmmActionError::UnsupportedAction("PutCpuConfig")
+                bangbang_runtime::VmmActionError::CpuConfig(
+                    bangbang_runtime::cpu::CpuConfigError::UnsupportedOnHvf {
+                        category: bangbang_runtime::cpu::CpuConfigTemplateCategory::Mixed
+                    }
+                )
             ))
         ));
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(display.contains(
+            "mixed cpu-config categories are KVM-specific and are not supported on arm64 HVF"
+        ));
+        for raw_value in ["4294967295", "31415926", "0b11010011"] {
+            assert!(!display.contains(raw_value));
+            assert!(!debug.contains(raw_value));
+        }
         assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
         assert!(!vmm.has_started_session());
 

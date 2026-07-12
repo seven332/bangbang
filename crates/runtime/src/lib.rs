@@ -376,6 +376,7 @@ pub enum VmmActionError {
     InstanceStart(BackendError),
     Lifecycle(BackendError),
     BootSourceConfig(boot::BootSourceConfigError),
+    CpuConfig(cpu::CpuConfigError),
     DriveConfig(block::DriveConfigError),
     DriveUpdate(block::DriveUpdateError),
     DriveUpdateUnsupported,
@@ -430,6 +431,7 @@ impl fmt::Display for VmmActionError {
             Self::InstanceStart(err) => write!(f, "failed to start microVM: {err}"),
             Self::Lifecycle(err) => write!(f, "failed to update microVM lifecycle: {err}"),
             Self::BootSourceConfig(err) => write!(f, "{err}"),
+            Self::CpuConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
             Self::DriveUpdate(err) => write!(f, "{err}"),
             Self::DriveUpdateUnsupported => f.write_str("Drive updates are not supported."),
@@ -469,6 +471,7 @@ impl std::error::Error for VmmActionError {
             Self::InstanceStart(err) => Some(err),
             Self::Lifecycle(err) => Some(err),
             Self::BootSourceConfig(err) => Some(err),
+            Self::CpuConfig(err) => Some(err),
             Self::BalloonConfig(err) => Some(err),
             Self::BalloonStats(err) => Some(err),
             Self::BalloonHintingCommand(err) => Some(err),
@@ -1390,8 +1393,10 @@ impl VmmController {
                     });
                 }
 
-                if config.custom_template_configured() {
-                    return Err(VmmActionError::UnsupportedAction(action_name));
+                if let Some(category) = config.category() {
+                    return Err(VmmActionError::CpuConfig(
+                        cpu::CpuConfigError::unsupported_on_hvf(category),
+                    ));
                 }
 
                 Ok(VmmData::Empty)
@@ -1689,7 +1694,7 @@ mod tests {
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
-        cpu::CpuConfigInput,
+        cpu::{CpuConfigError, CpuConfigInput, CpuConfigTemplateCategory},
         entropy::{
             EntropyConfig, EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
         },
@@ -3953,37 +3958,58 @@ mod tests {
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
             .expect("boot source config should be stored");
 
-        let action = VmmAction::PutCpuConfig(CpuConfigInput::with_custom_template());
-        let err = controller
-            .handle_action(action.clone())
-            .expect_err("custom CPU config should remain unsupported");
-        assert_eq!(err, VmmActionError::UnsupportedAction(action.name()));
-        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
-        assert!(controller.boot_source_config().is_some());
+        for category in [
+            CpuConfigTemplateCategory::KvmCapabilities,
+            CpuConfigTemplateCategory::VcpuFeatures,
+            CpuConfigTemplateCategory::ArmRegisterModifiers,
+            CpuConfigTemplateCategory::Mixed,
+        ] {
+            let err = controller
+                .handle_action(VmmAction::PutCpuConfig(CpuConfigInput::with_category(
+                    category,
+                )))
+                .expect_err("custom CPU config should remain unsupported");
+            assert_eq!(
+                err,
+                VmmActionError::CpuConfig(CpuConfigError::unsupported_on_hvf(category))
+            );
+            assert_eq!(
+                std::error::Error::source(&err).map(ToString::to_string),
+                Some(CpuConfigError::unsupported_on_hvf(category).to_string())
+            );
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            assert!(controller.boot_source_config().is_some());
+        }
     }
 
     #[test]
     fn put_cpu_config_rejects_running_or_paused_without_mutating() {
         for state in [InstanceState::Running, InstanceState::Paused] {
-            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
-            controller
-                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
-                .expect("boot source config should be stored");
-            controller.instance_info.state = state;
+            for input in [
+                CpuConfigInput::noop(),
+                CpuConfigInput::with_category(CpuConfigTemplateCategory::KvmCapabilities),
+                CpuConfigInput::with_category(CpuConfigTemplateCategory::Mixed),
+            ] {
+                let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+                controller
+                    .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                    .expect("boot source config should be stored");
+                controller.instance_info.state = state;
 
-            let err = controller
-                .handle_action(VmmAction::PutCpuConfig(CpuConfigInput::noop()))
-                .expect_err("CPU config should reject runtime mutation");
+                let err = controller
+                    .handle_action(VmmAction::PutCpuConfig(input))
+                    .expect_err("CPU config should reject runtime mutation");
 
-            assert_eq!(
-                err,
-                VmmActionError::UnsupportedState {
-                    action: VmmAction::PutCpuConfig(CpuConfigInput::noop()).name(),
-                    state,
-                }
-            );
-            assert_eq!(controller.instance_info().state, state);
-            assert!(controller.boot_source_config().is_some());
+                assert_eq!(
+                    err,
+                    VmmActionError::UnsupportedState {
+                        action: VmmAction::PutCpuConfig(input).name(),
+                        state,
+                    }
+                );
+                assert_eq!(controller.instance_info().state, state);
+                assert!(controller.boot_source_config().is_some());
+            }
         }
     }
 

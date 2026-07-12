@@ -2034,14 +2034,18 @@ fn executable_configures_vm_before_start() {
         "GET / after empty array PUT /cpu-config",
     );
 
-    let custom_cpu_config_response =
-        http_put_json(&socket_path, "/cpu-config", r#"{"kvm_capabilities":["1"]}"#);
+    let custom_cpu_config_response = http_put_json(
+        &socket_path,
+        "/cpu-config",
+        r#"{"kvm_capabilities":["4294967295"]}"#,
+    );
     assert_bad_request_response(&custom_cpu_config_response, "PUT /cpu-config custom");
     assert_response_contains(
         &custom_cpu_config_response,
-        r#"{"fault_message":"The requested operation is not supported: PutCpuConfig"}"#,
+        r#"{"fault_message":"cpu-config kvm_capabilities are KVM-specific and are not supported on arm64 HVF"}"#,
         "PUT /cpu-config custom",
     );
+    assert!(!custom_cpu_config_response.contains("4294967295"));
     let instance_info_after_cpu_config = http_get(&socket_path, "/");
     assert_response_contains(
         &instance_info_after_cpu_config,
@@ -3436,13 +3440,13 @@ fn executable_rejects_unsupported_machine_config_options_without_mutating() {
             "PUT /machine-config cpu_template",
             "PUT",
             r#"{"vcpu_count":4,"mem_size_mib":512,"cpu_template":"V1N1"}"#,
-            r#"{"fault_message":"machine cpu_template V1N1 is not supported"}"#,
+            r#"{"fault_message":"machine cpu_template V1N1 is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"}"#,
         ),
         (
             "PATCH /machine-config cpu_template",
             "PATCH",
             r#"{"mem_size_mib":512,"cpu_template":"T2A"}"#,
-            r#"{"fault_message":"machine cpu_template T2A is not supported"}"#,
+            r#"{"fault_message":"machine cpu_template T2A is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"}"#,
         ),
         (
             "PUT /machine-config smt",
