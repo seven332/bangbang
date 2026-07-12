@@ -447,8 +447,11 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
             "CPU_ON failure completion",
             false,
         ) {
-            let _ = self.power.abandon_caller_completion(cpu_on.token());
-            return Err(error);
+            let cleanup_failed = self
+                .power
+                .abandon_caller_completion(cpu_on.token())
+                .is_err();
+            return Err(with_cleanup_evidence(error, cleanup_failed));
         }
         self.power
             .commit_caller_completion(cpu_on.token())
