@@ -399,6 +399,8 @@ pub enum VmmActionError {
     PmemUpdate(pmem::PmemUpdateError),
     PmemUnsupported,
     SerialConfig(serial::SerialConfigError),
+    SnapshotCreate(BackendError),
+    SnapshotLoad(BackendError),
     SnapshotUnsupported,
     VsockConfig(vsock::VsockConfigError),
 }
@@ -453,6 +455,8 @@ impl fmt::Display for VmmActionError {
             Self::PmemUpdate(err) => write!(f, "{err}"),
             Self::PmemUnsupported => f.write_str("Pmem device is not supported."),
             Self::SerialConfig(err) => write!(f, "{err}"),
+            Self::SnapshotCreate(err) => write!(f, "failed to create snapshot: {err}"),
+            Self::SnapshotLoad(err) => write!(f, "failed to load snapshot: {err}"),
             Self::SnapshotUnsupported => f.write_str("Snapshot and restore are not supported."),
             Self::VsockConfig(err) => write!(f, "{err}"),
         }
@@ -489,6 +493,8 @@ impl std::error::Error for VmmActionError {
             Self::PmemConfig(err) => Some(err),
             Self::PmemUpdate(err) => Some(err),
             Self::SerialConfig(err) => Some(err),
+            Self::SnapshotCreate(err) => Some(err),
+            Self::SnapshotLoad(err) => Some(err),
             Self::VsockConfig(err) => Some(err),
             Self::BalloonUnsupported
             | Self::DriveUpdateUnsupported
@@ -6781,6 +6787,28 @@ mod tests {
 
         assert_eq!(err.to_string(), "Snapshot and restore are not supported.");
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_snapshot_execution_errors() {
+        let create = VmmActionError::SnapshotCreate(BackendError::Hypervisor(
+            "native-v1 publication failed".to_owned(),
+        ));
+        let load = VmmActionError::SnapshotLoad(BackendError::InvalidState(
+            "restored session unavailable",
+        ));
+
+        assert_eq!(
+            create.to_string(),
+            "failed to create snapshot: hypervisor error: native-v1 publication failed"
+        );
+        assert_eq!(
+            load.to_string(),
+            "failed to load snapshot: invalid backend state: restored session unavailable"
+        );
+        assert!(create.source().is_some());
+        assert!(load.source().is_some());
+        assert_ne!(create, load);
     }
 
     #[test]
