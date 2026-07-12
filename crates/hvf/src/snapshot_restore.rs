@@ -227,6 +227,7 @@ pub enum HvfSnapshotV1RestoreFailure {
     Backend(BackendError),
     Gic(HvfGicError),
     GicMetadataMismatch,
+    MemoryMapping,
     Runner(Box<HvfVcpuRunnerError>),
     Scheduler(std::io::ErrorKind),
     VmGenId(Box<HvfArm64BootVmGenIdRestoreError>),
@@ -241,6 +242,7 @@ impl fmt::Display for HvfSnapshotV1RestoreFailure {
             Self::GicMetadataMismatch => {
                 f.write_str("native-v1 destination GIC metadata is incompatible")
             }
+            Self::MemoryMapping => f.write_str("native-v1 guest-memory mapping failed"),
             Self::Runner(source) => write!(f, "native-v1 runner operation failed: {source}"),
             Self::Scheduler(kind) => {
                 write!(f, "native-v1 scheduler startup failed with {kind:?}")
@@ -258,7 +260,10 @@ impl std::error::Error for HvfSnapshotV1RestoreFailure {
             Self::Gic(source) => Some(source),
             Self::Runner(source) => Some(source.as_ref()),
             Self::VmGenId(source) => Some(source.as_ref()),
-            Self::GicMetadataMismatch | Self::Scheduler(_) | Self::InvalidRuntime => None,
+            Self::GicMetadataMismatch
+            | Self::MemoryMapping
+            | Self::Scheduler(_)
+            | Self::InvalidRuntime => None,
         }
     }
 }
@@ -567,5 +572,14 @@ mod tests {
             terminal.disposition(),
             HvfSnapshotV1RestoreDisposition::Terminal
         );
+
+        let mapping = HvfSnapshotV1RestoreError::new(
+            HvfSnapshotV1RestoreStage::MapMemory,
+            HvfSnapshotV1RestoreFailure::MemoryMapping,
+            HvfSnapshotV1RestoreCleanup::new(false, None, None),
+        );
+        let diagnostics = format!("{mapping:?} {mapping}");
+        assert!(diagnostics.contains("MemoryMapping"));
+        assert!(!diagnostics.contains("0x"));
     }
 }

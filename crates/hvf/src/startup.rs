@@ -2644,10 +2644,13 @@ impl OwnedHvfArm64BootSession {
                 &mut backend,
             ));
         }
-        if let Err(source) = backend.map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM) {
+        if backend
+            .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+            .is_err()
+        {
             return Err(failed_snapshot_v1_restore(
                 HvfSnapshotV1RestoreStage::MapMemory,
-                HvfSnapshotV1RestoreFailure::Backend(BackendError::Hypervisor(source.to_string())),
+                HvfSnapshotV1RestoreFailure::MemoryMapping,
                 &mut block_retry_wakeup_scheduler,
                 &mut runner,
                 &mut backend,
