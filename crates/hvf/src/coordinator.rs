@@ -945,13 +945,13 @@ where
     fn dispatch_online(&mut self) -> Result<usize, HvfVcpuRunCoordinatorError> {
         let indexes = {
             let state = self.shared.lock_state()?;
+            if !state.pending_events.is_empty() {
+                return Ok(0);
+            }
             if !matches!(state.phase, CoordinatorPhase::Running) {
                 return Err(HvfVcpuRunCoordinatorError::InvalidState(
                     RUNNING_PHASE_REQUIRED_MESSAGE,
                 ));
-            }
-            if !state.pending_events.is_empty() {
-                return Ok(0);
             }
             state
                 .members
@@ -2365,6 +2365,8 @@ mod tests {
         assert_eq!(report.reason(), HvfVcpuRunControlReason::Pause);
         assert!(report.acknowledgements().is_empty());
         assert!(batch.calls().is_empty());
+        assert_eq!(coordinator.dispatch_online(), Ok(0));
+        assert!(members[0].pending_tokens().is_empty());
         assert_eq!(
             coordinator.receive_event(),
             Ok(HvfVcpuRunEvent::Barrier(report))
