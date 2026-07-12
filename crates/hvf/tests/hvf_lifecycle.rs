@@ -2420,6 +2420,42 @@ fn cancels_runner_before_first_run() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn owns_and_cleans_ordered_two_vcpu_topology() {
+    use bangbang_hvf::HvfBackend;
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+
+    backend.create_vm().expect("VM should be created");
+    backend
+        .create_gic()
+        .expect("GIC should be created before the vCPU topology");
+    {
+        let topology = backend
+            .start_vcpu_topology(2)
+            .expect("host should support a two-vCPU topology");
+        assert_eq!(topology.mpidrs(), [0, 1]);
+        assert_eq!(topology.len(), 2);
+
+        topology
+            .cancel()
+            .expect("every topology member should accept cancellation");
+
+        topology
+            .shutdown()
+            .expect("every topology member should shut down");
+        topology
+            .shutdown()
+            .expect("topology shutdown should be idempotent");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_arm64_physical_timer_tval_on_idle_runner_thread() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;

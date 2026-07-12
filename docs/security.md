@@ -783,6 +783,23 @@ targets with one test thread. CI may use `--allow-unsupported` only to compile
 and sign on runners that cannot execute HVF; local HVF verification should fail
 when HVF is unavailable.
 
+An internal multi-vCPU topology does not relax HVF ownership rules. Each vCPU
+is created, configured, queried, run, and destroyed only on its permanent owner
+thread. The backend requires VM then GIC creation before topology allocation,
+checks both the portable count ceiling and the host-reported maximum before the
+first owner, reserves aggregate metadata first, and writes plus reads back every
+ordered MPIDR before returning the complete topology. A partial construction is
+never published: retained owners are shut down in reverse order, the original
+failure remains primary, and indexed cleanup failures remain observable. MPIDR
+values are topology metadata, but unrelated guest registers and memory are not
+included in these diagnostics.
+
+Topology-wide cancellation currently attempts each singular runner. Asking HVF
+to exit an idle vCPU can make that vCPU's next run return immediately, so this
+primitive is suitable for teardown and the signed pre-run cancellation proof;
+it is not a reusable concurrent run epoch. Batch in-flight snapshots and pause
+barriers remain deferred to the runner-coordination work.
+
 ## Guest Data Exposure
 
 The guest is untrusted. vCPU execution, guest memory contents, virtqueue

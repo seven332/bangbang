@@ -12,6 +12,7 @@ use crate::memory::{
     HvfMemoryPermissions, HvfVirtioMemMutationExecutor, RealHvfMemoryMapper,
 };
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
+use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
 use crate::vcpu::HvfVcpu;
 
 const VM_NOT_CREATED_FOR_MEMORY_MESSAGE: &str = "VM must be created before mapping guest memory";
@@ -20,6 +21,9 @@ const GUEST_MEMORY_NOT_MAPPED_MESSAGE: &str = "guest memory is not mapped";
 const VM_NOT_CREATED_FOR_GIC_MESSAGE: &str = "VM must be created before creating a GIC";
 const GIC_ALREADY_CREATED_MESSAGE: &str = "GIC is already created";
 const VCPU_TOPOLOGY_ALREADY_STARTED_MESSAGE: &str = "GIC must be created before creating vCPUs";
+const GIC_NOT_CREATED_FOR_VCPU_TOPOLOGY_MESSAGE: &str =
+    "GIC must be created before starting a vCPU topology";
+const VCPU_TOPOLOGY_ALREADY_OWNED_MESSAGE: &str = "vCPU topology has already started";
 const PMEM_SHADOW_COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -251,6 +255,21 @@ impl HvfBackend {
         Ok(runner)
     }
 
+    /// Start an ordered set of permanent owner-thread vCPUs for this VM/GIC.
+    ///
+    /// This internal compatibility prerequisite does not activate multi-vCPU
+    /// boot. All runners remain idle until callers explicitly issue commands.
+    pub fn start_vcpu_topology(
+        &mut self,
+        vcpu_count: u8,
+    ) -> Result<HvfVcpuTopology<'_>, HvfVcpuTopologyError> {
+        self.validate_vcpu_topology_start()?;
+
+        let topology = HvfVcpuTopology::create(vcpu_count)?;
+        self.vcpu_topology_started = true;
+        Ok(topology)
+    }
+
     fn validate_vcpu_runner_start(&self) -> Result<(), HvfVcpuRunnerError> {
         if !Self::is_supported_target() {
             return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
@@ -261,6 +280,28 @@ impl HvfBackend {
                 "VM must be created before starting a vCPU runner",
             )
             .into());
+        }
+
+        Ok(())
+    }
+
+    fn validate_vcpu_topology_start(&self) -> Result<(), HvfVcpuTopologyError> {
+        if !Self::is_supported_target() {
+            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        }
+        if !self.vm_created {
+            return Err(BackendError::InvalidState(
+                "VM must be created before starting a vCPU topology",
+            )
+            .into());
+        }
+        if self.gic.is_none() {
+            return Err(
+                BackendError::InvalidState(GIC_NOT_CREATED_FOR_VCPU_TOPOLOGY_MESSAGE).into(),
+            );
+        }
+        if self.vcpu_topology_started {
+            return Err(BackendError::InvalidState(VCPU_TOPOLOGY_ALREADY_OWNED_MESSAGE).into());
         }
 
         Ok(())
@@ -749,6 +790,94 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn start_vcpu_topology_before_vm_reports_state_or_target_error() {
+        let mut backend = HvfBackend::new();
+        let err = backend
+            .start_vcpu_topology(2)
+            .expect_err("starting a topology before VM creation should fail");
+
+        if HvfBackend::is_supported_target() {
+            assert_eq!(
+                err,
+                crate::topology::HvfVcpuTopologyError::Backend(BackendError::InvalidState(
+                    "VM must be created before starting a vCPU topology"
+                ))
+            );
+        } else {
+            assert_eq!(
+                err,
+                crate::topology::HvfVcpuTopologyError::Backend(BackendError::Unsupported(
+                    crate::ffi::UNSUPPORTED_TARGET_MESSAGE
+                ))
+            );
+        }
+        assert!(!backend.vcpu_topology_started);
+    }
+
+    #[test]
+    fn start_vcpu_topology_requires_gic_before_count_validation() {
+        if !HvfBackend::is_supported_target() {
+            return;
+        }
+
+        let mut backend = HvfBackend::new();
+        backend.vm_created = true;
+
+        assert_eq!(
+            backend
+                .start_vcpu_topology(0)
+                .expect_err("missing GIC should fail first"),
+            crate::topology::HvfVcpuTopologyError::Backend(BackendError::InvalidState(
+                super::GIC_NOT_CREATED_FOR_VCPU_TOPOLOGY_MESSAGE
+            ))
+        );
+        assert!(!backend.vcpu_topology_started);
+    }
+
+    #[test]
+    fn failed_topology_validation_does_not_publish_backend_state() {
+        if !HvfBackend::is_supported_target() {
+            return;
+        }
+
+        let mut backend = HvfBackend::new();
+        backend.vm_created = true;
+        backend.gic = Some(gic_metadata());
+
+        assert_eq!(
+            backend
+                .start_vcpu_topology(0)
+                .expect_err("zero topology should fail"),
+            crate::topology::HvfVcpuTopologyError::InvalidVcpuCount {
+                requested: 0,
+                max: 32,
+            }
+        );
+        assert!(!backend.vcpu_topology_started);
+    }
+
+    #[test]
+    fn duplicate_topology_start_is_rejected_before_count_validation() {
+        if !HvfBackend::is_supported_target() {
+            return;
+        }
+
+        let mut backend = HvfBackend::new();
+        backend.vm_created = true;
+        backend.gic = Some(gic_metadata());
+        backend.vcpu_topology_started = true;
+
+        assert_eq!(
+            backend
+                .start_vcpu_topology(0)
+                .expect_err("duplicate topology should fail first"),
+            crate::topology::HvfVcpuTopologyError::Backend(BackendError::InvalidState(
+                super::VCPU_TOPOLOGY_ALREADY_OWNED_MESSAGE
+            ))
+        );
     }
 
     #[test]

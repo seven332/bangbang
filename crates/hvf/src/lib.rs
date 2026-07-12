@@ -13,6 +13,7 @@ mod snapshot;
 mod snapshot_bundle;
 mod snapshot_restore;
 mod startup;
+mod topology;
 mod vcpu;
 mod vcpu_config;
 
@@ -35,8 +36,8 @@ pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
 pub use runner::{
     HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1CaptureStage,
     HvfArm64SnapshotV1CompatibilityError, HvfArm64SnapshotV1Restore,
-    HvfArm64SnapshotV1RestoreStage, HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner,
-    HvfVcpuRunnerError,
+    HvfArm64SnapshotV1RestoreStage, HvfVcpuMpidrAffinityStage, HvfVcpuRunCancelHandle,
+    HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 pub use sme::HvfArm64SmeConfiguration;
 pub use snapshot::{
@@ -72,6 +73,10 @@ pub use startup::{
     HvfArm64BootVmGenIdRestoreError, HvfArm64BootVsockNotificationDispatch,
     HvfArm64BootVsockNotificationDispatchError, HvfArm64BootVsockNotificationDispatches,
     OwnedHvfArm64BootSession, RestoredHvfArm64BootSession,
+};
+pub use topology::{
+    HvfVcpuTopology, HvfVcpuTopologyAllocation, HvfVcpuTopologyCreateStage, HvfVcpuTopologyError,
+    HvfVcpuTopologyMemberFailure, HvfVcpuTopologyOperation,
 };
 pub use vcpu::{
     ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,

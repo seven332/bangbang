@@ -94,6 +94,12 @@ const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
     "vCPU runner boot registers are already configured";
 const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
 const METADATA_READ_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has metadata read in flight";
+const MPIDR_ALREADY_CONFIGURED_MESSAGE: &str = "vCPU runner MPIDR affinity is already configured";
+const MPIDR_CONFIGURATION_FAILED_MESSAGE: &str =
+    "vCPU runner MPIDR affinity configuration failed and runner must be discarded";
+const MPIDR_NOT_CONFIGURED_MESSAGE: &str = "vCPU runner MPIDR affinity is not configured";
+const MPIDR_CONFIGURATION_AFTER_RUN_MESSAGE: &str =
+    "vCPU runner MPIDR affinity cannot be configured after execution starts";
 const CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has core register operation in flight";
 const TIMER_OPERATION_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has timer operation in flight";
@@ -138,6 +144,16 @@ pub enum HvfVcpuRunnerError {
     },
     VcpuExitResolve(HvfVcpuExitResolveError),
     MmioDispatch(HvfMmioDispatchError),
+    MpidrAffinity {
+        stage: HvfVcpuMpidrAffinityStage,
+        expected: u64,
+        actual: Option<u64>,
+        source: Option<BackendError>,
+    },
+    MpidrAffinityCleanup {
+        source: Box<HvfVcpuRunnerError>,
+        cleanup: Box<HvfVcpuRunnerError>,
+    },
     UnsupportedSys64 {
         exit: HvfSys64Exit,
     },
@@ -145,6 +161,24 @@ pub enum HvfVcpuRunnerError {
     ThreadSpawn(String),
     ChannelClosed(&'static str),
     ThreadPanicked,
+}
+
+/// Owner-thread stage that failed while assigning one vCPU's MPIDR affinity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfVcpuMpidrAffinityStage {
+    Write,
+    Read,
+    Verify,
+}
+
+impl fmt::Display for HvfVcpuMpidrAffinityStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Write => f.write_str("write"),
+            Self::Read => f.write_str("readback"),
+            Self::Verify => f.write_str("verification"),
+        }
+    }
 }
 
 /// Value-free reason why a fresh destination is incompatible with native-v1.
@@ -451,6 +485,28 @@ impl fmt::Display for HvfVcpuRunnerError {
             }
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
             Self::MmioDispatch(err) => write!(f, "{err}"),
+            Self::MpidrAffinity {
+                stage,
+                expected,
+                actual,
+                source,
+            } => {
+                write!(
+                    f,
+                    "vCPU MPIDR affinity {stage} failed for expected 0x{expected:x}"
+                )?;
+                if let Some(actual) = actual {
+                    write!(f, ": read back 0x{actual:x}")?;
+                }
+                if let Some(source) = source {
+                    write!(f, ": {source}")?;
+                }
+                Ok(())
+            }
+            Self::MpidrAffinityCleanup { source, cleanup } => write!(
+                f,
+                "vCPU MPIDR affinity setup failed: {source}; runner cleanup also failed: {cleanup}"
+            ),
             Self::UnsupportedSys64 { exit } => write!(
                 f,
                 "unsupported HVF SYS64 {:?} access to {} using Rt {}",
@@ -491,7 +547,12 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::SnapshotRestore { source, .. } => Some(source.as_ref()),
             Self::VcpuExitResolve(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
+            Self::MpidrAffinity {
+                source: Some(err), ..
+            } => Some(err),
+            Self::MpidrAffinityCleanup { source, .. } => Some(source.as_ref()),
             Self::InvalidState(_)
+            | Self::MpidrAffinity { source: None, .. }
             | Self::UnsupportedSys64 { .. }
             | Self::ThreadSpawn(_)
             | Self::ChannelClosed(_)
@@ -639,6 +700,8 @@ impl fmt::Debug for HvfVcpuRunCancelHandle {
 struct RunnerHandleState {
     thread: Option<JoinHandle<()>>,
     shutting_down: bool,
+    mpidr_configured: bool,
+    mpidr_configuration_failed: bool,
     in_flight_runs: usize,
     mmio_dispatch_in_flight: bool,
     boot_register_setup_in_flight: bool,
@@ -652,6 +715,10 @@ struct RunnerHandleState {
 }
 
 enum RunnerCommand {
+    ConfigureMpidrEl1 {
+        expected: u64,
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    },
     ConfigureArm64BootRegisters {
         registers: HvfArm64BootRegisters,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
@@ -1923,6 +1990,38 @@ fn restore_stage<T>(
     })
 }
 
+fn configure_mpidr_el1_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    expected: u64,
+) -> Result<u64, HvfVcpuRunnerError> {
+    vcpu.write_system_register(HvfSystemRegister::MPIDR_EL1, expected)
+        .map_err(|source| HvfVcpuRunnerError::MpidrAffinity {
+            stage: HvfVcpuMpidrAffinityStage::Write,
+            expected,
+            actual: None,
+            source: Some(source),
+        })?;
+    let actual = vcpu
+        .mpidr_el1()
+        .map_err(|source| HvfVcpuRunnerError::MpidrAffinity {
+            stage: HvfVcpuMpidrAffinityStage::Read,
+            expected,
+            actual: None,
+            source: Some(source),
+        })?;
+
+    if actual != expected {
+        return Err(HvfVcpuRunnerError::MpidrAffinity {
+            stage: HvfVcpuMpidrAffinityStage::Verify,
+            expected,
+            actual: Some(actual),
+            source: None,
+        });
+    }
+
+    Ok(actual)
+}
+
 struct RealRunnerVcpu {
     owner: HvfVcpuOwner,
     gic_ppi_pending_writer: Option<HvfGicPpiPendingWriter>,
@@ -1934,11 +2033,7 @@ struct RealRunnerVcpu {
 
 impl RealRunnerVcpu {
     fn create() -> Result<Self, BackendError> {
-        let mut owner = HvfVcpuOwner::new()?;
-        // Hypervisor.framework GIC redistributor access requires vCPU
-        // affinity before the topology is finalized. The current runner owns a
-        // single primary vCPU, so affinity 0 is the deterministic topology.
-        owner.set_system_register(HvfSystemRegister::MPIDR_EL1, 0)?;
+        let owner = HvfVcpuOwner::new()?;
 
         Ok(Self {
             owner,
@@ -2222,10 +2317,48 @@ impl RunnerVcpu for RealRunnerVcpu {
 
 impl<'vm> HvfVcpuRunner<'vm> {
     pub(crate) fn new() -> Result<Self, HvfVcpuRunnerError> {
-        Self::from_started(
+        Self::new_with_mpidr(0)
+    }
+
+    pub(crate) fn new_with_mpidr(expected: u64) -> Result<Self, HvfVcpuRunnerError> {
+        let runner = Self::new_unconfigured()?;
+        match runner.configure_mpidr_el1(expected) {
+            Ok(_) => Ok(runner),
+            Err(source) => match runner.shutdown() {
+                Ok(()) => Err(source),
+                Err(cleanup) => Err(HvfVcpuRunnerError::MpidrAffinityCleanup {
+                    source: Box::new(source),
+                    cleanup: Box::new(cleanup),
+                }),
+            },
+        }
+    }
+
+    pub(crate) fn new_unconfigured() -> Result<Self, HvfVcpuRunnerError> {
+        Self::from_started_with_mpidr_state(
             spawn_runner_thread(RealRunnerVcpu::create)?,
             real_cancel_vcpu(),
+            false,
         )
+    }
+
+    pub(crate) fn configure_mpidr_el1(&self, expected: u64) -> Result<u64, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_read = self.start_mpidr_el1_configuration(expected, response_sender)?;
+        let result = response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))
+            .and_then(|result| result);
+
+        let mut state = self.lock_state()?;
+        if result.is_ok() {
+            state.mpidr_configured = true;
+        } else {
+            state.mpidr_configuration_failed = true;
+        }
+        drop(state);
+
+        result
     }
 
     /// Verify that snapshot restore work may still mutate this unrun vCPU.
@@ -2330,6 +2463,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 | HvfVcpuRunnerError::UnsupportedSys64 { .. }
                 | HvfVcpuRunnerError::VcpuExitResolve(_)
                 | HvfVcpuRunnerError::MmioDispatch(_)
+                | HvfVcpuRunnerError::MpidrAffinity { .. }
+                | HvfVcpuRunnerError::MpidrAffinityCleanup { .. }
                 | HvfVcpuRunnerError::ThreadSpawn(_)
                 | HvfVcpuRunnerError::ChannelClosed(_)
                 | HvfVcpuRunnerError::ThreadPanicked,
@@ -3389,9 +3524,18 @@ impl<'vm> HvfVcpuRunner<'vm> {
         shutdown_result(response_result, join_result)
     }
 
+    #[cfg(test)]
     fn from_started(
         started: StartedRunner,
         cancel_vcpu: CancelVcpu,
+    ) -> Result<Self, HvfVcpuRunnerError> {
+        Self::from_started_with_mpidr_state(started, cancel_vcpu, true)
+    }
+
+    fn from_started_with_mpidr_state(
+        started: StartedRunner,
+        cancel_vcpu: CancelVcpu,
+        mpidr_configured: bool,
     ) -> Result<Self, HvfVcpuRunnerError> {
         Ok(Self {
             command_sender: started.command_sender,
@@ -3400,6 +3544,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
             state: Arc::new(Mutex::new(RunnerHandleState {
                 thread: Some(started.thread),
                 shutting_down: false,
+                mpidr_configured,
+                mpidr_configuration_failed: false,
                 in_flight_runs: 0,
                 mmio_dispatch_in_flight: false,
                 boot_register_setup_in_flight: false,
@@ -3499,6 +3645,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
         }
+        if !state.mpidr_configured {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MPIDR_NOT_CONFIGURED_MESSAGE,
+            ));
+        }
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -3563,6 +3714,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if !state.mpidr_configured {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MPIDR_NOT_CONFIGURED_MESSAGE,
+            ));
         }
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
@@ -3697,6 +3853,87 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
 
         Ok(InFlightMmioDispatch::new(&self.state))
+    }
+
+    fn start_mpidr_el1_configuration(
+        &self,
+        expected: u64,
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightMetadataRead, HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if state.mpidr_configured {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MPIDR_ALREADY_CONFIGURED_MESSAGE,
+            ));
+        }
+        if state.mpidr_configuration_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MPIDR_CONFIGURATION_FAILED_MESSAGE,
+            ));
+        }
+        if state.run_started {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MPIDR_CONFIGURATION_AFTER_RUN_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.core_register_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.timer_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                TIMER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.interrupt_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+
+        state.metadata_read_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::ConfigureMpidrEl1 {
+                expected,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.metadata_read_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightMetadataRead::new(&self.state))
     }
 
     fn start_mpidr_el1_read(
@@ -5437,6 +5674,13 @@ fn run_runner_thread<C, V>(
 
     while let Ok(command) = command_receiver.recv() {
         match command {
+            RunnerCommand::ConfigureMpidrEl1 {
+                expected,
+                response_sender,
+            } => {
+                let result = configure_mpidr_el1_on_runner_thread(&mut vcpu, expected);
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::ConfigureArm64BootRegisters {
                 registers,
                 response_sender,
@@ -6336,8 +6580,8 @@ mod tests {
 
     use super::{
         CancelVcpu, HvfArm64SnapshotV1CaptureStage, HvfArm64SnapshotV1Restore,
-        HvfArm64SnapshotV1RestoreStage, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
-        RunnerVcpu, spawn_runner_thread,
+        HvfArm64SnapshotV1RestoreStage, HvfVcpuMpidrAffinityStage, HvfVcpuRunStepOutcome,
+        HvfVcpuRunner, HvfVcpuRunnerError, RunnerVcpu, spawn_runner_thread,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -6884,6 +7128,9 @@ mod tests {
     struct MpidrRecordingVcpu {
         mpidr: u64,
         fail_next_read: bool,
+        fail_next_write: bool,
+        ignore_write: bool,
+        write_sender: Option<mpsc::Sender<(HvfSystemRegister, u64)>>,
     }
 
     struct BlockingMpidrVcpu {
@@ -8251,6 +8498,26 @@ mod tests {
             _dispatcher: &mut MmioDispatcher,
         ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
             unsupported_mmio_dispatch()
+        }
+
+        fn write_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            if let Some(write_sender) = &self.write_sender {
+                write_sender
+                    .send((register, value))
+                    .map_err(|_| BackendError::InvalidState("fake MPIDR write receiver closed"))?;
+            }
+            if self.fail_next_write {
+                self.fail_next_write = false;
+                return Err(BackendError::InvalidState("fake MPIDR write failed"));
+            }
+            if !self.ignore_write {
+                self.mpidr = value;
+            }
+            Ok(())
         }
 
         fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
@@ -16047,12 +16314,43 @@ mod tests {
             Ok(MpidrRecordingVcpu {
                 mpidr,
                 fail_next_read,
+                fail_next_write: false,
+                ignore_write: false,
+                write_sender: None,
             })
         })
         .expect("fake runner should start");
 
         HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
             .expect("runner should be created")
+    }
+
+    fn start_unconfigured_mpidr_runner(
+        mpidr: u64,
+        fail_next_read: bool,
+        fail_next_write: bool,
+        ignore_write: bool,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<(HvfSystemRegister, u64)>,
+    ) {
+        let (write_sender, write_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(MpidrRecordingVcpu {
+                mpidr,
+                fail_next_read,
+                fail_next_write,
+                ignore_write,
+                write_sender: Some(write_sender),
+            })
+        })
+        .expect("fake unconfigured runner should start");
+
+        (
+            HvfVcpuRunner::from_started_with_mpidr_state(started, Arc::new(|_| Ok(())), false)
+                .expect("fake unconfigured runner should initialize"),
+            write_receiver,
+        )
     }
 
     fn start_blocking_mpidr_runner() -> (
@@ -26690,6 +26988,115 @@ mod tests {
         destroyed_receiver
             .recv()
             .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn configures_and_verifies_mpidr_on_runner_thread_once() {
+        let (runner, write_receiver) = start_unconfigured_mpidr_runner(9, false, false, false);
+
+        assert_eq!(runner.configure_mpidr_el1(3), Ok(3));
+        assert_eq!(
+            write_receiver
+                .recv()
+                .expect("MPIDR write should be recorded"),
+            (HvfSystemRegister::MPIDR_EL1, 3)
+        );
+        assert_eq!(
+            runner.configure_mpidr_el1(4),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::MPIDR_ALREADY_CONFIGURED_MESSAGE
+            ))
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn mpidr_write_failure_is_typed_and_runner_becomes_fail_closed() {
+        let (runner, write_receiver) = start_unconfigured_mpidr_runner(9, false, true, false);
+
+        assert_eq!(
+            runner.configure_mpidr_el1(3),
+            Err(HvfVcpuRunnerError::MpidrAffinity {
+                stage: HvfVcpuMpidrAffinityStage::Write,
+                expected: 3,
+                actual: None,
+                source: Some(BackendError::InvalidState("fake MPIDR write failed")),
+            })
+        );
+        assert_eq!(
+            write_receiver
+                .recv()
+                .expect("failed MPIDR write should be recorded"),
+            (HvfSystemRegister::MPIDR_EL1, 3)
+        );
+        assert_eq!(
+            runner.configure_mpidr_el1(3),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::MPIDR_CONFIGURATION_FAILED_MESSAGE
+            ))
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn mpidr_readback_failure_and_mismatch_are_typed() {
+        let (read_failure_runner, _read_write_receiver) =
+            start_unconfigured_mpidr_runner(9, true, false, false);
+        assert_eq!(
+            read_failure_runner.configure_mpidr_el1(3),
+            Err(HvfVcpuRunnerError::MpidrAffinity {
+                stage: HvfVcpuMpidrAffinityStage::Read,
+                expected: 3,
+                actual: None,
+                source: Some(BackendError::InvalidState("fake MPIDR read failed")),
+            })
+        );
+        read_failure_runner
+            .shutdown()
+            .expect("read-failure runner should shut down");
+
+        let (mismatch_runner, _mismatch_write_receiver) =
+            start_unconfigured_mpidr_runner(9, false, false, true);
+        assert_eq!(
+            mismatch_runner.configure_mpidr_el1(3),
+            Err(HvfVcpuRunnerError::MpidrAffinity {
+                stage: HvfVcpuMpidrAffinityStage::Verify,
+                expected: 3,
+                actual: Some(9),
+                source: None,
+            })
+        );
+        mismatch_runner
+            .shutdown()
+            .expect("mismatch runner should shut down");
+    }
+
+    #[test]
+    fn mpidr_configuration_after_run_is_rejected_without_write() {
+        let (runner, write_receiver) = start_unconfigured_mpidr_runner(9, false, false, false);
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::MPIDR_NOT_CONFIGURED_MESSAGE
+            ))
+        );
+        runner
+            .state
+            .lock()
+            .expect("runner state should lock")
+            .run_started = true;
+        assert_eq!(
+            runner.configure_mpidr_el1(3),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::MPIDR_CONFIGURATION_AFTER_RUN_MESSAGE
+            ))
+        );
+        assert!(write_receiver.try_recv().is_err());
+
+        runner.shutdown().expect("runner should shut down");
     }
 
     #[test]
