@@ -262,6 +262,14 @@ pub enum HvfVcpuRunCoordinatorError {
         source: Box<HvfVcpuRunnerError>,
         acknowledgements: Vec<HvfVcpuRunMemberResult>,
     },
+    /// Prefix cancellation also failed after a bounded-run submission failure.
+    SubmissionCleanup {
+        index: usize,
+        mpidr: u64,
+        source: Box<HvfVcpuRunnerError>,
+        cleanup: Box<HvfVcpuRunnerError>,
+        acknowledgements: Vec<HvfVcpuRunMemberResult>,
+    },
     /// One batch cancellation failed before quiescence was proven.
     BatchCancel {
         reason: Option<HvfVcpuRunControlReason>,
@@ -325,6 +333,17 @@ impl fmt::Display for HvfVcpuRunCoordinatorError {
                 "failed to submit vCPU topology member {index} (MPIDR 0x{mpidr:x}); drained {} earlier runs: {source}",
                 acknowledgements.len()
             ),
+            Self::SubmissionCleanup {
+                index,
+                mpidr,
+                source,
+                cleanup,
+                acknowledgements,
+            } => write!(
+                f,
+                "failed to submit vCPU topology member {index} (MPIDR 0x{mpidr:x}); prefix cancellation also failed after {} acknowledgements: {source}; cleanup: {cleanup}",
+                acknowledgements.len()
+            ),
             Self::BatchCancel {
                 reason,
                 source,
@@ -379,6 +398,7 @@ impl std::error::Error for HvfVcpuRunCoordinatorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Submission { source, .. }
+            | Self::SubmissionCleanup { source, .. }
             | Self::BatchCancel { source, .. }
             | Self::MemberOperation { source, .. } => Some(source.as_ref()),
             Self::Shutdown(source) => Some(source.as_ref()),
@@ -1201,16 +1221,18 @@ fn begin_submission_drain(
         .map(|token| token.member_index())
         .collect::<Vec<_>>();
     state.phase = CoordinatorPhase::Draining(Box::new(DrainState {
-        reason: DrainReason::Submission(submission),
+        reason: DrainReason::Submission(submission.clone()),
         remaining: snapshot,
         acknowledgements: Vec::new(),
         waiters: Vec::new(),
     }));
-    if let Err(source) = (shared.batch_cancel)(&indexes) {
+    if let Err(cleanup) = (shared.batch_cancel)(&indexes) {
         state.phase = CoordinatorPhase::Failed;
-        return Ok(Some(HvfVcpuRunCoordinatorError::BatchCancel {
-            reason: None,
-            source: Box::new(source),
+        return Ok(Some(HvfVcpuRunCoordinatorError::SubmissionCleanup {
+            index: submission.index,
+            mpidr: submission.mpidr,
+            source: Box::new(submission.source),
+            cleanup: Box::new(cleanup),
             acknowledgements: Vec::new(),
         }));
     }
@@ -2254,6 +2276,42 @@ mod tests {
             &[vec![0]]
         );
         assert!(members[2].submissions().is_empty());
+    }
+
+    #[test]
+    fn partial_submission_cleanup_failure_preserves_both_errors() {
+        let members = fake_members(2);
+        members[1].queue_submit_error();
+        let batch = BatchHarness::default();
+        batch.fail_next();
+        let mut coordinator =
+            coordinator(&members, &[0, 1], batch.callback()).expect("coordinator should build");
+
+        let error = coordinator
+            .dispatch_online()
+            .expect_err("submission and prefix cancellation should fail");
+        let HvfVcpuRunCoordinatorError::SubmissionCleanup {
+            index,
+            mpidr,
+            source,
+            cleanup,
+            acknowledgements,
+        } = error
+        else {
+            panic!("expected combined submission cleanup failure");
+        };
+        assert_eq!(index, 1);
+        assert_eq!(mpidr, 0x8000_0001);
+        assert_eq!(
+            source.as_ref(),
+            &HvfVcpuRunnerError::InvalidState(TEST_ERROR_MESSAGE)
+        );
+        assert_eq!(
+            cleanup.as_ref(),
+            &HvfVcpuRunnerError::InvalidState(TEST_ERROR_MESSAGE)
+        );
+        assert!(acknowledgements.is_empty());
+        assert_eq!(batch.calls(), vec![vec![0]]);
     }
 
     #[test]
