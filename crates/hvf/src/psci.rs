@@ -154,6 +154,14 @@ const fn supports_legacy_function(function_id: u64) -> bool {
     )
 }
 
+const fn supports_coordinated_function(function_id: u64) -> bool {
+    supports_legacy_function(function_id)
+        || matches!(
+            function_id,
+            PSCI_CPU_ON_32 | PSCI_CPU_ON_64 | PSCI_AFFINITY_INFO_32 | PSCI_AFFINITY_INFO_64
+        )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PsciCallingConvention {
     Smc32,
@@ -284,6 +292,15 @@ pub(crate) enum PsciCoordinatedDispatch {
 }
 
 pub(crate) const fn handle_coordinated_call(call: PsciCall) -> PsciCoordinatedDispatch {
+    if call.function_id == PSCI_FEATURES {
+        let status = if supports_coordinated_function(call.arg0) {
+            PsciStatus::Success
+        } else {
+            PsciStatus::NotSupported
+        };
+        return PsciCoordinatedDispatch::Immediate(PsciCallResult::returned(status.return_value()));
+    }
+
     let convention = match call.function_id {
         PSCI_CPU_ON_32 | PSCI_AFFINITY_INFO_32 => Some(PsciCallingConvention::Smc32),
         PSCI_CPU_ON_64 | PSCI_AFFINITY_INFO_64 => Some(PsciCallingConvention::Smc64),
@@ -813,6 +830,33 @@ mod tests {
                 PsciStatus::NotSupported.return_value()
             );
         }
+    }
+
+    #[test]
+    fn coordinated_features_advertise_cpu_on_and_affinity_info_only() {
+        for function_id in [
+            PSCI_CPU_ON_32,
+            PSCI_CPU_ON_64,
+            PSCI_AFFINITY_INFO_32,
+            PSCI_AFFINITY_INFO_64,
+        ] {
+            let PsciCoordinatedDispatch::Immediate(result) =
+                handle_coordinated_call(PsciCall::new(PSCI_FEATURES, function_id))
+            else {
+                panic!("PSCI_FEATURES should complete immediately");
+            };
+            assert_eq!(result.return_value(), PsciStatus::Success.return_value());
+        }
+
+        let PsciCoordinatedDispatch::Immediate(result) =
+            handle_coordinated_call(PsciCall::new(PSCI_FEATURES, PSCI_CPU_OFF))
+        else {
+            panic!("unsupported PSCI_FEATURES should complete immediately");
+        };
+        assert_eq!(
+            result.return_value(),
+            PsciStatus::NotSupported.return_value()
+        );
     }
 
     #[test]

@@ -32291,6 +32291,40 @@ mod tests {
     }
 
     #[test]
+    fn coordinated_features_advertise_cpu_on_without_deferred_work() {
+        let (runner, register_read_receiver, register_write_receiver) =
+            start_coordinated_psci_run_step_recording_runner(
+                PSCI_FEATURES,
+                [PSCI_CPU_ON, 0, 0],
+                0,
+                false,
+            );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio_coordinated(shared_dispatcher()),
+            Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                HvfVcpuRunStepOutcome::Hvc {
+                    exit: hvc_exit(0),
+                    function_id: PSCI_FEATURES,
+                    return_value: PSCI_RET_SUCCESS,
+                }
+            ))
+        );
+        assert_eq!(
+            register_read_receiver.try_iter().collect::<Vec<_>>(),
+            vec![HvfRegister::X0, HvfRegister::X1]
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("PSCI_FEATURES should write X0"),
+            (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
     fn deferred_psci_completion_retries_x0_write_without_repeating_run() {
         let (runner, _, register_write_receiver) = start_coordinated_psci_run_step_recording_runner(
             PSCI_CPU_ON,
