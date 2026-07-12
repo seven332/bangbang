@@ -1390,13 +1390,15 @@ descriptors. The optional RTC node uses Firecracker's aarch64 PL031 shape with
 minimal RTC device does not implement alarm interrupts. PCI and other device
 nodes remain deferred until the corresponding emulation paths exist.
 Because the FDT advertises PSCI with `method = "hvc"`, the HVF backend decodes
-arm64 HVC exception exits and handles `HVC #0` as a minimal PSCI 0.2 responder
-for early single-vCPU boot probing. The responder returns `PSCI_VERSION`,
-reports feature support only for the implemented minimal calls, returns
+arm64 HVC exception exits and handles `HVC #0` through its PSCI 0.2 responder.
+The aggregate boot-session path coordinates `CPU_ON32/64` and
+`AFFINITY_INFO32/64` against the ordered topology; the immediate responder
+returns `PSCI_VERSION`, reports feature support for implemented calls, returns
 `MIGRATE_INFO_TYPE` as the PSCI value for a trusted OS that is MP-capable or
 not present, where migration is not required, and translates `SYSTEM_OFF` and
 `SYSTEM_RESET` into guest-requested terminal boot run-loop outcomes. It writes
-`NOT_SUPPORTED` to X0 for other PSCI calls or HVC immediates.
+`NOT_SUPPORTED` to X0 for `CPU_OFF`, other unsupported PSCI calls, or HVC
+immediates.
 Early boot also traps the guest's `OSDLR_EL1` and `OSLAR_EL1` OS lock
 system-register accesses through the AArch64 SYS64 exception class (`0x18`),
 not through SMC/SMCCC. The HVF runner handles only those observed
@@ -1700,19 +1702,21 @@ idle vCPU stays on a permanent owner thread, writes and reads back its MPIDR
 there before publication, and participates in topology-wide cancellation and
 reverse-order shutdown. Construction returns no successful prefix; a later
 owner or affinity failure shuts down every retained owner and preserves both
-the primary failure and indexed cleanup failures. This primitive is not wired
-to FDT, PSCI, the boot session, or public `InstanceStart`, so the documented
-public startup limit remains exactly one vCPU and native-v1 remains one-vCPU.
+the primary failure and indexed cleanup failures. Internal boot sessions now
+consume this topology: the complete MPIDR list drives FDT CPU nodes, PSCI
+targets, indexed runs, and per-vCPU PPI routing. Public `InstanceStart` still
+rejects counts other than one before host-resource work, and native-v1 remains
+one-vCPU.
 
 This still is not public guest startup. bangbang can now write an internal FDT
-payload, create an internal single-vCPU HVF arm64 boot session, read the primary
-runner-owned vCPU `MPIDR_EL1` for boot metadata, allocate deterministic block
-and optional serial SPI interrupt lines, map the assembled guest memory into
-HVF, and configure a single primary HVF vCPU with the arm64 Linux boot register
-state: PC points at the loaded kernel entry, X0 points at the FDT guest address,
-X1-X3 are zero, and CPSR/PSTATE is `0x3c5`. The runner path sets deterministic
-single-vCPU `MPIDR_EL1` affinity before redistributor access, performs metadata
-reads and boot-register setup on the vCPU-owning thread, rejects duplicate setup,
+payload, create an internal size-one-or-many HVF arm64 boot session, retain all
+runner-owned `MPIDR_EL1` values as ordered boot metadata, allocate deterministic
+block and optional serial SPI interrupt lines, and map the assembled guest
+memory into HVF. Only the primary initially receives the arm64 Linux boot
+register state: PC points at the loaded kernel entry, X0 points at the FDT guest
+address, X1-X3 are zero, and CPSR/PSTATE is `0x3c5`. Each runner path sets and
+verifies its ordered `MPIDR_EL1` affinity before redistributor access; primary
+boot-register setup remains owner-thread-only and rejects duplicate setup,
 setup during shutdown, setup while a run is in flight, and setup after a run has
 started. If setup fails after partially writing registers, the runner rejects
 guest runs until setup is retried successfully. The runner also exposes explicit
@@ -2139,18 +2143,18 @@ matching never-run window. Public snapshot orchestration uses those aggregate
 commands rather than the standalone operations. `ICC_SRE_EL2`, ICH/ICV,
 cross-host policy, and multi-vCPU association remain future work.
 
-By themselves, these commands do not yet form a continuous guest run loop. The
-boot session can run one vCPU step through the runner with its per-session shared
-MMIO dispatcher, so a
-resulting MMIO exit is handled on the vCPU-owning thread without global state.
-The boot session can also expose a cloneable cancellation-only handle for an
-in-flight run step without exposing the full runner. Public `InstanceStart`
+The boot session submits bounded steps to every online idle vCPU through its
+owning coordinator and one shared MMIO dispatcher, so each resulting MMIO exit
+is handled on the corresponding owner thread without duplicating device state.
+A primary-only cancellation handle remains for the explicit size-one
+compatibility step, while aggregate execution exposes topology-wide wakeup and
+stop control. Public `InstanceStart`
 now starts a process-owned internal boot run-loop worker across bounded step windows with retained internal worker status and an owned
 HVF boot session plus configured or default internal serial output after successful startup. A
 bounded internal
-boot-session run-loop pump now composes that one-step path with boot block,
+boot-session run-loop pump now composes indexed aggregate steps with boot block,
 virtio-net, and virtio-vsock notification dispatch between successful MMIO steps and virtual
-timer PPI assertion after virtual timer exits. It stops explicitly on a step limit,
+timer PPI assertion on the completing vCPU after virtual timer exits. It stops explicitly on a step limit,
 stop-token request, canceled run exit, PSCI `SYSTEM_OFF` or `SYSTEM_RESET`
 guest request, unknown run exit, dispatch error, or timer handler error. This
 remains internal runner-loop plumbing, not the future public guest scheduler.
@@ -2171,10 +2175,11 @@ runtime notifications and releases it before HVF GIC signaling.
 
 bangbang now wires `mem_size_mib` into startup preparation, and process-level
 tests cover the current HVF startup rejection for stored `vcpu_count` values
-above one. It still does not wire device interrupts into public guest execution,
-emulate devices, provide full public run-loop control beyond pause/resume, power on secondary vCPUs,
-implement reboot-in-place after `SYSTEM_RESET`, or implement full PSCI CPU
-control and process exit-code parity for error power actions. Public
+above one. Internal sessions can power on secondaries, but the process gate does
+not expose that capability publicly. The current scaffold still does not provide
+full public run-loop control beyond pause/resume, implement `CPU_OFF`, implement
+reboot-in-place after `SYSTEM_RESET`, or provide full process exit-code parity
+for error power actions. Public
 machine configuration rejects `mem_size_mib` above the current 1022 GiB Apple
 Silicon/aarch64 DRAM maximum before storage; startup keeps its architectural
 maximum check as a defensive guard. Dynamic host-memory availability policy
@@ -2551,19 +2556,17 @@ macOS design work instead of direct implementation:
   mask, raw offset, raw control, and raw CVAL on that owning thread and can
   capture those fields through one serialized command. It can
   also capture Hypervisor.framework's stable, versioned opaque GIC device blob
-  except CPU system registers while the current single-vCPU runner is stopped,
+  except CPU system registers while the native-v1 size-one runner is stopped,
   and reapply that complete value through a separate never-run owner command.
   A companion owner-thread command captures all ten EL1 ICC CPU-interface
   registers exposed by the current SDK as a separate per-vCPU value.
   None of these subsets is a complete or portable restore model. The
   runner explicitly dispatches one resolved MMIO access through a shared runtime
-  dispatcher on the owning thread, runs once and handles a resulting
-  MMIO exit through that dispatcher, supports one cancellable
-  `hv_vcpu_run` step at a time, exposes a cancellation-only handle for that run
-  step, and shuts down by canceling and joining the runner thread. The internal
-  boot session can compose those pieces into a bounded run-loop pump that
-  dispatches boot block and virtio-net notifications between successful MMIO
-  steps and asserts the EL1 virtual timer PPI after virtual timer exits.
+  dispatcher on its owning thread and supports one cancellable `hv_vcpu_run`
+  step at a time. The internal boot session owns the ordered runners through an
+  aggregate coordinator, dispatches online members concurrently, joins them on
+  shutdown, and composes indexed results into a bounded run-loop pump with boot
+  block and virtio-net notifications plus per-vCPU EL1 virtual-timer PPIs.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
@@ -2572,16 +2575,15 @@ macOS design work instead of direct implementation:
   handlers. A single resolved HVF exit can be converted into a runtime MMIO
   operation, dispatched through those handlers on the current thread or through
   an explicit runner-thread command, and completed back into guest GPRs for
-  successful reads. The runner and boot session can perform that path for one
-  run step, and the boot session can repeat it through a bounded internal loop
-  that terminates on explicit outcomes, but they do not yet provide full
-  Firecracker run-loop control beyond pause/resume or translate exits into
-  interrupt or runtime events.
+  successful reads. Each runner performs that path for one identified step, and
+  the boot session coordinates online members through a bounded internal loop
+  that terminates on explicit aggregate outcomes. Full public Firecracker
+  run-loop control beyond pause/resume remains deferred.
 - Firecracker's full paused/resumed microVM loop is not implemented yet. The
   current `PATCH /vm` support pauses the process-owned single boot-worker
-  scheduler between bounded run-loop windows, while multi-vCPU coordination,
-  complete HVF state capture/restore, capture orchestration, and snapshot-ready
-  paused ownership remain deferred.
+  scheduler between bounded run-loop windows. Public multi-vCPU activation and
+  topology-aware pause integration, complete HVF state capture/restore, capture
+  orchestration, and snapshot-ready paused ownership remain deferred.
 - Device-facing interrupt triggers are backend-neutral runtime state today, and
   HVF interrupt-line support can allocate deterministic SPI lines from GIC
   metadata and set validated SPI levels through `hv_gic_set_spi`. Internal boot
