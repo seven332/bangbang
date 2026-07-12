@@ -17,10 +17,11 @@ use bangbang_hvf::{
     HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugDeviceConfig,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-    HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
-    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle,
-    HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
-    HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
+    HvfArm64BootSessionError, HvfArm64BootSnapshotV1CaptureStage,
+    HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootSnapshotV1StateCaptureError,
+    HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError,
+    HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition, HvfSnapshotV1RestoreError,
+    HvfSnapshotV1State, HvfVcpuRunCoordinatorError, OwnedHvfArm64BootSession,
     PrepareHvfSnapshotV1LoadError, PreparedHvfSnapshotV1Load,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
@@ -1928,6 +1929,13 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
+        let vcpu_count = controller.machine_config().vcpu_count();
+        if vcpu_count != 1 {
+            return Err(BackendError::Hypervisor(
+                HvfArm64BootSessionError::UnsupportedVcpuCount { vcpu_count }.to_string(),
+            ));
+        }
+
         let serial_output = self
             .serial_output_for_controller(controller)
             .map_err(|err| {
@@ -2897,7 +2905,7 @@ pub(crate) trait BootRunLoopControl: Clone + fmt::Debug + Send + Sync + 'static 
 }
 
 impl BootRunLoopControl for HvfArm64BootRunLoopControl {
-    type Error = HvfVcpuRunnerError;
+    type Error = HvfVcpuRunCoordinatorError;
     type StopToken = HvfArm64BootRunLoopStopToken;
 
     fn stop_token(&self) -> Self::StopToken {
@@ -7280,6 +7288,43 @@ mod tests {
             !err.to_string()
                 .contains(&missing_path.to_string_lossy().into_owned())
         );
+    }
+
+    #[test]
+    fn instance_start_rejects_multi_vcpu_before_serial_or_boot_path_access() {
+        let missing_serial_path = missing_temp_child_path("private-multi-serial.out");
+        let private_kernel_path = "/private/missing-multi-vcpu-kernel";
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 128)))
+            .expect("multi-vCPU machine config should store");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                private_kernel_path,
+            )))
+            .expect("private boot source should store without access");
+        controller
+            .handle_action(VmmAction::PutSerial(
+                SerialConfigInput::new()
+                    .with_serial_out_path(missing_serial_path.to_string_lossy().into_owned()),
+            ))
+            .expect("private serial config should store without access");
+        let mut executor = HvfInstanceStartExecutor::default();
+
+        let error = executor
+            .start(&controller)
+            .expect_err("public multi-vCPU start should fail at the capability gate");
+
+        assert_eq!(
+            error,
+            BackendError::Hypervisor(
+                "HVF arm64 boot session supports exactly 1 vCPU, got 2".to_string()
+            )
+        );
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains(private_kernel_path));
+        assert!(!diagnostics.contains(&missing_serial_path.to_string_lossy().into_owned()));
+        assert!(!missing_serial_path.exists());
     }
 
     #[test]

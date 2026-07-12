@@ -15,6 +15,7 @@ BLOCK_READ_MARKER = b"BANGBANG_BLOCK_READ_OK"
 BLOCK_WRITE_MARKER = b"BANGBANG_BLOCK_WRITE_OK"
 BLOCK_WRITE_SECTOR_SIZE = 512
 ROOTFS_READ_MARKER = b"BANGBANG_ROOTFS_READ_OK"
+SMP_SECONDARY_MARKER = b"BANGBANG_SECONDARY_CPU_OK\n"
 ROOTFS_OS_RELEASE_READ_SIZE = 256
 CMDLINE_BEGIN_MARKER = b"BANGBANG_CMDLINE_BEGIN\n"
 CMDLINE_END_MARKER = b"BANGBANG_CMDLINE_END\n"
@@ -48,6 +49,8 @@ LINUX_AARCH64_SYSCALL_WRITE = 64
 LINUX_AARCH64_SYSCALL_FSYNC = 82
 LINUX_AARCH64_SYSCALL_EXIT = 93
 LINUX_AARCH64_SYSCALL_REBOOT = 142
+LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY = 122
+LINUX_AARCH64_SYSCALL_GETCPU = 168
 LINUX_REBOOT_MAGIC1 = 0xFEE1DEAD
 LINUX_REBOOT_MAGIC2 = 0x28121969
 LINUX_REBOOT_CMD_RESTART = 0x01234567
@@ -100,6 +103,11 @@ def cmp_imm_64(register: int, immediate: int) -> bytes:
     if not 0 <= immediate <= 0xFFF:
         raise RuntimeError(f"unsupported CMP immediate: {immediate}")
     instruction = 0xF100001F | ((immediate & 0xFFF) << 10) | (register << 5)
+    return struct.pack("<I", instruction)
+
+
+def ldr_u32(destination: int, base: int) -> bytes:
+    instruction = 0xB9400000 | (base << 5) | destination
     return struct.pack("<I", instruction)
 
 
@@ -427,6 +435,97 @@ def build_guest_init_elf() -> bytes:
     return build_guest_elf(code, data)
 
 
+def smp_init_data() -> list[tuple[str, bytes]]:
+    return [
+        ("affinity_mask", struct.pack("<Q", 1 << 1)),
+        ("observed_cpu", bytes(4)),
+        ("secondary_marker", SMP_SECONDARY_MARKER),
+    ]
+
+
+def smp_init_addresses(code_size: int) -> dict[str, int]:
+    addresses: dict[str, int] = {}
+    data_offset = ELF_CODE_OFFSET + code_size
+    for name, data in smp_init_data():
+        addresses[name] = ELF_BASE_VADDR + data_offset
+        data_offset += len(data)
+    return addresses
+
+
+def build_smp_init_code(addresses: dict[str, int]) -> bytes:
+    code = Aarch64CodeBuilder()
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 0),
+                movz_64(1, 8),
+                mov_imm_64(2, addresses["affinity_mask"]),
+                movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, addresses["observed_cpu"]),
+                movz_64(1, 0),
+                movz_64(2, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_GETCPU),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(mov_imm_64(1, addresses["observed_cpu"]))
+    code.emit(ldr_u32(0, 1))
+    code.emit(cmp_imm_64(0, 1))
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["secondary_marker"],
+            len(SMP_SECONDARY_MARKER),
+        )
+    )
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_EXIT),
+                svc_0(),
+            )
+        )
+    )
+    code.label("failure")
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 1),
+                movz_64(8, LINUX_AARCH64_SYSCALL_EXIT),
+                svc_0(),
+                branch_to_self(),
+            )
+        )
+    )
+    return code.build()
+
+
+def build_smp_init_elf() -> bytes:
+    placeholder_addresses = {name: ELF_BASE_VADDR for name, _data in smp_init_data()}
+    code_size = len(build_smp_init_code(placeholder_addresses))
+    addresses = smp_init_addresses(code_size)
+    code = build_smp_init_code(addresses)
+    if len(code) != code_size:
+        raise RuntimeError("guest SMP init code size changed after address assignment")
+
+    data = b"".join(data for _name, data in smp_init_data())
+    return build_guest_elf(code, data)
+
+
 def build_reboot_syscall_init_elf(command: int) -> bytes:
     code = b"".join(
         (
@@ -517,6 +616,7 @@ def cpio_entry(
 
 def build_initrd() -> bytes:
     guest_init = build_guest_init_elf()
+    smp_init = build_smp_init_elf()
     poweroff_init = build_poweroff_init_elf()
     reboot_init = build_reboot_init_elf()
     archive = b"".join(
@@ -544,7 +644,13 @@ def build_initrd() -> bytes:
                 mode=S_IFREG | 0o755,
                 data=reboot_init,
             ),
-            cpio_entry(name="TRAILER!!!", ino=8, mode=0, nlink=1),
+            cpio_entry(
+                name="smp-init",
+                ino=8,
+                mode=S_IFREG | 0o755,
+                data=smp_init,
+            ),
+            cpio_entry(name="TRAILER!!!", ino=9, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -656,6 +762,27 @@ def validate_reboot_init_entry(
         raise RuntimeError(f"guest initrd {name} payload does not contain SVC #0")
 
 
+def validate_smp_init_entry(entries: dict[str, dict[str, object]]) -> None:
+    entry = required_entry(entries, "smp-init")
+    if file_type(entry["mode"]) != S_IFREG:
+        raise RuntimeError("guest initrd smp-init entry is not a regular file")
+    payload = bytes(entry["payload"])
+    if not payload.startswith(b"\x7fELF"):
+        raise RuntimeError("guest initrd smp-init payload is not an ELF file")
+    if SMP_SECONDARY_MARKER not in payload:
+        raise RuntimeError("guest initrd smp-init payload does not contain the CPU1 marker")
+    if struct.pack("<Q", 1 << 1) not in payload:
+        raise RuntimeError("guest initrd smp-init payload does not contain the CPU1 affinity mask")
+    if movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY) not in payload:
+        raise RuntimeError("guest initrd smp-init payload does not load sched_setaffinity")
+    if movz_64(8, LINUX_AARCH64_SYSCALL_GETCPU) not in payload:
+        raise RuntimeError("guest initrd smp-init payload does not load getcpu")
+    if ldr_u32(0, 1) not in payload or cmp_imm_64(0, 1) not in payload:
+        raise RuntimeError("guest initrd smp-init payload does not verify observed CPU1")
+    if svc_0() not in payload:
+        raise RuntimeError("guest initrd smp-init payload does not contain SVC #0")
+
+
 def validate_initrd(data: bytes) -> None:
     if not data:
         raise RuntimeError("guest initrd is empty")
@@ -673,6 +800,7 @@ def validate_initrd(data: bytes) -> None:
         "init",
         "poweroff-init",
         "reboot-init",
+        "smp-init",
         CPIO_TRAILER,
     ]
     if names != expected_names:
@@ -744,6 +872,7 @@ def validate_initrd(data: bytes) -> None:
         command=LINUX_REBOOT_CMD_RESTART,
         command_description="restart",
     )
+    validate_smp_init_entry(entries)
 
 
 def default_output_path() -> Path:

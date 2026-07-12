@@ -1,5 +1,7 @@
 //! PSCI-over-HVC decoding and secondary-vCPU power-state coordination.
 
+use std::fmt;
+
 const PSCI_VERSION: u64 = 0x8400_0000;
 const PSCI_CPU_OFF: u64 = 0x8400_0002;
 const PSCI_CPU_ON_32: u64 = 0x8400_0003;
@@ -152,6 +154,14 @@ const fn supports_legacy_function(function_id: u64) -> bool {
     )
 }
 
+const fn supports_coordinated_function(function_id: u64) -> bool {
+    supports_legacy_function(function_id)
+        || matches!(
+            function_id,
+            PSCI_CPU_ON_32 | PSCI_CPU_ON_64 | PSCI_AFFINITY_INFO_32 | PSCI_AFFINITY_INFO_64
+        )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PsciCallingConvention {
     Smc32,
@@ -183,10 +193,6 @@ pub(crate) struct PsciCpuOnRequest {
     context_id: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
-)]
 impl PsciCpuOnRequest {
     #[cfg(test)]
     const fn new(target_mpidr: u64, entry_point: u64, context_id: u64) -> Self {
@@ -197,6 +203,7 @@ impl PsciCpuOnRequest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn target_mpidr(self) -> u64 {
         self.target_mpidr
     }
@@ -216,12 +223,8 @@ pub(crate) struct PsciAffinityInfoRequest {
     lowest_affinity_level: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
-)]
+#[cfg(test)]
 impl PsciAffinityInfoRequest {
-    #[cfg(test)]
     const fn new(target_mpidr: u64, lowest_affinity_level: u64) -> Self {
         Self {
             target_mpidr,
@@ -244,13 +247,6 @@ pub(crate) enum PsciCoordinatorRequest {
     AffinityInfo(PsciAffinityInfoRequest),
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "constructed by the later multi-vCPU scheduler slice"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PsciCoordinatorResponse {
     CpuOn(PsciCpuOnResponse),
@@ -289,6 +285,15 @@ pub(crate) enum PsciCoordinatedDispatch {
 }
 
 pub(crate) const fn handle_coordinated_call(call: PsciCall) -> PsciCoordinatedDispatch {
+    if call.function_id == PSCI_FEATURES {
+        let status = if supports_coordinated_function(call.arg0) {
+            PsciStatus::Success
+        } else {
+            PsciStatus::NotSupported
+        };
+        return PsciCoordinatedDispatch::Immediate(PsciCallResult::returned(status.return_value()));
+    }
+
     let convention = match call.function_id {
         PSCI_CPU_ON_32 | PSCI_AFFINITY_INFO_32 => Some(PsciCallingConvention::Smc32),
         PSCI_CPU_ON_64 | PSCI_AFFINITY_INFO_64 => Some(PsciCallingConvention::Smc64),
@@ -349,13 +354,7 @@ pub(crate) enum PsciCpuOnResponse {
     InvalidAddress,
     AlreadyOn,
     OnPending,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "constructed by the later capability profile slice"
-        )
-    )]
+    #[cfg(test)]
     Unsupported,
     InternalFailure,
 }
@@ -367,6 +366,7 @@ impl PsciCpuOnResponse {
             Self::InvalidTarget | Self::InvalidAddress => PsciStatus::InvalidParameters,
             Self::AlreadyOn => PsciStatus::AlreadyOn,
             Self::OnPending => PsciStatus::OnPending,
+            #[cfg(test)]
             Self::Unsupported => PsciStatus::NotSupported,
             Self::InternalFailure => PsciStatus::InternalFailure,
         }
@@ -383,10 +383,6 @@ pub(crate) struct PsciCpuOnWork {
     request: PsciCpuOnRequest,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
-)]
 impl PsciCpuOnWork {
     pub(crate) const fn token(self) -> PsciCpuOnToken {
         self.token
@@ -435,6 +431,29 @@ pub(crate) enum PsciCpuPowerError {
     InvalidTransactionPhase { token: PsciCpuOnToken },
 }
 
+impl fmt::Display for PsciCpuPowerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTopology => f.write_str("PSCI CPU power topology is empty"),
+            Self::DuplicateMpidr { mpidr } => {
+                write!(f, "PSCI CPU power topology repeats MPIDR 0x{mpidr:x}")
+            }
+            Self::InvalidMpidr { mpidr } => {
+                write!(f, "PSCI CPU power topology has invalid MPIDR 0x{mpidr:x}")
+            }
+            Self::TokenExhausted => f.write_str("PSCI CPU_ON transaction tokens are exhausted"),
+            Self::UnknownTransaction { token } => {
+                write!(f, "PSCI CPU_ON transaction {token:?} is unknown")
+            }
+            Self::InvalidTransactionPhase { token } => {
+                write!(f, "PSCI CPU_ON transaction {token:?} is in the wrong phase")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PsciCpuPowerError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PsciCpuOnPhase {
     AwaitingTargetSetup,
@@ -465,10 +484,6 @@ pub(crate) struct PsciCpuPowerCoordinator {
     next_token: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
-)]
 impl PsciCpuPowerCoordinator {
     pub(crate) fn new(mpidrs: &[u64]) -> Result<Self, PsciCpuPowerError> {
         if mpidrs.is_empty() {
@@ -502,6 +517,7 @@ impl PsciCpuPowerCoordinator {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn power_state(&self, index: usize) -> Option<PsciCpuPowerState> {
         self.cpus.get(index).map(|cpu| cpu.power)
     }
@@ -590,6 +606,7 @@ impl PsciCpuPowerCoordinator {
         Ok(response)
     }
 
+    #[cfg(test)]
     pub(crate) fn caller_completion(
         &self,
         token: PsciCpuOnToken,
@@ -697,6 +714,7 @@ impl PsciCpuPowerCoordinator {
             })
     }
 
+    #[cfg(test)]
     fn transaction(
         &self,
         token: PsciCpuOnToken,
@@ -799,6 +817,33 @@ mod tests {
                 PsciStatus::NotSupported.return_value()
             );
         }
+    }
+
+    #[test]
+    fn coordinated_features_advertise_cpu_on_and_affinity_info_only() {
+        for function_id in [
+            PSCI_CPU_ON_32,
+            PSCI_CPU_ON_64,
+            PSCI_AFFINITY_INFO_32,
+            PSCI_AFFINITY_INFO_64,
+        ] {
+            let PsciCoordinatedDispatch::Immediate(result) =
+                handle_coordinated_call(PsciCall::new(PSCI_FEATURES, function_id))
+            else {
+                panic!("PSCI_FEATURES should complete immediately");
+            };
+            assert_eq!(result.return_value(), PsciStatus::Success.return_value());
+        }
+
+        let PsciCoordinatedDispatch::Immediate(result) =
+            handle_coordinated_call(PsciCall::new(PSCI_FEATURES, PSCI_CPU_OFF))
+        else {
+            panic!("unsupported PSCI_FEATURES should complete immediately");
+        };
+        assert_eq!(
+            result.return_value(),
+            PsciStatus::NotSupported.return_value()
+        );
     }
 
     #[test]

@@ -2556,12 +2556,12 @@ fn concurrently_runs_and_batch_cancels_two_vcpus() {
             .create_gic()
             .expect("GIC should be created before the vCPU topology");
         {
-            let mut topology = backend
+            let topology = backend
                 .start_vcpu_topology(2)
                 .expect("host should support a two-vCPU topology");
             let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
             let mut coordinator = topology
-                .run_coordinator(dispatcher, &[0, 1])
+                .into_run_coordinator(dispatcher, &[0, 1])
                 .expect("two-vCPU coordinator should start");
             coordinator
                 .configure_arm64_boot_registers(

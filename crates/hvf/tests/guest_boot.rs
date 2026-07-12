@@ -19,6 +19,8 @@ const BLOCK_WRITE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITE_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ROOTFS_READ_MARKER: &[u8] = b"BANGBANG_ROOTFS_READ_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SECONDARY_CPU_MARKER: &[u8] = b"BANGBANG_SECONDARY_CPU_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const DIRECT_ROOTFS_BOOT_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VMGENID_GUEST_CHECK_MARKER: &[u8] = b"BANGBANG_VMGENID_GUEST_CHECK_OK";
@@ -40,6 +42,8 @@ const CMDLINE_BEGIN_MARKER: &[u8] = b"BANGBANG_CMDLINE_BEGIN";
 const CMDLINE_END_MARKER: &[u8] = b"BANGBANG_CMDLINE_END";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const INITRD_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SMP_INITRD_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/smp-init";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const DIRECT_ROOTFS_BOOT_ARGS: &str =
     "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
@@ -80,6 +84,42 @@ fn boots_firecracker_kernel_to_guest_marker() {
     assert!(
         !bytes_contain_marker(&observation.serial_bytes, ROOTFS_READ_MARKER),
         "guest boot test without a drive should not observe rootfs-read marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_and_executes_userspace_on_secondary_cpu() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::machine::MachineConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let initrd_path = env_path("BANGBANG_GUEST_INITRD_PATH");
+    let observation = run_guest_boot_with_boot_source(
+        "guest-smp-secondary",
+        SECONDARY_CPU_MARKER,
+        Some(initrd_path),
+        SMP_INITRD_BOOT_ARGS,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 128)))
+                .expect("two-vCPU guest machine config should store");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        SECONDARY_CPU_MARKER,
+        "secondary CPU execution marker",
+    );
+    assert_eq!(observation.boot_diagnostics.vcpu_mpidrs, [0, 1]);
+    assert!(
+        observation.run_diagnostics.hvc_steps > 0,
+        "two-vCPU guest boot should observe PSCI HVC work\n{}\nserial output:\n{}",
+        GuestBootFailureReport::new(&observation.boot_diagnostics, &observation.run_diagnostics),
         String::from_utf8_lossy(&observation.serial_bytes)
     );
 }
@@ -744,6 +784,7 @@ struct GuestBootDiagnostics {
     serial_mmio_base: u64,
     serial_mmio_size: u64,
     serial_interrupt_line: u32,
+    vcpu_mpidrs: Vec<u64>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -799,6 +840,7 @@ impl GuestBootDiagnostics {
             serial_mmio_base: serial.region.range().start().raw_value(),
             serial_mmio_size: serial.region.range().size(),
             serial_interrupt_line: serial.fdt_device.interrupt_line.raw_value(),
+            vcpu_mpidrs: session.vcpu_mpidrs().to_vec(),
         }
     }
 }
@@ -980,6 +1022,7 @@ impl std::fmt::Display for GuestBootFailureReport<'_> {
         }
         writeln!(f, "  boot args: {}", self.boot.boot_args)?;
         writeln!(f, "  boot PC: 0x{:x}", self.boot.boot_pc)?;
+        writeln!(f, "  vCPU MPIDRs: {:?}", self.boot.vcpu_mpidrs)?;
         writeln!(
             f,
             "  FDT: address=0x{:x}, size={}",
@@ -1047,6 +1090,17 @@ fn validate_pre_run_boot_metadata(
             assert!(!chosen.has_prop("linux,initrd-end"));
         }
         _ => panic!("guest boot test initrd diagnostics should be internally consistent"),
+    }
+
+    assert_eq!(session.vcpu_count(), diagnostics.vcpu_mpidrs.len());
+    assert_eq!(session.vcpu_mpidrs(), diagnostics.vcpu_mpidrs);
+    for mpidr in &diagnostics.vcpu_mpidrs {
+        let cpu_path = format!("/cpus/cpu@{mpidr:x}");
+        let cpu = tree
+            .find(&cpu_path)
+            .unwrap_or_else(|| panic!("guest boot test FDT should contain {cpu_path}"));
+        assert_eq!(cpu.prop_u64("reg").unwrap(), *mpidr);
+        assert_eq!(cpu.prop_str("enable-method").unwrap(), "psci");
     }
 
     let serial_node_path = format!("/uart@{:x}", diagnostics.serial_mmio_base);
@@ -1258,6 +1312,7 @@ mod tests {
             serial_mmio_base: 0x4000_0000,
             serial_mmio_size: 4096,
             serial_interrupt_line: 32,
+            vcpu_mpidrs: vec![0],
         };
         let mut run = GuestBootRunDiagnostics::default();
         run.finish(

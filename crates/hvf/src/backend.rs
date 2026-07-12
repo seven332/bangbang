@@ -255,6 +255,19 @@ impl HvfBackend {
         Ok(runner)
     }
 
+    pub(crate) fn start_session_vcpu_topology<'vm>(
+        &mut self,
+        vcpu_count: u8,
+    ) -> Result<HvfVcpuTopology<'vm>, HvfVcpuTopologyError> {
+        // The session object holds the backend borrow separately; keep this
+        // constructor crate-private so arbitrary callers cannot outlive the VM.
+        self.validate_vcpu_topology_start()?;
+
+        let topology = HvfVcpuTopology::create(vcpu_count)?;
+        self.vcpu_topology_started = true;
+        Ok(topology)
+    }
+
     /// Start an ordered set of permanent owner-thread vCPUs for this VM/GIC.
     ///
     /// This internal compatibility prerequisite does not activate multi-vCPU

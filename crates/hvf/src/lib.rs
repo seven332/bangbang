@@ -9,6 +9,7 @@ mod memory;
 mod mmio;
 mod psci;
 mod runner;
+mod session_vcpu;
 mod sme;
 mod snapshot;
 mod snapshot_bundle;
@@ -45,6 +46,7 @@ pub use runner::{
     HvfArm64SnapshotV1RestoreStage, HvfVcpuMpidrAffinityStage, HvfVcpuRunCancelHandle,
     HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
+pub use session_vcpu::HvfArm64BootVcpuError;
 pub use sme::HvfArm64SmeConfiguration;
 pub use snapshot::{
     HvfArm64SnapshotOptionalStateRejection, HvfArm64SnapshotTimerPolicyError,

@@ -72,12 +72,9 @@ gate must configure two different guest entries in one mapped memory, have each
 vCPU write its own flag and wait for its peer, poll both flags with a deadline
 and no fixed sleep, then collect two `Canceled` acknowledgements from one stop
 barrier. Repeat complete owner and VM teardown to catch stale cancellation or
-resource leaks. This proves internal concurrent bounded runs only; Linux SMP
-enumeration, PSCI-driven secondary startup, FDT/session activation, public
-multi-vCPU startup, and multi-vCPU native-v1 snapshots retain later gates.
+resource leaks.
 
-Validation for internal PSCI secondary-power changes remains unit-test-only
-until the later multi-vCPU boot slice connects them. Tests must cover both CPU_ON calling
+Validation for internal PSCI secondary-power changes must cover both CPU_ON calling
 conventions, exact X1-X3 reads and 32-bit truncation, MPIDR reserved-bit
 validation, all `OFF`/`ON_PENDING`/`ON` transitions and affinity results,
 already-on/on-pending/invalid-target/invalid-entry/internal-failure responses,
@@ -85,9 +82,17 @@ stale transaction rejection, target setup success and rollback, retryable
 caller X0 completion, response abandonment, and unchanged public CPU_ON
 rejection. Target owner-thread tests must preserve context in X0, clear X1-X3,
 apply the Linux boot PSTATE, write PC last, stop at every injected failure, and
-require a complete retry while the target remains fail-closed. These tests do
-not claim atomic HVF register rollback, PSCI-driven target execution, Linux SMP
-boot, FDT activation, or public multi-vCPU support.
+require a complete retry while the target remains fail-closed. Session tests
+must also prove target-only admission precedes caller `SUCCESS`, a pending
+caller is not resubmitted, barrier acknowledgements retain ordinary work, and
+timer PPIs use the completing index.
+
+The signed `guest_boot` gate builds a deterministic `/smp-init`, boots with two
+internal vCPUs, verifies FDT CPU nodes and PSCI enable methods for MPIDRs
+`[0, 1]`, pins PID 1 to CPU1 with raw `sched_setaffinity`, confirms `getcpu == 1`,
+and only then writes `BANGBANG_SECONDARY_CPU_OK`. Use deadline/marker
+synchronization and the signed wrapper; do not add a fixed sleep. Public process
+startup and native-v1 multi-vCPU acceptance remain separate negative gates.
 
 For virtio-pmem changes, unit tests should cover MMIO registration, FDT
 metadata, config-space `start`/`size`, deterministic multi-device layout,
@@ -716,8 +721,10 @@ cached kernel.
 The `guest_boot` runner also generates a deterministic tiny initrd under
 `.tmp/guest-artifacts/bangbang/guest-boot/` by default. That initrd contains its
 own `/init`, so a rootfs drive is not required for the minimal guest boot
-integration test. The test succeeds when the guest emits `BANGBANG_BOOT_OK` on
-the internal serial console. The same signed target also includes a raw
+integration test. It also contains `/smp-init`, whose raw arm64 syscalls pin PID
+1 to CPU1 and verify the observed CPU before emitting its deterministic marker.
+The baseline test succeeds when the guest emits `BANGBANG_BOOT_OK` on the
+internal serial console. The same signed target also includes a raw
 virtio-block read scenario: the test configures one temporary drive whose first
 sector contains `BANGBANG_BLOCK_READ_OK`, mounts `devtmpfs` from the tiny
 `/init`, reads `/dev/vda`, and expects the marker to appear on serial. It also

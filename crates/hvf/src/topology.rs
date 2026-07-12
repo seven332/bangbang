@@ -304,22 +304,30 @@ impl<'vm> HvfVcpuTopology<'vm> {
         &self.mpidrs
     }
 
-    /// Borrow this ordered topology through a concurrent bounded-run coordinator.
+    /// Consume this ordered topology into a concurrent bounded-run coordinator.
     ///
     /// `online_indexes` is software power state only. Offline members retain
     /// their permanent owner threads but are neither submitted nor canceled.
-    /// The exclusive borrow prevents two coordinators from driving the same
-    /// owner set concurrently.
-    pub fn run_coordinator<'topology>(
-        &'topology mut self,
+    /// Consuming the topology prevents two coordinators from driving the same
+    /// owner set concurrently and transfers shutdown authority to the result.
+    pub fn into_run_coordinator(
+        self,
         dispatcher: Arc<Mutex<MmioDispatcher>>,
         online_indexes: &[usize],
-    ) -> Result<HvfVcpuRunCoordinator<'topology, 'vm>, HvfVcpuRunCoordinatorError> {
+    ) -> Result<HvfVcpuRunCoordinator<'vm>, HvfVcpuRunCoordinatorError> {
         HvfVcpuRunCoordinator::new(self, dispatcher, online_indexes)
     }
 
-    pub(crate) fn runners(&self) -> &[HvfVcpuRunner<'vm>] {
-        &self.runners
+    pub(crate) fn into_parts(mut self) -> (Vec<HvfVcpuRunner<'vm>>, Vec<u64>) {
+        (
+            std::mem::take(&mut self.runners),
+            std::mem::take(&mut self.mpidrs),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(runners: Vec<HvfVcpuRunner<'vm>>, mpidrs: Vec<u64>) -> Self {
+        Self { runners, mpidrs }
     }
 
     /// Request cancellation from every topology member.
@@ -601,6 +609,44 @@ fn shutdown_members<M: TopologyMember>(
     mpidrs: &[u64],
 ) -> Result<(), HvfVcpuTopologyError> {
     let failures = cleanup_members(members, mpidrs);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(HvfVcpuTopologyError::Control {
+            operation: HvfVcpuTopologyOperation::Shutdown,
+            failures,
+        })
+    }
+}
+
+pub(crate) fn shutdown_runner_topology(
+    primary: &HvfVcpuRunner<'_>,
+    primary_mpidr: u64,
+    secondary: &[HvfVcpuRunner<'_>],
+    mpidrs: &[u64],
+) -> Result<(), HvfVcpuTopologyError> {
+    let mut failures = Vec::new();
+    for (secondary_index, (runner, mpidr)) in secondary
+        .iter()
+        .zip(mpidrs.iter().skip(1))
+        .enumerate()
+        .rev()
+    {
+        if let Err(source) = runner.shutdown() {
+            failures.push(HvfVcpuTopologyMemberFailure {
+                index: secondary_index.saturating_add(1),
+                mpidr: *mpidr,
+                source: Box::new(source),
+            });
+        }
+    }
+    if let Err(source) = primary.shutdown() {
+        failures.push(HvfVcpuTopologyMemberFailure {
+            index: 0,
+            mpidr: primary_mpidr,
+            source: Box::new(source),
+        });
+    }
     if failures.is_empty() {
         Ok(())
     } else {

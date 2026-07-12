@@ -113,6 +113,7 @@ const MMIO_DISPATCHER_BUSY_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is 
 const MMIO_DISPATCHER_POISONED_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is poisoned";
 const COMMAND_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner command channel is closed";
 const RESPONSE_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner response channel is closed";
+#[cfg(test)]
 const RUN_COMPLETION_TOKEN_MISMATCH_MESSAGE: &str =
     "vCPU runner completion token does not match the submitted run";
 const DUPLICATE_BATCH_CANCEL_MEMBER_MESSAGE: &str =
@@ -2680,10 +2681,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the later multi-vCPU scheduler slice")
-    )]
+    #[cfg(test)]
     pub(crate) fn run_once_and_handle_mmio_coordinated(
         &self,
         dispatcher: Arc<Mutex<MmioDispatcher>>,
@@ -7265,7 +7263,7 @@ fn shutdown_result(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -8897,6 +8895,12 @@ mod tests {
     struct SecondaryConfigureRecordingVcpu {
         configured_sender: mpsc::Sender<HvfArm64SecondaryBootRegisters>,
         fail_next_setup: bool,
+    }
+
+    struct DestroyOrderRecordingVcpu {
+        index: usize,
+        fail_destroy: bool,
+        destroyed_sender: mpsc::Sender<usize>,
     }
 
     struct Sys64RunStepRecordingVcpu {
@@ -15636,6 +15640,42 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for DestroyOrderRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(self.index as crate::ffi::HvVcpu + 7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            self.destroyed_sender
+                .send(self.index)
+                .map_err(|_| BackendError::InvalidState("fake destroy receiver closed"))?;
+            if self.fail_destroy {
+                Err(BackendError::InvalidState("fake destroy failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     impl RunnerVcpu for Sys64RunStepRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -17098,7 +17138,7 @@ mod tests {
         )
     }
 
-    fn start_coordinated_psci_run_step_recording_runner(
+    pub(crate) fn start_coordinated_psci_run_step_recording_runner(
         function_id: u64,
         arguments: [u64; 3],
         hvc_immediate: u16,
@@ -17129,7 +17169,7 @@ mod tests {
         )
     }
 
-    fn start_secondary_configure_recording_runner(
+    pub(crate) fn start_secondary_configure_recording_runner(
         fail_next_setup: bool,
     ) -> (
         HvfVcpuRunner<'static>,
@@ -17149,6 +17189,24 @@ mod tests {
                 .expect("runner should be created"),
             configured_receiver,
         )
+    }
+
+    pub(crate) fn start_destroy_order_recording_runner(
+        index: usize,
+        fail_destroy: bool,
+        destroyed_sender: mpsc::Sender<usize>,
+    ) -> HvfVcpuRunner<'static> {
+        let started = spawn_runner_thread(move || {
+            Ok(DestroyOrderRecordingVcpu {
+                index,
+                fail_destroy,
+                destroyed_sender,
+            })
+        })
+        .expect("fake destroy-order runner should start");
+
+        HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created")
     }
 
     fn start_sys64_run_step_recording_runner(
@@ -32285,6 +32343,40 @@ mod tests {
                 .recv()
                 .expect("affinity response should write X0"),
             (HvfRegister::X0, 1)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn coordinated_features_advertise_cpu_on_without_deferred_work() {
+        let (runner, register_read_receiver, register_write_receiver) =
+            start_coordinated_psci_run_step_recording_runner(
+                PSCI_FEATURES,
+                [PSCI_CPU_ON, 0, 0],
+                0,
+                false,
+            );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio_coordinated(shared_dispatcher()),
+            Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                HvfVcpuRunStepOutcome::Hvc {
+                    exit: hvc_exit(0),
+                    function_id: PSCI_FEATURES,
+                    return_value: PSCI_RET_SUCCESS,
+                }
+            ))
+        );
+        assert_eq!(
+            register_read_receiver.try_iter().collect::<Vec<_>>(),
+            vec![HvfRegister::X0, HvfRegister::X1]
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("PSCI_FEATURES should write X0"),
+            (HvfRegister::X0, PSCI_RET_SUCCESS)
         );
 
         runner.shutdown().expect("runner should shut down");
