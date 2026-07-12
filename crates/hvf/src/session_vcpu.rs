@@ -378,22 +378,20 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
             return self.complete_failed_cpu_on(caller_index, work, cpu_on);
         }
 
+        let admission = match self
+            .coordinator
+            .activate_and_dispatch_member(target_index)
+            .map_err(|source| {
+                self.coordinator_error("target-only run admission", target_index, source)
+            })? {
+            Some(admission) => admission,
+            None => return self.complete_failed_cpu_on(caller_index, work, cpu_on),
+        };
+        self.validate_admission(target_index, admission)?;
         let response = self
             .power
             .finish_target_setup(cpu_on.token(), true)
             .map_err(|_| self.power_error("target setup commit", target_index))?;
-        self.coordinator
-            .set_online(target_index, true)
-            .map_err(|source| {
-                self.coordinator_error("target online transition", target_index, source)
-            })?;
-        let admission = self
-            .coordinator
-            .dispatch_member(target_index)
-            .map_err(|source| {
-                self.coordinator_error("target-only run admission", target_index, source)
-            })?;
-        self.validate_admission(target_index, admission)?;
 
         let response = PsciCoordinatorResponse::CpuOn(response);
         if let Err(error) = self.complete_caller(

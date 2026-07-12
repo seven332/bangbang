@@ -963,25 +963,22 @@ where
                 .collect::<Vec<_>>()
         };
 
-        self.submit_indexes(&indexes)
+        self.submit_indexes(&indexes, false)
             .map(|admissions| admissions.len())
     }
 
-    fn dispatch_member(
+    fn activate_and_dispatch_member(
         &mut self,
         index: usize,
-    ) -> Result<HvfVcpuRunAdmission, HvfVcpuRunCoordinatorError> {
-        let mut admissions = self.submit_indexes(&[index])?;
-        admissions
-            .pop()
-            .ok_or(HvfVcpuRunCoordinatorError::InvalidState(
-                "vCPU run coordinator did not admit the requested member",
-            ))
+    ) -> Result<Option<HvfVcpuRunAdmission>, HvfVcpuRunCoordinatorError> {
+        let mut admissions = self.submit_indexes(&[index], true)?;
+        Ok(admissions.pop())
     }
 
     fn submit_indexes(
         &mut self,
         indexes: &[usize],
+        activate_offline: bool,
     ) -> Result<Vec<HvfVcpuRunAdmission>, HvfVcpuRunCoordinatorError> {
         let mut admissions = Vec::with_capacity(indexes.len());
         let mut failure = None;
@@ -990,8 +987,16 @@ where
         {
             let mut state = self.shared.lock_state()?;
             if !matches!(state.phase, CoordinatorPhase::Running) {
+                if activate_offline {
+                    return Ok(admissions);
+                }
                 return Err(HvfVcpuRunCoordinatorError::InvalidState(
                     RUNNING_PHASE_REQUIRED_MESSAGE,
+                ));
+            }
+            if activate_offline && indexes.len() != 1 {
+                return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                    "vCPU activation requires exactly one topology member",
                 ));
             }
             let member_count = state.members.len();
@@ -1009,9 +1014,15 @@ where
                         member_count,
                     },
                 )?;
-                if !member_state.online || member_state.active.is_some() {
+                let activating = activate_offline && !member_state.online;
+                if (!member_state.online && !activating) || member_state.active.is_some() {
                     return Err(HvfVcpuRunCoordinatorError::InvalidState(
                         ACTIVE_MEMBER_STATE_MESSAGE,
+                    ));
+                }
+                if activate_offline && !activating {
+                    return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                        "vCPU activation target is already online",
                     ));
                 }
                 let generation = member_state.next_generation;
@@ -1026,6 +1037,9 @@ where
                             index,
                             member_count,
                         })?;
+                if activating {
+                    member_state.online = true;
+                }
                 match member.submit(
                     token,
                     Arc::clone(&self.dispatcher),
@@ -1041,6 +1055,9 @@ where
                         });
                     }
                     Err(source) => {
+                        if activating {
+                            member_state.online = false;
+                        }
                         failure = Some(SubmissionFailure {
                             index,
                             mpidr,
@@ -1215,7 +1232,7 @@ where
             };
 
         if should_resubmit {
-            let _ = self.submit_indexes(&[index])?;
+            let _ = self.submit_indexes(&[index], false)?;
         }
 
         Ok(event)
@@ -1269,6 +1286,7 @@ where
         &self,
         index: usize,
         operation: &'static str,
+        allow_quiescing: bool,
         apply: impl FnOnce(&M) -> Result<(), HvfVcpuRunnerError>,
     ) -> Result<(), HvfVcpuRunCoordinatorError> {
         let member_count = self.members.len();
@@ -1283,10 +1301,15 @@ where
                 })?;
         {
             let state = self.shared.lock_state()?;
-            if !matches!(
+            let phase_allowed = matches!(
                 state.phase,
                 CoordinatorPhase::Running | CoordinatorPhase::Paused
-            ) {
+            ) || (allow_quiescing
+                && matches!(
+                    state.phase,
+                    CoordinatorPhase::Draining(_) | CoordinatorPhase::Stopped
+                ));
+            if !phase_allowed {
                 return Err(HvfVcpuRunCoordinatorError::InvalidState(
                     RUNNING_PHASE_REQUIRED_MESSAGE,
                 ));
@@ -1572,12 +1595,11 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         self.inner.dispatch_online()
     }
 
-    /// Submit one bounded run to one identified online idle member.
-    pub(crate) fn dispatch_member(
+    pub(crate) fn activate_and_dispatch_member(
         &mut self,
         index: usize,
-    ) -> Result<HvfVcpuRunAdmission, HvfVcpuRunCoordinatorError> {
-        self.inner.dispatch_member(index)
+    ) -> Result<Option<HvfVcpuRunAdmission>, HvfVcpuRunCoordinatorError> {
+        self.inner.activate_and_dispatch_member(index)
     }
 
     /// Return the number of permanent vCPU owners in topology order.
@@ -1630,7 +1652,7 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         registers: HvfArm64BootRegisters,
     ) -> Result<(), HvfVcpuRunCoordinatorError> {
         self.inner
-            .member_operation(index, "boot-register setup", |member| {
+            .member_operation(index, "boot-register setup", false, |member| {
                 member.configure_primary(registers)
             })
     }
@@ -1641,7 +1663,7 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         registers: HvfArm64SecondaryBootRegisters,
     ) -> Result<(), HvfVcpuRunCoordinatorError> {
         self.inner
-            .member_operation(index, "secondary boot-register setup", |member| {
+            .member_operation(index, "secondary boot-register setup", false, |member| {
                 member.configure_secondary(registers)
             })
     }
@@ -1654,7 +1676,7 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
     ) -> Result<(), HvfVcpuRunCoordinatorError> {
         let (_, _, token, _) = work.into_parts();
         self.inner
-            .member_operation(index, "deferred PSCI completion", |member| {
+            .member_operation(index, "deferred PSCI completion", true, |member| {
                 member.complete_psci(token, response)
             })
     }
@@ -1666,7 +1688,9 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         intid: u32,
     ) -> Result<(), HvfVcpuRunCoordinatorError> {
         self.inner
-            .member_operation(index, "GIC PPI set", |member| member.set_ppi_pending(intid))
+            .member_operation(index, "GIC PPI set", false, |member| {
+                member.set_ppi_pending(intid)
+            })
     }
 
     /// Clear one PPI pending on the selected vCPU owner thread.
@@ -1676,7 +1700,7 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         intid: u32,
     ) -> Result<(), HvfVcpuRunCoordinatorError> {
         self.inner
-            .member_operation(index, "GIC PPI clear", |member| {
+            .member_operation(index, "GIC PPI clear", false, |member| {
                 member.clear_ppi_pending(intid)
             })
     }
@@ -2093,14 +2117,15 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_member_returns_identified_admission_for_only_that_member() {
+    fn activating_member_returns_identified_admission_for_only_that_member() {
         let members = fake_members(2);
         let batch = BatchHarness::default();
         let mut coordinator =
-            coordinator(&members, &[0, 1], batch.callback()).expect("coordinator should build");
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
 
         let admission = coordinator
-            .dispatch_member(1)
+            .activate_and_dispatch_member(1)
+            .expect("secondary activation should be accepted")
             .expect("secondary should be admitted");
 
         assert_eq!(admission.index(), 1);
@@ -2111,6 +2136,32 @@ mod tests {
             members[1].pending_tokens(),
             vec![HvfVcpuRunToken::new(1, 1)]
         );
+    }
+
+    #[test]
+    fn control_phase_blocks_offline_member_activation_without_mutation() {
+        let members = fake_members(2);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        let _pause = coordinator
+            .control()
+            .request_pause()
+            .expect("idle pause should start")
+            .wait()
+            .expect("idle pause should complete");
+
+        assert_eq!(coordinator.activate_and_dispatch_member(1), Ok(None));
+        assert!(members[1].pending_tokens().is_empty());
+        assert!(
+            !coordinator
+                .shared
+                .lock_state()
+                .expect("coordinator state should lock")
+                .members[1]
+                .online
+        );
+        assert!(batch.calls().is_empty());
     }
 
     #[test]
@@ -2225,7 +2276,8 @@ mod tests {
         );
         assert!(matches!(waiter.try_wait(), Err(mpsc::TryRecvError::Empty)));
         assert!(matches!(
-            coordinator.member_operation(1, "PPI set", |member| member.set_ppi_pending(27)),
+            coordinator
+                .member_operation(1, "PPI set", false, |member| { member.set_ppi_pending(27) }),
             Err(HvfVcpuRunCoordinatorError::InvalidState(
                 super::RUNNING_PHASE_REQUIRED_MESSAGE
             ))
@@ -2704,18 +2756,20 @@ mod tests {
         let secondary = HvfArm64SecondaryBootRegisters::new(GuestAddress::new(0x3000), 0x44);
 
         coordinator
-            .member_operation(2, "primary", |member| member.configure_primary(primary))
+            .member_operation(2, "primary", false, |member| {
+                member.configure_primary(primary)
+            })
             .expect("primary setup should route");
         coordinator
-            .member_operation(2, "secondary", |member| {
+            .member_operation(2, "secondary", false, |member| {
                 member.configure_secondary(secondary)
             })
             .expect("secondary setup should route");
         coordinator
-            .member_operation(2, "PPI set", |member| member.set_ppi_pending(27))
+            .member_operation(2, "PPI set", false, |member| member.set_ppi_pending(27))
             .expect("PPI set should route");
         coordinator
-            .member_operation(2, "PPI clear", |member| member.clear_ppi_pending(27))
+            .member_operation(2, "PPI clear", false, |member| member.clear_ppi_pending(27))
             .expect("PPI clear should route");
         assert!(members[0].operations().is_empty());
         assert!(members[1].operations().is_empty());
@@ -2733,7 +2787,8 @@ mod tests {
             .dispatch_online()
             .expect("member zero should dispatch");
         assert!(matches!(
-            coordinator.member_operation(0, "PPI set", |member| member.set_ppi_pending(30)),
+            coordinator
+                .member_operation(0, "PPI set", false, |member| { member.set_ppi_pending(30) }),
             Err(HvfVcpuRunCoordinatorError::InvalidState(
                 super::MEMBER_NOT_IDLE_MESSAGE
             ))
