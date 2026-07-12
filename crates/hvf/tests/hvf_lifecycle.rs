@@ -3440,6 +3440,120 @@ fn prepares_owned_hvf_arm64_boot_session() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn captures_and_prepares_native_v1_inactive_device_profile() {
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput};
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
+    use bangbang_runtime::snapshot_device::{
+        decode_snapshot_v1_device_state, encode_snapshot_v1_device_state,
+    };
+    use bangbang_runtime::startup::prepare_snapshot_v1_device_profile;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel =
+        TempFile::new("snapshot-device-kernel", &image).expect("temp kernel should be created");
+    let root = TempFile::new_len("snapshot-device-root", 4096)
+        .expect("temp root backing should be created");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("boot source config should be stored");
+    controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", root.path(), true).with_is_read_only(true),
+        ))
+        .expect("read-only root config should be stored");
+
+    let serial_buffer = SharedSerialOutputBuffer::default();
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    )
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(serial_buffer),
+    ));
+    let mut session = OwnedHvfArm64BootSession::new(&controller, config)
+        .expect("owned snapshot device session should prepare");
+
+    let state = {
+        let guard = session
+            .quiesce_limiter_retry_wakeups()
+            .expect("snapshot device retry work should quiesce");
+        session
+            .capture_snapshot_v1_device_state_at(
+                &controller.drive_configs()[0],
+                controller.serial_config(),
+                &guard,
+                Instant::now(),
+            )
+            .expect("inactive snapshot device profile should capture")
+    };
+    let encoded = encode_snapshot_v1_device_state(&state)
+        .expect("captured snapshot device state should encode");
+    let decoded = decode_snapshot_v1_device_state(&encoded)
+        .expect("captured snapshot device state should decode");
+
+    let layout = session.runtime_resources().layout.clone();
+    let mut loaded_memory =
+        GuestMemory::allocate(&layout).expect("separate loaded guest memory should allocate");
+    for metadata in [decoded.vmgenid(), decoded.vmclock()] {
+        let len = usize::try_from(metadata.range().size())
+            .expect("platform range length should fit usize");
+        let mut bytes = vec![0; len];
+        session
+            .guest_memory()
+            .expect("source guest memory should remain mapped")
+            .read_slice(&mut bytes, metadata.range().start())
+            .expect("source platform bytes should read");
+        loaded_memory
+            .write_slice(&bytes, metadata.range().start())
+            .expect("loaded platform bytes should write");
+    }
+    let prepared = prepare_snapshot_v1_device_profile(&decoded, &loaded_memory, Instant::now())
+        .expect("decoded inactive device profile should prepare off-side");
+
+    assert!(!prepared.block_handler().is_device_activated());
+    assert!(
+        prepared.drive_config().path_on_host() == controller.drive_configs()[0].path_on_host(),
+        "prepared drive path should match without logging either path"
+    );
+    assert!(
+        prepared.vmgenid_device().range == decoded.vmgenid().range(),
+        "prepared VMGenID range should match without logging guest addresses"
+    );
+    assert!(
+        prepared.vmclock_device().range == decoded.vmclock().range(),
+        "prepared VMClock range should match without logging guest addresses"
+    );
+    drop(prepared);
+    session
+        .shutdown()
+        .expect("owned snapshot device session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn owned_hvf_arm64_boot_session_cleans_up_after_prepare_error() {
     use bangbang_hvf::{
         HvfArm64BootSessionConfig, HvfArm64BootSessionError, OwnedHvfArm64BootSession,

@@ -109,6 +109,21 @@ must not claim atomic source identity against a hostile directory writer. Run
 the focused surface with
 `cargo test -p bangbang-runtime snapshot_artifact --locked`.
 
+Native-v1 device-profile tests pin the fixed `BANGDEV\0` header and an exact
+active/inactive schema shape under the 16 KiB cap. Cover transport status and
+feature mismatches, queue mapping/non-overlap/cursor wraparound, drained
+notifications, interrupt bits, limiter budget/burst/age with injected
+`Instant`s, retry eligibility, UART register round trips, canonical
+VMGenID/VMClock metadata, exact EOF, bounded UTF-8 fields, and diagnostic
+redaction. Filesystem preflight tests must use real regular files, symlinks,
+directories, FIFOs, sockets, replacements, and metadata/length changes; prove
+that the retained descriptor is read-only/no-follow and that every failed
+preflight leaves guest memory and the MMIO dispatcher untouched. Run the
+focused codec/preflight surface with
+`cargo test -p bangbang-runtime snapshot_device --locked`; retry-scheduler
+snapshot tests belong in `cargo test -p bangbang-hvf limiter_retry_snapshot
+--lib --locked` and must not sleep.
+
 For process, socket, and multi-bangbang behavior, cover unique resource names,
 stale socket handling, shutdown cleanup, replacement races, and concurrent runs
 where practical.

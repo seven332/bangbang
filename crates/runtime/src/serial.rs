@@ -665,6 +665,68 @@ pub struct SerialMmioDevice<O> {
     divisor_latch_high: u8,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SerialMmioState {
+    interrupt_enable: u8,
+    line_control: u8,
+    modem_control: u8,
+    scratch: u8,
+    divisor_latch_low: u8,
+    divisor_latch_high: u8,
+}
+
+impl SerialMmioState {
+    pub const fn new(
+        interrupt_enable: u8,
+        line_control: u8,
+        modem_control: u8,
+        scratch: u8,
+        divisor_latch_low: u8,
+        divisor_latch_high: u8,
+    ) -> Self {
+        Self {
+            interrupt_enable,
+            line_control,
+            modem_control,
+            scratch,
+            divisor_latch_low,
+            divisor_latch_high,
+        }
+    }
+
+    pub const fn interrupt_enable(self) -> u8 {
+        self.interrupt_enable
+    }
+
+    pub const fn line_control(self) -> u8 {
+        self.line_control
+    }
+
+    pub const fn modem_control(self) -> u8 {
+        self.modem_control
+    }
+
+    pub const fn scratch(self) -> u8 {
+        self.scratch
+    }
+
+    pub const fn divisor_latch_low(self) -> u8 {
+        self.divisor_latch_low
+    }
+
+    pub const fn divisor_latch_high(self) -> u8 {
+        self.divisor_latch_high
+    }
+}
+
+impl fmt::Debug for SerialMmioState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SerialMmioState")
+            .field("registers", &"<redacted>")
+            .finish()
+    }
+}
+
 impl<O> SerialMmioDevice<O> {
     pub const fn new(output: O) -> Self {
         Self {
@@ -676,6 +738,29 @@ impl<O> SerialMmioDevice<O> {
             divisor_latch_low: 0,
             divisor_latch_high: 0,
         }
+    }
+
+    pub const fn from_state(output: O, state: SerialMmioState) -> Self {
+        Self {
+            output,
+            interrupt_enable: state.interrupt_enable,
+            line_control: state.line_control,
+            modem_control: state.modem_control,
+            scratch: state.scratch,
+            divisor_latch_low: state.divisor_latch_low,
+            divisor_latch_high: state.divisor_latch_high,
+        }
+    }
+
+    pub const fn state(&self) -> SerialMmioState {
+        SerialMmioState::new(
+            self.interrupt_enable,
+            self.line_control,
+            self.modem_control,
+            self.scratch,
+            self.divisor_latch_low,
+            self.divisor_latch_high,
+        )
     }
 
     pub const fn output(&self) -> &O {
@@ -976,9 +1061,9 @@ mod tests {
         SERIAL_MODEM_CONTROL_REGISTER_OFFSET, SERIAL_MODEM_STATUS_REGISTER_OFFSET,
         SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT, SERIAL_SCRATCH_REGISTER_OFFSET,
         SERIAL_TRANSMIT_REGISTER_OFFSET, SerialConfigError, SerialConfigInput, SerialMmioDevice,
-        SerialMmioError, SerialOutput, SerialOutputBuffer, SerialOutputError, SerialOutputFile,
-        SerialOutputMetrics, SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
-        SharedSerialOutputMetrics,
+        SerialMmioError, SerialMmioState, SerialOutput, SerialOutputBuffer, SerialOutputError,
+        SerialOutputFile, SerialOutputMetrics, SerialRateLimiterConfig, SharedSerialOutput,
+        SharedSerialOutputBuffer, SharedSerialOutputMetrics,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{
@@ -999,6 +1084,20 @@ mod tests {
         dispatcher
             .lookup(GuestAddress::new(0x1000 + offset), size)
             .expect("test lookup should succeed")
+    }
+
+    #[test]
+    fn serial_mmio_state_round_trips_into_fresh_output() {
+        let state = SerialMmioState::new(1, 0x83, 3, 0x5a, 0x34, 0x12);
+        let device = SerialMmioDevice::from_state(SerialOutputBuffer::default(), state);
+
+        assert_eq!(device.state(), state);
+        assert!(device.output().bytes().is_empty());
+        assert_eq!(
+            format!("{state:?}"),
+            "SerialMmioState { registers: \"<redacted>\" }"
+        );
+        assert!(!format!("{state:?}").contains("5a"));
     }
 
     fn bytes(data: &[u8]) -> MmioAccessBytes {

@@ -5,7 +5,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -17,12 +17,15 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
-use crate::token_bucket::{TokenBucket, TokenBucketConfig};
+use crate::token_bucket::{
+    PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
+};
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
     VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
-    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError, VirtioMmioTransportState,
+    VirtioMmioTransportStateError,
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
@@ -1685,6 +1688,275 @@ impl std::error::Error for VirtioBlockQueueBuildError {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBlockQueueState {
+    next_available: u16,
+    next_used: u16,
+}
+
+impl VirtioBlockQueueState {
+    pub const fn new(next_available: u16, next_used: u16) -> Self {
+        Self {
+            next_available,
+            next_used,
+        }
+    }
+
+    pub const fn next_available(self) -> u16 {
+        self.next_available
+    }
+
+    pub const fn next_used(self) -> u16 {
+        self.next_used
+    }
+}
+
+impl fmt::Debug for VirtioBlockQueueState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VirtioBlockQueueState")
+            .field("cursors", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtioBlockQueueSnapshotError {
+    QueueNotReady,
+    AvailableRingInvalid,
+    UsedRingInvalid,
+    QueueRangeInvalid,
+    QueueRangesOverlap,
+    UsedCursorMismatch,
+    AvailableCursorOutOfBounds,
+    RetryWithoutPendingDescriptor,
+}
+
+impl fmt::Display for VirtioBlockQueueSnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueNotReady => f.write_str("persisted virtio-block queue is not ready"),
+            Self::AvailableRingInvalid => {
+                f.write_str("persisted virtio-block available ring is invalid")
+            }
+            Self::UsedRingInvalid => f.write_str("persisted virtio-block used ring is invalid"),
+            Self::QueueRangeInvalid => f.write_str("persisted virtio-block queue range is invalid"),
+            Self::QueueRangesOverlap => f.write_str("persisted virtio-block queue ranges overlap"),
+            Self::UsedCursorMismatch => {
+                f.write_str("persisted virtio-block used cursor does not match guest memory")
+            }
+            Self::AvailableCursorOutOfBounds => f.write_str(
+                "persisted virtio-block available cursor is inconsistent with guest memory",
+            ),
+            Self::RetryWithoutPendingDescriptor => {
+                f.write_str("persisted virtio-block retry has no pending available descriptor")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockQueueSnapshotError {}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioBlockRuntimeState {
+    transport: VirtioMmioTransportState,
+    active_queue: Option<VirtioBlockQueueState>,
+    rate_limiter: VirtioBlockRateLimiterState,
+}
+
+pub(crate) struct VirtioBlockRuntimeRestoreInput<'a> {
+    pub backing: BlockFileBacking,
+    pub device_id: VirtioBlockDeviceId,
+    pub config_space: VirtioBlockConfigSpace,
+    pub rate_limiter_config: Option<DriveRateLimiterConfig>,
+    pub memory: &'a GuestMemory,
+    pub has_retry: bool,
+    pub now: Instant,
+}
+
+impl VirtioBlockRuntimeState {
+    pub fn new(
+        transport: VirtioMmioTransportState,
+        active_queue: Option<VirtioBlockQueueState>,
+        rate_limiter: VirtioBlockRateLimiterState,
+    ) -> Self {
+        Self {
+            transport,
+            active_queue,
+            rate_limiter,
+        }
+    }
+
+    pub const fn transport(&self) -> &VirtioMmioTransportState {
+        &self.transport
+    }
+
+    pub const fn active_queue(&self) -> Option<VirtioBlockQueueState> {
+        self.active_queue
+    }
+
+    pub const fn rate_limiter(&self) -> VirtioBlockRateLimiterState {
+        self.rate_limiter
+    }
+
+    pub fn validate_guest_memory(
+        &self,
+        memory: &GuestMemory,
+        has_retry: bool,
+    ) -> Result<(), VirtioBlockRuntimeStateError> {
+        validate_native_v1_block_runtime_shape(self)?;
+        if has_retry && self.active_queue.is_none() {
+            return Err(VirtioBlockRuntimeStateError::RetryWithoutActiveQueue);
+        }
+        if has_retry && self.rate_limiter.is_empty() {
+            return Err(VirtioBlockRuntimeStateError::RetryWithoutRateLimiter);
+        }
+        let Some(queue) = build_snapshot_block_queue(self)? else {
+            return Ok(());
+        };
+        queue
+            .validate_snapshot_state(memory, has_retry)
+            .map_err(|_| VirtioBlockRuntimeStateError::Queue)
+    }
+
+    pub(crate) fn restore_handler(
+        &self,
+        input: VirtioBlockRuntimeRestoreInput<'_>,
+    ) -> Result<VirtioBlockMmioHandler, VirtioBlockRuntimeStateError> {
+        self.validate_guest_memory(input.memory, input.has_retry)?;
+        let active_queue = build_snapshot_block_queue(self)?;
+        let rate_limiter = VirtioBlockRateLimiter::from_persisted_state_at(
+            input.rate_limiter_config,
+            self.rate_limiter,
+            input.now,
+        )
+        .map_err(|_| VirtioBlockRuntimeStateError::RateLimiter)?;
+        let device = VirtioBlockDevice::from_snapshot_parts(
+            input.backing,
+            input.device_id,
+            active_queue,
+            rate_limiter,
+        );
+        let activation_is_active = device.is_activated();
+        let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
+            VIRTIO_BLOCK_DEVICE_ID,
+            input.config_space.available_features(),
+            &VIRTIO_BLOCK_QUEUE_SIZES,
+            input.config_space,
+            device,
+        )
+        .map_err(|_| VirtioBlockRuntimeStateError::HandlerBuild)?;
+        handler
+            .restore_transport_state(&self.transport, activation_is_active)
+            .map_err(|_| VirtioBlockRuntimeStateError::Transport)?;
+        Ok(handler)
+    }
+}
+
+impl fmt::Debug for VirtioBlockRuntimeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VirtioBlockRuntimeState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioBlockRuntimeStateError {
+    Transport,
+    QueueProfile,
+    PendingQueueNotification,
+    ActivationMismatch,
+    Queue,
+    RateLimiter,
+    HandlerBuild,
+    RetryWithoutActiveQueue,
+    RetryWithoutRateLimiter,
+}
+
+impl fmt::Display for VirtioBlockRuntimeStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport => f.write_str("persisted virtio-block transport state is invalid"),
+            Self::QueueProfile => {
+                f.write_str("persisted virtio-block queue profile is unsupported")
+            }
+            Self::PendingQueueNotification => {
+                f.write_str("virtio-block queue notification work is not drained")
+            }
+            Self::ActivationMismatch => {
+                f.write_str("persisted virtio-block activation state is inconsistent")
+            }
+            Self::Queue => f.write_str("persisted virtio-block queue state is invalid"),
+            Self::RateLimiter => {
+                f.write_str("persisted virtio-block rate limiter state is invalid")
+            }
+            Self::HandlerBuild => f.write_str("failed to build persisted virtio-block handler"),
+            Self::RetryWithoutActiveQueue => {
+                f.write_str("persisted virtio-block retry requires an active queue")
+            }
+            Self::RetryWithoutRateLimiter => {
+                f.write_str("persisted virtio-block retry requires an active rate limiter")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockRuntimeStateError {}
+
+fn validate_native_v1_block_runtime_shape(
+    state: &VirtioBlockRuntimeState,
+) -> Result<(), VirtioBlockRuntimeStateError> {
+    let transport = state.transport();
+    let queues = transport.queues();
+    if transport.queue_select() != 0
+        || queues.len() != VIRTIO_BLOCK_QUEUE_COUNT
+        || queues.first().map(|queue| queue.max_size()) != Some(VIRTIO_BLOCK_QUEUE_SIZE)
+    {
+        return Err(VirtioBlockRuntimeStateError::QueueProfile);
+    }
+    if transport.pending_notifications().len() != VIRTIO_BLOCK_QUEUE_COUNT {
+        return Err(VirtioBlockRuntimeStateError::QueueProfile);
+    }
+    if transport
+        .pending_notifications()
+        .iter()
+        .copied()
+        .any(|pending| pending)
+    {
+        return Err(VirtioBlockRuntimeStateError::PendingQueueNotification);
+    }
+    if transport.is_device_activated() != state.active_queue().is_some() {
+        return Err(VirtioBlockRuntimeStateError::ActivationMismatch);
+    }
+    Ok(())
+}
+
+fn build_snapshot_block_queue(
+    state: &VirtioBlockRuntimeState,
+) -> Result<Option<VirtioBlockQueue>, VirtioBlockRuntimeStateError> {
+    validate_native_v1_block_runtime_shape(state)?;
+    let Some(queue_state) = state.active_queue() else {
+        return Ok(None);
+    };
+    let queue = state
+        .transport()
+        .queues()
+        .first()
+        .ok_or(VirtioBlockRuntimeStateError::QueueProfile)?;
+    let driver_features = state.transport().device_registers().driver_features();
+    let event_idx_enabled = virtio_feature_enabled(driver_features, VIRTIO_RING_FEATURE_EVENT_IDX);
+    let indirect_descriptors_enabled =
+        virtio_feature_enabled(driver_features, VIRTIO_RING_FEATURE_INDIRECT_DESC);
+    VirtioBlockQueue::from_snapshot_state(
+        queue,
+        queue_state,
+        event_idx_enabled,
+        indirect_descriptors_enabled,
+    )
+    .map(Some)
+    .map_err(|_| VirtioBlockRuntimeStateError::Queue)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioBlockQueue {
     available: VirtqueueAvailableRing,
@@ -1734,6 +2006,96 @@ impl VirtioBlockQueue {
             used,
             event_idx_enabled,
         })
+    }
+
+    pub(crate) fn from_snapshot_state(
+        queue: &VirtioMmioQueueState,
+        state: VirtioBlockQueueState,
+        event_idx_enabled: bool,
+        indirect_descriptors_enabled: bool,
+    ) -> Result<Self, VirtioBlockQueueSnapshotError> {
+        if !queue.ready() {
+            return Err(VirtioBlockQueueSnapshotError::QueueNotReady);
+        }
+
+        let available = VirtqueueAvailableRing::with_next_avail(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+            state.next_available(),
+        )
+        .map_err(|_| VirtioBlockQueueSnapshotError::AvailableRingInvalid)?
+        .with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new()
+                .with_indirect_descriptors(indirect_descriptors_enabled),
+        );
+        let used =
+            VirtqueueUsedRing::with_next_used(queue.device_ring(), queue.size(), state.next_used())
+                .map_err(|_| VirtioBlockQueueSnapshotError::UsedRingInvalid)?;
+
+        Ok(Self {
+            available,
+            used,
+            event_idx_enabled,
+        })
+    }
+
+    pub const fn snapshot_state(&self) -> VirtioBlockQueueState {
+        VirtioBlockQueueState::new(self.available.next_avail(), self.used.next_used())
+    }
+
+    pub(crate) fn validate_snapshot_state(
+        &self,
+        memory: &GuestMemory,
+        has_retry: bool,
+    ) -> Result<(), VirtioBlockQueueSnapshotError> {
+        self.available
+            .validate_mapped(memory)
+            .map_err(|_| VirtioBlockQueueSnapshotError::AvailableRingInvalid)?;
+        self.used
+            .validate_mapped(memory)
+            .map_err(|_| VirtioBlockQueueSnapshotError::UsedRingInvalid)?;
+
+        let descriptor_range = self
+            .available
+            .descriptor_table_range()
+            .map_err(|_| VirtioBlockQueueSnapshotError::QueueRangeInvalid)?;
+        let available_range = self
+            .available
+            .available_ring_range()
+            .map_err(|_| VirtioBlockQueueSnapshotError::QueueRangeInvalid)?;
+        let used_range = self
+            .used
+            .used_ring_range()
+            .map_err(|_| VirtioBlockQueueSnapshotError::QueueRangeInvalid)?;
+        if descriptor_range.overlaps(available_range)
+            || descriptor_range.overlaps(used_range)
+            || available_range.overlaps(used_range)
+        {
+            return Err(VirtioBlockQueueSnapshotError::QueueRangesOverlap);
+        }
+
+        let used_index = self
+            .used
+            .used_index(memory)
+            .map_err(|_| VirtioBlockQueueSnapshotError::UsedRingInvalid)?;
+        if used_index != self.used.next_used() {
+            return Err(VirtioBlockQueueSnapshotError::UsedCursorMismatch);
+        }
+
+        let available_index = self
+            .available
+            .available_index(memory)
+            .map_err(|_| VirtioBlockQueueSnapshotError::AvailableRingInvalid)?;
+        let pending = available_index.wrapping_sub(self.available.next_avail());
+        if pending > self.available.queue_size() {
+            return Err(VirtioBlockQueueSnapshotError::AvailableCursorOutOfBounds);
+        }
+        if has_retry && pending == 0 {
+            return Err(VirtioBlockQueueSnapshotError::RetryWithoutPendingDescriptor);
+        }
+
+        Ok(())
     }
 
     pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
@@ -2597,6 +2959,112 @@ pub struct BlockFileBacking {
     is_read_only: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BlockFileBackingIdentity {
+    device: u64,
+    inode: u64,
+    len: u64,
+    mode: u32,
+    modified_seconds: i64,
+    modified_nanos: u32,
+    changed_seconds: i64,
+    changed_nanos: u32,
+}
+
+impl BlockFileBackingIdentity {
+    pub fn new(file: [u64; 3], mode: u32, modified: [i64; 2], changed: [i64; 2]) -> Option<Self> {
+        let Ok(modified_nanos) = u32::try_from(modified[1]) else {
+            return None;
+        };
+        let Ok(changed_nanos) = u32::try_from(changed[1]) else {
+            return None;
+        };
+        if modified_nanos >= 1_000_000_000 || changed_nanos >= 1_000_000_000 {
+            return None;
+        }
+
+        Some(Self {
+            device: file[0],
+            inode: file[1],
+            len: file[2],
+            mode,
+            modified_seconds: modified[0],
+            modified_nanos,
+            changed_seconds: changed[0],
+            changed_nanos,
+        })
+    }
+
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+
+    pub const fn len(self) -> u64 {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn mode(self) -> u32 {
+        self.mode
+    }
+
+    pub const fn modified_seconds(self) -> i64 {
+        self.modified_seconds
+    }
+
+    pub const fn modified_nanos(self) -> u32 {
+        self.modified_nanos
+    }
+
+    pub const fn changed_seconds(self) -> i64 {
+        self.changed_seconds
+    }
+
+    pub const fn changed_nanos(self) -> u32 {
+        self.changed_nanos
+    }
+}
+
+impl fmt::Debug for BlockFileBackingIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockFileBackingIdentity")
+            .field("identity", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotBlockFileBackingError {
+    UnsupportedPlatform,
+    Open,
+    ReadMetadata,
+    NonRegularFile,
+    InvalidMetadata,
+}
+
+impl fmt::Display for SnapshotBlockFileBackingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedPlatform => {
+                f.write_str("snapshot block backing is unsupported on this platform")
+            }
+            Self::Open => f.write_str("failed to open snapshot block backing"),
+            Self::ReadMetadata => f.write_str("failed to read snapshot block backing metadata"),
+            Self::NonRegularFile => f.write_str("snapshot block backing is not a regular file"),
+            Self::InvalidMetadata => f.write_str("snapshot block backing metadata is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotBlockFileBackingError {}
+
 impl BlockFileBacking {
     pub fn open(config: &DriveConfig) -> Result<Self, BlockFileBackingError> {
         let file = open_block_file(config.path_on_host(), config.is_read_only())?;
@@ -2613,6 +3081,61 @@ impl BlockFileBacking {
             len: metadata.len(),
             is_read_only: config.is_read_only(),
         })
+    }
+
+    pub fn open_snapshot_read_only(
+        path: &Path,
+    ) -> Result<(Self, BlockFileBackingIdentity), SnapshotBlockFileBackingError> {
+        #[cfg(unix)]
+        {
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let file = options
+                .open(path)
+                .map_err(|_| SnapshotBlockFileBackingError::Open)?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| SnapshotBlockFileBackingError::ReadMetadata)?;
+            if !metadata.file_type().is_file() {
+                return Err(SnapshotBlockFileBackingError::NonRegularFile);
+            }
+            let identity = snapshot_block_file_identity(&metadata)?;
+            let backing = Self {
+                file,
+                len: metadata.len(),
+                is_read_only: true,
+            };
+            Ok((backing, identity))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(SnapshotBlockFileBackingError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn snapshot_identity(
+        &self,
+    ) -> Result<BlockFileBackingIdentity, SnapshotBlockFileBackingError> {
+        #[cfg(unix)]
+        {
+            let metadata = self
+                .file
+                .metadata()
+                .map_err(|_| SnapshotBlockFileBackingError::ReadMetadata)?;
+            if !metadata.file_type().is_file() {
+                return Err(SnapshotBlockFileBackingError::NonRegularFile);
+            }
+            snapshot_block_file_identity(&metadata)
+        }
+
+        #[cfg(not(unix))]
+        {
+            Err(SnapshotBlockFileBackingError::UnsupportedPlatform)
+        }
     }
 
     pub const fn len(&self) -> u64 {
@@ -2658,6 +3181,19 @@ impl BlockFileBacking {
             .sync_all()
             .map_err(|source| BlockFileBackingError::FlushFile { source })
     }
+}
+
+#[cfg(unix)]
+fn snapshot_block_file_identity(
+    metadata: &std::fs::Metadata,
+) -> Result<BlockFileBackingIdentity, SnapshotBlockFileBackingError> {
+    BlockFileBackingIdentity::new(
+        [metadata.dev(), metadata.ino(), metadata.len()],
+        metadata.mode(),
+        [metadata.mtime(), metadata.mtime_nsec()],
+        [metadata.ctime(), metadata.ctime_nsec()],
+    )
+    .ok_or(SnapshotBlockFileBackingError::InvalidMetadata)
 }
 
 fn open_block_file(path: &Path, is_read_only: bool) -> Result<File, BlockFileBackingError> {
@@ -2781,6 +3317,147 @@ impl std::error::Error for BlockFileBackingError {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBlockTokenBucketState {
+    config: DriveTokenBucketConfig,
+    budget: u64,
+    remaining_burst: u64,
+    age_nanos: u64,
+}
+
+impl VirtioBlockTokenBucketState {
+    pub const fn new(
+        config: DriveTokenBucketConfig,
+        budget: u64,
+        remaining_burst: u64,
+        age_nanos: u64,
+    ) -> Self {
+        Self {
+            config,
+            budget,
+            remaining_burst,
+            age_nanos,
+        }
+    }
+
+    pub const fn config(self) -> DriveTokenBucketConfig {
+        self.config
+    }
+
+    pub const fn budget(self) -> u64 {
+        self.budget
+    }
+
+    pub const fn remaining_burst(self) -> u64 {
+        self.remaining_burst
+    }
+
+    pub const fn age_nanos(self) -> u64 {
+        self.age_nanos
+    }
+
+    const fn from_persisted(state: PersistedTokenBucketState) -> Self {
+        let config = state.config();
+        Self::new(
+            DriveTokenBucketConfig::new(
+                config.size(),
+                config.one_time_burst(),
+                config.refill_time(),
+            ),
+            state.budget(),
+            state.one_time_burst(),
+            state.age_nanos(),
+        )
+    }
+
+    const fn into_persisted(self) -> PersistedTokenBucketState {
+        PersistedTokenBucketState::new(
+            self.config.token_bucket_config(),
+            self.budget,
+            self.remaining_burst,
+            self.age_nanos,
+        )
+    }
+}
+
+impl fmt::Debug for VirtioBlockTokenBucketState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VirtioBlockTokenBucketState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBlockRateLimiterState {
+    bandwidth: Option<VirtioBlockTokenBucketState>,
+    ops: Option<VirtioBlockTokenBucketState>,
+}
+
+impl VirtioBlockRateLimiterState {
+    pub const fn new(
+        bandwidth: Option<VirtioBlockTokenBucketState>,
+        ops: Option<VirtioBlockTokenBucketState>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
+    pub const fn bandwidth(self) -> Option<VirtioBlockTokenBucketState> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<VirtioBlockTokenBucketState> {
+        self.ops
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.bandwidth.is_none() && self.ops.is_none()
+    }
+}
+
+impl fmt::Debug for VirtioBlockRateLimiterState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VirtioBlockRateLimiterState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioBlockRateLimiterStateError {
+    MissingBandwidthBucket,
+    UnexpectedBandwidthBucket,
+    InvalidBandwidthBucket,
+    MissingOpsBucket,
+    UnexpectedOpsBucket,
+    InvalidOpsBucket,
+    UnexpectedRateLimiter,
+}
+
+impl fmt::Display for VirtioBlockRateLimiterStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingBandwidthBucket => {
+                f.write_str("persisted block bandwidth bucket is missing")
+            }
+            Self::UnexpectedBandwidthBucket => {
+                f.write_str("persisted block bandwidth bucket is unexpected")
+            }
+            Self::InvalidBandwidthBucket => {
+                f.write_str("persisted block bandwidth bucket is invalid")
+            }
+            Self::MissingOpsBucket => f.write_str("persisted block ops bucket is missing"),
+            Self::UnexpectedOpsBucket => f.write_str("persisted block ops bucket is unexpected"),
+            Self::InvalidOpsBucket => f.write_str("persisted block ops bucket is invalid"),
+            Self::UnexpectedRateLimiter => {
+                f.write_str("persisted block rate limiter does not match configuration")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockRateLimiterStateError {}
+
 #[derive(Debug, Clone)]
 pub struct VirtioBlockRateLimiter {
     bandwidth: Option<TokenBucket>,
@@ -2810,6 +3487,66 @@ impl VirtioBlockRateLimiter {
             None
         } else {
             Some(Self { bandwidth, ops })
+        }
+    }
+
+    fn persisted_state_at(
+        config: Option<DriveRateLimiterConfig>,
+        limiter: Option<&Self>,
+        now: Instant,
+    ) -> Result<VirtioBlockRateLimiterState, VirtioBlockRateLimiterStateError> {
+        if config.is_none() && limiter.is_some() {
+            return Err(VirtioBlockRateLimiterStateError::UnexpectedRateLimiter);
+        }
+
+        let bandwidth_config = config.and_then(DriveRateLimiterConfig::bandwidth);
+        let bandwidth = capture_block_bucket_state(
+            bandwidth_config,
+            limiter.and_then(|limiter| limiter.bandwidth.as_ref()),
+            now,
+            VirtioBlockRateLimiterStateError::MissingBandwidthBucket,
+            VirtioBlockRateLimiterStateError::UnexpectedBandwidthBucket,
+            VirtioBlockRateLimiterStateError::InvalidBandwidthBucket,
+        )?;
+        let ops_config = config.and_then(DriveRateLimiterConfig::ops);
+        let ops = capture_block_bucket_state(
+            ops_config,
+            limiter.and_then(|limiter| limiter.ops.as_ref()),
+            now,
+            VirtioBlockRateLimiterStateError::MissingOpsBucket,
+            VirtioBlockRateLimiterStateError::UnexpectedOpsBucket,
+            VirtioBlockRateLimiterStateError::InvalidOpsBucket,
+        )?;
+
+        Ok(VirtioBlockRateLimiterState::new(bandwidth, ops))
+    }
+
+    pub(crate) fn from_persisted_state_at(
+        config: Option<DriveRateLimiterConfig>,
+        state: VirtioBlockRateLimiterState,
+        now: Instant,
+    ) -> Result<Option<Self>, VirtioBlockRateLimiterStateError> {
+        let bandwidth = restore_block_bucket_state(
+            config.and_then(DriveRateLimiterConfig::bandwidth),
+            state.bandwidth(),
+            now,
+            VirtioBlockRateLimiterStateError::MissingBandwidthBucket,
+            VirtioBlockRateLimiterStateError::UnexpectedBandwidthBucket,
+            VirtioBlockRateLimiterStateError::InvalidBandwidthBucket,
+        )?;
+        let ops = restore_block_bucket_state(
+            config.and_then(DriveRateLimiterConfig::ops),
+            state.ops(),
+            now,
+            VirtioBlockRateLimiterStateError::MissingOpsBucket,
+            VirtioBlockRateLimiterStateError::UnexpectedOpsBucket,
+            VirtioBlockRateLimiterStateError::InvalidOpsBucket,
+        )?;
+
+        if bandwidth.is_none() && ops.is_none() {
+            Ok(None)
+        } else {
+            Ok(Some(Self { bandwidth, ops }))
         }
     }
 
@@ -2850,6 +3587,50 @@ impl VirtioBlockRateLimiter {
     }
 }
 
+fn capture_block_bucket_state(
+    config: Option<DriveTokenBucketConfig>,
+    bucket: Option<&TokenBucket>,
+    now: Instant,
+    missing: VirtioBlockRateLimiterStateError,
+    unexpected: VirtioBlockRateLimiterStateError,
+    invalid: VirtioBlockRateLimiterStateError,
+) -> Result<Option<VirtioBlockTokenBucketState>, VirtioBlockRateLimiterStateError> {
+    match (config, bucket) {
+        (Some(config), Some(bucket)) if config.is_enabled() => bucket
+            .persisted_state_at(config.token_bucket_config(), now)
+            .map(VirtioBlockTokenBucketState::from_persisted)
+            .map(Some)
+            .map_err(|_| invalid),
+        (Some(config), None) if config.is_enabled() => Err(missing),
+        (Some(config), Some(_)) if !config.is_enabled() => Err(unexpected),
+        (Some(_), None) | (None, None) => Ok(None),
+        (None, Some(_)) => Err(unexpected),
+        (Some(_), Some(_)) => Err(invalid),
+    }
+}
+
+fn restore_block_bucket_state(
+    config: Option<DriveTokenBucketConfig>,
+    state: Option<VirtioBlockTokenBucketState>,
+    now: Instant,
+    missing: VirtioBlockRateLimiterStateError,
+    unexpected: VirtioBlockRateLimiterStateError,
+    invalid: VirtioBlockRateLimiterStateError,
+) -> Result<Option<TokenBucket>, VirtioBlockRateLimiterStateError> {
+    match (config, state) {
+        (Some(config), Some(state)) if config.is_enabled() && state.config() == config => {
+            TokenBucket::from_persisted_state_at(state.into_persisted(), now)
+                .map(Some)
+                .map_err(|_: PersistedTokenBucketStateError| invalid)
+        }
+        (Some(config), None) if config.is_enabled() => Err(missing),
+        (Some(config), Some(_)) if !config.is_enabled() => Err(unexpected),
+        (Some(_), None) | (None, None) => Ok(None),
+        (None, Some(_)) => Err(unexpected),
+        (Some(_), Some(_)) => Err(invalid),
+    }
+}
+
 fn update_runtime_token_bucket(
     bucket: &mut Option<TokenBucket>,
     update: Option<DriveTokenBucketConfig>,
@@ -2882,6 +3663,20 @@ impl VirtioBlockDevice {
         self
     }
 
+    pub(crate) fn from_snapshot_parts(
+        backing: BlockFileBacking,
+        device_id: VirtioBlockDeviceId,
+        active_queue: Option<VirtioBlockQueue>,
+        rate_limiter: Option<VirtioBlockRateLimiter>,
+    ) -> Self {
+        Self {
+            backing,
+            device_id,
+            active_queue,
+            rate_limiter,
+        }
+    }
+
     pub fn backing(&self) -> &BlockFileBacking {
         &self.backing
     }
@@ -2907,6 +3702,14 @@ impl VirtioBlockDevice {
 
     pub fn rate_limiter(&self) -> Option<&VirtioBlockRateLimiter> {
         self.rate_limiter.as_ref()
+    }
+
+    pub fn snapshot_rate_limiter_state_at(
+        &self,
+        config: Option<DriveRateLimiterConfig>,
+        now: Instant,
+    ) -> Result<VirtioBlockRateLimiterState, VirtioBlockRateLimiterStateError> {
+        VirtioBlockRateLimiter::persisted_state_at(config, self.rate_limiter.as_ref(), now)
     }
 
     pub fn is_activated(&self) -> bool {
@@ -3569,6 +4372,26 @@ impl std::error::Error for BlockMmioRegistrationError {
 }
 
 impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockDevice> {
+    pub fn snapshot_block_runtime_state_at(
+        &self,
+        rate_limiter_config: Option<DriveRateLimiterConfig>,
+        now: Instant,
+    ) -> Result<VirtioBlockRuntimeState, VirtioBlockRuntimeStateError> {
+        let transport = self.transport_state();
+        let activation = self.activation_handler();
+        self.validate_transport_state(&transport, activation.is_activated())
+            .map_err(|_: VirtioMmioTransportStateError| VirtioBlockRuntimeStateError::Transport)?;
+        let active_queue = activation
+            .active_queue()
+            .map(VirtioBlockQueue::snapshot_state);
+        let rate_limiter = activation
+            .snapshot_rate_limiter_state_at(rate_limiter_config, now)
+            .map_err(|_| VirtioBlockRuntimeStateError::RateLimiter)?;
+        let state = VirtioBlockRuntimeState::new(transport, active_queue, rate_limiter);
+        validate_native_v1_block_runtime_shape(&state)?;
+        Ok(state)
+    }
+
     pub fn dispatch_block_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
@@ -3869,20 +4692,21 @@ mod tests {
         BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
         DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveRateLimiterConfig,
         DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput, PreparedBlockDeviceError,
-        PreparedBlockDevices, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID,
-        VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
-        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
-        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
-        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
-        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
-        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
-        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace, VirtioBlockDevice,
-        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
-        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError,
-        VirtioBlockRateLimiter, VirtioBlockRequest, VirtioBlockRequestCompletion,
-        VirtioBlockRequestError, VirtioBlockRequestExecutionError,
-        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
+        PreparedBlockDevices, SnapshotBlockFileBackingError, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE,
+        VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY,
+        VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE,
+        VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
+        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
+        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
+        VIRTIO_BLOCK_STATUS_SIZE, VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace,
+        VirtioBlockDevice, VirtioBlockDeviceActivationError, VirtioBlockDeviceId,
+        VirtioBlockDeviceNotificationError, VirtioBlockQueue, VirtioBlockQueueBuildError,
+        VirtioBlockQueueDispatchError, VirtioBlockQueueSnapshotError, VirtioBlockRateLimiter,
+        VirtioBlockRequest, VirtioBlockRequestCompletion, VirtioBlockRequestError,
+        VirtioBlockRequestExecutionError, VirtioBlockRequestExecutionOutcome,
+        VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -9176,5 +10000,130 @@ mod tests {
             "failed to open block backing file: denied"
         );
         assert!(open.source().is_some());
+    }
+
+    #[test]
+    fn snapshot_backing_open_is_nofollow_and_identity_is_descriptor_based() {
+        let file = temp_file("snapshot-backing.img", &[0x5a; 512]);
+        let directory = temp_dir("snapshot-backing-dir");
+        let fifo = temp_fifo("snapshot-backing-fifo");
+        let (socket, _listener) = temp_socket("snapshot-backing-socket");
+        let link = TempPath {
+            path: temp_path("snapshot-backing-link.img"),
+        };
+        std::os::unix::fs::symlink(file.as_path(), link.as_path())
+            .expect("test symlink should be created");
+
+        let (backing, identity) = BlockFileBacking::open_snapshot_read_only(file.as_path())
+            .expect("regular snapshot backing should open");
+        assert!(backing.is_read_only());
+        assert_eq!(backing.len(), 512);
+        assert_eq!(
+            backing
+                .snapshot_identity()
+                .expect("opened descriptor identity should read"),
+            identity
+        );
+        assert_eq!(
+            BlockFileBacking::open_snapshot_read_only(link.as_path())
+                .expect_err("snapshot backing symlink should reject"),
+            SnapshotBlockFileBackingError::Open
+        );
+        for unsupported in [directory.as_path(), fifo.as_path(), socket.as_path()] {
+            let error = BlockFileBacking::open_snapshot_read_only(unsupported)
+                .expect_err("non-regular snapshot backing should reject");
+            assert!(matches!(
+                error,
+                SnapshotBlockFileBackingError::Open | SnapshotBlockFileBackingError::NonRegularFile
+            ));
+            assert!(
+                !error
+                    .to_string()
+                    .contains(unsupported.to_string_lossy().as_ref())
+            );
+        }
+        assert!(!format!("{identity:?}").contains(file.as_path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn block_queue_snapshot_validation_checks_cursors_retry_and_overlap() {
+        let mut memory = request_memory();
+        let queue = block_queue();
+        queue
+            .validate_snapshot_state(&memory, false)
+            .expect("empty queue snapshot should validate");
+        assert_eq!(
+            queue
+                .validate_snapshot_state(&memory, true)
+                .expect_err("retry without a pending descriptor should reject"),
+            VirtioBlockQueueSnapshotError::RetryWithoutPendingDescriptor
+        );
+
+        write_available_heads(&mut memory, &[0]);
+        queue
+            .validate_snapshot_state(&memory, true)
+            .expect("retry with a pending descriptor should validate");
+
+        let overlapping = VirtioBlockQueue::new(
+            VirtqueueAvailableRing::new(
+                TEST_DESCRIPTOR_TABLE,
+                TEST_DESCRIPTOR_TABLE,
+                TEST_QUEUE_SIZE,
+            )
+            .expect("overlapping ring addresses remain structurally aligned"),
+            VirtqueueUsedRing::new(TEST_USED_RING, TEST_QUEUE_SIZE)
+                .expect("used ring should build"),
+        );
+        assert_eq!(
+            overlapping
+                .validate_snapshot_state(&memory, false)
+                .expect_err("overlapping queue ranges should reject"),
+            VirtioBlockQueueSnapshotError::QueueRangesOverlap
+        );
+    }
+
+    #[test]
+    fn block_rate_limiter_persisted_state_round_trips_at_injected_time() {
+        let origin = Instant::now();
+        let config =
+            DriveRateLimiterConfig::new(None, Some(DriveTokenBucketConfig::new(4, Some(1), 100)));
+        let mut limiter = VirtioBlockRateLimiter::new_at(config, origin)
+            .expect("configured limiter should build");
+        let ops = limiter.ops.as_mut().expect("ops bucket should exist");
+        assert!(ops.reduce_at(1, origin));
+        assert!(ops.reduce_at(2, origin));
+        let capture_now = origin + Duration::from_millis(25);
+
+        let state =
+            VirtioBlockRateLimiter::persisted_state_at(Some(config), Some(&limiter), capture_now)
+                .expect("limiter should capture");
+        let restored = VirtioBlockRateLimiter::from_persisted_state_at(
+            Some(config),
+            state,
+            origin + Duration::from_secs(5),
+        )
+        .expect("limiter should restore")
+        .expect("restored limiter should remain enabled");
+        let restored_state = VirtioBlockRateLimiter::persisted_state_at(
+            Some(config),
+            Some(&restored),
+            origin + Duration::from_secs(5),
+        )
+        .expect("restored limiter should recapture");
+
+        assert_eq!(
+            restored_state
+                .ops()
+                .expect("restored ops state should exist")
+                .budget(),
+            2
+        );
+        assert_eq!(
+            restored_state
+                .ops()
+                .expect("restored ops state should exist")
+                .age_nanos(),
+            25_000_000
+        );
     }
 }

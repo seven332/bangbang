@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use bangbang_runtime::balloon::{
     BalloonMmioLayout, BalloonUpdateError, VirtioBalloonDeviceNotificationError,
 };
-use bangbang_runtime::block::BlockMmioLayout;
+use bangbang_runtime::block::{BlockMmioLayout, DriveConfig};
 use bangbang_runtime::boot_timer::{
     BootTimerMmioLayout, BootTimerMmioRegistrationError, register_boot_timer_mmio,
 };
@@ -37,7 +37,8 @@ use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::pmem::{PmemMmioLayout, VirtioPmemFlushStatus};
 use bangbang_runtime::rtc::RtcMmioLayout;
-use bangbang_runtime::serial::SharedSerialOutput;
+use bangbang_runtime::serial::{SerialConfig, SharedSerialOutput};
+use bangbang_runtime::snapshot_device::{SnapshotV1BlockRetryState, SnapshotV1DeviceState};
 use bangbang_runtime::startup::{
     Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
     Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatch,
@@ -557,8 +558,162 @@ impl Drop for HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard {
 #[derive(Debug)]
 #[must_use = "dropping the guard resumes limiter retry wakeup publication"]
 pub struct HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
-    _block: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
+    block: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
     _entropy: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
+}
+
+impl HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
+    pub fn block_retry_state_at(
+        &self,
+        now: Instant,
+    ) -> Result<SnapshotV1BlockRetryState, HvfArm64BootLimiterRetrySnapshotError> {
+        snapshot_limiter_retry_state_at(&self.block, now)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64BootLimiterRetrySnapshotError {
+    Poisoned,
+    NotQuiesced,
+    Stopped,
+    PublicationInFlight,
+    DurationOverflow,
+}
+
+impl fmt::Display for HvfArm64BootLimiterRetrySnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Poisoned => f.write_str("limiter retry snapshot state is poisoned"),
+            Self::NotQuiesced => f.write_str("limiter retry snapshot is not quiesced"),
+            Self::Stopped => f.write_str("limiter retry snapshot scheduler is stopped"),
+            Self::PublicationInFlight => {
+                f.write_str("limiter retry snapshot publication is in flight")
+            }
+            Self::DurationOverflow => {
+                f.write_str("limiter retry snapshot duration is out of bounds")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootLimiterRetrySnapshotError {}
+
+fn snapshot_limiter_retry_state_at(
+    guard: &HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
+    now: Instant,
+) -> Result<SnapshotV1BlockRetryState, HvfArm64BootLimiterRetrySnapshotError> {
+    let state = guard
+        .shared
+        .state
+        .lock()
+        .map_err(|_| HvfArm64BootLimiterRetrySnapshotError::Poisoned)?;
+    match state.status {
+        HvfArm64BootLimiterRetryWakeupSchedulerStatus::Running => {
+            return Err(HvfArm64BootLimiterRetrySnapshotError::NotQuiesced);
+        }
+        HvfArm64BootLimiterRetryWakeupSchedulerStatus::Stopped => {
+            return Err(HvfArm64BootLimiterRetrySnapshotError::Stopped);
+        }
+        HvfArm64BootLimiterRetryWakeupSchedulerStatus::Quiesced => {}
+    }
+    if state.publication_in_flight {
+        return Err(HvfArm64BootLimiterRetrySnapshotError::PublicationInFlight);
+    }
+    if state.deferred_publication {
+        return Ok(SnapshotV1BlockRetryState::Immediate);
+    }
+    let Some(deadline) = state.deadline else {
+        return Ok(SnapshotV1BlockRetryState::None);
+    };
+    let Some(remaining) = deadline.checked_duration_since(now) else {
+        return Ok(SnapshotV1BlockRetryState::Immediate);
+    };
+    let remaining_nanos = u64::try_from(remaining.as_nanos())
+        .map_err(|_| HvfArm64BootLimiterRetrySnapshotError::DurationOverflow)?;
+    if remaining_nanos == 0 {
+        Ok(SnapshotV1BlockRetryState::Immediate)
+    } else {
+        Ok(SnapshotV1BlockRetryState::After { remaining_nanos })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64BootSnapshotV1DeviceCaptureError {
+    WrongQuiescenceGuard,
+    RetryState,
+    GuestMemory,
+    MmioDispatcherBusy,
+    MmioDispatcherPoisoned,
+    RuntimeCapture,
+}
+
+impl fmt::Display for HvfArm64BootSnapshotV1DeviceCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongQuiescenceGuard => {
+                f.write_str("snapshot device capture quiescence guard belongs to another session")
+            }
+            Self::RetryState => f.write_str("snapshot device retry-state capture failed"),
+            Self::GuestMemory => f.write_str("snapshot device guest memory is unavailable"),
+            Self::MmioDispatcherBusy => f.write_str("snapshot device MMIO dispatcher is busy"),
+            Self::MmioDispatcherPoisoned => {
+                f.write_str("snapshot device MMIO dispatcher is poisoned")
+            }
+            Self::RuntimeCapture => f.write_str("snapshot device runtime capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootSnapshotV1DeviceCaptureError {}
+
+struct HvfArm64BootSnapshotV1DeviceCaptureOwners<'a> {
+    backend: &'a HvfBackend,
+    mmio_dispatcher: &'a Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &'a Arm64BootRuntimeResources,
+    block_retry_wakeup_scheduler: &'a HvfArm64BootLimiterRetryWakeupScheduler,
+}
+
+impl HvfArm64BootSnapshotV1DeviceCaptureOwners<'_> {
+    fn capture_at(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<SnapshotV1DeviceState, HvfArm64BootSnapshotV1DeviceCaptureError> {
+        if !Arc::ptr_eq(
+            &guard.block.shared,
+            &self.block_retry_wakeup_scheduler.shared,
+        ) {
+            return Err(HvfArm64BootSnapshotV1DeviceCaptureError::WrongQuiescenceGuard);
+        }
+        let block_retry = guard
+            .block_retry_state_at(now)
+            .map_err(|_| HvfArm64BootSnapshotV1DeviceCaptureError::RetryState)?;
+        let memory = self
+            .backend
+            .mapped_guest_memory()
+            .map_err(|_| HvfArm64BootSnapshotV1DeviceCaptureError::GuestMemory)?;
+        let mut mmio_dispatcher =
+            lock_boot_mmio_dispatcher(self.mmio_dispatcher).map_err(|error| match error {
+                HvfArm64BootMmioDispatcherError::Busy => {
+                    HvfArm64BootSnapshotV1DeviceCaptureError::MmioDispatcherBusy
+                }
+                HvfArm64BootMmioDispatcherError::Poisoned => {
+                    HvfArm64BootSnapshotV1DeviceCaptureError::MmioDispatcherPoisoned
+                }
+            })?;
+        self.runtime_resources
+            .capture_snapshot_v1_device_state_at(
+                memory,
+                &mut mmio_dispatcher,
+                drive_config,
+                serial_config,
+                block_retry,
+                now,
+            )
+            .map_err(|_| HvfArm64BootSnapshotV1DeviceCaptureError::RuntimeCapture)
+    }
 }
 
 /// Describes why a boot session could not quiesce its limiter retry wakeups.
@@ -627,7 +782,7 @@ fn quiesce_limiter_retry_wakeups(
     }
 
     Ok(HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
-        _block: block,
+        block,
         _entropy: entropy,
     })
 }
@@ -1050,6 +1205,22 @@ impl HvfArm64BootSession<'_> {
             &self.entropy_retry_wakeup,
             &self.entropy_retry_wakeup_scheduler,
         )
+    }
+
+    pub fn capture_snapshot_v1_device_state_at(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<SnapshotV1DeviceState, HvfArm64BootSnapshotV1DeviceCaptureError> {
+        HvfArm64BootSnapshotV1DeviceCaptureOwners {
+            backend: self.backend,
+            mmio_dispatcher: &self.mmio_dispatcher,
+            runtime_resources: &self.runtime_resources,
+            block_retry_wakeup_scheduler: &self.block_retry_wakeup_scheduler,
+        }
+        .capture_at(drive_config, serial_config, guard, now)
     }
 
     pub fn shutdown(&mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
@@ -2139,6 +2310,22 @@ impl OwnedHvfArm64BootSession {
             &self.entropy_retry_wakeup,
             &self.entropy_retry_wakeup_scheduler,
         )
+    }
+
+    pub fn capture_snapshot_v1_device_state_at(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<SnapshotV1DeviceState, HvfArm64BootSnapshotV1DeviceCaptureError> {
+        HvfArm64BootSnapshotV1DeviceCaptureOwners {
+            backend: &self.backend,
+            mmio_dispatcher: &self.mmio_dispatcher,
+            runtime_resources: &self.runtime_resources,
+            block_retry_wakeup_scheduler: &self.block_retry_wakeup_scheduler,
+        }
+        .capture_at(drive_config, serial_config, guard, now)
     }
 
     pub fn shutdown(&mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
@@ -6780,7 +6967,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::balloon::{
@@ -6837,6 +7024,7 @@ mod tests {
     };
     use bangbang_runtime::rtc::RtcMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
+    use bangbang_runtime::snapshot_device::SnapshotV1BlockRetryState;
     use bangbang_runtime::startup::{
         ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonNotificationDispatches,
         Arm64BootBlockNotificationDispatches, Arm64BootEntropyDeviceConfig,
@@ -6866,8 +7054,8 @@ mod tests {
         HvfArm64BootBalloonDeviceConfig, HvfArm64BootBalloonNotificationDispatchError,
         HvfArm64BootBlockNotificationDispatchError, HvfArm64BootEntropyDeviceConfig,
         HvfArm64BootEntropyNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
-        HvfArm64BootInterruptRequest, HvfArm64BootLimiterRetryWakeupQuiescenceError,
-        HvfArm64BootLimiterRetryWakeupScheduler,
+        HvfArm64BootInterruptRequest, HvfArm64BootLimiterRetrySnapshotError,
+        HvfArm64BootLimiterRetryWakeupQuiescenceError, HvfArm64BootLimiterRetryWakeupScheduler,
         HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceError,
         HvfArm64BootLimiterRetryWakeupSchedulerStatus, HvfArm64BootLimiterRetryWakeupToken,
         HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootMemoryHotplugNotificationDispatchError,
@@ -6886,7 +7074,7 @@ mod tests {
         run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
         signal_network_queue_interrupts, signal_pmem_queue_interrupts,
-        signal_vsock_queue_interrupts, validate_single_vcpu,
+        signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at, validate_single_vcpu,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -7088,6 +7276,62 @@ mod tests {
         while state.publication_in_flight {
             state = super::wait_limiter_retry_wakeup_state(&scheduler.shared, state);
         }
+    }
+
+    #[test]
+    fn limiter_retry_snapshot_uses_injected_deadline_without_mutation() {
+        let scheduler = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let now = Instant::now();
+        {
+            let mut state = super::lock_limiter_retry_wakeup_state(&scheduler.shared);
+            state.deadline = now.checked_add(Duration::from_millis(25));
+        }
+        let guard = scheduler.quiesce().expect("scheduler should quiesce");
+
+        assert_eq!(
+            snapshot_limiter_retry_state_at(&guard, now).expect("future deadline should snapshot"),
+            SnapshotV1BlockRetryState::After {
+                remaining_nanos: 25_000_000,
+            }
+        );
+        assert_eq!(
+            snapshot_limiter_retry_state_at(&guard, now + Duration::from_millis(25))
+                .expect("due deadline should snapshot"),
+            SnapshotV1BlockRetryState::Immediate
+        );
+        let state = super::lock_limiter_retry_wakeup_state(&scheduler.shared);
+        assert_eq!(state.deadline, now.checked_add(Duration::from_millis(25)));
+        drop(state);
+        drop(guard);
+    }
+
+    #[test]
+    fn limiter_retry_snapshot_prioritizes_deferred_work_and_rejects_in_flight() {
+        let scheduler = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let now = Instant::now();
+        {
+            let mut state = super::lock_limiter_retry_wakeup_state(&scheduler.shared);
+            state.deferred_publication = true;
+        }
+        let guard = scheduler.quiesce().expect("scheduler should quiesce");
+        assert_eq!(
+            snapshot_limiter_retry_state_at(&guard, now).expect("deferred retry should snapshot"),
+            SnapshotV1BlockRetryState::Immediate
+        );
+        {
+            let mut state = super::lock_limiter_retry_wakeup_state(&scheduler.shared);
+            state.publication_in_flight = true;
+        }
+        assert_eq!(
+            snapshot_limiter_retry_state_at(&guard, now)
+                .expect_err("in-flight publication should reject"),
+            HvfArm64BootLimiterRetrySnapshotError::PublicationInFlight
+        );
+        {
+            let mut state = super::lock_limiter_retry_wakeup_state(&scheduler.shared);
+            state.publication_in_flight = false;
+        }
+        drop(guard);
     }
 
     #[test]

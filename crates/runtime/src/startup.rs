@@ -3,7 +3,7 @@
 use std::collections::TryReserveError;
 use std::fmt;
 use std::os::fd::RawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::VmmController;
 use crate::balloon::{
@@ -16,9 +16,10 @@ use crate::balloon::{
 };
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
-    DriveConfig, DriveRateLimiterConfig, DriveUpdateError, PreparedBlockDeviceError,
-    PreparedBlockDevices, VirtioBlockDeviceNotificationDispatch,
-    VirtioBlockDeviceNotificationError, VirtioBlockMmioHandler,
+    DriveConfig, DriveConfigInput, DriveIoEngine, DriveRateLimiterConfig, DriveUpdateError,
+    PreparedBlockDeviceError, PreparedBlockDevices, VirtioBlockConfigSpace, VirtioBlockDeviceId,
+    VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
+    VirtioBlockMmioHandler, VirtioBlockRuntimeRestoreInput,
 };
 use crate::boot::{
     BootCommandLineError, BootSource, BootSourceConfig, BootSourceLoadError, LoadedBootSource,
@@ -65,7 +66,15 @@ use crate::pmem::{
     VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus, VirtioPmemMmioHandler,
 };
 use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
-use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutput};
+use crate::serial::{
+    SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialMmioDevice, SharedSerialOutput,
+    SharedSerialOutputBuffer,
+};
+use crate::snapshot_device::{
+    SnapshotV1BlockRetryState, SnapshotV1DeviceCaptureInput, SnapshotV1DeviceState,
+    SnapshotV1MmioDeviceMetadata, SnapshotV1PlatformDeviceMetadata,
+    capture_snapshot_v1_device_state, validate_mmio_metadata, validate_platform_metadata,
+};
 use crate::vsock::{
     PreparedVsockDevice, PreparedVsockDeviceError, VirtioVsockDeviceNotificationDispatch,
     VirtioVsockDeviceNotificationError, VirtioVsockMmioHandler, VsockMmioDeviceRegistration,
@@ -342,6 +351,328 @@ fn replace_arm64_boot_vmgenid_with(
 pub struct Arm64BootVmClockDevice {
     pub range: GuestMemoryRange,
     pub fdt_device: Arm64FdtVmClockDevice,
+}
+
+pub struct PreparedSnapshotV1DeviceProfile {
+    drive_config: DriveConfig,
+    block_handler: VirtioBlockMmioHandler,
+    block_mmio: SnapshotV1MmioDeviceMetadata,
+    block_retry: SnapshotV1BlockRetryState,
+    serial_handler: SerialMmioDevice<SharedSerialOutput>,
+    serial_output_buffer: SharedSerialOutputBuffer,
+    serial_mmio: SnapshotV1MmioDeviceMetadata,
+    vmgenid_device: Arm64BootVmGenIdDevice,
+    vmclock_device: Arm64BootVmClockDevice,
+}
+
+impl fmt::Debug for PreparedSnapshotV1DeviceProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedSnapshotV1DeviceProfile")
+            .field("profile", &"native-v1")
+            .field("resources", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PreparedSnapshotV1DeviceProfile {
+    pub const fn drive_config(&self) -> &DriveConfig {
+        &self.drive_config
+    }
+
+    pub const fn block_handler(&self) -> &VirtioBlockMmioHandler {
+        &self.block_handler
+    }
+
+    pub const fn block_mmio(&self) -> SnapshotV1MmioDeviceMetadata {
+        self.block_mmio
+    }
+
+    pub const fn block_retry(&self) -> SnapshotV1BlockRetryState {
+        self.block_retry
+    }
+
+    pub const fn serial_handler(&self) -> &SerialMmioDevice<SharedSerialOutput> {
+        &self.serial_handler
+    }
+
+    pub const fn serial_output_buffer(&self) -> &SharedSerialOutputBuffer {
+        &self.serial_output_buffer
+    }
+
+    pub const fn serial_mmio(&self) -> SnapshotV1MmioDeviceMetadata {
+        self.serial_mmio
+    }
+
+    pub const fn vmgenid_device(&self) -> &Arm64BootVmGenIdDevice {
+        &self.vmgenid_device
+    }
+
+    pub const fn vmclock_device(&self) -> &Arm64BootVmClockDevice {
+        &self.vmclock_device
+    }
+
+    pub fn into_parts(self) -> PreparedSnapshotV1DeviceProfileParts {
+        PreparedSnapshotV1DeviceProfileParts {
+            drive_config: self.drive_config,
+            block_handler: self.block_handler,
+            block_mmio: self.block_mmio,
+            block_retry: self.block_retry,
+            serial_handler: self.serial_handler,
+            serial_output_buffer: self.serial_output_buffer,
+            serial_mmio: self.serial_mmio,
+            vmgenid_device: self.vmgenid_device,
+            vmclock_device: self.vmclock_device,
+        }
+    }
+}
+
+pub struct PreparedSnapshotV1DeviceProfileParts {
+    pub drive_config: DriveConfig,
+    pub block_handler: VirtioBlockMmioHandler,
+    pub block_mmio: SnapshotV1MmioDeviceMetadata,
+    pub block_retry: SnapshotV1BlockRetryState,
+    pub serial_handler: SerialMmioDevice<SharedSerialOutput>,
+    pub serial_output_buffer: SharedSerialOutputBuffer,
+    pub serial_mmio: SnapshotV1MmioDeviceMetadata,
+    pub vmgenid_device: Arm64BootVmGenIdDevice,
+    pub vmclock_device: Arm64BootVmClockDevice,
+}
+
+impl fmt::Debug for PreparedSnapshotV1DeviceProfileParts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedSnapshotV1DeviceProfileParts")
+            .field("resources", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareSnapshotV1DeviceProfileError {
+    InvalidDriveConfig,
+    InvalidBlockMetadata,
+    InvalidSerialMetadata,
+    InvalidVmGenIdMetadata,
+    InvalidVmClockMetadata,
+    OverlappingMetadata,
+    ConflictingMetadata,
+    BlockBacking,
+    BlockBackingMismatch,
+    BlockCapacityMismatch,
+    BlockDeviceIdMismatch,
+    BlockRuntime,
+    InvalidRetry,
+    ReadVmGenId,
+}
+
+impl fmt::Display for PrepareSnapshotV1DeviceProfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDriveConfig => {
+                f.write_str("native-v1 prepared drive configuration is invalid")
+            }
+            Self::InvalidBlockMetadata => {
+                f.write_str("native-v1 prepared block metadata is invalid")
+            }
+            Self::InvalidSerialMetadata => {
+                f.write_str("native-v1 prepared serial metadata is invalid")
+            }
+            Self::InvalidVmGenIdMetadata => {
+                f.write_str("native-v1 prepared VMGenID metadata is invalid")
+            }
+            Self::InvalidVmClockMetadata => {
+                f.write_str("native-v1 prepared VMClock metadata is invalid")
+            }
+            Self::OverlappingMetadata => f.write_str("native-v1 prepared device metadata overlaps"),
+            Self::ConflictingMetadata => {
+                f.write_str("native-v1 prepared device metadata conflicts")
+            }
+            Self::BlockBacking => f.write_str("native-v1 block backing preflight failed"),
+            Self::BlockBackingMismatch => {
+                f.write_str("native-v1 block backing identity does not match")
+            }
+            Self::BlockCapacityMismatch => {
+                f.write_str("native-v1 block backing capacity does not match")
+            }
+            Self::BlockDeviceIdMismatch => {
+                f.write_str("native-v1 block device ID does not match drive configuration")
+            }
+            Self::BlockRuntime => f.write_str("native-v1 block runtime restore is invalid"),
+            Self::InvalidRetry => f.write_str("native-v1 block retry state is invalid"),
+            Self::ReadVmGenId => f.write_str("native-v1 source VMGenID could not be retained"),
+        }
+    }
+}
+
+impl std::error::Error for PrepareSnapshotV1DeviceProfileError {}
+
+pub fn prepare_snapshot_v1_device_profile(
+    state: &SnapshotV1DeviceState,
+    memory: &GuestMemory,
+    now: Instant,
+) -> Result<PreparedSnapshotV1DeviceProfile, PrepareSnapshotV1DeviceProfileError> {
+    let root = state.root_block();
+    let drive_config = snapshot_v1_drive_config(root)?;
+    validate_mmio_metadata(
+        root.mmio(),
+        crate::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+    )
+    .map_err(|_| PrepareSnapshotV1DeviceProfileError::InvalidBlockMetadata)?;
+    validate_mmio_metadata(state.serial_mmio(), SERIAL_MMIO_DEVICE_WINDOW_SIZE)
+        .map_err(|_| PrepareSnapshotV1DeviceProfileError::InvalidSerialMetadata)?;
+    validate_platform_metadata(state.vmgenid(), ARM64_FDT_VMGENID_SIZE, memory)
+        .map_err(|_| PrepareSnapshotV1DeviceProfileError::InvalidVmGenIdMetadata)?;
+    validate_platform_metadata(state.vmclock(), ARM64_FDT_VMCLOCK_SIZE, memory)
+        .map_err(|_| PrepareSnapshotV1DeviceProfileError::InvalidVmClockMetadata)?;
+    let expected_vmclock = aarch64::SYSTEM_MEM_START
+        .checked_add(aarch64::SYSTEM_MEM_SIZE)
+        .and_then(|end| end.checked_sub(ARM64_FDT_VMCLOCK_SIZE))
+        .ok_or(PrepareSnapshotV1DeviceProfileError::InvalidVmClockMetadata)?;
+    let expected_vmgenid = expected_vmclock
+        .checked_sub(ARM64_FDT_VMGENID_SIZE)
+        .ok_or(PrepareSnapshotV1DeviceProfileError::InvalidVmGenIdMetadata)?;
+    if state.vmgenid().range().start().raw_value() != expected_vmgenid {
+        return Err(PrepareSnapshotV1DeviceProfileError::InvalidVmGenIdMetadata);
+    }
+    if state.vmclock().range().start().raw_value() != expected_vmclock {
+        return Err(PrepareSnapshotV1DeviceProfileError::InvalidVmClockMetadata);
+    }
+    validate_snapshot_v1_metadata_nonoverlap(state, memory)?;
+
+    if matches!(
+        state.block_retry(),
+        SnapshotV1BlockRetryState::After { remaining_nanos: 0 }
+    ) {
+        return Err(PrepareSnapshotV1DeviceProfileError::InvalidRetry);
+    }
+
+    let (backing, backing_identity) = BlockFileBacking::open_snapshot_read_only(root.path())
+        .map_err(|_| PrepareSnapshotV1DeviceProfileError::BlockBacking)?;
+    if backing_identity != root.backing_identity() {
+        return Err(PrepareSnapshotV1DeviceProfileError::BlockBackingMismatch);
+    }
+    let config_space = VirtioBlockConfigSpace::from_backing(&backing, root.cache_type());
+    if config_space.capacity_sectors() != root.capacity_sectors() {
+        return Err(PrepareSnapshotV1DeviceProfileError::BlockCapacityMismatch);
+    }
+    let expected_device_id = VirtioBlockDeviceId::from_bytes(root.drive_id().as_bytes());
+    if expected_device_id != root.device_id() {
+        return Err(PrepareSnapshotV1DeviceProfileError::BlockDeviceIdMismatch);
+    }
+    let block_handler = root
+        .runtime()
+        .restore_handler(VirtioBlockRuntimeRestoreInput {
+            backing,
+            device_id: root.device_id(),
+            config_space,
+            rate_limiter_config: root.rate_limiter_config(),
+            memory,
+            has_retry: state.block_retry().has_retry(),
+            now,
+        })
+        .map_err(|_| PrepareSnapshotV1DeviceProfileError::BlockRuntime)?;
+
+    let serial_output_buffer = SharedSerialOutputBuffer::default();
+    let serial_output = SharedSerialOutput::from(serial_output_buffer.clone());
+    let serial_handler = SerialMmioDevice::from_state(serial_output, state.serial_state());
+
+    let mut generation_id = [0; ARM64_BOOT_VMGENID_SIZE];
+    memory
+        .read_slice(&mut generation_id, state.vmgenid().range().start())
+        .map_err(|_| PrepareSnapshotV1DeviceProfileError::ReadVmGenId)?;
+    let vmgenid_device = Arm64BootVmGenIdDevice {
+        range: state.vmgenid().range(),
+        generation_id,
+        fdt_device: Arm64FdtVmGenIdDevice {
+            region: state.vmgenid().fdt_region(),
+            interrupt_line: state.vmgenid().interrupt_line(),
+        },
+    };
+    let vmclock_device = Arm64BootVmClockDevice {
+        range: state.vmclock().range(),
+        fdt_device: Arm64FdtVmClockDevice {
+            region: state.vmclock().fdt_region(),
+            interrupt_line: state.vmclock().interrupt_line(),
+        },
+    };
+
+    Ok(PreparedSnapshotV1DeviceProfile {
+        drive_config,
+        block_handler,
+        block_mmio: root.mmio(),
+        block_retry: state.block_retry(),
+        serial_handler,
+        serial_output_buffer,
+        serial_mmio: state.serial_mmio(),
+        vmgenid_device,
+        vmclock_device,
+    })
+}
+
+fn snapshot_v1_drive_config(
+    root: &crate::snapshot_device::SnapshotV1RootBlockState,
+) -> Result<DriveConfig, PrepareSnapshotV1DeviceProfileError> {
+    let mut input = DriveConfigInput::new(
+        root.drive_id(),
+        root.drive_id(),
+        root.path().to_path_buf(),
+        true,
+    )
+    .with_is_read_only(true)
+    .with_cache_type(root.cache_type())
+    .with_io_engine(DriveIoEngine::Sync);
+    if let Some(partuuid) = root.partuuid() {
+        input = input.with_partuuid(partuuid);
+    }
+    if let Some(rate_limiter) = root.rate_limiter_config() {
+        input = input.with_rate_limiter(rate_limiter);
+    }
+    input
+        .validate()
+        .map_err(|_| PrepareSnapshotV1DeviceProfileError::InvalidDriveConfig)
+}
+
+fn validate_snapshot_v1_metadata_nonoverlap(
+    state: &SnapshotV1DeviceState,
+    memory: &GuestMemory,
+) -> Result<(), PrepareSnapshotV1DeviceProfileError> {
+    let block_metadata = state.root_block().mmio();
+    let serial_metadata = state.serial_mmio();
+    let block = block_metadata.region().range();
+    let serial = serial_metadata.region().range();
+    let vmgenid = state.vmgenid().range();
+    let vmclock = state.vmclock().range();
+    if block_metadata.region().id() == serial_metadata.region().id() {
+        return Err(PrepareSnapshotV1DeviceProfileError::ConflictingMetadata);
+    }
+    let interrupt_lines = [
+        block_metadata.interrupt_line(),
+        serial_metadata.interrupt_line(),
+        state.vmgenid().interrupt_line(),
+        state.vmclock().interrupt_line(),
+    ];
+    if interrupt_lines.iter().enumerate().any(|(index, line)| {
+        interrupt_lines
+            .iter()
+            .skip(index + 1)
+            .any(|other| other == line)
+    }) {
+        return Err(PrepareSnapshotV1DeviceProfileError::ConflictingMetadata);
+    }
+    if block.overlaps(serial)
+        || block.overlaps(vmgenid)
+        || block.overlaps(vmclock)
+        || serial.overlaps(vmgenid)
+        || serial.overlaps(vmclock)
+        || vmgenid.overlaps(vmclock)
+        || memory
+            .regions()
+            .iter()
+            .any(|region| region.range().overlaps(block) || region.range().overlaps(serial))
+    {
+        Err(PrepareSnapshotV1DeviceProfileError::OverlappingMetadata)
+    } else {
+        Ok(())
+    }
 }
 
 impl fmt::Display for Arm64BootVsockWakeupFdsError {
@@ -1486,7 +1817,113 @@ pub struct Arm64BootSerialDevice {
     pub fdt_device: Arm64FdtSerialDevice,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arm64BootSnapshotV1DeviceCaptureError {
+    UnsupportedInventory,
+    BlockMetadataMismatch,
+    SerialMetadataMismatch,
+    HandlerLookup,
+    Capture,
+}
+
+impl fmt::Display for Arm64BootSnapshotV1DeviceCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedInventory => {
+                f.write_str("arm64 boot runtime does not match the native-v1 device inventory")
+            }
+            Self::BlockMetadataMismatch => f.write_str("arm64 boot block metadata is inconsistent"),
+            Self::SerialMetadataMismatch => {
+                f.write_str("arm64 boot serial metadata is inconsistent")
+            }
+            Self::HandlerLookup => f.write_str("arm64 boot snapshot device handler lookup failed"),
+            Self::Capture => f.write_str("arm64 boot snapshot device capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootSnapshotV1DeviceCaptureError {}
+
 impl Arm64BootRuntimeResources {
+    pub fn capture_snapshot_v1_device_state_at(
+        &self,
+        memory: &GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        block_retry: SnapshotV1BlockRetryState,
+        now: Instant,
+    ) -> Result<SnapshotV1DeviceState, Arm64BootSnapshotV1DeviceCaptureError> {
+        if self.block_devices.len() != 1
+            || self.serial_device.is_none()
+            || !self.pmem_devices.is_empty()
+            || !self.pmem_mmio_devices.is_empty()
+            || !self.network_devices.is_empty()
+            || self.vsock_device.is_some()
+            || self.balloon_device.is_some()
+            || self.memory_hotplug_device.is_some()
+            || self.entropy_device.is_some()
+        {
+            return Err(Arm64BootSnapshotV1DeviceCaptureError::UnsupportedInventory);
+        }
+
+        let block = self
+            .block_devices
+            .first()
+            .ok_or(Arm64BootSnapshotV1DeviceCaptureError::UnsupportedInventory)?;
+        let block_region = block.registration.region();
+        if block.registration.drive_id() != drive_config.drive_id()
+            || block.fdt_device.region.base != block_region.range().start().raw_value()
+            || block.fdt_device.region.size != block_region.range().size()
+        {
+            return Err(Arm64BootSnapshotV1DeviceCaptureError::BlockMetadataMismatch);
+        }
+        let block_mmio =
+            SnapshotV1MmioDeviceMetadata::new(block_region, block.fdt_device.interrupt_line);
+
+        let serial = self
+            .serial_device
+            .as_ref()
+            .ok_or(Arm64BootSnapshotV1DeviceCaptureError::UnsupportedInventory)?;
+        if serial.fdt_device.region.base != serial.region.range().start().raw_value()
+            || serial.fdt_device.region.size != serial.region.range().size()
+        {
+            return Err(Arm64BootSnapshotV1DeviceCaptureError::SerialMetadataMismatch);
+        }
+        let serial_mmio =
+            SnapshotV1MmioDeviceMetadata::new(serial.region, serial.fdt_device.interrupt_line);
+        let serial_state = mmio_dispatcher
+            .handler_mut::<SerialMmioDevice<SharedSerialOutput>>(serial.region.id())
+            .map_err(|_| Arm64BootSnapshotV1DeviceCaptureError::HandlerLookup)?
+            .state();
+
+        let block_handler = mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(block.registration.region_id())
+            .map_err(|_| Arm64BootSnapshotV1DeviceCaptureError::HandlerLookup)?;
+        capture_snapshot_v1_device_state(SnapshotV1DeviceCaptureInput {
+            drive_config,
+            block_mmio,
+            block_handler,
+            block_retry,
+            serial_config,
+            serial_mmio,
+            serial_state,
+            vmgenid: SnapshotV1PlatformDeviceMetadata::new(
+                self.vmgenid_device.range,
+                self.vmgenid_device.fdt_device.region,
+                self.vmgenid_device.fdt_device.interrupt_line,
+            ),
+            vmclock: SnapshotV1PlatformDeviceMetadata::new(
+                self.vmclock_device.range,
+                self.vmclock_device.fdt_device.region,
+                self.vmclock_device.fdt_device.interrupt_line,
+            ),
+            memory,
+            now,
+        })
+        .map_err(|_| Arm64BootSnapshotV1DeviceCaptureError::Capture)
+    }
+
     pub fn update_block_device_backing(
         &self,
         mmio_dispatcher: &mut MmioDispatcher,
