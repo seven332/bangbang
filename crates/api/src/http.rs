@@ -266,13 +266,21 @@ enum ActionTypeBody {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuConfigRequest {
-    custom_template_configured: bool,
+    category: Option<CpuConfigTemplateCategory>,
 }
 
 impl CpuConfigRequest {
-    pub const fn custom_template_configured(&self) -> bool {
-        self.custom_template_configured
+    pub const fn category(&self) -> Option<CpuConfigTemplateCategory> {
+        self.category
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuConfigTemplateCategory {
+    KvmCapabilities,
+    VcpuFeatures,
+    ArmRegisterModifiers,
+    Mixed,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,10 +308,18 @@ impl CpuConfigRequestBody {
         Ok(())
     }
 
-    const fn custom_template_configured(&self) -> bool {
-        !(self.kvm_capabilities.is_empty()
-            && self.reg_modifiers.is_empty()
-            && self.vcpu_features.is_empty())
+    fn category(&self) -> Option<CpuConfigTemplateCategory> {
+        match (
+            self.kvm_capabilities.is_empty(),
+            self.reg_modifiers.is_empty(),
+            self.vcpu_features.is_empty(),
+        ) {
+            (true, true, true) => None,
+            (false, true, true) => Some(CpuConfigTemplateCategory::KvmCapabilities),
+            (true, false, true) => Some(CpuConfigTemplateCategory::ArmRegisterModifiers),
+            (true, true, false) => Some(CpuConfigTemplateCategory::VcpuFeatures),
+            _ => Some(CpuConfigTemplateCategory::Mixed),
+        }
     }
 }
 
@@ -2980,7 +2996,7 @@ fn parse_cpu_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
         .map_err(|()| RequestError::MalformedRequest)?;
 
     Ok(ApiRequest::PutCpuConfig(Box::new(CpuConfigRequest {
-        custom_template_configured: body.custom_template_configured(),
+        category: body.category(),
     })))
 }
 
@@ -6599,7 +6615,7 @@ mod tests {
         let ApiRequest::PutCpuConfig(config) = parsed else {
             panic!("expected cpu-config request");
         };
-        assert!(!config.custom_template_configured());
+        assert_eq!(config.category(), None);
     }
 
     #[test]
@@ -6615,11 +6631,60 @@ mod tests {
         let ApiRequest::PutCpuConfig(config) = parsed else {
             panic!("expected cpu-config request");
         };
-        assert!(!config.custom_template_configured());
+        assert_eq!(config.category(), None);
     }
 
     #[test]
-    fn parses_firecracker_shaped_cpu_config_request() {
+    fn classifies_firecracker_shaped_cpu_config_request_categories() {
+        for (body, expected) in [
+            (
+                r#"{"kvm_capabilities":["4294967295"]}"#,
+                CpuConfigTemplateCategory::KvmCapabilities,
+            ),
+            (
+                r#"{"reg_modifiers":[{"addr":"0x0030000000000000","bitmap":"0b10100101"}]}"#,
+                CpuConfigTemplateCategory::ArmRegisterModifiers,
+            ),
+            (
+                r#"{"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
+                CpuConfigTemplateCategory::VcpuFeatures,
+            ),
+            (
+                r#"{"kvm_capabilities":["4294967295"],"reg_modifiers":[{"addr":"0x0030000000000000","bitmap":"0b10100101"}]}"#,
+                CpuConfigTemplateCategory::Mixed,
+            ),
+            (
+                r#"{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
+                CpuConfigTemplateCategory::Mixed,
+            ),
+            (
+                r#"{"reg_modifiers":[{"addr":"0x0030000000000000","bitmap":"0b10100101"}],"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
+                CpuConfigTemplateCategory::Mixed,
+            ),
+        ] {
+            let request = request_with_body("PUT", "/cpu-config", body);
+            let parsed = parse_request(&request).expect("cpu-config should parse");
+
+            let ApiRequest::PutCpuConfig(config) = parsed else {
+                panic!("expected cpu-config request");
+            };
+            assert_eq!(config.category(), Some(expected), "{body}");
+
+            let debug = format!("{config:?}");
+            for raw_value in [
+                "4294967295",
+                "0x0030000000000000",
+                "0b10100101",
+                "31415926",
+                "0b11010011",
+            ] {
+                assert!(!debug.contains(raw_value), "{body}: {debug}");
+            }
+        }
+    }
+
+    #[test]
+    fn classifies_three_cpu_config_categories_as_mixed() {
         let body = r#"{
             "kvm_capabilities": ["1", "!2"],
             "reg_modifiers": [
@@ -6642,7 +6707,7 @@ mod tests {
         let ApiRequest::PutCpuConfig(config) = parsed else {
             panic!("expected cpu-config request");
         };
-        assert!(config.custom_template_configured());
+        assert_eq!(config.category(), Some(CpuConfigTemplateCategory::Mixed));
     }
 
     #[test]

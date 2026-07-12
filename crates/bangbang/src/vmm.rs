@@ -4945,7 +4945,7 @@ mod tests {
         DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput, PreparedBlockDevices,
     };
     use bangbang_runtime::boot::BootSourceConfigInput;
-    use bangbang_runtime::cpu::CpuConfigInput;
+    use bangbang_runtime::cpu::{CpuConfigInput, CpuConfigTemplateCategory};
     use bangbang_runtime::entropy::EntropyConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
@@ -7847,6 +7847,7 @@ mod tests {
             | VmmActionError::Lifecycle(_)
             | VmmActionError::MissingBootSource
             | VmmActionError::BootSourceConfig(_)
+            | VmmActionError::CpuConfig(_)
             | VmmActionError::DriveConfig(_)
             | VmmActionError::DriveUpdate(_)
             | VmmActionError::DriveUpdateUnsupported
@@ -11584,10 +11585,14 @@ mod tests {
         )))
         .expect("vsock should configure");
         assert_eq!(
-            vmm.handle_action(VmmAction::PutCpuConfig(
-                CpuConfigInput::with_custom_template()
-            )),
-            Err(VmmActionError::UnsupportedAction("PutCpuConfig"))
+            vmm.handle_action(VmmAction::PutCpuConfig(CpuConfigInput::with_category(
+                CpuConfigTemplateCategory::KvmCapabilities
+            ))),
+            Err(VmmActionError::CpuConfig(
+                bangbang_runtime::cpu::CpuConfigError::unsupported_on_hvf(
+                    CpuConfigTemplateCategory::KvmCapabilities
+                )
+            ))
         );
         assert_eq!(
             vmm.handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(

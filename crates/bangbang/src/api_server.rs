@@ -17,7 +17,8 @@ use bangbang_api::http::{
     ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse,
     BalloonHintingStartRequest, BalloonHintingStatusResponse, BalloonStatsResponse,
     BalloonStatsUpdateRequest, BalloonUpdateRequest, BootSourceRequest, BootSourceResponse,
-    CpuConfigRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
+    CpuConfigRequest, CpuConfigTemplateCategory as ApiCpuConfigTemplateCategory,
+    DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, DriveRateLimiterRequest,
     EntropyConfigRequest, EntropyConfigResponse, EntropyRateLimiterRequest,
     HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest, HttpResponse,
@@ -42,7 +43,9 @@ use bangbang_runtime::block::{
     DriveTokenBucketConfig, DriveUpdateInput,
 };
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
-use bangbang_runtime::cpu::CpuConfigInput;
+use bangbang_runtime::cpu::{
+    CpuConfigInput, CpuConfigTemplateCategory as RuntimeCpuConfigTemplateCategory,
+};
 use bangbang_runtime::entropy::{
     EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
 };
@@ -1215,7 +1218,18 @@ fn boot_source_input_from_request(config: &BootSourceRequest) -> BootSourceConfi
 }
 
 fn cpu_config_input_from_request(config: &CpuConfigRequest) -> CpuConfigInput {
-    CpuConfigInput::new(config.custom_template_configured())
+    CpuConfigInput::new(config.category().map(|category| match category {
+        ApiCpuConfigTemplateCategory::KvmCapabilities => {
+            RuntimeCpuConfigTemplateCategory::KvmCapabilities
+        }
+        ApiCpuConfigTemplateCategory::VcpuFeatures => {
+            RuntimeCpuConfigTemplateCategory::VcpuFeatures
+        }
+        ApiCpuConfigTemplateCategory::ArmRegisterModifiers => {
+            RuntimeCpuConfigTemplateCategory::ArmRegisterModifiers
+        }
+        ApiCpuConfigTemplateCategory::Mixed => RuntimeCpuConfigTemplateCategory::Mixed,
+    }))
 }
 
 fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
@@ -3734,7 +3748,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(
-            response.contains(r#"{"fault_message":"machine cpu_template V1N1 is not supported"}"#)
+            response.contains(r#"{"fault_message":"machine cpu_template V1N1 is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"}"#)
         );
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
@@ -3750,7 +3764,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(
-            response.contains(r#"{"fault_message":"machine cpu_template T2A is not supported"}"#)
+            response.contains(r#"{"fault_message":"machine cpu_template T2A is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"}"#)
         );
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
@@ -7037,24 +7051,65 @@ mod tests {
     }
 
     #[test]
-    fn not_started_state_rejects_custom_cpu_config_without_mutating() {
-        let mut vmm = test_controller();
-        let body = r#"{"kvm_capabilities":["1"]}"#;
-        let request = format!(
-            "PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
+    fn not_started_state_classifies_custom_cpu_config_without_mutating_or_leaking_values() {
+        for (socket_name, body, expected_fault, raw_values) in [
+            (
+                "cck",
+                r#"{"kvm_capabilities":["4294967295"]}"#,
+                r#"{"fault_message":"cpu-config kvm_capabilities are KVM-specific and are not supported on arm64 HVF"}"#,
+                &["4294967295"][..],
+            ),
+            (
+                "ccr",
+                r#"{"reg_modifiers":[{"addr":"0x0030000000000000","bitmap":"0b10100101"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers have no safe Firecracker-equivalent feature configuration on arm64 HVF"}"#,
+                &["0x0030000000000000", "0b10100101"][..],
+            ),
+            (
+                "ccf",
+                r#"{"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
+                r#"{"fault_message":"cpu-config vcpu_features are KVM vCPU-init-specific and are not supported on arm64 HVF"}"#,
+                &["31415926", "0b11010011"][..],
+            ),
+            (
+                "ccm",
+                r#"{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
+                r#"{"fault_message":"mixed cpu-config categories are KVM-specific and are not supported on arm64 HVF"}"#,
+                &["4294967295", "31415926", "0b11010011"][..],
+            ),
+        ] {
+            let mut vmm = test_controller();
+            let request = request_with_body("PUT", "/cpu-config", body);
 
-        let response = request_over_socket(&mut vmm, "cpu-cfg-custom", &request);
+            let response = request_over_socket(&mut vmm, socket_name, &request);
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(
-            r#"{"fault_message":"The requested operation is not supported: PutCpuConfig"}"#
-        ));
-        assert_eq!(
-            vmm.instance_info().state,
-            bangbang_runtime::InstanceState::NotStarted
-        );
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(
+                response.contains(expected_fault),
+                "{socket_name}: {response}"
+            );
+            for raw_value in raw_values {
+                assert!(!response.contains(raw_value), "{socket_name}: {response}");
+            }
+            assert_eq!(
+                vmm.instance_info().state,
+                bangbang_runtime::InstanceState::NotStarted
+            );
+
+            let vm_config = request_over_socket(
+                &mut vmm,
+                &format!("{socket_name}v"),
+                "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(vm_config.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(
+                !vm_config.contains("cpu-config"),
+                "{socket_name}: {vm_config}"
+            );
+            for raw_value in raw_values {
+                assert!(!vm_config.contains(raw_value), "{socket_name}: {vm_config}");
+            }
+        }
     }
 
     #[test]
@@ -7087,14 +7142,16 @@ mod tests {
         );
         let start_response = put_action_over_socket(&mut vmm, "cpu-cfg-start", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        let request = "PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
+        let body = r#"{"kvm_capabilities":["4294967295"]}"#;
+        let request = request_with_body("PUT", "/cpu-config", body);
 
-        let response = request_over_socket(&mut vmm, "cpu-cfg-run", request);
+        let response = request_over_socket(&mut vmm, "cpu-cfg-run", &request);
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(
             r#"{"fault_message":"The requested operation is not supported in Running state: PutCpuConfig"}"#
         ));
+        assert!(!response.contains("4294967295"));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running
