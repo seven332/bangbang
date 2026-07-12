@@ -123,7 +123,7 @@ pre-boot `PUT /serial`, parsed `PUT /actions`, pre-boot
 action/data boundary. Validation rejects malformed boot-source, memory-hotplug,
 drive update, VM state update, and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, runtime `Paused`/`Running` transitions through `PATCH /vm`, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
-output and retained internal active, paused, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes, and fail the process on non-success terminal worker states. Startup CLI and config-file metrics paths write one initial minimal metrics line when the metrics sink is configured. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, `/actions` API request counters, selected deprecated HTTP API usage, top-level `latencies_us.pause_vm` and `latencies_us.resume_vm` values for the most recent successful runtime `PATCH /vm` pause/resume requests, Firecracker-shaped `latencies_us.full_create_snapshot`, `diff_create_snapshot`, and `load_snapshot` values for recognized snapshot requests that reach the snapshot-specific unsupported path, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger API request, action, or boot-timer write failure, Firecracker-shaped `signals.sigpipe` counts for handled non-terminating `SIGPIPE`, Firecracker-shaped `uart` metrics for implemented serial TX writes, output errors, missed writes, and rate-limiter drops, a minimal aggregate `block` object and non-empty per-drive `block_{drive_id}` objects for implemented virtio-block queue activity, read/write latency aggregates, backing update counters, and failures, a minimal aggregate `net` and non-empty per-interface `net_{iface_id}` objects for implemented virtio-net RX/TX queue activity, packet counts, byte counts, and failures, a minimal aggregate `vsock` object for implemented virtio-vsock RX/TX queue activity, packet counts, payload byte counts, connection add/remove cleanup counters, and classifiable queue/event failures, a minimal aggregate `entropy` object for implemented virtio-rng request, byte, host-randomness failure, and event-failure activity, a minimal `rtc` object for implemented PL031 invalid read/write and error counters, and a minimal `balloon` object when the active balloon device reports implemented queue activity or failures. API-enabled and no-api runtime loops also flush the same minimal metrics output every 60 seconds while the VM is running. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal parsed API request method/path lines, without request bodies, plus successful `InstanceStart` and `FlushMetrics` action-event output; full Firecracker run-loop control beyond the current single-worker pause/resume subset, public serial
+output and retained internal active, paused, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes, and fail the process on non-success terminal worker states. Startup CLI and config-file metrics paths write one initial minimal metrics line when the metrics sink is configured. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, `/actions` API request counters, selected deprecated HTTP API usage, top-level `latencies_us.pause_vm` and `latencies_us.resume_vm` values for the most recent successful runtime `PATCH /vm` pause/resume requests, Firecracker-shaped `latencies_us.full_create_snapshot`, `diff_create_snapshot`, and `load_snapshot` values for valid-lifecycle snapshot requests that succeed, reach a capability rejection, or fail during admitted execution, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger API request, action, or boot-timer write failure, Firecracker-shaped `signals.sigpipe` counts for handled non-terminating `SIGPIPE`, Firecracker-shaped `uart` metrics for implemented serial TX writes, output errors, missed writes, and rate-limiter drops, a minimal aggregate `block` object and non-empty per-drive `block_{drive_id}` objects for implemented virtio-block queue activity, read/write latency aggregates, backing update counters, and failures, a minimal aggregate `net` and non-empty per-interface `net_{iface_id}` objects for implemented virtio-net RX/TX queue activity, packet counts, byte counts, and failures, a minimal aggregate `vsock` object for implemented virtio-vsock RX/TX queue activity, packet counts, payload byte counts, connection add/remove cleanup counters, and classifiable queue/event failures, a minimal aggregate `entropy` object for implemented virtio-rng request, byte, host-randomness failure, and event-failure activity, a minimal `rtc` object for implemented PL031 invalid read/write and error counters, and a minimal `balloon` object when the active balloon device reports implemented queue activity or failures. API-enabled and no-api runtime loops also flush the same minimal metrics output every 60 seconds while the VM is running. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal parsed API request method/path lines, without request bodies, plus successful `InstanceStart` and `FlushMetrics` action-event output; full Firecracker run-loop control beyond the current single-worker pause/resume subset, public serial
 streaming, serial input and flush counter producers, broader Firecracker metrics
 counters, and full logger integration beyond API request method/path, action,
 and boot-timer events remain
@@ -741,10 +741,10 @@ recent API-layer action duration as `latencies_us.pause_vm` and
 `latencies_us.resume_vm`; failed state transitions and malformed requests do
 not emit those success latency fields. Recognized snapshot create/load requests
 record Firecracker-shaped `latencies_us.full_create_snapshot`,
-`latencies_us.diff_create_snapshot`, or `latencies_us.load_snapshot` only when
-the parsed request reaches the snapshot-specific unsupported runtime result.
-Malformed snapshot requests and snapshot state-policy failures do not emit
-snapshot latency fields.
+`latencies_us.diff_create_snapshot`, or `latencies_us.load_snapshot` when a
+valid-lifecycle action succeeds, reaches a capability rejection, or fails
+during admitted execution. Malformed snapshot requests and snapshot
+state-policy failures do not emit snapshot latency fields.
 Device runtime counters, remaining API request counters, and parser-level
 malformed-request counters for endpoints without Firecracker-shaped request
 metric fields remain deferred. Full public run-loop control beyond pause/resume,
@@ -2017,12 +2017,12 @@ maintenance, compatibility, persistence, rollback, schema, or portable restore
 policy.
 Pointer-authentication capture and raw apply additionally have no feature or
 destination validation, zeroization, protected persistence, rollback, or safe
-SCTLR enable ordering. The public process snapshot barrier invokes none of these
-captures or restore operations. The private native-v1 composite command now
-captures the fixed inactive baseline subset and persists it with redacted
-diagnostics. Its paired private aggregate restore validates destination
-identification and inactive optional state before applying the persisted subset
-under one never-run owner-thread admission window.
+SCTLR enable ordering. Public native-v1 create and load use the production
+aggregate commands rather than invoking these standalone operations
+independently. Composite capture persists the fixed inactive baseline subset
+with redacted diagnostics; aggregate restore validates destination
+identification and inactive optional state before applying that persisted
+subset under one never-run owner-thread admission window.
 
 A separate failure-atomic command reads CPU IRQ then FIQ pending levels. Its
 paired owner-thread restore writes the complete typed value in the same order
@@ -2050,9 +2050,10 @@ reject an older opaque format after a host software update and publishes no
 transactional rollback guarantee, so failure requires destination discard
 before execution. The bytes remain opaque but are bounded and persisted inside
 the bangbang-native composite schema. Standalone apply still releases its
-interrupt admission before returning; the private native-v1 aggregate restore
-instead composes blob, ICC, timers, and pending state in one never-run command.
-The public process snapshot barrier invokes neither capture nor apply.
+interrupt admission before returning; native-v1 aggregate restore instead
+composes blob, ICC, timers, and pending state in one never-run command. Public
+snapshot orchestration uses that aggregate path rather than the standalone
+capture or apply.
 
 A companion failure-atomic command captures the ten EL1 ICC CPU-interface
 registers exposed by Hypervisor.framework: PMR, BPR0, AP0R0, AP1R0, RPR, BPR1,
@@ -2067,10 +2068,10 @@ generalized interrupt admission with CPU pending, GIC PPI, and opaque GIC
 device-state operations, and both boot-session forms expose the fixed per-vCPU
 value. Standalone callers still receive no cross-step lease. Native-v1
 composite capture persists both values under one aggregate runner admission
-window, and the private aggregate restore reapplies the opaque blob before ICC
-under a matching never-run window. The public process snapshot barrier still
-invokes none of these commands. `ICC_SRE_EL2`, ICH/ICV, cross-host policy, and
-multi-vCPU association remain future work.
+window, and aggregate restore reapplies the opaque blob before ICC under a
+matching never-run window. Public snapshot orchestration uses those aggregate
+commands rather than the standalone operations. `ICC_SRE_EL2`, ICH/ICV,
+cross-host policy, and multi-vCPU association remain future work.
 
 By themselves, these commands do not yet form a continuous guest run loop. The
 boot session can run one vCPU step through the runner with its per-session shared
