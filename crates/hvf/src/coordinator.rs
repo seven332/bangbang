@@ -590,6 +590,19 @@ impl HvfVcpuRunControl {
         let waiter = HvfVcpuRunBarrierWaiter { receiver };
         let mut state = self.shared.lock_state()?;
 
+        if matches!(
+            state.phase,
+            CoordinatorPhase::Running | CoordinatorPhase::Paused | CoordinatorPhase::Stopped
+        ) && let Some(HvfVcpuRunEvent::Barrier(pending)) = state.pending_events.back_mut()
+        {
+            let reason = pending.reason.max(reason);
+            pending.reason = reason;
+            let report = pending.clone();
+            state.phase = phase_after_control(reason);
+            let _ = sender.send(Ok(report));
+            return Ok(waiter);
+        }
+
         match &mut state.phase {
             CoordinatorPhase::Draining(drain) => match &mut drain.reason {
                 DrainReason::Control(active_reason) => {
@@ -645,15 +658,6 @@ impl HvfVcpuRunControl {
                     RUNNING_PHASE_REQUIRED_MESSAGE,
                 ));
             }
-        }
-
-        if let Some(HvfVcpuRunEvent::Barrier(pending)) = state.pending_events.back_mut() {
-            let reason = pending.reason.max(reason);
-            pending.reason = reason;
-            let report = pending.clone();
-            state.phase = phase_after_control(reason);
-            let _ = sender.send(Ok(report));
-            return Ok(waiter);
         }
 
         let snapshot = active_tokens(&state);
@@ -2405,6 +2409,40 @@ mod tests {
             members[0].pending_tokens(),
             vec![HvfVcpuRunToken::new(0, 1)]
         );
+        assert!(batch.calls().is_empty());
+    }
+
+    #[test]
+    fn stronger_empty_control_updates_the_one_pending_barrier() {
+        let members = fake_members(1);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        let control = coordinator.control();
+
+        let pause = control
+            .request_pause()
+            .expect("idle pause should start")
+            .wait()
+            .expect("idle pause should complete");
+        let stop = control
+            .request_stop()
+            .expect("idle stop should coalesce")
+            .wait()
+            .expect("idle stop should complete");
+
+        assert_eq!(pause.reason(), HvfVcpuRunControlReason::Pause);
+        assert_eq!(stop.reason(), HvfVcpuRunControlReason::Stop);
+        assert_eq!(coordinator.dispatch_online(), Ok(0));
+        let HvfVcpuRunEvent::Barrier(report) = coordinator
+            .receive_event()
+            .expect("coalesced barrier should be pending")
+        else {
+            panic!("expected pending control barrier");
+        };
+        assert_eq!(report.reason(), HvfVcpuRunControlReason::Stop);
+        assert!(report.acknowledgements().is_empty());
+        assert!(members[0].pending_tokens().is_empty());
         assert!(batch.calls().is_empty());
     }
 
