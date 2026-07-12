@@ -148,6 +148,14 @@ pub struct HvfArm64VcpuGeneralRegisterState {
 }
 
 impl HvfArm64VcpuGeneralRegisterState {
+    pub(crate) const fn new(general_purpose_registers: [u64; 31], pc: u64, cpsr: u64) -> Self {
+        Self {
+            general_purpose_registers,
+            pc,
+            cpsr,
+        }
+    }
+
     /// Return the captured X0 through X30 values in architectural order.
     pub const fn general_purpose_registers(&self) -> &[u64; 31] {
         &self.general_purpose_registers

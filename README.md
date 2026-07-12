@@ -60,28 +60,31 @@ mutable values with derived RPR validation.
 A native-v1 optional-state classifier fails closed for active SVE/SME and
 enabled hardware breakpoint/watchpoint state. Prepared boot sessions can also
 replace the 16-byte VMGenID buffer and retained metadata before first run, then
-inject its edge-rising SPI after replacement.
-A separate no-handle query exposes the maximum SME streaming vector length used
-for the Z-, P-, and ZA-register allocations. These are internal snapshot
-feasibility primitives only. bangbang now has a bounded native-v1 outer state
-envelope, read-only version inspection, internal guest-memory image/binding
-I/O, and a macOS-only no-clobber two-file publisher plus committed-pair loader.
-It also has an internal, standalone `BANGDEV\0` native-v1 device profile capped
-at 16 KiB for exactly one read-only root virtio-block device, drained transport
-and queue state, frozen limiter/retry time, UART registers with a fresh default
-output policy, and mandatory VMGenID/VMClock topology. A staged preflight
-reopens the root file read-only with no-follow semantics, verifies its retained
-descriptor identity, validates queue ranges against loaded memory, and builds
-drop-safe block/serial resources without installing them into a VM.
-The publisher writes private owner-only files in each destination directory,
-makes memory durable first, and publishes state last as the commit marker. No
-process or API path invokes these internal artifact primitives. Public snapshot
-create/load wiring, complete restore, a composite VM-state
-payload schema, remaining vCPU state, EL2 GIC CPU-interface state,
-effective-SVL interpretation, SME/SME2 feature and destination policy,
-remaining setters and transition ordering, cache-topology manifests, and
-prepared-device installation, optional-device state, and cross-step restore leasing remain
-unsupported.
+inject its edge-rising SPI after replacement. A separate no-handle query
+exposes the maximum SME streaming vector length used for the Z-, P-, and
+ZA-register allocations.
+
+These are internal snapshot feasibility primitives only. bangbang now has a
+bounded native-v1 outer state envelope, guest-memory image/binding I/O, and two
+`BANGCMT\0` record kinds: the original memory-only kind and a composite kind
+that binds memory to an exact five-component `BANGHVF\0` payload. The composite
+payload contains the accepted machine profile, a same-default-configuration
+CPU/cache and fixed-platform compatibility manifest, restorable one-vCPU
+state, normalized timer/interrupt/GIC state, and the nested `BANGDEV\0`
+read-only-root device profile. PL031 RTC metadata records an explicit fresh-RTC
+reconstruction policy; it does not claim RTC register continuity.
+
+A private supervisor operation can hold paused-worker admission and block/
+entropy retry quiescence, capture all four runner ownership domains in one
+aggregate command, preflight the state encoding, and stream guest memory in
+cooperatively cancellable 1 MiB chunks. It returns no partial bundle and leaves
+the source session paused, retryable, and resumable. The existing macOS-only
+publisher still writes private owner-only files, makes memory durable first,
+and publishes state last as the commit marker, but no process or API path
+connects the new capture to that publisher. Public snapshot create/load,
+complete restore and VM construction, prepared-device installation, optional-
+device state, EL2 GIC CPU-interface state, cross-host portability, and signed
+fresh-process continuity remain unsupported.
 
 ## Process CLI
 

@@ -70,9 +70,14 @@ use crate::gic::{
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
 use crate::runner::{
-    HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
+    HvfArm64SnapshotV1Capture, HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner,
+    HvfVcpuRunnerError,
 };
 use crate::snapshot::HvfArm64SnapshotTimerState;
+use crate::snapshot_bundle::{
+    HvfSnapshotV1CompatibilityState, HvfSnapshotV1EncodeError, HvfSnapshotV1State,
+    encode_hvf_snapshot_v1_state,
+};
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
     HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
@@ -647,6 +652,81 @@ pub enum HvfArm64BootSnapshotV1DeviceCaptureError {
     RuntimeCapture,
 }
 
+#[derive(Debug)]
+pub enum HvfArm64BootSnapshotV1StateCaptureError {
+    Cancelled {
+        stage: HvfArm64BootSnapshotV1CaptureStage,
+    },
+    CacheManifest {
+        source: BackendError,
+    },
+    Runner {
+        source: HvfVcpuRunnerError,
+    },
+    Device {
+        source: HvfArm64BootSnapshotV1DeviceCaptureError,
+    },
+    MissingRtc,
+    EncodePreflight {
+        source: HvfSnapshotV1EncodeError,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfArm64BootSnapshotV1CaptureStage {
+    CacheManifest,
+    Runner,
+    Device,
+    EncodePreflight,
+}
+
+impl fmt::Display for HvfArm64BootSnapshotV1CaptureStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::CacheManifest => "cache manifest",
+            Self::Runner => "runner state",
+            Self::Device => "device state",
+            Self::EncodePreflight => "encoding preflight",
+        };
+        f.write_str(name)
+    }
+}
+
+impl fmt::Display for HvfArm64BootSnapshotV1StateCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled { stage } => {
+                write!(f, "native-v1 state capture was cancelled before {stage}")
+            }
+            Self::CacheManifest { source } => {
+                write!(f, "native-v1 cache compatibility capture failed: {source}")
+            }
+            Self::Runner { source } => {
+                write!(f, "native-v1 runner capture failed: {source}")
+            }
+            Self::Device { source } => {
+                write!(f, "native-v1 device capture failed: {source}")
+            }
+            Self::MissingRtc => f.write_str("native-v1 session is missing the mandatory PL031 RTC"),
+            Self::EncodePreflight { source } => {
+                write!(f, "native-v1 state encoding preflight failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootSnapshotV1StateCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CacheManifest { source } => Some(source),
+            Self::Runner { source } => Some(source),
+            Self::Device { source } => Some(source),
+            Self::EncodePreflight { source } => Some(source),
+            Self::Cancelled { .. } | Self::MissingRtc => None,
+        }
+    }
+}
+
 impl fmt::Display for HvfArm64BootSnapshotV1DeviceCaptureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -713,6 +793,53 @@ impl HvfArm64BootSnapshotV1DeviceCaptureOwners<'_> {
                 now,
             )
             .map_err(|_| HvfArm64BootSnapshotV1DeviceCaptureError::RuntimeCapture)
+    }
+}
+
+fn build_snapshot_v1_state(
+    runtime_resources: &Arm64BootRuntimeResources,
+    gic: HvfGicMetadata,
+    primary_mpidr: u64,
+    cache_manifest: crate::vcpu_config::HvfArm64VcpuCacheManifest,
+    runner_capture: HvfArm64SnapshotV1Capture,
+    device: SnapshotV1DeviceState,
+) -> Result<HvfSnapshotV1State, HvfArm64BootSnapshotV1StateCaptureError> {
+    let rtc = runtime_resources
+        .rtc_device
+        .as_ref()
+        .ok_or(HvfArm64BootSnapshotV1StateCaptureError::MissingRtc)?;
+    let rtc_mmio_layout = RtcMmioLayout::new(rtc.region.range().start(), rtc.region.id());
+    let (identification, optional_identification, vcpu, interrupts) = runner_capture.into_parts();
+    let compatibility = HvfSnapshotV1CompatibilityState::new(
+        identification,
+        optional_identification,
+        cache_manifest,
+        primary_mpidr,
+        gic,
+        rtc_mmio_layout,
+    );
+    let state = HvfSnapshotV1State::new(
+        runtime_resources.machine_config,
+        compatibility,
+        vcpu,
+        interrupts,
+        device,
+    );
+    // Fail before streaming guest memory if any fixed component, nested device
+    // value, or compatibility relationship cannot be encoded.
+    encode_hvf_snapshot_v1_state(&state)
+        .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::EncodePreflight { source })?;
+    Ok(state)
+}
+
+fn check_snapshot_v1_capture_cancelled(
+    is_cancelled: &mut impl FnMut(HvfArm64BootSnapshotV1CaptureStage) -> bool,
+    stage: HvfArm64BootSnapshotV1CaptureStage,
+) -> Result<(), HvfArm64BootSnapshotV1StateCaptureError> {
+    if is_cancelled(stage) {
+        Err(HvfArm64BootSnapshotV1StateCaptureError::Cancelled { stage })
+    } else {
+        Ok(())
     }
 }
 
@@ -1221,6 +1348,67 @@ impl HvfArm64BootSession<'_> {
             block_retry_wakeup_scheduler: &self.block_retry_wakeup_scheduler,
         }
         .capture_at(drive_config, serial_config, guard, now)
+    }
+
+    /// Capture and preflight every non-memory native-v1 component while the
+    /// caller retains the supervisor and auxiliary quiescence guards.
+    pub fn capture_snapshot_v1_state_at(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<HvfSnapshotV1State, HvfArm64BootSnapshotV1StateCaptureError> {
+        self.capture_snapshot_v1_state_at_with_cancel(
+            drive_config,
+            serial_config,
+            guard,
+            now,
+            |_| false,
+        )
+    }
+
+    pub fn capture_snapshot_v1_state_at_with_cancel(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+        mut is_cancelled: impl FnMut(HvfArm64BootSnapshotV1CaptureStage) -> bool,
+    ) -> Result<HvfSnapshotV1State, HvfArm64BootSnapshotV1StateCaptureError> {
+        check_snapshot_v1_capture_cancelled(
+            &mut is_cancelled,
+            HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
+        )?;
+        let cache_manifest = HvfBackend::arm64_vcpu_cache_manifest()
+            .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::CacheManifest { source })?;
+        check_snapshot_v1_capture_cancelled(
+            &mut is_cancelled,
+            HvfArm64BootSnapshotV1CaptureStage::Runner,
+        )?;
+        let runner_capture = self
+            .runner
+            .capture_arm64_snapshot_v1_state()
+            .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::Runner { source })?;
+        check_snapshot_v1_capture_cancelled(
+            &mut is_cancelled,
+            HvfArm64BootSnapshotV1CaptureStage::Device,
+        )?;
+        let device = self
+            .capture_snapshot_v1_device_state_at(drive_config, serial_config, guard, now)
+            .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::Device { source })?;
+        check_snapshot_v1_capture_cancelled(
+            &mut is_cancelled,
+            HvfArm64BootSnapshotV1CaptureStage::EncodePreflight,
+        )?;
+        build_snapshot_v1_state(
+            &self.runtime_resources,
+            self.gic,
+            self.primary_mpidr,
+            cache_manifest,
+            runner_capture,
+            device,
+        )
     }
 
     pub fn shutdown(&mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
@@ -2326,6 +2514,67 @@ impl OwnedHvfArm64BootSession {
             block_retry_wakeup_scheduler: &self.block_retry_wakeup_scheduler,
         }
         .capture_at(drive_config, serial_config, guard, now)
+    }
+
+    /// Capture and preflight every non-memory native-v1 component while the
+    /// caller retains the supervisor and auxiliary quiescence guards.
+    pub fn capture_snapshot_v1_state_at(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<HvfSnapshotV1State, HvfArm64BootSnapshotV1StateCaptureError> {
+        self.capture_snapshot_v1_state_at_with_cancel(
+            drive_config,
+            serial_config,
+            guard,
+            now,
+            |_| false,
+        )
+    }
+
+    pub fn capture_snapshot_v1_state_at_with_cancel(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+        mut is_cancelled: impl FnMut(HvfArm64BootSnapshotV1CaptureStage) -> bool,
+    ) -> Result<HvfSnapshotV1State, HvfArm64BootSnapshotV1StateCaptureError> {
+        check_snapshot_v1_capture_cancelled(
+            &mut is_cancelled,
+            HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
+        )?;
+        let cache_manifest = HvfBackend::arm64_vcpu_cache_manifest()
+            .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::CacheManifest { source })?;
+        check_snapshot_v1_capture_cancelled(
+            &mut is_cancelled,
+            HvfArm64BootSnapshotV1CaptureStage::Runner,
+        )?;
+        let runner_capture = self
+            .runner
+            .capture_arm64_snapshot_v1_state()
+            .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::Runner { source })?;
+        check_snapshot_v1_capture_cancelled(
+            &mut is_cancelled,
+            HvfArm64BootSnapshotV1CaptureStage::Device,
+        )?;
+        let device = self
+            .capture_snapshot_v1_device_state_at(drive_config, serial_config, guard, now)
+            .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::Device { source })?;
+        check_snapshot_v1_capture_cancelled(
+            &mut is_cancelled,
+            HvfArm64BootSnapshotV1CaptureStage::EncodePreflight,
+        )?;
+        build_snapshot_v1_state(
+            &self.runtime_resources,
+            self.gic,
+            self.primary_mpidr,
+            cache_manifest,
+            runner_capture,
+            device,
+        )
     }
 
     pub fn shutdown(&mut self) -> Result<(), HvfArm64BootSessionShutdownError> {

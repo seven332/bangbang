@@ -89,13 +89,17 @@ lengths, offsets, alignment, ordering, overlap, identity, and integrity; and
 inject short, interrupted, zero-progress, seek, allocation, and guest-access
 failures. Length-preflight tests must prove zero-position restoration before a
 rejection, while late truncation/growth tests prove the final trailer/EOF guard
-and that partial anonymous memory never escapes. Run the focused module with
+and that partial anonymous memory never escapes. Cancellation tests check every
+fixed write stage and successive 1 MiB chunks, prove that no binding escapes,
+and then reuse a fresh writer successfully. Run the focused module with
 `cargo test -p bangbang-runtime snapshot_memory --locked`.
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
-record and its exact nested binding/envelope composition. They must reject every
-length, schema, kind, flags, reserved, nested-binding, outer-envelope, and
-trailing-data failure without leaking identities, checksums, paths, or bytes.
+record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,
+non-empty backend state, and envelope composition. They must reject every
+length, schema, kind, flags, kind-specific state-length, nested-binding, outer-
+envelope, and trailing-data failure without leaking identities, checksums,
+paths, or bytes.
 Artifact tests run on macOS and cover same- and cross-directory success,
 owner-only staging modes, exact and opened-parent aliases, case-equivalent volume
 behavior, pre-existing regular/directory/FIFO/socket/symlink entries, missing and
@@ -123,6 +127,29 @@ focused codec/preflight surface with
 `cargo test -p bangbang-runtime snapshot_device --locked`; retry-scheduler
 snapshot tests belong in `cargo test -p bangbang-hvf limiter_retry_snapshot
 --lib --locked` and must not sleep.
+
+Native-HVF composite tests pin the `BANGHVF\0` header, five required component
+headers/order, deterministic complete round trip, and nested `BANGDEV\0` bytes.
+They reject missing, duplicate, reordered, unknown, flagged, empty, truncated,
+oversized, trailing, and cross-component-inconsistent values. Cross-validation
+must cover machine/binding memory size and ranges, MPIDR, optional-feature
+policy, baseline GIC topology and blob budget, fixed PL031 mapping/fresh policy,
+and device queue/platform ranges. Unique sentinels in registers, PAC keys,
+paths, image identity/checksums, and GIC bytes must remain absent from `Debug`,
+`Display`, and errors. Run the focused codec with
+`cargo test -p bangbang-hvf snapshot_bundle --lib --locked`.
+
+The aggregate runner test records the exact native-v1 capture order, injects a
+failure at every stage, and proves a complete fresh retry. It must exercise
+metadata/core/timer/interrupt conflicts in both directions and exactly-once
+release after response abandonment, channel closure, queued destruction,
+unwind, panic, and shutdown. The process-level fake capture session proves the
+outer order from auxiliary quiescence through state preflight, chunked memory,
+bundle construction, writer drop, auxiliary release, and admission release.
+It also proves cancellation emits no bundle, leaves `Paused`, and permits a
+fresh capture and resume. Run these focused surfaces with
+`cargo test -p bangbang-hvf snapshot_v1 --lib --locked` and
+`cargo test -p bangbang native_v1_ --locked`.
 
 For process, socket, and multi-bangbang behavior, cover unique resource names,
 stale socket handling, shutdown cleanup, replacement races, and concurrent runs
@@ -467,6 +494,17 @@ scripts/run-integration-tests.sh --test hvf_lifecycle
 scripts/run-integration-tests.sh --test guest_boot
 scripts/run-integration-tests.sh --test executable_hvf_e2e
 ```
+
+The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
+vCPU/read-only-root session, captures the complete non-memory state and memory
+image under limiter quiescence, decodes and validates both the kind-2 bundle and
+nested device state without logging raw values, and repeats capture with a
+fresh image identity. The guest first leaves non-default serial scratch state;
+after both captures, the original source continues from its retained PC to the
+next fixed HVC and the runner owner remains usable before shutdown. This proves
+capture did not reconstruct, replace, run, or consume the source session.
+Run the repository command without `--allow-unsupported`; this evidence must
+execute on supported Apple Silicon hosts.
 
 Run only the process-level executable e2e test when the change is limited to
 the `bangbang` process boundary:
