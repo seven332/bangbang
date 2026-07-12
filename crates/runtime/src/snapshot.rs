@@ -1,9 +1,60 @@
 //! Backend-neutral snapshot request and capability models.
 
+use std::collections::TryReserveError;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::block::{DriveConfig, DriveConfigs};
+use crate::machine::MachineConfig;
+use crate::serial::SerialConfig;
+
 const REDACTED: &str = "<redacted>";
+
+/// Preallocated controller state committed only after native-v1 restore success.
+pub struct SnapshotV1ControllerCommit {
+    machine_config: MachineConfig,
+    drive_configs: DriveConfigs,
+    serial_config: SerialConfig,
+    resume_requested: bool,
+}
+
+impl SnapshotV1ControllerCommit {
+    pub fn try_new(
+        machine_config: MachineConfig,
+        drive_config: DriveConfig,
+        resume_requested: bool,
+    ) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            machine_config,
+            drive_configs: DriveConfigs::from_validated_single(drive_config)?,
+            serial_config: SerialConfig::default(),
+            resume_requested,
+        })
+    }
+
+    pub const fn resume_requested(&self) -> bool {
+        self.resume_requested
+    }
+
+    pub(crate) fn into_parts(self) -> (MachineConfig, DriveConfigs, SerialConfig, bool) {
+        (
+            self.machine_config,
+            self.drive_configs,
+            self.serial_config,
+            self.resume_requested,
+        )
+    }
+}
+
+impl fmt::Debug for SnapshotV1ControllerCommit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotV1ControllerCommit")
+            .field("profile", &"native-v1")
+            .field("configuration", &REDACTED)
+            .field("resume_requested", &self.resume_requested)
+            .finish()
+    }
+}
 
 /// Snapshot image kind requested by the API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

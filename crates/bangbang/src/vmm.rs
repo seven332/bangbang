@@ -1,3 +1,4 @@
+use std::collections::TryReserveError;
 use std::fmt;
 use std::io::Read;
 use std::io::Seek;
@@ -18,7 +19,9 @@ use bangbang_hvf::{
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
     HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
     HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle,
-    HvfSnapshotV1BundleError, HvfSnapshotV1State, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
+    HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
+    HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
+    PrepareHvfSnapshotV1LoadError, PreparedHvfSnapshotV1Load,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -64,7 +67,12 @@ use bangbang_runtime::serial::{
     SerialConfig, SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
     SharedSerialOutputBuffer,
 };
-use bangbang_runtime::snapshot::SnapshotCreateInput;
+use bangbang_runtime::snapshot::{
+    SnapshotCreateInput, SnapshotLoadInput, SnapshotV1ControllerCommit,
+};
+use bangbang_runtime::snapshot_artifact::{
+    SnapshotArtifactLoadError, SnapshotArtifactPaths, load_snapshot_artifacts,
+};
 use bangbang_runtime::snapshot_device::SnapshotV1DeviceState;
 use bangbang_runtime::snapshot_memory::{
     SnapshotMemoryIoStage, SnapshotMemoryWriteError, write_snapshot_memory_image_with_cancel,
@@ -130,6 +138,130 @@ pub(crate) trait InstanceStartExecutor {
 
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         MetricsDiagnostics::default()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "native-v1 process load remains internal until public API enablement"
+)]
+pub(crate) trait SnapshotLoadExecutor: InstanceStartExecutor {
+    fn load_snapshot_v1(
+        &mut self,
+        controller: &VmmController,
+        input: &SnapshotLoadInput,
+    ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError>;
+}
+
+#[allow(
+    dead_code,
+    reason = "native-v1 process load remains internal until public API enablement"
+)]
+pub(crate) struct SnapshotV1LoadSuccess<S> {
+    session: S,
+    controller_commit: SnapshotV1ControllerCommit,
+}
+
+#[allow(
+    dead_code,
+    reason = "native-v1 process load remains internal until public API enablement"
+)]
+impl<S> SnapshotV1LoadSuccess<S> {
+    const fn new(session: S, controller_commit: SnapshotV1ControllerCommit) -> Self {
+        Self {
+            session,
+            controller_commit,
+        }
+    }
+
+    fn into_parts(self) -> (S, SnapshotV1ControllerCommit) {
+        (self.session, self.controller_commit)
+    }
+}
+
+impl<S> fmt::Debug for SnapshotV1LoadSuccess<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotV1LoadSuccess")
+            .field("session", &"<redacted>")
+            .field("controller_commit", &self.controller_commit)
+            .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "native-v1 process load remains internal until public API enablement"
+)]
+#[derive(Debug)]
+pub(crate) enum NativeV1SnapshotLoadError {
+    Preflight(VmmActionError),
+    ProcessTerminal,
+    Artifact(SnapshotArtifactLoadError),
+    Prepare(PrepareHvfSnapshotV1LoadError),
+    ProcessPreparation(BackendError),
+    ControllerCommitAllocation(TryReserveError),
+    Restore(HvfSnapshotV1RestoreError),
+    WorkerStart {
+        source: BackendError,
+        cleanup: HvfSnapshotV1RestoreCleanup,
+    },
+}
+
+#[allow(
+    dead_code,
+    reason = "native-v1 process load remains internal until public API enablement"
+)]
+impl NativeV1SnapshotLoadError {
+    const fn disposition(&self) -> HvfSnapshotV1RestoreDisposition {
+        match self {
+            Self::Restore(source) => source.disposition(),
+            Self::ProcessTerminal => HvfSnapshotV1RestoreDisposition::Terminal,
+            Self::WorkerStart { cleanup, .. } if !cleanup.is_complete() => {
+                HvfSnapshotV1RestoreDisposition::Terminal
+            }
+            Self::Preflight(_)
+            | Self::Artifact(_)
+            | Self::Prepare(_)
+            | Self::ProcessPreparation(_)
+            | Self::ControllerCommitAllocation(_)
+            | Self::WorkerStart { .. } => HvfSnapshotV1RestoreDisposition::Retryable,
+        }
+    }
+}
+
+impl fmt::Display for NativeV1SnapshotLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preflight(source) => write!(f, "native-v1 load preflight failed: {source}"),
+            Self::ProcessTerminal => f.write_str("native-v1 load process is terminal"),
+            Self::Artifact(source) => write!(f, "native-v1 artifact load failed: {source}"),
+            Self::Prepare(source) => write!(f, "native-v1 preparation failed: {source}"),
+            Self::ProcessPreparation(source) => {
+                write!(f, "native-v1 process preparation failed: {source}")
+            }
+            Self::ControllerCommitAllocation(_) => {
+                f.write_str("native-v1 controller commit allocation failed")
+            }
+            Self::Restore(source) => write!(f, "native-v1 HVF restore failed: {source}"),
+            Self::WorkerStart { source, .. } => {
+                write!(f, "native-v1 paused worker startup failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV1SnapshotLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Preflight(source) => Some(source),
+            Self::Artifact(source) => Some(source),
+            Self::Prepare(source) => Some(source),
+            Self::ProcessPreparation(source) => Some(source),
+            Self::ControllerCommitAllocation(source) => Some(source),
+            Self::Restore(source) => Some(source),
+            Self::WorkerStart { source, .. } => Some(source),
+            Self::ProcessTerminal => None,
+        }
     }
 }
 
@@ -877,6 +1009,7 @@ where
     started_session: Option<S::Session>,
     process_metrics_diagnostics: MetricsDiagnostics,
     process_signal_metrics: Option<SharedSignalMetrics>,
+    terminal_snapshot_load_failure: bool,
 }
 
 impl ProcessVmm<HvfInstanceStartExecutor> {
@@ -939,6 +1072,7 @@ where
             started_session: None,
             process_metrics_diagnostics: MetricsDiagnostics::default(),
             process_signal_metrics: None,
+            terminal_snapshot_load_failure: false,
         }
     }
 
@@ -1450,10 +1584,49 @@ where
     }
 
     pub(crate) fn process_exit_status(&self) -> ProcessSessionExitStatus {
+        if self.terminal_snapshot_load_failure {
+            return ProcessSessionExitStatus::Terminal;
+        }
         self.started_session
             .as_ref()
             .map(ProcessSessionDiagnostics::process_exit_status)
             .unwrap_or_default()
+    }
+}
+
+impl<S> ProcessVmm<S>
+where
+    S: SnapshotLoadExecutor,
+{
+    /// Internal Slice 7 load seam. Public action dispatch remains unsupported.
+    #[allow(
+        dead_code,
+        reason = "native-v1 process load remains internal until public API enablement"
+    )]
+    pub(crate) fn restore_native_v1_snapshot(
+        &mut self,
+        input: &SnapshotLoadInput,
+    ) -> Result<bool, NativeV1SnapshotLoadError> {
+        if self.terminal_snapshot_load_failure {
+            return Err(NativeV1SnapshotLoadError::ProcessTerminal);
+        }
+        self.controller
+            .preflight_load_snapshot(input)
+            .map_err(NativeV1SnapshotLoadError::Preflight)?;
+
+        let result = self.starter.load_snapshot_v1(&self.controller, input);
+        let restored = match result {
+            Ok(restored) => restored,
+            Err(error) => {
+                if error.disposition() == HvfSnapshotV1RestoreDisposition::Terminal {
+                    self.terminal_snapshot_load_failure = true;
+                }
+                return Err(error);
+            }
+        };
+        let (session, controller_commit) = restored.into_parts();
+        self.started_session = Some(session);
+        Ok(self.controller.commit_snapshot_v1_load(controller_commit))
     }
 }
 
@@ -1659,6 +1832,58 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             .as_ref()
             .map(|output| MetricsDiagnostics::new().with_serial_output_metrics(output.metrics()))
             .unwrap_or_default()
+    }
+}
+
+impl SnapshotLoadExecutor for HvfInstanceStartExecutor {
+    fn load_snapshot_v1(
+        &mut self,
+        controller: &VmmController,
+        input: &SnapshotLoadInput,
+    ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
+        let paths =
+            SnapshotArtifactPaths::new(input.snapshot_path(), input.mem_backend().backend_path());
+        let artifacts =
+            load_snapshot_artifacts(&paths).map_err(NativeV1SnapshotLoadError::Artifact)?;
+        let prepared = PreparedHvfSnapshotV1Load::from_loaded_artifacts(artifacts, Instant::now())
+            .map_err(NativeV1SnapshotLoadError::Prepare)?;
+        let restored_drive_config = prepared.runtime().drive_config.clone();
+        let controller_commit = SnapshotV1ControllerCommit::try_new(
+            prepared.state().machine(),
+            restored_drive_config.clone(),
+            input.resume_vm(),
+        )
+        .map_err(NativeV1SnapshotLoadError::ControllerCommitAllocation)?;
+        let (packet_io, mmds_metrics) = ProcessNetworkPacketIoProvider::from_controller(controller)
+            .map_err(|source| {
+                NativeV1SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(format!(
+                    "failed to build network packet I/O provider: {source}"
+                )))
+            })?;
+
+        let restored = OwnedHvfArm64BootSession::restore_snapshot_v1(prepared)
+            .map_err(NativeV1SnapshotLoadError::Restore)?;
+        let (session, restored_drive, serial_output, serial_output_buffer) = restored.into_parts();
+        debug_assert!(
+            restored_drive == restored_drive_config,
+            "restored drive configuration diverged from the preallocated controller commit"
+        );
+        let process_session = ProcessHvfBootSession::new(session, packet_io, mmds_metrics);
+        let supervisor = match HvfBootRunLoopSupervisor::start_paused(
+            process_session,
+            default_hvf_boot_run_loop_step_limit(),
+        ) {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                let (source, mut failed_session) = error.into_parts();
+                let cleanup = failed_session.session.teardown_snapshot_v1();
+                return Err(NativeV1SnapshotLoadError::WorkerStart { source, cleanup });
+            }
+        };
+
+        self.serial_output = serial_output_buffer;
+        self.active_serial_output = Some(serial_output);
+        Ok(SnapshotV1LoadSuccess::new(supervisor, controller_commit))
     }
 }
 
@@ -3659,6 +3884,42 @@ where
     worker: Option<JoinHandle<()>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "recoverable paused startup is reserved for internal native-v1 load"
+)]
+struct BootRunLoopStartError<S> {
+    source: BackendError,
+    session: S,
+}
+
+#[allow(
+    dead_code,
+    reason = "recoverable paused startup is reserved for internal native-v1 load"
+)]
+impl<S> BootRunLoopStartError<S> {
+    const fn new(source: BackendError, session: S) -> Self {
+        Self { source, session }
+    }
+
+    fn into_parts(self) -> (BackendError, S) {
+        (self.source, self.session)
+    }
+
+    fn into_source(self) -> BackendError {
+        self.source
+    }
+}
+
+impl<S> fmt::Debug for BootRunLoopStartError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BootRunLoopStartError")
+            .field("source", &self.source)
+            .field("session", &"<redacted>")
+            .finish()
+    }
+}
+
 impl<S> BootRunLoopSupervisor<S>
 where
     S: BootRunLoopSession,
@@ -3672,10 +3933,33 @@ where
     }
 
     fn start_with_command_queue_capacity(
-        mut session: S,
+        session: S,
         max_steps: NonZeroUsize,
         command_queue_capacity: usize,
     ) -> Result<Self, BackendError> {
+        Self::start_with_initial_state(session, max_steps, command_queue_capacity, false)
+            .map_err(BootRunLoopStartError::into_source)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "paused startup is reserved for internal native-v1 load"
+    )]
+    fn start_paused(session: S, max_steps: NonZeroUsize) -> Result<Self, BootRunLoopStartError<S>> {
+        Self::start_with_initial_state(
+            session,
+            max_steps,
+            BOOT_RUN_LOOP_COMMAND_QUEUE_CAPACITY,
+            true,
+        )
+    }
+
+    fn start_with_initial_state(
+        session: S,
+        max_steps: NonZeroUsize,
+        command_queue_capacity: usize,
+        initially_paused: bool,
+    ) -> Result<Self, BootRunLoopStartError<S>> {
         let control = session.run_loop_control();
         let block_device_updater = session.block_device_updater();
         let balloon_device_updater = session.balloon_device_updater();
@@ -3689,36 +3973,52 @@ where
         let rtc_device_metrics = session.shared_rtc_device_metrics();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
+        if initially_paused {
+            status.record(BootRunLoopWorkerStatus::Paused);
+        }
         let worker_status = Arc::clone(&status);
         let pause_gate = Arc::new(BootRunLoopPauseGate::default());
+        if initially_paused {
+            pause_gate.pause();
+        }
         let worker_pause_gate = Arc::clone(&pause_gate);
         let admission = Arc::new(BootRunLoopCommandAdmission::default());
         let active_snapshot_cancellation = Arc::new(Mutex::new(None));
         let (command_sender, command_receiver) = mpsc::sync_channel(command_queue_capacity);
-        let command_handle = BootRunLoopCommandHandle::new(
+        let command_handle: BootRunLoopCommandHandle<S> = BootRunLoopCommandHandle::new(
             command_sender,
             control.clone(),
             Arc::clone(&status),
             Arc::clone(&pause_gate),
             Arc::clone(&admission),
         );
-        let (terminal_wakeup_reader, mut terminal_wakeup_writer) =
-            UnixStream::pair().map_err(|err| {
-                BackendError::Hypervisor(format!(
-                    "failed to create HVF boot run loop wakeup stream: {err}"
-                ))
-            })?;
-        terminal_wakeup_reader
-            .set_nonblocking(true)
-            .map_err(|err| {
+        let (terminal_wakeup_reader, mut terminal_wakeup_writer) = match UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(err) => {
+                return Err(BootRunLoopStartError::new(
+                    BackendError::Hypervisor(format!(
+                        "failed to create HVF boot run loop wakeup stream: {err}"
+                    )),
+                    session,
+                ));
+            }
+        };
+        if let Err(err) = terminal_wakeup_reader.set_nonblocking(true) {
+            return Err(BootRunLoopStartError::new(
                 BackendError::Hypervisor(format!(
                     "failed to configure HVF boot run loop wakeup stream: {err}"
-                ))
-            })?;
+                )),
+                session,
+            ));
+        }
         let (session_release_sender, session_release_receiver) = mpsc::channel();
-        let worker = thread::Builder::new()
+        let (session_sender, session_receiver) = mpsc::sync_channel::<S>(1);
+        let worker = match thread::Builder::new()
             .name(HVF_BOOT_RUN_LOOP_THREAD_NAME.to_owned())
             .spawn(move || {
+                let Ok(mut session) = session_receiver.recv() else {
+                    return;
+                };
                 let worker_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut observed_command_generation = worker_pause_gate.command_generation();
                     'worker: loop {
@@ -3767,10 +4067,22 @@ where
                 }
                 drop(command_receiver);
                 let _ = session_release_receiver.recv();
-            })
-            .map_err(|err| {
-                BackendError::Hypervisor(format!("failed to spawn HVF boot run loop: {err}"))
-            })?;
+            }) {
+            Ok(worker) => worker,
+            Err(err) => {
+                return Err(BootRunLoopStartError::new(
+                    BackendError::Hypervisor(format!("failed to spawn HVF boot run loop: {err}")),
+                    session,
+                ));
+            }
+        };
+        if let Err(err) = session_sender.send(session) {
+            let _ = worker.join();
+            return Err(BootRunLoopStartError::new(
+                BackendError::InvalidState("failed to hand off HVF boot run loop session"),
+                err.0,
+            ));
+        }
 
         Ok(Self {
             control,
@@ -4448,7 +4760,7 @@ mod tests {
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::LoggerConfigInput;
-    use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
+    use bangbang_runtime::machine::{MachineConfig, MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
@@ -4477,7 +4789,10 @@ mod tests {
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfigInput, SerialOutput, SerialOutputMetrics,
         SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
     };
-    use bangbang_runtime::snapshot::{SnapshotCreateInput, SnapshotType};
+    use bangbang_runtime::snapshot::{
+        SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
+        SnapshotType, SnapshotV1ControllerCommit,
+    };
     use bangbang_runtime::snapshot_memory::SnapshotMemoryBinding;
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
@@ -4507,12 +4822,13 @@ mod tests {
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
         HvfArm64BootSnapshotV1CaptureStage, HvfInstanceStartExecutor, InstanceStartExecutor,
         NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
-        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
+        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
         NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
         ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
         ProcessNetworkPacketIoProviderBuildError, ProcessSessionDiagnostics, ProcessVmm,
-        ProcessVmnetPacketIoBackendFactory, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
+        ProcessVmnetPacketIoBackendFactory, SnapshotLoadExecutor, SnapshotV1LoadSuccess,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        process_vmnet_packet_io_provider_from_configs,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -5134,6 +5450,68 @@ mod tests {
                 FakeStartResult::Success(session) => Ok((**session).clone()),
                 FakeStartResult::Failure(source) => Err(source.clone()),
             }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FakeSnapshotLoadResult {
+        Success,
+        Terminal,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeSnapshotLoadStarter {
+        result: FakeSnapshotLoadResult,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl FakeSnapshotLoadStarter {
+        fn new(result: FakeSnapshotLoadResult) -> Self {
+            Self {
+                result,
+                calls: Arc::default(),
+            }
+        }
+
+        fn calls(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.calls)
+        }
+    }
+
+    impl InstanceStartExecutor for FakeSnapshotLoadStarter {
+        type Session = FakeSession;
+
+        fn start(&mut self, _controller: &VmmController) -> Result<Self::Session, BackendError> {
+            Err(BackendError::InvalidState(
+                "fake snapshot loader does not support ordinary start",
+            ))
+        }
+    }
+
+    impl SnapshotLoadExecutor for FakeSnapshotLoadStarter {
+        fn load_snapshot_v1(
+            &mut self,
+            controller: &VmmController,
+            input: &SnapshotLoadInput,
+        ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            if self.result == FakeSnapshotLoadResult::Terminal {
+                return Err(NativeV1SnapshotLoadError::ProcessTerminal);
+            }
+
+            let drive_config =
+                DriveConfigInput::new("root", "root", "/private/restored-rootfs", true)
+                    .with_is_read_only(true)
+                    .validate()
+                    .expect("fake restored drive should validate");
+            let commit = SnapshotV1ControllerCommit::try_new(
+                MachineConfig::default(),
+                drive_config,
+                input.resume_vm(),
+            )
+            .expect("fake controller commit should allocate");
+            Ok(SnapshotV1LoadSuccess::new(FakeSession::new(77), commit))
         }
     }
 
@@ -6056,6 +6434,101 @@ mod tests {
         ))
     }
 
+    fn snapshot_load_input(resume_vm: bool) -> SnapshotLoadInput {
+        SnapshotLoadInput::new(
+            "/private/state",
+            SnapshotMemoryBackend::new("/private/memory", SnapshotMemoryBackendType::File),
+        )
+        .with_resume_vm(resume_vm)
+    }
+
+    #[test]
+    fn internal_native_v1_load_commits_paused_state_and_returns_resume_intent() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        assert!(
+            vmm.restore_native_v1_snapshot(&snapshot_load_input(true))
+                .expect("eligible internal load should succeed")
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert!(vmm.has_started_session());
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(vmm.drive_configs()[0].drive_id(), "root");
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("restored session should be retained")
+                .resume_count,
+            0,
+            "resume intent must be returned without silently running the VM"
+        );
+
+        let second = vmm
+            .restore_native_v1_snapshot(&snapshot_load_input(false))
+            .expect_err("a committed controller must reject a second load");
+        assert!(matches!(second, NativeV1SnapshotLoadError::Preflight(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn terminal_native_v1_load_failure_latches_process_without_controller_commit() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Terminal);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        assert!(matches!(
+            vmm.restore_native_v1_snapshot(&snapshot_load_input(false)),
+            Err(NativeV1SnapshotLoadError::ProcessTerminal)
+        ));
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(
+            vmm.process_exit_status(),
+            super::ProcessSessionExitStatus::Terminal
+        );
+
+        assert!(matches!(
+            vmm.restore_native_v1_snapshot(&snapshot_load_input(false)),
+            Err(NativeV1SnapshotLoadError::ProcessTerminal)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn internal_native_v1_artifact_failure_redacts_both_paths_and_keeps_process_retryable() {
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        );
+        let input = SnapshotLoadInput::new(
+            "/private/missing-state-sentinel",
+            SnapshotMemoryBackend::new(
+                "/private/missing-memory-sentinel",
+                SnapshotMemoryBackendType::File,
+            ),
+        );
+
+        let error = vmm
+            .restore_native_v1_snapshot(&input)
+            .expect_err("missing private artifacts should fail before HVF construction");
+        assert!(matches!(error, NativeV1SnapshotLoadError::Artifact(_)));
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("missing-state-sentinel"));
+        assert!(!diagnostics.contains("missing-memory-sentinel"));
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(
+            vmm.process_exit_status(),
+            super::ProcessSessionExitStatus::Running
+        );
+    }
+
     #[test]
     fn default_hvf_boot_session_config_includes_process_owned_serial_output() {
         let executor = HvfInstanceStartExecutor::default();
@@ -6935,6 +7408,41 @@ mod tests {
 
         drop(supervisor);
 
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_can_publish_session_initially_paused() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender);
+
+        let supervisor = BootRunLoopSupervisor::start_paused(
+            session,
+            NonZeroUsize::new(7).expect("non-zero limit"),
+        )
+        .expect("paused supervisor should start");
+
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert_eq!(
+            max_steps_receiver.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "worker must not enter the guest before explicit resume"
+        );
+
+        supervisor.resume().expect("paused worker should resume");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("resumed worker should enter run loop"),
+            7
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Running);
+
+        drop(supervisor);
         assert_eq!(control.request_stop_count(), 1);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }

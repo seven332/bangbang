@@ -755,7 +755,11 @@ impl GuestBootDiagnostics {
         expected_serial_address: bangbang_runtime::memory::GuestAddress,
     ) -> Self {
         let resources = session.runtime_resources();
-        let initrd = resources.loaded_boot_source.initrd;
+        let boot_origin = resources
+            .boot_origin
+            .as_ref()
+            .expect("ordinary guest boot should retain boot-origin metadata");
+        let initrd = boot_origin.loaded_boot_source.initrd;
         let (initrd_address, initrd_size) = match initrd {
             Some(loaded) => (Some(loaded.address.raw_value()), Some(loaded.size)),
             None => (None, None),
@@ -774,19 +778,22 @@ impl GuestBootDiagnostics {
             session.serial_interrupt_line(),
             "guest boot test runtime and HVF serial interrupt metadata should match"
         );
-        let boot_args = resources
+        let boot_args = boot_origin
             .loaded_boot_source
             .command_line
             .as_str()
             .to_string();
+        let boot_registers = session
+            .boot_registers()
+            .expect("ordinary guest boot should retain boot registers");
 
         Self {
             kernel_path,
             initrd_path,
             boot_args,
-            boot_pc: session.boot_registers().kernel_entry.raw_value(),
-            fdt_address: resources.fdt.address.raw_value(),
-            fdt_size: resources.fdt.size,
+            boot_pc: boot_registers.kernel_entry.raw_value(),
+            fdt_address: boot_origin.fdt.address.raw_value(),
+            fdt_size: boot_origin.fdt.size,
             initrd_address,
             initrd_size,
             serial_mmio_base: serial.region.range().start().raw_value(),
@@ -1001,13 +1008,17 @@ fn validate_pre_run_boot_metadata(
     use device_tree::DeviceTree;
 
     let resources = session.runtime_resources();
+    let boot_origin = resources
+        .boot_origin
+        .as_ref()
+        .expect("ordinary guest boot should retain boot-origin metadata");
     assert_eq!(
-        resources.loaded_boot_source.command_line.as_str(),
+        boot_origin.loaded_boot_source.command_line.as_str(),
         diagnostics.boot_args,
         "guest boot test boot args should match diagnostics"
     );
     assert_eq!(
-        resources
+        boot_origin
             .loaded_boot_source
             .initrd
             .map(|loaded| loaded.address.raw_value()),
@@ -1015,11 +1026,11 @@ fn validate_pre_run_boot_metadata(
         "guest boot test loaded initrd address should match diagnostics"
     );
 
-    let mut fdt_bytes = vec![0; resources.fdt.size];
+    let mut fdt_bytes = vec![0; boot_origin.fdt.size];
     session
         .guest_memory()
         .expect("guest boot test memory should be mapped")
-        .read_slice(&mut fdt_bytes, resources.fdt.address)
+        .read_slice(&mut fdt_bytes, boot_origin.fdt.address)
         .expect("guest boot test FDT bytes should read");
     let tree = DeviceTree::load(&fdt_bytes).expect("guest boot test FDT should parse");
     let chosen = tree

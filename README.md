@@ -80,11 +80,18 @@ aggregate command, preflight the state encoding, and stream guest memory in
 cooperatively cancellable 1 MiB chunks. It returns no partial bundle and leaves
 the source session paused, retryable, and resumable. The existing macOS-only
 publisher still writes private owner-only files, makes memory durable first,
-and publishes state last as the commit marker, but no process or API path
-connects the new capture to that publisher. Public snapshot create/load,
-complete restore and VM construction, prepared-device installation, optional-
-device state, EL2 GIC CPU-interface state, cross-host portability, and signed
-fresh-process continuity remain unsupported.
+and publishes state last as the commit marker.
+
+The matching private load path now validates a committed kind-2 pair, prepares
+and installs the baseline devices without kernel/FDT boot writes, constructs a
+fresh HVF VM/GIC/vCPU runner, and restores the complete native-v1 state under
+one never-run owner-thread command. Destination CPU IDs, MPIDR, cache manifest,
+inactive SVE/SME/debug state, fixed platform layout, and GIC metadata must match.
+VMGenID is replaced and signaled before the restored session is handed to an
+initially paused process worker. `resume_vm` is returned as explicit caller
+intent and never silently executed. Public snapshot create/load, optional-
+device state, EL2 GIC CPU-interface state, cross-host portability, and a public
+fresh-process restore entrypoint remain unsupported.
 
 ## Process CLI
 
