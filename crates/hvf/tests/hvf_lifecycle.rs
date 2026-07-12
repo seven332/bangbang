@@ -3440,15 +3440,18 @@ fn prepares_owned_hvf_arm64_boot_session() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn captures_and_prepares_native_v1_inactive_device_profile() {
+fn captures_native_v1_composite_and_keeps_source_session_usable() {
+    use std::io::Cursor;
     use std::time::Instant;
 
     use bangbang_hvf::{
-        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfSnapshotV1Bundle,
+        HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
     };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput};
     use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory};
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
@@ -3456,6 +3459,9 @@ fn captures_and_prepares_native_v1_inactive_device_profile() {
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::snapshot_device::{
         decode_snapshot_v1_device_state, encode_snapshot_v1_device_state,
+    };
+    use bangbang_runtime::snapshot_memory::{
+        load_snapshot_memory_image, write_snapshot_memory_image,
     };
     use bangbang_runtime::startup::prepare_snapshot_v1_device_profile;
     use bangbang_runtime::vsock::VsockMmioLayout;
@@ -3479,6 +3485,9 @@ fn captures_and_prepares_native_v1_inactive_device_profile() {
             DriveConfigInput::new("rootfs", "rootfs", root.path(), true).with_is_read_only(true),
         ))
         .expect("read-only root config should be stored");
+    controller
+        .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(1, 16)))
+        .expect("compact snapshot test machine should configure");
 
     let serial_buffer = SharedSerialOutputBuffer::default();
     let config = HvfArm64BootSessionConfig::new(
@@ -3486,7 +3495,10 @@ fn captures_and_prepares_native_v1_inactive_device_profile() {
         PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
         NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
         VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
-        test_rtc_mmio_layout(),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
     )
     .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
         MmioRegionId::new(20),
@@ -3496,23 +3508,91 @@ fn captures_and_prepares_native_v1_inactive_device_profile() {
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
         .expect("owned snapshot device session should prepare");
 
-    let state = {
+    // Write deterministic guest code at the configured entry. The first exit
+    // stores a non-default serial scratch register, the second is a PSCI HVC,
+    // and the final HVC remains after both captures to prove source resumption.
+    let source_entry = GuestAddress::new(
+        session
+            .capture_arm64_general_register_state()
+            .expect("source entry registers should capture")
+            .pc(),
+    );
+    let guest_code = [
+        0xd282_4685, // mov x5, #0x1234
+        0xd2a8_0001, // mov x1, #0x40000000
+        0xf284_00e1, // movk x1, #0x2007
+        0xd280_0b42, // mov x2, #0x5a
+        0x3900_0022, // strb w2, [x1]
+        0xd2b0_8000, // mov x0, #0x84000000 (PSCI_VERSION)
+        0xd400_0002, // hvc #0
+        0xd28a_cf06, // mov x6, #0x5678
+        0xd2b0_8000, // mov x0, #0x84000000 (PSCI_VERSION)
+        0xd400_0002, // hvc #0
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect::<Vec<_>>();
+    session
+        .guest_memory_mut()
+        .expect("source guest memory should be mutable before execution")
+        .write_slice(&guest_code, source_entry)
+        .expect("source guest code should fit at the configured entry");
+    assert!(matches!(
+        session.run_once_and_handle_mmio(),
+        Ok(HvfVcpuRunStepOutcome::Mmio { .. })
+    ));
+    assert!(matches!(
+        session.run_once_and_handle_mmio(),
+        Ok(HvfVcpuRunStepOutcome::Hvc {
+            function_id: 0x8400_0000,
+            return_value: 2,
+            ..
+        })
+    ));
+
+    let (bundle, memory_image) = {
         let guard = session
             .quiesce_limiter_retry_wakeups()
             .expect("snapshot device retry work should quiesce");
-        session
-            .capture_snapshot_v1_device_state_at(
+        let state = session
+            .capture_snapshot_v1_state_at(
                 &controller.drive_configs()[0],
                 controller.serial_config(),
                 &guard,
                 Instant::now(),
             )
-            .expect("inactive snapshot device profile should capture")
+            .expect("complete inactive native-v1 state should capture");
+        let mut memory_image = Cursor::new(Vec::new());
+        let binding = write_snapshot_memory_image(
+            session
+                .guest_memory()
+                .expect("source guest memory should remain mapped"),
+            &mut memory_image,
+        )
+        .expect("source guest memory should stream while quiesced");
+        let bundle = HvfSnapshotV1Bundle::try_new(binding, state)
+            .expect("complete state and memory should form one bundle");
+        (bundle, memory_image)
     };
-    let encoded = encode_snapshot_v1_device_state(&state)
+    let decoded_bundle =
+        HvfSnapshotV1Bundle::try_from_commit_record(bundle.commit_record().clone())
+            .expect("captured composite commit should decode");
+    assert_eq!(decoded_bundle.state(), bundle.state());
+    let loaded_memory = load_snapshot_memory_image(
+        bundle.commit_record().memory_binding(),
+        &mut Cursor::new(memory_image.into_inner()),
+    )
+    .expect("captured memory image should validate and load");
+    assert_eq!(
+        loaded_memory.total_size(),
+        session.runtime_resources().layout.total_size()
+    );
+
+    let encoded = encode_snapshot_v1_device_state(bundle.state().device())
         .expect("captured snapshot device state should encode");
     let decoded = decode_snapshot_v1_device_state(&encoded)
         .expect("captured snapshot device state should decode");
+    assert_eq!(decoded.serial_state().scratch(), 0x5a);
 
     let layout = session.runtime_resources().layout.clone();
     let mut loaded_memory =
@@ -3547,6 +3627,46 @@ fn captures_and_prepares_native_v1_inactive_device_profile() {
         "prepared VMClock range should match without logging guest addresses"
     );
     drop(prepared);
+
+    let first_image_id = bundle.commit_record().memory_binding().image_id();
+    let second_image_id = {
+        let guard = session
+            .quiesce_limiter_retry_wakeups()
+            .expect("second snapshot retry work should quiesce");
+        let state = session
+            .capture_snapshot_v1_state_at(
+                &controller.drive_configs()[0],
+                controller.serial_config(),
+                &guard,
+                Instant::now(),
+            )
+            .expect("second complete native-v1 state should capture");
+        let mut memory_image = Cursor::new(Vec::new());
+        let binding = write_snapshot_memory_image(
+            session
+                .guest_memory()
+                .expect("source guest memory should remain mapped for retry"),
+            &mut memory_image,
+        )
+        .expect("second memory image should stream");
+        HvfSnapshotV1Bundle::try_new(binding, state)
+            .expect("second complete bundle should validate")
+            .commit_record()
+            .memory_binding()
+            .image_id()
+    };
+    assert_ne!(first_image_id, second_image_id);
+    assert!(matches!(
+        session.run_once_and_handle_mmio(),
+        Ok(HvfVcpuRunStepOutcome::Hvc {
+            function_id: 0x8400_0000,
+            return_value: 2,
+            ..
+        })
+    ));
+    session
+        .capture_arm64_general_register_state()
+        .expect("source owner should remain usable after resumption");
     session
         .shutdown()
         .expect("owned snapshot device session should shut down");

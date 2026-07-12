@@ -22,6 +22,7 @@ const SNAPSHOT_COMMIT_FLAGS_OFFSET: usize = 16;
 const SNAPSHOT_COMMIT_BINDING_LENGTH_OFFSET: usize = 20;
 const SNAPSHOT_COMMIT_RESERVED_OFFSET: usize = 24;
 const SNAPSHOT_COMMIT_MEMORY_ONLY_KIND: u16 = 1;
+const SNAPSHOT_COMMIT_COMPOSITE_KIND: u16 = 2;
 const SNAPSHOT_COMMIT_FLAGS: u32 = 0;
 const SNAPSHOT_COMMIT_RESERVED: u64 = 0;
 const REDACTED: &str = "<redacted>";
@@ -29,22 +30,63 @@ const REDACTED: &str = "<redacted>";
 /// Fixed native-v1 snapshot commit-record header size.
 pub const SNAPSHOT_COMMIT_HEADER_BYTES: usize = 32;
 
-/// Maximum complete native-v1 snapshot commit payload size.
+/// Maximum complete legacy native-v1 memory-only commit payload size.
 pub const NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES: usize =
     SNAPSHOT_COMMIT_HEADER_BYTES + NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES;
 
-const _: () = assert!(NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES <= NATIVE_V1_SNAPSHOT_MAX_PAYLOAD_BYTES);
+/// Explicit alias for the native-v1 memory-only commit payload limit.
+pub const NATIVE_V1_SNAPSHOT_MEMORY_ONLY_COMMIT_MAX_BYTES: usize =
+    NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES;
 
-/// Validated native-v1 memory-only snapshot commit record.
+/// Maximum complete native-v1 composite commit payload size.
+pub const NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES: usize =
+    NATIVE_V1_SNAPSHOT_MAX_PAYLOAD_BYTES;
+
+/// Maximum opaque state bytes in a composite commit with a maximum-size binding.
+pub const NATIVE_V1_SNAPSHOT_COMPOSITE_STATE_MAX_BYTES: usize =
+    NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES
+        - SNAPSHOT_COMMIT_HEADER_BYTES
+        - NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES;
+
+const _: () =
+    assert!(NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES <= NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES);
+
+/// Semantic kind carried by a validated native-v1 snapshot commit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotCommitKind {
+    /// The legacy internal record binds only a guest-memory image.
+    MemoryOnly,
+    /// The complete record binds memory and carries an opaque backend state payload.
+    Composite,
+}
+
+/// Validated native-v1 memory-only or composite snapshot commit record.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotCommitRecord {
     memory_binding: SnapshotMemoryBinding,
+    composite_state: Option<Vec<u8>>,
 }
 
 impl SnapshotCommitRecord {
     /// Creates a commit record around an already validated memory binding.
     pub const fn new(memory_binding: SnapshotMemoryBinding) -> Self {
-        Self { memory_binding }
+        Self {
+            memory_binding,
+            composite_state: None,
+        }
+    }
+
+    /// Creates a complete commit record with one bounded opaque state payload.
+    pub fn try_new_composite(
+        memory_binding: SnapshotMemoryBinding,
+        composite_state: Vec<u8>,
+    ) -> Result<Self, SnapshotCommitError> {
+        let binding_length = encode_snapshot_memory_binding(&memory_binding)?.len();
+        validate_composite_state_length(composite_state.len(), binding_length)?;
+        Ok(Self {
+            memory_binding,
+            composite_state: Some(composite_state),
+        })
     }
 
     /// Returns the exact native snapshot commit-record version.
@@ -56,15 +98,40 @@ impl SnapshotCommitRecord {
     pub const fn memory_binding(&self) -> &SnapshotMemoryBinding {
         &self.memory_binding
     }
+
+    /// Returns the semantic commit-record kind.
+    pub const fn kind(&self) -> SnapshotCommitKind {
+        if self.composite_state.is_some() {
+            SnapshotCommitKind::Composite
+        } else {
+            SnapshotCommitKind::MemoryOnly
+        }
+    }
+
+    /// Returns the opaque complete-state payload when this is a composite record.
+    pub fn composite_state(&self) -> Option<&[u8]> {
+        self.composite_state.as_deref()
+    }
 }
 
 impl fmt::Debug for SnapshotCommitRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SnapshotCommitRecord")
+        let mut debug = f.debug_struct("SnapshotCommitRecord");
+        debug
             .field("version", &NATIVE_V1_SNAPSHOT_VERSION)
-            .field("kind", &"memory-only")
-            .field("memory_binding", &REDACTED)
-            .finish()
+            .field(
+                "kind",
+                &if self.composite_state.is_some() {
+                    "composite"
+                } else {
+                    "memory-only"
+                },
+            )
+            .field("memory_binding", &REDACTED);
+        if let Some(state) = &self.composite_state {
+            debug.field("composite_state_bytes", &state.len());
+        }
+        debug.finish()
     }
 }
 
@@ -89,6 +156,8 @@ pub enum SnapshotCommitError {
     UnsupportedReserved(u64),
     /// The declared binding length is empty or exceeds native-v1 policy.
     BindingLengthOutOfBounds { length: u64, maximum: usize },
+    /// The composite state is empty or exceeds the remaining commit budget.
+    CompositeStateLengthOutOfBounds { length: u64, maximum: usize },
     /// Commit-record length or offset arithmetic overflowed.
     LengthOverflow,
     /// Commit-record allocation failed.
@@ -128,6 +197,10 @@ impl fmt::Display for SnapshotCommitError {
                 f,
                 "snapshot commit binding length {length} is outside 1..={maximum}"
             ),
+            Self::CompositeStateLengthOutOfBounds { length, maximum } => write!(
+                f,
+                "snapshot commit composite-state length {length} is outside 1..={maximum}"
+            ),
             Self::LengthOverflow => {
                 f.write_str("snapshot commit record length arithmetic overflowed")
             }
@@ -155,6 +228,7 @@ impl std::error::Error for SnapshotCommitError {
             | Self::UnsupportedFlags(_)
             | Self::UnsupportedReserved(_)
             | Self::BindingLengthOutOfBounds { .. }
+            | Self::CompositeStateLengthOutOfBounds { .. }
             | Self::LengthOverflow => None,
         }
     }
@@ -180,9 +254,31 @@ pub fn encode_snapshot_commit_payload(
     let binding_length =
         u32::try_from(binding.len()).map_err(|_| SnapshotCommitError::LengthOverflow)?;
     validate_binding_length(u64::from(binding_length))?;
+    let (kind, state, state_length) = match record.composite_state() {
+        Some(state) => {
+            validate_composite_state_length(state.len(), binding.len())?;
+            (
+                SNAPSHOT_COMMIT_COMPOSITE_KIND,
+                state,
+                u64::try_from(state.len()).map_err(|_| SnapshotCommitError::LengthOverflow)?,
+            )
+        }
+        None => (
+            SNAPSHOT_COMMIT_MEMORY_ONLY_KIND,
+            &[][..],
+            SNAPSHOT_COMMIT_RESERVED,
+        ),
+    };
     let encoded_length = SNAPSHOT_COMMIT_HEADER_BYTES
         .checked_add(binding.len())
+        .and_then(|length| length.checked_add(state.len()))
         .ok_or(SnapshotCommitError::LengthOverflow)?;
+    if encoded_length > NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES {
+        return Err(SnapshotCommitError::CompositeStateLengthOutOfBounds {
+            length: state_length,
+            maximum: composite_state_maximum(binding.len())?,
+        });
+    }
 
     let mut encoded = Vec::new();
     encoded
@@ -192,11 +288,12 @@ pub fn encode_snapshot_commit_payload(
     encoded.extend_from_slice(&NATIVE_V1_SNAPSHOT_VERSION.major().to_le_bytes());
     encoded.extend_from_slice(&NATIVE_V1_SNAPSHOT_VERSION.minor().to_le_bytes());
     encoded.extend_from_slice(&NATIVE_V1_SNAPSHOT_VERSION.patch().to_le_bytes());
-    encoded.extend_from_slice(&SNAPSHOT_COMMIT_MEMORY_ONLY_KIND.to_le_bytes());
+    encoded.extend_from_slice(&kind.to_le_bytes());
     encoded.extend_from_slice(&SNAPSHOT_COMMIT_FLAGS.to_le_bytes());
     encoded.extend_from_slice(&binding_length.to_le_bytes());
-    encoded.extend_from_slice(&SNAPSHOT_COMMIT_RESERVED.to_le_bytes());
+    encoded.extend_from_slice(&state_length.to_le_bytes());
     encoded.extend_from_slice(&binding);
+    encoded.extend_from_slice(state);
     Ok(encoded)
 }
 
@@ -213,7 +310,6 @@ pub fn decode_snapshot_commit_payload(
     if read_array::<8>(bytes, SNAPSHOT_COMMIT_MAGIC_OFFSET)? != SNAPSHOT_COMMIT_MAGIC {
         return Err(SnapshotCommitError::InvalidMagic);
     }
-
     let binding_length = u32::from_le_bytes(read_array::<4>(
         bytes,
         SNAPSHOT_COMMIT_BINDING_LENGTH_OFFSET,
@@ -221,21 +317,6 @@ pub fn decode_snapshot_commit_payload(
     validate_binding_length(u64::from(binding_length))?;
     let binding_length =
         usize::try_from(binding_length).map_err(|_| SnapshotCommitError::LengthOverflow)?;
-    let expected_length = SNAPSHOT_COMMIT_HEADER_BYTES
-        .checked_add(binding_length)
-        .ok_or(SnapshotCommitError::LengthOverflow)?;
-    if bytes.len() < expected_length {
-        return Err(SnapshotCommitError::Truncated {
-            expected: expected_length,
-            actual: bytes.len(),
-        });
-    }
-    if bytes.len() > expected_length {
-        return Err(SnapshotCommitError::TrailingData {
-            expected: expected_length,
-            actual: bytes.len(),
-        });
-    }
 
     let version = SnapshotFormatVersion::new(
         u16::from_le_bytes(read_array::<2>(
@@ -255,23 +336,69 @@ pub fn decode_snapshot_commit_payload(
         return Err(SnapshotCommitError::UnsupportedVersion(version));
     }
     let kind = u16::from_le_bytes(read_array::<2>(bytes, SNAPSHOT_COMMIT_KIND_OFFSET)?);
-    if kind != SNAPSHOT_COMMIT_MEMORY_ONLY_KIND {
-        return Err(SnapshotCommitError::UnsupportedKind(kind));
-    }
     let flags = u32::from_le_bytes(read_array::<4>(bytes, SNAPSHOT_COMMIT_FLAGS_OFFSET)?);
     if flags != SNAPSHOT_COMMIT_FLAGS {
         return Err(SnapshotCommitError::UnsupportedFlags(flags));
     }
-    let reserved = u64::from_le_bytes(read_array::<8>(bytes, SNAPSHOT_COMMIT_RESERVED_OFFSET)?);
-    if reserved != SNAPSHOT_COMMIT_RESERVED {
-        return Err(SnapshotCommitError::UnsupportedReserved(reserved));
+    let state_length = u64::from_le_bytes(read_array::<8>(bytes, SNAPSHOT_COMMIT_RESERVED_OFFSET)?);
+    let state_length = match kind {
+        SNAPSHOT_COMMIT_MEMORY_ONLY_KIND => {
+            if state_length != SNAPSHOT_COMMIT_RESERVED {
+                return Err(SnapshotCommitError::UnsupportedReserved(state_length));
+            }
+            0
+        }
+        SNAPSHOT_COMMIT_COMPOSITE_KIND => {
+            let state_length =
+                usize::try_from(state_length).map_err(|_| SnapshotCommitError::LengthOverflow)?;
+            validate_composite_state_length(state_length, binding_length)?;
+            state_length
+        }
+        _ => return Err(SnapshotCommitError::UnsupportedKind(kind)),
+    };
+    let binding_end = SNAPSHOT_COMMIT_HEADER_BYTES
+        .checked_add(binding_length)
+        .ok_or(SnapshotCommitError::LengthOverflow)?;
+    let expected_length = binding_end
+        .checked_add(state_length)
+        .ok_or(SnapshotCommitError::LengthOverflow)?;
+    if bytes.len() < expected_length {
+        return Err(SnapshotCommitError::Truncated {
+            expected: expected_length,
+            actual: bytes.len(),
+        });
+    }
+    if bytes.len() > expected_length {
+        return Err(SnapshotCommitError::TrailingData {
+            expected: expected_length,
+            actual: bytes.len(),
+        });
     }
 
     let binding_bytes = bytes
-        .get(SNAPSHOT_COMMIT_HEADER_BYTES..expected_length)
+        .get(SNAPSHOT_COMMIT_HEADER_BYTES..binding_end)
         .ok_or(SnapshotCommitError::LengthOverflow)?;
     let memory_binding = decode_snapshot_memory_binding(binding_bytes)?;
-    Ok(SnapshotCommitRecord::new(memory_binding))
+    if kind == SNAPSHOT_COMMIT_MEMORY_ONLY_KIND {
+        return Ok(SnapshotCommitRecord::new(memory_binding));
+    }
+
+    let state_bytes = bytes
+        .get(binding_end..expected_length)
+        .ok_or(SnapshotCommitError::LengthOverflow)?;
+    let composite_state = detach_composite_state_with(state_bytes, Vec::try_reserve_exact)?;
+    SnapshotCommitRecord::try_new_composite(memory_binding, composite_state)
+}
+
+fn detach_composite_state_with(
+    state_bytes: &[u8],
+    reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
+) -> Result<Vec<u8>, SnapshotCommitError> {
+    let mut composite_state = Vec::new();
+    reserve(&mut composite_state, state_bytes.len())
+        .map_err(|source| SnapshotCommitError::AllocationFailed { source })?;
+    composite_state.extend_from_slice(state_bytes);
+    Ok(composite_state)
 }
 
 /// Encodes a validated commit record in the native-v1 state envelope.
@@ -297,6 +424,27 @@ fn validate_binding_length(length: u64) -> Result<(), SnapshotCommitError> {
         return Err(SnapshotCommitError::BindingLengthOutOfBounds {
             length,
             maximum: NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn composite_state_maximum(binding_length: usize) -> Result<usize, SnapshotCommitError> {
+    NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES
+        .checked_sub(SNAPSHOT_COMMIT_HEADER_BYTES)
+        .and_then(|remaining| remaining.checked_sub(binding_length))
+        .ok_or(SnapshotCommitError::LengthOverflow)
+}
+
+fn validate_composite_state_length(
+    length: usize,
+    binding_length: usize,
+) -> Result<(), SnapshotCommitError> {
+    let maximum = composite_state_maximum(binding_length)?;
+    if length == 0 || length > maximum {
+        return Err(SnapshotCommitError::CompositeStateLengthOutOfBounds {
+            length: u64::try_from(length).unwrap_or(u64::MAX),
+            maximum,
         });
     }
     Ok(())
@@ -391,6 +539,45 @@ mod tests {
     }
 
     #[test]
+    fn composite_payload_round_trips_and_pins_kind_and_state_length() {
+        let (binding, binding_bytes) = test_binding(1);
+        let state = b"sensitive-composite-state".to_vec();
+        let record = SnapshotCommitRecord::try_new_composite(binding.clone(), state.clone())
+            .expect("fixture should be valid");
+        let encoded = encode_snapshot_commit_payload(&record).expect("fixture should encode");
+
+        assert_eq!(record.kind(), SnapshotCommitKind::Composite);
+        assert_eq!(record.composite_state(), Some(state.as_slice()));
+        assert_eq!(
+            u16::from_le_bytes(
+                encoded[SNAPSHOT_COMMIT_KIND_OFFSET..SNAPSHOT_COMMIT_KIND_OFFSET + 2]
+                    .try_into()
+                    .expect("kind should exist")
+            ),
+            SNAPSHOT_COMMIT_COMPOSITE_KIND
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                encoded[SNAPSHOT_COMMIT_RESERVED_OFFSET..SNAPSHOT_COMMIT_RESERVED_OFFSET + 8]
+                    .try_into()
+                    .expect("state length should exist")
+            ),
+            u64::try_from(state.len()).expect("state length should fit u64")
+        );
+        let binding_end = SNAPSHOT_COMMIT_HEADER_BYTES + binding_bytes.len();
+        assert_eq!(
+            encoded.get(SNAPSHOT_COMMIT_HEADER_BYTES..binding_end),
+            Some(binding_bytes.as_slice())
+        );
+        assert_eq!(encoded.get(binding_end..), Some(state.as_slice()));
+        assert_eq!(
+            decode_snapshot_commit_payload(&encoded).expect("fixture should decode"),
+            record
+        );
+        assert_eq!(record.memory_binding(), &binding);
+    }
+
+    #[test]
     fn maximum_binding_fits_outer_payload() {
         let (binding, binding_bytes) = test_binding(4096);
         let payload = encode_snapshot_commit_payload(&SnapshotCommitRecord::new(binding))
@@ -400,8 +587,43 @@ mod tests {
             binding_bytes.len(),
             NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES
         );
+        assert_eq!(
+            payload.len(),
+            NATIVE_V1_SNAPSHOT_MEMORY_ONLY_COMMIT_MAX_BYTES
+        );
         assert_eq!(payload.len(), NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES);
         assert!(payload.len() <= NATIVE_V1_SNAPSHOT_MAX_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn composite_state_uses_exact_remaining_outer_payload_budget() {
+        let (binding, binding_bytes) = test_binding(4096);
+        let state = vec![0x5a; NATIVE_V1_SNAPSHOT_COMPOSITE_STATE_MAX_BYTES];
+        let record = SnapshotCommitRecord::try_new_composite(binding.clone(), state)
+            .expect("maximum composite state should be valid");
+        let encoded = encode_snapshot_commit_payload(&record).expect("fixture should encode");
+
+        assert_eq!(
+            binding_bytes.len(),
+            NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES
+        );
+        assert_eq!(encoded.len(), NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES);
+        assert_eq!(
+            decode_snapshot_commit_payload(&encoded)
+                .expect("maximum fixture should decode")
+                .memory_binding(),
+            &binding
+        );
+
+        let oversized = vec![0; NATIVE_V1_SNAPSHOT_COMPOSITE_STATE_MAX_BYTES + 1];
+        assert!(matches!(
+            SnapshotCommitRecord::try_new_composite(binding, oversized),
+            Err(SnapshotCommitError::CompositeStateLengthOutOfBounds {
+                length,
+                maximum: NATIVE_V1_SNAPSHOT_COMPOSITE_STATE_MAX_BYTES,
+            }) if length == u64::try_from(NATIVE_V1_SNAPSHOT_COMPOSITE_STATE_MAX_BYTES + 1)
+                .expect("length should fit u64")
+        ));
     }
 
     #[test]
@@ -473,10 +695,10 @@ mod tests {
         let mut invalid_kind = encoded.clone();
         *invalid_kind
             .get_mut(SNAPSHOT_COMMIT_KIND_OFFSET)
-            .expect("kind should exist") = 2;
+            .expect("kind should exist") = 3;
         assert!(matches!(
             decode_snapshot_commit_payload(&invalid_kind),
-            Err(SnapshotCommitError::UnsupportedKind(2))
+            Err(SnapshotCommitError::UnsupportedKind(3))
         ));
 
         let mut invalid_flags = encoded.clone();
@@ -534,6 +756,72 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_truncated_trailing_and_oversized_composite_state() {
+        let (binding, binding_bytes) = test_binding(1);
+        let memory_only =
+            encode_snapshot_commit_payload(&SnapshotCommitRecord::new(binding.clone()))
+                .expect("fixture should encode");
+        let mut empty = memory_only.clone();
+        empty[SNAPSHOT_COMMIT_KIND_OFFSET..SNAPSHOT_COMMIT_KIND_OFFSET + 2]
+            .copy_from_slice(&SNAPSHOT_COMMIT_COMPOSITE_KIND.to_le_bytes());
+        assert!(matches!(
+            decode_snapshot_commit_payload(&empty),
+            Err(SnapshotCommitError::CompositeStateLengthOutOfBounds { length: 0, .. })
+        ));
+
+        let record = SnapshotCommitRecord::try_new_composite(binding, vec![1, 2, 3])
+            .expect("fixture should be valid");
+        let encoded = encode_snapshot_commit_payload(&record).expect("fixture should encode");
+        assert!(matches!(
+            decode_snapshot_commit_payload(&encoded[..encoded.len() - 1]),
+            Err(SnapshotCommitError::Truncated { expected, actual })
+                if expected == encoded.len() && actual == encoded.len() - 1
+        ));
+        let mut trailing = encoded.clone();
+        trailing.push(4);
+        assert!(matches!(
+            decode_snapshot_commit_payload(&trailing),
+            Err(SnapshotCommitError::TrailingData { expected, actual })
+                if expected == encoded.len() && actual == encoded.len() + 1
+        ));
+
+        let mut oversized = memory_only;
+        oversized[SNAPSHOT_COMMIT_KIND_OFFSET..SNAPSHOT_COMMIT_KIND_OFFSET + 2]
+            .copy_from_slice(&SNAPSHOT_COMMIT_COMPOSITE_KIND.to_le_bytes());
+        let maximum = composite_state_maximum(binding_bytes.len()).expect("maximum should exist");
+        oversized[SNAPSHOT_COMMIT_RESERVED_OFFSET..SNAPSHOT_COMMIT_RESERVED_OFFSET + 8]
+            .copy_from_slice(
+                &u64::try_from(maximum + 1)
+                    .expect("oversized length should fit u64")
+                    .to_le_bytes(),
+            );
+        assert!(matches!(
+            decode_snapshot_commit_payload(&oversized),
+            Err(SnapshotCommitError::CompositeStateLengthOutOfBounds {
+                length,
+                maximum: observed,
+            }) if length == u64::try_from(maximum + 1).expect("length should fit u64")
+                && observed == maximum
+        ));
+    }
+
+    #[test]
+    fn composite_state_allocation_failure_returns_no_partial_value() {
+        let allocation_error = Vec::<u8>::new()
+            .try_reserve_exact(usize::MAX)
+            .expect_err("impossible allocation should provide a test error");
+        let error =
+            detach_composite_state_with(b"sensitive-state", move |_, _| Err(allocation_error))
+                .expect_err("injected allocation failure should reject");
+
+        assert!(matches!(
+            error,
+            SnapshotCommitError::AllocationFailed { .. }
+        ));
+        assert!(!format!("{error:?}").contains("sensitive-state"));
+    }
+
+    #[test]
     fn rejects_invalid_nested_binding_and_outer_envelope() {
         let (binding, _) = test_binding(1);
         let record = SnapshotCommitRecord::new(binding);
@@ -567,8 +855,19 @@ mod tests {
         let debug = format!("{record:?}");
 
         assert!(debug.contains(REDACTED));
+        assert!(debug.contains("kind: \"memory-only\""));
+        assert!(!debug.contains("composite_state"));
         assert!(!debug.contains(&identity));
         assert!(!debug.contains(&checksum));
+
+        let state = b"state-payload-sentinel".to_vec();
+        let composite =
+            SnapshotCommitRecord::try_new_composite(record.memory_binding.clone(), state)
+                .expect("fixture should be valid");
+        let composite_debug = format!("{composite:?}");
+        assert!(composite_debug.contains("kind: \"composite\""));
+        assert!(composite_debug.contains("composite_state_bytes: 22"));
+        assert!(!composite_debug.contains("state-payload-sentinel"));
     }
 
     fn test_binding(range_count: usize) -> (SnapshotMemoryBinding, Vec<u8>) {

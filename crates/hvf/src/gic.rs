@@ -633,6 +633,10 @@ pub enum HvfGicError {
     StateAllocationFailed {
         size: u64,
     },
+    StateTooLarge {
+        size: u64,
+        maximum: usize,
+    },
     InvalidParameter {
         name: &'static str,
         value: u64,
@@ -680,6 +684,10 @@ impl fmt::Display for HvfGicError {
                     "failed to allocate {size} bytes for Hypervisor.framework GIC state"
                 )
             }
+            Self::StateTooLarge { size, maximum } => write!(
+                f,
+                "Hypervisor.framework GIC state size {size} exceeds snapshot limit {maximum}"
+            ),
             Self::InvalidParameter { name, value } => {
                 write!(
                     f,
@@ -727,6 +735,7 @@ impl std::error::Error for HvfGicError {
             | Self::ConfigCreateFailed
             | Self::StateCreateFailed
             | Self::StateAllocationFailed { .. }
+            | Self::StateTooLarge { .. }
             | Self::InvalidParameter { .. }
             | Self::AddressUnderflow { .. }
             | Self::UnalignedAddress { .. }
@@ -763,7 +772,7 @@ pub(crate) struct HvfGicIccRegisterRestorer {
 }
 
 trait HvfGicStateCapture: fmt::Debug {
-    fn capture(&self) -> Result<HvfGicDeviceState, HvfGicError>;
+    fn capture(&self, maximum_size: Option<usize>) -> Result<HvfGicDeviceState, HvfGicError>;
 }
 
 trait HvfGicStateApi: fmt::Debug {
@@ -812,7 +821,14 @@ impl HvfGicStateSnapshotter {
     }
 
     pub(crate) fn capture(&self) -> Result<HvfGicDeviceState, HvfGicError> {
-        self.capture.capture()
+        self.capture.capture(None)
+    }
+
+    pub(crate) fn capture_bounded(
+        &self,
+        maximum_size: usize,
+    ) -> Result<HvfGicDeviceState, HvfGicError> {
+        self.capture.capture(Some(maximum_size))
     }
 }
 
@@ -1413,8 +1429,16 @@ impl<Api: HvfGicStateApi + ?Sized> Drop for GicStateGuard<'_, Api> {
     }
 }
 
+#[cfg(test)]
 fn capture_gic_device_state_with_api<Api: HvfGicStateApi + ?Sized>(
     api: &Api,
+) -> Result<HvfGicDeviceState, HvfGicError> {
+    capture_gic_device_state_with_api_bounded(api, None)
+}
+
+fn capture_gic_device_state_with_api_bounded<Api: HvfGicStateApi + ?Sized>(
+    api: &Api,
+    maximum_size: Option<usize>,
 ) -> Result<HvfGicDeviceState, HvfGicError> {
     let state = GicStateGuard::new(api)?;
     let size = api.state_size(state.state()?)?;
@@ -1426,6 +1450,14 @@ fn capture_gic_device_state_with_api<Api: HvfGicStateApi + ?Sized>(
     }
 
     let reported_size = u64::try_from(size).unwrap_or(u64::MAX);
+    if let Some(maximum) = maximum_size
+        && size > maximum
+    {
+        return Err(HvfGicError::StateTooLarge {
+            size: reported_size,
+            maximum,
+        });
+    }
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(size)
@@ -2168,8 +2200,11 @@ mod dynamic {
     }
 
     impl super::HvfGicStateCapture for LoadedHvfGicStateCaptureApi {
-        fn capture(&self) -> Result<super::HvfGicDeviceState, HvfGicError> {
-            super::capture_gic_device_state_with_api(self)
+        fn capture(
+            &self,
+            maximum_size: Option<usize>,
+        ) -> Result<super::HvfGicDeviceState, HvfGicError> {
+            super::capture_gic_device_state_with_api_bounded(self, maximum_size)
         }
     }
 
@@ -2310,8 +2345,8 @@ mod tests {
         HvfGicMetadata, HvfGicMsiMetadata, HvfGicParameters, HvfGicPpiPendingWriter, HvfGicRegion,
         HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicStateApi, HvfGicStateRestoreApi,
         HvfGicStateRestorer, HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
-        capture_gic_device_state_with_api, create_gic_with_api, metadata_from_parameters,
-        restore_arm64_gic_icc_register_state_with,
+        capture_gic_device_state_with_api, capture_gic_device_state_with_api_bounded,
+        create_gic_with_api, metadata_from_parameters, restore_arm64_gic_icc_register_state_with,
     };
 
     const DIST_SIZE: u64 = 0x1_0000;
@@ -2621,6 +2656,25 @@ mod tests {
             ["state_create", "state_size", "state_data", "os_release"]
         );
         assert_eq!(api.released_states(), [7]);
+    }
+
+    #[test]
+    fn bounded_gic_capture_rejects_reported_size_before_allocation_or_copy() {
+        let api = FakeGicStateApi::new(vec![1, 2, 3, 4]);
+
+        assert_eq!(
+            capture_gic_device_state_with_api_bounded(&api, Some(3)),
+            Err(HvfGicError::StateTooLarge {
+                size: 4,
+                maximum: 3,
+            })
+        );
+        assert_eq!(api.calls(), ["state_create", "state_size", "os_release"]);
+        assert_eq!(api.released_states(), [7]);
+
+        let state = capture_gic_device_state_with_api_bounded(&api, Some(4))
+            .expect("exact bounded GIC state should capture on retry");
+        assert_eq!(state.as_bytes(), [1, 2, 3, 4]);
     }
 
     #[test]

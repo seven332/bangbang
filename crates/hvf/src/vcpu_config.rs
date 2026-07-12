@@ -1,5 +1,7 @@
 //! Default arm64 vCPU configuration exposed by Hypervisor.framework.
 
+use std::fmt;
+
 use bangbang_runtime::BackendError;
 
 use crate::HvfBackend;
@@ -21,7 +23,7 @@ pub struct HvfArm64VcpuCacheConfiguration {
 }
 
 impl HvfArm64VcpuCacheConfiguration {
-    const fn new(values: [u64; 3]) -> Self {
+    pub(crate) const fn new(values: [u64; 3]) -> Self {
         let [ctr_el0, clidr_el1, dczid_el0] = values;
         Self {
             ctr_el0,
@@ -61,8 +63,49 @@ pub struct HvfArm64VcpuCacheGeometry {
     instruction_ccsidr_el1: [u64; 8],
 }
 
+/// One detached, same-configuration native-v1 cache compatibility manifest.
+///
+/// Unlike the standalone queries, both feature registers and cache geometry
+/// are read from one owned default Hypervisor.framework configuration object.
+/// The raw values are compatibility metadata and remain redacted from `Debug`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64VcpuCacheManifest {
+    configuration: HvfArm64VcpuCacheConfiguration,
+    geometry: HvfArm64VcpuCacheGeometry,
+}
+
+impl HvfArm64VcpuCacheManifest {
+    pub(crate) const fn new(
+        configuration: HvfArm64VcpuCacheConfiguration,
+        geometry: HvfArm64VcpuCacheGeometry,
+    ) -> Self {
+        Self {
+            configuration,
+            geometry,
+        }
+    }
+
+    /// Return the default-vCPU cache feature registers.
+    pub const fn configuration(self) -> HvfArm64VcpuCacheConfiguration {
+        self.configuration
+    }
+
+    /// Return the default-vCPU cache geometry arrays.
+    pub const fn geometry(self) -> HvfArm64VcpuCacheGeometry {
+        self.geometry
+    }
+}
+
+impl fmt::Debug for HvfArm64VcpuCacheManifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64VcpuCacheManifest")
+            .field("cache_compatibility", &"<redacted>")
+            .finish()
+    }
+}
+
 impl HvfArm64VcpuCacheGeometry {
-    const fn new(values: [[u64; 8]; 2]) -> Self {
+    pub(crate) const fn new(values: [[u64; 8]; 2]) -> Self {
         let [data_or_unified_ccsidr_el1, instruction_ccsidr_el1] = values;
         Self {
             data_or_unified_ccsidr_el1,
@@ -104,6 +147,16 @@ impl HvfBackend {
     pub fn arm64_vcpu_cache_geometry() -> Result<HvfArm64VcpuCacheGeometry, BackendError> {
         crate::ffi::get_arm64_vcpu_cache_geometry().map(HvfArm64VcpuCacheGeometry::new)
     }
+
+    /// Query cache features and geometry from one default vCPU configuration.
+    pub fn arm64_vcpu_cache_manifest() -> Result<HvfArm64VcpuCacheManifest, BackendError> {
+        crate::ffi::get_arm64_vcpu_cache_manifest().map(|(configuration, geometry)| {
+            HvfArm64VcpuCacheManifest::new(
+                HvfArm64VcpuCacheConfiguration::new(configuration),
+                HvfArm64VcpuCacheGeometry::new(geometry),
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -113,7 +166,9 @@ mod tests {
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     use super::HvfBackend;
-    use super::{HvfArm64VcpuCacheConfiguration, HvfArm64VcpuCacheGeometry};
+    use super::{
+        HvfArm64VcpuCacheConfiguration, HvfArm64VcpuCacheGeometry, HvfArm64VcpuCacheManifest,
+    };
 
     #[test]
     fn cache_configuration_preserves_all_feature_values() {
@@ -155,6 +210,20 @@ mod tests {
         assert_eq!(geometry.instruction_ccsidr_el1(), &values[1]);
     }
 
+    #[test]
+    fn cache_manifest_preserves_both_values_and_redacts_debug() {
+        let configuration = HvfArm64VcpuCacheConfiguration::new([1, 2, 3]);
+        let geometry = HvfArm64VcpuCacheGeometry::new([[4; 8], [5; 8]]);
+        let manifest = HvfArm64VcpuCacheManifest::new(configuration, geometry);
+
+        assert_eq!(manifest.configuration(), configuration);
+        assert_eq!(manifest.geometry(), geometry);
+        assert_eq!(
+            format!("{manifest:?}"),
+            "HvfArm64VcpuCacheManifest { cache_compatibility: \"<redacted>\" }"
+        );
+    }
+
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     #[test]
     fn cache_configuration_query_reports_unsupported_compile_target() {
@@ -171,6 +240,17 @@ mod tests {
     fn cache_geometry_query_reports_unsupported_compile_target() {
         assert_eq!(
             HvfBackend::arm64_vcpu_cache_geometry(),
+            Err(BackendError::Unsupported(
+                crate::ffi::UNSUPPORTED_TARGET_MESSAGE
+            ))
+        );
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn cache_manifest_query_reports_unsupported_compile_target() {
+        assert_eq!(
+            HvfBackend::arm64_vcpu_cache_manifest(),
             Err(BackendError::Unsupported(
                 crate::ffi::UNSUPPORTED_TARGET_MESSAGE
             ))

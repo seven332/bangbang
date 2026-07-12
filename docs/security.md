@@ -91,7 +91,44 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | macOS sandboxing | Deferred feasible macOS work | Do not claim production containment until a sandbox profile and resource policy are designed and tested. |
 | Launcher or resource broker | Deferred feasible macOS work | Keep host-path and shared-resource isolation as operator responsibility until a separate broker owns privileged preparation and cleanup. |
 
-## Native Snapshot Device Boundary
+## Native Snapshot Composite and Device Boundary
+
+Every native snapshot layer remains untrusted even after its outer CRC passes.
+The kind-2 `BANGCMT\0` record binds the complete memory image to a bounded
+`BANGHVF\0` value with exactly five ordered components. Decode rejects unknown,
+missing, duplicate, reordered, truncated, oversized, flagged, inconsistent, or
+trailing data before constructing a bundle. The fixed cross-checks cover
+machine memory and GPA layout, CPU/MPIDR and optional-feature policy, one
+same-default-configuration cache manifest, GIC topology, PL031 mapping, and
+nested device ranges. Hypervisor.framework's GIC blob is opaque and capped
+before allocation; neither its embedded format nor acceptance after a host
+update is trusted.
+
+A complete bundle contains guest memory, general/system/SIMD register state,
+pointer-authentication keys, device paths and backing identity, limiter time,
+and opaque GIC bytes. Those values are confidential VM state. `Debug`, errors,
+logs, and metrics may expose only stable categories, stages, and bounded byte
+counts; they must never expose raw registers, keys, paths, guest addresses,
+image IDs, checksums, guest bytes, or GIC contents. CRC-64/Jones and random
+image identity detect accidental corruption or mismatched pairs, not malicious
+rewriting, confidentiality, provenance, or authorization.
+
+Private capture holds paused-worker admission, block/entropy retry quiescence,
+and all four runner operation domains through non-memory encoding and complete
+memory streaming. Cancellation is checked between fixed stages and 1 MiB
+chunks. Failure returns no binding or bundle, publishes no final state marker,
+and drops the consumed writer and auxiliary guard before admission release.
+Supervisor shutdown signals cancellation before joining, but Rust cannot
+forcibly preempt an arbitrary blocking `write`; the surface therefore remains
+limited to controlled internal regular-file/test writers and is not wired to a
+request path. A partially written private output is the caller's cleanup
+responsibility and must never be interpreted as committed state.
+
+PL031 RTC is represented by fixed MMIO metadata and an explicit fresh-device
+policy. No mutable RTC register or alarm state is persisted, so no continuity
+claim is permitted. Active SVE/SME or breakpoint/watchpoint state is rejected
+rather than silently omitted, and optional devices remain outside the accepted
+profile.
 
 The internal native-v1 device profile is untrusted input even when its outer
 state file passed length and CRC checks; CRC detects accidental corruption and
@@ -291,9 +328,10 @@ is resource-specific:
   and `ErrorKind`; image IDs, checksums, guest bytes, and host paths stay out of
   diagnostics. The random image ID and CRC detect mismatched or accidentally
   corrupt pairs but do not authenticate an actor able to rewrite both files.
-  The handle-level codec itself opens no path. The internal artifact layer
-  composes it with a minimal bounded commit record, but public snapshot paths do
-  not invoke that layer.
+  The handle-level codec itself opens no path. The internal artifact layer can
+  compose it with either memory-only or composite commit kind. The private
+  capture produces kind 2 but does not invoke final publication, and public
+  snapshot paths invoke neither operation.
 - Internal native snapshot publication treats both final paths and all existing
   directory entries as untrusted. It opens each parent once, anchors later
   operations to that descriptor, rejects exact aliases, preflights final names

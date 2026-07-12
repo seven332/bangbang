@@ -728,6 +728,42 @@ mod imp {
         )
     }
 
+    fn get_arm64_vcpu_cache_manifest_with(
+        create: HvVcpuConfigCreate,
+        get_feature_reg: HvVcpuConfigGetFeatureReg,
+        get_ccsidr_el1_sys_reg_values: HvVcpuConfigGetCcsidrEl1SysRegValues,
+        release: OsRelease,
+    ) -> Result<([u64; 3], [[u64; 8]; 2]), BackendError> {
+        let config = HvVcpuConfigOwner::create_with(create, release)?;
+        let features = [
+            get_vcpu_config_feature_reg_with(&config, get_feature_reg, HV_FEATURE_REG_CTR_EL0)?,
+            get_vcpu_config_feature_reg_with(&config, get_feature_reg, HV_FEATURE_REG_CLIDR_EL1)?,
+            get_vcpu_config_feature_reg_with(&config, get_feature_reg, HV_FEATURE_REG_DCZID_EL0)?,
+        ];
+        let geometry = [
+            get_vcpu_config_ccsidr_el1_values_with(
+                &config,
+                get_ccsidr_el1_sys_reg_values,
+                HV_CACHE_TYPE_DATA,
+            )?,
+            get_vcpu_config_ccsidr_el1_values_with(
+                &config,
+                get_ccsidr_el1_sys_reg_values,
+                HV_CACHE_TYPE_INSTRUCTION,
+            )?,
+        ];
+        Ok((features, geometry))
+    }
+
+    pub fn get_arm64_vcpu_cache_manifest() -> Result<([u64; 3], [[u64; 8]; 2]), BackendError> {
+        get_arm64_vcpu_cache_manifest_with(
+            hv_vcpu_config_create,
+            hv_vcpu_config_get_feature_reg,
+            hv_vcpu_config_get_ccsidr_el1_sys_reg_values,
+            os_release,
+        )
+    }
+
     pub fn create_vm() -> Result<(), BackendError> {
         let config = HvVmConfigOwner::with_max_ipa_size()?;
 
@@ -1145,11 +1181,11 @@ mod imp {
             HV_FEATURE_REG_CLIDR_EL1, HV_FEATURE_REG_CTR_EL0, HV_FEATURE_REG_DCZID_EL0, HV_SUCCESS,
             HV_UNSUPPORTED, HvVcpuConfig, HvVcpuConfigOwner, check,
             get_arm64_vcpu_cache_feature_registers_with, get_arm64_vcpu_cache_geometry_with,
-            get_sme_config_max_svl_bytes_with, get_sme_p_reg_with, get_sme_z_reg_with,
-            get_sme_za_reg_with, get_sme_zt0_reg_with, sme_config_max_svl_bytes_getter_from_symbol,
-            sme_p_reg_getter_from_symbol, sme_state_getter_from_symbol,
-            sme_z_reg_getter_from_symbol, sme_za_reg_getter_from_symbol,
-            sme_zt0_reg_getter_from_symbol,
+            get_arm64_vcpu_cache_manifest_with, get_sme_config_max_svl_bytes_with,
+            get_sme_p_reg_with, get_sme_z_reg_with, get_sme_za_reg_with, get_sme_zt0_reg_with,
+            sme_config_max_svl_bytes_getter_from_symbol, sme_p_reg_getter_from_symbol,
+            sme_state_getter_from_symbol, sme_z_reg_getter_from_symbol,
+            sme_za_reg_getter_from_symbol, sme_zt0_reg_getter_from_symbol,
         };
         use crate::ffi::{
             SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE,
@@ -2004,6 +2040,75 @@ mod imp {
         }
 
         #[test]
+        fn vcpu_cache_manifest_uses_one_configuration_in_exact_order() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            reset_test_vcpu_config_state(None);
+
+            assert_eq!(
+                get_arm64_vcpu_cache_manifest_with(
+                    test_vcpu_config_create,
+                    test_vcpu_config_get_feature_reg,
+                    test_vcpu_config_get_ccsidr_el1_sys_reg_values,
+                    test_vcpu_config_release,
+                ),
+                Ok((TEST_CACHE_FEATURE_VALUES, TEST_CACHE_GEOMETRY))
+            );
+            assert_eq!(
+                test_vcpu_config_calls(),
+                (
+                    vec![
+                        TestVcpuConfigCall::Create,
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_CTR_EL0),
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_CLIDR_EL1),
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_DCZID_EL0),
+                        TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_DATA),
+                        TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_INSTRUCTION),
+                        TestVcpuConfigCall::Release,
+                    ],
+                    true,
+                )
+            );
+        }
+
+        #[test]
+        fn every_vcpu_cache_manifest_failure_stops_and_releases_one_configuration() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            let operations = [
+                TestVcpuConfigCall::Get(HV_FEATURE_REG_CTR_EL0),
+                TestVcpuConfigCall::Get(HV_FEATURE_REG_CLIDR_EL1),
+                TestVcpuConfigCall::Get(HV_FEATURE_REG_DCZID_EL0),
+                TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_DATA),
+                TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_INSTRUCTION),
+            ];
+
+            for fail_on_get in 0..operations.len() {
+                reset_test_vcpu_config_state(Some(fail_on_get));
+                let error = get_arm64_vcpu_cache_manifest_with(
+                    test_vcpu_config_create,
+                    test_vcpu_config_get_feature_reg,
+                    test_vcpu_config_get_ccsidr_el1_sys_reg_values,
+                    test_vcpu_config_release,
+                )
+                .expect_err("configured manifest getter should fail");
+                let expected_operation = if fail_on_get < TEST_CACHE_FEATURE_VALUES.len() {
+                    "hv_vcpu_config_get_feature_reg"
+                } else {
+                    "hv_vcpu_config_get_ccsidr_el1_sys_reg_values"
+                };
+                assert!(error.to_string().contains(expected_operation));
+
+                let mut expected_calls = vec![TestVcpuConfigCall::Create];
+                expected_calls.extend(operations.iter().take(fail_on_get + 1).copied());
+                expected_calls.push(TestVcpuConfigCall::Release);
+                assert_eq!(test_vcpu_config_calls(), (expected_calls, true));
+            }
+        }
+
+        #[test]
         fn vcpu_configuration_guard_releases_during_unwind() {
             let _lock = TEST_VCPU_CONFIG_LOCK
                 .lock()
@@ -2077,6 +2182,10 @@ mod imp {
     }
 
     pub fn get_arm64_vcpu_cache_geometry() -> Result<[[u64; 8]; 2], BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_arm64_vcpu_cache_manifest() -> Result<([u64; 3], [[u64; 8]; 2]), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 

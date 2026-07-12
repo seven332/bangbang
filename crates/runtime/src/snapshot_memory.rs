@@ -388,6 +388,9 @@ pub enum SnapshotMemoryWriteError {
         range_index: usize,
         source: GuestMemoryAccessError,
     },
+    Cancelled {
+        stage: SnapshotMemoryIoStage,
+    },
 }
 
 impl fmt::Display for SnapshotMemoryWriteError {
@@ -430,6 +433,9 @@ impl fmt::Display for SnapshotMemoryWriteError {
                 f,
                 "snapshot memory range {range_index} read failed: {source}"
             ),
+            Self::Cancelled { stage } => {
+                write!(f, "snapshot memory output was cancelled before {stage}")
+            }
         }
     }
 }
@@ -445,7 +451,8 @@ impl std::error::Error for SnapshotMemoryWriteError {
             | Self::NonEmptyOutput { .. }
             | Self::PositionMismatch { .. }
             | Self::OutputLengthMismatch { .. }
-            | Self::Io { .. } => None,
+            | Self::Io { .. }
+            | Self::Cancelled { .. } => None,
         }
     }
 }
@@ -817,8 +824,26 @@ pub fn write_snapshot_memory_image<W: Write + Seek>(
     memory: &GuestMemory,
     writer: &mut W,
 ) -> Result<SnapshotMemoryBinding, SnapshotMemoryWriteError> {
+    write_snapshot_memory_image_with_cancel(memory, writer, |_| false)
+}
+
+/// Streams a complete native-v1 image with cooperative cancellation checkpoints.
+///
+/// The callback runs before output preflight, every bounded data chunk, the
+/// integrity trailer, and final length validation. Returning `true` cancels the
+/// operation without publishing a binding. It cannot preempt one in-progress
+/// `Write` or `Seek` call supplied by the caller.
+pub fn write_snapshot_memory_image_with_cancel<W, C>(
+    memory: &GuestMemory,
+    writer: &mut W,
+    is_cancelled: C,
+) -> Result<SnapshotMemoryBinding, SnapshotMemoryWriteError>
+where
+    W: Write + Seek,
+    C: FnMut(SnapshotMemoryIoStage) -> bool,
+{
     let image_id = generate_image_id()?;
-    write_snapshot_memory_image_with_id(memory, writer, image_id)
+    write_snapshot_memory_image_with_id_and_cancel(memory, writer, image_id, is_cancelled)
 }
 
 /// Loads a complete native-v1 image into newly allocated anonymous guest memory.
@@ -829,22 +854,38 @@ pub fn load_snapshot_memory_image<R: Read + Seek>(
     load_snapshot_memory_image_with_allocator(binding, reader, GuestMemory::allocate)
 }
 
+#[cfg(test)]
 fn write_snapshot_memory_image_with_id<W: Write + Seek>(
     memory: &GuestMemory,
     writer: &mut W,
     image_id: SnapshotMemoryImageId,
 ) -> Result<SnapshotMemoryBinding, SnapshotMemoryWriteError> {
+    write_snapshot_memory_image_with_id_and_cancel(memory, writer, image_id, |_| false)
+}
+
+fn write_snapshot_memory_image_with_id_and_cancel<W, C>(
+    memory: &GuestMemory,
+    writer: &mut W,
+    image_id: SnapshotMemoryImageId,
+    is_cancelled: C,
+) -> Result<SnapshotMemoryBinding, SnapshotMemoryWriteError>
+where
+    W: Write + Seek,
+    C: FnMut(SnapshotMemoryIoStage) -> bool,
+{
     let (ranges, data_length, file_length) = ranges_from_memory(memory)?;
-    write_snapshot_memory_image_from_parts(
+    write_snapshot_memory_image_from_parts_with_cancel(
         writer,
         image_id,
         ranges,
         data_length,
         file_length,
         |destination, address| memory.read_slice(destination, address),
+        is_cancelled,
     )
 }
 
+#[cfg(test)]
 fn write_snapshot_memory_image_from_parts<W, F>(
     writer: &mut W,
     image_id: SnapshotMemoryImageId,
@@ -857,17 +898,46 @@ where
     W: Write + Seek,
     F: FnMut(&mut [u8], GuestAddress) -> Result<(), GuestMemoryAccessError>,
 {
-    write_snapshot_memory_image_from_parts_with_buffer(
+    write_snapshot_memory_image_from_parts_with_cancel(
         writer,
         image_id,
         ranges,
         data_length,
         file_length,
-        allocate_io_buffer,
         read_memory,
+        |_| false,
     )
 }
 
+fn write_snapshot_memory_image_from_parts_with_cancel<W, F, C>(
+    writer: &mut W,
+    image_id: SnapshotMemoryImageId,
+    ranges: Vec<SnapshotMemoryRangeBinding>,
+    data_length: u64,
+    file_length: u64,
+    read_memory: F,
+    is_cancelled: C,
+) -> Result<SnapshotMemoryBinding, SnapshotMemoryWriteError>
+where
+    W: Write + Seek,
+    F: FnMut(&mut [u8], GuestAddress) -> Result<(), GuestMemoryAccessError>,
+    C: FnMut(SnapshotMemoryIoStage) -> bool,
+{
+    write_snapshot_memory_image_from_parts_with_buffer_and_cancel(
+        writer,
+        image_id,
+        ranges,
+        SnapshotMemoryImageLengths {
+            data_length,
+            file_length,
+        },
+        allocate_io_buffer,
+        read_memory,
+        is_cancelled,
+    )
+}
+
+#[cfg(test)]
 fn write_snapshot_memory_image_from_parts_with_buffer<W, B, F>(
     writer: &mut W,
     image_id: SnapshotMemoryImageId,
@@ -875,18 +945,55 @@ fn write_snapshot_memory_image_from_parts_with_buffer<W, B, F>(
     data_length: u64,
     file_length: u64,
     allocate_buffer: B,
-    mut read_memory: F,
+    read_memory: F,
 ) -> Result<SnapshotMemoryBinding, SnapshotMemoryWriteError>
 where
     W: Write + Seek,
     B: FnOnce() -> Result<Vec<u8>, TryReserveError>,
     F: FnMut(&mut [u8], GuestAddress) -> Result<(), GuestMemoryAccessError>,
 {
+    write_snapshot_memory_image_from_parts_with_buffer_and_cancel(
+        writer,
+        image_id,
+        ranges,
+        SnapshotMemoryImageLengths {
+            data_length,
+            file_length,
+        },
+        allocate_buffer,
+        read_memory,
+        |_| false,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotMemoryImageLengths {
+    data_length: u64,
+    file_length: u64,
+}
+
+fn write_snapshot_memory_image_from_parts_with_buffer_and_cancel<W, B, F, C>(
+    writer: &mut W,
+    image_id: SnapshotMemoryImageId,
+    ranges: Vec<SnapshotMemoryRangeBinding>,
+    lengths: SnapshotMemoryImageLengths,
+    allocate_buffer: B,
+    mut read_memory: F,
+    mut is_cancelled: C,
+) -> Result<SnapshotMemoryBinding, SnapshotMemoryWriteError>
+where
+    W: Write + Seek,
+    B: FnOnce() -> Result<Vec<u8>, TryReserveError>,
+    F: FnMut(&mut [u8], GuestAddress) -> Result<(), GuestMemoryAccessError>,
+    C: FnMut(SnapshotMemoryIoStage) -> bool,
+{
     let mut buffer = allocate_buffer()
         .map_err(|source| SnapshotMemoryWriteError::ChunkAllocationFailed { source })?;
+    check_write_cancelled(&mut is_cancelled, SnapshotMemoryIoStage::InitialPosition)?;
     preflight_empty_output(writer)?;
 
-    let header = encode_image_header(image_id, data_length)?;
+    let header = encode_image_header(image_id, lengths.data_length)?;
+    check_write_cancelled(&mut is_cancelled, SnapshotMemoryIoStage::Header)?;
     write_all_stage(writer, &header, SnapshotMemoryIoStage::Header)?;
     let mut checksum = crc64(0, &header);
     for (range_index, range_binding) in ranges.iter().copied().enumerate() {
@@ -894,6 +1001,8 @@ where
         let mut current = range.start();
         let mut remaining = range.size();
         while remaining > 0 {
+            let stage = SnapshotMemoryIoStage::Data { range_index };
+            check_write_cancelled(&mut is_cancelled, stage)?;
             let chunk_length_u64 = remaining.min(SNAPSHOT_MEMORY_IO_CHUNK_BYTES_U64);
             let chunk_length = usize::try_from(chunk_length_u64)
                 .map_err(|_| SnapshotMemoryBindingError::LengthOverflow)?;
@@ -907,27 +1016,43 @@ where
                 }
             })?;
             checksum = crc64(checksum, chunk);
-            write_all_stage(writer, chunk, SnapshotMemoryIoStage::Data { range_index })?;
+            write_all_stage(writer, chunk, stage)?;
             current = current
                 .checked_add(chunk_length_u64)
                 .ok_or(SnapshotMemoryBindingError::LengthOverflow)?;
             remaining -= chunk_length_u64;
         }
     }
+    check_write_cancelled(&mut is_cancelled, SnapshotMemoryIoStage::Trailer)?;
     write_all_stage(
         writer,
         &checksum.to_le_bytes(),
         SnapshotMemoryIoStage::Trailer,
     )?;
-    validate_final_output_length(writer, file_length)?;
+    check_write_cancelled(&mut is_cancelled, SnapshotMemoryIoStage::FinalEndLength)?;
+    validate_final_output_length(writer, lengths.file_length)?;
 
     Ok(SnapshotMemoryBinding {
         image_id,
-        data_length,
-        file_length,
+        data_length: lengths.data_length,
+        file_length: lengths.file_length,
         checksum,
         ranges,
     })
+}
+
+fn check_write_cancelled<C>(
+    is_cancelled: &mut C,
+    stage: SnapshotMemoryIoStage,
+) -> Result<(), SnapshotMemoryWriteError>
+where
+    C: FnMut(SnapshotMemoryIoStage) -> bool,
+{
+    if is_cancelled(stage) {
+        Err(SnapshotMemoryWriteError::Cancelled { stage })
+    } else {
+        Ok(())
+    }
 }
 
 fn load_snapshot_memory_image_with_allocator<R, A>(
@@ -1678,6 +1803,66 @@ mod tests {
             )
             .expect("binding should re-encode"),
             encoded
+        );
+    }
+
+    #[test]
+    fn cooperative_write_cancellation_covers_every_bounded_checkpoint() {
+        let guest_range = range(
+            0x20_0000,
+            u64::try_from(SNAPSHOT_MEMORY_IO_CHUNK_BYTES + 16 * 1024)
+                .expect("test range size should fit u64"),
+        );
+        let mut guest_memory = memory(vec![guest_range]);
+        fill_memory(&mut guest_memory);
+        let expected_stages = [
+            SnapshotMemoryIoStage::InitialPosition,
+            SnapshotMemoryIoStage::Header,
+            SnapshotMemoryIoStage::Data { range_index: 0 },
+            SnapshotMemoryIoStage::Data { range_index: 0 },
+            SnapshotMemoryIoStage::Trailer,
+            SnapshotMemoryIoStage::FinalEndLength,
+        ];
+
+        for (cancel_index, expected_stage) in expected_stages.into_iter().enumerate() {
+            let mut writer = Cursor::new(Vec::new());
+            let mut checkpoint_index = 0;
+            let error = write_snapshot_memory_image_with_id_and_cancel(
+                &guest_memory,
+                &mut writer,
+                TEST_IMAGE_ID,
+                |stage| {
+                    assert_eq!(stage, expected_stages[checkpoint_index]);
+                    let cancel = checkpoint_index == cancel_index;
+                    checkpoint_index += 1;
+                    cancel
+                },
+            )
+            .expect_err("selected checkpoint should cancel");
+
+            assert!(matches!(
+                error,
+                SnapshotMemoryWriteError::Cancelled { stage } if stage == expected_stage
+            ));
+            assert_eq!(checkpoint_index, cancel_index + 1);
+        }
+
+        let mut fresh = Cursor::new(Vec::new());
+        let mut observed = Vec::new();
+        let binding = write_snapshot_memory_image_with_id_and_cancel(
+            &guest_memory,
+            &mut fresh,
+            TEST_IMAGE_ID,
+            |stage| {
+                observed.push(stage);
+                false
+            },
+        )
+        .expect("fresh complete write should succeed");
+        assert_eq!(observed, expected_stages);
+        assert_eq!(
+            u64::try_from(fresh.into_inner().len()).expect("image length should fit u64"),
+            binding.file_length()
         );
     }
 

@@ -10,6 +10,7 @@ mod psci;
 mod runner;
 mod sme;
 mod snapshot;
+mod snapshot_bundle;
 mod startup;
 mod vcpu;
 mod vcpu_config;
@@ -31,7 +32,8 @@ pub use gic::{
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
 pub use runner::{
-    HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
+    HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1CaptureStage, HvfVcpuRunCancelHandle,
+    HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 pub use sme::HvfArm64SmeConfiguration;
 pub use snapshot::{
@@ -39,6 +41,12 @@ pub use snapshot::{
     HvfArm64SnapshotTimerRestoreError, HvfArm64SnapshotTimerRestoreOperation,
     HvfArm64SnapshotTimerState, normalize_arm64_snapshot_timer_state,
     validate_native_v1_arm64_snapshot_optional_state,
+};
+pub use snapshot_bundle::{
+    HVF_SNAPSHOT_V1_GIC_DEVICE_STATE_MAX_BYTES, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError,
+    HvfSnapshotV1CompatibilityState, HvfSnapshotV1DecodeError, HvfSnapshotV1EncodeError,
+    HvfSnapshotV1InterruptState, HvfSnapshotV1State, HvfSnapshotV1VcpuState,
+    decode_hvf_snapshot_v1_state, encode_hvf_snapshot_v1_state,
 };
 pub use startup::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootBlockNotificationDispatch,
@@ -51,7 +59,8 @@ pub use startup::{
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSession,
     HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootSessionShutdownError,
-    HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootTimerDeviceConfig,
+    HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
+    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootTimerDeviceConfig,
     HvfArm64BootVmGenIdRestoreError, HvfArm64BootVsockNotificationDispatch,
     HvfArm64BootVsockNotificationDispatchError, HvfArm64BootVsockNotificationDispatches,
     OwnedHvfArm64BootSession,
@@ -77,4 +86,6 @@ pub use vcpu::{
     HvfArm64VcpuVirtualTimerState, HvfArm64VcpuWatchpointRegisterState, HvfInterruptType,
     HvfRegister, HvfSimdFpRegister, HvfSystemRegister, HvfVcpu,
 };
-pub use vcpu_config::{HvfArm64VcpuCacheConfiguration, HvfArm64VcpuCacheGeometry};
+pub use vcpu_config::{
+    HvfArm64VcpuCacheConfiguration, HvfArm64VcpuCacheGeometry, HvfArm64VcpuCacheManifest,
+};

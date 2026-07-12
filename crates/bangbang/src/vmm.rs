@@ -1,10 +1,12 @@
 use std::fmt;
 use std::io::Read;
+use std::io::Seek;
 use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -14,8 +16,9 @@ use bangbang_hvf::{
     HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugDeviceConfig,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-    HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootTimerDeviceConfig, HvfVcpuRunnerError,
-    OwnedHvfArm64BootSession,
+    HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
+    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle,
+    HvfSnapshotV1BundleError, HvfSnapshotV1State, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -63,6 +66,9 @@ use bangbang_runtime::serial::{
 };
 use bangbang_runtime::snapshot::SnapshotCreateInput;
 use bangbang_runtime::snapshot_device::SnapshotV1DeviceState;
+use bangbang_runtime::snapshot_memory::{
+    SnapshotMemoryIoStage, SnapshotMemoryWriteError, write_snapshot_memory_image_with_cancel,
+};
 use bangbang_runtime::startup::{
     Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
     Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
@@ -1666,6 +1672,143 @@ pub(crate) struct ProcessHvfBootSession<S, P> {
     mmds_metrics: Option<SharedMmdsMetrics>,
 }
 
+pub(crate) trait NativeV1SnapshotMemoryOutput: std::io::Write + Seek + Send {}
+
+impl<T> NativeV1SnapshotMemoryOutput for T where T: std::io::Write + Seek + Send {}
+
+type BoxedNativeV1SnapshotMemoryOutput = Box<dyn NativeV1SnapshotMemoryOutput>;
+
+#[derive(Clone, Default)]
+pub(crate) struct NativeV1SnapshotCaptureCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl NativeV1SnapshotCaptureCancellation {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn same_operation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+}
+
+impl fmt::Debug for NativeV1SnapshotCaptureCancellation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeV1SnapshotCaptureCancellation")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeV1SnapshotCaptureStage {
+    State(HvfArm64BootSnapshotV1CaptureStage),
+    Memory(SnapshotMemoryIoStage),
+    Bundle,
+}
+
+impl fmt::Display for NativeV1SnapshotCaptureStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(stage) => write!(f, "state/{stage}"),
+            Self::Memory(stage) => write!(f, "memory/{stage}"),
+            Self::Bundle => f.write_str("bundle"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeV1SnapshotCaptureError {
+    Supervisor {
+        source: BackendError,
+    },
+    Auxiliary {
+        source: BackendError,
+    },
+    State {
+        source: HvfArm64BootSnapshotV1StateCaptureError,
+    },
+    MemoryAccess {
+        source: BackendError,
+    },
+    MemoryWrite {
+        source: SnapshotMemoryWriteError,
+    },
+    Cancelled {
+        stage: NativeV1SnapshotCaptureStage,
+    },
+    Bundle {
+        source: HvfSnapshotV1BundleError,
+    },
+}
+
+impl fmt::Display for NativeV1SnapshotCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Supervisor { source } => {
+                write!(f, "native-v1 supervisor capture failed: {source}")
+            }
+            Self::Auxiliary { source } => {
+                write!(f, "native-v1 auxiliary quiescence failed: {source}")
+            }
+            Self::State { source } => write!(f, "native-v1 state capture failed: {source}"),
+            Self::MemoryAccess { source } => {
+                write!(f, "native-v1 guest memory is unavailable: {source}")
+            }
+            Self::MemoryWrite { source } => {
+                write!(f, "native-v1 guest-memory capture failed: {source}")
+            }
+            Self::Cancelled { stage } => {
+                write!(f, "native-v1 capture was cancelled before {stage}")
+            }
+            Self::Bundle { source } => {
+                write!(f, "native-v1 composite bundle validation failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV1SnapshotCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Supervisor { source }
+            | Self::Auxiliary { source }
+            | Self::MemoryAccess { source } => Some(source),
+            Self::State { source } => Some(source),
+            Self::MemoryWrite { source } => Some(source),
+            Self::Bundle { source } => Some(source),
+            Self::Cancelled { .. } => None,
+        }
+    }
+}
+
+pub(crate) trait NativeV1SnapshotCaptureSession: BootRunLoopSession {
+    type DetachedState: Send + 'static;
+    type SnapshotBundle: Send + 'static;
+
+    fn capture_native_v1_state(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        now: Instant,
+        cancellation: &NativeV1SnapshotCaptureCancellation,
+    ) -> Result<Self::DetachedState, NativeV1SnapshotCaptureError>;
+
+    fn native_v1_guest_memory(&self) -> Result<&GuestMemory, NativeV1SnapshotCaptureError>;
+
+    fn bind_native_v1_snapshot(
+        &self,
+        binding: bangbang_runtime::snapshot_memory::SnapshotMemoryBinding,
+        state: Self::DetachedState,
+    ) -> Result<Self::SnapshotBundle, NativeV1SnapshotCaptureError>;
+}
+
 impl<S, P> ProcessHvfBootSession<S, P> {
     const fn new(session: S, packet_io: P, mmds_metrics: Option<SharedMmdsMetrics>) -> Self {
         Self {
@@ -1686,6 +1829,76 @@ impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
     ) -> Result<SnapshotV1DeviceState, HvfArm64BootSnapshotV1DeviceCaptureError> {
         self.session
             .capture_snapshot_v1_device_state_at(drive_config, serial_config, guard, now)
+    }
+
+    fn capture_snapshot_v1_state_at_with_cancel(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+        cancellation: &NativeV1SnapshotCaptureCancellation,
+    ) -> Result<HvfSnapshotV1State, HvfArm64BootSnapshotV1StateCaptureError> {
+        self.session.capture_snapshot_v1_state_at_with_cancel(
+            drive_config,
+            serial_config,
+            guard,
+            now,
+            |_| cancellation.is_cancelled(),
+        )
+    }
+
+    fn guest_memory(&self) -> Result<&GuestMemory, BackendError> {
+        self.session.guest_memory().map_err(|source| {
+            BackendError::Hypervisor(format!("failed to borrow HVF guest memory: {source}"))
+        })
+    }
+}
+
+impl<P> NativeV1SnapshotCaptureSession for ProcessHvfBootSession<OwnedHvfArm64BootSession, P>
+where
+    P: Arm64BootNetworkPacketIoProvider + Send + 'static,
+{
+    type DetachedState = HvfSnapshotV1State;
+    type SnapshotBundle = HvfSnapshotV1Bundle;
+
+    fn capture_native_v1_state(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        now: Instant,
+        cancellation: &NativeV1SnapshotCaptureCancellation,
+    ) -> Result<Self::DetachedState, NativeV1SnapshotCaptureError> {
+        self.capture_snapshot_v1_state_at_with_cancel(
+            drive_config,
+            serial_config,
+            guard,
+            now,
+            cancellation,
+        )
+        .map_err(|source| match source {
+            HvfArm64BootSnapshotV1StateCaptureError::Cancelled { stage } => {
+                NativeV1SnapshotCaptureError::Cancelled {
+                    stage: NativeV1SnapshotCaptureStage::State(stage),
+                }
+            }
+            source => NativeV1SnapshotCaptureError::State { source },
+        })
+    }
+
+    fn native_v1_guest_memory(&self) -> Result<&GuestMemory, NativeV1SnapshotCaptureError> {
+        self.guest_memory()
+            .map_err(|source| NativeV1SnapshotCaptureError::MemoryAccess { source })
+    }
+
+    fn bind_native_v1_snapshot(
+        &self,
+        binding: bangbang_runtime::snapshot_memory::SnapshotMemoryBinding,
+        state: Self::DetachedState,
+    ) -> Result<Self::SnapshotBundle, NativeV1SnapshotCaptureError> {
+        HvfSnapshotV1Bundle::try_new(binding, state)
+            .map_err(|source| NativeV1SnapshotCaptureError::Bundle { source })
     }
 }
 
@@ -3404,6 +3617,23 @@ fn drain_boot_run_loop_commands<S>(
     }
 }
 
+struct ActiveNativeV1SnapshotCapture {
+    registry: Arc<Mutex<Option<NativeV1SnapshotCaptureCancellation>>>,
+    cancellation: NativeV1SnapshotCaptureCancellation,
+}
+
+impl Drop for ActiveNativeV1SnapshotCapture {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.lock()
+            && active
+                .as_ref()
+                .is_some_and(|current| current.same_operation(&self.cancellation))
+        {
+            *active = None;
+        }
+    }
+}
+
 pub(crate) struct BootRunLoopSupervisor<S>
 where
     S: BootRunLoopSession,
@@ -3423,6 +3653,7 @@ where
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     pause_gate: Arc<BootRunLoopPauseGate>,
     admission: Arc<BootRunLoopCommandAdmission>,
+    active_snapshot_cancellation: Arc<Mutex<Option<NativeV1SnapshotCaptureCancellation>>>,
     terminal_wakeup_reader: UnixStream,
     session_release_sender: Option<mpsc::Sender<()>>,
     worker: Option<JoinHandle<()>>,
@@ -3462,6 +3693,7 @@ where
         let pause_gate = Arc::new(BootRunLoopPauseGate::default());
         let worker_pause_gate = Arc::clone(&pause_gate);
         let admission = Arc::new(BootRunLoopCommandAdmission::default());
+        let active_snapshot_cancellation = Arc::new(Mutex::new(None));
         let (command_sender, command_receiver) = mpsc::sync_channel(command_queue_capacity);
         let command_handle = BootRunLoopCommandHandle::new(
             command_sender,
@@ -3487,45 +3719,51 @@ where
         let worker = thread::Builder::new()
             .name(HVF_BOOT_RUN_LOOP_THREAD_NAME.to_owned())
             .spawn(move || {
-                let mut observed_command_generation = worker_pause_gate.command_generation();
-                loop {
-                    drain_boot_run_loop_commands(
-                        &mut session,
-                        &command_receiver,
-                        command_queue_capacity,
-                    );
-                    loop {
-                        match worker_pause_gate
-                            .wait_once_if_paused(&mut observed_command_generation)
-                        {
-                            BootRunLoopPauseWait::Running => break,
-                            BootRunLoopPauseWait::Paused => {
-                                drain_boot_run_loop_commands(
-                                    &mut session,
-                                    &command_receiver,
-                                    command_queue_capacity,
-                                );
+                let worker_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut observed_command_generation = worker_pause_gate.command_generation();
+                    'worker: loop {
+                        drain_boot_run_loop_commands(
+                            &mut session,
+                            &command_receiver,
+                            command_queue_capacity,
+                        );
+                        loop {
+                            match worker_pause_gate
+                                .wait_once_if_paused(&mut observed_command_generation)
+                            {
+                                BootRunLoopPauseWait::Running => break,
+                                BootRunLoopPauseWait::Paused => {
+                                    drain_boot_run_loop_commands(
+                                        &mut session,
+                                        &command_receiver,
+                                        command_queue_capacity,
+                                    );
+                                }
+                                BootRunLoopPauseWait::Shutdown => break 'worker,
                             }
-                            BootRunLoopPauseWait::Shutdown => {
-                                drop(command_receiver);
-                                let _ = session_release_receiver.recv();
-                                return;
+                        }
+                        match session.run_loop(&stop_token, max_steps) {
+                            Ok(outcome) if S::should_continue_after_outcome(&outcome) => continue,
+                            Ok(outcome) => {
+                                worker_status
+                                    .record(BootRunLoopWorkerStatus::Exited(outcome.clone()));
+                                let _ = terminal_wakeup_writer.write_all(&[1]);
+                                break;
+                            }
+                            Err(err) => {
+                                worker_status
+                                    .record(BootRunLoopWorkerStatus::Failed(err.to_string()));
+                                let _ = terminal_wakeup_writer.write_all(&[1]);
+                                break;
                             }
                         }
                     }
-                    match session.run_loop(&stop_token, max_steps) {
-                        Ok(outcome) if S::should_continue_after_outcome(&outcome) => continue,
-                        Ok(outcome) => {
-                            worker_status.record(BootRunLoopWorkerStatus::Exited(outcome.clone()));
-                            let _ = terminal_wakeup_writer.write_all(&[1]);
-                            break;
-                        }
-                        Err(err) => {
-                            worker_status.record(BootRunLoopWorkerStatus::Failed(err.to_string()));
-                            let _ = terminal_wakeup_writer.write_all(&[1]);
-                            break;
-                        }
-                    }
+                }));
+                if worker_result.is_err() {
+                    worker_status.record(BootRunLoopWorkerStatus::Failed(
+                        "boot run loop worker panicked".to_owned(),
+                    ));
+                    let _ = terminal_wakeup_writer.write_all(&[1]);
                 }
                 drop(command_receiver);
                 let _ = session_release_receiver.recv();
@@ -3550,6 +3788,7 @@ where
             status,
             pause_gate,
             admission,
+            active_snapshot_cancellation,
             terminal_wakeup_reader,
             session_release_sender: Some(session_release_sender),
             worker: Some(worker),
@@ -3581,6 +3820,40 @@ where
         E: Send + 'static,
     {
         self.command_handle.run_snapshot_quiesced(command)
+    }
+
+    fn register_snapshot_capture(
+        &self,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<ActiveNativeV1SnapshotCapture, NativeV1SnapshotCaptureError> {
+        let mut active = self.active_snapshot_cancellation.lock().map_err(|_| {
+            NativeV1SnapshotCaptureError::Supervisor {
+                source: BackendError::InvalidState(
+                    "native-v1 snapshot cancellation registry is poisoned",
+                ),
+            }
+        })?;
+        if active.is_some() {
+            return Err(NativeV1SnapshotCaptureError::Supervisor {
+                source: BackendError::InvalidState(
+                    "native-v1 snapshot capture is already registered",
+                ),
+            });
+        }
+        *active = Some(cancellation.clone());
+        drop(active);
+        Ok(ActiveNativeV1SnapshotCapture {
+            registry: Arc::clone(&self.active_snapshot_cancellation),
+            cancellation,
+        })
+    }
+
+    fn cancel_active_snapshot_capture(&self) {
+        if let Ok(active) = self.active_snapshot_cancellation.lock()
+            && let Some(cancellation) = active.as_ref()
+        {
+            cancellation.cancel();
+        }
     }
 
     #[cfg(test)]
@@ -3663,6 +3936,9 @@ where
             return;
         };
 
+        // Snapshot memory I/O is cooperative. Signal it before shutdown can
+        // wait for a paused worker that currently owns the snapshot lease.
+        self.cancel_active_snapshot_capture();
         let was_paused = matches!(self.status(), BootRunLoopWorkerStatus::Paused);
         let stop_requested = self.control.request_stop().is_ok();
         self.admission.shutdown();
@@ -3677,6 +3953,79 @@ where
     }
 }
 
+impl<S> BootRunLoopSupervisor<S>
+where
+    S: NativeV1SnapshotCaptureSession,
+{
+    fn capture_native_v1_snapshot(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        mut output: BoxedNativeV1SnapshotMemoryOutput,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<S::SnapshotBundle, NativeV1SnapshotCaptureError> {
+        let drive_config = drive_config.clone();
+        let serial_config = serial_config.clone();
+        let active_capture = self.register_snapshot_capture(cancellation.clone())?;
+
+        self.run_snapshot_quiesced(move |session| {
+            // Keep shutdown cancellation registered with the worker-owned
+            // operation even if the synchronous response receiver is dropped.
+            let _active_capture = active_capture;
+            if cancellation.is_cancelled() {
+                return Err(NativeV1SnapshotCaptureError::Cancelled {
+                    stage: NativeV1SnapshotCaptureStage::State(
+                        HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
+                    ),
+                });
+            }
+            let guard = session
+                .quiesce_snapshot_auxiliary_work()
+                .map_err(|source| NativeV1SnapshotCaptureError::Auxiliary { source })?;
+            let result = (|| {
+                let state = session.capture_native_v1_state(
+                    &drive_config,
+                    &serial_config,
+                    &guard,
+                    Instant::now(),
+                    &cancellation,
+                )?;
+                let memory = session.native_v1_guest_memory()?;
+                let binding =
+                    write_snapshot_memory_image_with_cancel(memory, &mut output, |_stage| {
+                        cancellation.is_cancelled()
+                    })
+                    .map_err(|source| match source {
+                        SnapshotMemoryWriteError::Cancelled { stage } => {
+                            NativeV1SnapshotCaptureError::Cancelled {
+                                stage: NativeV1SnapshotCaptureStage::Memory(stage),
+                            }
+                        }
+                        source => NativeV1SnapshotCaptureError::MemoryWrite { source },
+                    })?;
+                if cancellation.is_cancelled() {
+                    return Err(NativeV1SnapshotCaptureError::Cancelled {
+                        stage: NativeV1SnapshotCaptureStage::Bundle,
+                    });
+                }
+                let bundle = session.bind_native_v1_snapshot(binding, state)?;
+                if cancellation.is_cancelled() {
+                    return Err(NativeV1SnapshotCaptureError::Cancelled {
+                        stage: NativeV1SnapshotCaptureStage::Bundle,
+                    });
+                }
+                Ok(bundle)
+            })();
+            // The consumed output must be closed before retry publication is
+            // re-enabled, on both success and every recoverable failure.
+            drop(output);
+            drop(guard);
+            result
+        })
+        .map_err(native_snapshot_capture_error_from_boot_run_loop_command)
+    }
+}
+
 impl
     BootRunLoopSupervisor<
         ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider>,
@@ -3684,7 +4033,7 @@ impl
 {
     #[expect(
         dead_code,
-        reason = "native-v1 composite capture will consume this supervisor seam in parent slice 6"
+        reason = "standalone device capture remains a focused internal diagnostic seam"
     )]
     pub(crate) fn capture_snapshot_v1_device_state(
         &self,
@@ -3706,6 +4055,50 @@ impl
         })
         .map_err(lifecycle_error_from_boot_run_loop_command)
     }
+
+    #[expect(
+        dead_code,
+        reason = "public snapshot creation remains gated until parent slice 8"
+    )]
+    pub(crate) fn capture_snapshot_v1_bundle(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        output: BoxedNativeV1SnapshotMemoryOutput,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<HvfSnapshotV1Bundle, NativeV1SnapshotCaptureError> {
+        self.capture_native_v1_snapshot(drive_config, serial_config, output, cancellation)
+    }
+}
+
+fn native_snapshot_capture_error_from_boot_run_loop_command<C>(
+    error: BootRunLoopCommandError<C, NativeV1SnapshotCaptureError>,
+) -> NativeV1SnapshotCaptureError
+where
+    C: fmt::Display,
+{
+    let source = match error {
+        BootRunLoopCommandError::Command { source } => return source,
+        BootRunLoopCommandError::WorkerNotPaused => {
+            BackendError::InvalidState("boot run loop worker is not paused")
+        }
+        BootRunLoopCommandError::SnapshotQuiescenceActive => {
+            BackendError::InvalidState("boot run loop snapshot quiescence is active")
+        }
+        BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::AdmissionClosed
+        | BootRunLoopCommandError::QueueClosed
+        | BootRunLoopCommandError::ResponseClosed => {
+            BackendError::InvalidState("boot run loop worker is not running")
+        }
+        BootRunLoopCommandError::QueueFull => {
+            BackendError::Hypervisor("boot run loop command queue is full".to_string())
+        }
+        BootRunLoopCommandError::Wakeup { source } => BackendError::Hypervisor(format!(
+            "failed to wake boot run loop for native-v1 capture: {source}"
+        )),
+    };
+    NativeV1SnapshotCaptureError::Supervisor { source }
 }
 
 impl<S> ProcessSessionDiagnostics for BootRunLoopSupervisor<S>
@@ -4033,6 +4426,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fmt;
     use std::fs::{self, remove_file};
+    use std::io::{Cursor, Seek, SeekFrom, Write};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4055,6 +4449,9 @@ mod tests {
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
+    use bangbang_runtime::memory::{
+        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
+    };
     use bangbang_runtime::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdate,
         MemoryHotplugSizeUpdateInput, MemoryHotplugStatus, MemoryHotplugStatusError,
@@ -4081,6 +4478,7 @@ mod tests {
         SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
     };
     use bangbang_runtime::snapshot::{SnapshotCreateInput, SnapshotType};
+    use bangbang_runtime::snapshot_memory::SnapshotMemoryBinding;
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
@@ -4107,12 +4505,14 @@ mod tests {
         DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_PMEM_MMIO_BASE,
         DEFAULT_PMEM_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
-        HvfInstanceStartExecutor, InstanceStartExecutor, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessSessionDiagnostics, ProcessVmm, ProcessVmnetPacketIoBackendFactory,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        process_vmnet_packet_io_provider_from_configs,
+        HvfArm64BootSnapshotV1CaptureStage, HvfInstanceStartExecutor, InstanceStartExecutor,
+        NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
+        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
+        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
+        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
+        ProcessNetworkPacketIoProviderBuildError, ProcessSessionDiagnostics, ProcessVmm,
+        ProcessVmnetPacketIoBackendFactory, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -4120,6 +4520,80 @@ mod tests {
     #[derive(Debug)]
     struct TempFilePath {
         path: PathBuf,
+    }
+
+    struct RecordingSnapshotWriter {
+        cursor: Arc<Mutex<Cursor<Vec<u8>>>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        cancellation: Option<NativeV1SnapshotCaptureCancellation>,
+        cancel_after_write: Option<usize>,
+        write_count: usize,
+    }
+
+    impl RecordingSnapshotWriter {
+        fn new(
+            events: Arc<Mutex<Vec<&'static str>>>,
+            cancellation: Option<NativeV1SnapshotCaptureCancellation>,
+            cancel_after_write: Option<usize>,
+        ) -> (Self, Arc<Mutex<Cursor<Vec<u8>>>>) {
+            let cursor = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+            (
+                Self {
+                    cursor: Arc::clone(&cursor),
+                    events,
+                    cancellation,
+                    cancel_after_write,
+                    write_count: 0,
+                },
+                cursor,
+            )
+        }
+    }
+
+    impl Write for RecordingSnapshotWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.events
+                .lock()
+                .map_err(|_| std::io::Error::other("recording events are poisoned"))?
+                .push("write");
+            let written = self
+                .cursor
+                .lock()
+                .map_err(|_| std::io::Error::other("recording cursor is poisoned"))?
+                .write(buffer)?;
+            self.write_count += 1;
+            if self.cancel_after_write == Some(self.write_count)
+                && let Some(cancellation) = &self.cancellation
+            {
+                cancellation.cancel();
+            }
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for RecordingSnapshotWriter {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.events
+                .lock()
+                .map_err(|_| std::io::Error::other("recording events are poisoned"))?
+                .push("seek");
+            self.cursor
+                .lock()
+                .map_err(|_| std::io::Error::other("recording cursor is poisoned"))?
+                .seek(position)
+        }
+    }
+
+    impl Drop for RecordingSnapshotWriter {
+        fn drop(&mut self) {
+            if let Ok(mut events) = self.events.lock() {
+                events.push("writer-drop");
+            }
+        }
     }
 
     impl TempFilePath {
@@ -4860,6 +5334,7 @@ mod tests {
         drop_count: AtomicU64,
         acquire_error: Mutex<Option<BackendError>>,
         drop_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+        events: Mutex<Option<Arc<Mutex<Vec<&'static str>>>>>,
     }
 
     #[derive(Debug)]
@@ -4869,6 +5344,18 @@ mod tests {
 
     impl Drop for FakeSnapshotAuxiliaryQuiescenceGuard {
         fn drop(&mut self) {
+            if let Some(events) = self
+                .state
+                .events
+                .lock()
+                .expect("fake auxiliary event slot should lock")
+                .as_ref()
+            {
+                events
+                    .lock()
+                    .expect("fake auxiliary events should lock")
+                    .push("aux-drop");
+            }
             self.state.drop_count.fetch_add(1, Ordering::SeqCst);
             let drop_gate = self
                 .state
@@ -4909,6 +5396,8 @@ mod tests {
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
         snapshot_auxiliary_quiescence: Arc<FakeSnapshotAuxiliaryQuiescenceState>,
+        native_snapshot_memory: Option<GuestMemory>,
+        native_snapshot_events: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl FakeRunLoopSession {
@@ -4941,6 +5430,8 @@ mod tests {
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
                 snapshot_auxiliary_quiescence: Arc::default(),
+                native_snapshot_memory: None,
+                native_snapshot_events: Arc::default(),
             }
         }
 
@@ -4958,6 +5449,27 @@ mod tests {
 
         fn snapshot_auxiliary_quiescence(&self) -> Arc<FakeSnapshotAuxiliaryQuiescenceState> {
             Arc::clone(&self.snapshot_auxiliary_quiescence)
+        }
+
+        fn native_snapshot_events(&self) -> Arc<Mutex<Vec<&'static str>>> {
+            Arc::clone(&self.native_snapshot_events)
+        }
+
+        fn with_native_snapshot_memory(mut self, memory_mib: u64) -> Self {
+            let range =
+                GuestMemoryRange::new(GuestAddress::new(0x8000_0000), memory_mib * 1024 * 1024)
+                    .expect("fake snapshot memory range should validate");
+            let layout = GuestMemoryLayout::new(vec![range])
+                .expect("fake snapshot memory layout should validate");
+            self.native_snapshot_memory =
+                Some(GuestMemory::allocate(&layout).expect("fake snapshot memory should allocate"));
+            *self
+                .snapshot_auxiliary_quiescence
+                .events
+                .lock()
+                .expect("fake auxiliary event slot should lock") =
+                Some(Arc::clone(&self.native_snapshot_events));
+            self
         }
 
         fn with_snapshot_auxiliary_drop_gate(
@@ -5085,6 +5597,18 @@ mod tests {
         fn quiesce_snapshot_auxiliary_work(
             &self,
         ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError> {
+            if let Some(events) = self
+                .snapshot_auxiliary_quiescence
+                .events
+                .lock()
+                .expect("fake auxiliary event slot should lock")
+                .as_ref()
+            {
+                events
+                    .lock()
+                    .expect("fake auxiliary events should lock")
+                    .push("aux-acquire");
+            }
             self.snapshot_auxiliary_quiescence
                 .acquire_count
                 .fetch_add(1, Ordering::SeqCst);
@@ -5198,6 +5722,58 @@ mod tests {
                 outcome,
                 FakeRunLoopOutcome::StepLimitReached | FakeRunLoopOutcome::Wakeup
             )
+        }
+    }
+
+    impl NativeV1SnapshotCaptureSession for FakeRunLoopSession {
+        type DetachedState = ();
+        type SnapshotBundle = SnapshotMemoryBinding;
+
+        fn capture_native_v1_state(
+            &self,
+            _drive_config: &DriveConfig,
+            _serial_config: &bangbang_runtime::serial::SerialConfig,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+            _now: std::time::Instant,
+            cancellation: &NativeV1SnapshotCaptureCancellation,
+        ) -> Result<Self::DetachedState, NativeV1SnapshotCaptureError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("state");
+            if cancellation.is_cancelled() {
+                Err(NativeV1SnapshotCaptureError::Cancelled {
+                    stage: NativeV1SnapshotCaptureStage::State(
+                        HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
+                    ),
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        fn native_v1_guest_memory(&self) -> Result<&GuestMemory, NativeV1SnapshotCaptureError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("memory");
+            self.native_snapshot_memory
+                .as_ref()
+                .ok_or(NativeV1SnapshotCaptureError::MemoryAccess {
+                    source: BackendError::InvalidState("fake native snapshot memory is absent"),
+                })
+        }
+
+        fn bind_native_v1_snapshot(
+            &self,
+            binding: SnapshotMemoryBinding,
+            _state: Self::DetachedState,
+        ) -> Result<Self::SnapshotBundle, NativeV1SnapshotCaptureError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("bundle");
+            Ok(binding)
         }
     }
 
@@ -7566,11 +8142,17 @@ mod tests {
             supervisor.admission_state(),
             BootRunLoopCommandAdmissionState::Ordinary
         );
+        assert_eq!(
+            supervisor.status(),
+            BootRunLoopWorkerStatus::Failed("boot run loop worker panicked".to_owned())
+        );
         assert!(matches!(
             supervisor
                 .run_command(|_| Ok::<_, FakeRunLoopCommandError>(()))
                 .expect_err("panicked worker should close its command receiver"),
-            BootRunLoopCommandError::QueueClosed | BootRunLoopCommandError::ResponseClosed
+            BootRunLoopCommandError::WorkerNotRunning
+                | BootRunLoopCommandError::QueueClosed
+                | BootRunLoopCommandError::ResponseClosed
         ));
 
         drop(supervisor);
@@ -9915,5 +10497,214 @@ mod tests {
         );
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(vmm.started_session, Some(FakeSession::new(9)));
+    }
+
+    #[test]
+    fn native_v1_supervisor_capture_streams_memory_inside_one_paused_lease() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_native_snapshot_memory(2)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                ])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let auxiliary = session.snapshot_auxiliary_quiescence();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(61).expect("non-zero limit"))
+                .expect("native snapshot supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 61);
+        supervisor.pause().expect("supervisor should pause");
+
+        let backing = TempFilePath::create_with_bytes("native-snapshot-root", &[0; 512]);
+        let drive = drive_config("root", backing.path());
+        let serial = bangbang_runtime::serial::SerialConfig::default();
+        let (writer, captured_bytes) =
+            RecordingSnapshotWriter::new(Arc::clone(&events), None, None);
+        let binding = supervisor
+            .capture_native_v1_snapshot(
+                &drive,
+                &serial,
+                Box::new(writer),
+                NativeV1SnapshotCaptureCancellation::default(),
+            )
+            .expect("native snapshot capture should succeed");
+
+        assert_eq!(binding.data_length(), 2 * 1024 * 1024);
+        let captured_bytes = captured_bytes
+            .lock()
+            .expect("captured memory bytes should lock");
+        assert_eq!(captured_bytes.get_ref().len() as u64, binding.file_length());
+        assert_eq!(&captured_bytes.get_ref()[..8], b"BANGMEM\0");
+        drop(captured_bytes);
+        let events = events
+            .lock()
+            .expect("native snapshot events should lock")
+            .clone();
+        let position = |event| {
+            events
+                .iter()
+                .position(|candidate| *candidate == event)
+                .expect("expected native snapshot event should exist")
+        };
+        assert!(position("aux-acquire") < position("state"));
+        assert!(position("state") < position("memory"));
+        assert!(position("memory") < position("write"));
+        assert!(position("write") < position("bundle"));
+        assert!(position("bundle") < position("writer-drop"));
+        assert!(position("writer-drop") < position("aux-drop"));
+        assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 1);
+        assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        supervisor
+            .resume()
+            .expect("source VM should remain resumable");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should re-enter run loop after resume"),
+            61
+        );
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_v1_pre_cancel_stops_before_auxiliary_acquisition() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let auxiliary = session.snapshot_auxiliary_quiescence();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(62).expect("non-zero limit"))
+                .expect("native snapshot supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 62);
+        supervisor.pause().expect("supervisor should pause");
+
+        let backing = TempFilePath::create_with_bytes("pre-cancel-snapshot-root", &[0; 512]);
+        let drive = drive_config("root", backing.path());
+        let serial = bangbang_runtime::serial::SerialConfig::default();
+        let cancellation = NativeV1SnapshotCaptureCancellation::default();
+        cancellation.cancel();
+        let (writer, _) = RecordingSnapshotWriter::new(Arc::clone(&events), None, None);
+        assert!(matches!(
+            supervisor.capture_native_v1_snapshot(&drive, &serial, Box::new(writer), cancellation,),
+            Err(NativeV1SnapshotCaptureError::Cancelled {
+                stage: NativeV1SnapshotCaptureStage::State(
+                    HvfArm64BootSnapshotV1CaptureStage::CacheManifest
+                )
+            })
+        ));
+        assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 0);
+        assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            events
+                .lock()
+                .expect("pre-cancel events should lock")
+                .as_slice(),
+            ["writer-drop"]
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_v1_memory_cancellation_releases_lease_and_allows_fresh_retry() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(2)
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let auxiliary = session.snapshot_auxiliary_quiescence();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(63).expect("non-zero limit"))
+                .expect("native snapshot supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 63);
+        supervisor.pause().expect("supervisor should pause");
+
+        let backing = TempFilePath::create_with_bytes("cancel-snapshot-root", &[0; 512]);
+        let drive = drive_config("root", backing.path());
+        let serial = bangbang_runtime::serial::SerialConfig::default();
+        let cancellation = NativeV1SnapshotCaptureCancellation::default();
+        let (writer, partial_bytes) =
+            RecordingSnapshotWriter::new(Arc::clone(&events), Some(cancellation.clone()), Some(2));
+        assert!(matches!(
+            supervisor.capture_native_v1_snapshot(&drive, &serial, Box::new(writer), cancellation,),
+            Err(NativeV1SnapshotCaptureError::Cancelled {
+                stage: NativeV1SnapshotCaptureStage::Memory(
+                    bangbang_runtime::snapshot_memory::SnapshotMemoryIoStage::Data {
+                        range_index: 0
+                    }
+                )
+            })
+        ));
+        assert!(
+            partial_bytes
+                .lock()
+                .expect("partial memory bytes should lock")
+                .get_ref()
+                .len()
+                < 2 * 1024 * 1024
+        );
+        let cancelled_events = events
+            .lock()
+            .expect("cancelled snapshot events should lock")
+            .clone();
+        let writer_drop = cancelled_events
+            .iter()
+            .rposition(|event| *event == "writer-drop")
+            .expect("cancelled writer should drop");
+        let auxiliary_drop = cancelled_events
+            .iter()
+            .rposition(|event| *event == "aux-drop")
+            .expect("cancelled auxiliary guard should drop");
+        assert!(writer_drop < auxiliary_drop);
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        let (retry_writer, retry_bytes) =
+            RecordingSnapshotWriter::new(Arc::clone(&events), None, None);
+        let binding = supervisor
+            .capture_native_v1_snapshot(
+                &drive,
+                &serial,
+                Box::new(retry_writer),
+                NativeV1SnapshotCaptureCancellation::default(),
+            )
+            .expect("fresh capture after cancellation should succeed");
+        assert_eq!(
+            retry_bytes
+                .lock()
+                .expect("retry bytes should lock")
+                .get_ref()
+                .len() as u64,
+            binding.file_length()
+        );
+        assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 2);
+        assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 2);
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 }

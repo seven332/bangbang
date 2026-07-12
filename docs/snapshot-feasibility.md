@@ -8,10 +8,12 @@ roadmap, not a statement that snapshot create or restore is supported today.
 
 bangbang recognizes Firecracker-shaped snapshot requests and now implements a
 bangbang-native outer state envelope, read-only version inspection,
-guest-memory image/binding I/O, a minimal memory-only commit record, and an
-internal macOS no-clobber two-file publisher/loader. No process or API path
-invokes artifact publication or loading, and there is no composite VM-state
-payload schema yet.
+guest-memory image/binding I/O, memory-only and composite commit records, an
+exact five-component native-HVF state payload, and an internal macOS no-clobber
+two-file publisher/loader. A private supervisor operation can capture one
+accepted paused native-v1 source into a complete in-memory state bundle plus a
+caller-owned memory output. No process or API path invokes final artifact
+publication or loading.
 
 - `PUT /snapshot/create` and `PUT /snapshot/load` parse and normalize complete
   request bodies into debug-redacted API and runtime values before reaching VMM
@@ -45,9 +47,10 @@ payload schema yet.
 - The runtime can encode a bounded state-embeddable GPA manifest, stream a full
   memory image from exact `GuestMemory` regions, and load a validated image into
   newly allocated anonymous memory through already-open seekable handles. A
-  separate internal path layer can publish that image with a minimal state
-  commit record and load the committed pair. Snapshot create/load invokes
-  neither layer.
+  separate internal path layer can publish that image with either validated
+  commit kind and load the committed pair. The private capture path creates a
+  composite commit but deliberately does not call the publisher; public
+  snapshot create/load invokes neither layer.
 
 ## Native V1 State Envelope
 
@@ -81,8 +84,8 @@ CRC-64/Jones detects accidental corruption. It does not authenticate a
 snapshot: an actor able to rewrite the state file can also recompute the CRC,
 so every future payload decoder must remain safe for attacker-controlled input.
 The inspection CLI still treats the payload as opaque. The runtime additionally
-recognizes the minimal memory-only commit record below; broader HVF/device
-schemas remain later delivery slices.
+recognizes both commit kinds below, while the HVF crate alone validates the
+backend-specific composite payload.
 
 ## Native V1 Guest-Memory Image and Binding
 
@@ -145,23 +148,24 @@ secrets or authentication. CRC protects against accidental corruption only.
 
 ## Native V1 Commit Record and Artifact Publication
 
-The current payload is deliberately a minimal memory-only commit record, not a
-speculative composite vCPU/device schema. Its fixed 32-byte little-endian header
-is followed by the exact validated memory binding:
+The fixed 32-byte little-endian commit header is followed by the exact validated
+memory binding and, for kind 2 only, one bounded non-empty backend-state value:
 
 | Offset | Width | Field | Native-v1 rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | bytes `BANGCMT\0` |
 | 8..14 | 6 | semantic version | exact `1.0.0` |
-| 14 | 2 | record kind | `1` means memory-only commit |
+| 14 | 2 | record kind | `1` means memory-only; `2` means composite |
 | 16 | 4 | flags | must be zero |
 | 20 | 4 | binding length | exact `BANGMBND` byte count |
-| 24 | 8 | reserved | must be zero |
+| 24 | 8 | state length | zero for kind 1; exact backend-state length for kind 2 |
 | 32 | variable | memory binding | fully validated, with no trailing bytes |
+| following binding | variable | backend state | absent for kind 1; non-empty `BANGHVF\0` for kind 2 |
 
-The largest record is 98,408 bytes, within the outer 16 MiB payload policy.
-Later composite work must version or nest this record deliberately; it may not
-reinterpret trailing bytes.
+Kind 1 retains its exact original bytes and 98,408-byte maximum. Kind 2 uses the
+remainder of the outer 16 MiB payload budget after its exact binding. Unknown
+kinds, nonzero flags, a nonzero kind-1 state length, empty or oversized kind-2
+state, nested binding failures, truncation, and trailing bytes fail closed.
 
 On macOS, the internal publisher opens each destination directory once and
 performs subsequent namespace operations relative to that retained descriptor.
@@ -206,6 +210,54 @@ Case- or normalization-equivalent absent names can also escape exact alias
 preflight; the exclusive state rename then fails safely and may leave a memory
 orphan.
 
+### Native-HVF Composite Payload
+
+The kind-2 state value has a 32-byte `BANGHVF\0` header carrying exact semantic
+version `1.0.0`, profile `1`, zero flags, component count `5`, total length, and
+zero reserved fields. Each component has an 8-byte kind/flags/length header.
+The decoder requires these five non-empty components exactly once and in this
+order; it does not skip unknown future components:
+
+| Kind | Component | Native-v1 contents |
+| ---: | --- | --- |
+| 1 | machine/profile | Complete accepted `MachineConfig`: one vCPU, memory size, no SMT, dirty tracking, huge pages, or CPU template. |
+| 2 | compatibility/platform | Baseline and conditional optional CPU IDs, primary MPIDR, one atomic default-vCPU cache feature/geometry manifest, exact GIC metadata, fixed PL031 MMIO metadata, and explicit fresh-system-RTC policy. |
+| 3 | mutable vCPU | General, core-system, exception, execution-control, cache-selection, debug-control/trap, system-context, translation, pointer-authentication, thread-context, and SIMD/FP state. |
+| 4 | timer/interrupt/GIC | Normalized timer state, CPU IRQ/FIQ levels, bounded opaque Hypervisor.framework GIC bytes, and all ten EL1 ICC registers. |
+| 5 | baseline device | The exact nested `BANGDEV\0` profile for one read-only root block device, UART, limiter/retry time, VMGenID metadata/policy, and VMClock metadata/policy. |
+
+Construction and decode cross-check the machine memory size and one canonical
+DRAM range against the memory binding, the primary MPIDR against CPU identity,
+optional-feature absence/inactivity, the baseline GIC topology, fixed RTC
+mapping, and every nested device queue/platform range. The cache values come
+from one retained default `hv_vcpu_config_t`; they describe same-environment
+compatibility and are not a cross-host portability claim. The opaque GIC blob
+is bounded before allocation and can still be rejected by Hypervisor.framework
+after a host update. PL031 is deliberately reconstructed fresh: no mutable RTC
+register or alarm continuity is encoded.
+
+### Private Composite Capture Boundary
+
+The private supervisor command detaches the accepted machine/drive/serial
+configuration, reserves FIFO snapshot admission on a paused worker, and
+quiesces block and entropy retry schedulers. One aggregate runner command then
+atomically reserves metadata, core, timer, and interrupt operation domains and
+captures its fixed state order. The boot session captures the atomic cache
+manifest and baseline device state, validates and encodes all non-memory state,
+then streams the exact guest-memory image to a consumed controlled `Write +
+Seek + Send` output in 1 MiB chunks. Only a complete binding permits final
+bundle construction.
+
+Cancellation is cooperative before each fixed stage, each memory chunk, the
+trailer, and final-length validation. Cancellation or any recoverable failure
+returns no binding or bundle, drops the output and auxiliary guard before
+releasing snapshot admission, and leaves the source paused for retry or resume.
+Supervisor shutdown signals cancellation before joining the worker. An
+individual blocking OS write cannot be forcibly preempted, which is one reason
+the operation remains restricted to controlled internal writers. The operation
+does not open request paths, stage final names, call the publisher, reconstruct
+a VM, or mutate the source session.
+
 ## Current Ownership and Pause Boundary
 
 The current single-vCPU process keeps control-plane, run-loop, and HVF
@@ -215,8 +267,8 @@ ownership on separate threads:
 | --- | --- |
 | Process owner | `ProcessVmm` owns the VMM controller, startup executor, and active `BootRunLoopSupervisor` handle. It serves API requests and commits public instance-state transitions, but it does not own the live boot session after startup. |
 | Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy state, and block and entropy retry schedulers. Device-update commands execute here. |
-| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes HVF operations through commands and can return immutable X0-X30, PC, and CPSR values; guest-visible MIDR, MPIDR, and baseline PFR/DFR/ISAR/MMFR compatibility metadata; optional macOS 15.2 ZFR0/SMFR0 SVE/SME compatibility metadata; mutable macOS 15.2 SME `PSTATE.SM`/`PSTATE.ZA` controls; conditional maximum-width macOS 15.2 streaming Z0-Z31 bytes, maximum-derived P0-P15 predicate bytes, a maximum-SVL-square ZA matrix, and fixed 64-byte SME2 ZT0 contents in separate debug-redacted values; raw macOS 15.2 SMCR_EL1, SMPRI_EL1, and TPIDR2_EL0 values in a debug-redacted value; raw macOS 15.2 SCXTNUM_EL0 and SCXTNUM_EL1 software context numbers in a debug-redacted value with paired ordered restore; raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values with paired ordered restore; raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 values; raw ACTLR_EL1 and CPACR_EL1 values; raw CSSELR_EL1 cache-selection state with paired ordered restore; every DFR0-reported raw DBGBVR/DBGBCR hardware-breakpoint pair; every DFR0-reported raw DBGWVR/DBGWCR hardware-watchpoint pair; raw MDCCINT_EL1 and MDSCR_EL1 debug controls with paired ordered restore; raw Hypervisor.framework debug-exception and debug-register-access trap policy with paired ordered restore; raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1, TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 values with paired ordered restore; raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values with paired ordered restore; raw baseline Q0-Q31, FPCR, and FPSR values with paired ordered restore; raw APIA, APIB, APDA, APDB, and APGA pointer-authentication keys in a debug-redacted value with paired ordered restore; raw physical/virtual timers plus a normalized freeze-downtime timer value with paired never-run restore; CPU-level IRQ/FIQ pending values with paired ordered restore; Hypervisor.framework's opaque GIC device-state bytes with paired pre-first-run apply; or raw EL1 GIC ICC CPU-interface values with paired owner-thread capture and pre-first-run restore of nine mutable registers plus derived-RPR validation. The snapshot barrier invokes none of these captures or restore operations, and the remaining architectural/device inventory is not implemented. |
-| Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. The snapshot barrier can temporarily quiesce the block and entropy schedulers. The vmnet interface, vsock listener, retained streams, and their host/kernel buffers remain open for the lifetime of the boot session. A transient vsock polling thread is joined at the end of each vCPU run step. |
+| vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes HVF operations through commands and can return immutable X0-X30, PC, and CPSR values; guest-visible MIDR, MPIDR, and baseline PFR/DFR/ISAR/MMFR compatibility metadata; optional macOS 15.2 ZFR0/SMFR0 SVE/SME compatibility metadata; mutable macOS 15.2 SME `PSTATE.SM`/`PSTATE.ZA` controls; conditional maximum-width macOS 15.2 streaming Z0-Z31 bytes, maximum-derived P0-P15 predicate bytes, a maximum-SVL-square ZA matrix, and fixed 64-byte SME2 ZT0 contents in separate debug-redacted values; raw macOS 15.2 SMCR_EL1, SMPRI_EL1, and TPIDR2_EL0 values in a debug-redacted value; raw macOS 15.2 SCXTNUM_EL0 and SCXTNUM_EL1 software context numbers in a debug-redacted value with paired ordered restore; raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values with paired ordered restore; raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 values; raw ACTLR_EL1 and CPACR_EL1 values; raw CSSELR_EL1 cache-selection state with paired ordered restore; every DFR0-reported raw DBGBVR/DBGBCR hardware-breakpoint pair; every DFR0-reported raw DBGWVR/DBGWCR hardware-watchpoint pair; raw MDCCINT_EL1 and MDSCR_EL1 debug controls with paired ordered restore; raw Hypervisor.framework debug-exception and debug-register-access trap policy with paired ordered restore; raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1, TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 values with paired ordered restore; raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values with paired ordered restore; raw baseline Q0-Q31, FPCR, and FPSR values with paired ordered restore; raw APIA, APIB, APDA, APDB, and APGA pointer-authentication keys in a debug-redacted value with paired ordered restore; raw physical/virtual timers plus a normalized freeze-downtime timer value with paired never-run restore; CPU-level IRQ/FIQ pending values with paired ordered restore; Hypervisor.framework's opaque GIC device-state bytes with paired pre-first-run apply; or raw EL1 GIC ICC CPU-interface values with paired owner-thread capture and pre-first-run restore of nine mutable registers plus derived-RPR validation. The private native-v1 path captures its fixed baseline subset through one aggregate command that holds metadata, core, timer, and interrupt admission until completion; public snapshot paths still invoke no capture or restore operation. |
+| Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. The private native-v1 capture temporarily quiesces the block and entropy schedulers for state and memory capture. The vmnet interface, vsock listener, retained streams, and their host/kernel buffers remain open for the lifetime of the boot session and therefore remain outside the accepted baseline profile. A transient vsock polling thread is joined at the end of each vCPU run step. |
 
 A successful public pause has a narrower boundary than a snapshot needs:
 
@@ -243,8 +295,16 @@ this is not a frozen runtime boundary. In particular:
 - vmnet packet queues and vsock connections can change in host or kernel buffers
   even when bangbang is not dispatching them to the guest.
 
-The current pause path does not capture vCPU, GIC, device, or guest-memory state
-and does not transfer ownership of any live resource.
+The public pause path does not capture vCPU, GIC, device, or guest-memory state
+and does not transfer ownership of any live resource. The private composite
+capture is a separate worker command available only after that paused boundary;
+it returns detached state and a binding, never live handles or mutable aliases.
+
+The detailed inventory below records the standalone primitives and their
+original delivery boundaries. The composite capture described above now
+consumes its fixed baseline subset; references below to public snapshot paths
+remain accurate, and later implementation-split rows supersede earlier
+"deferred" notes.
 
 The HVF crate now has a narrower runner-local building block: one command reads
 X0-X30, PC, and CPSR in architectural order on the owning thread and returns a
@@ -323,21 +383,23 @@ A separate macOS 11+ configuration query creates a fresh default
 `hv_vcpu_config_t`, reads raw `CTR_EL0`, `CLIDR_EL1`, then `DCZID_EL0`, and
 releases the retained object before returning one immutable value. It takes no
 VM/vCPU handle and remains outside runner admission, boot sessions, and public
-snapshot paths. These feature registers are inputs to a later cache manifest,
-not the live `CSSELR_EL1` selector, instruction/data `CCSIDR_EL1` geometry, a
-destination decision, or restore policy. Signed coverage compares two pre-VM
-queries with fixed messages and no raw-value logging.
+snapshot paths. The private composite capture instead uses a combined query
+that reads these features and all CCSIDR geometry from one retained default
+configuration. Neither surface includes the live `CSSELR_EL1` selector or
+defines a destination decision or restore policy. Signed coverage compares two
+pre-VM queries with fixed messages and no raw-value logging.
 
 Another macOS 11+ configuration query creates a fresh default object, reads all
 eight raw data or unified `CCSIDR_EL1` values followed by all eight instruction
 values, and releases the retained object before returning one immutable
 geometry value. It also takes no VM/vCPU handle and remains outside runner
-admission, boot sessions, and public snapshot paths. The feature and geometry
-queries use independent objects and do not form one atomic cache manifest. The
+admission, boot sessions, and public snapshot paths. The original standalone
+feature and geometry queries remain independent compatibility surfaces; the
+private composite capture uses the combined same-configuration manifest. The
 raw arrays define no implemented-level selection, field interpretation, masks,
-destination decision, selector synchronization, cache maintenance, or restore
-policy. Signed coverage compares two pre-VM queries with fixed messages and no
-raw-value logging.
+cross-host destination decision, selector synchronization, cache maintenance,
+or restore policy. Signed coverage compares two pre-VM queries with fixed
+messages and no raw-value logging.
 
 A separate macOS 15.2+ core-register command reads guest-visible
 `ID_AA64ZFR0_EL1` then `ID_AA64SMFR0_EL1` and publishes one optional SVE/SME
@@ -678,9 +740,10 @@ interrupt-operation admission domain with both aggregate commands, while CPU
 levels and GIC state remain distinct models. HVF clears the CPU pending levels
 after a vCPU run returns, so setters and aggregate restore are pre-run injection
 primitives rather than durable delivery state. Both boot-session forms delegate
-capture and restore; the supervisor lease and public snapshot paths invoke
-neither. GIC device and EL1 ICC values are captured and restored separately
-below, while their persistence and composite orchestration remain deferred.
+capture and restore. The public snapshot barrier invokes neither. The private
+native-v1 aggregate captures and persists the pending levels together with the
+separately modeled GIC device and EL1 ICC values; complete restore orchestration
+remains deferred.
 
 Another command creates Hypervisor.framework's opaque GIC state object, queries
 and fallibly allocates its reported size, copies the complete serialized GIC
@@ -887,10 +950,11 @@ snapshot state unless a later design proves otherwise.
 | API transaction and detached captured-state bundle | Coordinated by the process owner only after snapshot readiness is acknowledged. It may own an immutable captured bundle, but never the live boot session or runner-owned HVF handles. |
 | vmnet, vsock, disks, and other host resources | Represented by explicit configuration or restore metadata according to later resource policy, not by serializing live host handles. |
 
-Exact register inventories, GIC and device payload schemas, capture ownership,
-dirty tracking, and the duration of the lease during file I/O remain separate
-design decisions. The fixed memory-only artifact layout and publication
-boundary are implemented independently of them.
+The native-v1 baseline register inventory, GIC/device payload schemas, capture
+ownership, and lease duration through synchronous memory output are now fixed
+by the private composite capture. Dirty tracking, optional resources, final
+artifact orchestration, and restore remain separate design decisions. The
+publisher remains independently implemented and is not called by capture.
 
 ### Failure and terminal precedence
 
@@ -915,8 +979,27 @@ boundary are implemented independently of them.
 
 ## Required Prerequisites
 
-Snapshot support should land only after these prerequisites are designed and
-tested:
+Public snapshot success still requires these current prerequisites:
+
+- create-side artifact orchestration that opens controlled staging outputs,
+  invokes the private composite capture, passes the resulting kind-2 record to
+  the existing memory-first/state-last publisher, and maps every orphan or
+  durability-uncertain outcome without exposing paths or partial state;
+- load-side destination compatibility checks, fresh VM construction, complete
+  never-run restore ordering, prepared baseline-device installation, VMGenID
+  replacement/signaling, and terminal handling after any nontransactional
+  restore failure;
+- explicit external-resource and override policy for every profile beyond one
+  read-only root block device and default serial, plus optional-device state;
+- a dirty-page strategy before `Diff` can be admitted; and
+- API/process/signed fresh-process coverage before either public endpoint can
+  return success.
+
+The detailed list below is the pre-composite prerequisite inventory retained to
+show why the baseline was chosen. Its capture/schema/orchestration gaps are
+superseded by #1270 and the sections above; its destination-validation,
+restore-ordering, optional-state, external-resource, and dirty-tracking gaps
+remain relevant.
 
 - Snapshot-ready pause ownership: extend the implemented supervisor admission
   foundation to satisfy every invariant above without racing the HVF runner,
@@ -1035,7 +1118,8 @@ tested:
 
 Snapshot-ready ownership should land as ordered, PR-sized slices before a
 snapshot create success path. Each slice must preserve recognized unsupported
-API behavior until all of its prerequisites exist.
+API behavior until all of its prerequisites exist. Rows describe the boundary
+when each slice landed; later rows supersede earlier deferred-work clauses.
 
 | Slice | Scope | Minimum validation |
 | --- | --- | --- |
@@ -1072,20 +1156,21 @@ API behavior until all of its prerequisites exist.
 | Runner pending-interrupt capture and restore (first bidirectional interrupt subset implemented) | #1174 adds typed IRQ/FIQ owner-thread get/set commands and one failure-atomic IRQ-then-FIQ capture. #1248 adds ordered owner-thread restore of that complete value through a dedicated value-free failure with the exact failed type and completed prefix. The two writes are nontransactional, so callers must retry the complete value or discard the vCPU before execution. CPU pending levels and validated GIC PPI mutations share generalized interrupt-operation admission but remain distinct state models. Both boot-session forms expose capture and restore, but the snapshot lease invokes neither. HVF clears both levels after a run, so automatic pre-run reassertion, the separately captured opaque GIC blob and EL1 ICC value, routing, delivery/EOI, persistence, schema, orchestration, and multi-vCPU association remain deferred. | Exact IRQ-then-FIQ read/write order; both read and write failures; typed value-free partial-write context; complete retry; bidirectional conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed IRQ-only restore/recapture twice after a FIQ-only mutation, followed by explicit clear, without a guest run or GIC/delivery claims. |
 | Runner opaque GIC device-state capture and restore (second bidirectional interrupt subset implemented) | #1178 adds a redacted immutable byte value and owner-loop capture for Hypervisor.framework's stable, versioned GIC device blob, with fallible allocation and retained-object cleanup. #1255 adds an independently loaded setter and command-owned pre-first-run apply of the complete value. Both operations share generalized interrupt admission; restore checks the sticky run lifetime atomically, preserves exact HVF failure provenance, and clones no bytes into diagnostics. Both boot-session forms expose capture and apply without involving the snapshot lease. EL1 ICC state is separate; parsing, persistence, compatibility preflight, cross-step lease, schema, orchestration, and multi-vCPU stopping remain deferred. | Capture create/size/data/release order and cleanup; restore exact pointer/`usize` length, empty/no-call and backend failure; sticky run gate; every forward/reverse conflict; abandonment, channels, queued destruction, unwind, panic, shutdown; redacted debug; and signed non-empty same-VM capture/reapply before run without parsing, comparison, logging, or guest execution. |
 | Runner EL1 GIC ICC register capture and restore (third bidirectional interrupt subset implemented) | #1180 adds a typed immutable ten-register value and owner-thread capture for PMR, BPR0, AP0R0, AP1R0, RPR, BPR1, CTLR, SRE, IGRPEN0, and IGRPEN1. #1258 adds a pre-first-run owner command that independently preloads getter and setter capabilities, writes the nine architecturally mutable fields in capture order, and validates the derived read-only RPR at its original position. A typed value-free error distinguishes write from derived-value validation and reports the exact register and completed write prefix. The operation is nontransactional, so callers must retry the complete value or discard the vCPU before execution. It shares generalized interrupt admission and complements, but is not embedded in, the opaque GIC blob; callers apply that compatible blob first without receiving a cross-step lease. Both boot-session forms expose capture and restore without involving the snapshot lease. `ICC_SRE_EL2`, ICH/ICV, destination validation, host-update preflight, persistence, composite orchestration, and multi-vCPU association remain deferred. | Exact SDK ids and ten-position read/write-or-validate order; every capture read failure, every mutable write failure, RPR read failure and mismatch; typed value-free partial-write context; complete retry; sticky never-run gate; bidirectional conflicts, abandonment, channels, queued destruction, unwind, panic, shutdown, and both boot-session delegates; signed guest-written PMR/BPR/SRE/group-enable capture plus same-idle-vCPU opaque-blob/ICC capture, ordered restore, and two exact recaptures without guest execution or value logging. |
-| Native-v1 baseline device profile (internal state and preflight implemented) | #1268 adds an exact standalone `BANGDEV\0` v1 profile capped at 16 KiB for one read-only root virtio-block device, complete healthy virtio-mmio registers, one queue and active cursors, guest-visible interrupt status, frozen limiter/retry time, UART registers with fresh-default output, and canonical VMGenID/VMClock metadata without reusable generation bytes. Capture joins process-owned drive/serial configuration with one quiesced worker observation; load preflight validates mapped non-overlapping rings and cursors, reopens the root regular file read-only/no-follow with exact descriptor stat identity, and builds drop-safe block/serial resources off-side. The memory-only `BANGCMT\0` record, public endpoints, composite lease, VM construction, prepared-device installation, and post-GIC VMGenID stage remain unchanged/deferred. | Deterministic codec/header/EOF/bounds/redaction; transport no-partial-restore; queue mapping/cursor/retry; injected-time limiter and scheduler tests; real-file identity/no-follow and fresh-serial preflight; runtime/HVF inventory ownership delegates; signed fresh-process active continuity remains the later integration gate. |
+| Native-v1 baseline device profile (internal state and preflight implemented) | #1268 adds an exact standalone `BANGDEV\0` v1 profile capped at 16 KiB for one read-only root virtio-block device, complete healthy virtio-mmio registers, one queue and active cursors, guest-visible interrupt status, frozen limiter/retry time, UART registers with fresh-default output, and canonical VMGenID/VMClock metadata without reusable generation bytes. Capture joins process-owned drive/serial configuration with one quiesced worker observation; load preflight validates mapped non-overlapping rings and cursors, reopens the root regular file read-only/no-follow with exact descriptor stat identity, and builds drop-safe block/serial resources off-side. #1270 later nests this exact value in the composite bundle; VM construction, prepared-device installation, and post-GIC VMGenID restore remain deferred. | Deterministic codec/header/EOF/bounds/redaction; transport no-partial-restore; queue mapping/cursor/retry; injected-time limiter and scheduler tests; real-file identity/no-follow and fresh-serial preflight; runtime/HVF inventory ownership delegates; signed fresh-process active continuity remains the later integration gate. |
 | EL2 GIC CPU registers and remaining emulated-device state | Inventory `ICC_SRE_EL2` plus ICH/ICV ownership and add stable state models for optional MMIO devices outside the native-v1 baseline. | Per-device round-trip unit tests and signed HVF EL2 CPU-interface/device-state coverage if nested virtualization is enabled. |
-| Full guest-memory image I/O (internal primitives implemented) | #1263 defines the native-v1 fixed memory header and state-authoritative GPA binding, preserves exact discontiguous/dynamic region boundaries and canonical absolute offsets, streams full bytes through a fallible 1 MiB buffer with CRC-64/Jones, and anonymously loads only after seek-observed length, pair identity, trailer, binding checksum, and EOF validation. It uses already-open seekable handles and no API/VMM path invokes it. Immutable capture ownership, orchestration, and public success remain deferred. | Golden header/binding/CRC bytes; exact maximum metadata; multi-region and chunk-boundary round trips; malformed layout/length/identity/integrity; short/interrupted/failing I/O and seek races; allocation/access failure and partial-owner drop; full process and signed capture coverage deferred. |
-| No-clobber artifact commit boundary (internal primitive implemented) | #1264 adds the fixed memory-only commit record, directory-fd-anchored macOS staging, exclusive memory-first/state-last publication with file and directory barriers, typed orphan and committed-uncertain outcomes, and the inverse state-first committed-pair loader. Destination directories are trusted; published finals are never cleanup targets; no public VMM/API path invokes it. Composite state, capture ownership, orchestration, and public success remain deferred. | Exact codec bytes and malformed inputs; same/cross-directory success; all final file types and aliases; ordered failure injection; late collisions; observed staging replacement; cleanup failure; corruption/mismatch; redaction; and coordinated multiprocess contention. |
+| Full guest-memory image I/O (internal primitives implemented) | #1263 defines the native-v1 fixed memory header and state-authoritative GPA binding, preserves exact discontiguous/dynamic region boundaries and canonical absolute offsets, streams full bytes through a fallible 1 MiB buffer with CRC-64/Jones, and anonymously loads only after seek-observed length, pair identity, trailer, binding checksum, and EOF validation. #1270 adds cooperative stage/chunk cancellation and holds immutable capture ownership through this copy; public success remains deferred. | Golden header/binding/CRC bytes; exact maximum metadata; multi-region and chunk-boundary round trips; malformed layout/length/identity/integrity; short/interrupted/failing I/O and seek races; cancellation before fixed stages and successive chunks; allocation/access failure and partial-owner drop; full process and signed capture coverage. |
+| No-clobber artifact commit boundary (internal primitive implemented) | #1264 adds the fixed memory-only commit record, directory-fd-anchored macOS staging, exclusive memory-first/state-last publication with file and directory barriers, typed orphan and committed-uncertain outcomes, and the inverse state-first committed-pair loader. #1270 preserves kind 1 exactly and adds bounded kind 2 for binding plus opaque complete state. Destination directories are trusted; published finals are never cleanup targets; no public VMM/API path invokes the publisher. | Exact codec bytes and malformed inputs for both kinds; same/cross-directory success; all final file types and aliases; ordered failure injection; late collisions; observed staging replacement; cleanup failure; corruption/mismatch; redaction; and coordinated multiprocess contention. |
+| Native-v1 composite bundle and private capture (internal implemented) | #1270 adds the exact five-component `BANGHVF\0` profile, atomic default-vCPU cache manifest, bounded GIC capture, one aggregate four-domain runner command, explicit fresh-RTC policy, and a supervisor-owned capture that holds paused admission and auxiliary quiescence through encoding and cancellable memory streaming. It returns a detached kind-2 bundle, publishes no final path, and leaves recoverable source sessions paused, retryable, and resumable. Public create/load, restore, prepared-device installation, optional devices, and fresh-process continuity remain deferred. | Kind-1 preservation and kind-2/component golden/malformed/cross-validation/redaction tests; exact runner order, every-stage retry, conflicts, abandonment, and cleanup; supervisor order/cancellation/retry/drop tests; full memory decode plus two real signed captures and retained source-owner reuse. |
 | External resource policy | Define disk, vmnet, and vsock metadata, buffering boundary, disconnect/reconnect behavior, and restore overrides. | Resource-policy unit/process tests and focused signed network/vsock coverage. |
-| Snapshot create orchestration | Hold the lease across the agreed capture boundary, assemble the versioned state, invoke the documented memory-first/state-last artifact boundary, and release to ordinary pause. | API and process e2e tests plus signed HVF create/resume coverage. |
+| Public snapshot create orchestration | Open controlled staging outputs, invoke the implemented private capture, pass its kind-2 record through the documented memory-first/state-last publisher, and map publication outcomes without changing unsupported load behavior. | API and process e2e tests plus signed final-artifact create/source-resume coverage. |
 
-Snapshot load/restore, concrete payload-schema compatibility, dirty tracking,
-minimum macOS GIC support, and artifact orchestration remain their own
-issue-sized areas. A restore-path e2e should land only after a minimal versioned
-create/load pair exists.
+Snapshot load/restore, destination compatibility, dirty tracking, optional
+resources, and public artifact orchestration remain their own issue-sized
+areas. A restore-path e2e should land only after a minimal versioned create/load
+pair exists.
 
 Until those areas land, bangbang should continue reporting public snapshot
 create and snapshot load as recognized unsupported. Native envelope version
 reporting and read-only inspection are the only implemented user-visible
-exceptions; the internal memory, commit, and device-profile primitives neither
-create nor restore a VM.
+exceptions; the internal composite capture creates no final artifact and
+neither constructs nor restores a VM.
