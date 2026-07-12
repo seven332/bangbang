@@ -121,8 +121,9 @@ and drops the consumed writer and auxiliary guard before admission release.
 Supervisor shutdown signals cancellation before joining, but Rust cannot
 forcibly preempt an arbitrary blocking `write`; the surface therefore remains
 limited to controlled internal regular-file/test writers and is not wired to a
-request path. A partially written private output is the caller's cleanup
-responsibility and must never be interpreted as committed state.
+public request path. In the private create transaction, the writer names no path
+and the publisher owns cleanup of its private staging entry. A partially written
+staging inode is never interpreted as committed state.
 
 PL031 RTC is represented by fixed MMIO metadata and an explicit fresh-device
 policy. No mutable RTC register or alarm state is persisted, so no continuity
@@ -354,8 +355,8 @@ is resource-specific:
   corrupt pairs but do not authenticate an actor able to rewrite both files.
   The handle-level codec itself opens no path. The internal artifact layer can
   compose it with either memory-only or composite commit kind. The private
-  capture produces kind 2 but does not invoke final publication, and public
-  snapshot paths invoke neither operation.
+  process create seam now composes complete capture with final publication;
+  public snapshot paths invoke neither private transaction.
 - Internal native snapshot publication treats both final paths and all existing
   directory entries as untrusted. It opens each parent once, anchors later
   operations to that descriptor, rejects exact aliases, preflights final names
@@ -368,6 +369,15 @@ is resource-specific:
   typed orphan rather than unlinking a final name. A state-directory sync error
   after state rename is a committed, durability-uncertain result and is not safe
   to retry under unchanged names.
+- The generic content producer receives only a non-cloneable, pathless staging
+  writer. Writer destruction closes its descriptor before publishing a close
+  proof; retention or `mem::forget` fails without waiting and before any file
+  barrier or rename. Producer failures retain a typed source only through a
+  trusted accessor while formatted diagnostics redact it. Before sync, a
+  fixed-size verifier matches the actual memory header identity, data/file
+  lengths, EOF, and stored checksum trailer to the returned codec binding. This
+  is mismatch detection for a trusted producer, not full validation: only the
+  loader recomputes CRC and validates GPA ranges.
 - Destination directories are trusted security boundaries. Darwin has no
   public rename or unlink conditioned on the identity of an already-open file,
   so the immediate staging inode check is best-effort and has a residual race.

@@ -71,8 +71,11 @@ use bangbang_runtime::snapshot::{
     SnapshotCreateInput, SnapshotLoadInput, SnapshotV1ControllerCommit,
 };
 use bangbang_runtime::snapshot_artifact::{
-    SnapshotArtifactLoadError, SnapshotArtifactPaths, load_snapshot_artifacts,
+    SnapshotArtifactLoadError, SnapshotArtifactPaths, SnapshotCommitDurability,
+    SnapshotPublicationOutcome, SnapshotPublicationTransactionError, load_snapshot_artifacts,
+    publish_snapshot_artifacts_with,
 };
+use bangbang_runtime::snapshot_commit::{SnapshotCommitKind, SnapshotCommitRecord};
 use bangbang_runtime::snapshot_device::SnapshotV1DeviceState;
 use bangbang_runtime::snapshot_memory::{
     SnapshotMemoryIoStage, SnapshotMemoryWriteError, write_snapshot_memory_image_with_cancel,
@@ -151,6 +154,97 @@ pub(crate) trait SnapshotLoadExecutor: InstanceStartExecutor {
         controller: &VmmController,
         input: &SnapshotLoadInput,
     ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError>;
+}
+
+#[allow(
+    dead_code,
+    reason = "native-v1 process create remains internal until public API enablement"
+)]
+pub(crate) trait SnapshotCreateSession: ProcessSessionDiagnostics {
+    fn publish_native_v1_snapshot(
+        &mut self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        paths: &SnapshotArtifactPaths,
+    ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>>;
+}
+
+type NativeV1SnapshotPublicationTransactionError =
+    SnapshotPublicationTransactionError<NativeV1SnapshotPublicationProducerError>;
+
+#[allow(
+    dead_code,
+    reason = "native-v1 process create remains internal until public API enablement"
+)]
+pub(crate) enum NativeV1SnapshotPublicationProducerError {
+    Capture(NativeV1SnapshotCaptureError),
+    NonCompositeCommit,
+}
+
+impl fmt::Debug for NativeV1SnapshotPublicationProducerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Capture(_) => f.debug_tuple("Capture").field(&"<redacted>").finish(),
+            Self::NonCompositeCommit => f.write_str("NonCompositeCommit"),
+        }
+    }
+}
+
+impl fmt::Display for NativeV1SnapshotPublicationProducerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Capture(_) => f.write_str("native-v1 capture failed"),
+            Self::NonCompositeCommit => {
+                f.write_str("native-v1 capture returned a non-composite commit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV1SnapshotPublicationProducerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture(source) => Some(source),
+            Self::NonCompositeCommit => None,
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "native-v1 process create remains internal until public API enablement"
+)]
+#[derive(Debug)]
+pub(crate) enum NativeV1SnapshotPublicationError {
+    Preflight(VmmActionError),
+    SessionUnavailable,
+    ConfigurationUnavailable,
+    Transaction(Box<NativeV1SnapshotPublicationTransactionError>),
+}
+
+impl fmt::Display for NativeV1SnapshotPublicationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preflight(source) => {
+                write!(f, "native-v1 publication preflight failed: {source}")
+            }
+            Self::SessionUnavailable => f.write_str("native-v1 publication session is unavailable"),
+            Self::ConfigurationUnavailable => {
+                f.write_str("native-v1 publication configuration is unavailable")
+            }
+            Self::Transaction(source) => write!(f, "native-v1 publication failed: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for NativeV1SnapshotPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Preflight(source) => Some(source),
+            Self::Transaction(source) => Some(source),
+            Self::SessionUnavailable | Self::ConfigurationUnavailable => None,
+        }
+    }
 }
 
 #[allow(
@@ -1630,6 +1724,45 @@ where
     }
 }
 
+impl<S> ProcessVmm<S>
+where
+    S: InstanceStartExecutor,
+    S::Session: SnapshotCreateSession,
+{
+    /// Internal Slice 8a create seam. Public action dispatch remains unsupported.
+    #[allow(
+        dead_code,
+        reason = "native-v1 process create remains internal until public API enablement"
+    )]
+    pub(crate) fn publish_native_v1_snapshot(
+        &mut self,
+        input: &SnapshotCreateInput,
+    ) -> Result<SnapshotCommitDurability, NativeV1SnapshotPublicationError> {
+        self.controller
+            .preflight_create_snapshot(input)
+            .map_err(NativeV1SnapshotPublicationError::Preflight)?;
+
+        let drive_config = match self.controller.drive_configs() {
+            [drive_config] => drive_config.clone(),
+            _ => return Err(NativeV1SnapshotPublicationError::ConfigurationUnavailable),
+        };
+        let serial_config = self.controller.serial_config().clone();
+        let paths = SnapshotArtifactPaths::new(input.snapshot_path(), input.mem_file_path());
+        let Some(session) = self.started_session.as_mut() else {
+            return Err(NativeV1SnapshotPublicationError::SessionUnavailable);
+        };
+
+        let outcome = session
+            .publish_native_v1_snapshot(&drive_config, &serial_config, &paths)
+            .map_err(NativeV1SnapshotPublicationError::Transaction)?;
+        debug_assert_eq!(
+            self.controller.instance_info().state,
+            bangbang_runtime::InstanceState::Paused
+        );
+        Ok(outcome.durability())
+    }
+}
+
 impl<S> VmmRequestHandler for ProcessVmm<S>
 where
     S: InstanceStartExecutor,
@@ -2032,6 +2165,12 @@ pub(crate) trait NativeV1SnapshotCaptureSession: BootRunLoopSession {
         binding: bangbang_runtime::snapshot_memory::SnapshotMemoryBinding,
         state: Self::DetachedState,
     ) -> Result<Self::SnapshotBundle, NativeV1SnapshotCaptureError>;
+
+    #[allow(
+        dead_code,
+        reason = "native-v1 process create remains internal until public API enablement"
+    )]
+    fn native_v1_snapshot_commit_record(bundle: Self::SnapshotBundle) -> SnapshotCommitRecord;
 }
 
 impl<S, P> ProcessHvfBootSession<S, P> {
@@ -2124,6 +2263,10 @@ where
     ) -> Result<Self::SnapshotBundle, NativeV1SnapshotCaptureError> {
         HvfSnapshotV1Bundle::try_new(binding, state)
             .map_err(|source| NativeV1SnapshotCaptureError::Bundle { source })
+    }
+
+    fn native_v1_snapshot_commit_record(bundle: Self::SnapshotBundle) -> SnapshotCommitRecord {
+        bundle.into_commit_record()
     }
 }
 
@@ -4336,6 +4479,44 @@ where
         })
         .map_err(native_snapshot_capture_error_from_boot_run_loop_command)
     }
+
+    #[allow(
+        dead_code,
+        reason = "native-v1 process create remains internal until public API enablement"
+    )]
+    fn publish_native_v1_snapshot(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        paths: &SnapshotArtifactPaths,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>> {
+        publish_snapshot_artifacts_with(paths, |writer| {
+            let bundle = self
+                .capture_native_v1_snapshot(
+                    drive_config,
+                    serial_config,
+                    Box::new(writer),
+                    cancellation,
+                )
+                .map_err(NativeV1SnapshotPublicationProducerError::Capture)?;
+            require_native_v1_composite_record(S::native_v1_snapshot_commit_record(bundle))
+        })
+        .map_err(Box::new)
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "native-v1 process create remains internal until public API enablement"
+)]
+fn require_native_v1_composite_record(
+    record: SnapshotCommitRecord,
+) -> Result<SnapshotCommitRecord, NativeV1SnapshotPublicationProducerError> {
+    if record.kind() != SnapshotCommitKind::Composite {
+        return Err(NativeV1SnapshotPublicationProducerError::NonCompositeCommit);
+    }
+    Ok(record)
 }
 
 impl
@@ -4370,7 +4551,7 @@ impl
 
     #[expect(
         dead_code,
-        reason = "public snapshot creation remains gated until parent slice 8"
+        reason = "standalone bundle capture remains an internal diagnostic seam"
     )]
     pub(crate) fn capture_snapshot_v1_bundle(
         &self,
@@ -4380,6 +4561,23 @@ impl
         cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<HvfSnapshotV1Bundle, NativeV1SnapshotCaptureError> {
         self.capture_native_v1_snapshot(drive_config, serial_config, output, cancellation)
+    }
+}
+
+impl SnapshotCreateSession for HvfBootRunLoopSupervisor {
+    fn publish_native_v1_snapshot(
+        &mut self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        paths: &SnapshotArtifactPaths,
+    ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>> {
+        BootRunLoopSupervisor::publish_native_v1_snapshot(
+            self,
+            drive_config,
+            serial_config,
+            paths,
+            NativeV1SnapshotCaptureCancellation::default(),
+        )
     }
 }
 
@@ -4793,7 +4991,15 @@ mod tests {
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
         SnapshotType, SnapshotV1ControllerCommit,
     };
-    use bangbang_runtime::snapshot_memory::SnapshotMemoryBinding;
+    use bangbang_runtime::snapshot_artifact::{
+        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+    };
+    #[cfg(target_os = "macos")]
+    use bangbang_runtime::snapshot_artifact::{SnapshotCommitDurability, load_snapshot_artifacts};
+    #[cfg(target_os = "macos")]
+    use bangbang_runtime::snapshot_commit::SnapshotCommitKind;
+    use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
+    use bangbang_runtime::snapshot_memory::{SnapshotMemoryBinding, write_snapshot_memory_image};
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
@@ -4823,18 +5029,26 @@ mod tests {
         HvfArm64BootSnapshotV1CaptureStage, HvfInstanceStartExecutor, InstanceStartExecutor,
         NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
         NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
-        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
-        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
-        ProcessNetworkPacketIoProviderBuildError, ProcessSessionDiagnostics, ProcessVmm,
-        ProcessVmnetPacketIoBackendFactory, SnapshotLoadExecutor, SnapshotV1LoadSuccess,
+        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
+        NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
+        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
+        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
+        ProcessSessionDiagnostics, ProcessVmm, ProcessVmnetPacketIoBackendFactory,
+        SnapshotCreateSession, SnapshotLoadExecutor, SnapshotV1LoadSuccess,
         default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        process_vmnet_packet_io_provider_from_configs,
+        process_vmnet_packet_io_provider_from_configs, require_native_v1_composite_record,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug)]
     struct TempFilePath {
+        path: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Debug)]
+    struct TempSnapshotDirectory {
         path: PathBuf,
     }
 
@@ -4927,6 +5141,37 @@ mod tests {
 
         fn path(&self) -> &Path {
             &self.path
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl TempSnapshotDirectory {
+        fn new(name: &str) -> Self {
+            let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "bb-vmm-snapshot-{}-{id}-{name}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("snapshot test directory should create");
+            Self { path }
+        }
+
+        fn paths(&self) -> SnapshotArtifactPaths {
+            SnapshotArtifactPaths::new(self.path.join("state.snap"), self.path.join("memory.snap"))
+        }
+
+        fn assert_no_staging(&self) {
+            let staging_count = fs::read_dir(&self.path)
+                .expect("snapshot test directory should read")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".bangbang-snapshot-")
+                })
+                .count();
+            assert_eq!(staging_count, 0);
         }
     }
 
@@ -5036,6 +5281,13 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    impl Drop for TempSnapshotDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeSession {
         id: u64,
@@ -5045,6 +5297,8 @@ mod tests {
         resume_result: Option<BackendError>,
         snapshot_create_barrier_count: usize,
         snapshot_create_barrier_result: Option<BackendError>,
+        native_snapshot_publication_count: usize,
+        native_snapshot_producer_count: usize,
         block_update_count: usize,
         last_block_update: Option<String>,
         last_block_update_refresh_backing: Option<bool>,
@@ -5087,6 +5341,8 @@ mod tests {
                 resume_result: None,
                 snapshot_create_barrier_count: 0,
                 snapshot_create_barrier_result: None,
+                native_snapshot_publication_count: 0,
+                native_snapshot_producer_count: 0,
                 block_update_count: 0,
                 last_block_update: None,
                 last_block_update_refresh_backing: None,
@@ -5351,6 +5607,41 @@ mod tests {
                 Some(result) => result,
                 None => Ok(MemoryHotplugStatus::new(config, 0, requested_size_mib)),
             }
+        }
+    }
+
+    impl SnapshotCreateSession for FakeSession {
+        fn publish_native_v1_snapshot(
+            &mut self,
+            _drive_config: &DriveConfig,
+            _serial_config: &bangbang_runtime::serial::SerialConfig,
+            paths: &SnapshotArtifactPaths,
+        ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>>
+        {
+            self.native_snapshot_publication_count += 1;
+            let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+                .expect("fake publication memory range should validate");
+            let layout = GuestMemoryLayout::new(vec![range])
+                .expect("fake publication memory layout should validate");
+            let memory = GuestMemory::allocate(&layout)
+                .expect("fake publication guest memory should allocate");
+
+            publish_snapshot_artifacts_with(paths, |mut writer| {
+                self.native_snapshot_producer_count += 1;
+                let binding =
+                    write_snapshot_memory_image(&memory, &mut writer).map_err(|source| {
+                        NativeV1SnapshotPublicationProducerError::Capture(
+                            NativeV1SnapshotCaptureError::MemoryWrite { source },
+                        )
+                    })?;
+                let record = SnapshotCommitRecord::try_new_composite(
+                    binding,
+                    b"fake-process-native-v1-state".to_vec(),
+                )
+                .expect("fake composite commit should validate");
+                require_native_v1_composite_record(record)
+            })
+            .map_err(Box::new)
         }
     }
 
@@ -5776,6 +6067,7 @@ mod tests {
         snapshot_auxiliary_quiescence: Arc<FakeSnapshotAuxiliaryQuiescenceState>,
         native_snapshot_memory: Option<GuestMemory>,
         native_snapshot_events: Arc<Mutex<Vec<&'static str>>>,
+        native_snapshot_panic: bool,
     }
 
     impl FakeRunLoopSession {
@@ -5810,6 +6102,7 @@ mod tests {
                 snapshot_auxiliary_quiescence: Arc::default(),
                 native_snapshot_memory: None,
                 native_snapshot_events: Arc::default(),
+                native_snapshot_panic: false,
             }
         }
 
@@ -5847,6 +6140,12 @@ mod tests {
                 .lock()
                 .expect("fake auxiliary event slot should lock") =
                 Some(Arc::clone(&self.native_snapshot_events));
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        const fn with_native_snapshot_panic(mut self) -> Self {
+            self.native_snapshot_panic = true;
             self
         }
 
@@ -6115,6 +6414,10 @@ mod tests {
             _now: std::time::Instant,
             cancellation: &NativeV1SnapshotCaptureCancellation,
         ) -> Result<Self::DetachedState, NativeV1SnapshotCaptureError> {
+            assert!(
+                !self.native_snapshot_panic,
+                "fake native-v1 snapshot capture panic"
+            );
             self.native_snapshot_events
                 .lock()
                 .expect("fake native snapshot events should lock")
@@ -6152,6 +6455,11 @@ mod tests {
                 .expect("fake native snapshot events should lock")
                 .push("bundle");
             Ok(binding)
+        }
+
+        fn native_v1_snapshot_commit_record(bundle: Self::SnapshotBundle) -> SnapshotCommitRecord {
+            SnapshotCommitRecord::try_new_composite(bundle, b"fake-native-v1-state".to_vec())
+                .expect("fake native-v1 commit should validate")
         }
     }
 
@@ -9926,6 +10234,153 @@ mod tests {
         assert_eq!(session.snapshot_create_barrier_count, 1);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn internal_native_v1_publication_commits_composite_pair_without_controller_mutation() {
+        let directory = TempSnapshotDirectory::new("process-success");
+        let paths = directory.paths();
+        let input = SnapshotCreateInput::new(SnapshotType::Full, paths.state(), paths.memory());
+        let mut vmm = snapshot_profile_vmm(FakeStarter::success(19));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("source should pause");
+        let machine_before = vmm.machine_config();
+        let drive_before = vmm.drive_configs()[0].clone();
+
+        let durability = vmm
+            .publish_native_v1_snapshot(&input)
+            .expect("internal native-v1 publication should succeed");
+
+        assert_eq!(durability, SnapshotCommitDurability::Durable);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert_eq!(vmm.machine_config(), machine_before);
+        assert_eq!(vmm.drive_configs(), [drive_before]);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("source session should remain retained");
+        assert_eq!(session.native_snapshot_publication_count, 1);
+        assert_eq!(session.native_snapshot_producer_count, 1);
+        assert_eq!(session.snapshot_create_barrier_count, 0);
+
+        let artifacts = load_snapshot_artifacts(&paths).expect("committed pair should load");
+        assert_eq!(artifacts.record().kind(), SnapshotCommitKind::Composite);
+        assert_eq!(
+            artifacts.record().composite_state(),
+            Some(b"fake-process-native-v1-state".as_slice())
+        );
+        directory.assert_no_staging();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn internal_native_v1_preflight_and_path_collision_skip_content_capture() {
+        let running_directory = TempSnapshotDirectory::new("process-running");
+        let running_paths = running_directory.paths();
+        let running_input = SnapshotCreateInput::new(
+            SnapshotType::Full,
+            running_paths.state(),
+            running_paths.memory(),
+        );
+        let mut running = snapshot_profile_vmm(FakeStarter::success(20));
+        running
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        assert!(matches!(
+            running.publish_native_v1_snapshot(&running_input),
+            Err(NativeV1SnapshotPublicationError::Preflight(
+                VmmActionError::UnsupportedState { .. }
+            ))
+        ));
+        let running_session = running
+            .started_session
+            .as_ref()
+            .expect("running session should remain retained");
+        assert_eq!(running_session.native_snapshot_publication_count, 0);
+        assert_eq!(running_session.native_snapshot_producer_count, 0);
+
+        let collision_directory = TempSnapshotDirectory::new("process-collision");
+        let collision = collision_directory.path.join("same.snap");
+        let collision_input = SnapshotCreateInput::new(SnapshotType::Full, &collision, &collision);
+        let mut paused = snapshot_profile_vmm(FakeStarter::success(21));
+        paused
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        paused
+            .handle_action(VmmAction::Pause)
+            .expect("source should pause");
+
+        let error = paused
+            .publish_native_v1_snapshot(&collision_input)
+            .expect_err("aliased finals should reject before content capture");
+        assert!(matches!(
+            error,
+            NativeV1SnapshotPublicationError::Transaction(_)
+        ));
+        let paused_session = paused
+            .started_session
+            .as_ref()
+            .expect("paused session should remain retained");
+        assert_eq!(paused_session.native_snapshot_publication_count, 1);
+        assert_eq!(paused_session.native_snapshot_producer_count, 0);
+        assert_eq!(paused.instance_info().state, InstanceState::Paused);
+        assert!(!collision.exists());
+        collision_directory.assert_no_staging();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_snapshot_create_remains_unsupported_and_does_not_publish() {
+        let directory = TempSnapshotDirectory::new("public-create-unsupported");
+        let paths = directory.paths();
+        let input = SnapshotCreateInput::new(SnapshotType::Full, paths.state(), paths.memory());
+        let mut vmm = snapshot_profile_vmm(FakeStarter::success(22));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("source should pause");
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::CreateSnapshot(input)),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("source session should remain retained");
+        assert_eq!(session.snapshot_create_barrier_count, 1);
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert!(!paths.state().exists());
+        assert!(!paths.memory().exists());
+        directory.assert_no_staging();
+    }
+
+    #[test]
+    fn native_v1_publication_errors_redact_capture_details_and_reject_kind_one() {
+        let producer = NativeV1SnapshotPublicationProducerError::Capture(
+            NativeV1SnapshotCaptureError::Supervisor {
+                source: BackendError::Hypervisor("private-capture-sentinel".to_string()),
+            },
+        );
+        let diagnostics = format!("{producer:?} {producer}");
+        assert!(!diagnostics.contains("private-capture-sentinel"));
+
+        let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+            .expect("kind-one fixture range should validate");
+        let layout =
+            GuestMemoryLayout::new(vec![range]).expect("kind-one fixture layout should validate");
+        let memory = GuestMemory::allocate(&layout).expect("kind-one fixture should allocate");
+        let mut bytes = Cursor::new(Vec::new());
+        let binding = write_snapshot_memory_image(&memory, &mut bytes)
+            .expect("kind-one fixture should encode");
+        assert!(matches!(
+            require_native_v1_composite_record(SnapshotCommitRecord::new(binding)),
+            Err(NativeV1SnapshotPublicationProducerError::NonCompositeCommit)
+        ));
+    }
+
     #[test]
     fn runtime_balloon_update_refreshes_active_session_before_config_commit() {
         let mut vmm = configured_vmm(FakeStarter::success(15));
@@ -11005,6 +11460,219 @@ mod tests {
         );
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(vmm.started_session, Some(FakeSession::new(9)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v1_supervisor_publishes_one_exact_composite_pair() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(60).expect("non-zero limit"))
+                .expect("native publication supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 60);
+        supervisor.pause().expect("supervisor should pause");
+
+        let backing = TempFilePath::create_with_bytes("published-snapshot-root", &[0; 512]);
+        let drive = drive_config("root", backing.path());
+        let serial = bangbang_runtime::serial::SerialConfig::default();
+        let directory = TempSnapshotDirectory::new("supervisor-success");
+        let paths = directory.paths();
+        let outcome = supervisor
+            .publish_native_v1_snapshot(
+                &drive,
+                &serial,
+                &paths,
+                NativeV1SnapshotCaptureCancellation::default(),
+            )
+            .expect("paused supervisor publication should succeed");
+
+        assert_eq!(outcome.durability(), SnapshotCommitDurability::Durable);
+        assert_eq!(outcome.record().kind(), SnapshotCommitKind::Composite);
+        let artifacts = load_snapshot_artifacts(&paths).expect("published pair should load");
+        assert_eq!(artifacts.record(), outcome.record());
+        assert_eq!(
+            artifacts.record().composite_state(),
+            Some(b"fake-native-v1-state".as_slice())
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        let events = events
+            .lock()
+            .expect("native publication events should lock")
+            .clone();
+        let bundle = events
+            .iter()
+            .position(|event| *event == "bundle")
+            .expect("bundle event should exist");
+        let auxiliary_drop = events
+            .iter()
+            .position(|event| *event == "aux-drop")
+            .expect("auxiliary drop should exist");
+        assert!(bundle < auxiliary_drop);
+        directory.assert_no_staging();
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v1_publication_cancellation_cleans_staging_and_allows_retry() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(58).expect("non-zero limit"))
+                .expect("native publication supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 58);
+        supervisor.pause().expect("supervisor should pause");
+
+        let backing = TempFilePath::create_with_bytes("cancelled-publication-root", &[0; 512]);
+        let drive = drive_config("root", backing.path());
+        let serial = bangbang_runtime::serial::SerialConfig::default();
+        let directory = TempSnapshotDirectory::new("private-cancel-sentinel");
+        let paths = directory.paths();
+        let cancellation = NativeV1SnapshotCaptureCancellation::default();
+        cancellation.cancel();
+        let error = supervisor
+            .publish_native_v1_snapshot(&drive, &serial, &paths, cancellation)
+            .expect_err("cancelled publication should fail");
+        let producer = error
+            .producer()
+            .expect("capture cancellation should remain a typed producer failure");
+        assert!(matches!(
+            producer.source(),
+            NativeV1SnapshotPublicationProducerError::Capture(
+                NativeV1SnapshotCaptureError::Cancelled { .. }
+            )
+        ));
+        assert!(!format!("{error:?} {error}").contains("private-cancel-sentinel"));
+        assert!(!paths.state().exists());
+        assert!(!paths.memory().exists());
+        directory.assert_no_staging();
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        supervisor
+            .publish_native_v1_snapshot(
+                &drive,
+                &serial,
+                &paths,
+                NativeV1SnapshotCaptureCancellation::default(),
+            )
+            .expect("fresh publication after cancellation should succeed");
+        load_snapshot_artifacts(&paths).expect("retry pair should load");
+        directory.assert_no_staging();
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v1_publication_preflight_skips_capture_and_worker_panic_is_terminal() {
+        let collision_control = FakeRunLoopControl::default();
+        let collision_drops = Arc::new(AtomicU64::new(0));
+        let (collision_sender, collision_receiver) = mpsc::channel();
+        let collision_session = FakeRunLoopSession::new(
+            collision_control,
+            Arc::clone(&collision_drops),
+            collision_sender,
+        )
+        .with_native_snapshot_memory(1)
+        .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+        .with_wait_for_stop(false)
+        .with_wait_for_wakeup(true);
+        let collision_events = collision_session.native_snapshot_events();
+        let collision_supervisor = BootRunLoopSupervisor::start(
+            collision_session,
+            NonZeroUsize::new(57).expect("non-zero limit"),
+        )
+        .expect("collision supervisor should start");
+        assert_eq!(collision_receiver.recv().expect("worker should start"), 57);
+        collision_supervisor
+            .pause()
+            .expect("collision supervisor should pause");
+        let backing = TempFilePath::create_with_bytes("collision-publication-root", &[0; 512]);
+        let drive = drive_config("root", backing.path());
+        let serial = bangbang_runtime::serial::SerialConfig::default();
+        let collision_directory = TempSnapshotDirectory::new("supervisor-collision");
+        let collision_paths = collision_directory.paths();
+        fs::write(collision_paths.state(), b"winner").expect("existing final should create");
+
+        collision_supervisor
+            .publish_native_v1_snapshot(
+                &drive,
+                &serial,
+                &collision_paths,
+                NativeV1SnapshotCaptureCancellation::default(),
+            )
+            .expect_err("existing final should fail before capture");
+        assert!(
+            collision_events
+                .lock()
+                .expect("collision events should lock")
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(collision_paths.state()).expect("existing final should remain"),
+            b"winner"
+        );
+        assert!(!collision_paths.memory().exists());
+        collision_directory.assert_no_staging();
+        drop(collision_supervisor);
+        assert_eq!(collision_drops.load(Ordering::SeqCst), 1);
+
+        let panic_control = FakeRunLoopControl::default();
+        let panic_drops = Arc::new(AtomicU64::new(0));
+        let (panic_sender, panic_receiver) = mpsc::channel();
+        let panic_session =
+            FakeRunLoopSession::new(panic_control, Arc::clone(&panic_drops), panic_sender)
+                .with_native_snapshot_memory(1)
+                .with_native_snapshot_panic()
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let panic_supervisor = BootRunLoopSupervisor::start(
+            panic_session,
+            NonZeroUsize::new(56).expect("non-zero limit"),
+        )
+        .expect("panic supervisor should start");
+        assert_eq!(panic_receiver.recv().expect("worker should start"), 56);
+        panic_supervisor
+            .pause()
+            .expect("panic supervisor should pause");
+        let panic_directory = TempSnapshotDirectory::new("supervisor-panic");
+        let panic_paths = panic_directory.paths();
+
+        panic_supervisor
+            .publish_native_v1_snapshot(
+                &drive,
+                &serial,
+                &panic_paths,
+                NativeV1SnapshotCaptureCancellation::default(),
+            )
+            .expect_err("worker panic should fail publication");
+        assert_eq!(
+            panic_supervisor.wait_for_terminal_status(),
+            BootRunLoopWorkerStatus::Failed("boot run loop worker panicked".to_owned())
+        );
+        assert!(!panic_paths.state().exists());
+        assert!(!panic_paths.memory().exists());
+        panic_directory.assert_no_staging();
+        drop(panic_supervisor);
+        assert_eq!(panic_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

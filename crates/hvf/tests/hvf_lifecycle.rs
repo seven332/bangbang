@@ -3448,19 +3448,19 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
     use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput};
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::machine::MachineConfigInput;
-    use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::pmem::PmemMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
-    use bangbang_runtime::snapshot_artifact::{SnapshotArtifactPaths, load_snapshot_artifacts};
-    use bangbang_runtime::snapshot_commit::encode_snapshot_commit_envelope;
+    use bangbang_runtime::snapshot_artifact::{
+        SnapshotCommitDurability, load_snapshot_artifacts, publish_snapshot_artifacts_with,
+    };
+    use bangbang_runtime::snapshot_commit::SnapshotCommitKind;
     use bangbang_runtime::snapshot_device::{
         decode_snapshot_v1_device_state, encode_snapshot_v1_device_state,
     };
-    use bangbang_runtime::snapshot_memory::{
-        load_snapshot_memory_image, write_snapshot_memory_image,
-    };
+    use bangbang_runtime::snapshot_memory::write_snapshot_memory_image;
     use bangbang_runtime::startup::prepare_snapshot_v1_device_profile;
     use bangbang_runtime::vsock::VsockMmioLayout;
 
@@ -3548,7 +3548,10 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         })
     ));
 
-    let (bundle, memory_image) = {
+    let artifact_pair = TempSnapshotArtifacts::new("native-v1-composite")
+        .expect("snapshot artifact directory should create");
+    let artifact_paths = artifact_pair.paths();
+    let publication = publish_snapshot_artifacts_with(&artifact_paths, |mut writer| {
         let guard = session
             .quiesce_limiter_retry_wakeups()
             .expect("snapshot device retry work should quiesce");
@@ -3560,28 +3563,32 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
                 Instant::now(),
             )
             .expect("complete inactive native-v1 state should capture");
-        let mut memory_image = Cursor::new(Vec::new());
         let binding = write_snapshot_memory_image(
             session
                 .guest_memory()
                 .expect("source guest memory should remain mapped"),
-            &mut memory_image,
+            &mut writer,
         )
         .expect("source guest memory should stream while quiesced");
         let bundle = HvfSnapshotV1Bundle::try_new(binding, state)
             .expect("complete state and memory should form one bundle");
-        (bundle, memory_image)
-    };
-    let decoded_bundle =
-        HvfSnapshotV1Bundle::try_from_commit_record(bundle.commit_record().clone())
-            .expect("captured composite commit should decode");
-    assert_eq!(decoded_bundle.state(), bundle.state());
-    let memory_image_bytes = memory_image.into_inner();
-    let loaded_memory = load_snapshot_memory_image(
-        bundle.commit_record().memory_binding(),
-        &mut Cursor::new(memory_image_bytes.clone()),
-    )
-    .expect("captured memory image should validate and load");
+        drop(writer);
+        drop(guard);
+        Ok::<_, std::convert::Infallible>(bundle.into_commit_record())
+    })
+    .expect("production publisher should commit complete native-v1 capture");
+    assert_eq!(publication.durability(), SnapshotCommitDurability::Durable);
+    assert_eq!(publication.record().kind(), SnapshotCommitKind::Composite);
+    artifact_pair
+        .assert_committed_without_staging()
+        .expect("committed artifact directory should contain no staging entries");
+
+    let artifacts = load_snapshot_artifacts(&artifact_paths)
+        .expect("production-published artifact pair should validate and load");
+    assert_eq!(artifacts.record(), publication.record());
+    let bundle = HvfSnapshotV1Bundle::try_from_commit_record(artifacts.record().clone())
+        .expect("published composite commit should decode");
+    let loaded_memory = artifacts.memory();
     assert_eq!(
         loaded_memory.total_size(),
         session.runtime_resources().layout.total_size()
@@ -3597,23 +3604,7 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         .read_slice(&mut source_generation_id, decoded.vmgenid().range().start())
         .expect("captured VMGenID bytes should read");
 
-    let layout = session.runtime_resources().layout.clone();
-    let mut loaded_memory =
-        GuestMemory::allocate(&layout).expect("separate loaded guest memory should allocate");
-    for metadata in [decoded.vmgenid(), decoded.vmclock()] {
-        let len = usize::try_from(metadata.range().size())
-            .expect("platform range length should fit usize");
-        let mut bytes = vec![0; len];
-        session
-            .guest_memory()
-            .expect("source guest memory should remain mapped")
-            .read_slice(&mut bytes, metadata.range().start())
-            .expect("source platform bytes should read");
-        loaded_memory
-            .write_slice(&bytes, metadata.range().start())
-            .expect("loaded platform bytes should write");
-    }
-    let prepared = prepare_snapshot_v1_device_profile(&decoded, &loaded_memory, Instant::now())
+    let prepared = prepare_snapshot_v1_device_profile(&decoded, loaded_memory, Instant::now())
         .expect("decoded inactive device profile should prepare off-side");
 
     assert!(!prepared.block_handler().is_device_activated());
@@ -3674,19 +3665,8 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         .shutdown()
         .expect("owned snapshot device session should shut down");
 
-    let state_envelope = encode_snapshot_commit_envelope(bundle.commit_record())
-        .expect("captured composite commit should encode for disk loading");
-    let state_artifact = TempFile::new("snapshot-restore-state", &state_envelope)
-        .expect("snapshot state artifact should be created");
-    let memory_artifact = TempFile::new("snapshot-restore-memory", &memory_image_bytes)
-        .expect("snapshot memory artifact should be created");
-    let artifacts = load_snapshot_artifacts(&SnapshotArtifactPaths::new(
-        state_artifact.path(),
-        memory_artifact.path(),
-    ))
-    .expect("captured artifact pair should load from distinct files");
     let prepared = PreparedHvfSnapshotV1Load::from_loaded_artifacts(artifacts, Instant::now())
-        .expect("captured artifact pair should prepare without constructing a VM");
+        .expect("production-published pair should prepare without constructing a VM");
     assert!(prepared.runtime().runtime_resources.boot_origin.is_none());
 
     let restored = OwnedHvfArm64BootSession::restore_snapshot_v1(prepared)
@@ -3877,6 +3857,52 @@ fn host_page_size() -> Result<u64, std::num::TryFromIntError> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
 
     u64::try_from(page_size)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct TempSnapshotArtifacts {
+    directory: std::path::PathBuf,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl TempSnapshotArtifacts {
+    fn new(name: &str) -> std::io::Result<Self> {
+        let id = NEXT_HVF_TEST_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("bangbang-hvf-{name}-{}-{id}", std::process::id()));
+        std::fs::create_dir(&directory)?;
+        Ok(Self { directory })
+    }
+
+    fn paths(&self) -> bangbang_runtime::snapshot_artifact::SnapshotArtifactPaths {
+        bangbang_runtime::snapshot_artifact::SnapshotArtifactPaths::new(
+            self.directory.join("state.snap"),
+            self.directory.join("memory.snap"),
+        )
+    }
+
+    fn assert_committed_without_staging(&self) -> std::io::Result<()> {
+        let paths = self.paths();
+        assert!(paths.state().is_file());
+        assert!(paths.memory().is_file());
+        let entries = std::fs::read_dir(&self.directory)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|name| !name.starts_with(".bangbang-snapshot-"))
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for TempSnapshotArtifacts {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

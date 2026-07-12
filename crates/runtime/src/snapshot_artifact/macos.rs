@@ -138,10 +138,13 @@ impl Drop for StagingFile<'_> {
     }
 }
 
-pub(super) fn publish_snapshot_artifacts_macos(
+pub(super) fn publish_snapshot_artifacts_macos_with<E, F>(
     paths: &SnapshotArtifactPaths,
-    memory: &GuestMemory,
-) -> Result<SnapshotPublicationOutcome, SnapshotPublicationError> {
+    producer: F,
+) -> Result<SnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<SnapshotCommitRecord, E>,
+{
     enter_publication_stage(SnapshotPublicationStage::StatePathValidation).map_err(|kind| {
         publication_error(
             SnapshotPublicationStage::StatePathValidation,
@@ -190,7 +193,8 @@ pub(super) fn publish_snapshot_artifacts_macos(
             SnapshotPublicationStage::AliasCheck,
             SnapshotArtifactVisibility::NoFinalArtifact,
             SnapshotPublicationFailure::SameArtifact,
-        ));
+        )
+        .into());
     }
 
     preflight_absent(
@@ -217,46 +221,83 @@ pub(super) fn publish_snapshot_artifacts_macos(
         Ok(staging) => staging,
         Err(mut error) => {
             error.memory_cleanup = memory_staging.cleanup();
-            return Err(error);
+            return Err(error.into());
         }
     };
 
-    match publish_prepared(
+    match publish_prepared_with(
         &memory_path,
         &state,
-        memory,
         &mut memory_staging,
         &mut state_staging,
+        producer,
     ) {
         Ok(outcome) => Ok(outcome),
-        Err(mut error) => {
+        Err(SnapshotPublicationTransactionError::Publication(mut error)) => {
             error.memory_cleanup = memory_staging.cleanup();
             error.state_cleanup = state_staging.cleanup();
-            Err(error)
+            Err(SnapshotPublicationTransactionError::Publication(error))
+        }
+        Err(SnapshotPublicationTransactionError::Producer(mut error)) => {
+            error.memory_cleanup = memory_staging.cleanup();
+            error.state_cleanup = state_staging.cleanup();
+            Err(SnapshotPublicationTransactionError::Producer(error))
         }
     }
 }
 
-fn publish_prepared(
+fn publish_prepared_with<E, F>(
     memory_path: &OpenedFinalPath,
     state_path: &OpenedFinalPath,
-    memory: &GuestMemory,
     memory_staging: &mut StagingFile<'_>,
     state_staging: &mut StagingFile<'_>,
-) -> Result<SnapshotPublicationOutcome, SnapshotPublicationError> {
+    producer: F,
+) -> Result<SnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<SnapshotCommitRecord, E>,
+{
     stage_io(
         SnapshotPublicationStage::MemoryWrite,
         SnapshotArtifactVisibility::NoFinalArtifact,
     )?;
-    let binding =
-        write_snapshot_memory_image(memory, &mut memory_staging.file).map_err(|source| {
+    let writer_file = memory_staging.file.try_clone().map_err(|source| {
+        publication_error(
+            SnapshotPublicationStage::MemoryWrite,
+            SnapshotArtifactVisibility::NoFinalArtifact,
+            SnapshotPublicationFailure::Io(source.kind()),
+        )
+    })?;
+    let writer_closed = Arc::new(AtomicBool::new(false));
+    let writer = SnapshotMemoryStagingWriter::new(writer_file, Arc::clone(&writer_closed));
+    let record = producer(writer).map_err(|source| {
+        SnapshotPublicationTransactionError::Producer(SnapshotPublicationProducerError::new(source))
+    })?;
+
+    stage_io(
+        SnapshotPublicationStage::MemoryWriterClose,
+        SnapshotArtifactVisibility::NoFinalArtifact,
+    )?;
+    if !writer_closed.load(Ordering::Acquire) {
+        return Err(publication_error(
+            SnapshotPublicationStage::MemoryWriterClose,
+            SnapshotArtifactVisibility::NoFinalArtifact,
+            SnapshotPublicationFailure::StagingWriterRetained,
+        )
+        .into());
+    }
+
+    stage_io(
+        SnapshotPublicationStage::MemoryWriteVerify,
+        SnapshotArtifactVisibility::NoFinalArtifact,
+    )?;
+    verify_snapshot_memory_image_output(record.memory_binding(), &mut memory_staging.file)
+        .map_err(|source| {
             publication_error(
-                SnapshotPublicationStage::MemoryWrite,
+                SnapshotPublicationStage::MemoryWriteVerify,
                 SnapshotArtifactVisibility::NoFinalArtifact,
-                SnapshotPublicationFailure::MemoryWrite(source),
+                SnapshotPublicationFailure::MemoryVerify(source),
             )
         })?;
-    let record = SnapshotCommitRecord::new(binding);
 
     stage_io(
         SnapshotPublicationStage::StateEncode,

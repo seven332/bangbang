@@ -78,9 +78,14 @@ A private supervisor operation can hold paused-worker admission and block/
 entropy retry quiescence, capture all four runner ownership domains in one
 aggregate command, preflight the state encoding, and stream guest memory in
 cooperatively cancellable 1 MiB chunks. It returns no partial bundle and leaves
-the source session paused, retryable, and resumable. The existing macOS-only
-publisher still writes private owner-only files, makes memory durable first,
-and publishes state last as the commit marker.
+the source session paused, retryable, and resumable. A private process create
+transaction now preflights both final paths and private owner-only staging
+files, streams that capture directly into the publisher-owned memory inode,
+requires the producer writer to close, and commits the exact kind-2 record with
+memory durable first and state published last as the marker. The fixed-size
+pre-publish check matches header identity, lengths, and stored checksum to the
+codec-produced binding; the loader still performs authoritative full CRC and
+GPA validation.
 
 The matching private load path now validates a committed kind-2 pair, prepares
 and installs the baseline devices without kernel/FDT boot writes, constructs a
@@ -89,9 +94,10 @@ one never-run owner-thread command. Destination CPU IDs, MPIDR, cache manifest,
 inactive SVE/SME/debug state, fixed platform layout, and GIC metadata must match.
 VMGenID is replaced and signaled before the restored session is handed to an
 initially paused process worker. `resume_vm` is returned as explicit caller
-intent and never silently executed. Public snapshot create/load, optional-
-device state, EL2 GIC CPU-interface state, cross-host portability, and a public
-fresh-process restore entrypoint remain unsupported.
+intent and never silently executed. Both create and load transactions remain
+private: public snapshot create/load, optional-device state, EL2 GIC CPU-
+interface state, cross-host portability, and a public fresh-process restore
+entrypoint remain unsupported.
 
 ## Process CLI
 
