@@ -990,6 +990,9 @@ where
 
         {
             let mut state = self.shared.lock_state()?;
+            if activate_offline && !state.pending_events.is_empty() {
+                return Ok(admissions);
+            }
             if !matches!(state.phase, CoordinatorPhase::Running) {
                 if activate_offline {
                     return Ok(admissions);
@@ -2154,6 +2157,32 @@ mod tests {
             .expect("idle pause should start")
             .wait()
             .expect("idle pause should complete");
+
+        assert_eq!(coordinator.activate_and_dispatch_member(1), Ok(None));
+        assert!(members[1].pending_tokens().is_empty());
+        assert!(
+            !coordinator
+                .shared
+                .lock_state()
+                .expect("coordinator state should lock")
+                .members[1]
+                .online
+        );
+        assert!(batch.calls().is_empty());
+    }
+
+    #[test]
+    fn pending_empty_wakeup_blocks_offline_member_activation() {
+        let members = fake_members(2);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        let _wakeup = coordinator
+            .control()
+            .request_wakeup()
+            .expect("idle wakeup should start")
+            .wait()
+            .expect("idle wakeup should complete");
 
         assert_eq!(coordinator.activate_and_dispatch_member(1), Ok(None));
         assert!(members[1].pending_tokens().is_empty());
