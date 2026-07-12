@@ -8,13 +8,13 @@ use bangbang_runtime::mmio::MmioDispatcher;
 
 use crate::HvfVcpuRunStepOutcome;
 use crate::coordinator::{
-    HvfVcpuCoordinatorWork, HvfVcpuRunAdmission, HvfVcpuRunControl, HvfVcpuRunCoordinator,
-    HvfVcpuRunCoordinatorError, HvfVcpuRunEvent, HvfVcpuRunMemberOutcome, HvfVcpuRunMemberResult,
-    HvfVcpuRunTerminalReport,
+    HvfVcpuCoordinatorWork, HvfVcpuRunAdmission, HvfVcpuRunControl, HvfVcpuRunControlReason,
+    HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError, HvfVcpuRunEvent, HvfVcpuRunMemberOutcome,
+    HvfVcpuRunMemberResult, HvfVcpuRunTerminalReport,
 };
 use crate::memory::HvfGuestMemoryMappingError;
 use crate::psci::{
-    PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOnBegin, PsciCpuOnToken,
+    PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOnBegin, PsciCpuOnToken, PsciCpuOnWork,
     PsciCpuPowerCoordinator,
 };
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
@@ -227,17 +227,24 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
     ) -> Result<(), HvfArm64BootVcpuError> {
         match event {
             HvfVcpuRunEvent::Member(member) => {
-                let step = self.process_member(member, entry_is_valid);
+                let step = self.process_member(member, entry_is_valid, true);
                 self.pending_steps.push_back(step);
             }
             HvfVcpuRunEvent::Barrier(report) => {
                 let mut sentinel_index = 0;
+                let cpu_on_admission = barrier_cpu_on_admission(report.reason());
                 for member in report.acknowledgements().iter().cloned() {
                     sentinel_index = member.index();
-                    if member_is_canceled(&member) {
+                    if member_is_canceled(&member)
+                        || (cpu_on_admission.is_none() && member_has_coordinator_work(&member))
+                    {
                         continue;
                     }
-                    let step = self.process_member(member, entry_is_valid);
+                    let step = self.process_member(
+                        member,
+                        entry_is_valid,
+                        cpu_on_admission.unwrap_or(false),
+                    );
                     self.pending_steps.push_back(step);
                 }
                 self.pending_steps.push_back(Ok(IndexedBootStep {
@@ -252,13 +259,14 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
                     if (member.index(), member.generation()) == primary
                         || member_is_canceled(&member)
                         || member_is_terminal(&member)
+                        || member_has_coordinator_work(&member)
                     {
                         continue;
                     }
-                    let step = self.process_member(member, entry_is_valid);
+                    let step = self.process_member(member, entry_is_valid, false);
                     self.pending_steps.push_back(step);
                 }
-                let primary = self.process_member(report.primary().clone(), entry_is_valid);
+                let primary = self.process_member(report.primary().clone(), entry_is_valid, false);
                 self.pending_steps.push_back(primary);
             }
         }
@@ -269,6 +277,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         &mut self,
         member: HvfVcpuRunMemberResult,
         entry_is_valid: &mut impl FnMut(u64) -> bool,
+        cpu_on_admission: bool,
     ) -> Result<IndexedBootStep, HvfArm64BootVcpuError> {
         let index = member.index();
         let mpidr = member.mpidr();
@@ -276,7 +285,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         let outcome = match member.result() {
             Ok(HvfVcpuRunMemberOutcome::Handled(outcome)) => *outcome,
             Ok(HvfVcpuRunMemberOutcome::Coordinator(work)) => {
-                self.process_coordinator_work(index, *work, entry_is_valid)?
+                self.process_coordinator_work(index, *work, entry_is_valid, cpu_on_admission)?
             }
             Err(source) => {
                 return Err(HvfArm64BootVcpuError::Member {
@@ -295,6 +304,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         caller_index: usize,
         work: HvfVcpuCoordinatorWork,
         entry_is_valid: &mut impl FnMut(u64) -> bool,
+        cpu_on_admission: bool,
     ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
         let (exit, function_id, _, request) = work.into_parts();
         let response = match request {
@@ -305,10 +315,9 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
                 return self.process_cpu_on(
                     caller_index,
                     work,
-                    exit,
-                    function_id,
                     request,
                     entry_is_valid,
+                    cpu_on_admission,
                 );
             }
         };
@@ -330,11 +339,11 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         &mut self,
         caller_index: usize,
         work: HvfVcpuCoordinatorWork,
-        exit: crate::HvfHvcExit,
-        function_id: u64,
         request: crate::psci::PsciCpuOnRequest,
         entry_is_valid: &mut impl FnMut(u64) -> bool,
+        cpu_on_admission: bool,
     ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        let (exit, function_id, _, _) = work.into_parts();
         let begin = self
             .power
             .begin_cpu_on(request, entry_is_valid)
@@ -352,6 +361,10 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
             });
         };
 
+        if !cpu_on_admission {
+            return self.complete_failed_cpu_on(caller_index, work, cpu_on);
+        }
+
         let target_index = cpu_on.target_index();
         let registers = HvfArm64SecondaryBootRegisters::new(
             GuestAddress::new(cpu_on.request().entry_point()),
@@ -362,29 +375,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
             .configure_arm64_secondary_boot_registers(target_index, registers)
             .is_err()
         {
-            let response = self
-                .power
-                .finish_target_setup(cpu_on.token(), false)
-                .map_err(|_| self.power_error("target setup failure", target_index))?;
-            let response = PsciCoordinatorResponse::CpuOn(response);
-            if let Err(error) = self.complete_caller(
-                caller_index,
-                work,
-                response,
-                "CPU_ON failure completion",
-                false,
-            ) {
-                let _ = self.power.abandon_caller_completion(cpu_on.token());
-                return Err(error);
-            }
-            self.power
-                .commit_caller_completion(cpu_on.token())
-                .map_err(|_| self.power_error("CPU_ON failure commit", target_index))?;
-            return Ok(HvfVcpuRunStepOutcome::Hvc {
-                exit,
-                function_id,
-                return_value: response.return_value(),
-            });
+            return self.complete_failed_cpu_on(caller_index, work, cpu_on);
         }
 
         let response = self
@@ -431,6 +422,39 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
             .mark_target_entered(cpu_on.token())
             .map_err(|_| self.power_error("target entered transition", target_index))?;
 
+        Ok(HvfVcpuRunStepOutcome::Hvc {
+            exit,
+            function_id,
+            return_value: response.return_value(),
+        })
+    }
+
+    fn complete_failed_cpu_on(
+        &mut self,
+        caller_index: usize,
+        work: HvfVcpuCoordinatorWork,
+        cpu_on: PsciCpuOnWork,
+    ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        let (exit, function_id, _, _) = work.into_parts();
+        let target_index = cpu_on.target_index();
+        let response = self
+            .power
+            .finish_target_setup(cpu_on.token(), false)
+            .map_err(|_| self.power_error("target setup failure", target_index))?;
+        let response = PsciCoordinatorResponse::CpuOn(response);
+        if let Err(error) = self.complete_caller(
+            caller_index,
+            work,
+            response,
+            "CPU_ON failure completion",
+            false,
+        ) {
+            let _ = self.power.abandon_caller_completion(cpu_on.token());
+            return Err(error);
+        }
+        self.power
+            .commit_caller_completion(cpu_on.token())
+            .map_err(|_| self.power_error("CPU_ON failure commit", target_index))?;
         Ok(HvfVcpuRunStepOutcome::Hvc {
             exit,
             function_id,
@@ -514,6 +538,18 @@ fn member_is_canceled(member: &HvfVcpuRunMemberResult) -> bool {
     )
 }
 
+const fn barrier_cpu_on_admission(reason: HvfVcpuRunControlReason) -> Option<bool> {
+    match reason {
+        HvfVcpuRunControlReason::Wakeup => Some(true),
+        HvfVcpuRunControlReason::Pause => Some(false),
+        HvfVcpuRunControlReason::Stop | HvfVcpuRunControlReason::Shutdown => None,
+    }
+}
+
+fn member_has_coordinator_work(member: &HvfVcpuRunMemberResult) -> bool {
+    matches!(member.result(), Ok(HvfVcpuRunMemberOutcome::Coordinator(_)))
+}
+
 fn member_is_terminal(member: &HvfVcpuRunMemberResult) -> bool {
     matches!(
         member.result(),
@@ -553,5 +589,31 @@ impl<'vm> Deref for HvfArm64BootVcpuSession<'vm> {
 
     fn deref(&self) -> &Self::Target {
         self.coordinator.primary_runner()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::barrier_cpu_on_admission;
+    use crate::coordinator::HvfVcpuRunControlReason;
+
+    #[test]
+    fn barrier_policy_admits_rejects_or_abandons_cpu_on_by_reason() {
+        assert_eq!(
+            barrier_cpu_on_admission(HvfVcpuRunControlReason::Wakeup),
+            Some(true)
+        );
+        assert_eq!(
+            barrier_cpu_on_admission(HvfVcpuRunControlReason::Pause),
+            Some(false)
+        );
+        assert_eq!(
+            barrier_cpu_on_admission(HvfVcpuRunControlReason::Stop),
+            None
+        );
+        assert_eq!(
+            barrier_cpu_on_admission(HvfVcpuRunControlReason::Shutdown),
+            None
+        );
     }
 }
