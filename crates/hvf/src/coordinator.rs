@@ -285,7 +285,10 @@ pub enum HvfVcpuRunCoordinatorError {
         expected: Option<u64>,
     },
     /// A control waiter was superseded by a terminal member result.
-    ControlSupersededByTerminal { reason: HvfVcpuRunControlReason },
+    ControlSupersededByTerminal {
+        reason: HvfVcpuRunControlReason,
+        report: Box<HvfVcpuRunTerminalReport>,
+    },
     /// One indexed owner-thread control operation failed.
     MemberOperation {
         operation: &'static str,
@@ -372,10 +375,15 @@ impl fmt::Display for HvfVcpuRunCoordinatorError {
                 f,
                 "vCPU topology member {index} completed generation {generation}, expected {expected:?}"
             ),
-            Self::ControlSupersededByTerminal { reason } => write!(
-                f,
-                "vCPU topology {reason} control was superseded by a terminal member result"
-            ),
+            Self::ControlSupersededByTerminal { reason, report } => {
+                let primary = report.primary();
+                write!(
+                    f,
+                    "vCPU topology {reason} control was superseded by terminal member {} (MPIDR 0x{:x})",
+                    primary.index(),
+                    primary.mpidr()
+                )
+            }
             Self::MemberOperation {
                 operation,
                 index,
@@ -1304,20 +1312,24 @@ fn finish_drain(
             Ok(Some(HvfVcpuRunEvent::Barrier(report)))
         }
         DrainReason::Terminal { superseded_control } => {
-            for waiter in drain.waiters {
-                let Some(reason) = superseded_control else {
-                    return Err(HvfVcpuRunCoordinatorError::InvalidState(
-                        TERMINAL_REPORT_MISSING_MESSAGE,
-                    ));
-                };
-                let _ = waiter.send(Err(
-                    HvfVcpuRunCoordinatorError::ControlSupersededByTerminal { reason },
+            if !drain.waiters.is_empty() && superseded_control.is_none() {
+                return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                    TERMINAL_REPORT_MISSING_MESSAGE,
                 ));
             }
+            let report = terminal_report(drain.acknowledgements)?;
+            if let Some(reason) = superseded_control {
+                for waiter in drain.waiters {
+                    let _ = waiter.send(Err(
+                        HvfVcpuRunCoordinatorError::ControlSupersededByTerminal {
+                            reason,
+                            report: Box::new(report.clone()),
+                        },
+                    ));
+                }
+            }
             state.phase = CoordinatorPhase::Stopped;
-            terminal_report(drain.acknowledgements)
-                .map(HvfVcpuRunEvent::Terminal)
-                .map(Some)
+            Ok(Some(HvfVcpuRunEvent::Terminal(report)))
         }
         DrainReason::Submission(submission) => {
             state.phase = CoordinatorPhase::Failed;
@@ -2178,12 +2190,18 @@ mod tests {
             panic!("expected terminal report");
         };
         assert_eq!(report.primary().index(), 1);
-        assert!(matches!(
-            waiter.wait(),
-            Err(HvfVcpuRunCoordinatorError::ControlSupersededByTerminal {
-                reason: HvfVcpuRunControlReason::Pause
-            })
-        ));
+        let error = waiter
+            .wait()
+            .expect_err("pause waiter should retain the terminal report");
+        let HvfVcpuRunCoordinatorError::ControlSupersededByTerminal {
+            reason,
+            report: waiter_report,
+        } = error
+        else {
+            panic!("expected terminal-superseded pause error");
+        };
+        assert_eq!(reason, HvfVcpuRunControlReason::Pause);
+        assert_eq!(*waiter_report, report);
         assert_eq!(batch.calls(), vec![vec![0, 1]]);
     }
 
