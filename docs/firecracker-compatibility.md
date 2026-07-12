@@ -44,12 +44,12 @@ for future device handlers, internal boot-resource assembly from stored VM
 configuration with optional RTC and serial plus block and network MMIO registration,
 boot-runtime block and network notification dispatch with per-device metadata,
 including an HVF wrapper path for injected virtio-net packet I/O, an internal
-backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
-boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
-with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
-access, one-step runner-thread MMIO handling, a run-cancellation boundary,
-an ordered owner-thread vCPU topology with an internal concurrent bounded-run
-coordinator and active-only batch cancellation,
+backend-neutral interrupt line/status/trigger model, primary-only arm64 HVF
+boot-register setup, internal size-one-or-many HVF arm64 boot-session preparation
+with one shared MMIO dispatcher, controlled mapped guest-memory access, indexed
+runner-thread MMIO handling, a topology-wide run-control boundary, and an
+ordered owner-thread vCPU topology consumed by an internal concurrent bounded-run
+coordinator with active-only batch cancellation,
 baseline and optional SVE/SME guest-visible identification metadata, pointer-
 authentication key-state capture with redacted `Debug`, raw cache-selection
 plus ordered nontransactional restore of its typed CSSELR_EL1 value,
@@ -94,30 +94,32 @@ recorded as pre-boot VM state and applied during startup preparation. Runtime
 virtio-block device through the process-owned boot session, but public
 block-device attachment, boot selection changes, and hotplug remain deferred.
 
-## Internal PSCI Secondary-Power Groundwork
+## Internal PSCI Secondary-Power Sessions
 
-The HVF backend now has an internal, crate-private PSCI coordination boundary
-for later multi-vCPU work. It decodes `CPU_ON32`, `CPU_ON64`,
-`AFFINITY_INFO32`, and `AFFINITY_INFO64` with their architectural X1-X3 width
-rules; models boot CPU `ON` and secondary `OFF`/`ON_PENDING`/`ON` states; and
-separates target owner-thread register setup from retryable caller X0
-completion. Secondary setup retains the PSCI context in target X0 and writes
-the entry PC last as a logical publication boundary. HVF register writes are
-not atomic, so a failed setup remains fail-closed and must be retried in full
-or discarded.
+Internal HVF boot sessions now compose the ordered owner topology, concurrent
+run coordinator, and PSCI power model. Every verified MPIDR feeds the arm64 FDT;
+only index 0 receives the initial Linux boot registers, while secondaries remain
+offline until `CPU_ON32` or `CPU_ON64`. `AFFINITY_INFO32/64` reports the same
+`OFF`/`ON_PENDING`/`ON` model used for scheduling.
 
-This machinery is not connected to the public boot session yet. Public startup
-still accepts exactly one vCPU, the existing run path still returns
-`NOT_SUPPORTED` for `CPU_ON` and advertises no CPU_ON feature, and successful
-`CPU_OFF` remains unsupported. Concurrent scheduling, multi-vCPU FDT/session
-wiring, Linux SMP boot, and public activation remain later capability gates.
-Firecracker delegates equivalent PSCI 0.2 secondary-power behavior to KVM;
-bangbang must coordinate it explicitly above Hypervisor.framework's per-vCPU
-owner threads.
+`CPU_ON` validates an aligned entry inside mapped guest RAM, installs the entry
+and context on the target owner thread, and submits only that target. The caller
+does not receive `SUCCESS` until the identified target run is admitted. Caller
+completion is then committed before the target becomes logically `ON`; any
+post-admission failure terminates the session with indexed evidence instead of
+pretending the target returned to `OFF`. Per-vCPU virtual-timer PPIs use the
+completing member index.
+
+This capability remains internal. Public process startup rejects any count
+other than one before serial, network, boot-path, or VM work, and native-v1
+capture/load remains a strict one-vCPU profile. `CPU_OFF`, broader hotplug,
+reboot-in-place, CPU templates, and public SMP activation remain deferred.
+Firecracker delegates equivalent PSCI 0.2 behavior to KVM; bangbang coordinates
+it explicitly above Hypervisor.framework's per-vCPU owner threads.
 
 ## Internal Concurrent vCPU Run Coordination
 
-The ordered HVF topology can now be borrowed through an internal concurrent
+The ordered HVF topology is consumed by an internal concurrent
 bounded-run coordinator. It submits one identified generation to every online,
 idle member before collecting completions, keeps one shared MMIO dispatcher,
 accepts out-of-order owner-thread results, and routes indexed boot-register,
@@ -139,9 +141,10 @@ Signed lifecycle coverage runs two real vCPUs against separate guest entry
 points. Each writes a shared-memory flag and waits for its peer before the host
 issues one active-only stop barrier; both identified runs must return
 `Canceled`, and the complete create/run/cancel/shutdown/VM teardown sequence is
-repeated. This is an internal execution prerequisite only. Public startup still
-accepts exactly one vCPU, native-v1 snapshot capture/restore remains a one-vCPU
-profile, and PSCI/FDT/Linux SMP session wiring remains deferred.
+repeated. Signed `guest_boot` coverage additionally boots a two-vCPU Linux
+session, validates FDT CPU nodes for MPIDRs `[0, 1]`, pins a deterministic tiny
+init to CPU1 with `sched_setaffinity`, verifies CPU1 with `getcpu`, and emits a
+fixed marker without sleeps. Public startup and native-v1 remain one-vCPU.
 
 ## Firecracker Model Alignment
 

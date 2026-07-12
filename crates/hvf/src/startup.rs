@@ -64,15 +64,18 @@ use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
 use crate::backend::HvfBackend;
+use crate::coordinator::{HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuRunTerminalReport};
 use crate::gic::{
     HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator,
     HvfGicMetadata, HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
+use crate::psci::PsciCpuPowerCoordinator;
 use crate::runner::{
     HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1Restore, HvfVcpuRunCancelHandle,
     HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
+use crate::session_vcpu::{HvfArm64BootVcpuError, HvfArm64BootVcpuSession};
 use crate::snapshot::HvfArm64SnapshotTimerState;
 use crate::snapshot_bundle::{
     HvfSnapshotV1CompatibilityState, HvfSnapshotV1EncodeError, HvfSnapshotV1State,
@@ -82,6 +85,7 @@ use crate::snapshot_restore::{
     HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreError, HvfSnapshotV1RestoreFailure,
     HvfSnapshotV1RestoreStage, PreparedHvfSnapshotV1Load,
 };
+use crate::topology::HvfVcpuTopologyError;
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
     HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
@@ -267,7 +271,7 @@ impl HvfArm64BootSerialDeviceConfig {
 
 #[derive(Debug)]
 pub struct HvfArm64BootSession<'vm> {
-    runner: HvfVcpuRunner<'vm>,
+    runner: HvfArm64BootVcpuSession<'vm>,
     backend: &'vm mut HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
@@ -285,7 +289,6 @@ pub struct HvfArm64BootSession<'vm> {
     vsock_device_metrics: SharedVsockDeviceMetrics,
     entropy_device_metrics: SharedEntropyDeviceMetrics,
     gic: HvfGicMetadata,
-    primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
     pmem_interrupt_lines: Vec<GuestInterruptLine>,
     network_interrupt_lines: Vec<GuestInterruptLine>,
@@ -301,7 +304,7 @@ pub struct HvfArm64BootSession<'vm> {
 
 #[derive(Debug)]
 pub struct OwnedHvfArm64BootSession {
-    runner: HvfVcpuRunner<'static>,
+    runner: HvfArm64BootVcpuSession<'static>,
     backend: HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
@@ -319,7 +322,6 @@ pub struct OwnedHvfArm64BootSession {
     vsock_device_metrics: SharedVsockDeviceMetrics,
     entropy_device_metrics: SharedEntropyDeviceMetrics,
     gic: HvfGicMetadata,
-    primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
     pmem_interrupt_lines: Vec<GuestInterruptLine>,
     network_interrupt_lines: Vec<GuestInterruptLine>,
@@ -400,6 +402,10 @@ impl HvfArm64BootRunLoopStopToken {
 
     pub fn is_stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::Relaxed)
+    }
+
+    fn clear_stop_request(&self) {
+        self.stop_requested.store(false, Ordering::Relaxed);
     }
 }
 
@@ -714,6 +720,9 @@ pub enum HvfArm64BootSnapshotV1DeviceCaptureError {
 
 #[derive(Debug)]
 pub enum HvfArm64BootSnapshotV1StateCaptureError {
+    UnsupportedVcpuCount {
+        vcpu_count: usize,
+    },
     Cancelled {
         stage: HvfArm64BootSnapshotV1CaptureStage,
     },
@@ -755,6 +764,10 @@ impl fmt::Display for HvfArm64BootSnapshotV1CaptureStage {
 impl fmt::Display for HvfArm64BootSnapshotV1StateCaptureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedVcpuCount { vcpu_count } => write!(
+                f,
+                "native-v1 state capture supports exactly one vCPU, got {vcpu_count}"
+            ),
             Self::Cancelled { stage } => {
                 write!(f, "native-v1 state capture was cancelled before {stage}")
             }
@@ -782,7 +795,7 @@ impl std::error::Error for HvfArm64BootSnapshotV1StateCaptureError {
             Self::Runner { source } => Some(source),
             Self::Device { source } => Some(source),
             Self::EncodePreflight { source } => Some(source),
-            Self::Cancelled { .. } | Self::MissingRtc => None,
+            Self::UnsupportedVcpuCount { .. } | Self::Cancelled { .. } | Self::MissingRtc => None,
         }
     }
 }
@@ -1098,18 +1111,18 @@ impl HvfArm64BootRunLoopControlWakeupToken {
 pub struct HvfArm64BootRunLoopControl {
     stop_token: HvfArm64BootRunLoopStopToken,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
-    cancel_handle: HvfVcpuRunCancelHandle,
+    vcpu_control: HvfVcpuRunControl,
 }
 
 impl HvfArm64BootRunLoopControl {
     fn new(
-        cancel_handle: HvfVcpuRunCancelHandle,
+        vcpu_control: HvfVcpuRunControl,
         control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     ) -> Self {
         Self {
             stop_token: HvfArm64BootRunLoopStopToken::new(),
             control_wakeup,
-            cancel_handle,
+            vcpu_control,
         }
     }
 
@@ -1117,9 +1130,13 @@ impl HvfArm64BootRunLoopControl {
         self.stop_token.clone()
     }
 
-    pub fn request_stop(&self) -> Result<(), HvfVcpuRunnerError> {
+    pub fn request_stop(&self) -> Result<(), HvfVcpuRunCoordinatorError> {
         self.stop_token.request_stop();
-        self.cancel_handle.cancel()
+        if let Err(source) = self.vcpu_control.request_stop() {
+            self.stop_token.clear_stop_request();
+            return Err(source);
+        }
+        Ok(())
     }
 
     /// Wake the boot run loop without requesting guest shutdown.
@@ -1127,9 +1144,9 @@ impl HvfArm64BootRunLoopControl {
     /// This is runner-command plumbing for future runtime device updates. It
     /// lets the process worker regain control while keeping stop semantics
     /// separate from ordinary command dispatch.
-    pub fn request_wakeup(&self) -> Result<(), HvfVcpuRunnerError> {
+    pub fn request_wakeup(&self) -> Result<(), HvfVcpuRunCoordinatorError> {
         self.control_wakeup.request_wakeup();
-        if let Err(source) = self.cancel_handle.cancel() {
+        if let Err(source) = self.vcpu_control.request_wakeup() {
             let _ = self.control_wakeup.take_wakeup_request();
             return Err(source);
         }
@@ -1157,7 +1174,7 @@ pub enum HvfArm64BootRunLoopError {
     },
     RunStep {
         steps_completed: usize,
-        source: Box<HvfVcpuRunnerError>,
+        source: Box<HvfArm64BootVcpuError>,
     },
     StopVsockWakeupMonitor {
         steps_completed: usize,
@@ -1193,7 +1210,7 @@ pub enum HvfArm64BootRunLoopError {
     },
     HandleVirtualTimer {
         steps_completed: usize,
-        source: Box<HvfVcpuRunnerError>,
+        source: Box<HvfArm64BootVcpuError>,
     },
 }
 
@@ -1436,6 +1453,13 @@ impl HvfArm64BootSession<'_> {
         now: Instant,
         mut is_cancelled: impl FnMut(HvfArm64BootSnapshotV1CaptureStage) -> bool,
     ) -> Result<HvfSnapshotV1State, HvfArm64BootSnapshotV1StateCaptureError> {
+        if self.runner.member_count() != 1 {
+            return Err(
+                HvfArm64BootSnapshotV1StateCaptureError::UnsupportedVcpuCount {
+                    vcpu_count: self.runner.member_count(),
+                },
+            );
+        }
         check_snapshot_v1_capture_cancelled(
             &mut is_cancelled,
             HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
@@ -1464,7 +1488,7 @@ impl HvfArm64BootSession<'_> {
         build_snapshot_v1_state(
             &self.runtime_resources,
             self.gic,
-            self.primary_mpidr,
+            self.primary_mpidr(),
             cache_manifest,
             runner_capture,
             device,
@@ -1478,7 +1502,7 @@ impl HvfArm64BootSession<'_> {
         let destroy_result = <HvfBackend as VmBackend>::destroy_vm(self.backend);
 
         match (runner_result, destroy_result) {
-            (Err(source), _) => Err(HvfArm64BootSessionShutdownError::Runner { source }),
+            (Err(source), _) => Err(HvfArm64BootSessionShutdownError::Vcpu { source }),
             (Ok(()), Err(source)) => Err(HvfArm64BootSessionShutdownError::DestroyVm { source }),
             (Ok(()), Ok(())) => Ok(()),
         }
@@ -1488,8 +1512,20 @@ impl HvfArm64BootSession<'_> {
         self.gic
     }
 
-    pub const fn primary_mpidr(&self) -> u64 {
-        self.primary_mpidr
+    pub fn primary_mpidr(&self) -> u64 {
+        self.runner.primary_mpidr()
+    }
+
+    pub fn vcpu_count(&self) -> usize {
+        self.runner.member_count()
+    }
+
+    pub fn vcpu_mpidrs(&self) -> &[u64] {
+        self.runner.mpidrs()
+    }
+
+    pub fn last_vcpu_terminal_report(&self) -> Option<&HvfVcpuRunTerminalReport> {
+        self.runner.last_terminal_report()
     }
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
@@ -2139,18 +2175,19 @@ impl HvfArm64BootSession<'_> {
         self.runner.restore_arm64_gic_icc_register_state(state)
     }
 
-    /// Run the boot session's primary vCPU once with runner-thread MMIO handling.
+    /// Run a size-one boot session's primary vCPU once with runner-thread MMIO handling.
     ///
-    /// This is runner-loop plumbing. It does not dispatch boot block or
-    /// virtio-net TX notifications or enter a continuous guest run loop.
+    /// Multi-vCPU sessions must use the aggregate run loop. This compatibility
+    /// primitive does not dispatch boot block or virtio-net TX notifications or
+    /// enter a continuous guest run loop.
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
-        run_boot_session_vcpu_step(&self.runner, &self.mmio_dispatcher)
+        run_boot_session_vcpu_step(self.runner.singular_runner()?, &self.mmio_dispatcher)
     }
 
-    /// Return a handle that can request cancellation of an in-flight vCPU run step.
+    /// Return a primary-only compatibility handle for a size-one run step.
     ///
-    /// This is runner-loop plumbing. It does not shut down the boot session or
-    /// enter a continuous guest run loop.
+    /// Multi-vCPU aggregate execution must use [`Self::run_loop_control`]. This
+    /// handle does not shut down the boot session or enter a continuous loop.
     pub fn run_cancel_handle(&self) -> HvfVcpuRunCancelHandle {
         self.runner.run_cancel_handle()
     }
@@ -2161,7 +2198,7 @@ impl HvfArm64BootSession<'_> {
     /// boundary. This remains internal runner-loop plumbing and does not start
     /// an unbounded guest loop.
     pub fn run_loop_control(&self) -> HvfArm64BootRunLoopControl {
-        HvfArm64BootRunLoopControl::new(self.run_cancel_handle(), self.control_wakeup.clone())
+        HvfArm64BootRunLoopControl::new(self.runner.control(), self.control_wakeup.clone())
     }
 
     /// Run bounded vCPU steps and dispatch boot block and virtio-net TX
@@ -2199,10 +2236,10 @@ impl HvfArm64BootSession<'_> {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootBlockNotificationDispatchError::MapGuestMemory { source }
             })?;
-            let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
-                    HvfArm64BootBlockNotificationDispatchError::MmioDispatcher { source }
-                })?;
+            let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher)
+                .map_err(
+                    |source| HvfArm64BootBlockNotificationDispatchError::MmioDispatcher { source },
+                )?;
 
             self.runtime_resources
                 .dispatch_block_queue_notifications(memory, &mut mmio_dispatcher)
@@ -2253,7 +2290,7 @@ impl HvfArm64BootSession<'_> {
                 HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
             })?;
             let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher).map_err(|source| {
                     HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
@@ -2290,7 +2327,7 @@ impl HvfArm64BootSession<'_> {
                 HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
             })?;
             let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher).map_err(|source| {
                     HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
@@ -2324,10 +2361,10 @@ impl HvfArm64BootSession<'_> {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootVsockNotificationDispatchError::MapGuestMemory { source }
             })?;
-            let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
-                    HvfArm64BootVsockNotificationDispatchError::MmioDispatcher { source }
-                })?;
+            let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher)
+                .map_err(
+                    |source| HvfArm64BootVsockNotificationDispatchError::MmioDispatcher { source },
+                )?;
 
             dispatch_vsock_runtime_notifications(
                 memory,
@@ -2356,7 +2393,7 @@ impl HvfArm64BootSession<'_> {
                 HvfArm64BootBalloonNotificationDispatchError::MapGuestMemory { source }
             })?;
             let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher).map_err(|source| {
                     HvfArm64BootBalloonNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
@@ -2395,8 +2432,8 @@ impl HvfArm64BootSession<'_> {
                 .map_err(|source| {
                     HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
                 })?;
-            let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+            let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher)
+                .map_err(|source| {
                     HvfArm64BootMemoryHotplugNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
@@ -2551,7 +2588,6 @@ impl OwnedHvfArm64BootSession {
             vsock_device_metrics: prepared.vsock_device_metrics,
             entropy_device_metrics: prepared.entropy_device_metrics,
             gic: prepared.gic,
-            primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
             pmem_interrupt_lines: prepared.pmem_interrupt_lines,
             network_interrupt_lines: prepared.network_interrupt_lines,
@@ -2781,7 +2817,7 @@ impl OwnedHvfArm64BootSession {
                 ));
             }
         };
-        let block_retry_wakeup_scheduler = match block_retry_wakeup_scheduler.take() {
+        let mut block_retry_wakeup_scheduler = match block_retry_wakeup_scheduler.take() {
             Some(scheduler) => scheduler,
             None => {
                 let mut runner = Some(runner);
@@ -2795,11 +2831,28 @@ impl OwnedHvfArm64BootSession {
             }
         };
 
+        let mmio_dispatcher = Arc::new(Mutex::new(mmio_dispatcher));
+        let runner = match HvfArm64BootVcpuSession::from_restored_runner(
+            runner,
+            primary_mpidr,
+            Arc::clone(&mmio_dispatcher),
+        ) {
+            Ok(runner) => runner,
+            Err(source) => {
+                let scheduler_failed = block_retry_wakeup_scheduler.stop_with_result().is_err();
+                let backend_error = <HvfBackend as VmBackend>::destroy_vm(&mut backend).err();
+                return Err(HvfSnapshotV1RestoreError::new(
+                    HvfSnapshotV1RestoreStage::AssembleSession,
+                    HvfSnapshotV1RestoreFailure::Coordinator(Box::new(source)),
+                    HvfSnapshotV1RestoreCleanup::new(scheduler_failed, None, backend_error),
+                ));
+            }
+        };
         let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let session = Self {
             runner,
             backend,
-            mmio_dispatcher: Arc::new(Mutex::new(mmio_dispatcher)),
+            mmio_dispatcher,
             runtime_resources,
             control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
             run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
@@ -2815,7 +2868,6 @@ impl OwnedHvfArm64BootSession {
             vsock_device_metrics: SharedVsockDeviceMetrics::default(),
             entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
             gic,
-            primary_mpidr,
             block_interrupt_lines,
             pmem_interrupt_lines: Vec::new(),
             network_interrupt_lines: Vec::new(),
@@ -2894,6 +2946,13 @@ impl OwnedHvfArm64BootSession {
         now: Instant,
         mut is_cancelled: impl FnMut(HvfArm64BootSnapshotV1CaptureStage) -> bool,
     ) -> Result<HvfSnapshotV1State, HvfArm64BootSnapshotV1StateCaptureError> {
+        if self.runner.member_count() != 1 {
+            return Err(
+                HvfArm64BootSnapshotV1StateCaptureError::UnsupportedVcpuCount {
+                    vcpu_count: self.runner.member_count(),
+                },
+            );
+        }
         check_snapshot_v1_capture_cancelled(
             &mut is_cancelled,
             HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
@@ -2922,7 +2981,7 @@ impl OwnedHvfArm64BootSession {
         build_snapshot_v1_state(
             &self.runtime_resources,
             self.gic,
-            self.primary_mpidr,
+            self.primary_mpidr(),
             cache_manifest,
             runner_capture,
             device,
@@ -2936,7 +2995,7 @@ impl OwnedHvfArm64BootSession {
         let destroy_result = <HvfBackend as VmBackend>::destroy_vm(&mut self.backend);
 
         match (runner_result, destroy_result) {
-            (Err(source), _) => Err(HvfArm64BootSessionShutdownError::Runner { source }),
+            (Err(source), _) => Err(HvfArm64BootSessionShutdownError::Vcpu { source }),
             (Ok(()), Err(source)) => Err(HvfArm64BootSessionShutdownError::DestroyVm { source }),
             (Ok(()), Ok(())) => Ok(()),
         }
@@ -2952,17 +3011,29 @@ impl OwnedHvfArm64BootSession {
                 .entropy_retry_wakeup_scheduler
                 .stop_with_result()
                 .is_err();
-        let runner = self.runner.shutdown().err();
+        let coordinator = self.runner.shutdown().err();
         let backend = <HvfBackend as VmBackend>::destroy_vm(&mut self.backend).err();
-        HvfSnapshotV1RestoreCleanup::new(scheduler_failed, runner, backend)
+        HvfSnapshotV1RestoreCleanup::with_coordinator(scheduler_failed, coordinator, backend)
     }
 
     pub const fn gic_metadata(&self) -> HvfGicMetadata {
         self.gic
     }
 
-    pub const fn primary_mpidr(&self) -> u64 {
-        self.primary_mpidr
+    pub fn primary_mpidr(&self) -> u64 {
+        self.runner.primary_mpidr()
+    }
+
+    pub fn vcpu_count(&self) -> usize {
+        self.runner.member_count()
+    }
+
+    pub fn vcpu_mpidrs(&self) -> &[u64] {
+        self.runner.mpidrs()
+    }
+
+    pub fn last_vcpu_terminal_report(&self) -> Option<&HvfVcpuRunTerminalReport> {
+        self.runner.last_terminal_report()
     }
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
@@ -3613,15 +3684,18 @@ impl OwnedHvfArm64BootSession {
     }
 
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
-        run_boot_session_vcpu_step(&self.runner, &self.mmio_dispatcher)
+        run_boot_session_vcpu_step(self.runner.singular_runner()?, &self.mmio_dispatcher)
     }
 
+    /// Return a primary-only compatibility handle for a size-one run step.
+    ///
+    /// Multi-vCPU aggregate execution must use [`Self::run_loop_control`].
     pub fn run_cancel_handle(&self) -> HvfVcpuRunCancelHandle {
         self.runner.run_cancel_handle()
     }
 
     pub fn run_loop_control(&self) -> HvfArm64BootRunLoopControl {
-        HvfArm64BootRunLoopControl::new(self.run_cancel_handle(), self.control_wakeup.clone())
+        HvfArm64BootRunLoopControl::new(self.runner.control(), self.control_wakeup.clone())
     }
 
     pub fn run_loop(
@@ -3659,10 +3733,10 @@ impl OwnedHvfArm64BootSession {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootBlockNotificationDispatchError::MapGuestMemory { source }
             })?;
-            let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
-                    HvfArm64BootBlockNotificationDispatchError::MmioDispatcher { source }
-                })?;
+            let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher)
+                .map_err(
+                    |source| HvfArm64BootBlockNotificationDispatchError::MmioDispatcher { source },
+                )?;
 
             self.runtime_resources
                 .dispatch_block_queue_notifications(memory, &mut mmio_dispatcher)
@@ -3713,7 +3787,7 @@ impl OwnedHvfArm64BootSession {
                 HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
             })?;
             let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher).map_err(|source| {
                     HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
@@ -3750,7 +3824,7 @@ impl OwnedHvfArm64BootSession {
                 HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
             })?;
             let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher).map_err(|source| {
                     HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
@@ -3784,10 +3858,10 @@ impl OwnedHvfArm64BootSession {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootVsockNotificationDispatchError::MapGuestMemory { source }
             })?;
-            let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
-                    HvfArm64BootVsockNotificationDispatchError::MmioDispatcher { source }
-                })?;
+            let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher)
+                .map_err(
+                    |source| HvfArm64BootVsockNotificationDispatchError::MmioDispatcher { source },
+                )?;
 
             dispatch_vsock_runtime_notifications(
                 memory,
@@ -3816,7 +3890,7 @@ impl OwnedHvfArm64BootSession {
                 HvfArm64BootBalloonNotificationDispatchError::MapGuestMemory { source }
             })?;
             let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher).map_err(|source| {
                     HvfArm64BootBalloonNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
@@ -3855,8 +3929,8 @@ impl OwnedHvfArm64BootSession {
                 .map_err(|source| {
                     HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
                 })?;
-            let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+            let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(&self.mmio_dispatcher)
+                .map_err(|source| {
                     HvfArm64BootMemoryHotplugNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
@@ -3957,7 +4031,7 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
         start_run_loop_vsock_wakeup_monitor(
             &self.runtime_resources,
             &self.mmio_dispatcher,
-            self.run_cancel_handle(),
+            self.runner.control(),
             self.run_loop_wakeup.clone(),
         )
     }
@@ -3994,13 +4068,13 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
             .schedule_after(retry_after);
     }
 
-    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
-        self.run_once_and_handle_mmio()
+    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        run_boot_session_coordinated_vcpu_step(&mut self.runner, &self.backend)
     }
 
-    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError> {
+    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfArm64BootVcpuError> {
         let intid = self.gic.timer_interrupts.el1_virtual_timer_intid;
-        self.runner.set_gic_ppi_pending(intid)
+        self.runner.set_last_step_ppi_pending(intid)
     }
 
     fn dispatch_run_loop_block_notifications(
@@ -4124,13 +4198,13 @@ where
             .schedule_run_loop_entropy_retry_wakeup(retry_after);
     }
 
-    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
-        self.session.run_once_and_handle_mmio()
+    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        run_boot_session_coordinated_vcpu_step(&mut self.session.runner, &self.session.backend)
     }
 
-    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError> {
+    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfArm64BootVcpuError> {
         let intid = self.session.gic.timer_interrupts.el1_virtual_timer_intid;
-        self.session.runner.set_gic_ppi_pending(intid)
+        self.session.runner.set_last_step_ppi_pending(intid)
     }
 
     fn dispatch_run_loop_block_notifications(
@@ -5181,10 +5255,29 @@ fn run_boot_session_vcpu_step(
     runner.run_once_and_handle_mmio(Arc::clone(dispatcher))
 }
 
+fn run_boot_session_coordinated_vcpu_step(
+    runner: &mut HvfArm64BootVcpuSession<'_>,
+    backend: &HvfBackend,
+) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+    let memory =
+        backend
+            .mapped_guest_memory()
+            .map_err(|source| HvfArm64BootVcpuError::GuestMemory {
+                source: Box::new(source),
+            })?;
+    runner.run_step(|entry| {
+        let address = GuestAddress::new(entry);
+        memory
+            .regions()
+            .iter()
+            .any(|region| region.range().contains(address))
+    })
+}
+
 fn start_run_loop_vsock_wakeup_monitor(
     runtime_resources: &Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
-    cancel_handle: HvfVcpuRunCancelHandle,
+    vcpu_control: HvfVcpuRunControl,
     wakeup_token: HvfArm64BootRunLoopWakeupToken,
 ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
     if runtime_resources.vsock_device.is_none() {
@@ -5192,7 +5285,7 @@ fn start_run_loop_vsock_wakeup_monitor(
     }
 
     let fds = {
-        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher)
+        let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(dispatcher)
             .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
         runtime_resources
             .vsock_host_read_wakeup_fds(&mut mmio_dispatcher)
@@ -5201,7 +5294,7 @@ fn start_run_loop_vsock_wakeup_monitor(
             )?
     };
 
-    HvfArm64BootRunLoopWakeupMonitor::start(fds, cancel_handle, wakeup_token)
+    HvfArm64BootRunLoopWakeupMonitor::start(fds, vcpu_control, wakeup_token)
 }
 
 trait BootSessionRunLoopSession {
@@ -5231,9 +5324,9 @@ trait BootSessionRunLoopSession {
 
     fn schedule_run_loop_entropy_retry_wakeup(&mut self, _retry_after: Option<Duration>) {}
 
-    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>;
+    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError>;
 
-    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError>;
+    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfArm64BootVcpuError>;
 
     fn dispatch_run_loop_block_notifications(
         &mut self,
@@ -5283,7 +5376,7 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
         start_run_loop_vsock_wakeup_monitor(
             &self.runtime_resources,
             &self.mmio_dispatcher,
-            self.run_cancel_handle(),
+            self.runner.control(),
             self.run_loop_wakeup.clone(),
         )
     }
@@ -5320,13 +5413,13 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
             .schedule_after(retry_after);
     }
 
-    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
-        self.run_once_and_handle_mmio()
+    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        run_boot_session_coordinated_vcpu_step(&mut self.runner, self.backend)
     }
 
-    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError> {
+    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfArm64BootVcpuError> {
         self.runner
-            .set_gic_ppi_pending(self.gic.timer_interrupts.el1_virtual_timer_intid)
+            .set_last_step_ppi_pending(self.gic.timer_interrupts.el1_virtual_timer_intid)
     }
 
     fn dispatch_run_loop_block_notifications(
@@ -5717,7 +5810,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
 
     fn start(
         mut fds: Vec<RawFd>,
-        cancel_handle: HvfVcpuRunCancelHandle,
+        vcpu_control: HvfVcpuRunControl,
         wakeup_token: HvfArm64BootRunLoopWakeupToken,
     ) -> Result<Self, HvfArm64BootRunLoopWakeupMonitorError> {
         fds.sort_unstable();
@@ -5741,7 +5834,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
                     &mut pollfds,
                     pollfd_count,
                     stop_reader,
-                    cancel_handle,
+                    vcpu_control,
                     wakeup_token,
                 )
             })
@@ -5818,7 +5911,7 @@ fn run_vsock_wakeup_monitor(
     pollfds: &mut [libc::pollfd],
     pollfd_count: libc::nfds_t,
     _stop_reader: UnixStream,
-    cancel_handle: HvfVcpuRunCancelHandle,
+    vcpu_control: HvfVcpuRunControl,
     wakeup_token: HvfArm64BootRunLoopWakeupToken,
 ) -> bool {
     loop {
@@ -5849,7 +5942,7 @@ fn run_vsock_wakeup_monitor(
             .any(|pollfd| pollfd_has_wakeup_event(pollfd.revents))
         {
             wakeup_token.request_wakeup();
-            let _ = cancel_handle.cancel();
+            let _ = vcpu_control.request_wakeup();
             return true;
         }
     }
@@ -5866,6 +5959,14 @@ fn lock_boot_mmio_dispatcher(
         TryLockError::WouldBlock => HvfArm64BootMmioDispatcherError::Busy,
         TryLockError::Poisoned(_) => HvfArm64BootMmioDispatcherError::Poisoned,
     })
+}
+
+fn lock_boot_mmio_dispatcher_runtime(
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+) -> Result<MutexGuard<'_, MmioDispatcher>, HvfArm64BootMmioDispatcherError> {
+    dispatcher
+        .lock()
+        .map_err(|_| HvfArm64BootMmioDispatcherError::Poisoned)
 }
 
 fn collect_block_notification_dispatches(
@@ -6064,9 +6165,10 @@ fn dispatch_pmem_queue_notifications_and_signal_interrupts(
     metrics: &SharedPmemDeviceMetricsRegistry,
 ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
     let flush_status = {
-        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
-            HvfArm64BootPmemNotificationDispatchError::MmioDispatcher { source }
-        })?;
+        let mut mmio_dispatcher =
+            lock_boot_mmio_dispatcher_runtime(dispatcher).map_err(|source| {
+                HvfArm64BootPmemNotificationDispatchError::MmioDispatcher { source }
+            })?;
 
         if runtime_resources.has_pending_pmem_queue_notifications(&mut mmio_dispatcher) {
             VirtioPmemFlushStatus::from_result(backend.flush_mapped_pmem_shadows().is_ok())
@@ -6079,9 +6181,10 @@ fn dispatch_pmem_queue_notifications_and_signal_interrupts(
         let memory = backend.mapped_guest_memory_mut().map_err(|source| {
             HvfArm64BootPmemNotificationDispatchError::MapGuestMemory { source }
         })?;
-        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
-            HvfArm64BootPmemNotificationDispatchError::MmioDispatcher { source }
-        })?;
+        let mut mmio_dispatcher =
+            lock_boot_mmio_dispatcher_runtime(dispatcher).map_err(|source| {
+                HvfArm64BootPmemNotificationDispatchError::MmioDispatcher { source }
+            })?;
 
         dispatch_pmem_runtime_notifications(
             memory,
@@ -6554,9 +6657,10 @@ fn dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
         let memory = backend.mapped_guest_memory_mut().map_err(|source| {
             HvfArm64BootEntropyNotificationDispatchError::MapGuestMemory { source }
         })?;
-        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
-            HvfArm64BootEntropyNotificationDispatchError::MmioDispatcher { source }
-        })?;
+        let mut mmio_dispatcher =
+            lock_boot_mmio_dispatcher_runtime(dispatcher).map_err(|source| {
+                HvfArm64BootEntropyNotificationDispatchError::MmioDispatcher { source }
+            })?;
 
         dispatch_entropy_runtime_notifications_with_source(
             memory,
@@ -6912,6 +7016,13 @@ pub enum HvfArm64BootSessionError {
     StartRunner {
         source: HvfVcpuRunnerError,
     },
+    StartTopology {
+        source: HvfVcpuTopologyError,
+    },
+    PowerTopology,
+    RunCoordinator {
+        source: HvfVcpuRunCoordinatorError,
+    },
     StartBlockRetryWakeupScheduler {
         source: io::Error,
     },
@@ -6931,7 +7042,7 @@ pub enum HvfArm64BootSessionError {
         source: HvfGuestMemoryMappingError,
     },
     ConfigureBootRegisters {
-        source: HvfVcpuRunnerError,
+        source: HvfVcpuRunCoordinatorError,
     },
 }
 
@@ -6967,6 +7078,13 @@ impl fmt::Display for HvfArm64BootSessionError {
             }
             Self::StartRunner { source } => {
                 write!(f, "failed to start HVF vCPU runner: {source}")
+            }
+            Self::StartTopology { source } => {
+                write!(f, "failed to start HVF vCPU topology: {source}")
+            }
+            Self::PowerTopology => f.write_str("failed to initialize HVF vCPU power topology"),
+            Self::RunCoordinator { source } => {
+                write!(f, "failed to initialize HVF vCPU run coordinator: {source}")
             }
             Self::StartBlockRetryWakeupScheduler { source } => {
                 write!(
@@ -7014,6 +7132,8 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::InterruptLineStorage { source } => Some(source),
             Self::AllocateInterruptLine { source, .. } => Some(source),
             Self::StartRunner { source } => Some(source),
+            Self::StartTopology { source } => Some(source),
+            Self::RunCoordinator { source } => Some(source),
             Self::StartBlockRetryWakeupScheduler { source } => Some(source),
             Self::StartEntropyRetryWakeupScheduler { source } => Some(source),
             Self::ReadMpidr { source } => Some(source),
@@ -7021,7 +7141,9 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::RegisterBootTimerMmio { source } => Some(source),
             Self::MapGuestMemory { source } => Some(source),
             Self::ConfigureBootRegisters { source } => Some(source),
-            Self::BackendAlreadyInitialized | Self::UnsupportedVcpuCount { .. } => None,
+            Self::BackendAlreadyInitialized
+            | Self::UnsupportedVcpuCount { .. }
+            | Self::PowerTopology => None,
         }
     }
 }
@@ -7114,15 +7236,18 @@ impl std::error::Error for HvfArm64BootVmGenIdRestoreError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfArm64BootSessionShutdownError {
-    Runner { source: HvfVcpuRunnerError },
+    Vcpu { source: HvfVcpuRunCoordinatorError },
     DestroyVm { source: BackendError },
 }
 
 impl fmt::Display for HvfArm64BootSessionShutdownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Runner { source } => {
-                write!(f, "failed to shut down HVF boot-session runner: {source}")
+            Self::Vcpu { source } => {
+                write!(
+                    f,
+                    "failed to shut down HVF boot-session vCPU topology: {source}"
+                )
             }
             Self::DestroyVm { source } => {
                 write!(f, "failed to destroy HVF boot-session VM: {source}")
@@ -7134,7 +7259,7 @@ impl fmt::Display for HvfArm64BootSessionShutdownError {
 impl std::error::Error for HvfArm64BootSessionShutdownError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Runner { source } => Some(source),
+            Self::Vcpu { source } => Some(source),
             Self::DestroyVm { source } => Some(source),
         }
     }
@@ -7142,7 +7267,7 @@ impl std::error::Error for HvfArm64BootSessionShutdownError {
 
 #[derive(Debug)]
 struct PreparedHvfArm64BootSession<'vm> {
-    runner: HvfVcpuRunner<'vm>,
+    runner: HvfArm64BootVcpuSession<'vm>,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
@@ -7158,7 +7283,6 @@ struct PreparedHvfArm64BootSession<'vm> {
     vsock_device_metrics: SharedVsockDeviceMetrics,
     entropy_device_metrics: SharedEntropyDeviceMetrics,
     gic: HvfGicMetadata,
-    primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
     pmem_interrupt_lines: Vec<GuestInterruptLine>,
     network_interrupt_lines: Vec<GuestInterruptLine>,
@@ -7235,7 +7359,6 @@ impl HvfBackend {
             vsock_device_metrics: prepared.vsock_device_metrics,
             entropy_device_metrics: prepared.entropy_device_metrics,
             gic: prepared.gic,
-            primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
             pmem_interrupt_lines: prepared.pmem_interrupt_lines,
             network_interrupt_lines: prepared.network_interrupt_lines,
@@ -7256,8 +7379,6 @@ fn prepare_arm64_boot_session_parts<'vm>(
     controller: &VmmController,
     config: HvfArm64BootSessionConfig,
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
-    validate_single_vcpu(controller)?;
-
     <HvfBackend as VmBackend>::create_vm(backend)
         .map_err(|source| HvfArm64BootSessionError::CreateVm { source })?;
     let gic = *backend
@@ -7282,12 +7403,12 @@ fn prepare_arm64_boot_session_parts<'vm>(
         },
     )?;
 
-    let runner = backend
-        .start_session_vcpu_runner()
-        .map_err(|source| HvfArm64BootSessionError::StartRunner { source })?;
-    let primary_mpidr = runner
-        .mpidr_el1()
-        .map_err(|source| HvfArm64BootSessionError::ReadMpidr { source })?;
+    let topology = backend
+        .start_session_vcpu_topology(controller.machine_config().vcpu_count())
+        .map_err(|source| HvfArm64BootSessionError::StartTopology { source })?;
+    let mpidrs = topology.mpidrs().to_vec();
+    let power = PsciCpuPowerCoordinator::new(&mpidrs)
+        .map_err(|_| HvfArm64BootSessionError::PowerTopology)?;
     let runtime_serial = config
         .serial_device
         .zip(interrupt_lines.serial)
@@ -7303,7 +7424,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
     let resources = Arm64BootResources::assemble_from_controller(
         controller,
         Arm64BootResourceConfig {
-            vcpu_mpidrs: &[primary_mpidr],
+            vcpu_mpidrs: &mpidrs,
             gic: gic.arm64_fdt_gic(),
             timer,
             rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),
@@ -7355,9 +7476,14 @@ fn prepare_arm64_boot_session_parts<'vm>(
             HvfMemoryPermissions::GUEST_RAM,
         )
         .map_err(|source| HvfArm64BootSessionError::MapGuestMemory { source })?;
-    runner
-        .configure_arm64_boot_registers(boot_registers)
+    let mmio_dispatcher = Arc::new(Mutex::new(mmio_dispatcher));
+    let coordinator = topology
+        .into_run_coordinator(Arc::clone(&mmio_dispatcher), &[0])
+        .map_err(|source| HvfArm64BootSessionError::RunCoordinator { source })?;
+    coordinator
+        .configure_arm64_boot_registers(0, boot_registers)
         .map_err(|source| HvfArm64BootSessionError::ConfigureBootRegisters { source })?;
+    let runner = HvfArm64BootVcpuSession::new(coordinator, power);
     let block_device_metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(
         runtime
             .block_devices
@@ -7377,10 +7503,11 @@ fn prepare_arm64_boot_session_parts<'vm>(
     let block_retry_wakeup_scheduler = if runtime.block_devices.is_empty() {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
     } else {
-        HvfArm64BootLimiterRetryWakeupScheduler::start(
+        let vcpu_control = runner.control();
+        HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
             BLOCK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
-            runner.run_cancel_handle(),
             block_retry_wakeup.clone(),
+            move || vcpu_control.request_wakeup(),
         )
         .map_err(|source| HvfArm64BootSessionError::StartBlockRetryWakeupScheduler { source })?
     };
@@ -7388,17 +7515,18 @@ fn prepare_arm64_boot_session_parts<'vm>(
     let entropy_retry_wakeup_scheduler = if runtime.entropy_device.is_none() {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
     } else {
-        HvfArm64BootLimiterRetryWakeupScheduler::start(
+        let vcpu_control = runner.control();
+        HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
             ENTROPY_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
-            runner.run_cancel_handle(),
             entropy_retry_wakeup.clone(),
+            move || vcpu_control.request_wakeup(),
         )
         .map_err(|source| HvfArm64BootSessionError::StartEntropyRetryWakeupScheduler { source })?
     };
 
     Ok(PreparedHvfArm64BootSession {
         runner,
-        mmio_dispatcher: Arc::new(Mutex::new(mmio_dispatcher)),
+        mmio_dispatcher,
         runtime_resources: runtime,
         control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
         run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
@@ -7413,7 +7541,6 @@ fn prepare_arm64_boot_session_parts<'vm>(
         vsock_device_metrics: SharedVsockDeviceMetrics::default(),
         entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
         gic,
-        primary_mpidr,
         block_interrupt_lines: interrupt_lines.block,
         pmem_interrupt_lines: interrupt_lines.pmem,
         network_interrupt_lines: interrupt_lines.network,
@@ -7426,15 +7553,6 @@ fn prepare_arm64_boot_session_parts<'vm>(
         vmclock_interrupt_line: interrupt_lines.vmclock,
         boot_registers: Some(boot_registers),
     })
-}
-
-fn validate_single_vcpu(controller: &VmmController) -> Result<(), HvfArm64BootSessionError> {
-    let vcpu_count = controller.machine_config().vcpu_count();
-    if vcpu_count == SINGLE_VCPU_COUNT {
-        Ok(())
-    } else {
-        Err(HvfArm64BootSessionError::UnsupportedVcpuCount { vcpu_count })
-    }
 }
 
 fn allocate_interrupt_lines(
@@ -7685,12 +7803,13 @@ mod tests {
         collect_network_notification_dispatches, collect_vsock_notification_dispatches,
         dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
-        quiesce_limiter_retry_wakeups, record_entropy_dispatch_metrics,
-        record_pmem_dispatch_metrics, replace_vmgenid_and_signal_with, run_boot_session_loop,
-        run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        lock_boot_mmio_dispatcher_runtime, quiesce_limiter_retry_wakeups,
+        record_entropy_dispatch_metrics, record_pmem_dispatch_metrics,
+        replace_vmgenid_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
+        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
         signal_network_queue_interrupts, signal_pmem_queue_interrupts,
-        signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at, validate_single_vcpu,
+        signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -8964,7 +9083,9 @@ mod tests {
             self.scheduled_entropy_retry_wakeups.push(retry_after);
         }
 
-        fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+        fn run_loop_vcpu_step(
+            &mut self,
+        ) -> Result<HvfVcpuRunStepOutcome, super::HvfArm64BootVcpuError> {
             self.events.push("run");
             if let Some(stop_token) = self.request_stop_on_run.take() {
                 stop_token.request_stop();
@@ -8973,15 +9094,19 @@ mod tests {
             self.run_results
                 .pop_front()
                 .expect("test run result should be queued")
+                .map_err(super::HvfArm64BootVcpuError::from)
         }
 
-        fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError> {
+        fn handle_run_loop_virtual_timer(&mut self) -> Result<(), super::HvfArm64BootVcpuError> {
             self.events.push("timer");
             if let Some(stop_token) = self.request_stop_on_timer.take() {
                 stop_token.request_stop();
             }
 
-            self.timer_results.pop_front().unwrap_or(Ok(()))
+            self.timer_results
+                .pop_front()
+                .unwrap_or(Ok(()))
+                .map_err(super::HvfArm64BootVcpuError::from)
         }
 
         fn dispatch_run_loop_block_notifications(
@@ -9254,16 +9379,6 @@ mod tests {
             },
             msi: None,
         }
-    }
-
-    fn controller_with_vcpus(vcpu_count: u8) -> bangbang_runtime::VmmController {
-        let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
-        controller
-            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(
-                vcpu_count, 128,
-            )))
-            .expect("machine config should be stored");
-        controller
     }
 
     fn line_values(lines: &[bangbang_runtime::interrupt::GuestInterruptLine]) -> Vec<u32> {
@@ -14176,7 +14291,18 @@ mod tests {
                 source: actual,
             } => {
                 assert_eq!(steps_completed, 0);
-                assert_eq!(*actual, source);
+                match *actual {
+                    super::HvfArm64BootVcpuError::Member {
+                        index,
+                        mpidr,
+                        generation,
+                        source: actual,
+                    } => {
+                        assert_eq!((index, mpidr, generation), (0, 0, 0));
+                        assert_eq!(*actual, source);
+                    }
+                    other => panic!("expected member error, got {other:?}"),
+                }
             }
             other => panic!("expected run-step error, got {other:?}"),
         }
@@ -14503,7 +14629,18 @@ mod tests {
                 source: actual,
             } => {
                 assert_eq!(steps_completed, 1);
-                assert_eq!(*actual, source);
+                match *actual {
+                    super::HvfArm64BootVcpuError::Member {
+                        index,
+                        mpidr,
+                        generation,
+                        source: actual,
+                    } => {
+                        assert_eq!((index, mpidr, generation), (0, 0, 0));
+                        assert_eq!(*actual, source);
+                    }
+                    other => panic!("expected member error, got {other:?}"),
+                }
             }
             other => panic!("expected virtual timer handler error, got {other:?}"),
         }
@@ -14566,6 +14703,43 @@ mod tests {
             .expect_err("already-held dispatcher lock should be busy");
 
         assert_eq!(err, HvfArm64BootMmioDispatcherError::Busy);
+    }
+
+    #[test]
+    fn boot_mmio_dispatcher_runtime_lock_waits_for_peer_owner() {
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let held = dispatcher
+            .lock()
+            .expect("test dispatcher lock should be acquired");
+        let waiter_dispatcher = Arc::clone(&dispatcher);
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (completed_sender, completed_receiver) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            entered_sender
+                .send(())
+                .expect("runtime lock waiter should announce entry");
+            let result = lock_boot_mmio_dispatcher_runtime(&waiter_dispatcher)
+                .map(|guard| guard.regions().len());
+            completed_sender
+                .send(result)
+                .expect("runtime lock waiter should publish result");
+        });
+
+        entered_receiver
+            .recv()
+            .expect("runtime lock waiter should start");
+        assert!(matches!(
+            completed_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(held);
+        assert_eq!(
+            completed_receiver
+                .recv()
+                .expect("runtime lock waiter should complete"),
+            Ok(0)
+        );
+        waiter.join().expect("runtime lock waiter should join");
     }
 
     #[test]
@@ -14826,23 +15000,6 @@ mod tests {
 
         assert_eq!(config.balloon_device, Some(balloon));
         assert_eq!(config.entropy_device, None);
-    }
-
-    #[test]
-    fn single_vcpu_validation_accepts_default_controller() {
-        let controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
-
-        assert!(validate_single_vcpu(&controller).is_ok());
-    }
-
-    #[test]
-    fn single_vcpu_validation_rejects_multi_vcpu_controller() {
-        let controller = controller_with_vcpus(2);
-
-        assert!(matches!(
-            validate_single_vcpu(&controller),
-            Err(HvfArm64BootSessionError::UnsupportedVcpuCount { vcpu_count: 2 })
-        ));
     }
 
     #[test]

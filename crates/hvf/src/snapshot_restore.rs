@@ -13,6 +13,7 @@ use bangbang_runtime::startup::{
 };
 
 use crate::backend::HvfBackend;
+use crate::coordinator::HvfVcpuRunCoordinatorError;
 use crate::gic::HvfGicError;
 use crate::runner::HvfVcpuRunnerError;
 use crate::snapshot_bundle::{HvfSnapshotV1Bundle, HvfSnapshotV1BundleError, HvfSnapshotV1State};
@@ -189,6 +190,7 @@ pub enum HvfSnapshotV1RestoreDisposition {
 pub struct HvfSnapshotV1RestoreCleanup {
     scheduler_failed: bool,
     runner: Option<Box<HvfVcpuRunnerError>>,
+    coordinator: Option<Box<HvfVcpuRunCoordinatorError>>,
     backend: Option<BackendError>,
 }
 
@@ -201,12 +203,29 @@ impl HvfSnapshotV1RestoreCleanup {
         Self {
             scheduler_failed,
             runner: runner.map(Box::new),
+            coordinator: None,
+            backend,
+        }
+    }
+
+    pub(crate) fn with_coordinator(
+        scheduler_failed: bool,
+        coordinator: Option<HvfVcpuRunCoordinatorError>,
+        backend: Option<BackendError>,
+    ) -> Self {
+        Self {
+            scheduler_failed,
+            runner: None,
+            coordinator: coordinator.map(Box::new),
             backend,
         }
     }
 
     pub const fn is_complete(&self) -> bool {
-        !self.scheduler_failed && self.runner.is_none() && self.backend.is_none()
+        !self.scheduler_failed
+            && self.runner.is_none()
+            && self.coordinator.is_none()
+            && self.backend.is_none()
     }
 
     pub const fn scheduler_failed(&self) -> bool {
@@ -215,6 +234,10 @@ impl HvfSnapshotV1RestoreCleanup {
 
     pub fn runner_error(&self) -> Option<&HvfVcpuRunnerError> {
         self.runner.as_deref()
+    }
+
+    pub fn coordinator_error(&self) -> Option<&HvfVcpuRunCoordinatorError> {
+        self.coordinator.as_deref()
     }
 
     pub const fn backend_error(&self) -> Option<&BackendError> {
@@ -229,6 +252,7 @@ pub enum HvfSnapshotV1RestoreFailure {
     GicMetadataMismatch,
     MemoryMapping,
     Runner(Box<HvfVcpuRunnerError>),
+    Coordinator(Box<HvfVcpuRunCoordinatorError>),
     Scheduler(std::io::ErrorKind),
     VmGenId(Box<HvfArm64BootVmGenIdRestoreError>),
     InvalidRuntime,
@@ -244,6 +268,9 @@ impl fmt::Display for HvfSnapshotV1RestoreFailure {
             }
             Self::MemoryMapping => f.write_str("native-v1 guest-memory mapping failed"),
             Self::Runner(source) => write!(f, "native-v1 runner operation failed: {source}"),
+            Self::Coordinator(source) => {
+                write!(f, "native-v1 vCPU coordinator assembly failed: {source}")
+            }
             Self::Scheduler(kind) => {
                 write!(f, "native-v1 scheduler startup failed with {kind:?}")
             }
@@ -259,6 +286,7 @@ impl std::error::Error for HvfSnapshotV1RestoreFailure {
             Self::Backend(source) => Some(source),
             Self::Gic(source) => Some(source),
             Self::Runner(source) => Some(source.as_ref()),
+            Self::Coordinator(source) => Some(source.as_ref()),
             Self::VmGenId(source) => Some(source.as_ref()),
             Self::GicMetadataMismatch
             | Self::MemoryMapping

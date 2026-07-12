@@ -1,5 +1,7 @@
 //! PSCI-over-HVC decoding and secondary-vCPU power-state coordination.
 
+use std::fmt;
+
 const PSCI_VERSION: u64 = 0x8400_0000;
 const PSCI_CPU_OFF: u64 = 0x8400_0002;
 const PSCI_CPU_ON_32: u64 = 0x8400_0003;
@@ -244,13 +246,6 @@ pub(crate) enum PsciCoordinatorRequest {
     AffinityInfo(PsciAffinityInfoRequest),
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "constructed by the later multi-vCPU scheduler slice"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PsciCoordinatorResponse {
     CpuOn(PsciCpuOnResponse),
@@ -383,10 +378,6 @@ pub(crate) struct PsciCpuOnWork {
     request: PsciCpuOnRequest,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
-)]
 impl PsciCpuOnWork {
     pub(crate) const fn token(self) -> PsciCpuOnToken {
         self.token
@@ -434,6 +425,29 @@ pub(crate) enum PsciCpuPowerError {
     UnknownTransaction { token: PsciCpuOnToken },
     InvalidTransactionPhase { token: PsciCpuOnToken },
 }
+
+impl fmt::Display for PsciCpuPowerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTopology => f.write_str("PSCI CPU power topology is empty"),
+            Self::DuplicateMpidr { mpidr } => {
+                write!(f, "PSCI CPU power topology repeats MPIDR 0x{mpidr:x}")
+            }
+            Self::InvalidMpidr { mpidr } => {
+                write!(f, "PSCI CPU power topology has invalid MPIDR 0x{mpidr:x}")
+            }
+            Self::TokenExhausted => f.write_str("PSCI CPU_ON transaction tokens are exhausted"),
+            Self::UnknownTransaction { token } => {
+                write!(f, "PSCI CPU_ON transaction {token:?} is unknown")
+            }
+            Self::InvalidTransactionPhase { token } => {
+                write!(f, "PSCI CPU_ON transaction {token:?} is in the wrong phase")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PsciCpuPowerError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PsciCpuOnPhase {

@@ -36,10 +36,6 @@ pub(crate) struct HvfArm64SecondaryBootRegisters {
 }
 
 impl HvfArm64SecondaryBootRegisters {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the later multi-vCPU scheduler slice")
-    )]
     pub(crate) const fn new(entry_point: GuestAddress, context_id: u64) -> Self {
         Self {
             entry_point,

@@ -813,6 +813,21 @@ publish only after the exact active snapshot drains. A batch failure produces
 no false barrier acknowledgement and leaves the coordinator fail-closed;
 shutdown still reports cleanup separately rather than claiming quiescence.
 
+An internal boot session consumes the topology into that coordinator, so no
+second runner owner or raw-id authority survives beside it. The same ordered
+MPIDR metadata drives FDT CPU nodes, PSCI targets, run identities, and PPI
+routing. `CPU_ON` diagnostics expose only index, MPIDR, and transaction stage;
+the guest entry, context, registers, memory contents, and host pointers remain
+redacted. An entry is accepted only when four-byte aligned and contained in the
+already mapped guest RAM.
+
+Online peers may hold the shared MMIO dispatcher while the boot worker handles
+another member's completed step. Runtime notification dispatch therefore waits
+for that short owner critical section under the existing guest-memory then
+dispatcher lock order. Snapshot capture, preflight, and control-plane mutation
+retain the nonblocking busy policy, so this does not turn their admission checks
+into unbounded waits.
+
 ## Guest Data Exposure
 
 The guest is untrusted. vCPU execution, guest memory contents, virtqueue

@@ -1,0 +1,557 @@
+use std::collections::VecDeque;
+use std::fmt;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
+
+use bangbang_runtime::memory::GuestAddress;
+use bangbang_runtime::mmio::MmioDispatcher;
+
+use crate::HvfVcpuRunStepOutcome;
+use crate::coordinator::{
+    HvfVcpuCoordinatorWork, HvfVcpuRunAdmission, HvfVcpuRunControl, HvfVcpuRunCoordinator,
+    HvfVcpuRunCoordinatorError, HvfVcpuRunEvent, HvfVcpuRunMemberOutcome, HvfVcpuRunMemberResult,
+    HvfVcpuRunTerminalReport,
+};
+use crate::memory::HvfGuestMemoryMappingError;
+use crate::psci::{
+    PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOnBegin, PsciCpuOnToken,
+    PsciCpuPowerCoordinator,
+};
+use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
+use crate::vcpu::HvfArm64SecondaryBootRegisters;
+
+/// Failure while translating aggregate vCPU events into boot-session steps.
+#[derive(Debug)]
+pub enum HvfArm64BootVcpuError {
+    /// The mapped guest memory needed for PSCI entry validation is unavailable.
+    GuestMemory {
+        source: Box<HvfGuestMemoryMappingError>,
+    },
+    /// One identified owner-thread run failed.
+    Member {
+        index: usize,
+        mpidr: u64,
+        generation: u64,
+        source: Box<HvfVcpuRunnerError>,
+    },
+    /// The aggregate coordinator rejected an indexed lifecycle operation.
+    Coordinator {
+        stage: &'static str,
+        index: usize,
+        mpidr: u64,
+        cleanup_failed: bool,
+        source: Box<HvfVcpuRunCoordinatorError>,
+    },
+    /// The PSCI power transaction rejected an internal transition.
+    Power {
+        stage: &'static str,
+        index: usize,
+        mpidr: u64,
+    },
+}
+
+impl fmt::Display for HvfArm64BootVcpuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GuestMemory { source } => {
+                write!(f, "boot-session vCPU guest-memory access failed: {source}")
+            }
+            Self::Member {
+                index,
+                mpidr,
+                generation,
+                source,
+            } => write!(
+                f,
+                "boot-session vCPU {index} (MPIDR 0x{mpidr:x}) generation {generation} failed: {source}"
+            ),
+            Self::Coordinator {
+                stage,
+                index,
+                mpidr,
+                cleanup_failed,
+                source,
+            } => write!(
+                f,
+                "boot-session vCPU {index} (MPIDR 0x{mpidr:x}) {stage} failed (cleanup_failed={cleanup_failed}): {source}"
+            ),
+            Self::Power {
+                stage,
+                index,
+                mpidr,
+            } => write!(
+                f,
+                "boot-session vCPU {index} (MPIDR 0x{mpidr:x}) PSCI transaction failed during {stage}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootVcpuError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::GuestMemory { source } => Some(source.as_ref()),
+            Self::Member { source, .. } => Some(source.as_ref()),
+            Self::Coordinator { source, .. } => Some(source.as_ref()),
+            Self::Power { .. } => None,
+        }
+    }
+}
+
+impl From<HvfVcpuRunnerError> for HvfArm64BootVcpuError {
+    fn from(source: HvfVcpuRunnerError) -> Self {
+        Self::Member {
+            index: 0,
+            mpidr: 0,
+            generation: 0,
+            source: Box::new(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IndexedBootStep {
+    index: usize,
+    outcome: HvfVcpuRunStepOutcome,
+}
+
+/// Boot-session aggregate that owns every vCPU runner and its PSCI power model.
+#[derive(Debug)]
+pub(crate) struct HvfArm64BootVcpuSession<'vm> {
+    coordinator: HvfVcpuRunCoordinator<'vm>,
+    power: PsciCpuPowerCoordinator,
+    pending_steps: VecDeque<Result<IndexedBootStep, HvfArm64BootVcpuError>>,
+    last_step_index: usize,
+    last_terminal_report: Option<HvfVcpuRunTerminalReport>,
+}
+
+impl<'vm> HvfArm64BootVcpuSession<'vm> {
+    pub(crate) const fn new(
+        coordinator: HvfVcpuRunCoordinator<'vm>,
+        power: PsciCpuPowerCoordinator,
+    ) -> Self {
+        Self {
+            coordinator,
+            power,
+            pending_steps: VecDeque::new(),
+            last_step_index: 0,
+            last_terminal_report: None,
+        }
+    }
+
+    pub(crate) fn from_restored_runner(
+        runner: HvfVcpuRunner<'vm>,
+        mpidr: u64,
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+    ) -> Result<Self, HvfVcpuRunCoordinatorError> {
+        let coordinator = HvfVcpuRunCoordinator::from_runner(runner, mpidr, dispatcher, true)?;
+        let power = PsciCpuPowerCoordinator::new(&[mpidr]).map_err(|_| {
+            HvfVcpuRunCoordinatorError::InvalidState(
+                "restored vCPU power topology is incompatible with its MPIDR",
+            )
+        })?;
+        Ok(Self::new(coordinator, power))
+    }
+
+    pub(crate) fn member_count(&self) -> usize {
+        self.coordinator.member_count()
+    }
+
+    pub(crate) fn mpidrs(&self) -> &[u64] {
+        self.coordinator.mpidrs()
+    }
+
+    pub(crate) fn primary_mpidr(&self) -> u64 {
+        self.coordinator.primary_mpidr()
+    }
+
+    pub(crate) fn shutdown(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
+        self.coordinator.shutdown()
+    }
+
+    pub(crate) fn control(&self) -> HvfVcpuRunControl {
+        self.coordinator.control()
+    }
+
+    pub(crate) fn singular_runner(&self) -> Result<&HvfVcpuRunner<'vm>, HvfVcpuRunnerError> {
+        if self.member_count() != 1 {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                "direct boot-session vCPU steps require exactly one topology member",
+            ));
+        }
+        Ok(self.coordinator.primary_runner())
+    }
+
+    pub(crate) const fn last_terminal_report(&self) -> Option<&HvfVcpuRunTerminalReport> {
+        self.last_terminal_report.as_ref()
+    }
+
+    pub(crate) fn run_step(
+        &mut self,
+        mut entry_is_valid: impl FnMut(u64) -> bool,
+    ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        if self.pending_steps.is_empty() {
+            self.coordinator
+                .dispatch_online()
+                .map_err(|source| self.coordinator_error("run dispatch", 0, source))?;
+            let event = self
+                .coordinator
+                .receive_event()
+                .map_err(|source| self.coordinator_error("event collection", 0, source))?;
+            self.enqueue_event(event, &mut entry_is_valid)?;
+        }
+
+        let step = self
+            .pending_steps
+            .pop_front()
+            .ok_or_else(|| self.power_error("event translation", 0))??;
+        self.last_step_index = step.index;
+        Ok(step.outcome)
+    }
+
+    pub(crate) fn set_last_step_ppi_pending(
+        &self,
+        intid: u32,
+    ) -> Result<(), HvfArm64BootVcpuError> {
+        self.coordinator
+            .set_gic_ppi_pending(self.last_step_index, intid)
+            .map_err(|source| {
+                self.coordinator_error("virtual-timer PPI delivery", self.last_step_index, source)
+            })
+    }
+
+    fn enqueue_event(
+        &mut self,
+        event: HvfVcpuRunEvent,
+        entry_is_valid: &mut impl FnMut(u64) -> bool,
+    ) -> Result<(), HvfArm64BootVcpuError> {
+        match event {
+            HvfVcpuRunEvent::Member(member) => {
+                let step = self.process_member(member, entry_is_valid);
+                self.pending_steps.push_back(step);
+            }
+            HvfVcpuRunEvent::Barrier(report) => {
+                let mut sentinel_index = 0;
+                for member in report.acknowledgements().iter().cloned() {
+                    sentinel_index = member.index();
+                    if member_is_canceled(&member) {
+                        continue;
+                    }
+                    let step = self.process_member(member, entry_is_valid);
+                    self.pending_steps.push_back(step);
+                }
+                self.pending_steps.push_back(Ok(IndexedBootStep {
+                    index: sentinel_index,
+                    outcome: HvfVcpuRunStepOutcome::Canceled,
+                }));
+            }
+            HvfVcpuRunEvent::Terminal(report) => {
+                self.last_terminal_report = Some(report.clone());
+                let primary = (report.primary().index(), report.primary().generation());
+                for member in report.members().iter().cloned() {
+                    if (member.index(), member.generation()) == primary
+                        || member_is_canceled(&member)
+                        || member_is_terminal(&member)
+                    {
+                        continue;
+                    }
+                    let step = self.process_member(member, entry_is_valid);
+                    self.pending_steps.push_back(step);
+                }
+                let primary = self.process_member(report.primary().clone(), entry_is_valid);
+                self.pending_steps.push_back(primary);
+            }
+        }
+        Ok(())
+    }
+
+    fn process_member(
+        &mut self,
+        member: HvfVcpuRunMemberResult,
+        entry_is_valid: &mut impl FnMut(u64) -> bool,
+    ) -> Result<IndexedBootStep, HvfArm64BootVcpuError> {
+        let index = member.index();
+        let mpidr = member.mpidr();
+        let generation = member.generation();
+        let outcome = match member.result() {
+            Ok(HvfVcpuRunMemberOutcome::Handled(outcome)) => *outcome,
+            Ok(HvfVcpuRunMemberOutcome::Coordinator(work)) => {
+                self.process_coordinator_work(index, *work, entry_is_valid)?
+            }
+            Err(source) => {
+                return Err(HvfArm64BootVcpuError::Member {
+                    index,
+                    mpidr,
+                    generation,
+                    source: Box::new(source.clone()),
+                });
+            }
+        };
+        Ok(IndexedBootStep { index, outcome })
+    }
+
+    fn process_coordinator_work(
+        &mut self,
+        caller_index: usize,
+        work: HvfVcpuCoordinatorWork,
+        entry_is_valid: &mut impl FnMut(u64) -> bool,
+    ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        let (exit, function_id, _, request) = work.into_parts();
+        let response = match request {
+            PsciCoordinatorRequest::AffinityInfo(request) => {
+                PsciCoordinatorResponse::AffinityInfo(self.power.affinity_info(request))
+            }
+            PsciCoordinatorRequest::CpuOn(request) => {
+                return self.process_cpu_on(
+                    caller_index,
+                    work,
+                    exit,
+                    function_id,
+                    request,
+                    entry_is_valid,
+                );
+            }
+        };
+        self.complete_caller(
+            caller_index,
+            work,
+            response,
+            "AFFINITY_INFO completion",
+            false,
+        )?;
+        Ok(HvfVcpuRunStepOutcome::Hvc {
+            exit,
+            function_id,
+            return_value: response.return_value(),
+        })
+    }
+
+    fn process_cpu_on(
+        &mut self,
+        caller_index: usize,
+        work: HvfVcpuCoordinatorWork,
+        exit: crate::HvfHvcExit,
+        function_id: u64,
+        request: crate::psci::PsciCpuOnRequest,
+        entry_is_valid: &mut impl FnMut(u64) -> bool,
+    ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        let begin = self
+            .power
+            .begin_cpu_on(request, entry_is_valid)
+            .map_err(|_| self.power_error("CPU_ON validation", caller_index))?;
+        let PsciCpuOnBegin::Pending(cpu_on) = begin else {
+            let PsciCpuOnBegin::Complete(response) = begin else {
+                return Err(self.power_error("CPU_ON validation", caller_index));
+            };
+            let response = PsciCoordinatorResponse::CpuOn(response);
+            self.complete_caller(caller_index, work, response, "CPU_ON completion", false)?;
+            return Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit,
+                function_id,
+                return_value: response.return_value(),
+            });
+        };
+
+        let target_index = cpu_on.target_index();
+        let registers = HvfArm64SecondaryBootRegisters::new(
+            GuestAddress::new(cpu_on.request().entry_point()),
+            cpu_on.request().context_id(),
+        );
+        if self
+            .coordinator
+            .configure_arm64_secondary_boot_registers(target_index, registers)
+            .is_err()
+        {
+            let response = self
+                .power
+                .finish_target_setup(cpu_on.token(), false)
+                .map_err(|_| self.power_error("target setup failure", target_index))?;
+            let response = PsciCoordinatorResponse::CpuOn(response);
+            if let Err(error) = self.complete_caller(
+                caller_index,
+                work,
+                response,
+                "CPU_ON failure completion",
+                false,
+            ) {
+                let _ = self.power.abandon_caller_completion(cpu_on.token());
+                return Err(error);
+            }
+            self.power
+                .commit_caller_completion(cpu_on.token())
+                .map_err(|_| self.power_error("CPU_ON failure commit", target_index))?;
+            return Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit,
+                function_id,
+                return_value: response.return_value(),
+            });
+        }
+
+        let response = self
+            .power
+            .finish_target_setup(cpu_on.token(), true)
+            .map_err(|_| self.power_error("target setup commit", target_index))?;
+        self.coordinator
+            .set_online(target_index, true)
+            .map_err(|source| {
+                self.coordinator_error("target online transition", target_index, source)
+            })?;
+        let admission = self
+            .coordinator
+            .dispatch_member(target_index)
+            .map_err(|source| {
+                self.coordinator_error("target-only run admission", target_index, source)
+            })?;
+        self.validate_admission(target_index, admission)?;
+
+        let response = PsciCoordinatorResponse::CpuOn(response);
+        if let Err(error) = self.complete_caller(
+            caller_index,
+            work,
+            response,
+            "CPU_ON success completion",
+            false,
+        ) {
+            let cleanup_failed = self.cleanup_admitted_cpu_on(cpu_on.token());
+            return Err(with_cleanup_evidence(error, cleanup_failed));
+        }
+        if self.power.commit_caller_completion(cpu_on.token()).is_err() {
+            let cleanup_failed = self.cleanup_admitted_cpu_on(cpu_on.token());
+            return Err(HvfArm64BootVcpuError::Power {
+                stage: if cleanup_failed {
+                    "caller commit and admitted-target cleanup"
+                } else {
+                    "caller commit"
+                },
+                index: target_index,
+                mpidr: self.mpidr(target_index),
+            });
+        }
+        self.power
+            .mark_target_entered(cpu_on.token())
+            .map_err(|_| self.power_error("target entered transition", target_index))?;
+
+        Ok(HvfVcpuRunStepOutcome::Hvc {
+            exit,
+            function_id,
+            return_value: response.return_value(),
+        })
+    }
+
+    fn complete_caller(
+        &self,
+        caller_index: usize,
+        work: HvfVcpuCoordinatorWork,
+        response: PsciCoordinatorResponse,
+        stage: &'static str,
+        cleanup_failed: bool,
+    ) -> Result<(), HvfArm64BootVcpuError> {
+        self.coordinator
+            .complete_coordinator_work(caller_index, work, response)
+            .map_err(|source| HvfArm64BootVcpuError::Coordinator {
+                stage,
+                index: caller_index,
+                mpidr: self.mpidr(caller_index),
+                cleanup_failed,
+                source: Box::new(source),
+            })
+    }
+
+    fn validate_admission(
+        &self,
+        target_index: usize,
+        admission: HvfVcpuRunAdmission,
+    ) -> Result<(), HvfArm64BootVcpuError> {
+        if admission.index() == target_index && admission.mpidr() == self.mpidr(target_index) {
+            let _generation = admission.generation();
+            Ok(())
+        } else {
+            Err(self.power_error("target admission identity", target_index))
+        }
+    }
+
+    fn cleanup_admitted_cpu_on(&mut self, token: PsciCpuOnToken) -> bool {
+        if self.power.abandon_caller_completion(token).is_err() {
+            return true;
+        }
+        self.power.mark_target_entered(token).is_err()
+    }
+
+    fn coordinator_error(
+        &self,
+        stage: &'static str,
+        index: usize,
+        source: HvfVcpuRunCoordinatorError,
+    ) -> HvfArm64BootVcpuError {
+        HvfArm64BootVcpuError::Coordinator {
+            stage,
+            index,
+            mpidr: self.mpidr(index),
+            cleanup_failed: false,
+            source: Box::new(source),
+        }
+    }
+
+    fn power_error(&self, stage: &'static str, index: usize) -> HvfArm64BootVcpuError {
+        HvfArm64BootVcpuError::Power {
+            stage,
+            index,
+            mpidr: self.mpidr(index),
+        }
+    }
+
+    fn mpidr(&self, index: usize) -> u64 {
+        self.coordinator.mpidrs().get(index).copied().unwrap_or(0)
+    }
+}
+
+fn member_is_canceled(member: &HvfVcpuRunMemberResult) -> bool {
+    matches!(
+        member.result(),
+        Ok(HvfVcpuRunMemberOutcome::Handled(
+            HvfVcpuRunStepOutcome::Canceled
+        ))
+    )
+}
+
+fn member_is_terminal(member: &HvfVcpuRunMemberResult) -> bool {
+    matches!(
+        member.result(),
+        Err(_)
+            | Ok(HvfVcpuRunMemberOutcome::Handled(
+                HvfVcpuRunStepOutcome::Unknown { .. }
+                    | HvfVcpuRunStepOutcome::GuestReset { .. }
+                    | HvfVcpuRunStepOutcome::GuestShutdown { .. }
+            ))
+    )
+}
+
+fn with_cleanup_evidence(
+    error: HvfArm64BootVcpuError,
+    cleanup_failed: bool,
+) -> HvfArm64BootVcpuError {
+    match error {
+        HvfArm64BootVcpuError::Coordinator {
+            stage,
+            index,
+            mpidr,
+            source,
+            ..
+        } => HvfArm64BootVcpuError::Coordinator {
+            stage,
+            index,
+            mpidr,
+            cleanup_failed,
+            source,
+        },
+        error => error,
+    }
+}
+
+impl<'vm> Deref for HvfArm64BootVcpuSession<'vm> {
+    type Target = HvfVcpuRunner<'vm>;
+
+    fn deref(&self) -> &Self::Target {
+        self.coordinator.primary_runner()
+    }
+}
