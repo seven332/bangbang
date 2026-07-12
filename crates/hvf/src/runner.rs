@@ -127,8 +127,13 @@ pub enum HvfVcpuRunnerError {
     SnapshotTimerPolicy(HvfArm64SnapshotTimerPolicyError),
     SnapshotTimerRestore(HvfArm64SnapshotTimerRestoreError),
     SnapshotOptionalState(HvfArm64SnapshotOptionalStateRejection),
+    SnapshotRestoreCompatibility(HvfArm64SnapshotV1CompatibilityError),
     SnapshotCapture {
         stage: HvfArm64SnapshotV1CaptureStage,
+        source: Box<HvfVcpuRunnerError>,
+    },
+    SnapshotRestore {
+        stage: HvfArm64SnapshotV1RestoreStage,
         source: Box<HvfVcpuRunnerError>,
     },
     VcpuExitResolve(HvfVcpuExitResolveError),
@@ -140,6 +145,94 @@ pub enum HvfVcpuRunnerError {
     ThreadSpawn(String),
     ChannelClosed(&'static str),
     ThreadPanicked,
+}
+
+/// Value-free reason why a fresh destination is incompatible with native-v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64SnapshotV1CompatibilityError {
+    Identification,
+    OptionalIdentification,
+    Mpidr,
+}
+
+impl fmt::Display for HvfArm64SnapshotV1CompatibilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let category = match self {
+            Self::Identification => "baseline identification",
+            Self::OptionalIdentification => "optional identification",
+            Self::Mpidr => "primary MPIDR",
+        };
+        write!(f, "native-v1 destination {category} is incompatible")
+    }
+}
+
+impl std::error::Error for HvfArm64SnapshotV1CompatibilityError {}
+
+/// Ordered owner-thread native-v1 destination validation and restore stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfArm64SnapshotV1RestoreStage {
+    Admission,
+    Identification,
+    OptionalIdentification,
+    Mpidr,
+    DestinationExecutionControls,
+    DestinationBreakpoints,
+    DestinationWatchpoints,
+    DestinationSmePstate,
+    DestinationOptionalStateValidation,
+    SourceOptionalStateValidation,
+    GeneralRegisters,
+    CoreRegisters,
+    ExceptionRegisters,
+    ExecutionControls,
+    CacheSelection,
+    DebugControls,
+    DebugTrapPolicy,
+    SystemContext,
+    Translation,
+    PointerAuthentication,
+    ThreadContext,
+    SimdFp,
+    GicDevice,
+    GicIcc,
+    Timers,
+    PendingInterrupts,
+    Response,
+}
+
+impl fmt::Display for HvfArm64SnapshotV1RestoreStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Admission => "admission",
+            Self::Identification => "destination identification",
+            Self::OptionalIdentification => "destination optional identification",
+            Self::Mpidr => "destination MPIDR",
+            Self::DestinationExecutionControls => "destination execution controls",
+            Self::DestinationBreakpoints => "destination breakpoint evidence",
+            Self::DestinationWatchpoints => "destination watchpoint evidence",
+            Self::DestinationSmePstate => "destination SME PSTATE evidence",
+            Self::DestinationOptionalStateValidation => "destination optional-state validation",
+            Self::SourceOptionalStateValidation => "source optional-state validation",
+            Self::GeneralRegisters => "general registers",
+            Self::CoreRegisters => "core registers",
+            Self::ExceptionRegisters => "exception registers",
+            Self::ExecutionControls => "execution controls",
+            Self::CacheSelection => "cache selection",
+            Self::DebugControls => "debug controls",
+            Self::DebugTrapPolicy => "debug trap policy",
+            Self::SystemContext => "system context",
+            Self::Translation => "translation registers",
+            Self::PointerAuthentication => "pointer authentication",
+            Self::ThreadContext => "thread context",
+            Self::SimdFp => "SIMD/FP",
+            Self::GicDevice => "GIC device state",
+            Self::GicIcc => "GIC ICC registers",
+            Self::Timers => "normalized timers",
+            Self::PendingInterrupts => "pending interrupts",
+            Self::Response => "response delivery",
+        };
+        f.write_str(name)
+    }
 }
 
 /// Ordered native-v1 owner-thread capture stage used for failure context.
@@ -257,6 +350,43 @@ impl fmt::Debug for HvfArm64SnapshotV1Capture {
     }
 }
 
+/// Complete native-v1 state moved into one never-run owner-thread restore.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64SnapshotV1Restore {
+    expected_identification: HvfArm64VcpuIdentificationRegisterState,
+    expected_optional_identification: Option<HvfArm64VcpuSveSmeIdentificationRegisterState>,
+    expected_mpidr: u64,
+    vcpu: HvfSnapshotV1VcpuState,
+    interrupts: HvfSnapshotV1InterruptState,
+}
+
+impl HvfArm64SnapshotV1Restore {
+    pub fn new(
+        expected_identification: HvfArm64VcpuIdentificationRegisterState,
+        expected_optional_identification: Option<HvfArm64VcpuSveSmeIdentificationRegisterState>,
+        expected_mpidr: u64,
+        vcpu: HvfSnapshotV1VcpuState,
+        interrupts: HvfSnapshotV1InterruptState,
+    ) -> Self {
+        Self {
+            expected_identification,
+            expected_optional_identification,
+            expected_mpidr,
+            vcpu,
+            interrupts,
+        }
+    }
+}
+
+impl fmt::Debug for HvfArm64SnapshotV1Restore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64SnapshotV1Restore")
+            .field("profile", &"native-v1")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfVcpuRunStepOutcome {
     Canceled,
@@ -306,10 +436,17 @@ impl fmt::Display for HvfVcpuRunnerError {
             Self::SnapshotTimerPolicy(err) => write!(f, "{err}"),
             Self::SnapshotTimerRestore(err) => write!(f, "{err}"),
             Self::SnapshotOptionalState(err) => write!(f, "{err}"),
+            Self::SnapshotRestoreCompatibility(err) => write!(f, "{err}"),
             Self::SnapshotCapture { stage, source } => {
                 write!(
                     f,
                     "native-v1 arm64 snapshot capture failed at {stage}: {source}"
+                )
+            }
+            Self::SnapshotRestore { stage, source } => {
+                write!(
+                    f,
+                    "native-v1 arm64 snapshot restore failed at {stage}: {source}"
                 )
             }
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
@@ -349,7 +486,9 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::SnapshotTimerPolicy(err) => Some(err),
             Self::SnapshotTimerRestore(err) => Some(err),
             Self::SnapshotOptionalState(err) => Some(err),
+            Self::SnapshotRestoreCompatibility(err) => Some(err),
             Self::SnapshotCapture { source, .. } => Some(source.as_ref()),
+            Self::SnapshotRestore { source, .. } => Some(source.as_ref()),
             Self::VcpuExitResolve(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
             Self::InvalidState(_)
@@ -538,6 +677,11 @@ enum RunnerCommand {
     CaptureArm64SnapshotV1State {
         admission: InFlightSnapshotCapture,
         response_sender: mpsc::Sender<Result<HvfArm64SnapshotV1Capture, HvfVcpuRunnerError>>,
+    },
+    RestoreArm64SnapshotV1State {
+        admission: InFlightSnapshotCapture,
+        state: Box<HvfArm64SnapshotV1Restore>,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     CaptureArm64GeneralRegisterState {
         admission: InFlightCoreRegisterOperation,
@@ -1579,6 +1723,183 @@ trait RunnerVcpu {
             },
         })
     }
+
+    fn restore_arm64_snapshot_v1_state(
+        &mut self,
+        state: HvfArm64SnapshotV1Restore,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let destination_identification = restore_stage(
+            HvfArm64SnapshotV1RestoreStage::Identification,
+            self.capture_arm64_identification_register_state()
+                .map_err(HvfVcpuRunnerError::Backend),
+        )?;
+        if destination_identification != state.expected_identification {
+            return restore_stage(
+                HvfArm64SnapshotV1RestoreStage::Identification,
+                Err(HvfVcpuRunnerError::SnapshotRestoreCompatibility(
+                    HvfArm64SnapshotV1CompatibilityError::Identification,
+                )),
+            );
+        }
+
+        let sve_present = ((destination_identification.id_aa64pfr0_el1() >> 32) & 0xf) != 0xf;
+        let sme_present = ((destination_identification.id_aa64pfr1_el1() >> 24) & 0xf) != 0xf;
+        let destination_optional_identification = if sve_present || sme_present {
+            Some(restore_stage(
+                HvfArm64SnapshotV1RestoreStage::OptionalIdentification,
+                self.capture_arm64_sve_sme_identification_register_state()
+                    .map_err(HvfVcpuRunnerError::Backend),
+            )?)
+        } else {
+            None
+        };
+        if destination_optional_identification != state.expected_optional_identification {
+            return restore_stage(
+                HvfArm64SnapshotV1RestoreStage::OptionalIdentification,
+                Err(HvfVcpuRunnerError::SnapshotRestoreCompatibility(
+                    HvfArm64SnapshotV1CompatibilityError::OptionalIdentification,
+                )),
+            );
+        }
+
+        let destination_mpidr = restore_stage(
+            HvfArm64SnapshotV1RestoreStage::Mpidr,
+            self.mpidr_el1().map_err(HvfVcpuRunnerError::Backend),
+        )?;
+        if destination_mpidr != state.expected_mpidr {
+            return restore_stage(
+                HvfArm64SnapshotV1RestoreStage::Mpidr,
+                Err(HvfVcpuRunnerError::SnapshotRestoreCompatibility(
+                    HvfArm64SnapshotV1CompatibilityError::Mpidr,
+                )),
+            );
+        }
+
+        let destination_execution = restore_stage(
+            HvfArm64SnapshotV1RestoreStage::DestinationExecutionControls,
+            self.capture_arm64_execution_control_register_state()
+                .map_err(HvfVcpuRunnerError::Backend),
+        )?;
+        let destination_breakpoints = restore_stage(
+            HvfArm64SnapshotV1RestoreStage::DestinationBreakpoints,
+            self.capture_arm64_breakpoint_register_state()
+                .map_err(HvfVcpuRunnerError::Backend),
+        )?;
+        let destination_watchpoints = restore_stage(
+            HvfArm64SnapshotV1RestoreStage::DestinationWatchpoints,
+            self.capture_arm64_watchpoint_register_state()
+                .map_err(HvfVcpuRunnerError::Backend),
+        )?;
+        let destination_sme_pstate = if sme_present {
+            Some(restore_stage(
+                HvfArm64SnapshotV1RestoreStage::DestinationSmePstate,
+                self.capture_arm64_sme_pstate()
+                    .map_err(HvfVcpuRunnerError::Backend),
+            )?)
+        } else {
+            None
+        };
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::DestinationOptionalStateValidation,
+            self.validate_arm64_snapshot_optional_state(
+                destination_execution,
+                destination_sme_pstate,
+                &destination_breakpoints,
+                &destination_watchpoints,
+            )
+            .map_err(HvfVcpuRunnerError::SnapshotOptionalState),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::SourceOptionalStateValidation,
+            validate_native_v1_arm64_snapshot_optional_state(
+                state.vcpu.execution,
+                None,
+                None,
+                None,
+            )
+            .map_err(HvfVcpuRunnerError::SnapshotOptionalState),
+        )?;
+
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::GeneralRegisters,
+            self.restore_arm64_general_register_state(&state.vcpu.general)
+                .map_err(HvfVcpuRunnerError::GeneralRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::CoreRegisters,
+            self.restore_arm64_core_system_register_state(&state.vcpu.core)
+                .map_err(HvfVcpuRunnerError::SystemRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::ExceptionRegisters,
+            self.restore_arm64_exception_register_state(&state.vcpu.exception)
+                .map_err(HvfVcpuRunnerError::SystemRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::ExecutionControls,
+            self.restore_arm64_execution_control_register_state(&state.vcpu.execution)
+                .map_err(HvfVcpuRunnerError::SystemRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::CacheSelection,
+            self.restore_arm64_cache_selection_register_state(&state.vcpu.cache_selection)
+                .map_err(HvfVcpuRunnerError::SystemRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::DebugControls,
+            self.restore_arm64_debug_control_register_state(&state.vcpu.debug_control)
+                .map_err(HvfVcpuRunnerError::SystemRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::DebugTrapPolicy,
+            self.restore_arm64_debug_trap_state(&state.vcpu.debug_trap)
+                .map_err(HvfVcpuRunnerError::DebugTrapRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::SystemContext,
+            self.restore_arm64_system_context_register_state(&state.vcpu.system_context)
+                .map_err(HvfVcpuRunnerError::SystemRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::Translation,
+            self.restore_arm64_translation_register_state(&state.vcpu.translation)
+                .map_err(HvfVcpuRunnerError::SystemRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::PointerAuthentication,
+            self.restore_arm64_pointer_authentication_key_state(&state.vcpu.pointer_authentication)
+                .map_err(HvfVcpuRunnerError::SystemRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::ThreadContext,
+            self.restore_arm64_thread_context_register_state(&state.vcpu.thread_context)
+                .map_err(HvfVcpuRunnerError::SystemRegisterRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::SimdFp,
+            self.restore_arm64_simd_fp_state(&state.vcpu.simd_fp)
+                .map_err(HvfVcpuRunnerError::SimdFpRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::GicDevice,
+            self.restore_gic_device_state(&state.interrupts.gic_device)
+                .map_err(HvfVcpuRunnerError::Gic),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::GicIcc,
+            self.restore_arm64_gic_icc_register_state(&state.interrupts.gic_icc),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::Timers,
+            self.restore_arm64_snapshot_timer_state(&state.interrupts.timer)
+                .map_err(HvfVcpuRunnerError::SnapshotTimerRestore),
+        )?;
+        restore_stage(
+            HvfArm64SnapshotV1RestoreStage::PendingInterrupts,
+            self.restore_arm64_pending_interrupt_state(&state.interrupts.pending_interrupts)
+                .map_err(HvfVcpuRunnerError::PendingInterruptRestore),
+        )
+    }
     fn destroy(&mut self) -> Result<(), BackendError>;
 }
 
@@ -1587,6 +1908,16 @@ fn capture_stage<T>(
     result: Result<T, HvfVcpuRunnerError>,
 ) -> Result<T, HvfVcpuRunnerError> {
     result.map_err(|source| HvfVcpuRunnerError::SnapshotCapture {
+        stage,
+        source: Box::new(source),
+    })
+}
+
+fn restore_stage<T>(
+    stage: HvfArm64SnapshotV1RestoreStage,
+    result: Result<T, HvfVcpuRunnerError>,
+) -> Result<T, HvfVcpuRunnerError> {
+    result.map_err(|source| HvfVcpuRunnerError::SnapshotRestore {
         stage,
         source: Box::new(source),
     })
@@ -1992,7 +2323,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 | HvfVcpuRunnerError::SnapshotTimerPolicy(_)
                 | HvfVcpuRunnerError::SnapshotTimerRestore(_)
                 | HvfVcpuRunnerError::SnapshotOptionalState(_)
+                | HvfVcpuRunnerError::SnapshotRestoreCompatibility(_)
                 | HvfVcpuRunnerError::SnapshotCapture { .. }
+                | HvfVcpuRunnerError::SnapshotRestore { .. }
                 | HvfVcpuRunnerError::InvalidState(_)
                 | HvfVcpuRunnerError::UnsupportedSys64 { .. }
                 | HvfVcpuRunnerError::VcpuExitResolve(_)
@@ -2081,6 +2414,28 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .recv()
             .map_err(|_| HvfVcpuRunnerError::SnapshotCapture {
                 stage: HvfArm64SnapshotV1CaptureStage::Response,
+                source: Box::new(HvfVcpuRunnerError::ChannelClosed(
+                    RESPONSE_CHANNEL_CLOSED_MESSAGE,
+                )),
+            })?
+    }
+
+    /// Validate and restore complete native-v1 state under one never-run lease.
+    pub fn restore_arm64_snapshot_v1_state(
+        &self,
+        state: HvfArm64SnapshotV1Restore,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_snapshot_v1_restore(state, response_sender)
+            .map_err(|source| HvfVcpuRunnerError::SnapshotRestore {
+                stage: HvfArm64SnapshotV1RestoreStage::Admission,
+                source: Box::new(source),
+            })?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::SnapshotRestore {
+                stage: HvfArm64SnapshotV1RestoreStage::Response,
                 source: Box::new(HvfVcpuRunnerError::ChannelClosed(
                     RESPONSE_CHANNEL_CLOSED_MESSAGE,
                 )),
@@ -3419,6 +3774,21 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
     }
 
+    fn start_arm64_snapshot_v1_restore(
+        &self,
+        state: HvfArm64SnapshotV1Restore,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let admission = self.reserve_snapshot_restore()?;
+        self.command_sender
+            .send(RunnerCommand::RestoreArm64SnapshotV1State {
+                admission,
+                state: Box::new(state),
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
+    }
+
     fn reserve_snapshot_capture(&self) -> Result<InFlightSnapshotCapture, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
@@ -3427,6 +3797,63 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(
                 RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.core_register_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.timer_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                TIMER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.interrupt_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+
+        state.metadata_read_in_flight = true;
+        state.core_register_operation_in_flight = true;
+        state.timer_operation_in_flight = true;
+        state.interrupt_operation_in_flight = true;
+        drop(state);
+        Ok(InFlightSnapshotCapture::new(&self.state))
+    }
+
+    fn reserve_snapshot_restore(&self) -> Result<InFlightSnapshotCapture, HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if state.run_started {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUN_ALREADY_STARTED_MESSAGE,
             ));
         }
         if state.in_flight_runs > 0 {
@@ -5055,6 +5482,15 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::RestoreArm64SnapshotV1State {
+                mut admission,
+                state,
+                response_sender,
+            } => {
+                let result = vcpu.restore_arm64_snapshot_v1_state(*state);
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureArm64GeneralRegisterState {
                 mut admission,
                 response_sender,
@@ -5899,8 +6335,9 @@ mod tests {
     use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher, MmioRegionId};
 
     use super::{
-        CancelVcpu, HvfArm64SnapshotV1CaptureStage, HvfVcpuRunStepOutcome, HvfVcpuRunner,
-        HvfVcpuRunnerError, RunnerVcpu, spawn_runner_thread,
+        CancelVcpu, HvfArm64SnapshotV1CaptureStage, HvfArm64SnapshotV1Restore,
+        HvfArm64SnapshotV1RestoreStage, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
+        RunnerVcpu, spawn_runner_thread,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -5975,6 +6412,8 @@ mod tests {
 
     struct SnapshotV1AggregateRecordingVcpu {
         stage_sender: mpsc::Sender<HvfArm64SnapshotV1CaptureStage>,
+        restore_stage_sender: Option<mpsc::Sender<HvfArm64SnapshotV1RestoreStage>>,
+        destination_cpacr_el1: u64,
         fail_once: Option<HvfArm64SnapshotV1CaptureStage>,
         block_stage: Option<HvfArm64SnapshotV1CaptureStage>,
         entered_sender: Option<mpsc::Sender<()>>,
@@ -6015,6 +6454,26 @@ mod tests {
             }
             Ok(())
         }
+
+        fn record_observation(
+            &mut self,
+            capture: HvfArm64SnapshotV1CaptureStage,
+            restore: HvfArm64SnapshotV1RestoreStage,
+        ) -> Result<(), BackendError> {
+            if let Some(sender) = &self.restore_stage_sender {
+                sender.send(restore).map_err(|_| {
+                    BackendError::InvalidState("snapshot-v1 restore stage receiver is closed")
+                })
+            } else {
+                self.record(capture)
+            }
+        }
+
+        fn record_restore(&mut self, stage: HvfArm64SnapshotV1RestoreStage) {
+            if let Some(sender) = &self.restore_stage_sender {
+                let _ = sender.send(stage);
+            }
+        }
     }
 
     impl RunnerVcpu for SnapshotV1AggregateRecordingVcpu {
@@ -6044,7 +6503,10 @@ mod tests {
         fn capture_arm64_identification_register_state(
             &mut self,
         ) -> Result<HvfArm64VcpuIdentificationRegisterState, BackendError> {
-            self.record(HvfArm64SnapshotV1CaptureStage::Identification)?;
+            self.record_observation(
+                HvfArm64SnapshotV1CaptureStage::Identification,
+                HvfArm64SnapshotV1RestoreStage::Identification,
+            )?;
             Ok(HvfArm64VcpuIdentificationRegisterState::new([
                 1,
                 0x8000_0000,
@@ -6063,7 +6525,10 @@ mod tests {
         fn capture_arm64_sve_sme_identification_register_state(
             &mut self,
         ) -> Result<HvfArm64VcpuSveSmeIdentificationRegisterState, BackendError> {
-            self.record(HvfArm64SnapshotV1CaptureStage::OptionalIdentification)?;
+            self.record_observation(
+                HvfArm64SnapshotV1CaptureStage::OptionalIdentification,
+                HvfArm64SnapshotV1RestoreStage::OptionalIdentification,
+            )?;
             Ok(HvfArm64VcpuSveSmeIdentificationRegisterState::new(9, 10))
         }
 
@@ -6093,8 +6558,14 @@ mod tests {
         fn capture_arm64_execution_control_register_state(
             &mut self,
         ) -> Result<HvfArm64VcpuExecutionControlRegisterState, BackendError> {
-            self.record(HvfArm64SnapshotV1CaptureStage::ExecutionControls)?;
-            Ok(HvfArm64VcpuExecutionControlRegisterState::new(24, 0))
+            self.record_observation(
+                HvfArm64SnapshotV1CaptureStage::ExecutionControls,
+                HvfArm64SnapshotV1RestoreStage::DestinationExecutionControls,
+            )?;
+            Ok(HvfArm64VcpuExecutionControlRegisterState::new(
+                24,
+                self.destination_cpacr_el1,
+            ))
         }
 
         fn capture_arm64_cache_selection_register_state(
@@ -6158,7 +6629,10 @@ mod tests {
         fn capture_arm64_breakpoint_register_state(
             &mut self,
         ) -> Result<HvfArm64VcpuBreakpointRegisterState, BackendError> {
-            self.record(HvfArm64SnapshotV1CaptureStage::Breakpoints)?;
+            self.record_observation(
+                HvfArm64SnapshotV1CaptureStage::Breakpoints,
+                HvfArm64SnapshotV1RestoreStage::DestinationBreakpoints,
+            )?;
             Ok(HvfArm64VcpuBreakpointRegisterState::new(
                 1, [0; 16], [0; 16],
             ))
@@ -6167,14 +6641,20 @@ mod tests {
         fn capture_arm64_watchpoint_register_state(
             &mut self,
         ) -> Result<HvfArm64VcpuWatchpointRegisterState, BackendError> {
-            self.record(HvfArm64SnapshotV1CaptureStage::Watchpoints)?;
+            self.record_observation(
+                HvfArm64SnapshotV1CaptureStage::Watchpoints,
+                HvfArm64SnapshotV1RestoreStage::DestinationWatchpoints,
+            )?;
             Ok(HvfArm64VcpuWatchpointRegisterState::new(
                 1, [0; 16], [0; 16],
             ))
         }
 
         fn capture_arm64_sme_pstate(&mut self) -> Result<HvfArm64VcpuSmePstate, BackendError> {
-            self.record(HvfArm64SnapshotV1CaptureStage::SmePstate)?;
+            self.record_observation(
+                HvfArm64SnapshotV1CaptureStage::SmePstate,
+                HvfArm64SnapshotV1RestoreStage::DestinationSmePstate,
+            )?;
             Ok(HvfArm64VcpuSmePstate::new(false, false))
         }
 
@@ -6186,7 +6666,10 @@ mod tests {
             watchpoints: &HvfArm64VcpuWatchpointRegisterState,
         ) -> Result<(), HvfArm64SnapshotOptionalStateRejection> {
             if self
-                .record(HvfArm64SnapshotV1CaptureStage::OptionalStateValidation)
+                .record_observation(
+                    HvfArm64SnapshotV1CaptureStage::OptionalStateValidation,
+                    HvfArm64SnapshotV1RestoreStage::DestinationOptionalStateValidation,
+                )
                 .is_err()
             {
                 return Err(HvfArm64SnapshotOptionalStateRejection::SveAccessEnabled);
@@ -6229,6 +6712,139 @@ mod tests {
             Ok(HvfArm64GicIccRegisterState::new(
                 GIC_ICC_REGISTER_STATE_TEST_VALUES,
             ))
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::Mpidr);
+            Ok(0x8000_0000)
+        }
+
+        fn restore_arm64_general_register_state(
+            &mut self,
+            _state: &HvfArm64VcpuGeneralRegisterState,
+        ) -> Result<(), HvfArm64VcpuGeneralRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::GeneralRegisters);
+            Ok(())
+        }
+
+        fn restore_arm64_core_system_register_state(
+            &mut self,
+            _state: &HvfArm64VcpuCoreSystemRegisterState,
+        ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::CoreRegisters);
+            Ok(())
+        }
+
+        fn restore_arm64_exception_register_state(
+            &mut self,
+            _state: &HvfArm64VcpuExceptionRegisterState,
+        ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::ExceptionRegisters);
+            Ok(())
+        }
+
+        fn restore_arm64_execution_control_register_state(
+            &mut self,
+            _state: &HvfArm64VcpuExecutionControlRegisterState,
+        ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::ExecutionControls);
+            Ok(())
+        }
+
+        fn restore_arm64_cache_selection_register_state(
+            &mut self,
+            _state: &HvfArm64VcpuCacheSelectionRegisterState,
+        ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::CacheSelection);
+            Ok(())
+        }
+
+        fn restore_arm64_debug_control_register_state(
+            &mut self,
+            _state: &HvfArm64VcpuDebugControlRegisterState,
+        ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::DebugControls);
+            Ok(())
+        }
+
+        fn restore_arm64_debug_trap_state(
+            &mut self,
+            _state: &HvfArm64VcpuDebugTrapState,
+        ) -> Result<(), HvfArm64VcpuDebugTrapRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::DebugTrapPolicy);
+            Ok(())
+        }
+
+        fn restore_arm64_system_context_register_state(
+            &mut self,
+            _state: &HvfArm64VcpuSystemContextRegisterState,
+        ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::SystemContext);
+            Ok(())
+        }
+
+        fn restore_arm64_translation_register_state(
+            &mut self,
+            _state: &HvfArm64VcpuTranslationRegisterState,
+        ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::Translation);
+            Ok(())
+        }
+
+        fn restore_arm64_pointer_authentication_key_state(
+            &mut self,
+            _state: &HvfArm64VcpuPointerAuthenticationKeyState,
+        ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::PointerAuthentication);
+            Ok(())
+        }
+
+        fn restore_arm64_thread_context_register_state(
+            &mut self,
+            _state: &HvfArm64VcpuThreadContextRegisterState,
+        ) -> Result<(), HvfArm64VcpuSystemRegisterRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::ThreadContext);
+            Ok(())
+        }
+
+        fn restore_arm64_simd_fp_state(
+            &mut self,
+            _state: &HvfArm64VcpuSimdFpState,
+        ) -> Result<(), HvfArm64VcpuSimdFpRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::SimdFp);
+            Ok(())
+        }
+
+        fn restore_gic_device_state(
+            &mut self,
+            _state: &HvfGicDeviceState,
+        ) -> Result<(), HvfGicError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::GicDevice);
+            Ok(())
+        }
+
+        fn restore_arm64_gic_icc_register_state(
+            &mut self,
+            _state: &HvfArm64GicIccRegisterState,
+        ) -> Result<(), HvfVcpuRunnerError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::GicIcc);
+            Ok(())
+        }
+
+        fn restore_arm64_snapshot_timer_state(
+            &mut self,
+            _state: &HvfArm64SnapshotTimerState,
+        ) -> Result<(), crate::snapshot::HvfArm64SnapshotTimerRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::Timers);
+            Ok(())
+        }
+
+        fn restore_arm64_pending_interrupt_state(
+            &mut self,
+            _state: &HvfArm64VcpuPendingInterruptState,
+        ) -> Result<(), HvfArm64VcpuPendingInterruptRestoreError> {
+            self.record_restore(HvfArm64SnapshotV1RestoreStage::PendingInterrupts);
+            Ok(())
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -15194,6 +15810,8 @@ mod tests {
         let started = spawn_runner_thread(move || {
             Ok(SnapshotV1AggregateRecordingVcpu {
                 stage_sender,
+                restore_stage_sender: None,
+                destination_cpacr_el1: 0,
                 fail_once,
                 block_stage,
                 entered_sender,
@@ -15207,6 +15825,57 @@ mod tests {
             stage_receiver,
             entered_receiver,
             release_sender,
+        )
+    }
+
+    fn start_snapshot_v1_restore_runner() -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<HvfArm64SnapshotV1RestoreStage>,
+    ) {
+        start_snapshot_v1_restore_runner_with_cpacr(0)
+    }
+
+    fn start_snapshot_v1_restore_runner_with_cpacr(
+        destination_cpacr_el1: u64,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<HvfArm64SnapshotV1RestoreStage>,
+    ) {
+        let (capture_stage_sender, _capture_stage_receiver) = mpsc::channel();
+        let (restore_stage_sender, restore_stage_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(SnapshotV1AggregateRecordingVcpu {
+                stage_sender: capture_stage_sender,
+                restore_stage_sender: Some(restore_stage_sender),
+                destination_cpacr_el1,
+                fail_once: None,
+                block_stage: None,
+                entered_sender: None,
+                release_receiver: None,
+            })
+        })
+        .expect("snapshot-v1 restore runner should start");
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("snapshot-v1 restore runner should initialize"),
+            restore_stage_receiver,
+        )
+    }
+
+    fn snapshot_v1_restore_test_state() -> HvfArm64SnapshotV1Restore {
+        let (runner, _stages, _, _) = start_snapshot_v1_aggregate_runner(None, None);
+        let capture = runner
+            .capture_arm64_snapshot_v1_state()
+            .expect("source aggregate capture should succeed");
+        runner
+            .shutdown()
+            .expect("source aggregate runner should shut down");
+        HvfArm64SnapshotV1Restore::new(
+            capture.identification(),
+            capture.optional_sve_sme_identification(),
+            0x8000_0000,
+            capture.vcpu().clone(),
+            capture.interrupts().clone(),
         )
     }
 
@@ -31075,6 +31744,168 @@ mod tests {
             HvfArm64SnapshotV1CaptureStage::GicDevice,
             HvfArm64SnapshotV1CaptureStage::GicIcc,
         ]
+    }
+
+    fn snapshot_v1_restore_expected_operations() -> [HvfArm64SnapshotV1RestoreStage; 24] {
+        [
+            HvfArm64SnapshotV1RestoreStage::Identification,
+            HvfArm64SnapshotV1RestoreStage::OptionalIdentification,
+            HvfArm64SnapshotV1RestoreStage::Mpidr,
+            HvfArm64SnapshotV1RestoreStage::DestinationExecutionControls,
+            HvfArm64SnapshotV1RestoreStage::DestinationBreakpoints,
+            HvfArm64SnapshotV1RestoreStage::DestinationWatchpoints,
+            HvfArm64SnapshotV1RestoreStage::DestinationSmePstate,
+            HvfArm64SnapshotV1RestoreStage::DestinationOptionalStateValidation,
+            HvfArm64SnapshotV1RestoreStage::GeneralRegisters,
+            HvfArm64SnapshotV1RestoreStage::CoreRegisters,
+            HvfArm64SnapshotV1RestoreStage::ExceptionRegisters,
+            HvfArm64SnapshotV1RestoreStage::ExecutionControls,
+            HvfArm64SnapshotV1RestoreStage::CacheSelection,
+            HvfArm64SnapshotV1RestoreStage::DebugControls,
+            HvfArm64SnapshotV1RestoreStage::DebugTrapPolicy,
+            HvfArm64SnapshotV1RestoreStage::SystemContext,
+            HvfArm64SnapshotV1RestoreStage::Translation,
+            HvfArm64SnapshotV1RestoreStage::PointerAuthentication,
+            HvfArm64SnapshotV1RestoreStage::ThreadContext,
+            HvfArm64SnapshotV1RestoreStage::SimdFp,
+            HvfArm64SnapshotV1RestoreStage::GicDevice,
+            HvfArm64SnapshotV1RestoreStage::GicIcc,
+            HvfArm64SnapshotV1RestoreStage::Timers,
+            HvfArm64SnapshotV1RestoreStage::PendingInterrupts,
+        ]
+    }
+
+    #[test]
+    fn snapshot_v1_aggregate_restore_validates_then_writes_in_exact_order() {
+        let state = snapshot_v1_restore_test_state();
+        let (runner, stages) = start_snapshot_v1_restore_runner();
+
+        runner
+            .restore_arm64_snapshot_v1_state(state)
+            .expect("compatible never-run destination should restore");
+        runner
+            .shutdown()
+            .expect("snapshot-v1 restore runner should shut down");
+
+        assert_eq!(
+            stages.into_iter().collect::<Vec<_>>(),
+            snapshot_v1_restore_expected_operations()
+        );
+    }
+
+    #[test]
+    fn snapshot_v1_aggregate_restore_rejects_destination_optional_state_before_writes() {
+        let state = snapshot_v1_restore_test_state();
+        let (runner, stages) = start_snapshot_v1_restore_runner_with_cpacr(0b11 << 16);
+
+        let error = runner
+            .restore_arm64_snapshot_v1_state(state)
+            .expect_err("active destination SVE state should reject");
+        assert!(matches!(
+            error,
+            HvfVcpuRunnerError::SnapshotRestore {
+                stage: HvfArm64SnapshotV1RestoreStage::DestinationOptionalStateValidation,
+                ..
+            }
+        ));
+        runner
+            .shutdown()
+            .expect("snapshot-v1 restore runner should shut down");
+
+        assert_eq!(
+            stages.into_iter().collect::<Vec<_>>(),
+            snapshot_v1_restore_expected_operations()[..8]
+        );
+    }
+
+    #[test]
+    fn snapshot_v1_aggregate_restore_rejects_source_optional_state_before_writes() {
+        let mut state = snapshot_v1_restore_test_state();
+        state.vcpu.execution = HvfArm64VcpuExecutionControlRegisterState::new(24, 0b11 << 16);
+        let (runner, stages) = start_snapshot_v1_restore_runner();
+
+        let error = runner
+            .restore_arm64_snapshot_v1_state(state)
+            .expect_err("active source SVE state should reject");
+        assert!(matches!(
+            error,
+            HvfVcpuRunnerError::SnapshotRestore {
+                stage: HvfArm64SnapshotV1RestoreStage::SourceOptionalStateValidation,
+                ..
+            }
+        ));
+        runner
+            .shutdown()
+            .expect("snapshot-v1 restore runner should shut down");
+
+        assert_eq!(
+            stages.into_iter().collect::<Vec<_>>(),
+            snapshot_v1_restore_expected_operations()[..8]
+        );
+    }
+
+    #[test]
+    fn snapshot_v1_aggregate_restore_compatibility_failure_releases_admission_for_retry() {
+        let compatible = snapshot_v1_restore_test_state();
+        let mut incompatible = compatible.clone();
+        incompatible.expected_identification =
+            HvfArm64VcpuIdentificationRegisterState::new([u64::MAX; 11]);
+        let (runner, stages) = start_snapshot_v1_restore_runner();
+
+        let error = runner
+            .restore_arm64_snapshot_v1_state(incompatible)
+            .expect_err("different destination identification should reject");
+        assert!(matches!(
+            error,
+            HvfVcpuRunnerError::SnapshotRestore {
+                stage: HvfArm64SnapshotV1RestoreStage::Identification,
+                source,
+            } if matches!(
+                source.as_ref(),
+                HvfVcpuRunnerError::SnapshotRestoreCompatibility(
+                    super::HvfArm64SnapshotV1CompatibilityError::Identification
+                )
+            )
+        ));
+
+        runner
+            .restore_arm64_snapshot_v1_state(compatible)
+            .expect("fresh compatible retry should succeed");
+        runner
+            .shutdown()
+            .expect("snapshot-v1 restore runner should shut down");
+
+        let observed = stages.into_iter().collect::<Vec<_>>();
+        assert_eq!(observed[0], HvfArm64SnapshotV1RestoreStage::Identification);
+        assert_eq!(&observed[1..], &snapshot_v1_restore_expected_operations());
+    }
+
+    #[test]
+    fn snapshot_v1_aggregate_restore_is_rejected_after_first_run_attempt() {
+        let state = snapshot_v1_restore_test_state();
+        let (runner, stages) = start_snapshot_v1_restore_runner();
+        assert_eq!(
+            runner.run_once().expect("fake first run should complete"),
+            HvfVcpuExit::Canceled
+        );
+
+        let error = runner
+            .restore_arm64_snapshot_v1_state(state)
+            .expect_err("restore after run should reject at admission");
+        assert!(matches!(
+            error,
+            HvfVcpuRunnerError::SnapshotRestore {
+                stage: HvfArm64SnapshotV1RestoreStage::Admission,
+                source,
+            } if matches!(
+                source.as_ref(),
+                HvfVcpuRunnerError::InvalidState(super::RUN_ALREADY_STARTED_MESSAGE)
+            )
+        ));
+        assert_eq!(stages.try_recv(), Err(mpsc::TryRecvError::Empty));
+        runner
+            .shutdown()
+            .expect("snapshot-v1 restore runner should shut down");
     }
 
     #[test]

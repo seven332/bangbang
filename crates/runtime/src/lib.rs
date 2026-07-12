@@ -951,6 +951,20 @@ impl VmmController {
         .map_err(|_| VmmActionError::SnapshotUnsupported)
     }
 
+    /// Commit a completely restored native-v1 session as paused controller state.
+    pub fn commit_snapshot_v1_load(
+        &mut self,
+        commit: snapshot::SnapshotV1ControllerCommit,
+    ) -> bool {
+        let (machine_config, drive_configs, serial_config, resume_requested) = commit.into_parts();
+        self.machine_config = machine_config;
+        self.drive_configs = drive_configs;
+        self.serial_config = serial_config;
+        self.snapshot_load_history_fresh = false;
+        self.instance_info.state = InstanceState::Paused;
+        resume_requested
+    }
+
     #[track_caller]
     fn log_action(&mut self, action: &str) -> Result<(), VmmActionError> {
         if let Err(err) = self.logger_state.log_action(action) {

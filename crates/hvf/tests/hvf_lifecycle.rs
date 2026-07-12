@@ -2934,36 +2934,34 @@ fn prepares_internal_hvf_arm64_boot_session() {
             .total_size(),
         session.runtime_resources().layout.total_size()
     );
+    let boot_origin = session
+        .runtime_resources()
+        .boot_origin
+        .as_ref()
+        .expect("ordinary session should retain boot-origin metadata");
+    let boot_registers = session
+        .boot_registers()
+        .expect("ordinary session should retain boot registers");
     let mut fdt_magic = [0; 4];
     session
         .guest_memory()
         .expect("session should expose mapped guest memory")
-        .read_slice(&mut fdt_magic, session.runtime_resources().fdt.address)
+        .read_slice(&mut fdt_magic, boot_origin.fdt.address)
         .expect("mapped guest memory should contain the written FDT");
     assert_eq!(u32::from_be_bytes(fdt_magic), 0xd00d_feed);
     assert_eq!(
-        session.boot_registers().kernel_entry,
-        session
-            .runtime_resources()
-            .loaded_boot_source
-            .kernel
-            .entry_address
+        boot_registers.kernel_entry,
+        boot_origin.loaded_boot_source.kernel.entry_address
     );
-    assert_eq!(
-        session.boot_registers().fdt_address,
-        session.runtime_resources().fdt.address
-    );
+    assert_eq!(boot_registers.fdt_address, boot_origin.fdt.address);
     let register_state = session
         .capture_arm64_general_register_state()
         .expect("internal session should capture general-register state");
     assert_eq!(
         register_state.general_purpose_register(0),
-        Some(session.boot_registers().fdt_address.raw_value())
+        Some(boot_registers.fdt_address.raw_value())
     );
-    assert_eq!(
-        register_state.pc(),
-        session.boot_registers().kernel_entry.raw_value()
-    );
+    assert_eq!(register_state.pc(), boot_registers.kernel_entry.raw_value());
     assert_eq!(register_state.cpsr(), ARM64_LINUX_BOOT_CPSR);
     session
         .restore_arm64_general_register_state(&register_state)
@@ -3215,36 +3213,34 @@ fn prepares_owned_hvf_arm64_boot_session() {
             .total_size(),
         session.runtime_resources().layout.total_size()
     );
+    let boot_origin = session
+        .runtime_resources()
+        .boot_origin
+        .as_ref()
+        .expect("ordinary session should retain boot-origin metadata");
+    let boot_registers = session
+        .boot_registers()
+        .expect("ordinary session should retain boot registers");
     let mut fdt_magic = [0; 4];
     session
         .guest_memory()
         .expect("owned session should expose mapped guest memory")
-        .read_slice(&mut fdt_magic, session.runtime_resources().fdt.address)
+        .read_slice(&mut fdt_magic, boot_origin.fdt.address)
         .expect("mapped guest memory should contain the written FDT");
     assert_eq!(u32::from_be_bytes(fdt_magic), 0xd00d_feed);
     assert_eq!(
-        session.boot_registers().kernel_entry,
-        session
-            .runtime_resources()
-            .loaded_boot_source
-            .kernel
-            .entry_address
+        boot_registers.kernel_entry,
+        boot_origin.loaded_boot_source.kernel.entry_address
     );
-    assert_eq!(
-        session.boot_registers().fdt_address,
-        session.runtime_resources().fdt.address
-    );
+    assert_eq!(boot_registers.fdt_address, boot_origin.fdt.address);
     let register_state = session
         .capture_arm64_general_register_state()
         .expect("owned session should capture general-register state");
     assert_eq!(
         register_state.general_purpose_register(0),
-        Some(session.boot_registers().fdt_address.raw_value())
+        Some(boot_registers.fdt_address.raw_value())
     );
-    assert_eq!(
-        register_state.pc(),
-        session.boot_registers().kernel_entry.raw_value()
-    );
+    assert_eq!(register_state.pc(), boot_registers.kernel_entry.raw_value());
     assert_eq!(register_state.cpsr(), ARM64_LINUX_BOOT_CPSR);
     session
         .restore_arm64_general_register_state(&register_state)
@@ -3446,7 +3442,7 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
 
     use bangbang_hvf::{
         HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfSnapshotV1Bundle,
-        HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
+        HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession, PreparedHvfSnapshotV1Load,
     };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput};
@@ -3457,6 +3453,8 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::pmem::PmemMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
+    use bangbang_runtime::snapshot_artifact::{SnapshotArtifactPaths, load_snapshot_artifacts};
+    use bangbang_runtime::snapshot_commit::encode_snapshot_commit_envelope;
     use bangbang_runtime::snapshot_device::{
         decode_snapshot_v1_device_state, encode_snapshot_v1_device_state,
     };
@@ -3578,9 +3576,10 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         HvfSnapshotV1Bundle::try_from_commit_record(bundle.commit_record().clone())
             .expect("captured composite commit should decode");
     assert_eq!(decoded_bundle.state(), bundle.state());
+    let memory_image_bytes = memory_image.into_inner();
     let loaded_memory = load_snapshot_memory_image(
         bundle.commit_record().memory_binding(),
-        &mut Cursor::new(memory_image.into_inner()),
+        &mut Cursor::new(memory_image_bytes.clone()),
     )
     .expect("captured memory image should validate and load");
     assert_eq!(
@@ -3593,6 +3592,10 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
     let decoded = decode_snapshot_v1_device_state(&encoded)
         .expect("captured snapshot device state should decode");
     assert_eq!(decoded.serial_state().scratch(), 0x5a);
+    let mut source_generation_id = [0; 16];
+    loaded_memory
+        .read_slice(&mut source_generation_id, decoded.vmgenid().range().start())
+        .expect("captured VMGenID bytes should read");
 
     let layout = session.runtime_resources().layout.clone();
     let mut loaded_memory =
@@ -3670,6 +3673,103 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
     session
         .shutdown()
         .expect("owned snapshot device session should shut down");
+
+    let state_envelope = encode_snapshot_commit_envelope(bundle.commit_record())
+        .expect("captured composite commit should encode for disk loading");
+    let state_artifact = TempFile::new("snapshot-restore-state", &state_envelope)
+        .expect("snapshot state artifact should be created");
+    let memory_artifact = TempFile::new("snapshot-restore-memory", &memory_image_bytes)
+        .expect("snapshot memory artifact should be created");
+    let artifacts = load_snapshot_artifacts(&SnapshotArtifactPaths::new(
+        state_artifact.path(),
+        memory_artifact.path(),
+    ))
+    .expect("captured artifact pair should load from distinct files");
+    let prepared = PreparedHvfSnapshotV1Load::from_loaded_artifacts(artifacts, Instant::now())
+        .expect("captured artifact pair should prepare without constructing a VM");
+    assert!(prepared.runtime().runtime_resources.boot_origin.is_none());
+
+    let restored = OwnedHvfArm64BootSession::restore_snapshot_v1(prepared)
+        .expect("fresh destination VM should restore from native-v1 artifacts");
+    let (mut restored_session, restored_drive, _serial_output, restored_serial_buffer) =
+        restored.into_parts();
+    assert!(restored_session.boot_registers().is_none());
+    assert!(restored_session.runtime_resources().boot_origin.is_none());
+    assert_eq!(restored_drive, controller.drive_configs()[0]);
+    assert_eq!(
+        restored_serial_buffer
+            .bytes()
+            .expect("restored serial buffer should read"),
+        Vec::<u8>::new()
+    );
+
+    let mut destination_generation_id = [0; 16];
+    restored_session
+        .guest_memory()
+        .expect("restored destination memory should remain mapped")
+        .read_slice(
+            &mut destination_generation_id,
+            decoded.vmgenid().range().start(),
+        )
+        .expect("restored VMGenID bytes should read");
+    assert_ne!(destination_generation_id, source_generation_id);
+    assert_ne!(destination_generation_id, [0; 16]);
+
+    let restored_state = {
+        let guard = restored_session
+            .quiesce_limiter_retry_wakeups()
+            .expect("restored retry work should quiesce before first run");
+        restored_session
+            .capture_snapshot_v1_state_at(
+                &restored_drive,
+                &bangbang_runtime::serial::SerialConfig::default(),
+                &guard,
+                Instant::now(),
+            )
+            .expect("restored destination state should recapture before first run")
+    };
+    assert_eq!(restored_state.vcpu(), bundle.state().vcpu());
+    assert_eq!(
+        restored_state.interrupts().pending_interrupts,
+        bundle.state().interrupts().pending_interrupts
+    );
+    assert!(
+        !restored_state.interrupts().gic_device.is_empty(),
+        "HVF should recapture a nonempty opaque GIC state after restore"
+    );
+    assert!(
+        restored_state.interrupts().gic_device.len()
+            <= bangbang_hvf::HVF_SNAPSHOT_V1_GIC_DEVICE_STATE_MAX_BYTES,
+        "recaptured opaque GIC state should remain within the native-v1 bound"
+    );
+    assert_eq!(
+        restored_state.interrupts().gic_icc,
+        bundle.state().interrupts().gic_icc
+    );
+    assert_normalized_timer_restore_equivalent(
+        bundle.state().interrupts().timer,
+        restored_state.interrupts().timer,
+    );
+    assert_eq!(restored_state.device().serial_state().scratch(), 0x5a);
+
+    assert!(matches!(
+        restored_session.run_once_and_handle_mmio(),
+        Ok(HvfVcpuRunStepOutcome::Hvc {
+            function_id: 0x8400_0000,
+            return_value: 2,
+            ..
+        })
+    ));
+    assert_eq!(
+        restored_session
+            .capture_arm64_general_register_state()
+            .expect("restored destination registers should capture after continuation")
+            .general_purpose_register(6),
+        Some(0x5678)
+    );
+    restored_session
+        .shutdown()
+        .expect("restored destination session should shut down");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

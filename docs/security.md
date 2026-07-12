@@ -155,6 +155,30 @@ as live handles; the supported serial policy creates a new empty buffer and
 metrics owner. Source VMGenID bytes are not encoded as reusable identity and
 must be replaced and signaled through the separate never-run restore stage.
 
+The private native-v1 loader completes bundle, platform, memory, cache, root,
+and baseline-device validation before creating an HVF VM. Runtime installation
+consumes the validated block and UART owners, creates a fresh RTC, and leaves
+the loaded guest bytes untouched; it does not reload a kernel, rewrite an FDT,
+or configure boot registers. Destination CPU identity, optional-state evidence,
+MPIDR, and GIC metadata are exact local compatibility checks rather than a
+cross-host portability or artifact-authentication boundary.
+
+VM creation begins the nontransactional restore boundary. One never-run runner
+command validates every destination-derived value before its first setter and
+then applies architecture, opaque GIC, ICC, normalized timer, and pending
+interrupt state in a fixed order. VMGenID replacement and edge notification
+follow that state. Any failure tears down the scheduler, runner, mapped memory,
+and VM; a same-process retry is reported only when explicit cleanup evidence is
+complete, while uncertain cleanup latches the private process load path as
+terminal. Errors expose stages and categories, not paths, register values,
+opaque bytes, identities, or guest contents.
+
+The restored session is handed to a worker whose pause gate is closed before it
+can receive the session. Controller and process ownership commit only after
+that handoff, always as `Paused`; the retained `resume_vm` bit is intent and is
+not executed by this slice. Public snapshot create/load actions still invoke no
+artifact loader or restore transaction and remain unsupported.
+
 ## macOS Isolation Design Boundaries
 
 The current isolation boundary is one macOS process running as the invoking host

@@ -222,11 +222,16 @@ pub struct Arm64BootResourceParts {
 }
 
 #[derive(Debug)]
+pub struct Arm64BootOriginMetadata {
+    pub loaded_boot_source: LoadedBootSource,
+    pub fdt: Arm64FdtGuestMemoryWrite,
+}
+
+#[derive(Debug)]
 pub struct Arm64BootRuntimeResources {
     pub machine_config: MachineConfig,
     pub layout: GuestMemoryLayout,
-    pub loaded_boot_source: LoadedBootSource,
-    pub fdt: Arm64FdtGuestMemoryWrite,
+    pub boot_origin: Option<Arm64BootOriginMetadata>,
     pub rtc_device: Option<Arm64BootRtcDevice>,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub vmgenid_device: Arm64BootVmGenIdDevice,
@@ -359,6 +364,7 @@ pub struct PreparedSnapshotV1DeviceProfile {
     block_mmio: SnapshotV1MmioDeviceMetadata,
     block_retry: SnapshotV1BlockRetryState,
     serial_handler: SerialMmioDevice<SharedSerialOutput>,
+    serial_output: SharedSerialOutput,
     serial_output_buffer: SharedSerialOutputBuffer,
     serial_mmio: SnapshotV1MmioDeviceMetadata,
     vmgenid_device: Arm64BootVmGenIdDevice,
@@ -395,6 +401,10 @@ impl PreparedSnapshotV1DeviceProfile {
         &self.serial_handler
     }
 
+    pub const fn serial_output(&self) -> &SharedSerialOutput {
+        &self.serial_output
+    }
+
     pub const fn serial_output_buffer(&self) -> &SharedSerialOutputBuffer {
         &self.serial_output_buffer
     }
@@ -418,6 +428,7 @@ impl PreparedSnapshotV1DeviceProfile {
             block_mmio: self.block_mmio,
             block_retry: self.block_retry,
             serial_handler: self.serial_handler,
+            serial_output: self.serial_output,
             serial_output_buffer: self.serial_output_buffer,
             serial_mmio: self.serial_mmio,
             vmgenid_device: self.vmgenid_device,
@@ -432,6 +443,7 @@ pub struct PreparedSnapshotV1DeviceProfileParts {
     pub block_mmio: SnapshotV1MmioDeviceMetadata,
     pub block_retry: SnapshotV1BlockRetryState,
     pub serial_handler: SerialMmioDevice<SharedSerialOutput>,
+    pub serial_output: SharedSerialOutput,
     pub serial_output_buffer: SharedSerialOutputBuffer,
     pub serial_mmio: SnapshotV1MmioDeviceMetadata,
     pub vmgenid_device: Arm64BootVmGenIdDevice,
@@ -573,7 +585,7 @@ pub fn prepare_snapshot_v1_device_profile(
 
     let serial_output_buffer = SharedSerialOutputBuffer::default();
     let serial_output = SharedSerialOutput::from(serial_output_buffer.clone());
-    let serial_handler = SerialMmioDevice::from_state(serial_output, state.serial_state());
+    let serial_handler = SerialMmioDevice::from_state(serial_output.clone(), state.serial_state());
 
     let mut generation_id = [0; ARM64_BOOT_VMGENID_SIZE];
     memory
@@ -601,10 +613,179 @@ pub fn prepare_snapshot_v1_device_profile(
         block_mmio: root.mmio(),
         block_retry: state.block_retry(),
         serial_handler,
+        serial_output,
         serial_output_buffer,
         serial_mmio: state.serial_mmio(),
         vmgenid_device,
         vmclock_device,
+    })
+}
+
+/// Baseline runtime owners installed from a validated native-v1 device value.
+pub struct InstalledSnapshotV1Runtime {
+    pub memory: GuestMemory,
+    pub mmio_dispatcher: MmioDispatcher,
+    pub runtime_resources: Arm64BootRuntimeResources,
+    pub drive_config: DriveConfig,
+    pub block_retry: SnapshotV1BlockRetryState,
+    pub serial_output: SharedSerialOutput,
+    pub serial_output_buffer: SharedSerialOutputBuffer,
+}
+
+impl fmt::Debug for InstalledSnapshotV1Runtime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InstalledSnapshotV1Runtime")
+            .field("profile", &"native-v1")
+            .field("resources", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Failure while installing already prepared native-v1 device owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallSnapshotV1RuntimeError {
+    LayoutAllocation,
+    InvalidLayout,
+    BlockMetadataAllocation,
+    BlockRegion,
+    BlockHandler,
+    SerialRegion,
+    SerialHandler,
+    Rtc,
+}
+
+impl fmt::Display for InstallSnapshotV1RuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::LayoutAllocation => "native-v1 runtime layout allocation failed",
+            Self::InvalidLayout => "native-v1 runtime memory layout is invalid",
+            Self::BlockMetadataAllocation => "native-v1 runtime block metadata allocation failed",
+            Self::BlockRegion => "native-v1 runtime block MMIO region is invalid",
+            Self::BlockHandler => "native-v1 runtime block MMIO handler installation failed",
+            Self::SerialRegion => "native-v1 runtime serial MMIO region is invalid",
+            Self::SerialHandler => "native-v1 runtime serial MMIO handler installation failed",
+            Self::Rtc => "native-v1 runtime RTC installation failed",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for InstallSnapshotV1RuntimeError {}
+
+/// Consume prepared native-v1 devices and install them without boot-time writes.
+pub fn install_snapshot_v1_runtime(
+    profile: PreparedSnapshotV1DeviceProfile,
+    machine_config: MachineConfig,
+    memory: GuestMemory,
+    rtc_mmio_layout: RtcMmioLayout,
+) -> Result<InstalledSnapshotV1Runtime, InstallSnapshotV1RuntimeError> {
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(memory.regions().len())
+        .map_err(|_| InstallSnapshotV1RuntimeError::LayoutAllocation)?;
+    ranges.extend(memory.regions().iter().map(|region| region.range()));
+    let layout =
+        GuestMemoryLayout::new(ranges).map_err(|_| InstallSnapshotV1RuntimeError::InvalidLayout)?;
+
+    let PreparedSnapshotV1DeviceProfileParts {
+        drive_config,
+        block_handler,
+        block_mmio,
+        block_retry,
+        serial_handler,
+        serial_output,
+        serial_output_buffer,
+        serial_mmio,
+        vmgenid_device,
+        vmclock_device,
+    } = profile.into_parts();
+
+    let mut mmio_dispatcher = MmioDispatcher::new();
+    let block_region = mmio_dispatcher
+        .insert_region(
+            block_mmio.region().id(),
+            block_mmio.region().range().start(),
+            block_mmio.region().range().size(),
+        )
+        .map_err(|_| InstallSnapshotV1RuntimeError::BlockRegion)?;
+    mmio_dispatcher
+        .register_handler(block_region.id(), block_handler)
+        .map_err(|_| InstallSnapshotV1RuntimeError::BlockHandler)?;
+
+    let block_registration = BlockMmioDeviceRegistration::from_restored(
+        0,
+        drive_config.drive_id().to_owned(),
+        block_region,
+    );
+    let mut block_devices = Vec::new();
+    block_devices
+        .try_reserve_exact(1)
+        .map_err(|_| InstallSnapshotV1RuntimeError::BlockMetadataAllocation)?;
+    block_devices.push(Arm64BootBlockDevice {
+        registration: block_registration,
+        fdt_device: Arm64FdtVirtioMmioDevice {
+            region: Arm64FdtRegion {
+                base: block_region.range().start().raw_value(),
+                size: block_region.range().size(),
+            },
+            interrupt_line: block_mmio.interrupt_line(),
+        },
+    });
+
+    let serial_region = mmio_dispatcher
+        .insert_region(
+            serial_mmio.region().id(),
+            serial_mmio.region().range().start(),
+            serial_mmio.region().range().size(),
+        )
+        .map_err(|_| InstallSnapshotV1RuntimeError::SerialRegion)?;
+    mmio_dispatcher
+        .register_handler(serial_region.id(), serial_handler)
+        .map_err(|_| InstallSnapshotV1RuntimeError::SerialHandler)?;
+    let serial_device = Arm64BootSerialDevice {
+        region: serial_region,
+        output: serial_output.clone(),
+        fdt_device: Arm64FdtSerialDevice {
+            region: Arm64FdtRegion {
+                base: serial_region.range().start().raw_value(),
+                size: serial_region.range().size(),
+            },
+            interrupt_line: serial_mmio.interrupt_line(),
+        },
+    };
+
+    let rtc_device = register_rtc_mmio(
+        &mut mmio_dispatcher,
+        Arm64BootRtcDeviceConfig::new(rtc_mmio_layout),
+    )
+    .map_err(|_| InstallSnapshotV1RuntimeError::Rtc)?;
+
+    let runtime_resources = Arm64BootRuntimeResources {
+        machine_config,
+        layout,
+        boot_origin: None,
+        rtc_device: Some(rtc_device),
+        serial_device: Some(serial_device),
+        vmgenid_device,
+        vmclock_device,
+        block_devices,
+        pmem_devices: Vec::new(),
+        pmem_mmio_devices: Vec::new(),
+        network_devices: Vec::new(),
+        vsock_device: None,
+        balloon_device: None,
+        memory_hotplug_device: None,
+        entropy_device: None,
+    };
+
+    Ok(InstalledSnapshotV1Runtime {
+        memory,
+        mmio_dispatcher,
+        runtime_resources,
+        drive_config,
+        block_retry,
+        serial_output,
+        serial_output_buffer,
     })
 }
 
@@ -3188,8 +3369,10 @@ impl Arm64BootResources {
             runtime: Arm64BootRuntimeResources {
                 machine_config: self.machine_config,
                 layout: self.layout,
-                loaded_boot_source: self.loaded_boot_source,
-                fdt: self.fdt,
+                boot_origin: Some(Arm64BootOriginMetadata {
+                    loaded_boot_source: self.loaded_boot_source,
+                    fdt: self.fdt,
+                }),
                 rtc_device: self.rtc_device,
                 serial_device: self.serial_device,
                 vmgenid_device: self.vmgenid_device,
@@ -8067,11 +8250,16 @@ mod tests {
 
         assert_eq!(parts.memory.total_size(), memory_size);
         assert_eq!(parts.runtime.layout, layout);
+        let boot_origin = parts
+            .runtime
+            .boot_origin
+            .as_ref()
+            .expect("boot resources should retain boot-origin metadata");
         assert_eq!(
-            parts.runtime.loaded_boot_source.kernel.entry_address,
+            boot_origin.loaded_boot_source.kernel.entry_address,
             kernel_entry
         );
-        assert_eq!(parts.runtime.fdt, fdt);
+        assert_eq!(boot_origin.fdt, fdt);
         assert_eq!(parts.runtime.block_devices.len(), 1);
         assert!(parts.runtime.vsock_device.is_none());
         assert!(parts.runtime.entropy_device.is_none());

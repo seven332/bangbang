@@ -1488,10 +1488,15 @@ mod tests {
     };
     use crate::fdt::Arm64FdtRegion;
     use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatus, GuestInterruptLine};
+    use crate::machine::MachineConfig;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange, aarch64};
     use crate::mmio::{MmioRegion, MmioRegionId};
+    use crate::rtc::RtcMmioLayout;
     use crate::serial::SerialMmioState;
-    use crate::startup::{PrepareSnapshotV1DeviceProfileError, prepare_snapshot_v1_device_profile};
+    use crate::startup::{
+        PrepareSnapshotV1DeviceProfileError, install_snapshot_v1_runtime,
+        prepare_snapshot_v1_device_profile,
+    };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
@@ -1865,6 +1870,68 @@ mod tests {
             prepare_snapshot_v1_device_profile(&duplicate_interrupt, &memory, Instant::now())
                 .expect_err("duplicate device interrupts should reject"),
             PrepareSnapshotV1DeviceProfileError::ConflictingMetadata
+        );
+    }
+
+    #[test]
+    fn installation_consumes_prepared_state_without_boot_writes() {
+        let file = TempFile::new(&[0x5a; 512]);
+        let (_, identity) = BlockFileBacking::open_snapshot_read_only(file.path())
+            .expect("test backing should identify");
+        let mut state = fixture_with_path(file.path().to_path_buf(), identity);
+        let vmclock_base = aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE - 4096;
+        let vmgenid_base = vmclock_base - 16;
+        state.vmgenid = platform(vmgenid_base, 16, 34);
+        state.vmclock = platform(vmclock_base, 4096, 35);
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(
+                GuestAddress::new(aarch64::SYSTEM_MEM_START),
+                aarch64::SYSTEM_MEM_SIZE,
+            )
+            .expect("test memory range should be valid"),
+        ])
+        .expect("test memory layout should be valid");
+        let mut memory = GuestMemory::allocate(&layout).expect("test memory should allocate");
+        let boot_area = vec![0xa5; 16 * 1024];
+        memory
+            .write_slice(&boot_area, GuestAddress::new(aarch64::SYSTEM_MEM_START))
+            .expect("source boot area should write");
+        memory
+            .write_slice(&[0x7a; 16], state.vmgenid().range().start())
+            .expect("source generation should write");
+
+        let prepared = prepare_snapshot_v1_device_profile(&state, &memory, Instant::now())
+            .expect("supported device state should prepare");
+        let installed = install_snapshot_v1_runtime(
+            prepared,
+            MachineConfig::default(),
+            memory,
+            RtcMmioLayout::new(GuestAddress::new(0x4000_1000), MmioRegionId::new(10)),
+        )
+        .expect("prepared state should install");
+
+        let mut restored_boot_area = vec![0; boot_area.len()];
+        installed
+            .memory
+            .read_slice(
+                &mut restored_boot_area,
+                GuestAddress::new(aarch64::SYSTEM_MEM_START),
+            )
+            .expect("installed memory should remain readable");
+        assert_eq!(restored_boot_area, boot_area);
+        assert!(installed.runtime_resources.boot_origin.is_none());
+        assert_eq!(installed.runtime_resources.block_devices.len(), 1);
+        assert!(installed.runtime_resources.serial_device.is_some());
+        assert!(installed.runtime_resources.rtc_device.is_some());
+        assert_eq!(installed.drive_config.path_on_host(), file.path());
+        assert_eq!(installed.block_retry, SnapshotV1BlockRetryState::None);
+        assert_eq!(installed.mmio_dispatcher.regions().len(), 3);
+        assert_eq!(
+            installed
+                .serial_output_buffer
+                .bytes()
+                .expect("fresh serial output should read"),
+            Vec::<u8>::new()
         );
     }
 

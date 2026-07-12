@@ -11,6 +11,7 @@ mod runner;
 mod sme;
 mod snapshot;
 mod snapshot_bundle;
+mod snapshot_restore;
 mod startup;
 mod vcpu;
 mod vcpu_config;
@@ -32,8 +33,10 @@ pub use gic::{
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
 pub use runner::{
-    HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1CaptureStage, HvfVcpuRunCancelHandle,
-    HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
+    HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1CaptureStage,
+    HvfArm64SnapshotV1CompatibilityError, HvfArm64SnapshotV1Restore,
+    HvfArm64SnapshotV1RestoreStage, HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner,
+    HvfVcpuRunnerError,
 };
 pub use sme::HvfArm64SmeConfiguration;
 pub use snapshot::{
@@ -47,6 +50,11 @@ pub use snapshot_bundle::{
     HvfSnapshotV1CompatibilityState, HvfSnapshotV1DecodeError, HvfSnapshotV1EncodeError,
     HvfSnapshotV1InterruptState, HvfSnapshotV1State, HvfSnapshotV1VcpuState,
     decode_hvf_snapshot_v1_state, encode_hvf_snapshot_v1_state,
+};
+pub use snapshot_restore::{
+    HvfSnapshotV1PlatformError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
+    HvfSnapshotV1RestoreError, HvfSnapshotV1RestoreFailure, HvfSnapshotV1RestoreStage,
+    PrepareHvfSnapshotV1LoadError, PreparedHvfSnapshotV1Load,
 };
 pub use startup::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootBlockNotificationDispatch,
@@ -63,7 +71,7 @@ pub use startup::{
     HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootTimerDeviceConfig,
     HvfArm64BootVmGenIdRestoreError, HvfArm64BootVsockNotificationDispatch,
     HvfArm64BootVsockNotificationDispatchError, HvfArm64BootVsockNotificationDispatches,
-    OwnedHvfArm64BootSession,
+    OwnedHvfArm64BootSession, RestoredHvfArm64BootSession,
 };
 pub use vcpu::{
     ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,

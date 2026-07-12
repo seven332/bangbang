@@ -37,7 +37,7 @@ use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::pmem::{PmemMmioLayout, VirtioPmemFlushStatus};
 use bangbang_runtime::rtc::RtcMmioLayout;
-use bangbang_runtime::serial::{SerialConfig, SharedSerialOutput};
+use bangbang_runtime::serial::{SerialConfig, SharedSerialOutput, SharedSerialOutputBuffer};
 use bangbang_runtime::snapshot_device::{SnapshotV1BlockRetryState, SnapshotV1DeviceState};
 use bangbang_runtime::startup::{
     Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
@@ -57,8 +57,8 @@ use bangbang_runtime::startup::{
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig, Arm64BootVmGenIdDevice,
     Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
     Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
-    Arm64BootVsockWakeupFdsError, memory_hotplug_status_for_device, replace_arm64_boot_vmgenid,
-    update_memory_hotplug_config_for_device,
+    Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, memory_hotplug_status_for_device,
+    replace_arm64_boot_vmgenid, update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -70,13 +70,17 @@ use crate::gic::{
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
 use crate::runner::{
-    HvfArm64SnapshotV1Capture, HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner,
-    HvfVcpuRunnerError,
+    HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1Restore, HvfVcpuRunCancelHandle,
+    HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 use crate::snapshot::HvfArm64SnapshotTimerState;
 use crate::snapshot_bundle::{
     HvfSnapshotV1CompatibilityState, HvfSnapshotV1EncodeError, HvfSnapshotV1State,
     encode_hvf_snapshot_v1_state,
+};
+use crate::snapshot_restore::{
+    HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreError, HvfSnapshotV1RestoreFailure,
+    HvfSnapshotV1RestoreStage, PreparedHvfSnapshotV1Load,
 };
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
@@ -292,7 +296,7 @@ pub struct HvfArm64BootSession<'vm> {
     serial_interrupt_line: Option<GuestInterruptLine>,
     vmgenid_interrupt_line: GuestInterruptLine,
     vmclock_interrupt_line: GuestInterruptLine,
-    boot_registers: HvfArm64BootRegisters,
+    boot_registers: Option<HvfArm64BootRegisters>,
 }
 
 #[derive(Debug)]
@@ -326,7 +330,58 @@ pub struct OwnedHvfArm64BootSession {
     serial_interrupt_line: Option<GuestInterruptLine>,
     vmgenid_interrupt_line: GuestInterruptLine,
     vmclock_interrupt_line: GuestInterruptLine,
-    boot_registers: HvfArm64BootRegisters,
+    boot_registers: Option<HvfArm64BootRegisters>,
+}
+
+/// A never-run native-v1 session plus process-owned restored configuration.
+pub struct RestoredHvfArm64BootSession {
+    session: OwnedHvfArm64BootSession,
+    drive_config: DriveConfig,
+    serial_output: SharedSerialOutput,
+    serial_output_buffer: SharedSerialOutputBuffer,
+}
+
+impl RestoredHvfArm64BootSession {
+    pub const fn session(&self) -> &OwnedHvfArm64BootSession {
+        &self.session
+    }
+
+    pub const fn drive_config(&self) -> &DriveConfig {
+        &self.drive_config
+    }
+
+    pub const fn serial_output(&self) -> &SharedSerialOutput {
+        &self.serial_output
+    }
+
+    pub const fn serial_output_buffer(&self) -> &SharedSerialOutputBuffer {
+        &self.serial_output_buffer
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        OwnedHvfArm64BootSession,
+        DriveConfig,
+        SharedSerialOutput,
+        SharedSerialOutputBuffer,
+    ) {
+        (
+            self.session,
+            self.drive_config,
+            self.serial_output,
+            self.serial_output_buffer,
+        )
+    }
+}
+
+impl fmt::Debug for RestoredHvfArm64BootSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RestoredHvfArm64BootSession")
+            .field("profile", &"native-v1")
+            .field("resources", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -476,7 +531,7 @@ impl HvfArm64BootLimiterRetryWakeupScheduler {
         })
     }
 
-    fn stop(&mut self) {
+    fn stop_with_result(&mut self) -> Result<(), ()> {
         {
             let mut state = lock_limiter_retry_wakeup_state(&self.shared);
             state.status = HvfArm64BootLimiterRetryWakeupSchedulerStatus::Stopped;
@@ -485,9 +540,14 @@ impl HvfArm64BootLimiterRetryWakeupScheduler {
         }
         self.shared.condvar.notify_all();
 
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        match self.thread.take() {
+            Some(thread) => thread.join().map_err(|_| ()),
+            None => Ok(()),
         }
+    }
+
+    fn stop(&mut self) {
+        let _ = self.stop_with_result();
     }
 }
 
@@ -1533,7 +1593,7 @@ impl HvfArm64BootSession<'_> {
         self.vmclock_interrupt_line
     }
 
-    pub const fn boot_registers(&self) -> HvfArm64BootRegisters {
+    pub const fn boot_registers(&self) -> Option<HvfArm64BootRegisters> {
         self.boot_registers
     }
 
@@ -2436,6 +2496,27 @@ impl Drop for HvfArm64BootSession<'_> {
     }
 }
 
+fn failed_snapshot_v1_restore(
+    stage: HvfSnapshotV1RestoreStage,
+    failure: HvfSnapshotV1RestoreFailure,
+    scheduler: &mut Option<HvfArm64BootLimiterRetryWakeupScheduler>,
+    runner: &mut Option<HvfVcpuRunner<'static>>,
+    backend: &mut HvfBackend,
+) -> HvfSnapshotV1RestoreError {
+    let scheduler_failed = scheduler
+        .as_mut()
+        .is_some_and(|scheduler| scheduler.stop_with_result().is_err());
+    drop(scheduler.take());
+    let runner_error = runner.as_mut().and_then(|runner| runner.shutdown().err());
+    drop(runner.take());
+    let backend_error = <HvfBackend as VmBackend>::destroy_vm(backend).err();
+    HvfSnapshotV1RestoreError::new(
+        stage,
+        failure,
+        HvfSnapshotV1RestoreCleanup::new(scheduler_failed, runner_error, backend_error),
+    )
+}
+
 impl OwnedHvfArm64BootSession {
     pub fn new(
         controller: &VmmController,
@@ -2482,6 +2563,277 @@ impl OwnedHvfArm64BootSession {
             vmgenid_interrupt_line: prepared.vmgenid_interrupt_line,
             vmclock_interrupt_line: prepared.vmclock_interrupt_line,
             boot_registers: prepared.boot_registers,
+        })
+    }
+
+    /// Construct and completely restore one never-run native-v1 destination.
+    pub fn restore_snapshot_v1(
+        prepared: PreparedHvfSnapshotV1Load,
+    ) -> Result<RestoredHvfArm64BootSession, HvfSnapshotV1RestoreError> {
+        let (state, installed) = prepared.into_parts();
+        let (_machine, compatibility, vcpu_state, interrupt_state, _device_state) =
+            state.into_parts();
+        let expected_gic = compatibility.gic_metadata();
+        let primary_mpidr = compatibility.primary_mpidr();
+        let restore_state = HvfArm64SnapshotV1Restore::new(
+            compatibility.identification(),
+            compatibility.optional_sve_sme_identification(),
+            primary_mpidr,
+            vcpu_state,
+            interrupt_state,
+        );
+
+        let InstalledSnapshotV1Runtime {
+            memory,
+            mmio_dispatcher,
+            mut runtime_resources,
+            drive_config,
+            block_retry,
+            serial_output,
+            serial_output_buffer,
+        } = installed;
+        let block_interrupt_lines = runtime_resources
+            .block_devices
+            .iter()
+            .map(|device| device.fdt_device.interrupt_line)
+            .collect::<Vec<_>>();
+        let serial_interrupt_line = runtime_resources
+            .serial_device
+            .as_ref()
+            .map(|device| device.fdt_device.interrupt_line);
+        let vmgenid_interrupt_line = runtime_resources.vmgenid_device.fdt_device.interrupt_line;
+        let vmclock_interrupt_line = runtime_resources.vmclock_device.fdt_device.interrupt_line;
+        let block_device_metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(
+            runtime_resources
+                .block_devices
+                .iter()
+                .map(|device| device.registration.drive_id()),
+        );
+
+        let mut backend = HvfBackend::new();
+        let mut runner: Option<HvfVcpuRunner<'static>> = None;
+        let mut block_retry_wakeup_scheduler = None;
+
+        if let Err(source) = <HvfBackend as VmBackend>::create_vm(&mut backend) {
+            return Err(failed_snapshot_v1_restore(
+                HvfSnapshotV1RestoreStage::CreateVm,
+                HvfSnapshotV1RestoreFailure::Backend(source),
+                &mut block_retry_wakeup_scheduler,
+                &mut runner,
+                &mut backend,
+            ));
+        }
+        let gic = match backend.create_gic() {
+            Ok(gic) => *gic,
+            Err(source) => {
+                return Err(failed_snapshot_v1_restore(
+                    HvfSnapshotV1RestoreStage::CreateGic,
+                    HvfSnapshotV1RestoreFailure::Gic(source),
+                    &mut block_retry_wakeup_scheduler,
+                    &mut runner,
+                    &mut backend,
+                ));
+            }
+        };
+        if gic != expected_gic {
+            return Err(failed_snapshot_v1_restore(
+                HvfSnapshotV1RestoreStage::ValidateGic,
+                HvfSnapshotV1RestoreFailure::GicMetadataMismatch,
+                &mut block_retry_wakeup_scheduler,
+                &mut runner,
+                &mut backend,
+            ));
+        }
+        if backend
+            .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+            .is_err()
+        {
+            return Err(failed_snapshot_v1_restore(
+                HvfSnapshotV1RestoreStage::MapMemory,
+                HvfSnapshotV1RestoreFailure::MemoryMapping,
+                &mut block_retry_wakeup_scheduler,
+                &mut runner,
+                &mut backend,
+            ));
+        }
+        match backend.start_session_vcpu_runner() {
+            Ok(created) => runner = Some(created),
+            Err(source) => {
+                return Err(failed_snapshot_v1_restore(
+                    HvfSnapshotV1RestoreStage::StartRunner,
+                    HvfSnapshotV1RestoreFailure::Runner(Box::new(source)),
+                    &mut block_retry_wakeup_scheduler,
+                    &mut runner,
+                    &mut backend,
+                ));
+            }
+        }
+
+        let block_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let run_cancel_handle = match runner.as_ref() {
+            Some(runner) => runner.run_cancel_handle(),
+            None => {
+                return Err(failed_snapshot_v1_restore(
+                    HvfSnapshotV1RestoreStage::AssembleSession,
+                    HvfSnapshotV1RestoreFailure::InvalidRuntime,
+                    &mut block_retry_wakeup_scheduler,
+                    &mut runner,
+                    &mut backend,
+                ));
+            }
+        };
+        let created_scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start(
+            BLOCK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+            run_cancel_handle,
+            block_retry_wakeup.clone(),
+        );
+        match created_scheduler {
+            Ok(scheduler) => block_retry_wakeup_scheduler = Some(scheduler),
+            Err(source) => {
+                return Err(failed_snapshot_v1_restore(
+                    HvfSnapshotV1RestoreStage::StartBlockRetryScheduler,
+                    HvfSnapshotV1RestoreFailure::Scheduler(source.kind()),
+                    &mut block_retry_wakeup_scheduler,
+                    &mut runner,
+                    &mut backend,
+                ));
+            }
+        }
+
+        let restore_result = match runner.as_ref() {
+            Some(runner) => runner.restore_arm64_snapshot_v1_state(restore_state),
+            None => {
+                return Err(failed_snapshot_v1_restore(
+                    HvfSnapshotV1RestoreStage::AssembleSession,
+                    HvfSnapshotV1RestoreFailure::InvalidRuntime,
+                    &mut block_retry_wakeup_scheduler,
+                    &mut runner,
+                    &mut backend,
+                ));
+            }
+        };
+        if let Err(source) = restore_result {
+            return Err(failed_snapshot_v1_restore(
+                HvfSnapshotV1RestoreStage::RestoreRunnerState,
+                HvfSnapshotV1RestoreFailure::Runner(Box::new(source)),
+                &mut block_retry_wakeup_scheduler,
+                &mut runner,
+                &mut backend,
+            ));
+        }
+        let vmgenid_result = match runner.as_ref() {
+            Some(runner) => replace_vmgenid_for_snapshot_restore(
+                runner,
+                &mut backend,
+                &mut runtime_resources,
+                gic,
+                vmgenid_interrupt_line,
+            ),
+            None => {
+                return Err(failed_snapshot_v1_restore(
+                    HvfSnapshotV1RestoreStage::AssembleSession,
+                    HvfSnapshotV1RestoreFailure::InvalidRuntime,
+                    &mut block_retry_wakeup_scheduler,
+                    &mut runner,
+                    &mut backend,
+                ));
+            }
+        };
+        if let Err(source) = vmgenid_result {
+            return Err(failed_snapshot_v1_restore(
+                HvfSnapshotV1RestoreStage::ReplaceVmGenId,
+                HvfSnapshotV1RestoreFailure::VmGenId(Box::new(source)),
+                &mut block_retry_wakeup_scheduler,
+                &mut runner,
+                &mut backend,
+            ));
+        }
+
+        let retry_after = match block_retry {
+            SnapshotV1BlockRetryState::None => None,
+            SnapshotV1BlockRetryState::Immediate => Some(Duration::ZERO),
+            SnapshotV1BlockRetryState::After { remaining_nanos } => {
+                Some(Duration::from_nanos(remaining_nanos))
+            }
+        };
+        match block_retry_wakeup_scheduler.as_ref() {
+            Some(scheduler) => scheduler.schedule_after(retry_after),
+            None => {
+                return Err(failed_snapshot_v1_restore(
+                    HvfSnapshotV1RestoreStage::AssembleSession,
+                    HvfSnapshotV1RestoreFailure::InvalidRuntime,
+                    &mut block_retry_wakeup_scheduler,
+                    &mut runner,
+                    &mut backend,
+                ));
+            }
+        }
+
+        let runner = match runner.take() {
+            Some(runner) => runner,
+            None => {
+                return Err(failed_snapshot_v1_restore(
+                    HvfSnapshotV1RestoreStage::AssembleSession,
+                    HvfSnapshotV1RestoreFailure::InvalidRuntime,
+                    &mut block_retry_wakeup_scheduler,
+                    &mut runner,
+                    &mut backend,
+                ));
+            }
+        };
+        let block_retry_wakeup_scheduler = match block_retry_wakeup_scheduler.take() {
+            Some(scheduler) => scheduler,
+            None => {
+                let mut runner = Some(runner);
+                return Err(failed_snapshot_v1_restore(
+                    HvfSnapshotV1RestoreStage::AssembleSession,
+                    HvfSnapshotV1RestoreFailure::InvalidRuntime,
+                    &mut block_retry_wakeup_scheduler,
+                    &mut runner,
+                    &mut backend,
+                ));
+            }
+        };
+
+        let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let session = Self {
+            runner,
+            backend,
+            mmio_dispatcher: Arc::new(Mutex::new(mmio_dispatcher)),
+            runtime_resources,
+            control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
+            run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
+            block_retry_wakeup,
+            block_retry_wakeup_scheduler,
+            entropy_retry_wakeup,
+            entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            entropy_source: VirtioRngOsEntropySource::new(),
+            block_device_metrics,
+            pmem_device_metrics: SharedPmemDeviceMetricsRegistry::default(),
+            balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+            network_interface_metrics: SharedNetworkInterfaceMetricsRegistry::default(),
+            vsock_device_metrics: SharedVsockDeviceMetrics::default(),
+            entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
+            gic,
+            primary_mpidr,
+            block_interrupt_lines,
+            pmem_interrupt_lines: Vec::new(),
+            network_interrupt_lines: Vec::new(),
+            vsock_interrupt_line: None,
+            balloon_interrupt_line: None,
+            entropy_interrupt_line: None,
+            memory_hotplug_interrupt_line: None,
+            serial_interrupt_line,
+            vmgenid_interrupt_line,
+            vmclock_interrupt_line,
+            boot_registers: None,
+        };
+
+        Ok(RestoredHvfArm64BootSession {
+            session,
+            drive_config,
+            serial_output,
+            serial_output_buffer,
         })
     }
 
@@ -2588,6 +2940,21 @@ impl OwnedHvfArm64BootSession {
             (Ok(()), Err(source)) => Err(HvfArm64BootSessionShutdownError::DestroyVm { source }),
             (Ok(()), Ok(())) => Ok(()),
         }
+    }
+
+    /// Explicit cleanup evidence for an uncommitted restored destination.
+    pub fn teardown_snapshot_v1(&mut self) -> HvfSnapshotV1RestoreCleanup {
+        let scheduler_failed = self
+            .block_retry_wakeup_scheduler
+            .stop_with_result()
+            .is_err()
+            | self
+                .entropy_retry_wakeup_scheduler
+                .stop_with_result()
+                .is_err();
+        let runner = self.runner.shutdown().err();
+        let backend = <HvfBackend as VmBackend>::destroy_vm(&mut self.backend).err();
+        HvfSnapshotV1RestoreCleanup::new(scheduler_failed, runner, backend)
     }
 
     pub const fn gic_metadata(&self) -> HvfGicMetadata {
@@ -2699,7 +3066,7 @@ impl OwnedHvfArm64BootSession {
         self.vmclock_interrupt_line
     }
 
-    pub const fn boot_registers(&self) -> HvfArm64BootRegisters {
+    pub const fn boot_registers(&self) -> Option<HvfArm64BootRegisters> {
         self.boot_registers
     }
 
@@ -6802,7 +7169,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     serial_interrupt_line: Option<GuestInterruptLine>,
     vmgenid_interrupt_line: GuestInterruptLine,
     vmclock_interrupt_line: GuestInterruptLine,
-    boot_registers: HvfArm64BootRegisters,
+    boot_registers: Option<HvfArm64BootRegisters>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6963,6 +7330,10 @@ fn prepare_arm64_boot_session_parts<'vm>(
         },
     )
     .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
+    let boot_registers = HvfArm64BootRegisters {
+        kernel_entry: resources.loaded_boot_source.kernel.entry_address,
+        fdt_address: resources.fdt.address,
+    };
     let Arm64BootResourceParts {
         memory,
         mut mmio_dispatcher,
@@ -6984,10 +7355,6 @@ fn prepare_arm64_boot_session_parts<'vm>(
             HvfMemoryPermissions::GUEST_RAM,
         )
         .map_err(|source| HvfArm64BootSessionError::MapGuestMemory { source })?;
-    let boot_registers = HvfArm64BootRegisters {
-        kernel_entry: runtime.loaded_boot_source.kernel.entry_address,
-        fdt_address: runtime.fdt.address,
-    };
     runner
         .configure_arm64_boot_registers(boot_registers)
         .map_err(|source| HvfArm64BootSessionError::ConfigureBootRegisters { source })?;
@@ -7057,7 +7424,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         serial_interrupt_line: interrupt_lines.serial,
         vmgenid_interrupt_line: interrupt_lines.vmgenid,
         vmclock_interrupt_line: interrupt_lines.vmclock,
-        boot_registers,
+        boot_registers: Some(boot_registers),
     })
 }
 

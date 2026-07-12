@@ -451,6 +451,15 @@ impl DriveConfigs {
         &self.configs
     }
 
+    pub(crate) fn from_validated_single(
+        config: DriveConfig,
+    ) -> Result<Self, std::collections::TryReserveError> {
+        let mut configs = Vec::new();
+        configs.try_reserve_exact(1)?;
+        configs.push(config);
+        Ok(Self { configs })
+    }
+
     pub fn insert(&mut self, input: DriveConfigInput) -> Result<(), DriveConfigError> {
         let config = input.validate()?;
         if config.is_root_device()
@@ -4069,6 +4078,14 @@ pub struct BlockMmioDeviceRegistration {
 }
 
 impl BlockMmioDeviceRegistration {
+    pub(crate) fn from_restored(index: usize, drive_id: String, region: MmioRegion) -> Self {
+        Self {
+            index,
+            drive_id,
+            region,
+        }
+    }
+
     pub const fn index(&self) -> usize {
         self.index
     }

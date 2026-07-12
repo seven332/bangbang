@@ -501,8 +501,14 @@ image under limiter quiescence, decodes and validates both the kind-2 bundle and
 nested device state without logging raw values, and repeats capture with a
 fresh image identity. The guest first leaves non-default serial scratch state;
 after both captures, the original source continues from its retained PC to the
-next fixed HVC and the runner owner remains usable before shutdown. This proves
-capture did not reconstruct, replace, run, or consume the source session.
+next fixed HVC and the runner owner remains usable before shutdown. After source
+shutdown, the test writes the captured state and memory as distinct disk
+artifacts, reloads them through the production loader, constructs a fresh
+destination VM, and verifies pre-run vCPU/ICC/pending/device state, normalized
+timer equivalence, VMGenID replacement, absent boot-origin metadata, and
+continuation from the captured PC. Opaque GIC bytes are asserted nonempty and
+bounded after recapture rather than byte-equal because Hypervisor.framework's
+stable versioned serialization is not a canonical encoding.
 Run the repository command without `--allow-unsupported`; this evidence must
 execute on supported Apple Silicon hosts.
 
