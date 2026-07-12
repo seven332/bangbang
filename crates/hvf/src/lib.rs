@@ -9,6 +9,7 @@ mod mmio;
 mod psci;
 mod runner;
 mod sme;
+mod snapshot;
 mod startup;
 mod vcpu;
 mod vcpu_config;
@@ -33,6 +34,12 @@ pub use runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 pub use sme::HvfArm64SmeConfiguration;
+pub use snapshot::{
+    HvfArm64SnapshotOptionalStateRejection, HvfArm64SnapshotTimerPolicyError,
+    HvfArm64SnapshotTimerRestoreError, HvfArm64SnapshotTimerRestoreOperation,
+    HvfArm64SnapshotTimerState, normalize_arm64_snapshot_timer_state,
+    validate_native_v1_arm64_snapshot_optional_state,
+};
 pub use startup::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootBlockNotificationDispatch,
     HvfArm64BootBlockNotificationDispatchError, HvfArm64BootBlockNotificationDispatches,
@@ -44,8 +51,9 @@ pub use startup::{
     HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken,
     HvfArm64BootSerialDeviceConfig, HvfArm64BootSession, HvfArm64BootSessionConfig,
     HvfArm64BootSessionError, HvfArm64BootSessionShutdownError, HvfArm64BootTimerDeviceConfig,
-    HvfArm64BootVsockNotificationDispatch, HvfArm64BootVsockNotificationDispatchError,
-    HvfArm64BootVsockNotificationDispatches, OwnedHvfArm64BootSession,
+    HvfArm64BootVmGenIdRestoreError, HvfArm64BootVsockNotificationDispatch,
+    HvfArm64BootVsockNotificationDispatchError, HvfArm64BootVsockNotificationDispatches,
+    OwnedHvfArm64BootSession,
 };
 pub use vcpu::{
     ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,

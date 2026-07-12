@@ -51,11 +51,16 @@ typed MDCCINT_EL1/MDSCR_EL1 value, raw Hypervisor.framework debug-trap policy
 plus ordered nontransactional restore of its complete two-Boolean value,
 pointer-authentication key state with redacted `Debug` plus ordered
 nontransactional restore of the complete APIA/APIB/APDA/APDB/APGA value, raw
-physical and virtual timer state, CPU-level IRQ/FIQ pending injection
+physical and virtual timer state plus a separate debug-redacted normalized
+timer value with ordered never-run restore, CPU-level IRQ/FIQ pending injection
 levels plus ordered nontransactional restore of their complete typed value,
 opaque GIC device state plus runner-owned pre-first-run reapply, and raw EL1
 GIC ICC CPU-interface registers plus ordered pre-first-run restore of their nine
 mutable values with derived RPR validation.
+A native-v1 optional-state classifier fails closed for active SVE/SME and
+enabled hardware breakpoint/watchpoint state. Prepared boot sessions can also
+replace the 16-byte VMGenID buffer and retained metadata before first run, then
+inject its edge-rising SPI after replacement.
 A separate no-handle query exposes the maximum SME streaming vector length used
 for the Z-, P-, and ZA-register allocations. These are internal snapshot
 feasibility primitives only. bangbang now has a bounded native-v1 outer state
@@ -68,7 +73,8 @@ create/load wiring, complete restore, a composite VM-state
 payload schema, remaining vCPU state, EL2 GIC CPU-interface state,
 effective-SVL interpretation, SME/SME2 feature and destination policy,
 remaining setters and transition ordering, cache-topology manifests, and
-complete emulated device state remain unsupported.
+complete emulated device state, and cross-step restore leasing remain
+unsupported.
 
 ## Process CLI
 

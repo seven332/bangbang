@@ -74,7 +74,7 @@ use crate::vsock::{
 
 const MIB: u64 = 1024 * 1024;
 pub const ARM64_BOOT_VMGENID_SIZE: usize = ARM64_FDT_VMGENID_SIZE as usize;
-const ARM64_BOOT_VMGENID_ALIGNMENT: u64 = 8;
+const ARM64_BOOT_VMGENID_ALIGNMENT: u64 = ARM64_FDT_VMGENID_SIZE;
 pub const ARM64_BOOT_VMCLOCK_SIZE: usize = ARM64_FDT_VMCLOCK_SIZE as usize;
 const ARM64_BOOT_VMCLOCK_ALIGNMENT: u64 = ARM64_FDT_VMCLOCK_SIZE;
 const ARM64_BOOT_VMCLOCK_ABI_SIZE: usize = 112;
@@ -238,11 +238,104 @@ pub enum Arm64BootVsockWakeupFdsError {
     ResultAllocation { source: TryReserveError },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Arm64BootVmGenIdDevice {
     pub range: GuestMemoryRange,
     pub generation_id: [u8; ARM64_BOOT_VMGENID_SIZE],
     pub fdt_device: Arm64FdtVmGenIdDevice,
+}
+
+impl fmt::Debug for Arm64BootVmGenIdDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Arm64BootVmGenIdDevice")
+            .field("range", &self.range)
+            .field("generation_id", &"<redacted>")
+            .field("fdt_device", &self.fdt_device)
+            .finish()
+    }
+}
+
+/// Failure while replacing the retained arm64 VM Generation ID.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Arm64BootVmGenIdReplacementError {
+    /// The retained device range is not exactly the VMGenID ABI size.
+    InvalidRange,
+    /// Host randomness could not fill a complete candidate value.
+    Random,
+    /// The complete candidate could not be written to guest memory.
+    GuestMemoryWrite { source: GuestMemoryAccessError },
+}
+
+impl fmt::Debug for Arm64BootVmGenIdReplacementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stage = match self {
+            Self::InvalidRange => "invalid-range",
+            Self::Random => "random",
+            Self::GuestMemoryWrite { .. } => "guest-memory-write",
+        };
+        f.debug_struct("Arm64BootVmGenIdReplacementError")
+            .field("stage", &stage)
+            .finish()
+    }
+}
+
+impl fmt::Display for Arm64BootVmGenIdReplacementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRange => f.write_str("retained arm64 VMGenID range is invalid"),
+            Self::Random => f.write_str("failed to generate replacement arm64 VMGenID"),
+            Self::GuestMemoryWrite { .. } => {
+                f.write_str("failed to write replacement arm64 VMGenID to guest memory")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootVmGenIdReplacementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::GuestMemoryWrite { source } => Some(source),
+            Self::InvalidRange | Self::Random => None,
+        }
+    }
+}
+
+/// Replace a prepared arm64 VMGenID buffer and retained host metadata.
+///
+/// A complete nonzero value distinct from the retained generation is written
+/// first. Host metadata is committed only after that guest-memory write
+/// succeeds. Interrupt notification is backend-specific and deliberately not
+/// performed by this helper.
+pub fn replace_arm64_boot_vmgenid(
+    memory: &mut GuestMemory,
+    device: &mut Arm64BootVmGenIdDevice,
+) -> Result<(), Arm64BootVmGenIdReplacementError> {
+    replace_arm64_boot_vmgenid_with(memory, device, |candidate| {
+        getrandom::fill(candidate).map_err(|_| Arm64BootVmGenIdReplacementError::Random)
+    })
+}
+
+fn replace_arm64_boot_vmgenid_with(
+    memory: &mut GuestMemory,
+    device: &mut Arm64BootVmGenIdDevice,
+    fill_candidate: impl FnOnce(
+        &mut [u8; ARM64_BOOT_VMGENID_SIZE],
+    ) -> Result<(), Arm64BootVmGenIdReplacementError>,
+) -> Result<(), Arm64BootVmGenIdReplacementError> {
+    if device.range.size() != ARM64_FDT_VMGENID_SIZE {
+        return Err(Arm64BootVmGenIdReplacementError::InvalidRange);
+    }
+
+    let mut candidate = [0; ARM64_BOOT_VMGENID_SIZE];
+    fill_candidate(&mut candidate)?;
+    ensure_nonzero_vmgenid_generation_id(&mut candidate);
+    ensure_distinct_vmgenid_generation_id(&mut candidate, &device.generation_id);
+
+    memory
+        .write_slice(&candidate, device.range.start())
+        .map_err(|source| Arm64BootVmGenIdReplacementError::GuestMemoryWrite { source })?;
+    device.generation_id = candidate;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2777,6 +2870,18 @@ fn ensure_nonzero_vmgenid_generation_id(generation_id: &mut [u8; ARM64_BOOT_VMGE
     }
 }
 
+fn ensure_distinct_vmgenid_generation_id(
+    candidate: &mut [u8; ARM64_BOOT_VMGENID_SIZE],
+    retained: &[u8; ARM64_BOOT_VMGENID_SIZE],
+) {
+    if candidate == retained
+        && let Some(first_byte) = candidate.first_mut()
+    {
+        *first_byte = first_byte.wrapping_add(1);
+        ensure_nonzero_vmgenid_generation_id(candidate);
+    }
+}
+
 fn initial_vmclock_backing_page() -> Vec<u8> {
     let mut bytes = initial_vmclock_abi_bytes();
     bytes.resize(ARM64_BOOT_VMCLOCK_SIZE, 0);
@@ -3218,12 +3323,13 @@ mod tests {
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
         Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources,
         Arm64BootRtcDeviceConfig, Arm64BootRtcMmioRegistrationError, Arm64BootSerialDeviceConfig,
-        Arm64BootSerialMmioRegistrationError, MIB, arm64_boot_network_device_metadata,
+        Arm64BootSerialMmioRegistrationError, Arm64BootVmGenIdDevice,
+        Arm64BootVmGenIdReplacementError, MIB, arm64_boot_network_device_metadata,
         balloon_hinting_status_for_device, balloon_stats_for_device, block_device_metadata,
         ensure_nonzero_vmgenid_generation_id, initial_vmclock_abi_bytes, initial_vmclock_range,
-        initial_vmgenid_range, start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
-        update_balloon_config_for_device, update_balloon_statistics_for_device,
-        update_block_device_for_devices_with_opened,
+        initial_vmgenid_range, replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
+        stop_balloon_hinting_for_device, update_balloon_config_for_device,
+        update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
     };
     use crate::VmmAction;
     use crate::balloon::{
@@ -6043,6 +6149,182 @@ mod tests {
         ensure_nonzero_vmgenid_generation_id(&mut generation_id);
 
         assert!(generation_id.iter().any(|byte| *byte != 0));
+    }
+
+    fn vmgenid_replacement_test_memory() -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(
+                GuestAddress::new(aarch64::SYSTEM_MEM_START),
+                aarch64::SYSTEM_MEM_SIZE,
+            )
+            .expect("VMGenID test page should be valid"),
+        ])
+        .expect("VMGenID test layout should be valid");
+        GuestMemory::allocate(&layout).expect("VMGenID test memory should allocate")
+    }
+
+    fn vmgenid_replacement_test_device(
+        generation_id: [u8; ARM64_BOOT_VMGENID_SIZE],
+    ) -> Arm64BootVmGenIdDevice {
+        let range = initial_vmgenid_range().expect("VMGenID range should be valid");
+        Arm64BootVmGenIdDevice {
+            range,
+            generation_id,
+            fdt_device: super::Arm64FdtVmGenIdDevice {
+                region: Arm64FdtRegion {
+                    base: range.start().raw_value(),
+                    size: range.size(),
+                },
+                interrupt_line: line(127),
+            },
+        }
+    }
+
+    #[test]
+    fn vmgenid_replacement_writes_exact_candidate_before_metadata_commit() {
+        let old = [0x11; ARM64_BOOT_VMGENID_SIZE];
+        let candidate = [0xab; ARM64_BOOT_VMGENID_SIZE];
+        let mut memory = vmgenid_replacement_test_memory();
+        let mut device = vmgenid_replacement_test_device(old);
+        memory
+            .write_slice(&old, device.range.start())
+            .expect("old VMGenID should write");
+
+        replace_arm64_boot_vmgenid_with(&mut memory, &mut device, |destination| {
+            destination.copy_from_slice(&candidate);
+            Ok(())
+        })
+        .expect("VMGenID replacement should succeed");
+
+        assert_eq!(device.generation_id, candidate);
+        assert_eq!(
+            read_guest_bytes(&memory, device.range.start(), ARM64_BOOT_VMGENID_SIZE),
+            candidate
+        );
+        let adjacent = device
+            .range
+            .start()
+            .checked_add(ARM64_BOOT_VMGENID_SIZE as u64)
+            .expect("adjacent test address should not overflow");
+        assert_eq!(read_guest_bytes(&memory, adjacent, 1), vec![0]);
+    }
+
+    #[test]
+    fn vmgenid_replacement_rejects_invalid_range_before_randomness_or_write() {
+        let old = [0x19; ARM64_BOOT_VMGENID_SIZE];
+        let mut memory = vmgenid_replacement_test_memory();
+        let mut device = vmgenid_replacement_test_device(old);
+        device.range = GuestMemoryRange::new(device.range.start(), ARM64_FDT_VMGENID_SIZE - 1)
+            .expect("short VMGenID test range should be valid");
+        let mut fill_called = false;
+
+        let error = replace_arm64_boot_vmgenid_with(&mut memory, &mut device, |_candidate| {
+            fill_called = true;
+            Ok(())
+        })
+        .expect_err("non-ABI-sized VMGenID range should fail closed");
+
+        assert_eq!(error, Arm64BootVmGenIdReplacementError::InvalidRange);
+        assert!(!fill_called);
+        assert_eq!(device.generation_id, old);
+    }
+
+    #[test]
+    fn vmgenid_replacement_normalizes_zero_and_forces_a_distinct_generation() {
+        let mut memory = vmgenid_replacement_test_memory();
+        let mut device = vmgenid_replacement_test_device([0x22; ARM64_BOOT_VMGENID_SIZE]);
+
+        replace_arm64_boot_vmgenid_with(&mut memory, &mut device, |_candidate| Ok(()))
+            .expect("zero candidate should be normalized");
+        assert!(device.generation_id.iter().any(|byte| *byte != 0));
+
+        let retained = device.generation_id;
+        replace_arm64_boot_vmgenid_with(&mut memory, &mut device, |candidate| {
+            candidate.copy_from_slice(&retained);
+            Ok(())
+        })
+        .expect("same candidate should be made distinct");
+        assert_ne!(device.generation_id, retained);
+        assert!(device.generation_id.iter().any(|byte| *byte != 0));
+        assert_eq!(
+            read_guest_bytes(&memory, device.range.start(), ARM64_BOOT_VMGENID_SIZE),
+            device.generation_id
+        );
+    }
+
+    #[test]
+    fn vmgenid_random_failure_is_retryable_without_guest_or_metadata_mutation() {
+        let old = [0x33; ARM64_BOOT_VMGENID_SIZE];
+        let candidate = [0x44; ARM64_BOOT_VMGENID_SIZE];
+        let mut memory = vmgenid_replacement_test_memory();
+        let mut device = vmgenid_replacement_test_device(old);
+        memory
+            .write_slice(&old, device.range.start())
+            .expect("old VMGenID should write");
+
+        assert_eq!(
+            replace_arm64_boot_vmgenid_with(&mut memory, &mut device, |_candidate| {
+                Err(Arm64BootVmGenIdReplacementError::Random)
+            }),
+            Err(Arm64BootVmGenIdReplacementError::Random)
+        );
+        assert_eq!(device.generation_id, old);
+        assert_eq!(
+            read_guest_bytes(&memory, device.range.start(), ARM64_BOOT_VMGENID_SIZE),
+            old
+        );
+
+        replace_arm64_boot_vmgenid_with(&mut memory, &mut device, |destination| {
+            destination.copy_from_slice(&candidate);
+            Ok(())
+        })
+        .expect("VMGenID retry should succeed");
+        assert_eq!(device.generation_id, candidate);
+    }
+
+    #[test]
+    fn vmgenid_guest_write_failure_preserves_retained_metadata() {
+        let old = [0x55; ARM64_BOOT_VMGENID_SIZE];
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), aarch64::SYSTEM_MEM_SIZE)
+                .expect("unmapped test range should be valid"),
+        ])
+        .expect("unmapped test layout should be valid");
+        let mut memory = GuestMemory::allocate(&layout).expect("test memory should allocate");
+        let mut device = vmgenid_replacement_test_device(old);
+
+        let error = replace_arm64_boot_vmgenid_with(&mut memory, &mut device, |candidate| {
+            candidate.fill(0x66);
+            Ok(())
+        })
+        .expect_err("unmapped VMGenID write should fail");
+
+        assert!(matches!(
+            error,
+            Arm64BootVmGenIdReplacementError::GuestMemoryWrite { .. }
+        ));
+        assert_eq!(device.generation_id, old);
+    }
+
+    #[test]
+    fn vmgenid_replacement_debug_output_redacts_generation_and_write_details() {
+        let generation_id = [0xab; ARM64_BOOT_VMGENID_SIZE];
+        let device = vmgenid_replacement_test_device(generation_id);
+        let debug = format!("{device:?}");
+        assert!(!debug.contains("171"));
+        assert!(debug.contains("<redacted>"));
+
+        let error = Arm64BootVmGenIdReplacementError::GuestMemoryWrite {
+            source: crate::memory::GuestMemoryAccessError::UnmappedRange {
+                range: device.range,
+            },
+        };
+        assert!(!format!("{error:?}").contains(&device.range.start().to_string()));
+        assert!(
+            !error
+                .to_string()
+                .contains(&device.range.start().to_string())
+        );
     }
 
     #[test]

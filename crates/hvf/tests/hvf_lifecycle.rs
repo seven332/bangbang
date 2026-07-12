@@ -22,6 +22,35 @@ const PHYSICAL_TIMER_ISTATUS_MASK: u64 = 0b100;
 const PHYSICAL_TIMER_DEFINED_CONTROL_MASK: u64 = 0b111;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_normalized_timer_restore_equivalent(
+    source: bangbang_hvf::HvfArm64SnapshotTimerState,
+    recaptured: bangbang_hvf::HvfArm64SnapshotTimerState,
+) {
+    assert_eq!(
+        recaptured.virtual_timer_exit_masked(),
+        source.virtual_timer_exit_masked()
+    );
+    assert_eq!(recaptured.cntkctl_el1(), source.cntkctl_el1());
+    assert_eq!(recaptured.virtual_control(), source.virtual_control());
+    assert_eq!(
+        recaptured.virtual_compare_value(),
+        source.virtual_compare_value()
+    );
+    assert_eq!(recaptured.physical_control(), source.physical_control());
+
+    let virtual_elapsed = recaptured
+        .virtual_count()
+        .wrapping_sub(source.virtual_count());
+    let physical_elapsed = source
+        .physical_compare_delta()
+        .wrapping_sub(recaptured.physical_compare_delta());
+    assert_eq!(
+        virtual_elapsed, physical_elapsed,
+        "virtual count and physical comparator distance should advance by one shared host-counter interval"
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn assert_sme_pstate_capture_supported_or_unavailable(
     result: Result<bangbang_hvf::HvfArm64VcpuSmePstate, bangbang_hvf::HvfVcpuRunnerError>,
 ) -> Result<Option<bangbang_hvf::HvfArm64VcpuSmePstate>, bangbang_hvf::HvfVcpuRunnerError> {
@@ -2572,6 +2601,78 @@ fn captures_runner_arm64_virtual_timer_state() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn restores_normalized_arm64_timers_across_fresh_hvf_vms() {
+    use bangbang_hvf::{HvfArm64SnapshotTimerState, HvfBackend};
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+
+    backend.create_vm().expect("source VM should be created");
+    backend
+        .create_gic()
+        .expect("source GIC should be created before its vCPU");
+    let source = {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("source vCPU runner should start");
+        let state = runner
+            .capture_arm64_snapshot_timer_state()
+            .expect("source normalized timer state should be captured");
+        runner.shutdown().expect("source runner should shut down");
+        state
+    };
+    backend.destroy_vm().expect("source VM should be destroyed");
+
+    backend
+        .create_vm()
+        .expect("fresh destination VM should be created");
+    backend
+        .create_gic()
+        .expect("destination GIC should be created before its vCPU");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("destination vCPU runner should start");
+        runner
+            .restore_arm64_snapshot_timer_state(source)
+            .expect("source timer state should restore on the fresh unrun vCPU");
+        let recaptured = runner
+            .capture_arm64_snapshot_timer_state()
+            .expect("destination timer state should be recaptured");
+        assert_normalized_timer_restore_equivalent(source, recaptured);
+
+        let armed = HvfArm64SnapshotTimerState::try_new(
+            true,
+            3,
+            recaptured.virtual_count(),
+            0b11,
+            recaptured.virtual_count().wrapping_add(10_000_000),
+            0b11,
+            10_000_000,
+        )
+        .expect("armed normalized timer state should be valid");
+        runner
+            .restore_arm64_snapshot_timer_state(armed)
+            .expect("armed masked timer state should restore before first run");
+        let recaptured_armed = runner
+            .capture_arm64_snapshot_timer_state()
+            .expect("armed timer state should be recaptured");
+        assert_normalized_timer_restore_equivalent(armed, recaptured_armed);
+
+        runner
+            .shutdown()
+            .expect("destination runner should shut down");
+    }
+    backend
+        .destroy_vm()
+        .expect("destination VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_and_restores_runner_arm64_pending_interrupt_state() {
     use bangbang_hvf::{HvfBackend, HvfInterruptType};
     use bangbang_runtime::VmBackend;
@@ -2973,6 +3074,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .capture_arm64_virtual_timer_state()
         .expect("internal session should capture virtual-timer state");
+    let snapshot_timer_state = session
+        .capture_arm64_snapshot_timer_state()
+        .expect("internal session should capture normalized timer state");
     let pending_interrupt_state = session
         .capture_arm64_pending_interrupt_state()
         .expect("internal session should capture pending-interrupt state");
@@ -2999,6 +3103,30 @@ fn prepares_internal_hvf_arm64_boot_session() {
         restored_gic_icc_register_state == gic_icc_register_state,
         "internal session should preserve original GIC ICC register state"
     );
+    session
+        .restore_arm64_snapshot_timer_state(snapshot_timer_state)
+        .expect("internal session should restore normalized timers after GIC state");
+    assert_normalized_timer_restore_equivalent(
+        snapshot_timer_state,
+        session
+            .capture_arm64_snapshot_timer_state()
+            .expect("internal session should recapture normalized timers"),
+    );
+    let old_vmgenid = session.runtime_resources().vmgenid_device;
+    session
+        .replace_vmgenid_for_snapshot_restore()
+        .expect("internal session should replace VMGenID and inject its SPI");
+    let new_vmgenid = session.runtime_resources().vmgenid_device;
+    assert_ne!(new_vmgenid.generation_id, old_vmgenid.generation_id);
+    assert_eq!(new_vmgenid.range, old_vmgenid.range);
+    assert_eq!(new_vmgenid.fdt_device, old_vmgenid.fdt_device);
+    let mut guest_vmgenid = [0; bangbang_runtime::startup::ARM64_BOOT_VMGENID_SIZE];
+    session
+        .guest_memory()
+        .expect("internal session should expose VMGenID guest memory")
+        .read_slice(&mut guest_vmgenid, new_vmgenid.range.start())
+        .expect("internal session replacement VMGenID should read");
+    assert_eq!(guest_vmgenid, new_vmgenid.generation_id);
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();
@@ -3227,6 +3355,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .capture_arm64_virtual_timer_state()
         .expect("owned session should capture virtual-timer state");
+    let snapshot_timer_state = session
+        .capture_arm64_snapshot_timer_state()
+        .expect("owned session should capture normalized timer state");
     let pending_interrupt_state = session
         .capture_arm64_pending_interrupt_state()
         .expect("owned session should capture pending-interrupt state");
@@ -3253,6 +3384,30 @@ fn prepares_owned_hvf_arm64_boot_session() {
         restored_gic_icc_register_state == gic_icc_register_state,
         "owned session should preserve original GIC ICC register state"
     );
+    session
+        .restore_arm64_snapshot_timer_state(snapshot_timer_state)
+        .expect("owned session should restore normalized timers after GIC state");
+    assert_normalized_timer_restore_equivalent(
+        snapshot_timer_state,
+        session
+            .capture_arm64_snapshot_timer_state()
+            .expect("owned session should recapture normalized timers"),
+    );
+    let old_vmgenid = session.runtime_resources().vmgenid_device;
+    session
+        .replace_vmgenid_for_snapshot_restore()
+        .expect("owned session should replace VMGenID and inject its SPI");
+    let new_vmgenid = session.runtime_resources().vmgenid_device;
+    assert_ne!(new_vmgenid.generation_id, old_vmgenid.generation_id);
+    assert_eq!(new_vmgenid.range, old_vmgenid.range);
+    assert_eq!(new_vmgenid.fdt_device, old_vmgenid.fdt_device);
+    let mut guest_vmgenid = [0; bangbang_runtime::startup::ARM64_BOOT_VMGENID_SIZE];
+    session
+        .guest_memory()
+        .expect("owned session should expose VMGenID guest memory")
+        .read_slice(&mut guest_vmgenid, new_vmgenid.range.start())
+        .expect("owned session replacement VMGenID should read");
+    assert_eq!(guest_vmgenid, new_vmgenid.generation_id);
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();

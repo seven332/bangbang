@@ -55,7 +55,9 @@ hardware-breakpoint, hardware-watchpoint, debug-control plus ordered
 nontransactional restore of its typed MDCCINT_EL1/MDSCR_EL1 value, debug-trap
 policy plus ordered nontransactional restore of its complete two-Boolean value, and
 physical-timer CNTKCTL/control/CVAL/TVAL capture, a virtual-timer
-mask/offset/control/CVAL boundary, CPU-level IRQ/FIQ pending capture plus
+mask/offset/control/CVAL boundary, a normalized freeze-downtime timer state with
+never-run restore, a fail-closed inactive SVE/SME/debug snapshot classifier,
+prepared-session VMGenID replacement plus edge notification, CPU-level IRQ/FIQ pending capture plus
 ordered nontransactional restore of its complete typed value, a bounded
 internal boot-session run-loop pump, owned internal boot-session handle,
 process-level owned
@@ -1439,10 +1441,14 @@ Firecracker VMClock ABI fields for guest discovery, and leaves unsupported time
 fields zeroed. Signed executable direct-rootfs coverage checks that Linux
 observes the startup `amazon,vmclock` `ptp@...` device-tree node with a 16-byte
 `reg` property tuple and 4 KiB region size through the public `bangbang` startup
-path. Restore-time generation-ID and VMClock generation-counter updates,
-VMGenID/VMClock interrupt signaling after restore, VMGenID state persistence,
-and VMClock restore semantics remain deferred to later snapshot/time-device
-work tracked by #543.
+path. Internally, a prepared never-run boot session can generate a distinct
+nonzero VMGenID, write the complete guest buffer, commit retained metadata, and
+then assert the edge-rising SPI. Random/preflight/write failures send no edge;
+a signal failure is reported after commit and requires another replacement or
+session discard. Snapshot-schema persistence, public load orchestration,
+guest-observed restore notification, VMClock generation-counter updates and
+signaling, and VMClock restore semantics remain deferred to later
+snapshot/time-device work tracked by #543.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
@@ -1981,7 +1987,14 @@ boot-session forms expose that immutable subset. The raw offset follows HVF's
 `CNTVCT_EL0 = mach_absolute_time() - offset` relation, while control ISTATUS is
 derived and may change as virtual time advances. This capture does not include
 GIC state and does not define portable offset adjustment
-or control-restore policy. The baseline and optional SVE/SME identification,
+or control-restore policy. A separate native policy samples both raw timer
+domains against one `mach_absolute_time()` value, stores virtual count and
+physical CVAL distance, strips ISTATUS, ignores TVAL, and retains only
+ENABLE/IMASK. Its never-run owner command reconstructs the destination offset
+and CVAL after complete read/clock preflight, then applies a ten-write safe
+order with typed value-free partial progress. Snapshot downtime is frozen;
+after restore, both domains advance by the same host-counter interval. Retry
+uses a fresh sample, and a partially updated destination must never run. The baseline and optional SVE/SME identification,
 SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register,
 breakpoint, watchpoint, and physical-timer
 subsets are raw, getter-only observations and likewise have no restore

@@ -564,10 +564,27 @@ is resource-specific:
   architecturally signed 32-bit relative TVAL is returned as raw `u64` and
   changes as that count advances. CVAL and TVAL are read sequentially rather
   than simultaneously, and control ISTATUS bits are time-sensitive observations
-  rather than writable configuration. These values
-  must not be treated as portable or trusted restore data without explicit
-  adjustment, writable-bit, and validation policies. The public pause and
-  snapshot paths do not invoke any of these capture or restore commands.
+  rather than writable configuration. These raw values remain observation-only
+  and are not the native restore form. The separate normalized timer policy
+  removes the source counter epoch, strips ISTATUS, ignores TVAL, retains only
+  ENABLE/IMASK, and rejects unknown control bits. Its state and failure `Debug`
+  output redact values, and restore preflights all capabilities before an
+  ordered nontransactional write sequence. A failed apply may have changed the
+  never-run destination; callers must retry the complete value with a fresh
+  sample or discard it. Individual command admission is not a cross-step
+  restore lease. The public pause and snapshot paths do not invoke any of these
+  capture or restore commands.
+  Native-v1 optional-state classification also fails closed when CPACR enables
+  SVE/SME access, PSTATE.SM/ZA is active, or an implemented breakpoint or
+  watchpoint is enabled. Category-only rejections expose no register value,
+  address, feature value, or comparator index. An accepted inactive capture is
+  not authorization to persist or restore other raw optional-state subsets.
+  Prepared-session VMGenID replacement keeps the random candidate local, writes
+  all 16 guest bytes before committing retained metadata, and formats neither
+  old nor new generation bytes. GIC capability and line checks precede the
+  write. The edge-rising SPI is asserted only afterward; signal failure means
+  the new value is already committed and requires another complete replacement
+  and notification or session discard, never a claimed rollback.
 - `/vsock` stores the configured Unix socket path during configuration. Startup
   can attach a guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the
