@@ -4551,7 +4551,7 @@ impl
 
     #[expect(
         dead_code,
-        reason = "public snapshot creation remains gated until parent slice 8"
+        reason = "standalone bundle capture remains an internal diagnostic seam"
     )]
     pub(crate) fn capture_snapshot_v1_bundle(
         &self,
