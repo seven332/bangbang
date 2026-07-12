@@ -55,16 +55,26 @@ must run through
 `com.apple.security.hypervisor` entitlement. Do not add real HVF tests to the
 unsigned workspace test path.
 
-Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` scenario
+Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` baseline
 that creates one VM and GIC before two permanent owner-thread runners, proves
 their exact ordered MPIDRs are `[0, 1]`, cancels both before their first bounded
-run, shuts them down in full, and destroys the VM. The scenario proves capacity,
-affinity ownership, cancellation, and cleanup only; Linux SMP enumeration,
-PSCI secondary startup, concurrent execution, FDT activation, and public
-multi-vCPU startup require their later dedicated signed gates. Unit tests must
-inject count, host-capacity, allocation, owner-start, affinity write/readback,
-channel, cancel, and shutdown failures and assert reverse cleanup plus primary
-error precedence without entering unsigned HVF.
+run, shuts them down in full, and destroys the VM. Unit tests must inject count,
+host-capacity, allocation, owner-start, affinity write/readback, channel,
+cancel, and shutdown failures and assert reverse cleanup plus primary error
+precedence without entering unsigned HVF.
+
+Concurrent topology-runner changes additionally require deterministic fake
+tests for submit-before-collect, out-of-order identified completions, shared
+MMIO identity, online/offline membership, stale generations, partial submission
+unwind, one active-only batch call, cancellation debt, exact control barriers,
+reason coalescing, terminal precedence, and indexed owner operations. The signed
+gate must configure two different guest entries in one mapped memory, have each
+vCPU write its own flag and wait for its peer, poll both flags with a deadline
+and no fixed sleep, then collect two `Canceled` acknowledgements from one stop
+barrier. Repeat complete owner and VM teardown to catch stale cancellation or
+resource leaks. This proves internal concurrent bounded runs only; Linux SMP
+enumeration, PSCI-driven secondary startup, FDT/session activation, public
+multi-vCPU startup, and multi-vCPU native-v1 snapshots retain later gates.
 
 Validation for internal PSCI secondary-power changes remains unit-test-only
 until the later multi-vCPU boot slice connects them. Tests must cover both CPU_ON calling
@@ -76,8 +86,8 @@ caller X0 completion, response abandonment, and unchanged public CPU_ON
 rejection. Target owner-thread tests must preserve context in X0, clear X1-X3,
 apply the Linux boot PSTATE, write PC last, stop at every injected failure, and
 require a complete retry while the target remains fail-closed. These tests do
-not claim atomic HVF register rollback, target execution, concurrent runners,
-Linux SMP boot, FDT activation, or public multi-vCPU support.
+not claim atomic HVF register rollback, PSCI-driven target execution, Linux SMP
+boot, FDT activation, or public multi-vCPU support.
 
 For virtio-pmem changes, unit tests should cover MMIO registration, FDT
 metadata, config-space `start`/`size`, deterministic multi-device layout,

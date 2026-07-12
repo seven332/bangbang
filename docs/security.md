@@ -794,11 +794,24 @@ failure remains primary, and indexed cleanup failures remain observable. MPIDR
 values are topology metadata, but unrelated guest registers and memory are not
 included in these diagnostics.
 
-Topology-wide cancellation currently attempts each singular runner. Asking HVF
-to exit an idle vCPU can make that vCPU's next run return immediately, so this
-primitive is suitable for teardown and the signed pre-run cancellation proof;
-it is not a reusable concurrent run epoch. Batch in-flight snapshots and pause
-barriers remain deferred to the runner-coordination work.
+The legacy topology-wide `cancel` prerequisite still attempts each singular
+runner and is suitable only for teardown and its signed pre-run cancellation
+proof: asking HVF to exit an idle vCPU can affect that vCPU's next run. The
+concurrent coordinator does not use that primitive. Under one aggregate state
+lock it snapshots only online members with an active identified generation,
+locks their runner state while raw ids are borrowed, and submits exactly one
+slice-level `hv_vcpus_exit` request. Offline and idle members are excluded, raw
+ids never leave the internal cancellation boundary, and diagnostics expose only
+stable topology index/MPIDR and typed stages—not guest registers, memory, or host
+pointers.
+
+Successful batch exit records cancellation debt per member. If an ordinary
+completion wins the race, a later matching `Canceled` generation is absorbed
+instead of being reported as guest progress; members with active work or debt
+cannot be moved offline. Wakeup, pause, stop, shutdown, and terminal outcomes
+publish only after the exact active snapshot drains. A batch failure produces
+no false barrier acknowledgement and leaves the coordinator fail-closed;
+shutdown still reports cleanup separately rather than claiming quiescence.
 
 ## Guest Data Exposure
 
