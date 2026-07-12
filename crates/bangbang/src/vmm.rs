@@ -8651,7 +8651,7 @@ mod tests {
             BootRunLoopCommandAdmissionState::Ordinary
         );
         assert_eq!(
-            supervisor.status(),
+            supervisor.wait_for_terminal_status(),
             BootRunLoopWorkerStatus::Failed("boot run loop worker panicked".to_owned())
         );
         assert!(matches!(
