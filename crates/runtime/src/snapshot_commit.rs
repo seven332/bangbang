@@ -30,20 +30,26 @@ const REDACTED: &str = "<redacted>";
 /// Fixed native-v1 snapshot commit-record header size.
 pub const SNAPSHOT_COMMIT_HEADER_BYTES: usize = 32;
 
-/// Maximum complete native-v1 memory-only commit payload size.
-pub const NATIVE_V1_SNAPSHOT_MEMORY_ONLY_COMMIT_MAX_BYTES: usize =
+/// Maximum complete legacy native-v1 memory-only commit payload size.
+pub const NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES: usize =
     SNAPSHOT_COMMIT_HEADER_BYTES + NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES;
 
-/// Maximum complete native-v1 snapshot commit payload size.
-pub const NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES: usize = NATIVE_V1_SNAPSHOT_MAX_PAYLOAD_BYTES;
+/// Explicit alias for the native-v1 memory-only commit payload limit.
+pub const NATIVE_V1_SNAPSHOT_MEMORY_ONLY_COMMIT_MAX_BYTES: usize =
+    NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES;
+
+/// Maximum complete native-v1 composite commit payload size.
+pub const NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES: usize =
+    NATIVE_V1_SNAPSHOT_MAX_PAYLOAD_BYTES;
 
 /// Maximum opaque state bytes in a composite commit with a maximum-size binding.
-pub const NATIVE_V1_SNAPSHOT_COMPOSITE_STATE_MAX_BYTES: usize = NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES
-    - SNAPSHOT_COMMIT_HEADER_BYTES
-    - NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES;
+pub const NATIVE_V1_SNAPSHOT_COMPOSITE_STATE_MAX_BYTES: usize =
+    NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES
+        - SNAPSHOT_COMMIT_HEADER_BYTES
+        - NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES;
 
 const _: () =
-    assert!(NATIVE_V1_SNAPSHOT_MEMORY_ONLY_COMMIT_MAX_BYTES <= NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES);
+    assert!(NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES <= NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES);
 
 /// Semantic kind carried by a validated native-v1 snapshot commit record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,15 +116,22 @@ impl SnapshotCommitRecord {
 
 impl fmt::Debug for SnapshotCommitRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SnapshotCommitRecord")
+        let mut debug = f.debug_struct("SnapshotCommitRecord");
+        debug
             .field("version", &NATIVE_V1_SNAPSHOT_VERSION)
-            .field("kind", &self.kind())
-            .field("memory_binding", &REDACTED)
             .field(
-                "composite_state",
-                &self.composite_state.as_ref().map(|state| state.len()),
+                "kind",
+                &if self.composite_state.is_some() {
+                    "composite"
+                } else {
+                    "memory-only"
+                },
             )
-            .finish()
+            .field("memory_binding", &REDACTED);
+        if let Some(state) = &self.composite_state {
+            debug.field("composite_state_bytes", &state.len());
+        }
+        debug.finish()
     }
 }
 
@@ -260,7 +273,7 @@ pub fn encode_snapshot_commit_payload(
         .checked_add(binding.len())
         .and_then(|length| length.checked_add(state.len()))
         .ok_or(SnapshotCommitError::LengthOverflow)?;
-    if encoded_length > NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES {
+    if encoded_length > NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES {
         return Err(SnapshotCommitError::CompositeStateLengthOutOfBounds {
             length: state_length,
             maximum: composite_state_maximum(binding.len())?,
@@ -417,7 +430,7 @@ fn validate_binding_length(length: u64) -> Result<(), SnapshotCommitError> {
 }
 
 fn composite_state_maximum(binding_length: usize) -> Result<usize, SnapshotCommitError> {
-    NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES
+    NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES
         .checked_sub(SNAPSHOT_COMMIT_HEADER_BYTES)
         .and_then(|remaining| remaining.checked_sub(binding_length))
         .ok_or(SnapshotCommitError::LengthOverflow)
@@ -578,6 +591,7 @@ mod tests {
             payload.len(),
             NATIVE_V1_SNAPSHOT_MEMORY_ONLY_COMMIT_MAX_BYTES
         );
+        assert_eq!(payload.len(), NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES);
         assert!(payload.len() <= NATIVE_V1_SNAPSHOT_MAX_PAYLOAD_BYTES);
     }
 
@@ -593,7 +607,7 @@ mod tests {
             binding_bytes.len(),
             NATIVE_V1_SNAPSHOT_MEMORY_MAX_BINDING_BYTES
         );
-        assert_eq!(encoded.len(), NATIVE_V1_SNAPSHOT_COMMIT_MAX_BYTES);
+        assert_eq!(encoded.len(), NATIVE_V1_SNAPSHOT_COMPOSITE_COMMIT_MAX_BYTES);
         assert_eq!(
             decode_snapshot_commit_payload(&encoded)
                 .expect("maximum fixture should decode")
@@ -841,6 +855,8 @@ mod tests {
         let debug = format!("{record:?}");
 
         assert!(debug.contains(REDACTED));
+        assert!(debug.contains("kind: \"memory-only\""));
+        assert!(!debug.contains("composite_state"));
         assert!(!debug.contains(&identity));
         assert!(!debug.contains(&checksum));
 
@@ -849,6 +865,8 @@ mod tests {
             SnapshotCommitRecord::try_new_composite(record.memory_binding.clone(), state)
                 .expect("fixture should be valid");
         let composite_debug = format!("{composite:?}");
+        assert!(composite_debug.contains("kind: \"composite\""));
+        assert!(composite_debug.contains("composite_state_bytes: 22"));
         assert!(!composite_debug.contains("state-payload-sentinel"));
     }
 
