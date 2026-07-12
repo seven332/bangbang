@@ -113,6 +113,7 @@ const MMIO_DISPATCHER_BUSY_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is 
 const MMIO_DISPATCHER_POISONED_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is poisoned";
 const COMMAND_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner command channel is closed";
 const RESPONSE_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner response channel is closed";
+#[cfg(test)]
 const RUN_COMPLETION_TOKEN_MISMATCH_MESSAGE: &str =
     "vCPU runner completion token does not match the submitted run";
 const DUPLICATE_BATCH_CANCEL_MEMBER_MESSAGE: &str =
@@ -2680,10 +2681,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the later multi-vCPU scheduler slice")
-    )]
+    #[cfg(test)]
     pub(crate) fn run_once_and_handle_mmio_coordinated(
         &self,
         dispatcher: Arc<Mutex<MmioDispatcher>>,

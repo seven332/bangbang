@@ -193,10 +193,6 @@ pub(crate) struct PsciCpuOnRequest {
     context_id: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
-)]
 impl PsciCpuOnRequest {
     #[cfg(test)]
     const fn new(target_mpidr: u64, entry_point: u64, context_id: u64) -> Self {
@@ -207,6 +203,7 @@ impl PsciCpuOnRequest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn target_mpidr(self) -> u64 {
         self.target_mpidr
     }
@@ -226,12 +223,8 @@ pub(crate) struct PsciAffinityInfoRequest {
     lowest_affinity_level: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
-)]
+#[cfg(test)]
 impl PsciAffinityInfoRequest {
-    #[cfg(test)]
     const fn new(target_mpidr: u64, lowest_affinity_level: u64) -> Self {
         Self {
             target_mpidr,
@@ -361,13 +354,7 @@ pub(crate) enum PsciCpuOnResponse {
     InvalidAddress,
     AlreadyOn,
     OnPending,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "constructed by the later capability profile slice"
-        )
-    )]
+    #[cfg(test)]
     Unsupported,
     InternalFailure,
 }
@@ -379,6 +366,7 @@ impl PsciCpuOnResponse {
             Self::InvalidTarget | Self::InvalidAddress => PsciStatus::InvalidParameters,
             Self::AlreadyOn => PsciStatus::AlreadyOn,
             Self::OnPending => PsciStatus::OnPending,
+            #[cfg(test)]
             Self::Unsupported => PsciStatus::NotSupported,
             Self::InternalFailure => PsciStatus::InternalFailure,
         }
@@ -496,10 +484,6 @@ pub(crate) struct PsciCpuPowerCoordinator {
     next_token: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the later multi-vCPU scheduler slice")
-)]
 impl PsciCpuPowerCoordinator {
     pub(crate) fn new(mpidrs: &[u64]) -> Result<Self, PsciCpuPowerError> {
         if mpidrs.is_empty() {
@@ -533,6 +517,7 @@ impl PsciCpuPowerCoordinator {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn power_state(&self, index: usize) -> Option<PsciCpuPowerState> {
         self.cpus.get(index).map(|cpu| cpu.power)
     }
@@ -621,6 +606,7 @@ impl PsciCpuPowerCoordinator {
         Ok(response)
     }
 
+    #[cfg(test)]
     pub(crate) fn caller_completion(
         &self,
         token: PsciCpuOnToken,
@@ -728,6 +714,7 @@ impl PsciCpuPowerCoordinator {
             })
     }
 
+    #[cfg(test)]
     fn transaction(
         &self,
         token: PsciCpuOnToken,
