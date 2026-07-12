@@ -403,10 +403,6 @@ impl HvfArm64BootRunLoopStopToken {
     pub fn is_stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::Relaxed)
     }
-
-    fn clear_stop_request(&self) {
-        self.stop_requested.store(false, Ordering::Relaxed);
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1130,28 +1126,26 @@ impl HvfArm64BootRunLoopControl {
         self.stop_token.clone()
     }
 
+    /// Request a sticky run-loop stop and interrupt the current topology run.
+    ///
+    /// If the topology can no longer accept a control barrier, the stop flag
+    /// remains set so a run loop that regains control still observes the
+    /// request. The returned error reports only the failed vCPU interruption.
     pub fn request_stop(&self) -> Result<(), HvfVcpuRunCoordinatorError> {
         self.stop_token.request_stop();
-        if let Err(source) = self.vcpu_control.request_stop() {
-            self.stop_token.clear_stop_request();
-            return Err(source);
-        }
-        Ok(())
+        self.vcpu_control.request_stop().map(|_| ())
     }
 
     /// Wake the boot run loop without requesting guest shutdown.
     ///
     /// This is runner-command plumbing for future runtime device updates. It
     /// lets the process worker regain control while keeping stop semantics
-    /// separate from ordinary command dispatch.
+    /// separate from ordinary command dispatch. A failed vCPU interruption
+    /// leaves the wakeup pending so a run loop that regains control does not
+    /// lose the request.
     pub fn request_wakeup(&self) -> Result<(), HvfVcpuRunCoordinatorError> {
         self.control_wakeup.request_wakeup();
-        if let Err(source) = self.vcpu_control.request_wakeup() {
-            let _ = self.control_wakeup.take_wakeup_request();
-            return Err(source);
-        }
-
-        Ok(())
+        self.vcpu_control.request_wakeup().map(|_| ())
     }
 }
 
@@ -7794,7 +7788,8 @@ mod tests {
         HvfArm64BootLimiterRetryWakeupSchedulerStatus, HvfArm64BootLimiterRetryWakeupToken,
         HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootMemoryHotplugNotificationDispatchError,
         HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatchError,
-        HvfArm64BootPmemNotificationDispatchError, HvfArm64BootRunLoopOutcome,
+        HvfArm64BootPmemNotificationDispatchError, HvfArm64BootRunLoopControl,
+        HvfArm64BootRunLoopControlWakeupToken, HvfArm64BootRunLoopOutcome,
         HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
         HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig, HvfArm64BootVmGenIdRestoreError,
         HvfArm64BootVsockNotificationDispatchError, allocate_interrupt_lines,
@@ -7811,6 +7806,7 @@ mod tests {
         signal_network_queue_interrupts, signal_pmem_queue_interrupts,
         signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at,
     };
+    use crate::coordinator::HvfVcpuRunCoordinator;
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
         HvfSys64Exit,
@@ -7819,6 +7815,7 @@ mod tests {
         HvfGicInterruptRange, HvfGicMetadata, HvfGicRedistributor, HvfGicRegion,
         HvfGicSpiSignalError,
     };
+    use crate::runner::tests::start_secondary_configure_recording_runner;
     use crate::runner::{HvfVcpuRunStepOutcome, HvfVcpuRunnerError};
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -13607,6 +13604,29 @@ mod tests {
 
         assert_send_sync::<super::HvfArm64BootRunLoopControl>();
         assert_send_sync::<HvfArm64BootRunLoopStopToken>();
+    }
+
+    #[test]
+    fn boot_session_run_loop_control_preserves_requests_when_vcpu_control_fails() {
+        let (runner, _configured) = start_secondary_configure_recording_runner(false);
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let mut coordinator =
+            HvfVcpuRunCoordinator::from_test_runners(vec![runner], vec![0], dispatcher, &[0])
+                .expect("test coordinator should build");
+        let wakeup = HvfArm64BootRunLoopControlWakeupToken::default();
+        let control = HvfArm64BootRunLoopControl::new(coordinator.control(), wakeup.clone());
+        coordinator
+            .shutdown()
+            .expect("test coordinator should shut down");
+
+        control
+            .request_stop()
+            .expect_err("shut-down coordinator should reject stop cancellation");
+        assert!(control.stop_token().is_stop_requested());
+        control
+            .request_wakeup()
+            .expect_err("shut-down coordinator should reject wakeup cancellation");
+        assert!(wakeup.take_wakeup_request());
     }
 
     #[test]
