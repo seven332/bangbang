@@ -8899,6 +8899,12 @@ pub(crate) mod tests {
         fail_next_setup: bool,
     }
 
+    struct DestroyOrderRecordingVcpu {
+        index: usize,
+        fail_destroy: bool,
+        destroyed_sender: mpsc::Sender<usize>,
+    }
+
     struct Sys64RunStepRecordingVcpu {
         run_once_result: Result<HvfVcpuExit, BackendError>,
         pc: u64,
@@ -15636,6 +15642,42 @@ pub(crate) mod tests {
         }
     }
 
+    impl RunnerVcpu for DestroyOrderRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(self.index as crate::ffi::HvVcpu + 7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            self.destroyed_sender
+                .send(self.index)
+                .map_err(|_| BackendError::InvalidState("fake destroy receiver closed"))?;
+            if self.fail_destroy {
+                Err(BackendError::InvalidState("fake destroy failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     impl RunnerVcpu for Sys64RunStepRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -17149,6 +17191,24 @@ pub(crate) mod tests {
                 .expect("runner should be created"),
             configured_receiver,
         )
+    }
+
+    pub(crate) fn start_destroy_order_recording_runner(
+        index: usize,
+        fail_destroy: bool,
+        destroyed_sender: mpsc::Sender<usize>,
+    ) -> HvfVcpuRunner<'static> {
+        let started = spawn_runner_thread(move || {
+            Ok(DestroyOrderRecordingVcpu {
+                index,
+                fail_destroy,
+                destroyed_sender,
+            })
+        })
+        .expect("fake destroy-order runner should start");
+
+        HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created")
     }
 
     fn start_sys64_run_step_recording_runner(

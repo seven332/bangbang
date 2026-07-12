@@ -325,6 +325,11 @@ impl<'vm> HvfVcpuTopology<'vm> {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(runners: Vec<HvfVcpuRunner<'vm>>, mpidrs: Vec<u64>) -> Self {
+        Self { runners, mpidrs }
+    }
+
     /// Request cancellation from every topology member.
     ///
     /// This prerequisite primitive attempts each current singular cancel path.

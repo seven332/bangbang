@@ -320,6 +320,11 @@ pub enum HvfVcpuRunCoordinatorError {
     },
     /// Owner-thread topology shutdown did not complete cleanly.
     Shutdown(Box<HvfVcpuTopologyError>),
+    /// Topology cleanup also failed after coordinator construction validation.
+    ConstructionCleanup {
+        primary: Box<HvfVcpuRunCoordinatorError>,
+        cleanup: Box<HvfVcpuTopologyError>,
+    },
     /// Cleanup also failed after an earlier shutdown-barrier failure.
     ShutdownCleanup {
         primary: Box<HvfVcpuRunCoordinatorError>,
@@ -416,6 +421,10 @@ impl fmt::Display for HvfVcpuRunCoordinatorError {
                 "vCPU topology member {index} (MPIDR 0x{mpidr:x}) {operation} failed: {source}"
             ),
             Self::Shutdown(source) => write!(f, "vCPU run coordinator shutdown failed: {source}"),
+            Self::ConstructionCleanup { primary, cleanup } => write!(
+                f,
+                "vCPU run coordinator construction cleanup failed after {primary}: {cleanup}"
+            ),
             Self::ShutdownCleanup { primary, cleanup } => write!(
                 f,
                 "vCPU run coordinator shutdown cleanup failed after {primary}: {cleanup}"
@@ -432,6 +441,7 @@ impl std::error::Error for HvfVcpuRunCoordinatorError {
             | Self::BatchCancel { source, .. }
             | Self::MemberOperation { source, .. } => Some(source.as_ref()),
             Self::Shutdown(source) => Some(source.as_ref()),
+            Self::ConstructionCleanup { primary, .. } => Some(primary.as_ref()),
             Self::ShutdownCleanup { primary, .. } => Some(primary.as_ref()),
             _ => None,
         }
@@ -899,6 +909,8 @@ where
                 "vCPU run coordinator requires at least one topology member",
             ))?;
 
+        validate_online_indexes(members.len(), online_indexes)?;
+
         let mut member_states = (0..members.len())
             .map(|_| MemberState {
                 online: false,
@@ -908,18 +920,9 @@ where
             })
             .collect::<Vec<_>>();
         for index in online_indexes.iter().copied() {
-            let member_count = member_states.len();
-            let state =
-                member_states
-                    .get_mut(index)
-                    .ok_or(HvfVcpuRunCoordinatorError::InvalidMember {
-                        index,
-                        member_count,
-                    })?;
-            if state.online {
-                return Err(HvfVcpuRunCoordinatorError::DuplicateOnlineMember { index });
+            if let Some(state) = member_states.get_mut(index) {
+                state.online = true;
             }
-            state.online = true;
         }
 
         let (completion_sender, completion_receiver) = mpsc::channel();
@@ -1367,6 +1370,28 @@ where
     }
 }
 
+fn validate_online_indexes(
+    member_count: usize,
+    online_indexes: &[usize],
+) -> Result<(), HvfVcpuRunCoordinatorError> {
+    for (position, index) in online_indexes.iter().copied().enumerate() {
+        if index >= member_count {
+            return Err(HvfVcpuRunCoordinatorError::InvalidMember {
+                index,
+                member_count,
+            });
+        }
+        if online_indexes
+            .iter()
+            .take(position)
+            .any(|candidate| *candidate == index)
+        {
+            return Err(HvfVcpuRunCoordinatorError::DuplicateOnlineMember { index });
+        }
+    }
+    Ok(())
+}
+
 fn begin_submission_drain(
     shared: &CoordinatorShared,
     state: &mut CoordinatorState,
@@ -1535,6 +1560,15 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         dispatcher: Arc<Mutex<MmioDispatcher>>,
         online_indexes: &[usize],
     ) -> Result<Self, HvfVcpuRunCoordinatorError> {
+        if let Err(primary) = validate_online_indexes(topology.len(), online_indexes) {
+            return match topology.shutdown() {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(HvfVcpuRunCoordinatorError::ConstructionCleanup {
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                }),
+            };
+        }
         let (runners, mpidrs) = topology.into_parts();
         Self::from_parts(runners, mpidrs, dispatcher, online_indexes)
     }
@@ -1815,10 +1849,12 @@ mod tests {
     use crate::HvfVcpuRunStepOutcome;
     use crate::exit::{HvfExceptionExit, HvfHvcExit};
     use crate::psci::PsciCoordinatorResponse;
+    use crate::runner::tests::start_destroy_order_recording_runner;
     use crate::runner::{
         HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken, HvfVcpuRunCompletion,
         HvfVcpuRunToken, HvfVcpuRunnerError,
     };
+    use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError, HvfVcpuTopologyOperation};
     use crate::vcpu::{HvfArm64BootRegisters, HvfArm64SecondaryBootRegisters};
 
     const TEST_ERROR_MESSAGE: &str = "injected coordinator test failure";
@@ -2131,6 +2167,82 @@ mod tests {
             coordinator(&members, &[1, 1], batch.callback()),
             Err(HvfVcpuRunCoordinatorError::DuplicateOnlineMember { index: 1 })
         ));
+    }
+
+    #[test]
+    fn concrete_coordinator_validation_cleans_consumed_topology_in_reverse_order() {
+        let (destroyed_sender, destroyed_receiver) = mpsc::channel();
+        let runners = vec![
+            start_destroy_order_recording_runner(0, false, destroyed_sender.clone()),
+            start_destroy_order_recording_runner(1, false, destroyed_sender),
+        ];
+        let topology = HvfVcpuTopology::from_test_parts(runners, vec![0, 1]);
+
+        let error = topology
+            .into_run_coordinator(Arc::new(Mutex::new(MmioDispatcher::new())), &[2])
+            .expect_err("invalid online member should reject coordinator construction");
+
+        assert_eq!(
+            error,
+            HvfVcpuRunCoordinatorError::InvalidMember {
+                index: 2,
+                member_count: 2,
+            }
+        );
+        assert_eq!(
+            [
+                destroyed_receiver
+                    .recv()
+                    .expect("secondary destroy should be observed"),
+                destroyed_receiver
+                    .recv()
+                    .expect("primary destroy should be observed"),
+            ],
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn concrete_coordinator_validation_preserves_cleanup_failure_evidence() {
+        let (destroyed_sender, destroyed_receiver) = mpsc::channel();
+        let runners = vec![
+            start_destroy_order_recording_runner(0, false, destroyed_sender.clone()),
+            start_destroy_order_recording_runner(1, true, destroyed_sender),
+        ];
+        let topology = HvfVcpuTopology::from_test_parts(runners, vec![0, 1]);
+
+        let error = topology
+            .into_run_coordinator(Arc::new(Mutex::new(MmioDispatcher::new())), &[2])
+            .expect_err("invalid online member should preserve failed cleanup");
+
+        let HvfVcpuRunCoordinatorError::ConstructionCleanup { primary, cleanup } = error else {
+            panic!("expected construction cleanup evidence");
+        };
+        assert_eq!(
+            *primary,
+            HvfVcpuRunCoordinatorError::InvalidMember {
+                index: 2,
+                member_count: 2,
+            }
+        );
+        assert!(matches!(
+            *cleanup,
+            HvfVcpuTopologyError::Control {
+                operation: HvfVcpuTopologyOperation::Shutdown,
+                ref failures,
+            } if failures.len() == 1 && failures[0].index() == 1
+        ));
+        assert_eq!(
+            [
+                destroyed_receiver
+                    .recv()
+                    .expect("failing secondary destroy should be observed"),
+                destroyed_receiver
+                    .recv()
+                    .expect("primary destroy should be observed"),
+            ],
+            [1, 0]
+        );
     }
 
     #[test]
