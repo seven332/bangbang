@@ -26,6 +26,7 @@ cargo test --workspace --all-targets --all-features --locked --exclude bangbang-
 cargo test -p bangbang-hvf --lib --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo clippy -p bangbang --test executable_hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
+cargo clippy -p bangbang --test app_sandbox_process_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
@@ -36,6 +37,10 @@ HVF-backed integration targets. These tests should not be skipped or ignored on
 hosts that support HVF. Hosted CI may use
 `scripts/run-integration-tests.sh --allow-unsupported` to validate build/sign
 behavior without executing HVF when the runner does not support it.
+Changes to signing, entitlements, host-resource policy, or macOS isolation must
+also retain the integration-only `app_sandbox` target in that wrapper. Review
+its claims as bundle/HVF/resource-boundary validation, not as a production
+sandboxed distribution or launcher.
 
 Reviewers should confirm the PR body lists the checks that were run. If any
 command is intentionally skipped, the PR should explain why the skipped command

@@ -408,6 +408,18 @@ Run signed HVF integration tests on macOS Apple Silicon:
 scripts/run-integration-tests.sh
 ```
 
+Run the integration-only App Sandbox boundary on its own:
+
+```sh
+scripts/run-integration-tests.sh --test app_sandbox
+```
+
+This target packages real test binaries as minimal app bundles, runs the full
+HVF lifecycle suite with App Sandbox plus Hypervisor entitlements, and checks
+that the real executable accepts an app-container API socket while rejecting
+the default `/tmp` socket and outside configuration paths. It validates an
+Apple containment building block, not a production sandboxed distribution.
+
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
 validation work:
 
