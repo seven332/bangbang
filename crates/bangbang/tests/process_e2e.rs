@@ -2817,41 +2817,44 @@ fn executable_rejects_invalid_network_interfaces_without_mutating() {
 
     let rx_rate_limiter_response = http_put_json(
         &socket_path,
-        "/network-interfaces/rx_limited",
-        r#"{"iface_id":"rx_limited","host_dev_name":"vmnet:rx","guest_mac":"02:00:00:00:00:03","rx_rate_limiter":{"bandwidth":{"size":1000,"one_time_burst":1000,"refill_time":100}}}"#,
+        "/network-interfaces/eth0",
+        r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"12:34:56:78:9a:bc","mtu":1500,"rx_rate_limiter":{"bandwidth":{"size":1000,"one_time_burst":2000,"refill_time":100}}}"#,
     );
-    assert_bad_request_response(
+    assert_no_content_response(
         &rx_rate_limiter_response,
-        "PUT /network-interfaces/rx_limited",
+        "PUT /network-interfaces/eth0 with RX rate limiter",
     );
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config after RX rate limiter");
     assert_response_contains(
-        &rx_rate_limiter_response,
-        r#"{"fault_message":"network rx_rate_limiter is not supported"}"#,
-        "PUT /network-interfaces/rx_limited",
+        &vm_config,
+        r#""rx_rate_limiter":{"bandwidth":{"one_time_burst":2000,"refill_time":100,"size":1000}}"#,
+        "GET /vm/config after RX rate limiter",
     );
-    assert_only_eth0(
-        "GET /vm/config after rejected rx rate limiter",
-        &[("rx_limited", Some("vmnet:rx"), Some("02:00:00:00:00:03"))],
-    );
+    assert_only_eth0("GET /vm/config after RX rate limiter", &[]);
 
     let tx_rate_limiter_response = http_put_json(
         &socket_path,
-        "/network-interfaces/tx_limited",
-        r#"{"iface_id":"tx_limited","host_dev_name":"vmnet:tx","guest_mac":"02:00:00:00:00:04","tx_rate_limiter":{"ops":{"size":100,"one_time_burst":100,"refill_time":1000}}}"#,
+        "/network-interfaces/eth0",
+        r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"12:34:56:78:9a:bc","mtu":1500,"rx_rate_limiter":{"bandwidth":{"size":1000,"one_time_burst":2000,"refill_time":100}},"tx_rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
     );
-    assert_bad_request_response(
+    assert_no_content_response(
         &tx_rate_limiter_response,
-        "PUT /network-interfaces/tx_limited",
+        "PUT /network-interfaces/eth0 with RX and TX rate limiters",
+    );
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config after TX rate limiter");
+    assert_response_contains(
+        &vm_config,
+        r#""rx_rate_limiter":{"bandwidth":{"one_time_burst":2000,"refill_time":100,"size":1000}}"#,
+        "GET /vm/config after TX rate limiter",
     );
     assert_response_contains(
-        &tx_rate_limiter_response,
-        r#"{"fault_message":"network tx_rate_limiter is not supported"}"#,
-        "PUT /network-interfaces/tx_limited",
+        &vm_config,
+        r#""tx_rate_limiter":{"ops":{"one_time_burst":200,"refill_time":1000,"size":100}}"#,
+        "GET /vm/config after TX rate limiter",
     );
-    assert_only_eth0(
-        "GET /vm/config after rejected tx rate limiter",
-        &[("tx_limited", Some("vmnet:tx"), Some("02:00:00:00:00:04"))],
-    );
+    assert_only_eth0("GET /vm/config after TX rate limiter", &[]);
 
     let duplicate_mac_response = http_put_json(
         &socket_path,

@@ -7752,7 +7752,8 @@ mod tests {
         NetworkInterfaceConfigInput, NetworkMmioLayout, VIRTIO_NET_RX_QUEUE_INDEX,
         VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRxPacket,
         VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
-        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+        VirtioNetworkTxPacketSinkError,
     };
     use bangbang_runtime::pmem::{
         PmemConfigInput, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT, VIRTIO_PMEM_REQUEST_SIZE,
@@ -8536,7 +8537,7 @@ mod tests {
             &mut self,
             memory: &GuestMemory,
             frame: &VirtioNetworkTxFrame,
-        ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+        ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
             let payload_len = usize::try_from(frame.payload_len())
                 .expect("test TX payload length should fit in usize");
             let mut packet = Vec::new();
@@ -8554,7 +8555,7 @@ mod tests {
             }
             self.packets.push(packet);
 
-            Ok(())
+            Ok(VirtioNetworkTxPacketDisposition::Forwarded)
         }
     }
 

@@ -27,12 +27,12 @@ use bangbang_api::http::{
     MemoryHotplugConfigResponse, MemoryHotplugSizeUpdateRequest, MemoryHotplugStatusResponse,
     MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest,
     MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
-    NetworkInterfacePatchRequest, PmemConfigRequest, PmemConfigResponse, PmemPatchRequest,
-    RequestError, SerialConfigRequest, SnapshotCreateRequest, SnapshotLoadRequest,
-    SnapshotMemoryBackendType as ApiSnapshotMemoryBackendType, SnapshotType as ApiSnapshotType,
-    TokenBucketRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest,
-    VsockConfigResponse, api_request_metric_endpoint, parse_request_with_limit,
-    request_total_len_with_limit,
+    NetworkInterfacePatchRequest, NetworkRateLimiterRequest, PmemConfigRequest, PmemConfigResponse,
+    PmemPatchRequest, RequestError, SerialConfigRequest, SnapshotCreateRequest,
+    SnapshotLoadRequest, SnapshotMemoryBackendType as ApiSnapshotMemoryBackendType,
+    SnapshotType as ApiSnapshotType, TokenBucketRequest, VmConfigResponse, VmStateUpdate,
+    VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse, api_request_metric_endpoint,
+    parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
     BalloonConfig, BalloonConfigInput, BalloonHintingStartInput, BalloonHintingStatus,
@@ -67,6 +67,7 @@ use bangbang_runtime::mmds::{
 use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigInput, NetworkInterfaceUpdateInput,
+    NetworkRateLimiterConfig, NetworkTokenBucketConfig,
 };
 use bangbang_runtime::pmem::{PmemConfig, PmemConfigInput, PmemUpdateInput};
 use bangbang_runtime::serial::{SerialConfigInput, SerialRateLimiterConfig};
@@ -1648,8 +1649,33 @@ fn network_interface_config_response_from_runtime(
     if let Some(mtu) = config.mtu() {
         response = response.with_mtu(mtu);
     }
+    if let Some(rate_limiter) = config.rx_rate_limiter() {
+        response =
+            response.with_rx_rate_limiter(network_rate_limiter_response_from_runtime(rate_limiter));
+    }
+    if let Some(rate_limiter) = config.tx_rate_limiter() {
+        response =
+            response.with_tx_rate_limiter(network_rate_limiter_response_from_runtime(rate_limiter));
+    }
 
     response
+}
+
+fn network_rate_limiter_response_from_runtime(
+    config: NetworkRateLimiterConfig,
+) -> NetworkRateLimiterRequest {
+    NetworkRateLimiterRequest::new(
+        config
+            .bandwidth()
+            .map(network_token_bucket_response_from_runtime),
+        config.ops().map(network_token_bucket_response_from_runtime),
+    )
+}
+
+fn network_token_bucket_response_from_runtime(
+    config: NetworkTokenBucketConfig,
+) -> TokenBucketRequest {
+    TokenBucketRequest::new(config.size(), config.one_time_burst(), config.refill_time())
 }
 
 fn mmds_config_response_from_runtime(config: &MmdsConfig) -> MmdsConfigResponse {
@@ -1885,14 +1911,31 @@ fn network_interface_config_input_from_request(
     if let Some(mtu) = config.mtu() {
         input = input.with_mtu(mtu);
     }
-    if config.rx_rate_limiter_configured() {
-        input = input.with_rx_rate_limiter_configured();
+    if let Some(rate_limiter) = config.rx_rate_limiter() {
+        input = input.with_rx_rate_limiter(network_rate_limiter_config_from_request(rate_limiter));
     }
-    if config.tx_rate_limiter_configured() {
-        input = input.with_tx_rate_limiter_configured();
+    if let Some(rate_limiter) = config.tx_rate_limiter() {
+        input = input.with_tx_rate_limiter(network_rate_limiter_config_from_request(rate_limiter));
     }
 
     input
+}
+
+fn network_rate_limiter_config_from_request(
+    config: NetworkRateLimiterRequest,
+) -> NetworkRateLimiterConfig {
+    NetworkRateLimiterConfig::new(
+        config
+            .bandwidth()
+            .map(network_token_bucket_config_from_request),
+        config.ops().map(network_token_bucket_config_from_request),
+    )
+}
+
+fn network_token_bucket_config_from_request(
+    config: TokenBucketRequest,
+) -> NetworkTokenBucketConfig {
+    NetworkTokenBucketConfig::new(config.size(), config.one_time_burst(), config.refill_time())
 }
 
 fn network_interface_update_input_from_request(
@@ -9378,10 +9421,19 @@ mod tests {
             "host_dev_name": "tap0",
             "mtu": 1500,
             "rx_rate_limiter": {
-                "bandwidth": null,
-                "ops": null
+                "bandwidth": {
+                    "size": 0,
+                    "one_time_burst": 1000,
+                    "refill_time": 100
+                }
             },
-            "tx_rate_limiter": {}
+            "tx_rate_limiter": {
+                "ops": {
+                    "size": 10,
+                    "one_time_burst": null,
+                    "refill_time": 0
+                }
+            }
         }"#;
         let request = format!(
             "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -9400,53 +9452,70 @@ mod tests {
         assert!(config_response.body().contains(r#""iface_id":"eth0""#));
         assert!(config_response.body().contains(r#""host_dev_name":"tap0""#));
         assert!(config_response.body().contains(r#""mtu":1500"#));
+        assert!(!config_response.body().contains("rx_rate_limiter"));
+        assert!(!config_response.body().contains("tx_rate_limiter"));
     }
 
     #[test]
-    fn returns_fault_for_configured_network_rate_limiters_without_storing() {
-        for (field, message, socket_name) in [
-            (
-                "rx_rate_limiter",
-                "network rx_rate_limiter is not supported",
-                "net-rx-rate-limiter",
-            ),
-            (
-                "tx_rate_limiter",
-                "network tx_rate_limiter is not supported",
-                "net-tx-rate-limiter",
-            ),
-        ] {
-            let body = format!(
-                r#"{{
-                    "iface_id": "eth0",
-                    "host_dev_name": "tap0",
-                    "{field}": {{
-                        "ops": {{
-                            "size": 1000,
-                            "one_time_burst": 1000,
-                            "refill_time": 100
-                        }}
-                    }}
-                }}"#
-            );
-            let request = format!(
-                "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            let mut vmm = test_controller();
+    fn stores_configured_network_rate_limiters_and_returns_exact_values() {
+        let body = r#"{
+            "iface_id":"eth0",
+            "host_dev_name":"tap0",
+            "rx_rate_limiter":{
+                "bandwidth":{"size":1000,"one_time_burst":2000,"refill_time":100}
+            },
+            "tx_rate_limiter":{
+                "ops":{"size":10,"one_time_burst":null,"refill_time":1000}
+            }
+        }"#;
+        let request = format!(
+            "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut vmm = test_controller();
 
-            let response = request_over_socket(&mut vmm, socket_name, &request);
+        let response = request_over_socket(&mut vmm, "nrl", &request);
 
-            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-            assert!(response.contains(&format!(r#"{{"fault_message":"{message}"}}"#)));
-            let data = vmm
-                .handle_action(VmmAction::GetVmConfig)
-                .expect("VM config should be returned");
-            let VmmData::VmConfiguration(config) = data else {
-                panic!("expected VM config");
-            };
-            assert!(config.network_interface_configs().is_empty());
-        }
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(vm_config) = data else {
+            panic!("expected VM config");
+        };
+        let config = vm_config
+            .network_interface_configs()
+            .first()
+            .expect("network interface should be stored");
+        let rx_bandwidth = config
+            .rx_rate_limiter()
+            .expect("RX limiter should be stored")
+            .bandwidth()
+            .expect("RX bandwidth bucket should be stored");
+        assert_eq!(rx_bandwidth.size(), 1000);
+        assert_eq!(rx_bandwidth.one_time_burst(), Some(2000));
+        assert_eq!(rx_bandwidth.refill_time(), 100);
+        let tx_ops = config
+            .tx_rate_limiter()
+            .expect("TX limiter should be stored")
+            .ops()
+            .expect("TX ops bucket should be stored");
+        assert_eq!(tx_ops.size(), 10);
+        assert_eq!(tx_ops.one_time_burst(), None);
+        assert_eq!(tx_ops.refill_time(), 1000);
+
+        let config_response = request_over_socket(
+            &mut vmm,
+            "nrlg",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(config_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(config_response.contains(
+            r#""rx_rate_limiter":{"bandwidth":{"one_time_burst":2000,"refill_time":100,"size":1000}}"#
+        ));
+        assert!(config_response.contains(
+            r#""tx_rate_limiter":{"ops":{"one_time_burst":null,"refill_time":1000,"size":10}}"#
+        ));
     }
 
     #[test]

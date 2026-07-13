@@ -3,6 +3,7 @@
 use std::collections::TryReserveError;
 use std::fmt;
 use std::str::FromStr;
+use std::time::Instant;
 
 use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
@@ -12,6 +13,7 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
+use crate::token_bucket::{TokenBucket, TokenBucketConfig, TokenBucketSnapshot};
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
@@ -53,6 +55,89 @@ const VIRTIO_NET_TX_QUEUE_INDEX_U32: u32 = 1;
 pub type VirtioNetworkMmioHandler =
     VirtioMmioRegisterHandler<VirtioNetworkConfigSpace, VirtioNetworkDevice>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkRateLimiterConfig {
+    bandwidth: Option<NetworkTokenBucketConfig>,
+    ops: Option<NetworkTokenBucketConfig>,
+}
+
+impl NetworkRateLimiterConfig {
+    pub const fn new(
+        bandwidth: Option<NetworkTokenBucketConfig>,
+        ops: Option<NetworkTokenBucketConfig>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
+    pub const fn bandwidth(self) -> Option<NetworkTokenBucketConfig> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<NetworkTokenBucketConfig> {
+        self.ops
+    }
+
+    pub const fn is_configured(self) -> bool {
+        self.bandwidth.is_some() || self.ops.is_some()
+    }
+
+    const fn normalized(self) -> Option<Self> {
+        let bandwidth = enabled_network_token_bucket(self.bandwidth);
+        let ops = enabled_network_token_bucket(self.ops);
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkTokenBucketConfig {
+    size: u64,
+    one_time_burst: Option<u64>,
+    refill_time: u64,
+}
+
+impl NetworkTokenBucketConfig {
+    pub const fn new(size: u64, one_time_burst: Option<u64>, refill_time: u64) -> Self {
+        Self {
+            size,
+            one_time_burst,
+            refill_time,
+        }
+    }
+
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    pub const fn one_time_burst(self) -> Option<u64> {
+        self.one_time_burst
+    }
+
+    pub const fn refill_time(self) -> u64 {
+        self.refill_time
+    }
+
+    const fn token_bucket_config(self) -> TokenBucketConfig {
+        TokenBucketConfig::new(self.size, self.one_time_burst, self.refill_time)
+    }
+
+    const fn is_enabled(self) -> bool {
+        self.token_bucket_config().is_enabled()
+    }
+}
+
+const fn enabled_network_token_bucket(
+    bucket: Option<NetworkTokenBucketConfig>,
+) -> Option<NetworkTokenBucketConfig> {
+    match bucket {
+        Some(bucket) if bucket.is_enabled() => Some(bucket),
+        Some(_) | None => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInterfaceConfigInput {
     path_iface_id: String,
@@ -60,8 +145,8 @@ pub struct NetworkInterfaceConfigInput {
     host_dev_name: String,
     guest_mac: Option<String>,
     mtu: Option<u16>,
-    rx_rate_limiter_configured: bool,
-    tx_rate_limiter_configured: bool,
+    rx_rate_limiter: Option<NetworkRateLimiterConfig>,
+    tx_rate_limiter: Option<NetworkRateLimiterConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,8 +169,8 @@ impl NetworkInterfaceConfigInput {
             host_dev_name: host_dev_name.into(),
             guest_mac: None,
             mtu: None,
-            rx_rate_limiter_configured: false,
-            tx_rate_limiter_configured: false,
+            rx_rate_limiter: None,
+            tx_rate_limiter: None,
         }
     }
 
@@ -109,12 +194,12 @@ impl NetworkInterfaceConfigInput {
         self.mtu
     }
 
-    pub const fn rx_rate_limiter_configured(&self) -> bool {
-        self.rx_rate_limiter_configured
+    pub const fn rx_rate_limiter(&self) -> Option<NetworkRateLimiterConfig> {
+        self.rx_rate_limiter
     }
 
-    pub const fn tx_rate_limiter_configured(&self) -> bool {
-        self.tx_rate_limiter_configured
+    pub const fn tx_rate_limiter(&self) -> Option<NetworkRateLimiterConfig> {
+        self.tx_rate_limiter
     }
 
     pub fn with_guest_mac(mut self, guest_mac: impl Into<String>) -> Self {
@@ -127,13 +212,13 @@ impl NetworkInterfaceConfigInput {
         self
     }
 
-    pub const fn with_rx_rate_limiter_configured(mut self) -> Self {
-        self.rx_rate_limiter_configured = true;
+    pub const fn with_rx_rate_limiter(mut self, rate_limiter: NetworkRateLimiterConfig) -> Self {
+        self.rx_rate_limiter = Some(rate_limiter);
         self
     }
 
-    pub const fn with_tx_rate_limiter_configured(mut self) -> Self {
-        self.tx_rate_limiter_configured = true;
+    pub const fn with_tx_rate_limiter(mut self, rate_limiter: NetworkRateLimiterConfig) -> Self {
+        self.tx_rate_limiter = Some(rate_limiter);
         self
     }
 
@@ -189,6 +274,8 @@ pub struct NetworkInterfaceConfig {
     host_dev_name: String,
     guest_mac: Option<GuestMacAddress>,
     mtu: Option<u16>,
+    rx_rate_limiter: Option<NetworkRateLimiterConfig>,
+    tx_rate_limiter: Option<NetworkRateLimiterConfig>,
 }
 
 impl NetworkInterfaceConfig {
@@ -206,6 +293,14 @@ impl NetworkInterfaceConfig {
 
     pub const fn mtu(&self) -> Option<u16> {
         self.mtu
+    }
+
+    pub const fn rx_rate_limiter(&self) -> Option<NetworkRateLimiterConfig> {
+        self.rx_rate_limiter
+    }
+
+    pub const fn tx_rate_limiter(&self) -> Option<NetworkRateLimiterConfig> {
+        self.tx_rate_limiter
     }
 }
 
@@ -231,13 +326,6 @@ impl TryFrom<NetworkInterfaceConfigInput> for NetworkInterfaceConfig {
         {
             return Err(NetworkInterfaceConfigError::InvalidMtu { mtu });
         }
-        if input.rx_rate_limiter_configured {
-            return Err(NetworkInterfaceConfigError::UnsupportedRxRateLimiter);
-        }
-        if input.tx_rate_limiter_configured {
-            return Err(NetworkInterfaceConfigError::UnsupportedTxRateLimiter);
-        }
-
         let guest_mac = input
             .guest_mac
             .map(|guest_mac| GuestMacAddress::from_str(&guest_mac))
@@ -248,6 +336,12 @@ impl TryFrom<NetworkInterfaceConfigInput> for NetworkInterfaceConfig {
             host_dev_name: input.host_dev_name,
             guest_mac,
             mtu: input.mtu,
+            rx_rate_limiter: input
+                .rx_rate_limiter
+                .and_then(NetworkRateLimiterConfig::normalized),
+            tx_rate_limiter: input
+                .tx_rate_limiter
+                .and_then(NetworkRateLimiterConfig::normalized),
         })
     }
 }
@@ -572,7 +666,13 @@ pub trait VirtioNetworkTxPacketSink {
         &mut self,
         memory: &GuestMemory,
         frame: &VirtioNetworkTxFrame,
-    ) -> Result<(), VirtioNetworkTxPacketSinkError>;
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioNetworkTxPacketDisposition {
+    Forwarded,
+    Detoured,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -608,8 +708,82 @@ impl VirtioNetworkTxPacketSink for NoopVirtioNetworkTxPacketSink {
         &mut self,
         _memory: &GuestMemory,
         _frame: &VirtioNetworkTxFrame,
-    ) -> Result<(), VirtioNetworkTxPacketSinkError> {
-        Ok(())
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        Ok(VirtioNetworkTxPacketDisposition::Forwarded)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioNetworkRateLimiter {
+    bandwidth: Option<TokenBucket>,
+    ops: Option<TokenBucket>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtioNetworkRateLimiterReservation {
+    bandwidth: Option<TokenBucketSnapshot>,
+    ops: Option<TokenBucketSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtioNetworkRateLimiterReduction {
+    Allowed(VirtioNetworkRateLimiterReservation),
+    Throttled,
+}
+
+impl VirtioNetworkRateLimiter {
+    pub fn new(config: NetworkRateLimiterConfig) -> Option<Self> {
+        Self::new_at(config, Instant::now())
+    }
+
+    fn new_at(config: NetworkRateLimiterConfig, now: Instant) -> Option<Self> {
+        let bandwidth = config
+            .bandwidth()
+            .and_then(|bucket| TokenBucket::new_at(bucket.token_bucket_config(), now));
+        let ops = config
+            .ops()
+            .and_then(|bucket| TokenBucket::new_at(bucket.token_bucket_config(), now));
+
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
+
+    fn reduce_at(&mut self, bytes: u64, now: Instant) -> VirtioNetworkRateLimiterReduction {
+        let reservation = VirtioNetworkRateLimiterReservation {
+            bandwidth: self.bandwidth.as_ref().map(TokenBucket::snapshot),
+            ops: self.ops.as_ref().map(TokenBucket::snapshot),
+        };
+
+        if self
+            .ops
+            .as_mut()
+            .is_some_and(|ops| !ops.reduce_with_retry_at(1, now).is_allowed())
+        {
+            self.restore(reservation);
+            return VirtioNetworkRateLimiterReduction::Throttled;
+        }
+        if self.bandwidth.as_mut().is_some_and(|bandwidth| {
+            !bandwidth
+                .reduce_allow_overconsumption_with_retry_at(bytes, now)
+                .is_allowed()
+        }) {
+            self.restore(reservation);
+            return VirtioNetworkRateLimiterReduction::Throttled;
+        }
+
+        VirtioNetworkRateLimiterReduction::Allowed(reservation)
+    }
+
+    fn restore(&mut self, reservation: VirtioNetworkRateLimiterReservation) {
+        if let (Some(bucket), Some(snapshot)) = (self.bandwidth.as_mut(), reservation.bandwidth) {
+            bucket.restore(snapshot);
+        }
+        if let (Some(bucket), Some(snapshot)) = (self.ops.as_mut(), reservation.ops) {
+            bucket.restore(snapshot);
+        }
     }
 }
 
@@ -1054,11 +1228,39 @@ impl std::error::Error for VirtioNetworkRxBufferParseError {
 pub struct VirtioNetworkDevice {
     active_rx_queue: Option<VirtioNetworkRxQueue>,
     active_tx_queue: Option<VirtioNetworkTxQueue>,
+    rx_rate_limiter: Option<VirtioNetworkRateLimiter>,
+    tx_rate_limiter: Option<VirtioNetworkRateLimiter>,
+    pending_rate_limited_rx_queue: bool,
+    pending_rate_limited_tx_queue: bool,
 }
 
 impl VirtioNetworkDevice {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_rate_limiters(
+        rx_rate_limiter: Option<NetworkRateLimiterConfig>,
+        tx_rate_limiter: Option<NetworkRateLimiterConfig>,
+    ) -> Self {
+        Self::with_rate_limiters_at(rx_rate_limiter, tx_rate_limiter, Instant::now())
+    }
+
+    fn with_rate_limiters_at(
+        rx_rate_limiter: Option<NetworkRateLimiterConfig>,
+        tx_rate_limiter: Option<NetworkRateLimiterConfig>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            active_rx_queue: None,
+            active_tx_queue: None,
+            rx_rate_limiter: rx_rate_limiter
+                .and_then(|rate_limiter| VirtioNetworkRateLimiter::new_at(rate_limiter, now)),
+            tx_rate_limiter: tx_rate_limiter
+                .and_then(|rate_limiter| VirtioNetworkRateLimiter::new_at(rate_limiter, now)),
+            pending_rate_limited_rx_queue: false,
+            pending_rate_limited_tx_queue: false,
+        }
     }
 
     pub fn is_activated(&self) -> bool {
@@ -1083,6 +1285,26 @@ impl VirtioNetworkDevice {
 
     pub const fn active_tx_dispatch_queue(&self) -> Option<&VirtioNetworkTxQueue> {
         self.active_tx_queue.as_ref()
+    }
+
+    pub const fn rx_rate_limiter(&self) -> Option<&VirtioNetworkRateLimiter> {
+        self.rx_rate_limiter.as_ref()
+    }
+
+    pub const fn tx_rate_limiter(&self) -> Option<&VirtioNetworkRateLimiter> {
+        self.tx_rate_limiter.as_ref()
+    }
+
+    pub const fn has_pending_rate_limited_rx_queue(&self) -> bool {
+        self.pending_rate_limited_rx_queue
+    }
+
+    pub const fn has_pending_rate_limited_tx_queue(&self) -> bool {
+        self.pending_rate_limited_tx_queue
+    }
+
+    pub const fn has_pending_rate_limited_queue_work(&self) -> bool {
+        self.pending_rate_limited_rx_queue || self.pending_rate_limited_tx_queue
     }
 
     pub fn activate_network(
@@ -1137,6 +1359,8 @@ impl VirtioNetworkDevice {
     pub fn reset(&mut self) {
         self.active_rx_queue = None;
         self.active_tx_queue = None;
+        self.pending_rate_limited_rx_queue = false;
+        self.pending_rate_limited_tx_queue = false;
     }
 
     fn dispatch_drained_queue_notifications_with_tx_sink(
@@ -1161,7 +1385,24 @@ impl VirtioNetworkDevice {
         tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
         rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
     ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
-        if drained_notifications.is_empty() {
+        self.dispatch_drained_queue_notifications_with_packet_io_at(
+            memory,
+            drained_notifications,
+            tx_sink,
+            rx_source,
+            Instant::now(),
+        )
+    }
+
+    fn dispatch_drained_queue_notifications_with_packet_io_at(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
+        rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
+        now: Instant,
+    ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
+        if drained_notifications.is_empty() && !self.has_pending_rate_limited_queue_work() {
             return Ok(VirtioNetworkDeviceNotificationDispatch::new(
                 drained_notifications,
                 None,
@@ -1188,11 +1429,13 @@ impl VirtioNetworkDevice {
         let dispatch_rx = drained_notifications
             .iter()
             .copied()
-            .any(|queue_index| queue_index == VIRTIO_NET_RX_QUEUE_INDEX);
+            .any(|queue_index| queue_index == VIRTIO_NET_RX_QUEUE_INDEX)
+            || self.pending_rate_limited_rx_queue;
         let dispatch_tx = drained_notifications
             .iter()
             .copied()
-            .any(|queue_index| queue_index == VIRTIO_NET_TX_QUEUE_INDEX);
+            .any(|queue_index| queue_index == VIRTIO_NET_TX_QUEUE_INDEX)
+            || self.pending_rate_limited_tx_queue;
 
         let rx_queue_dispatch = if dispatch_rx {
             let Some(queue) = self.active_rx_queue.as_mut() else {
@@ -1201,8 +1444,18 @@ impl VirtioNetworkDevice {
                 });
             };
 
-            match queue.dispatch_with_source(memory, rx_source) {
-                Ok(dispatch) => Some(dispatch),
+            match queue.dispatch_with_source_hint_policy(
+                memory,
+                rx_source,
+                false,
+                self.rx_rate_limiter.as_mut(),
+                now,
+            ) {
+                Ok(dispatch) => {
+                    self.pending_rate_limited_rx_queue =
+                        dispatch.rate_limiter_throttled_packets() != 0;
+                    Some(dispatch)
+                }
                 Err(source) => {
                     return Err(VirtioNetworkDeviceNotificationError::RxQueueDispatch {
                         drained_notifications,
@@ -1223,8 +1476,12 @@ impl VirtioNetworkDevice {
                 });
             };
 
-            match queue.dispatch_with_sink(memory, tx_sink) {
-                Ok(dispatch) => Some(dispatch),
+            match queue.dispatch_with_sink_at(memory, tx_sink, self.tx_rate_limiter.as_mut(), now) {
+                Ok(dispatch) => {
+                    self.pending_rate_limited_tx_queue =
+                        dispatch.rate_limiter_throttled_frames() != 0;
+                    Some(dispatch)
+                }
                 Err(source) => {
                     return Err(VirtioNetworkDeviceNotificationError::TxQueueDispatch {
                         drained_notifications,
@@ -1237,15 +1494,23 @@ impl VirtioNetworkDevice {
             None
         };
 
-        let post_tx_rx_queue_dispatch = if dispatch_tx && rx_source.retry_after_tx_hint() {
+        let post_tx_rx_queue_dispatch = if dispatch_tx
+            && !self.pending_rate_limited_rx_queue
+            && rx_source.retry_after_tx_hint()
+        {
             let Some(queue) = self.active_rx_queue.as_mut() else {
                 return Err(VirtioNetworkDeviceNotificationError::Inactive {
                     drained_notifications,
                 });
             };
 
-            match queue.dispatch_ready_source(memory, rx_source) {
-                Ok(dispatch) => Some(dispatch),
+            match queue.dispatch_ready_source(memory, rx_source, self.rx_rate_limiter.as_mut(), now)
+            {
+                Ok(dispatch) => {
+                    self.pending_rate_limited_rx_queue =
+                        dispatch.rate_limiter_throttled_packets() != 0;
+                    Some(dispatch)
+                }
                 Err(source) => {
                     return Err(VirtioNetworkDeviceNotificationError::RxQueueDispatch {
                         drained_notifications,
@@ -1342,15 +1607,17 @@ impl VirtioNetworkRxQueue {
         memory: &mut GuestMemory,
         rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
     ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
-        self.dispatch_with_source_hint_policy(memory, rx_source, false)
+        self.dispatch_with_source_hint_policy(memory, rx_source, false, None, Instant::now())
     }
 
     fn dispatch_ready_source(
         &mut self,
         memory: &mut GuestMemory,
         rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
+        rate_limiter: Option<&mut VirtioNetworkRateLimiter>,
+        now: Instant,
     ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
-        self.dispatch_with_source_hint_policy(memory, rx_source, true)
+        self.dispatch_with_source_hint_policy(memory, rx_source, true, rate_limiter, now)
     }
 
     fn dispatch_with_source_hint_policy(
@@ -1358,9 +1625,12 @@ impl VirtioNetworkRxQueue {
         memory: &mut GuestMemory,
         rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
         require_ready_hint: bool,
+        rate_limiter: Option<&mut VirtioNetworkRateLimiter>,
+        now: Instant,
     ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
         let mut dispatch =
             VirtioNetworkRxQueueDispatch::with_capacity(self.available.queue_size())?;
+        let mut rate_limiter = rate_limiter;
 
         loop {
             if require_ready_hint && !rx_source.retry_after_tx_hint() {
@@ -1460,6 +1730,21 @@ impl VirtioNetworkRxQueue {
                                 publication,
                             )
                         } else {
+                            if let Some(limiter) = rate_limiter.as_deref_mut()
+                                && matches!(
+                                    limiter.reduce_at(u64::from(bytes_written_to_guest), now),
+                                    VirtioNetworkRateLimiterReduction::Throttled
+                                )
+                            {
+                                if let Err(source) = self.available.undo_pop_descriptor_chain() {
+                                    return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
+                                        completed_dispatch: Box::new(dispatch),
+                                        source,
+                                    });
+                                }
+                                dispatch.record_rate_limited_packet();
+                                break;
+                            }
                             if let Err(source) = write_rx_packet_to_buffer(memory, &buffer, packet)
                             {
                                 return Err(VirtioNetworkRxQueueDispatchError::BufferWrite {
@@ -1655,6 +1940,7 @@ pub struct VirtioNetworkRxQueueDispatch {
     buffer_parse_failures: usize,
     buffer_too_small_failures: usize,
     source_failures: usize,
+    rate_limiter_throttled_packets: usize,
     deliveries: Vec<VirtioNetworkRxPacketDelivery>,
     first_buffer_parse_failure: Option<VirtioNetworkRxBufferParseError>,
     first_buffer_too_small: Option<VirtioNetworkRxBufferTooSmall>,
@@ -1677,6 +1963,7 @@ impl VirtioNetworkRxQueueDispatch {
             buffer_parse_failures: 0,
             buffer_too_small_failures: 0,
             source_failures: 0,
+            rate_limiter_throttled_packets: 0,
             deliveries,
             first_buffer_parse_failure: None,
             first_buffer_too_small: None,
@@ -1703,6 +1990,10 @@ impl VirtioNetworkRxQueueDispatch {
 
     pub const fn source_failures(&self) -> usize {
         self.source_failures
+    }
+
+    pub const fn rate_limiter_throttled_packets(&self) -> usize {
+        self.rate_limiter_throttled_packets
     }
 
     pub fn deliveries(&self) -> &[VirtioNetworkRxPacketDelivery] {
@@ -1757,6 +2048,10 @@ impl VirtioNetworkRxQueueDispatch {
         if self.first_source_failure.is_none() {
             self.first_source_failure = Some(source);
         }
+    }
+
+    fn record_rate_limited_packet(&mut self) {
+        self.rate_limiter_throttled_packets += 1;
     }
 }
 
@@ -2155,8 +2450,19 @@ impl VirtioNetworkTxQueue {
         memory: &mut GuestMemory,
         tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
     ) -> Result<VirtioNetworkTxQueueDispatch, VirtioNetworkTxQueueDispatchError> {
+        self.dispatch_with_sink_at(memory, tx_sink, None, Instant::now())
+    }
+
+    fn dispatch_with_sink_at(
+        &mut self,
+        memory: &mut GuestMemory,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
+        rate_limiter: Option<&mut VirtioNetworkRateLimiter>,
+        now: Instant,
+    ) -> Result<VirtioNetworkTxQueueDispatch, VirtioNetworkTxQueueDispatchError> {
         let mut dispatch =
             VirtioNetworkTxQueueDispatch::with_capacity(self.available.queue_size())?;
+        let mut rate_limiter = rate_limiter;
         while let Some(chain) = match self.available.pop_descriptor_chain(memory) {
             Ok(chain) => chain,
             Err(source) => {
@@ -2175,6 +2481,25 @@ impl VirtioNetworkTxQueue {
                 }
             };
             let frame = VirtioNetworkTxFrame::parse(memory, &chain);
+            let reservation = if let Ok(frame) = &frame
+                && let Some(limiter) = rate_limiter.as_deref_mut()
+            {
+                match limiter.reduce_at(frame.frame_len(), now) {
+                    VirtioNetworkRateLimiterReduction::Allowed(reservation) => Some(reservation),
+                    VirtioNetworkRateLimiterReduction::Throttled => {
+                        if let Err(source) = self.available.undo_pop_descriptor_chain() {
+                            return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                                completed_dispatch: Box::new(dispatch),
+                                source,
+                            });
+                        }
+                        dispatch.record_rate_limited_frame();
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
             let notification_suppression = match self.notification_suppression(memory) {
                 Ok(notification_suppression) => notification_suppression,
                 Err(source) => {
@@ -2202,7 +2527,18 @@ impl VirtioNetworkTxQueue {
             };
             let outcome = match frame {
                 Ok(frame) => {
-                    let sink_error = tx_sink.transmit_frame(memory, &frame).err();
+                    let sink_error = match tx_sink.transmit_frame(memory, &frame) {
+                        Ok(VirtioNetworkTxPacketDisposition::Detoured) => {
+                            if let (Some(limiter), Some(reservation)) =
+                                (rate_limiter.as_deref_mut(), reservation)
+                            {
+                                limiter.restore(reservation);
+                            }
+                            None
+                        }
+                        Ok(VirtioNetworkTxPacketDisposition::Forwarded) => None,
+                        Err(source) => Some(source),
+                    };
                     VirtioNetworkTxQueueDispatchOutcome::Ok { frame, sink_error }
                 }
                 Err(source) => VirtioNetworkTxQueueDispatchOutcome::ParseError(source),
@@ -2267,6 +2603,7 @@ pub struct VirtioNetworkTxQueueDispatch {
     sink_successful_frames: usize,
     sink_failures: usize,
     sink_successful_bytes: u64,
+    rate_limiter_throttled_frames: usize,
     frames: Vec<VirtioNetworkTxFrame>,
     first_parse_failure: Option<VirtioNetworkTxFrameParseError>,
     first_sink_failure: Option<VirtioNetworkTxPacketSinkError>,
@@ -2289,6 +2626,7 @@ impl VirtioNetworkTxQueueDispatch {
             sink_successful_frames: 0,
             sink_failures: 0,
             sink_successful_bytes: 0,
+            rate_limiter_throttled_frames: 0,
             frames,
             first_parse_failure: None,
             first_sink_failure: None,
@@ -2318,6 +2656,10 @@ impl VirtioNetworkTxQueueDispatch {
 
     pub const fn sink_successful_bytes(&self) -> u64 {
         self.sink_successful_bytes
+    }
+
+    pub const fn rate_limiter_throttled_frames(&self) -> usize {
+        self.rate_limiter_throttled_frames
     }
 
     pub const fn first_parse_failure(&self) -> Option<&VirtioNetworkTxFrameParseError> {
@@ -2368,6 +2710,10 @@ impl VirtioNetworkTxQueueDispatch {
                 }
             }
         }
+    }
+
+    fn record_rate_limited_frame(&mut self) {
+        self.rate_limiter_throttled_frames += 1;
     }
 }
 
@@ -2470,6 +2816,13 @@ fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
 }
 
 impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetworkDevice> {
+    pub fn has_pending_network_queue_work(&self) -> bool {
+        self.has_pending_queue_notifications()
+            || self
+                .activation_handler()
+                .has_pending_rate_limited_queue_work()
+    }
+
     pub fn dispatch_network_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
@@ -2576,7 +2929,10 @@ impl PreparedNetworkDevice {
             iface_id: config.iface_id().to_string(),
             host_dev_name: config.host_dev_name().to_string(),
             config_space: VirtioNetworkConfigSpace::new(config.guest_mac(), config.mtu()),
-            device: VirtioNetworkDevice::new(),
+            device: VirtioNetworkDevice::with_rate_limiters(
+                config.rx_rate_limiter(),
+                config.tx_rate_limiter(),
+            ),
         }
     }
 
@@ -3823,8 +4179,6 @@ pub enum NetworkInterfaceConfigError {
     InvalidMtu {
         mtu: u16,
     },
-    UnsupportedRxRateLimiter,
-    UnsupportedTxRateLimiter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3873,12 +4227,6 @@ impl fmt::Display for NetworkInterfaceConfigError {
                     f,
                     "network mtu {mtu} is out of range [{VIRTIO_NET_MIN_MTU}, {VIRTIO_NET_MAX_MTU}]"
                 )
-            }
-            Self::UnsupportedRxRateLimiter => {
-                f.write_str("network rx_rate_limiter is not supported")
-            }
-            Self::UnsupportedTxRateLimiter => {
-                f.write_str("network tx_rate_limiter is not supported")
             }
         }
     }
@@ -3968,6 +4316,7 @@ fn validate_interface_update_id(
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::time::{Duration, Instant};
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
@@ -3995,18 +4344,20 @@ mod tests {
         GuestMacAddress, InterfaceIdSource, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig,
         NetworkInterfaceConfigError, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
         NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput, NetworkMmioDevices,
-        NetworkMmioLayout, NetworkMmioRegistrationError, PreparedNetworkDevices,
-        VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_CONFIG_MTU_OFFSET,
-        VIRTIO_NET_CONFIG_MTU_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU,
-        VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT,
-        VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE,
-        VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace,
-        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
-        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxBuffer,
+        NetworkMmioLayout, NetworkMmioRegistrationError, NetworkRateLimiterConfig,
+        NetworkTokenBucketConfig, PreparedNetworkDevices, VIRTIO_FEATURE_VERSION_1,
+        VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_CONFIG_MTU_OFFSET, VIRTIO_NET_CONFIG_MTU_SIZE,
+        VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU, VIRTIO_NET_MAX_BUFFER_SIZE,
+        VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE,
+        VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX,
+        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace, VirtioNetworkDevice,
+        VirtioNetworkDeviceActivationError, VirtioNetworkDeviceNotificationError,
+        VirtioNetworkMmioHandler, VirtioNetworkRateLimiter, VirtioNetworkRxBuffer,
         VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
         VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
-        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketDisposition,
+        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
         VirtioNetworkTxQueueDispatchError,
     };
 
@@ -4021,6 +4372,7 @@ mod tests {
     const TEST_TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x21_0000);
     const TEST_TX_USED_RING: GuestAddress = GuestAddress::new(0x22_0000);
     const TEST_TX_HEADER: GuestAddress = GuestAddress::new(0x23_0000);
+    const TEST_TX_SECOND_HEADER: GuestAddress = GuestAddress::new(0x23_1000);
     const TEST_TX_PAYLOAD: GuestAddress = GuestAddress::new(0x24_0000);
     const TEST_TX_SECOND_PAYLOAD: GuestAddress = GuestAddress::new(0x25_0000);
     const TEST_TX_INDIRECT_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x26_0000);
@@ -4096,6 +4448,22 @@ mod tests {
             VirtioNetworkDevice::new(),
         )
         .expect("network activation handler should build")
+    }
+
+    fn network_activation_handler_with_rate_limiters_at(
+        rx_rate_limiter: Option<NetworkRateLimiterConfig>,
+        tx_rate_limiter: Option<NetworkRateLimiterConfig>,
+        now: Instant,
+    ) -> VirtioNetworkMmioHandler {
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
+        VirtioMmioRegisterHandler::with_device_config_and_activation(
+            VIRTIO_NET_DEVICE_ID,
+            config.available_features(),
+            &VIRTIO_NET_QUEUE_SIZES,
+            config,
+            VirtioNetworkDevice::with_rate_limiters_at(rx_rate_limiter, tx_rate_limiter, now),
+        )
+        .expect("rate-limited network activation handler should build")
     }
 
     fn read_network_config(
@@ -4432,6 +4800,7 @@ mod tests {
     struct RecordingTxPacketSink {
         calls: usize,
         fail_on_call: Option<usize>,
+        detour_successes: bool,
         frame_heads: Vec<u16>,
         packets: Vec<Vec<u8>>,
     }
@@ -4441,6 +4810,17 @@ mod tests {
             Self {
                 calls: 0,
                 fail_on_call: Some(fail_on_call),
+                detour_successes: false,
+                frame_heads: Vec::new(),
+                packets: Vec::new(),
+            }
+        }
+
+        const fn detouring() -> Self {
+            Self {
+                calls: 0,
+                fail_on_call: None,
+                detour_successes: true,
                 frame_heads: Vec::new(),
                 packets: Vec::new(),
             }
@@ -4452,7 +4832,7 @@ mod tests {
             &mut self,
             memory: &GuestMemory,
             frame: &VirtioNetworkTxFrame,
-        ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+        ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
             self.calls += 1;
             self.frame_heads.push(frame.descriptor_head());
 
@@ -4483,7 +4863,11 @@ mod tests {
             }
             self.packets.push(packet);
 
-            Ok(())
+            if self.detour_successes {
+                Ok(VirtioNetworkTxPacketDisposition::Detoured)
+            } else {
+                Ok(VirtioNetworkTxPacketDisposition::Forwarded)
+            }
         }
     }
 
@@ -4619,6 +5003,29 @@ mod tests {
         memory
             .write_slice(bytes, address)
             .expect("test TX payload should write");
+    }
+
+    fn write_two_tx_frames(memory: &mut GuestMemory) {
+        write_tx_header(memory, TEST_TX_HEADER);
+        write_tx_header(memory, TEST_TX_SECOND_HEADER);
+        write_tx_payload(memory, TEST_TX_PAYLOAD, &[0x10, 0x11, 0x12, 0x13]);
+        write_tx_payload(memory, TEST_TX_SECOND_PAYLOAD, &[0x20, 0x21, 0x22, 0x23]);
+        for (index, descriptor) in [
+            TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+            TestDescriptor::readable(TEST_TX_PAYLOAD, 4, None),
+            TestDescriptor::readable(TEST_TX_SECOND_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(3)),
+            TestDescriptor::readable(TEST_TX_SECOND_PAYLOAD, 4, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_tx_descriptor(
+                memory,
+                u16::try_from(index).expect("test TX descriptor index should fit"),
+                descriptor,
+            );
+        }
+        write_tx_available_heads(memory, &[0, 2]);
     }
 
     fn write_tx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
@@ -5115,32 +5522,169 @@ mod tests {
     }
 
     #[test]
-    fn rejects_deferred_fields() {
-        assert_eq!(
-            validate(input().with_rx_rate_limiter_configured()),
-            Err(NetworkInterfaceConfigError::UnsupportedRxRateLimiter)
+    fn accepts_configured_network_rate_limiters() {
+        let rx_rate_limiter = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(1024, Some(2048), 100)),
+            None,
         );
+        let tx_rate_limiter = NetworkRateLimiterConfig::new(
+            None,
+            Some(NetworkTokenBucketConfig::new(10, None, 1000)),
+        );
+
+        let config = validate(
+            input()
+                .with_rx_rate_limiter(rx_rate_limiter)
+                .with_tx_rate_limiter(tx_rate_limiter),
+        )
+        .expect("configured network rate limiters should validate");
+
+        assert_eq!(config.rx_rate_limiter(), Some(rx_rate_limiter));
+        assert_eq!(config.tx_rate_limiter(), Some(tx_rate_limiter));
+    }
+
+    #[test]
+    fn normalizes_disabled_network_rate_limiter_buckets() {
+        let config = validate(input().with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(0, Some(2048), 100)),
+            Some(NetworkTokenBucketConfig::new(10, None, 0)),
+        )))
+        .expect("disabled network rate limiter buckets should validate");
+
+        assert_eq!(config.rx_rate_limiter(), None);
+    }
+
+    #[test]
+    fn network_rate_limiter_enforces_ops_and_refills_at_injected_time() {
+        let now = Instant::now();
+        let config =
+            NetworkRateLimiterConfig::new(None, Some(NetworkTokenBucketConfig::new(1, None, 100)));
+        let mut limiter = VirtioNetworkRateLimiter::new_at(config, now)
+            .expect("enabled ops limiter should build");
+
+        assert!(matches!(
+            limiter.reduce_at(4096, now),
+            super::VirtioNetworkRateLimiterReduction::Allowed(_)
+        ));
         assert_eq!(
-            validate(input().with_tx_rate_limiter_configured()),
-            Err(NetworkInterfaceConfigError::UnsupportedTxRateLimiter)
+            limiter.reduce_at(1, now),
+            super::VirtioNetworkRateLimiterReduction::Throttled
+        );
+        assert!(matches!(
+            limiter.reduce_at(1, now + Duration::from_millis(100)),
+            super::VirtioNetworkRateLimiterReduction::Allowed(_)
+        ));
+    }
+
+    #[test]
+    fn network_rate_limiter_rolls_back_ops_when_bandwidth_throttles() {
+        let now = Instant::now();
+        let config = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(16, None, 100)),
+            Some(NetworkTokenBucketConfig::new(2, None, 100)),
+        );
+        let mut limiter = VirtioNetworkRateLimiter::new_at(config, now)
+            .expect("enabled dual limiter should build");
+
+        assert!(matches!(
+            limiter.reduce_at(16, now),
+            super::VirtioNetworkRateLimiterReduction::Allowed(_)
+        ));
+        let before_throttle = limiter.clone();
+
+        assert_eq!(
+            limiter.reduce_at(1, now),
+            super::VirtioNetworkRateLimiterReduction::Throttled
+        );
+        assert_eq!(limiter, before_throttle);
+    }
+
+    #[test]
+    fn network_rate_limiter_consumes_one_time_burst_before_steady_budget() {
+        let now = Instant::now();
+        let config = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(16, Some(16), 100)),
+            None,
+        );
+        let mut limiter = VirtioNetworkRateLimiter::new_at(config, now)
+            .expect("enabled bandwidth limiter should build");
+
+        for _ in 0..2 {
+            assert!(matches!(
+                limiter.reduce_at(16, now),
+                super::VirtioNetworkRateLimiterReduction::Allowed(_)
+            ));
+        }
+        assert_eq!(
+            limiter.reduce_at(1, now),
+            super::VirtioNetworkRateLimiterReduction::Throttled
         );
     }
 
     #[test]
+    fn network_rate_limiter_allows_one_oversized_frame_from_full_bucket() {
+        let now = Instant::now();
+        let config =
+            NetworkRateLimiterConfig::new(Some(NetworkTokenBucketConfig::new(16, None, 100)), None);
+        let mut limiter = VirtioNetworkRateLimiter::new_at(config, now)
+            .expect("enabled bandwidth limiter should build");
+
+        assert!(matches!(
+            limiter.reduce_at(32, now),
+            super::VirtioNetworkRateLimiterReduction::Allowed(_)
+        ));
+        assert_eq!(
+            limiter.reduce_at(32, now),
+            super::VirtioNetworkRateLimiterReduction::Throttled
+        );
+        assert!(matches!(
+            limiter.reduce_at(32, now + Duration::from_millis(100)),
+            super::VirtioNetworkRateLimiterReduction::Allowed(_)
+        ));
+    }
+
+    #[test]
+    fn network_rate_limiter_ignores_disabled_and_overflowing_buckets() {
+        let now = Instant::now();
+        for bucket in [
+            NetworkTokenBucketConfig::new(0, Some(10), 100),
+            NetworkTokenBucketConfig::new(10, Some(10), 0),
+            NetworkTokenBucketConfig::new(10, Some(10), u64::MAX),
+        ] {
+            assert_eq!(
+                VirtioNetworkRateLimiter::new_at(
+                    NetworkRateLimiterConfig::new(Some(bucket), None),
+                    now,
+                ),
+                None,
+                "{bucket:?}"
+            );
+        }
+    }
+
+    #[test]
     fn network_interface_config_input_exposes_firecracker_shape() {
+        let rx_rate_limiter = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(1024, Some(2048), 100)),
+            None,
+        );
+        let tx_rate_limiter = NetworkRateLimiterConfig::new(
+            None,
+            Some(NetworkTokenBucketConfig::new(10, None, 1000)),
+        );
         let input = input()
             .with_guest_mac("12:34:56:78:9a:bc")
             .with_mtu(1500)
-            .with_rx_rate_limiter_configured()
-            .with_tx_rate_limiter_configured();
+            .with_rx_rate_limiter(rx_rate_limiter)
+            .with_tx_rate_limiter(tx_rate_limiter);
 
         assert_eq!(input.path_iface_id(), "eth0");
         assert_eq!(input.body_iface_id(), "eth0");
         assert_eq!(input.host_dev_name(), "tap0");
         assert_eq!(input.guest_mac(), Some("12:34:56:78:9a:bc"));
         assert_eq!(input.mtu(), Some(1500));
-        assert!(input.rx_rate_limiter_configured());
-        assert!(input.tx_rate_limiter_configured());
+        assert_eq!(input.rx_rate_limiter(), Some(rx_rate_limiter));
+        assert_eq!(input.tx_rate_limiter(), Some(tx_rate_limiter));
     }
 
     #[test]
@@ -5198,9 +5742,9 @@ mod tests {
 
     #[test]
     fn network_interface_config_errors_display_without_sources() {
-        let err = NetworkInterfaceConfigError::UnsupportedRxRateLimiter;
+        let err = NetworkInterfaceConfigError::EmptyHostDeviceName;
 
-        assert_eq!(err.to_string(), "network rx_rate_limiter is not supported");
+        assert_eq!(err.to_string(), "network host_dev_name must not be empty");
         assert!(std::error::Error::source(&err).is_none());
     }
 
@@ -5494,6 +6038,100 @@ mod tests {
                 | virtio_feature_bit(VIRTIO_NET_F_MTU)
         );
         assert!(!device.device().is_activated());
+    }
+
+    #[test]
+    fn prepared_network_devices_build_independent_directional_rate_limiters() {
+        let rx_rate_limiter = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(1024, Some(2048), 100)),
+            None,
+        );
+        let tx_rate_limiter = NetworkRateLimiterConfig::new(
+            None,
+            Some(NetworkTokenBucketConfig::new(10, None, 1000)),
+        );
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(
+                input()
+                    .with_rx_rate_limiter(rx_rate_limiter)
+                    .with_tx_rate_limiter(tx_rate_limiter),
+            )
+            .expect("rate-limited network config should be stored");
+
+        let devices =
+            PreparedNetworkDevices::from_configs(&configs).expect("network device should prepare");
+        let device = devices
+            .as_slice()
+            .first()
+            .expect("prepared network device should exist")
+            .device();
+
+        assert!(device.rx_rate_limiter().is_some());
+        assert!(device.tx_rate_limiter().is_some());
+        assert_ne!(device.rx_rate_limiter(), device.tx_rate_limiter());
+    }
+
+    #[test]
+    fn network_rate_limiter_state_is_isolated_by_direction_and_device() {
+        let now = Instant::now();
+        let config =
+            NetworkRateLimiterConfig::new(None, Some(NetworkTokenBucketConfig::new(1, None, 100)));
+        let mut first = VirtioNetworkDevice::with_rate_limiters_at(Some(config), Some(config), now);
+        let second = VirtioNetworkDevice::with_rate_limiters_at(Some(config), Some(config), now);
+        let initial = second
+            .tx_rate_limiter()
+            .expect("second TX limiter should exist")
+            .clone();
+
+        assert!(matches!(
+            first
+                .tx_rate_limiter
+                .as_mut()
+                .expect("first TX limiter should exist")
+                .reduce_at(1, now),
+            super::VirtioNetworkRateLimiterReduction::Allowed(_)
+        ));
+
+        assert_eq!(
+            first
+                .rx_rate_limiter()
+                .expect("first RX limiter should exist"),
+            &initial
+        );
+        assert_eq!(
+            second
+                .tx_rate_limiter()
+                .expect("second TX limiter should exist"),
+            &initial
+        );
+    }
+
+    #[test]
+    fn network_device_reset_clears_pending_flags_but_retains_limiter_budget() {
+        let now = Instant::now();
+        let config =
+            NetworkRateLimiterConfig::new(None, Some(NetworkTokenBucketConfig::new(1, None, 100)));
+        let mut device = VirtioNetworkDevice::with_rate_limiters_at(None, Some(config), now);
+        assert!(matches!(
+            device
+                .tx_rate_limiter
+                .as_mut()
+                .expect("TX limiter should exist")
+                .reduce_at(1, now),
+            super::VirtioNetworkRateLimiterReduction::Allowed(_)
+        ));
+        device.pending_rate_limited_rx_queue = true;
+        device.pending_rate_limited_tx_queue = true;
+        let spent_limiter = device
+            .tx_rate_limiter()
+            .expect("TX limiter should exist")
+            .clone();
+
+        device.reset();
+
+        assert!(!device.has_pending_rate_limited_queue_work());
+        assert_eq!(device.tx_rate_limiter(), Some(&spent_limiter));
     }
 
     #[test]
@@ -7737,6 +8375,285 @@ mod tests {
             read_interrupt_status(&handler),
             DeviceInterruptKind::Queue.status().bits()
         );
+    }
+
+    #[test]
+    fn virtio_network_rx_rate_limit_throttles_without_side_effects_and_retries() {
+        let now = Instant::now();
+        let rate_limiter =
+            NetworkRateLimiterConfig::new(Some(NetworkTokenBucketConfig::new(16, None, 100)), None);
+        let mut memory = tx_frame_memory();
+        let mut handler =
+            network_activation_handler_with_rate_limiters_at(Some(rate_limiter), None, now);
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source = RecordingRxPacketSource::with_packets(vec![
+            vec![0x10, 0x11, 0x12, 0x13],
+            vec![0x20, 0x21, 0x22, 0x23],
+        ]);
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_rx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::writable(
+                    TEST_RX_BUFFER,
+                    u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+                        .expect("RX minimum should fit u32"),
+                    None,
+                ),
+                TestDescriptor::writable(
+                    TEST_RX_SECOND_BUFFER,
+                    u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+                        .expect("RX minimum should fit u32"),
+                    None,
+                ),
+            ],
+        );
+        write_rx_available_heads(&mut memory, &[0, 1]);
+        memory
+            .write_slice(&[0xa5; 16], TEST_RX_SECOND_BUFFER)
+            .expect("second RX buffer sentinel should write");
+
+        let first = handler
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications_with_packet_io_at(
+                &mut memory,
+                vec![VIRTIO_NET_RX_QUEUE_INDEX],
+                &mut sink,
+                &mut source,
+                now,
+            )
+            .expect("initial rate-limited RX dispatch should complete");
+
+        assert_eq!(first.drained_notifications(), [VIRTIO_NET_RX_QUEUE_INDEX]);
+        let first_rx = first
+            .rx_queue_dispatch()
+            .expect("initial RX dispatch should be present");
+        assert_eq!(first_rx.processed_buffers(), 1);
+        assert_eq!(first_rx.delivered_packets(), 1);
+        assert_eq!(first_rx.rate_limiter_throttled_packets(), 1);
+        assert_eq!(source.consume_calls, 1);
+        assert_eq!(source.remaining_packets(), 1);
+        assert_eq!(read_rx_used_index(&memory), 1);
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_RX_SECOND_BUFFER, 16),
+            [0xa5; 16]
+        );
+        assert!(handler.has_pending_network_queue_work());
+
+        let retry = handler
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications_with_packet_io_at(
+                &mut memory,
+                Vec::new(),
+                &mut sink,
+                &mut source,
+                now + Duration::from_millis(100),
+            )
+            .expect("refilled RX work should retry without a new notification");
+
+        assert!(retry.drained_notifications().is_empty());
+        let retry_rx = retry
+            .rx_queue_dispatch()
+            .expect("retry RX dispatch should be present");
+        assert_eq!(retry_rx.processed_buffers(), 1);
+        assert_eq!(retry_rx.delivered_packets(), 1);
+        assert_eq!(retry_rx.rate_limiter_throttled_packets(), 0);
+        assert_eq!(source.consume_calls, 2);
+        assert_eq!(source.remaining_packets(), 0);
+        assert_eq!(read_rx_used_index(&memory), 2);
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_RX_SECOND_BUFFER
+                    .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                    .expect("second RX payload address should not overflow"),
+                4,
+            ),
+            [0x20, 0x21, 0x22, 0x23]
+        );
+        assert!(!handler.has_pending_network_queue_work());
+
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&first);
+        metrics.record_notification_dispatch(&retry);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_rx_queue_event_count(1)
+                .with_rx_bytes_count(32)
+                .with_rx_packets_count(2)
+                .with_rx_count(2)
+        );
+    }
+
+    #[test]
+    fn virtio_network_tx_rate_limit_throttles_without_side_effects_and_retries() {
+        let now = Instant::now();
+        let rate_limiter =
+            NetworkRateLimiterConfig::new(Some(NetworkTokenBucketConfig::new(16, None, 100)), None);
+        let mut memory = tx_frame_memory();
+        let mut handler =
+            network_activation_handler_with_rate_limiters_at(None, Some(rate_limiter), now);
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source = RecordingRxPacketSource::default();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_two_tx_frames(&mut memory);
+
+        let first = handler
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications_with_packet_io_at(
+                &mut memory,
+                vec![VIRTIO_NET_TX_QUEUE_INDEX],
+                &mut sink,
+                &mut source,
+                now,
+            )
+            .expect("initial rate-limited TX dispatch should complete");
+
+        assert_eq!(first.drained_notifications(), [VIRTIO_NET_TX_QUEUE_INDEX]);
+        let first_tx = first
+            .tx_queue_dispatch()
+            .expect("initial TX dispatch should be present");
+        assert_eq!(first_tx.processed_frames(), 1);
+        assert_eq!(first_tx.sink_successful_frames(), 1);
+        assert_eq!(first_tx.rate_limiter_throttled_frames(), 1);
+        assert_eq!(sink.calls, 1);
+        assert_eq!(sink.frame_heads, [0]);
+        assert_eq!(read_tx_used_index(&memory), 1);
+        assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+        assert!(handler.has_pending_network_queue_work());
+
+        let retry = handler
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications_with_packet_io_at(
+                &mut memory,
+                Vec::new(),
+                &mut sink,
+                &mut source,
+                now + Duration::from_millis(100),
+            )
+            .expect("refilled TX work should retry without a new notification");
+
+        assert!(retry.drained_notifications().is_empty());
+        let retry_tx = retry
+            .tx_queue_dispatch()
+            .expect("retry TX dispatch should be present");
+        assert_eq!(retry_tx.processed_frames(), 1);
+        assert_eq!(retry_tx.sink_successful_frames(), 1);
+        assert_eq!(retry_tx.rate_limiter_throttled_frames(), 0);
+        assert_eq!(sink.calls, 2);
+        assert_eq!(sink.frame_heads, [0, 2]);
+        assert_eq!(
+            sink.packets,
+            [vec![0x10, 0x11, 0x12, 0x13], vec![0x20, 0x21, 0x22, 0x23]]
+        );
+        assert_eq!(read_tx_used_index(&memory), 2);
+        assert_eq!(read_tx_used_element(&memory, 1), (2, 0));
+        assert!(!handler.has_pending_network_queue_work());
+
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&first);
+        metrics.record_notification_dispatch(&retry);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_tx_queue_event_count(1)
+                .with_tx_bytes_count(32)
+                .with_tx_packets_count(2)
+                .with_tx_count(2)
+        );
+    }
+
+    #[test]
+    fn virtio_network_tx_rate_limiter_refunds_successful_detours() {
+        let now = Instant::now();
+        let rate_limiter = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(16, None, 100)),
+            Some(NetworkTokenBucketConfig::new(1, None, 100)),
+        );
+        let mut memory = tx_frame_memory();
+        let mut handler =
+            network_activation_handler_with_rate_limiters_at(None, Some(rate_limiter), now);
+        let mut sink = RecordingTxPacketSink::detouring();
+        let mut source = RecordingRxPacketSource::default();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_two_tx_frames(&mut memory);
+        let initial_limiter = handler
+            .activation_handler()
+            .tx_rate_limiter()
+            .expect("TX limiter should exist")
+            .clone();
+
+        let notification = handler
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications_with_packet_io_at(
+                &mut memory,
+                vec![VIRTIO_NET_TX_QUEUE_INDEX],
+                &mut sink,
+                &mut source,
+                now,
+            )
+            .expect("detoured TX frames should dispatch");
+
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch should be present");
+        assert_eq!(dispatch.processed_frames(), 2);
+        assert_eq!(dispatch.sink_successful_frames(), 2);
+        assert_eq!(dispatch.rate_limiter_throttled_frames(), 0);
+        assert_eq!(sink.calls, 2);
+        assert_eq!(read_tx_used_index(&memory), 2);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .tx_rate_limiter()
+                .expect("TX limiter should remain configured"),
+            &initial_limiter
+        );
+        assert!(!handler.has_pending_network_queue_work());
+    }
+
+    #[test]
+    fn virtio_network_tx_rate_limiter_charges_sink_failures() {
+        let now = Instant::now();
+        let rate_limiter =
+            NetworkRateLimiterConfig::new(None, Some(NetworkTokenBucketConfig::new(1, None, 100)));
+        let mut memory = tx_frame_memory();
+        let mut handler =
+            network_activation_handler_with_rate_limiters_at(None, Some(rate_limiter), now);
+        let mut sink = RecordingTxPacketSink::failing_on(1);
+        let mut source = RecordingRxPacketSource::default();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_two_tx_frames(&mut memory);
+
+        let notification = handler
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications_with_packet_io_at(
+                &mut memory,
+                vec![VIRTIO_NET_TX_QUEUE_INDEX],
+                &mut sink,
+                &mut source,
+                now,
+            )
+            .expect("sink failure should remain a completed queue outcome");
+
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch should be present");
+        assert_eq!(dispatch.processed_frames(), 1);
+        assert_eq!(dispatch.sink_failures(), 1);
+        assert_eq!(dispatch.rate_limiter_throttled_frames(), 1);
+        assert_eq!(sink.calls, 1);
+        assert_eq!(read_tx_used_index(&memory), 1);
+        assert!(handler.has_pending_network_queue_work());
     }
 
     #[test]
