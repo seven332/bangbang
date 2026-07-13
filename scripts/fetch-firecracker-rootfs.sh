@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v29"
+direct_boot_variant="direct-boot-v30"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -447,7 +447,11 @@ fetch_mmds_marker() {
 
   if [ "$mmds_value" = BANGBANG_MMDS_GUEST_VALUE ]; then
     emit_line BANGBANG_MMDS_FETCH_OK
-    write_vdb_marker BANGBANG_MMDS_GUEST_FETCH_OK
+    if cmdline_has bangbang.mmds-mtu=1280; then
+      write_vdb_marker BANGBANG_MMDS_MTU_GUEST_FETCH_OK
+    else
+      write_vdb_marker BANGBANG_MMDS_GUEST_FETCH_OK
+    fi
   else
     emit_line BANGBANG_MMDS_FETCH_FAIL_RESPONSE
     write_vdb_marker BANGBANG_MMDS_FETCH_FAIL

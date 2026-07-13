@@ -48,6 +48,7 @@ mod macos_arm64 {
     const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
     const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
     const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
+    const DIRECT_ROOTFS_MMDS_MTU_MARKER: &[u8] = b"BANGBANG_MMDS_MTU_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_V2_MARKER: &[u8] = b"BANGBANG_MMDS_V2_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
     const DIRECT_ROOTFS_VSOCK_EXCHANGES: &[(&[u8], &[u8])] = &[
@@ -2824,7 +2825,7 @@ mod macos_arm64 {
             request_context: "MMDS guest fetch with configured MTU",
             mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
             boot_args: DIRECT_ROOTFS_MMDS_MTU_BOOT_ARGS,
-            success_marker: DIRECT_ROOTFS_MMDS_MARKER,
+            success_marker: DIRECT_ROOTFS_MMDS_MTU_MARKER,
             network_mtu: Some(1280),
             content_source: DirectRootfsMmdsContentSource::ApiRequest,
         });
