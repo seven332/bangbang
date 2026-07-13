@@ -4422,11 +4422,19 @@ impl HvfArm64BootPmemNotificationDispatch {
 #[derive(Debug)]
 pub struct HvfArm64BootNetworkNotificationDispatches {
     devices: Vec<HvfArm64BootNetworkNotificationDispatch>,
+    rate_limiter_retry_after: Option<Duration>,
 }
 
 impl HvfArm64BootNetworkNotificationDispatches {
     fn new(devices: Vec<HvfArm64BootNetworkNotificationDispatch>) -> Self {
-        Self { devices }
+        let rate_limiter_retry_after = devices
+            .iter()
+            .filter_map(|device| device.dispatch().rate_limiter_retry_after())
+            .min();
+        Self {
+            devices,
+            rate_limiter_retry_after,
+        }
     }
 
     pub fn as_slice(&self) -> &[HvfArm64BootNetworkNotificationDispatch] {
@@ -4445,6 +4453,10 @@ impl HvfArm64BootNetworkNotificationDispatches {
         self.devices
             .iter()
             .any(|device| device.signal_error().is_some())
+    }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.rate_limiter_retry_after
     }
 }
 
@@ -7749,11 +7761,11 @@ mod tests {
         MmioHandlerError, MmioOperation, MmioRegionId,
     };
     use bangbang_runtime::network::{
-        NetworkInterfaceConfigInput, NetworkMmioLayout, VIRTIO_NET_RX_QUEUE_INDEX,
-        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRxPacket,
-        VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
-        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
-        VirtioNetworkTxPacketSinkError,
+        NetworkInterfaceConfigInput, NetworkMmioLayout, NetworkRateLimiterConfig,
+        NetworkTokenBucketConfig, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
+        VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
+        VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition,
+        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
     use bangbang_runtime::pmem::{
         PmemConfigInput, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT, VIRTIO_PMEM_REQUEST_SIZE,
@@ -8433,6 +8445,8 @@ mod tests {
     const TEST_NETWORK_TX_USED_RING: GuestAddress = GuestAddress::new(0x8062_0000);
     const TEST_NETWORK_TX_HEADER: GuestAddress = GuestAddress::new(0x8063_0000);
     const TEST_NETWORK_TX_PAYLOAD: GuestAddress = GuestAddress::new(0x8064_0000);
+    const TEST_NETWORK_SECOND_TX_HEADER: GuestAddress = GuestAddress::new(0x8065_0000);
+    const TEST_NETWORK_SECOND_TX_PAYLOAD: GuestAddress = GuestAddress::new(0x8066_0000);
     const TEST_VSOCK_RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8070_0000);
     const TEST_VSOCK_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8071_0000);
     const TEST_VSOCK_RX_USED_RING: GuestAddress = GuestAddress::new(0x8072_0000);
@@ -9501,6 +9515,20 @@ mod tests {
             .expect("network interface config should be stored");
     }
 
+    fn add_network_with_tx_rate_limiter(
+        controller: &mut bangbang_runtime::VmmController,
+        iface_id: &str,
+        host_dev_name: &str,
+        tx_rate_limiter: NetworkRateLimiterConfig,
+    ) {
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(iface_id, iface_id, host_dev_name)
+                    .with_tx_rate_limiter(tx_rate_limiter),
+            ))
+            .expect("network interface config with TX rate limiter should be stored");
+    }
+
     fn add_vsock(
         controller: &mut bangbang_runtime::VmmController,
         guest_cid: u32,
@@ -9704,6 +9732,22 @@ mod tests {
         let resources = Arm64BootResources::assemble_from_controller(
             &controller,
             valid_boot_resource_config_with_network_lines(&[], &interrupt_lines),
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
+    fn boot_runtime_with_network_tx_rate_limiter(
+        tx_rate_limiter: NetworkRateLimiterConfig,
+    ) -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
+        let kernel = temp_file("kernel-with-network-rate-limiter", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network_with_tx_rate_limiter(&mut controller, "eth0", "tap0", tx_rate_limiter);
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_boot_resource_config_with_network_lines(&[], &[line(32)]),
         )
         .expect("boot resources should assemble");
         let parts = resources.into_parts();
@@ -11250,7 +11294,7 @@ mod tests {
             .expect("balloon descriptor should write");
     }
 
-    fn write_network_tx_header(memory: &mut GuestMemory) {
+    fn write_network_tx_header_at(memory: &mut GuestMemory, address: GuestAddress) {
         let mut bytes = [0; VIRTIO_NET_TX_HEADER_SIZE as usize];
         let (flags, tail) = bytes.split_at_mut(1);
         let (gso_type, tail) = tail.split_at_mut(1);
@@ -11268,8 +11312,12 @@ mod tests {
         num_buffers.copy_from_slice(&0x0b0c_u16.to_le_bytes());
 
         memory
-            .write_slice(&bytes, TEST_NETWORK_TX_HEADER)
+            .write_slice(&bytes, address)
             .expect("virtio-net TX header should write");
+    }
+
+    fn write_network_tx_header(memory: &mut GuestMemory) {
+        write_network_tx_header_at(memory, TEST_NETWORK_TX_HEADER);
     }
 
     fn write_network_tx_descriptor(
@@ -11661,6 +11709,7 @@ mod tests {
         assert!(result.is_empty());
         assert_eq!(result.len(), 0);
         assert!(!result.has_signal_failure());
+        assert_eq!(result.rate_limiter_retry_after(), None);
     }
 
     #[test]
@@ -12376,6 +12425,7 @@ mod tests {
         assert!(result.is_empty());
         assert_eq!(result.len(), 0);
         assert!(!result.has_signal_failure());
+        assert_eq!(result.rate_limiter_retry_after(), None);
         assert!(provider.requested_ifaces.is_empty());
     }
 
@@ -12750,6 +12800,78 @@ mod tests {
             ),
             DeviceInterruptKind::Queue.status().bits()
         );
+    }
+
+    #[test]
+    fn network_notification_signal_failure_preserves_rate_limiter_retry_after() {
+        let rate_limiter = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(16, None, 60_000)),
+            None,
+        );
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_network_tx_rate_limiter(rate_limiter);
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
+        write_network_tx_header_at(&mut memory, TEST_NETWORK_TX_HEADER);
+        write_network_tx_header_at(&mut memory, TEST_NETWORK_SECOND_TX_HEADER);
+        memory
+            .write_slice(&[0x10, 0x11, 0x12, 0x13], TEST_NETWORK_TX_PAYLOAD)
+            .expect("first network TX payload should write");
+        memory
+            .write_slice(&[0x20, 0x21, 0x22, 0x23], TEST_NETWORK_SECOND_TX_PAYLOAD)
+            .expect("second network TX payload should write");
+        write_network_tx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::readable(
+                    TEST_NETWORK_TX_HEADER,
+                    VIRTIO_NET_TX_HEADER_SIZE,
+                    Some(1),
+                ),
+                TestDescriptor::readable(TEST_NETWORK_TX_PAYLOAD, 4, None),
+                TestDescriptor::readable(
+                    TEST_NETWORK_SECOND_TX_HEADER,
+                    VIRTIO_NET_TX_HEADER_SIZE,
+                    Some(3),
+                ),
+                TestDescriptor::readable(TEST_NETWORK_SECOND_TX_PAYLOAD, 4, None),
+            ],
+        );
+        write_network_tx_available_heads(&mut memory, &[0, 2]);
+        notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let retry_after = dispatches
+            .rate_limiter_retry_after()
+            .expect("runtime dispatch should expose retry timing");
+        assert!(retry_after > Duration::ZERO);
+        assert!(retry_after <= Duration::from_secs(60));
+        let (lines, sink) = RecordingSink::failing("injected network signal failure");
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("network signal failure should stay per-device");
+
+        assert!(result.has_signal_failure());
+        assert_eq!(result.rate_limiter_retry_after(), Some(retry_after));
+        let device = &result.as_slice()[0];
+        assert_eq!(
+            device.dispatch().rate_limiter_retry_after(),
+            Some(retry_after)
+        );
+        assert!(device.signal_error().is_some());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        let dispatch = device
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("network notification should dispatch before signal failure");
+        let tx = dispatch
+            .tx_queue_dispatch()
+            .expect("TX queue dispatch should be present");
+        assert_eq!(tx.processed_frames(), 1);
+        assert_eq!(tx.rate_limiter_throttled_frames(), 1);
+        assert_eq!(tx.rate_limiter_retry_after(), Some(retry_after));
+        assert_eq!(read_network_tx_used_index(&memory), 1);
+        assert_eq!(read_network_tx_used_element(&memory, 0), (0, 0));
     }
 
     #[test]

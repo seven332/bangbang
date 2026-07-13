@@ -1173,6 +1173,13 @@ impl Arm64BootNetworkNotificationDispatches {
             .iter()
             .any(Arm64BootNetworkNotificationDispatch::needs_queue_interrupt)
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.devices
+            .iter()
+            .filter_map(Arm64BootNetworkNotificationDispatch::rate_limiter_retry_after)
+            .min()
+    }
 }
 
 #[derive(Debug)]
@@ -1197,6 +1204,10 @@ impl Arm64BootNetworkNotificationDispatch {
     pub fn needs_queue_interrupt(&self) -> bool {
         self.outcome.needs_queue_interrupt()
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.outcome.rate_limiter_retry_after()
+    }
 }
 
 #[derive(Debug)]
@@ -1219,6 +1230,14 @@ impl Arm64BootNetworkNotificationOutcome {
                 )
             }
             Self::HandlerLookupFailed(_) | Self::PacketIoProviderFailed(_) => false,
+        }
+    }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.rate_limiter_retry_after(),
+            Self::DispatchFailed(source) => source.rate_limiter_retry_after(),
+            Self::HandlerLookupFailed(_) | Self::PacketIoProviderFailed(_) => None,
         }
     }
 
@@ -10166,7 +10185,8 @@ mod tests {
             .expect("initial rate-limited dispatch should allocate");
 
         assert_eq!(provider.requested_ifaces, ["eth0".to_string()]);
-        let first_dispatch = first.as_slice()[0]
+        let first_device_dispatch = &first.as_slice()[0];
+        let first_dispatch = first_device_dispatch
             .outcome()
             .dispatched()
             .expect("initial rate-limited dispatch should complete");
@@ -10179,6 +10199,20 @@ mod tests {
             .expect("initial TX dispatch should be present");
         assert_eq!(first_tx.processed_frames(), 1);
         assert_eq!(first_tx.rate_limiter_throttled_frames(), 1);
+        let first_retry_after = first_tx
+            .rate_limiter_retry_after()
+            .expect("initial TX throttle should expose retry timing");
+        assert!(first_retry_after > Duration::ZERO);
+        assert!(first_retry_after <= Duration::from_secs(60));
+        assert_eq!(
+            first_dispatch.rate_limiter_retry_after(),
+            Some(first_retry_after)
+        );
+        assert_eq!(
+            first_device_dispatch.rate_limiter_retry_after(),
+            Some(first_retry_after)
+        );
+        assert_eq!(first.rate_limiter_retry_after(), Some(first_retry_after));
         assert_eq!(provider.endpoint("eth0").tx_sink.calls, 1);
         provider.requested_ifaces.clear();
 
@@ -10191,7 +10225,8 @@ mod tests {
             .expect("pending rate-limit retry should allocate");
 
         assert_eq!(provider.requested_ifaces, ["eth0".to_string()]);
-        let retry_dispatch = retry.as_slice()[0]
+        let retry_device_dispatch = &retry.as_slice()[0];
+        let retry_dispatch = retry_device_dispatch
             .outcome()
             .dispatched()
             .expect("pending rate-limit retry should dispatch");
@@ -10201,6 +10236,20 @@ mod tests {
             .expect("pending TX retry should be present");
         assert_eq!(retry_tx.processed_frames(), 0);
         assert_eq!(retry_tx.rate_limiter_throttled_frames(), 1);
+        let repeated_retry_after = retry_tx
+            .rate_limiter_retry_after()
+            .expect("repeated TX throttle should expose retry timing");
+        assert!(repeated_retry_after > Duration::ZERO);
+        assert!(repeated_retry_after <= first_retry_after);
+        assert_eq!(
+            retry_dispatch.rate_limiter_retry_after(),
+            Some(repeated_retry_after)
+        );
+        assert_eq!(
+            retry_device_dispatch.rate_limiter_retry_after(),
+            Some(repeated_retry_after)
+        );
+        assert_eq!(retry.rate_limiter_retry_after(), Some(repeated_retry_after));
         assert_eq!(provider.endpoint("eth0").tx_sink.calls, 1);
     }
 
@@ -10342,11 +10391,27 @@ mod tests {
     }
 
     #[test]
-    fn boot_runtime_network_notification_dispatch_routes_multiple_interfaces_separately() {
+    fn boot_runtime_network_notification_dispatch_reports_earliest_interface_retry() {
         let kernel = temp_file("kernel-network-packet-io-multiple", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
-        add_network(&mut controller, "eth0", "tap0");
-        add_network(&mut controller, "eth1", "tap1");
+        add_network_with_tx_rate_limiter(
+            &mut controller,
+            "eth0",
+            "tap0",
+            NetworkRateLimiterConfig::new(
+                Some(NetworkTokenBucketConfig::new(13, None, 60_000)),
+                None,
+            ),
+        );
+        add_network_with_tx_rate_limiter(
+            &mut controller,
+            "eth1",
+            "tap1",
+            NetworkRateLimiterConfig::new(
+                Some(NetworkTokenBucketConfig::new(14, None, 30_000)),
+                None,
+            ),
+        );
         let config = Arm64BootResourceConfig {
             network_interrupt_lines: &[line(33), line(34)],
             ..valid_config(&[])
@@ -10361,22 +10426,52 @@ mod tests {
         let second = network_queue_layout(1);
         configure_boot_network_queues_with_layout(&mut runtime, &mut mmio_dispatcher, 0, first);
         configure_boot_network_queues_with_layout(&mut runtime, &mut mmio_dispatcher, 1, second);
-        write_queued_tx_frame_at(
+        write_queued_tx_frame_at_head(
             &mut memory,
             first.tx_descriptor_table,
+            0,
             first.tx_header,
             first.tx_payload,
             &[0x10],
         );
-        write_available_heads_at(&mut memory, first.tx_available_ring, &[0]);
-        write_queued_tx_frame_at(
+        write_queued_tx_frame_at_head(
+            &mut memory,
+            first.tx_descriptor_table,
+            2,
+            first
+                .tx_header
+                .checked_add(0x1000)
+                .expect("second first-interface TX header should not overflow"),
+            first
+                .tx_payload
+                .checked_add(0x1000)
+                .expect("second first-interface TX payload should not overflow"),
+            &[0x11],
+        );
+        write_available_heads_at(&mut memory, first.tx_available_ring, &[0, 2]);
+        write_queued_tx_frame_at_head(
             &mut memory,
             second.tx_descriptor_table,
+            0,
             second.tx_header,
             second.tx_payload,
             &[0x20, 0x21],
         );
-        write_available_heads_at(&mut memory, second.tx_available_ring, &[0]);
+        write_queued_tx_frame_at_head(
+            &mut memory,
+            second.tx_descriptor_table,
+            2,
+            second
+                .tx_header
+                .checked_add(0x1000)
+                .expect("second second-interface TX header should not overflow"),
+            second
+                .tx_payload
+                .checked_add(0x1000)
+                .expect("second second-interface TX payload should not overflow"),
+            &[0x22, 0x23],
+        );
+        write_available_heads_at(&mut memory, second.tx_available_ring, &[0, 2]);
         notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 0);
         notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 1);
         let mut provider = RecordingNetworkPacketIoProvider::default()
@@ -10404,6 +10499,44 @@ mod tests {
         );
         assert_eq!(provider.endpoint("eth0").tx_sink.calls, 1);
         assert_eq!(provider.endpoint("eth1").tx_sink.calls, 1);
+
+        let first_device_dispatch = &dispatches.as_slice()[0];
+        let first_dispatch = first_device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("first interface should dispatch");
+        let first_retry_after = first_dispatch
+            .tx_queue_dispatch()
+            .expect("first interface TX dispatch should be present")
+            .rate_limiter_retry_after()
+            .expect("first interface should expose retry timing");
+        assert!(first_retry_after > Duration::from_secs(30));
+        assert!(first_retry_after <= Duration::from_secs(60));
+        assert_eq!(
+            first_device_dispatch.rate_limiter_retry_after(),
+            Some(first_retry_after)
+        );
+
+        let second_device_dispatch = &dispatches.as_slice()[1];
+        let second_dispatch = second_device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("second interface should dispatch");
+        let second_retry_after = second_dispatch
+            .tx_queue_dispatch()
+            .expect("second interface TX dispatch should be present")
+            .rate_limiter_retry_after()
+            .expect("second interface should expose retry timing");
+        assert!(second_retry_after > Duration::ZERO);
+        assert!(second_retry_after <= Duration::from_secs(30));
+        assert_eq!(
+            second_device_dispatch.rate_limiter_retry_after(),
+            Some(second_retry_after)
+        );
+        assert_eq!(
+            dispatches.rate_limiter_retry_after(),
+            Some(second_retry_after)
+        );
     }
 
     #[test]
@@ -10435,6 +10568,8 @@ mod tests {
             .expect("network dispatch result should allocate");
 
         assert!(!failed.needs_queue_interrupt());
+        assert_eq!(failed.rate_limiter_retry_after(), None);
+        assert_eq!(failed.as_slice()[0].rate_limiter_retry_after(), None);
         match failed.as_slice()[0].outcome() {
             Arm64BootNetworkNotificationOutcome::PacketIoProviderFailed(source) => {
                 assert_eq!(
@@ -10502,6 +10637,8 @@ mod tests {
             .expect("network dispatch result should allocate");
 
         assert!(provider.requested_ifaces.is_empty());
+        assert_eq!(dispatches.rate_limiter_retry_after(), None);
+        assert_eq!(dispatches.as_slice()[0].rate_limiter_retry_after(), None);
         assert!(
             dispatches.as_slice()[0]
                 .outcome()
@@ -10533,6 +10670,8 @@ mod tests {
 
         assert_eq!(dispatches.len(), 1);
         assert!(!dispatches.needs_queue_interrupt());
+        assert_eq!(dispatches.rate_limiter_retry_after(), None);
+        assert_eq!(dispatches.as_slice()[0].rate_limiter_retry_after(), None);
         let error = dispatches.as_slice()[0]
             .outcome()
             .handler_lookup_error()
