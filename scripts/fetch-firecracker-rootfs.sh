@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v31"
+direct_boot_variant="direct-boot-v32"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -1062,11 +1062,10 @@ read_flush_pmem_marker() {
   write_vdb_marker BANGBANG_PMEM_READ_FLUSH_OK
 }
 
-fetch_mmds_v2_marker() {
-  if ! prepare_mmds_network BANGBANG_MMDS_V2_FETCH_FAIL BANGBANG_MMDS_V2_FETCH_FAIL; then
-    return
-  fi
-
+request_mmds_v2_token() {
+  failure_prefix=$1
+  failure_marker=$2
+  token_ttl=$3
   mmds_token=$(
     curl \
       --fail \
@@ -1075,35 +1074,50 @@ fetch_mmds_v2_marker() {
       --connect-timeout 2 \
       --max-time 5 \
       -X PUT \
-      -H 'X-metadata-token-ttl-seconds: 60' \
+      -H "X-metadata-token-ttl-seconds: $token_ttl" \
       http://169.254.169.254/latest/api/token \
       2>/dev/null || true
   )
 
   if [ "${#mmds_token}" -ne 64 ]; then
-    emit_line BANGBANG_MMDS_V2_FETCH_FAIL_TOKEN
-    write_vdb_marker BANGBANG_MMDS_V2_FETCH_FAIL
-    return
+    emit_line "${failure_prefix}_TOKEN"
+    write_vdb_marker "$failure_marker"
+    return 1
   fi
   case "$mmds_token" in
     *[!0123456789abcdef]*)
-      emit_line BANGBANG_MMDS_V2_FETCH_FAIL_TOKEN
-      write_vdb_marker BANGBANG_MMDS_V2_FETCH_FAIL
-      return
+      emit_line "${failure_prefix}_TOKEN"
+      write_vdb_marker "$failure_marker"
+      return 1
       ;;
   esac
 
-  mmds_value=$(
-    curl \
-      --fail \
-      --silent \
-      --show-error \
-      --connect-timeout 2 \
-      --max-time 5 \
-      -H "X-metadata-token: $mmds_token" \
-      http://169.254.169.254/meta-data/bangbang-marker \
-      2>/dev/null || true
-  )
+  return 0
+}
+
+get_mmds_v2_value() {
+  mmds_path=$1
+  curl \
+    --fail \
+    --silent \
+    --show-error \
+    --connect-timeout 2 \
+    --max-time 5 \
+    -H "X-metadata-token: $mmds_token" \
+    "http://169.254.169.254/$mmds_path" \
+    2>/dev/null
+}
+
+fetch_mmds_v2_marker() {
+  if ! prepare_mmds_network BANGBANG_MMDS_V2_FETCH_FAIL BANGBANG_MMDS_V2_FETCH_FAIL; then
+    return
+  fi
+
+  if ! request_mmds_v2_token BANGBANG_MMDS_V2_FETCH_FAIL BANGBANG_MMDS_V2_FETCH_FAIL 60; then
+    return
+  fi
+
+  mmds_value=$(get_mmds_v2_value meta-data/bangbang-marker || true)
 
   if [ "$mmds_value" = BANGBANG_MMDS_GUEST_VALUE ]; then
     emit_line BANGBANG_MMDS_V2_FETCH_OK
@@ -1112,6 +1126,100 @@ fetch_mmds_v2_marker() {
     emit_line BANGBANG_MMDS_V2_FETCH_FAIL_RESPONSE
     write_vdb_marker BANGBANG_MMDS_V2_FETCH_FAIL
   fi
+}
+
+fetch_mmds_process_a_marker() {
+  if ! prepare_mmds_network BANGBANG_MMDS_PROCESS_A_FETCH_FAIL BANGBANG_MMDS_PROCESS_A_FETCH_FAIL; then
+    return
+  fi
+
+  if ! request_mmds_v2_token BANGBANG_MMDS_PROCESS_A_FETCH_FAIL BANGBANG_MMDS_PROCESS_A_FETCH_FAIL 600; then
+    return
+  fi
+
+  mmds_value=$(get_mmds_v2_value meta-data/bangbang-marker || true)
+  if [ "$mmds_value" = BANGBANG_MMDS_PROCESS_A_VALUE ]; then
+    emit_line BANGBANG_MMDS_PROCESS_A_FETCH_OK
+    write_vdb_marker BANGBANG_MMDS_PROCESS_A_FETCH_OK
+  else
+    emit_line BANGBANG_MMDS_PROCESS_A_FETCH_FAIL_RESPONSE
+    write_vdb_marker BANGBANG_MMDS_PROCESS_A_FETCH_FAIL
+  fi
+}
+
+fetch_mmds_process_b_marker() {
+  if ! prepare_mmds_network BANGBANG_MMDS_PROCESS_B_READY_FAIL BANGBANG_MMDS_PROCESS_B_READY_FAIL; then
+    return
+  fi
+
+  if ! request_mmds_v2_token BANGBANG_MMDS_PROCESS_B_READY_FAIL BANGBANG_MMDS_PROCESS_B_READY_FAIL 600; then
+    return
+  fi
+
+  mmds_value=$(get_mmds_v2_value meta-data/bangbang-marker || true)
+  if [ "$mmds_value" != BANGBANG_MMDS_PROCESS_B_VALUE ]; then
+    emit_line BANGBANG_MMDS_PROCESS_B_READY_FAIL_RESPONSE
+    write_vdb_marker BANGBANG_MMDS_PROCESS_B_READY_FAIL
+    return
+  fi
+
+  mmds_release=$(get_mmds_v2_value meta-data/bangbang-release || true)
+  if [ "$mmds_release" != BANGBANG_MMDS_PROCESS_B_PENDING ]; then
+    emit_line BANGBANG_MMDS_PROCESS_B_READY_FAIL_RELEASE
+    write_vdb_marker BANGBANG_MMDS_PROCESS_B_READY_FAIL
+    return
+  fi
+
+  mmds_now=$(date +%s 2>/dev/null || true)
+  case "$mmds_now" in
+    ''|*[!0-9]*)
+      emit_line BANGBANG_MMDS_PROCESS_B_READY_FAIL_CLOCK
+      write_vdb_marker BANGBANG_MMDS_PROCESS_B_READY_FAIL
+      return
+      ;;
+  esac
+  mmds_release_deadline=$((mmds_now + 300))
+
+  emit_line BANGBANG_MMDS_PROCESS_B_READY
+  write_vdb_marker BANGBANG_MMDS_PROCESS_B_READY
+
+  while true; do
+    mmds_now=$(date +%s 2>/dev/null || true)
+    case "$mmds_now" in
+      ''|*[!0-9]*)
+        emit_line BANGBANG_MMDS_PROCESS_B_FETCH_FAIL_CLOCK
+        write_vdb_marker_at_sector BANGBANG_MMDS_PROCESS_B_FETCH_FAIL 1
+        return
+        ;;
+    esac
+    if [ "$mmds_now" -ge "$mmds_release_deadline" ]; then
+      emit_line BANGBANG_MMDS_PROCESS_B_FETCH_FAIL_TIMEOUT
+      write_vdb_marker_at_sector BANGBANG_MMDS_PROCESS_B_FETCH_FAIL 1
+      return
+    fi
+
+    mmds_release=$(get_mmds_v2_value meta-data/bangbang-release || true)
+    case "$mmds_release" in
+      BANGBANG_MMDS_PROCESS_B_PENDING|'')
+        ;;
+      BANGBANG_MMDS_PROCESS_B_RELEASE)
+        mmds_value=$(get_mmds_v2_value meta-data/bangbang-marker || true)
+        if [ "$mmds_value" = BANGBANG_MMDS_PROCESS_B_VALUE ]; then
+          emit_line BANGBANG_MMDS_PROCESS_B_FETCH_OK
+          write_vdb_marker_at_sector BANGBANG_MMDS_PROCESS_B_FETCH_OK 1
+        else
+          emit_line BANGBANG_MMDS_PROCESS_B_FETCH_FAIL_RESPONSE
+          write_vdb_marker_at_sector BANGBANG_MMDS_PROCESS_B_FETCH_FAIL 1
+        fi
+        return
+        ;;
+      *)
+        emit_line BANGBANG_MMDS_PROCESS_B_FETCH_FAIL_RELEASE
+        write_vdb_marker_at_sector BANGBANG_MMDS_PROCESS_B_FETCH_FAIL 1
+        return
+        ;;
+    esac
+  done
 }
 
 fetch_vsock_marker() {
@@ -1558,6 +1666,10 @@ elif cmdline_has bangbang.pmem-read-flush=1; then
   read_flush_pmem_marker
 elif cmdline_has bangbang.mmds-multi-fetch=1; then
   fetch_multi_interface_mmds_markers
+elif cmdline_has bangbang.mmds-process-a-fetch=1; then
+  fetch_mmds_process_a_marker
+elif cmdline_has bangbang.mmds-process-b-fetch=1; then
+  fetch_mmds_process_b_marker
 elif cmdline_has bangbang.mmds-v2-fetch=1; then
   fetch_mmds_v2_marker
 elif cmdline_has bangbang.mmds-fetch=1; then

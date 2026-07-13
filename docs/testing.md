@@ -861,7 +861,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v31.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v32.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -890,7 +890,22 @@ request, and writes the `eth0` and `eth1` results to separate fixed sectors of
 the scratch drive. The host requires both static success markers under one
 deadline and checks that both API interface metric objects report RX and TX
 activity. This MMDS-only scenario does not open direct vmnet resources or need
-the restricted networking entitlement. When the boot args include
+the restricted networking entitlement. The process-specific MMDS boot modes
+extend that protocol to two concurrently running signed executables with
+unique API sockets, interface IDs, metadata, metrics, and scratch drives. The
+second guest obtains a v2 token, verifies its own value plus an initial
+process-local release state, and writes a static ready marker before the host
+pauses it. After the first guest succeeds and its process exits, the host
+patches only the surviving process's release field and resumes it; that guest
+must re-fetch its original value with the same token before writing a distinct
+terminal marker. Bounded kqueue-backed marker waits replace fixed sleeps, and
+the test verifies that each metrics file contains only its own interface key,
+that peer flush/teardown cannot rewrite it, and that API socket cleanup cannot
+remove or stop the survivor. Tokens, metadata values, scratch bytes, private
+paths, and raw worker output are excluded from failure diagnostics. Both
+interfaces are completely covered by their process-local MMDS configuration,
+so this concurrent scenario also stays on MMDS-only packet I/O without the
+restricted networking entitlement. When the boot args include
 `bangbang.entropy-read=1`, the same
 init script checks `/sys/class/misc/hw_random/rng_current` for `virtio_rng`,
 reads bytes from `/dev/hwrng`, and writes

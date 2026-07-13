@@ -18,9 +18,10 @@ mod macos_arm64 {
     use std::time::{Duration, Instant};
 
     use crate::support::{
-        BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
-        assert_no_content_response, assert_ok_response, assert_response_contains, http_get,
-        http_json, http_json_with_io_timeout, http_no_body, http_put_json, json_string, path_text,
+        BangbangProcess, CompletedProcess, TestDir, assert_bad_request_response,
+        assert_clean_shutdown, assert_no_content_response, assert_ok_response,
+        assert_response_contains, http_get, http_json, http_json_with_io_timeout, http_no_body,
+        http_put_json, json_string, path_text,
     };
 
     const BANGBANG_GUEST_KERNEL_PATH_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
@@ -56,6 +57,25 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_MMDS_ETH1_FAILURE_MARKER: &[u8] = b"BANGBANG_MMDS_ETH1_FETCH_FAIL";
     const DIRECT_ROOTFS_MMDS_ETH0_MARKER_OFFSET: u64 = 0;
     const DIRECT_ROOTFS_MMDS_ETH1_MARKER_OFFSET: u64 =
+        bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const CONCURRENT_MMDS_PROCESS_A_IFACE_ID: &str = "mmds_a";
+    const CONCURRENT_MMDS_PROCESS_B_IFACE_ID: &str = "mmds_b";
+    const CONCURRENT_MMDS_PROCESS_A_VALUE: &str = "BANGBANG_MMDS_PROCESS_A_VALUE";
+    const CONCURRENT_MMDS_PROCESS_B_VALUE: &str = "BANGBANG_MMDS_PROCESS_B_VALUE";
+    const CONCURRENT_MMDS_PROCESS_B_PENDING: &str = "BANGBANG_MMDS_PROCESS_B_PENDING";
+    const CONCURRENT_MMDS_PROCESS_B_RELEASE: &str = "BANGBANG_MMDS_PROCESS_B_RELEASE";
+    const CONCURRENT_MMDS_PROCESS_A_CONTENT: &str =
+        r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_PROCESS_A_VALUE"}}"#;
+    const CONCURRENT_MMDS_PROCESS_B_CONTENT: &str = r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_PROCESS_B_VALUE","bangbang-release":"BANGBANG_MMDS_PROCESS_B_PENDING"}}"#;
+    const CONCURRENT_MMDS_PROCESS_B_RELEASE_PATCH: &str =
+        r#"{"meta-data":{"bangbang-release":"BANGBANG_MMDS_PROCESS_B_RELEASE"}}"#;
+    const CONCURRENT_MMDS_PROCESS_A_SUCCESS: &[u8] = b"BANGBANG_MMDS_PROCESS_A_FETCH_OK";
+    const CONCURRENT_MMDS_PROCESS_A_FAILURE: &[u8] = b"BANGBANG_MMDS_PROCESS_A_FETCH_FAIL";
+    const CONCURRENT_MMDS_PROCESS_B_READY: &[u8] = b"BANGBANG_MMDS_PROCESS_B_READY";
+    const CONCURRENT_MMDS_PROCESS_B_READY_FAILURE: &[u8] = b"BANGBANG_MMDS_PROCESS_B_READY_FAIL";
+    const CONCURRENT_MMDS_PROCESS_B_SUCCESS: &[u8] = b"BANGBANG_MMDS_PROCESS_B_FETCH_OK";
+    const CONCURRENT_MMDS_PROCESS_B_FAILURE: &[u8] = b"BANGBANG_MMDS_PROCESS_B_FETCH_FAIL";
+    const CONCURRENT_MMDS_PROCESS_B_TERMINAL_OFFSET: u64 =
         bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
     const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
     const DIRECT_ROOTFS_VSOCK_EXCHANGES: &[(&[u8], &[u8])] = &[
@@ -132,6 +152,8 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_MMDS_MTU_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1 bangbang.mmds-mtu=1280";
     const DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-v2-fetch=1";
     const DIRECT_ROOTFS_MMDS_MULTI_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-multi-fetch=1";
+    const CONCURRENT_MMDS_PROCESS_A_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-process-a-fetch=1";
+    const CONCURRENT_MMDS_PROCESS_B_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-process-b-fetch=1";
     const DIRECT_ROOTFS_MMDS_CONTENT: &str =
         r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_GUEST_VALUE"}}"#;
     const DIRECT_ROOTFS_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-connect=1";
@@ -171,6 +193,16 @@ mod macos_arm64 {
         mmds_config_body: &'a str,
         boot_args: &'a str,
         success_marker: &'a [u8],
+    }
+
+    #[derive(Clone, Copy)]
+    struct ConcurrentMmdsGuestConfig<'a> {
+        iface_id: &'a str,
+        guest_mac: &'a str,
+        mmds_content: &'a str,
+        boot_args: &'a str,
+        scratch_path: &'a Path,
+        metrics_path: &'a Path,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3040,6 +3072,297 @@ mod macos_arm64 {
     }
 
     #[test]
+    fn signed_executable_keeps_concurrent_mmds_processes_isolated() {
+        let test_dir = TestDir::new();
+        let socket_a = test_dir.path().join("mmds-a.socket");
+        let socket_b = test_dir.path().join("mmds-b.socket");
+        let scratch_a = test_dir.path().join("mmds-a.img");
+        let scratch_b = test_dir.path().join("mmds-b.img");
+        let metrics_a = test_dir.path().join("mmds-a.metrics");
+        let metrics_b = test_dir.path().join("mmds-b.metrics");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_prefix = test_dir.instance_id();
+        let instance_a = format!("{instance_prefix}-mmds-a");
+        let instance_b = format!("{instance_prefix}-mmds-b");
+        let private_fragments = concurrent_mmds_private_fragments(
+            test_dir.path(),
+            &kernel_path,
+            &rootfs_path,
+            &instance_a,
+            &instance_b,
+        );
+
+        create_zeroed_block_backing(&scratch_a);
+        create_zeroed_block_backing_with_sectors(&scratch_b, 2);
+        let mut process_a = BangbangProcess::start(&socket_a, &instance_a);
+        let mut process_b = BangbangProcess::start(&socket_b, &instance_b);
+
+        let configured_a = configure_concurrent_mmds_guest(
+            &socket_a,
+            &kernel_path,
+            &rootfs_path,
+            ConcurrentMmdsGuestConfig {
+                iface_id: CONCURRENT_MMDS_PROCESS_A_IFACE_ID,
+                guest_mac: "06:00:00:00:01:01",
+                mmds_content: CONCURRENT_MMDS_PROCESS_A_CONTENT,
+                boot_args: CONCURRENT_MMDS_PROCESS_A_BOOT_ARGS,
+                scratch_path: &scratch_a,
+                metrics_path: &metrics_a,
+            },
+        );
+        let configured_b = configure_concurrent_mmds_guest(
+            &socket_b,
+            &kernel_path,
+            &rootfs_path,
+            ConcurrentMmdsGuestConfig {
+                iface_id: CONCURRENT_MMDS_PROCESS_B_IFACE_ID,
+                guest_mac: "06:00:00:00:02:02",
+                mmds_content: CONCURRENT_MMDS_PROCESS_B_CONTENT,
+                boot_args: CONCURRENT_MMDS_PROCESS_B_BOOT_ARGS,
+                scratch_path: &scratch_b,
+                metrics_path: &metrics_b,
+            },
+        );
+        if configured_a.is_err() || configured_b.is_err() {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "guest configuration",
+            );
+        }
+
+        if start_concurrent_mmds_guest(&socket_a).is_err()
+            || start_concurrent_mmds_guest(&socket_b).is_err()
+            || concurrent_mmds_state_is(&socket_a, "Running").is_err()
+            || concurrent_mmds_state_is(&socket_b, "Running").is_err()
+        {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "concurrent guest startup",
+            );
+        }
+
+        if wait_for_concurrent_mmds_marker(
+            &scratch_b,
+            0,
+            CONCURRENT_MMDS_PROCESS_B_READY,
+            CONCURRENT_MMDS_PROCESS_B_READY_FAILURE,
+        )
+        .is_err()
+            || concurrent_mmds_state_is(&socket_a, "Running").is_err()
+            || concurrent_mmds_state_is(&socket_b, "Running").is_err()
+        {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process B guest readiness",
+            );
+        }
+
+        let pause_b = concurrent_mmds_http_json(&socket_b, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        let terminal_before_a_exit = concurrent_mmds_marker_state(
+            &scratch_b,
+            CONCURRENT_MMDS_PROCESS_B_TERMINAL_OFFSET,
+            CONCURRENT_MMDS_PROCESS_B_SUCCESS,
+            CONCURRENT_MMDS_PROCESS_B_FAILURE,
+        );
+        if !matches!(pause_b, Ok(ref response) if concurrent_mmds_response_is_no_content(response))
+            || concurrent_mmds_state_is(&socket_b, "Paused").is_err()
+            || concurrent_mmds_state_is(&socket_a, "Running").is_err()
+            || terminal_before_a_exit != Ok(BlockMarkerState::Pending)
+        {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process B pause before process A exit",
+            );
+        }
+
+        if wait_for_concurrent_mmds_marker(
+            &scratch_a,
+            0,
+            CONCURRENT_MMDS_PROCESS_A_SUCCESS,
+            CONCURRENT_MMDS_PROCESS_A_FAILURE,
+        )
+        .is_err()
+        {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process A guest completion",
+            );
+        }
+
+        let metrics_b_before_a_flush = match fs::read(&metrics_b) {
+            Ok(bytes) => bytes,
+            Err(_) => fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process B paused metrics read",
+            ),
+        };
+        if flush_concurrent_mmds_metrics(&socket_a).is_err()
+            || !concurrent_mmds_metrics_are_isolated(
+                &metrics_a,
+                CONCURRENT_MMDS_PROCESS_A_IFACE_ID,
+                CONCURRENT_MMDS_PROCESS_B_IFACE_ID,
+            )
+        {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process A metrics isolation",
+            );
+        }
+        let metrics_b_after_a_flush = match fs::read(&metrics_b) {
+            Ok(bytes) => bytes,
+            Err(_) => fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process B metrics after process A flush",
+            ),
+        };
+        if metrics_b_before_a_flush != metrics_b_after_a_flush {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process B metrics during process A flush",
+            );
+        }
+
+        let output_a = process_a.terminate();
+        if !output_a.status.success()
+            || socket_a.exists()
+            || !concurrent_mmds_output_is_redacted(&output_a, &private_fragments)
+        {
+            fail_concurrent_mmds_survivor(
+                &mut process_b,
+                &output_a,
+                &private_fragments,
+                "process A shutdown",
+            );
+        }
+        let metrics_b_after_a_exit = match fs::read(&metrics_b) {
+            Ok(bytes) => bytes,
+            Err(_) => fail_concurrent_mmds_survivor(
+                &mut process_b,
+                &output_a,
+                &private_fragments,
+                "process B metrics after process A exit",
+            ),
+        };
+        let metrics_a_after_exit = match fs::read(&metrics_a) {
+            Ok(bytes) => bytes,
+            Err(_) => fail_concurrent_mmds_survivor(
+                &mut process_b,
+                &output_a,
+                &private_fragments,
+                "process A final metrics read",
+            ),
+        };
+        if metrics_b_before_a_flush != metrics_b_after_a_exit
+            || !socket_b.exists()
+            || !scratch_b.exists()
+            || !metrics_b.exists()
+            || concurrent_mmds_state_is(&socket_b, "Paused").is_err()
+        {
+            fail_concurrent_mmds_survivor(
+                &mut process_b,
+                &output_a,
+                &private_fragments,
+                "process B resources after process A exit",
+            );
+        }
+
+        let release_b = concurrent_mmds_http_json(
+            &socket_b,
+            "PATCH",
+            "/mmds",
+            CONCURRENT_MMDS_PROCESS_B_RELEASE_PATCH,
+        );
+        let resume_b =
+            concurrent_mmds_http_json(&socket_b, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        if !matches!(release_b, Ok(ref response) if concurrent_mmds_response_is_no_content(response))
+            || !matches!(resume_b, Ok(ref response) if concurrent_mmds_response_is_no_content(response))
+            || concurrent_mmds_state_is(&socket_b, "Running").is_err()
+        {
+            fail_concurrent_mmds_survivor(
+                &mut process_b,
+                &output_a,
+                &private_fragments,
+                "process B release and resume",
+            );
+        }
+
+        if wait_for_concurrent_mmds_marker(
+            &scratch_b,
+            CONCURRENT_MMDS_PROCESS_B_TERMINAL_OFFSET,
+            CONCURRENT_MMDS_PROCESS_B_SUCCESS,
+            CONCURRENT_MMDS_PROCESS_B_FAILURE,
+        )
+        .is_err()
+            || flush_concurrent_mmds_metrics(&socket_b).is_err()
+            || !concurrent_mmds_metrics_are_isolated(
+                &metrics_b,
+                CONCURRENT_MMDS_PROCESS_B_IFACE_ID,
+                CONCURRENT_MMDS_PROCESS_A_IFACE_ID,
+            )
+        {
+            fail_concurrent_mmds_survivor(
+                &mut process_b,
+                &output_a,
+                &private_fragments,
+                "process B post-shutdown guest completion",
+            );
+        }
+        let metrics_a_after_b_completion = match fs::read(&metrics_a) {
+            Ok(bytes) => bytes,
+            Err(_) => fail_concurrent_mmds_survivor(
+                &mut process_b,
+                &output_a,
+                &private_fragments,
+                "process A retained metrics read",
+            ),
+        };
+        if metrics_a_after_exit != metrics_a_after_b_completion {
+            fail_concurrent_mmds_survivor(
+                &mut process_b,
+                &output_a,
+                &private_fragments,
+                "process A metrics after process B completion",
+            );
+        }
+
+        let output_b = process_b.terminate();
+        assert!(
+            concurrent_mmds_output_is_redacted(&output_a, &private_fragments)
+                && concurrent_mmds_output_is_redacted(&output_b, &private_fragments),
+            "concurrent MMDS diagnostics exposed private test data"
+        );
+        assert!(
+            output_a.status.success() && output_b.status.success(),
+            "concurrent MMDS processes should exit cleanly; statuses: {:?}, {:?}",
+            output_a.status,
+            output_b.status
+        );
+        assert!(
+            !socket_a.exists() && !socket_b.exists(),
+            "concurrent MMDS processes should remove only their owned API sockets"
+        );
+    }
+
+    #[test]
     fn signed_executable_serves_metadata_file_mmds_to_direct_rootfs_guest() {
         run_direct_rootfs_mmds_guest_fetch_test(DirectRootfsMmdsFetchCase {
             request_context: "metadata-file MMDS guest fetch",
@@ -4247,6 +4570,286 @@ mod macos_arm64 {
                 case.request_context, output.status, output.stdout, output.stderr
             );
         }
+    }
+
+    fn configure_concurrent_mmds_guest(
+        socket_path: &Path,
+        kernel_path: &Path,
+        rootfs_path: &Path,
+        config: ConcurrentMmdsGuestConfig<'_>,
+    ) -> Result<(), ()> {
+        concurrent_mmds_json_no_content(
+            socket_path,
+            "PUT",
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        )?;
+
+        let network_endpoint = format!("/network-interfaces/{}", config.iface_id);
+        let network_body = format!(
+            r#"{{"iface_id":"{}","host_dev_name":"vmnet:shared","guest_mac":"{}"}}"#,
+            config.iface_id, config.guest_mac
+        );
+        concurrent_mmds_json_no_content(socket_path, "PUT", &network_endpoint, &network_body)?;
+
+        let mmds_config = format!(
+            r#"{{"network_interfaces":["{}"],"version":"V2","ipv4_address":"169.254.169.254"}}"#,
+            config.iface_id
+        );
+        concurrent_mmds_json_no_content(socket_path, "PUT", "/mmds/config", &mmds_config)?;
+        concurrent_mmds_json_no_content(socket_path, "PUT", "/mmds", config.mmds_content)?;
+
+        let metrics_body = format!(
+            r#"{{"metrics_path":{}}}"#,
+            json_string(path_text(config.metrics_path))
+        );
+        concurrent_mmds_json_no_content(socket_path, "PUT", "/metrics", &metrics_body)?;
+
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+            json_string(path_text(kernel_path)),
+            json_string(config.boot_args)
+        );
+        concurrent_mmds_json_no_content(socket_path, "PUT", "/boot-source", &boot_body)?;
+
+        let rootfs_body = format!(
+            r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+            json_string(path_text(rootfs_path))
+        );
+        concurrent_mmds_json_no_content(socket_path, "PUT", "/drives/rootfs", &rootfs_body)?;
+
+        let scratch_body = format!(
+            r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false}}"#,
+            json_string(path_text(config.scratch_path))
+        );
+        concurrent_mmds_json_no_content(socket_path, "PUT", "/drives/data", &scratch_body)
+    }
+
+    fn start_concurrent_mmds_guest(socket_path: &Path) -> Result<(), ()> {
+        concurrent_mmds_json_no_content(
+            socket_path,
+            "PUT",
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        )
+    }
+
+    fn flush_concurrent_mmds_metrics(socket_path: &Path) -> Result<(), ()> {
+        concurrent_mmds_json_no_content(
+            socket_path,
+            "PUT",
+            "/actions",
+            r#"{"action_type":"FlushMetrics"}"#,
+        )
+    }
+
+    fn concurrent_mmds_state_is(socket_path: &Path, expected: &str) -> Result<(), ()> {
+        let response = concurrent_mmds_http_request(socket_path, "GET", "/", None)?;
+        let state = format!(r#""state":"{expected}""#);
+        if response.starts_with("HTTP/1.1 200 OK\r\n") && response.contains(&state) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn concurrent_mmds_json_no_content(
+        socket_path: &Path,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<(), ()> {
+        let response = concurrent_mmds_http_json(socket_path, method, path, body)?;
+        if concurrent_mmds_response_is_no_content(&response) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn concurrent_mmds_http_json(
+        socket_path: &Path,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<String, ()> {
+        concurrent_mmds_http_request(socket_path, method, path, Some(body))
+    }
+
+    fn concurrent_mmds_http_request(
+        socket_path: &Path,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<String, ()> {
+        let io_timeout = Duration::from_secs(5);
+        let mut stream = UnixStream::connect(socket_path).map_err(|_| ())?;
+        stream.set_read_timeout(Some(io_timeout)).map_err(|_| ())?;
+        stream.set_write_timeout(Some(io_timeout)).map_err(|_| ())?;
+
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        if let Some(body) = body {
+            request.push_str("Content-Type: application/json\r\n");
+            request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+            request.push_str(body);
+        } else {
+            request.push_str("\r\n");
+        }
+        stream.write_all(request.as_bytes()).map_err(|_| ())?;
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).map_err(|_| ())?;
+        Ok(response)
+    }
+
+    fn concurrent_mmds_response_is_no_content(response: &str) -> bool {
+        response.starts_with("HTTP/1.1 204 No Content\r\n")
+            && response.contains("Content-Length: 0\r\n")
+            && response.ends_with("\r\n\r\n")
+    }
+
+    fn wait_for_concurrent_mmds_marker(
+        path: &Path,
+        offset: u64,
+        success: &[u8],
+        failure: &[u8],
+    ) -> Result<(), ()> {
+        wait_for_file_markers_at(path, &[(offset, success, failure)], GUEST_EXECUTION_TIMEOUT)
+            .map_err(|_| ())
+    }
+
+    fn concurrent_mmds_marker_state(
+        path: &Path,
+        offset: u64,
+        success: &[u8],
+        failure: &[u8],
+    ) -> Result<BlockMarkerState, ()> {
+        file_marker_state_at(path, offset, success, failure).map_err(|_| ())
+    }
+
+    fn concurrent_mmds_metrics_are_isolated(
+        path: &Path,
+        own_iface_id: &str,
+        peer_iface_id: &str,
+    ) -> bool {
+        let Ok(output) = fs::read_to_string(path) else {
+            return false;
+        };
+        let Some(latest_line) = output.lines().rev().find(|line| !line.is_empty()) else {
+            return false;
+        };
+        let Ok(latest) = serde_json::from_str::<serde_json::Value>(latest_line) else {
+            return false;
+        };
+        let own_key = format!("net_{own_iface_id}");
+        let peer_key = format!("net_{peer_iface_id}");
+        let Some(own_metrics) = latest.get(&own_key) else {
+            return false;
+        };
+        if latest.get(&peer_key).is_some() || latest.get("mmds").is_none() {
+            return false;
+        }
+        if own_metrics
+            .get("event_fails")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        {
+            return false;
+        }
+
+        [
+            "rx_count",
+            "rx_packets_count",
+            "tx_count",
+            "tx_packets_count",
+        ]
+        .iter()
+        .all(|field| {
+            own_metrics
+                .get(*field)
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|value| value > 0)
+        })
+    }
+
+    fn concurrent_mmds_private_fragments(
+        test_directory: &Path,
+        kernel_path: &Path,
+        rootfs_path: &Path,
+        instance_a: &str,
+        instance_b: &str,
+    ) -> Vec<String> {
+        let mut fragments = vec![
+            path_text(test_directory).to_string(),
+            path_text(kernel_path).to_string(),
+            path_text(rootfs_path).to_string(),
+            instance_a.to_string(),
+            instance_b.to_string(),
+            CONCURRENT_MMDS_PROCESS_A_VALUE.to_string(),
+            CONCURRENT_MMDS_PROCESS_B_VALUE.to_string(),
+            CONCURRENT_MMDS_PROCESS_B_PENDING.to_string(),
+            CONCURRENT_MMDS_PROCESS_B_RELEASE.to_string(),
+        ];
+        fragments.extend(
+            [
+                CONCURRENT_MMDS_PROCESS_A_SUCCESS,
+                CONCURRENT_MMDS_PROCESS_A_FAILURE,
+                CONCURRENT_MMDS_PROCESS_B_READY,
+                CONCURRENT_MMDS_PROCESS_B_READY_FAILURE,
+                CONCURRENT_MMDS_PROCESS_B_SUCCESS,
+                CONCURRENT_MMDS_PROCESS_B_FAILURE,
+            ]
+            .into_iter()
+            .map(|marker| String::from_utf8_lossy(marker).into_owned()),
+        );
+        fragments
+    }
+
+    fn concurrent_mmds_output_is_redacted(
+        output: &CompletedProcess,
+        private_fragments: &[String],
+    ) -> bool {
+        private_fragments.iter().all(|fragment| {
+            !output.stdout.contains(fragment.as_str()) && !output.stderr.contains(fragment.as_str())
+        })
+    }
+
+    fn fail_concurrent_mmds_pair(
+        first: &mut BangbangProcess,
+        second: &mut BangbangProcess,
+        private_fragments: &[String],
+        phase: &str,
+    ) -> ! {
+        let first_output = first.force_stop_and_collect();
+        let second_output = second.force_stop_and_collect();
+        assert!(
+            concurrent_mmds_output_is_redacted(&first_output, private_fragments)
+                && concurrent_mmds_output_is_redacted(&second_output, private_fragments),
+            "concurrent MMDS diagnostics exposed private test data"
+        );
+        panic!(
+            "concurrent MMDS {phase} failed; process statuses: {:?}, {:?}",
+            first_output.status, second_output.status
+        );
+    }
+
+    fn fail_concurrent_mmds_survivor(
+        survivor: &mut BangbangProcess,
+        exited_output: &CompletedProcess,
+        private_fragments: &[String],
+        phase: &str,
+    ) -> ! {
+        let survivor_output = survivor.force_stop_and_collect();
+        assert!(
+            concurrent_mmds_output_is_redacted(exited_output, private_fragments)
+                && concurrent_mmds_output_is_redacted(&survivor_output, private_fragments),
+            "concurrent MMDS diagnostics exposed private test data"
+        );
+        panic!(
+            "concurrent MMDS {phase} failed; process statuses: {:?}, {:?}",
+            exited_output.status, survivor_output.status
+        );
     }
 
     fn run_direct_rootfs_no_api_mmds_guest_fetch_test(case: DirectRootfsNoApiMmdsFetchCase<'_>) {
