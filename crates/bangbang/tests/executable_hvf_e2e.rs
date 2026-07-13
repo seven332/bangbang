@@ -48,6 +48,7 @@ mod macos_arm64 {
     const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
     const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
     const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
+    const DIRECT_ROOTFS_MMDS_MTU_MARKER: &[u8] = b"BANGBANG_MMDS_MTU_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_V2_MARKER: &[u8] = b"BANGBANG_MMDS_V2_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
     const DIRECT_ROOTFS_VSOCK_EXCHANGES: &[(&[u8], &[u8])] = &[
@@ -121,6 +122,7 @@ mod macos_arm64 {
         "console=ttyS0 reboot=k panic=1 nomodule swiotlb=noforce init=/usr/local/bin/init";
     const DIRECT_ROOTFS_ENTROPY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-read=1";
     const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
+    const DIRECT_ROOTFS_MMDS_MTU_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1 bangbang.mmds-mtu=1280";
     const DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-v2-fetch=1";
     const DIRECT_ROOTFS_MMDS_CONTENT: &str =
         r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_GUEST_VALUE"}}"#;
@@ -149,6 +151,7 @@ mod macos_arm64 {
         mmds_config_body: &'a str,
         boot_args: &'a str,
         success_marker: &'a [u8],
+        network_mtu: Option<u16>,
         content_source: DirectRootfsMmdsContentSource,
     }
 
@@ -2817,12 +2820,13 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_serves_mmds_to_direct_rootfs_guest() {
+    fn signed_executable_serves_mmds_with_configured_mtu_to_direct_rootfs_guest() {
         run_direct_rootfs_mmds_guest_fetch_test(DirectRootfsMmdsFetchCase {
-            request_context: "MMDS guest fetch",
+            request_context: "MMDS guest fetch with configured MTU",
             mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
-            boot_args: DIRECT_ROOTFS_MMDS_BOOT_ARGS,
-            success_marker: DIRECT_ROOTFS_MMDS_MARKER,
+            boot_args: DIRECT_ROOTFS_MMDS_MTU_BOOT_ARGS,
+            success_marker: DIRECT_ROOTFS_MMDS_MTU_MARKER,
+            network_mtu: Some(1280),
             content_source: DirectRootfsMmdsContentSource::ApiRequest,
         });
     }
@@ -2834,6 +2838,7 @@ mod macos_arm64 {
             mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
             boot_args: DIRECT_ROOTFS_MMDS_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_MARKER,
+            network_mtu: None,
             content_source: DirectRootfsMmdsContentSource::MetadataFile,
         });
     }
@@ -2845,6 +2850,7 @@ mod macos_arm64 {
             mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#,
             boot_args: DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_V2_MARKER,
+            network_mtu: None,
             content_source: DirectRootfsMmdsContentSource::MetadataFile,
         });
     }
@@ -2866,6 +2872,7 @@ mod macos_arm64 {
             mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#,
             boot_args: DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_V2_MARKER,
+            network_mtu: None,
             content_source: DirectRootfsMmdsContentSource::ApiRequest,
         });
     }
@@ -3788,11 +3795,14 @@ mod macos_arm64 {
         let machine_context = format!("PUT /machine-config {}", case.request_context);
         assert_no_content_response(&machine_response, &machine_context);
 
-        let network_response = http_put_json(
-            &socket_path,
-            "/network-interfaces/eth0",
-            r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:01"}"#,
-        );
+        let network_body = match case.network_mtu {
+            Some(mtu) => format!(
+                r#"{{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:01","mtu":{mtu}}}"#
+            ),
+            None => r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:01"}"#.to_string(),
+        };
+        let network_response =
+            http_put_json(&socket_path, "/network-interfaces/eth0", &network_body);
         let network_context = format!("PUT /network-interfaces/eth0 {}", case.request_context);
         assert_no_content_response(&network_response, &network_context);
 
@@ -3930,6 +3940,9 @@ mod macos_arm64 {
             r#""host_dev_name":"vmnet:shared""#,
             &vm_config_context,
         );
+        if let Some(mtu) = case.network_mtu {
+            assert_response_contains(&vm_config, &format!(r#""mtu":{mtu}"#), &vm_config_context);
+        }
         assert!(
             !vm_config.contains(r#""iface_id":"eth9""#),
             "{vm_config_context} must not add the rejected interface; response:\n{vm_config}"
