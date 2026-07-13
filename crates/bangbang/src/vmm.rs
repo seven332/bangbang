@@ -59,7 +59,8 @@ use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkInterfaceConfigInput,
     NetworkInterfaceUpdateInput, NetworkMmioLayout, VirtioNetworkRxPacket,
     VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
-    VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
+    VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+    validate_network_interface_count,
 };
 use bangbang_runtime::pmem::{PmemMmioLayout, PmemUpdateInput};
 use bangbang_runtime::rtc::RtcMmioLayout;
@@ -2670,8 +2671,8 @@ impl VirtioNetworkTxPacketSink for NoopProcessNetworkTxPacketSink {
         &mut self,
         _memory: &GuestMemory,
         _frame: &VirtioNetworkTxFrame,
-    ) -> Result<(), VirtioNetworkTxPacketSinkError> {
-        Ok(())
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        Ok(VirtioNetworkTxPacketDisposition::Forwarded)
     }
 }
 

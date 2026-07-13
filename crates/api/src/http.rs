@@ -582,6 +582,12 @@ pub struct DriveRateLimiterRequest {
     ops: Option<TokenBucketRequest>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkRateLimiterRequest {
+    bandwidth: Option<TokenBucketRequest>,
+    ops: Option<TokenBucketRequest>,
+}
+
 type RateLimiterBuckets = (Option<TokenBucketRequest>, Option<TokenBucketRequest>);
 
 impl DriveRateLimiterRequest {
@@ -602,6 +608,23 @@ impl DriveRateLimiterRequest {
 }
 
 impl EntropyRateLimiterRequest {
+    pub const fn new(
+        bandwidth: Option<TokenBucketRequest>,
+        ops: Option<TokenBucketRequest>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
+    pub const fn bandwidth(self) -> Option<TokenBucketRequest> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<TokenBucketRequest> {
+        self.ops
+    }
+}
+
+impl NetworkRateLimiterRequest {
     pub const fn new(
         bandwidth: Option<TokenBucketRequest>,
         ops: Option<TokenBucketRequest>,
@@ -1139,8 +1162,8 @@ pub struct NetworkInterfaceConfigRequest {
     host_dev_name: String,
     guest_mac: Option<String>,
     mtu: Option<u16>,
-    rx_rate_limiter_configured: bool,
-    tx_rate_limiter_configured: bool,
+    rx_rate_limiter: Option<NetworkRateLimiterRequest>,
+    tx_rate_limiter: Option<NetworkRateLimiterRequest>,
 }
 
 impl NetworkInterfaceConfigRequest {
@@ -1164,12 +1187,12 @@ impl NetworkInterfaceConfigRequest {
         self.mtu
     }
 
-    pub const fn rx_rate_limiter_configured(&self) -> bool {
-        self.rx_rate_limiter_configured
+    pub const fn rx_rate_limiter(&self) -> Option<NetworkRateLimiterRequest> {
+        self.rx_rate_limiter
     }
 
-    pub const fn tx_rate_limiter_configured(&self) -> bool {
-        self.tx_rate_limiter_configured
+    pub const fn tx_rate_limiter(&self) -> Option<NetworkRateLimiterRequest> {
+        self.tx_rate_limiter
     }
 }
 
@@ -1397,6 +1420,8 @@ pub struct NetworkInterfaceConfigResponse {
     host_dev_name: String,
     guest_mac: Option<String>,
     mtu: Option<u16>,
+    rx_rate_limiter: Option<NetworkRateLimiterRequest>,
+    tx_rate_limiter: Option<NetworkRateLimiterRequest>,
 }
 
 impl NetworkInterfaceConfigResponse {
@@ -1406,6 +1431,8 @@ impl NetworkInterfaceConfigResponse {
             host_dev_name: host_dev_name.into(),
             guest_mac: None,
             mtu: None,
+            rx_rate_limiter: None,
+            tx_rate_limiter: None,
         }
     }
 
@@ -1416,6 +1443,16 @@ impl NetworkInterfaceConfigResponse {
 
     pub const fn with_mtu(mut self, mtu: u16) -> Self {
         self.mtu = Some(mtu);
+        self
+    }
+
+    pub const fn with_rx_rate_limiter(mut self, rate_limiter: NetworkRateLimiterRequest) -> Self {
+        self.rx_rate_limiter = Some(rate_limiter);
+        self
+    }
+
+    pub const fn with_tx_rate_limiter(mut self, rate_limiter: NetworkRateLimiterRequest) -> Self {
+        self.tx_rate_limiter = Some(rate_limiter);
         self
     }
 }
@@ -2543,6 +2580,18 @@ fn network_interface_config_response_value(
             serde_json::Value::Number(serde_json::Number::from(mtu)),
         );
     }
+    if let Some(rate_limiter) = network_interface.rx_rate_limiter {
+        body.insert(
+            "rx_rate_limiter".to_string(),
+            network_rate_limiter_response_value(rate_limiter),
+        );
+    }
+    if let Some(rate_limiter) = network_interface.tx_rate_limiter {
+        body.insert(
+            "tx_rate_limiter".to_string(),
+            network_rate_limiter_response_value(rate_limiter),
+        );
+    }
     body.insert(
         "host_dev_name".to_string(),
         serde_json::Value::String(network_interface.host_dev_name.clone()),
@@ -2590,6 +2639,12 @@ fn entropy_rate_limiter_response_value(
 }
 
 fn drive_rate_limiter_response_value(rate_limiter: DriveRateLimiterRequest) -> serde_json::Value {
+    rate_limiter_response_value(rate_limiter.bandwidth(), rate_limiter.ops())
+}
+
+fn network_rate_limiter_response_value(
+    rate_limiter: NetworkRateLimiterRequest,
+) -> serde_json::Value {
     rate_limiter_response_value(rate_limiter.bandwidth(), rate_limiter.ops())
 }
 
@@ -3420,20 +3475,8 @@ fn parse_network_interface_config_request(
     if path_iface_id != body.iface_id {
         return Err(RequestError::MismatchedInterfaceId);
     }
-    let rx_rate_limiter_configured = match &body.rx_rate_limiter {
-        Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
-            rate_limiter_configured(rate_limiter.as_value())?
-        }
-        None => false,
-    };
-    let tx_rate_limiter_configured = match &body.tx_rate_limiter {
-        Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
-            rate_limiter_configured(rate_limiter.as_value())?
-        }
-        None => false,
-    };
+    let rx_rate_limiter = parse_network_rate_limiter(body.rx_rate_limiter.as_ref())?;
+    let tx_rate_limiter = parse_network_rate_limiter(body.tx_rate_limiter.as_ref())?;
 
     Ok(ApiRequest::PutNetworkInterface(Box::new(
         NetworkInterfaceConfigRequest {
@@ -3442,8 +3485,8 @@ fn parse_network_interface_config_request(
             host_dev_name: body.host_dev_name,
             guest_mac: body.guest_mac,
             mtu: body.mtu,
-            rx_rate_limiter_configured,
-            tx_rate_limiter_configured,
+            rx_rate_limiter,
+            tx_rate_limiter,
         },
     )))
 }
@@ -3684,6 +3727,14 @@ fn parse_drive_rate_limiter(
 ) -> Result<Option<DriveRateLimiterRequest>, RequestError> {
     parse_rate_limiter_buckets(value)
         .map(|buckets| buckets.map(|(bandwidth, ops)| DriveRateLimiterRequest::new(bandwidth, ops)))
+}
+
+fn parse_network_rate_limiter(
+    value: Option<&JsonValueWithoutDuplicateObjectKeys>,
+) -> Result<Option<NetworkRateLimiterRequest>, RequestError> {
+    parse_rate_limiter_buckets(value).map(|buckets| {
+        buckets.map(|(bandwidth, ops)| NetworkRateLimiterRequest::new(bandwidth, ops))
+    })
 }
 
 fn parse_rate_limiter_buckets(
@@ -6147,8 +6198,8 @@ mod tests {
         assert_eq!(config.host_dev_name(), "tap0");
         assert_eq!(config.guest_mac(), None);
         assert_eq!(config.mtu(), None);
-        assert!(!config.rx_rate_limiter_configured());
-        assert!(!config.tx_rate_limiter_configured());
+        assert_eq!(config.rx_rate_limiter(), None);
+        assert_eq!(config.tx_rate_limiter(), None);
     }
 
     #[test]
@@ -6185,8 +6236,20 @@ mod tests {
         assert_eq!(config.host_dev_name(), "tap0");
         assert_eq!(config.guest_mac(), Some("12:34:56:78:9a:bc"));
         assert_eq!(config.mtu(), Some(1500));
-        assert!(config.rx_rate_limiter_configured());
-        assert!(config.tx_rate_limiter_configured());
+        assert_eq!(
+            config.rx_rate_limiter(),
+            Some(NetworkRateLimiterRequest::new(
+                Some(TokenBucketRequest::new(1024, Some(2048), 1000)),
+                None,
+            ))
+        );
+        assert_eq!(
+            config.tx_rate_limiter(),
+            Some(NetworkRateLimiterRequest::new(
+                None,
+                Some(TokenBucketRequest::new(100, None, 1000)),
+            ))
+        );
     }
 
     #[test]
@@ -6242,8 +6305,8 @@ mod tests {
         };
         assert_eq!(config.guest_mac(), None);
         assert_eq!(config.mtu(), None);
-        assert!(!config.rx_rate_limiter_configured());
-        assert!(!config.tx_rate_limiter_configured());
+        assert_eq!(config.rx_rate_limiter(), None);
+        assert_eq!(config.tx_rate_limiter(), None);
     }
 
     #[test]
@@ -6272,9 +6335,39 @@ mod tests {
             let ApiRequest::PutNetworkInterface(config) = parsed else {
                 panic!("expected network interface request");
             };
-            assert_eq!(config.rx_rate_limiter_configured(), expected_rx, "{body}");
-            assert_eq!(config.tx_rate_limiter_configured(), expected_tx, "{body}");
+            assert_eq!(config.rx_rate_limiter().is_some(), expected_rx, "{body}");
+            assert_eq!(config.tx_rate_limiter().is_some(), expected_tx, "{body}");
         }
+    }
+
+    #[test]
+    fn parses_put_network_interface_with_explicit_disabled_rate_limiter_buckets() {
+        let body = r#"{
+            "iface_id":"eth0",
+            "host_dev_name":"tap0",
+            "rx_rate_limiter":{"bandwidth":{"size":0,"one_time_burst":123,"refill_time":100}},
+            "tx_rate_limiter":{"ops":{"size":10,"one_time_burst":null,"refill_time":0}}
+        }"#;
+        let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+        let parsed = parse_request(&request).expect("disabled limiter controls should parse");
+        let ApiRequest::PutNetworkInterface(config) = parsed else {
+            panic!("expected network interface request");
+        };
+        assert_eq!(
+            config.rx_rate_limiter(),
+            Some(NetworkRateLimiterRequest::new(
+                Some(TokenBucketRequest::new(0, Some(123), 100)),
+                None,
+            ))
+        );
+        assert_eq!(
+            config.tx_rate_limiter(),
+            Some(NetworkRateLimiterRequest::new(
+                None,
+                Some(TokenBucketRequest::new(10, None, 0)),
+            ))
+        );
     }
 
     #[test]
@@ -8332,7 +8425,15 @@ mod tests {
                 ));
         let network_interface = NetworkInterfaceConfigResponse::new("eth0", "tap0")
             .with_guest_mac("12:34:56:78:9a:bc")
-            .with_mtu(1500);
+            .with_mtu(1500)
+            .with_rx_rate_limiter(NetworkRateLimiterRequest::new(
+                Some(TokenBucketRequest::new(4096, Some(8192), 100)),
+                None,
+            ))
+            .with_tx_rate_limiter(NetworkRateLimiterRequest::new(
+                None,
+                Some(TokenBucketRequest::new(10, None, 1000)),
+            ));
         let mmds_config = MmdsConfigResponse::new(vec!["eth0".to_string()], "V2", true)
             .with_ipv4_address("169.254.169.254");
         let vsock = VsockConfigResponse::new(3, "./v.sock");
@@ -8414,6 +8515,20 @@ mod tests {
                         "host_dev_name": "tap0",
                         "iface_id": "eth0",
                         "mtu": 1500,
+                        "rx_rate_limiter": {
+                            "bandwidth": {
+                                "one_time_burst": 8192,
+                                "refill_time": 100,
+                                "size": 4096,
+                            },
+                        },
+                        "tx_rate_limiter": {
+                            "ops": {
+                                "one_time_burst": null,
+                                "refill_time": 1000,
+                                "size": 10,
+                            },
+                        },
                     },
                 ],
                 "pmem": [
@@ -8482,6 +8597,7 @@ mod tests {
             .expect("one network interface should be returned");
         assert_eq!(network_interface.get("guest_mac"), None);
         assert_eq!(network_interface.get("rx_rate_limiter"), None);
+        assert_eq!(network_interface.get("tx_rate_limiter"), None);
         assert_eq!(
             body.get("vsock"),
             Some(&serde_json::json!({

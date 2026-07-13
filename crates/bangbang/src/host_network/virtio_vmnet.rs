@@ -15,8 +15,8 @@ use bangbang_runtime::mmds::{
 };
 use bangbang_runtime::network::{
     VIRTIO_NET_MAX_BUFFER_SIZE, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
-    VirtioNetworkTxPacketSinkError,
+    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition,
+    VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
 };
 use bangbang_runtime::startup::{
     Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
@@ -1127,14 +1127,14 @@ where
         &mut self,
         memory: &GuestMemory,
         frame: &VirtioNetworkTxFrame,
-    ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
         let packet = copy_tx_frame_payload(memory, frame).map_err(tx_error)?;
         if let Some(mmds_detour) = &mut self.mmds_detour
             && mmds_detour
                 .detour_packet(&packet)
                 .map_err(tx_mmds_detour_error)?
         {
-            return Ok(());
+            return Ok(VirtioNetworkTxPacketDisposition::Detoured);
         }
 
         let mut packet = VmnetWritePacket::new(&packet).map_err(tx_descriptor_error)?;
@@ -1143,6 +1143,7 @@ where
 
         backend
             .write_packet(interface, &mut packet)
+            .map(|()| VirtioNetworkTxPacketDisposition::Forwarded)
             .map_err(tx_vmnet_error)
     }
 }
@@ -1305,11 +1306,17 @@ impl VirtioNetworkTxPacketSink for MmdsOnlyVirtioNetworkTxPacketSink {
         &mut self,
         memory: &GuestMemory,
         frame: &VirtioNetworkTxFrame,
-    ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
         let packet = copy_tx_frame_payload(memory, frame).map_err(tx_error)?;
         self.mmds_detour
             .detour_packet(&packet)
-            .map(|_| ())
+            .map(|detoured| {
+                if detoured {
+                    VirtioNetworkTxPacketDisposition::Detoured
+                } else {
+                    VirtioNetworkTxPacketDisposition::Forwarded
+                }
+            })
             .map_err(tx_mmds_detour_error)
     }
 }
@@ -1591,7 +1598,7 @@ mod tests {
     use bangbang_runtime::network::{
         NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioLayout,
         PreparedNetworkDevices, VIRTIO_NET_TX_HEADER_SIZE, VirtioNetworkRxPacketSource,
-        VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
+        VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
     };
     use bangbang_runtime::startup::{Arm64BootNetworkDevice, Arm64BootNetworkPacketIoProvider};
     use bangbang_runtime::virtio_queue::{
@@ -2263,11 +2270,12 @@ mod tests {
         let frame = tx_frame(&mut memory, &[(&[0xaa, 0xbb, 0xcc], PAYLOAD_ADDRESS)]);
         let mut packet_io = packet_io(FakeVmnetPacketIoBackend::default());
 
-        packet_io
+        let disposition = packet_io
             .tx_sink()
             .transmit_frame(&memory, &frame)
             .expect("TX should write vmnet packet");
 
+        assert_eq!(disposition, VirtioNetworkTxPacketDisposition::Forwarded);
         let state = packet_io
             .tx_sink()
             .shared
@@ -2318,11 +2326,12 @@ mod tests {
             response_queue.clone(),
         );
 
-        packet_io
+        let disposition = packet_io
             .tx_sink()
             .transmit_frame(&memory, &frame)
             .expect("MMDS TX should detour");
 
+        assert_eq!(disposition, VirtioNetworkTxPacketDisposition::Detoured);
         let state = packet_io
             .tx_sink()
             .shared
@@ -2508,10 +2517,11 @@ mod tests {
         let mut packet_io = mmds_only_packet_io(MmdsStateHandle::default(), response_queue.clone());
 
         assert!(!packet_io.rx_source.retry_after_tx_hint());
-        packet_io
+        let disposition = packet_io
             .tx_sink
             .transmit_frame(&memory, &frame)
             .expect("MMDS-only TX should detour");
+        assert_eq!(disposition, VirtioNetworkTxPacketDisposition::Detoured);
         assert!(packet_io.rx_source.retry_after_tx_hint());
         let response = packet_io
             .rx_source
@@ -2993,11 +3003,12 @@ mod tests {
             response_queue.clone(),
         );
 
-        packet_io
+        let disposition = packet_io
             .tx_sink()
             .transmit_frame(&memory, &frame)
             .expect("non-MMDS TX should forward");
 
+        assert_eq!(disposition, VirtioNetworkTxPacketDisposition::Forwarded);
         let state = packet_io
             .tx_sink()
             .shared

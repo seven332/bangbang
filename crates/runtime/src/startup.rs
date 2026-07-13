@@ -2249,7 +2249,7 @@ impl Arm64BootRuntimeResources {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioNetworkMmioHandler>(region_id) {
                 Ok(handler) => {
-                    if !handler.has_pending_queue_notifications() {
+                    if !handler.has_pending_network_queue_work() {
                         match handler.dispatch_network_queue_notifications(memory) {
                             Ok(dispatch) => {
                                 Arm64BootNetworkNotificationOutcome::Dispatched(Box::new(dispatch))
@@ -3994,10 +3994,12 @@ mod tests {
     };
     use crate::network::{
         NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioDeviceRegistration,
-        NetworkMmioLayout, PreparedNetworkDevices, VIRTIO_NET_RX_MIN_BUFFER_SIZE,
-        VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
-        VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
-        VirtioNetworkTxFrame, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+        NetworkMmioLayout, NetworkRateLimiterConfig, NetworkTokenBucketConfig,
+        PreparedNetworkDevices, VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX,
+        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRxPacket,
+        VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
+        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+        VirtioNetworkTxPacketSinkError,
     };
     use crate::pmem::{
         PmemConfigInput, PmemMmioLayout, PreparedPmemDeviceError, VIRTIO_PMEM_ALIGNMENT,
@@ -4254,6 +4256,20 @@ mod tests {
                 NetworkInterfaceConfigInput::new(iface_id, iface_id, host_dev_name),
             ))
             .expect("network config should be stored");
+    }
+
+    fn add_network_with_tx_rate_limiter(
+        controller: &mut crate::VmmController,
+        iface_id: &str,
+        host_dev_name: &str,
+        tx_rate_limiter: NetworkRateLimiterConfig,
+    ) {
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(iface_id, iface_id, host_dev_name)
+                    .with_tx_rate_limiter(tx_rate_limiter),
+            ))
+            .expect("network config with TX rate limiter should be stored");
     }
 
     fn add_vsock(controller: &mut crate::VmmController, guest_cid: u32, uds_path: &Path) {
@@ -5934,7 +5950,7 @@ mod tests {
             &mut self,
             memory: &crate::memory::GuestMemory,
             frame: &VirtioNetworkTxFrame,
-        ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+        ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
             self.calls += 1;
             let payload_len = usize::try_from(frame.payload_len())
                 .expect("test TX payload length should fit in usize");
@@ -5953,7 +5969,7 @@ mod tests {
             }
             self.packets.push(packet);
 
-            Ok(())
+            Ok(VirtioNetworkTxPacketDisposition::Forwarded)
         }
     }
 
@@ -6225,22 +6241,47 @@ mod tests {
         payload_address: GuestAddress,
         payload: &[u8],
     ) {
+        write_queued_tx_frame_at_head(
+            memory,
+            descriptor_table,
+            0,
+            header_address,
+            payload_address,
+            payload,
+        );
+    }
+
+    fn write_queued_tx_frame_at_head(
+        memory: &mut crate::memory::GuestMemory,
+        descriptor_table: GuestAddress,
+        head: u16,
+        header_address: GuestAddress,
+        payload_address: GuestAddress,
+        payload: &[u8],
+    ) {
         memory
             .write_slice(&[0; VIRTIO_NET_TX_HEADER_SIZE as usize], header_address)
             .expect("TX header should write");
         memory
             .write_slice(payload, payload_address)
             .expect("TX payload should write");
+        let payload_descriptor = head
+            .checked_add(1)
+            .expect("TX payload descriptor index should not overflow");
         write_descriptor_at(
             memory,
             descriptor_table,
-            0,
-            TestDescriptor::readable(header_address, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+            head,
+            TestDescriptor::readable(
+                header_address,
+                VIRTIO_NET_TX_HEADER_SIZE,
+                Some(payload_descriptor),
+            ),
         );
         write_descriptor_at(
             memory,
             descriptor_table,
-            1,
+            payload_descriptor,
             TestDescriptor::readable(
                 payload_address,
                 u32::try_from(payload.len()).expect("test payload length should fit in u32"),
@@ -10022,6 +10063,105 @@ mod tests {
             .expect("no pending notification should dispatch as no-op");
         assert!(dispatch.drained_notifications().is_empty());
         assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_network_pending_rate_limit_retry_requests_packet_io_without_notification() {
+        let kernel = temp_file("kernel-network-packet-io-rate-limit-retry", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network_with_tx_rate_limiter(
+            &mut controller,
+            "eth0",
+            "tap0",
+            NetworkRateLimiterConfig::new(
+                Some(NetworkTokenBucketConfig::new(16, None, 60_000)),
+                None,
+            ),
+        );
+        let config = Arm64BootResourceConfig {
+            network_interrupt_lines: &[line(33)],
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        let layout = network_queue_layout(0);
+        configure_boot_network_queues_with_layout(&mut runtime, &mut mmio_dispatcher, 0, layout);
+        write_queued_tx_frame_at_head(
+            &mut memory,
+            layout.tx_descriptor_table,
+            0,
+            layout.tx_header,
+            layout.tx_payload,
+            &[0x10, 0x11, 0x12, 0x13],
+        );
+        write_queued_tx_frame_at_head(
+            &mut memory,
+            layout.tx_descriptor_table,
+            2,
+            layout
+                .tx_header
+                .checked_add(0x1000)
+                .expect("second TX header should not overflow"),
+            layout
+                .tx_payload
+                .checked_add(0x1000)
+                .expect("second TX payload should not overflow"),
+            &[0x20, 0x21, 0x22, 0x23],
+        );
+        write_available_heads_at(&mut memory, layout.tx_available_ring, &[0, 2]);
+        notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let mut provider =
+            RecordingNetworkPacketIoProvider::default().with_endpoint("eth0", Vec::new());
+
+        let first = runtime
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("initial rate-limited dispatch should allocate");
+
+        assert_eq!(provider.requested_ifaces, ["eth0".to_string()]);
+        let first_dispatch = first.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("initial rate-limited dispatch should complete");
+        assert_eq!(
+            first_dispatch.drained_notifications(),
+            [VIRTIO_NET_TX_QUEUE_INDEX]
+        );
+        let first_tx = first_dispatch
+            .tx_queue_dispatch()
+            .expect("initial TX dispatch should be present");
+        assert_eq!(first_tx.processed_frames(), 1);
+        assert_eq!(first_tx.rate_limiter_throttled_frames(), 1);
+        assert_eq!(provider.endpoint("eth0").tx_sink.calls, 1);
+        provider.requested_ifaces.clear();
+
+        let retry = runtime
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("pending rate-limit retry should allocate");
+
+        assert_eq!(provider.requested_ifaces, ["eth0".to_string()]);
+        let retry_dispatch = retry.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("pending rate-limit retry should dispatch");
+        assert!(retry_dispatch.drained_notifications().is_empty());
+        let retry_tx = retry_dispatch
+            .tx_queue_dispatch()
+            .expect("pending TX retry should be present");
+        assert_eq!(retry_tx.processed_frames(), 0);
+        assert_eq!(retry_tx.rate_limiter_throttled_frames(), 1);
+        assert_eq!(provider.endpoint("eth0").tx_sink.calls, 1);
     }
 
     #[test]

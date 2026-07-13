@@ -43,7 +43,7 @@ impl TokenBucketConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TokenBucket {
     size: u64,
     refill_time_nanos: u64,

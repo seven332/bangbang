@@ -2097,7 +2097,7 @@ mod tests {
     use bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput;
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics};
     use bangbang_runtime::mmds::MmdsDataStoreError;
-    use bangbang_runtime::network::{NetworkInterfaceConfigError, NetworkInterfaceConfigInput};
+    use bangbang_runtime::network::NetworkInterfaceConfigInput;
     use bangbang_runtime::pmem::{PmemConfigError, PmemConfigInput};
     use bangbang_runtime::serial::{SerialConfig, SerialRateLimiterConfig};
     use bangbang_runtime::snapshot::SnapshotLoadInput;
@@ -4790,7 +4790,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_network_rate_limiter_fails_before_starting() {
+    fn config_file_network_rate_limiter_replaces_stored_interface() {
         let config_path = unique_config_path("network-rate-limiter");
         let config = r#"{
             "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
@@ -4807,22 +4807,11 @@ mod tests {
             TestInstanceStarter,
         );
 
-        let err = super::apply_startup_config_file(
-            &mut vmm,
-            Some(config_path.to_str().expect("UTF-8 path")),
-        )
-        .expect_err("configured network rate limiter should fail");
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("configured network rate limiter should apply");
 
-        assert_eq!(
-            err,
-            ProcessError::ConfigFile(super::ConfigFileError::Apply(
-                VmmActionError::NetworkInterfaceConfig(
-                    NetworkInterfaceConfigError::UnsupportedRxRateLimiter
-                )
-            ))
-        );
-        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
-        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
         let data = vmm
             .handle_action(VmmAction::GetVmConfig)
             .expect("VM config should be returned");
@@ -4832,8 +4821,16 @@ mod tests {
         assert_eq!(config.network_interface_configs().len(), 1);
         assert_eq!(
             config.network_interface_configs()[0].host_dev_name(),
-            "vmnet:shared"
+            "vmnet:host"
         );
+        let rate_limiter = config.network_interface_configs()[0]
+            .rx_rate_limiter()
+            .expect("configured RX rate limiter should be stored");
+        let bandwidth = rate_limiter
+            .bandwidth()
+            .expect("bandwidth bucket should be stored");
+        assert_eq!(bandwidth.size(), 1);
+        assert_eq!(bandwidth.refill_time(), 1);
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }
