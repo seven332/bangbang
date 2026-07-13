@@ -836,8 +836,8 @@ already mapped guest RAM. `CPU_OFF` uses the same indexed transaction boundary:
 the exact pending token is required, success writes no return register, the last
 committed online CPU is denied, and scheduler removal completes before the
 power model publishes `OFF`. Later re-entry reuses the fixed owner and shared
-GIC, clears only the retained EL1 MMU enablement required by the Linux warm-entry
-contract, and does not claim a full architectural reset.
+GIC, writes the retained `SCTLR_EL1` to zero for the Linux warm-entry contract,
+and does not claim a full architectural reset.
 
 Public `InstanceStart` now exposes the same topology for counts through
 `min(32, host_max)`; it does not add another owner or capacity authority. A

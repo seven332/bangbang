@@ -114,8 +114,8 @@ completing member index.
 when it is the last committed `ON` CPU. A successful call consumes the exact
 pending runner token without writing X0, removes that member from scheduling,
 and commits it `OFF`. A later `CPU_ON` reuses the same owner, MPIDR, and GIC
-topology. Re-entry clears the retained `SCTLR_EL1` MMU enablement before applying
-the existing Linux X0-X3, PSTATE, and PC-last entry contract; this is a narrow
+topology. Re-entry writes the retained `SCTLR_EL1` to zero before applying the
+existing Linux X0-X3, PSTATE, and PC-last entry contract; this is a narrow
 warm-entry reset and not a claim of complete architectural cold reset.
 
 Public process startup now uses this capability for the host-limited range
