@@ -131,6 +131,9 @@ pub enum HvfGuestMemoryMappingError {
     FlushFailed {
         failures: Vec<HvfGuestMemoryFlushFailure>,
     },
+    PmemShadowMissing {
+        range: GuestMemoryRange,
+    },
     MappingMetadataAllocationFailed {
         source: TryReserveError,
     },
@@ -283,6 +286,12 @@ impl fmt::Display for HvfGuestMemoryMappingError {
                 },
                 [] => f.write_str("failed to flush host-backed guest memory mapping(s)"),
             },
+            Self::PmemShadowMissing { range } => {
+                write!(
+                    f,
+                    "HVF pmem shadow for guest memory range {range} is missing"
+                )
+            }
             Self::MappingMetadataAllocationFailed { source } => {
                 write!(
                     f,
@@ -343,7 +352,8 @@ impl std::error::Error for HvfGuestMemoryMappingError {
             | Self::HostSizeMismatch { .. }
             | Self::DynamicRegionOverlapsMapped { .. }
             | Self::DynamicRegionMissing { .. }
-            | Self::DynamicRegionOwnerMissing { .. } => None,
+            | Self::DynamicRegionOwnerMissing { .. }
+            | Self::PmemShadowMissing { .. } => None,
         }
     }
 }
@@ -485,10 +495,6 @@ impl HvfGuestMemoryMapping {
             ))
     }
 
-    pub(crate) fn flush_host_memory_now(&self) -> Result<(), HvfGuestMemoryMappingError> {
-        self.state.flush_host_memory_now()
-    }
-
     // HVF destroys guest mappings with the VM. Use this only after `hv_vm_destroy`
     // succeeds following an earlier unmap failure.
     pub(crate) fn release_after_vm_destroy(mut self) {
@@ -522,6 +528,13 @@ impl HvfGuestMemoryMapping {
             memory,
             HvfVirtioMemMutationExecutor::new(state, permissions),
         ))
+    }
+
+    pub(crate) fn memory_and_pmem_flush_executor_mut(
+        &mut self,
+    ) -> Result<(&mut GuestMemory, HvfPmemFlushExecutor<'_>), HvfGuestMemoryMappingError> {
+        let (memory, state) = self.memory_and_state_mut()?;
+        Ok((memory, HvfPmemFlushExecutor::new(state)))
     }
 
     fn memory_and_state_mut(
@@ -574,6 +587,20 @@ impl HvfGuestMemoryMappingState {
         } else {
             Err(HvfGuestMemoryMappingError::FlushFailed { failures })
         }
+    }
+
+    fn flush_pmem_shadow(&self, range: GuestMemoryRange) -> Result<(), HvfGuestMemoryMappingError> {
+        let mapping = self
+            .host_memory
+            .iter()
+            .find(|mapping| mapping.pmem_shadow_range() == Some(range))
+            .ok_or(HvfGuestMemoryMappingError::PmemShadowMissing { range })?;
+
+        mapping
+            .flush()
+            .map_err(|failure| HvfGuestMemoryMappingError::FlushFailed {
+                failures: vec![failure],
+            })
     }
 
     fn release_after_vm_destroy(&mut self) {
@@ -779,6 +806,24 @@ impl HvfGuestMemoryMappingState {
         self.flush_host_memory_now()?;
         self.host_memory_flushed = true;
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct HvfPmemFlushExecutor<'a> {
+    state: &'a HvfGuestMemoryMappingState,
+}
+
+impl<'a> HvfPmemFlushExecutor<'a> {
+    fn new(state: &'a HvfGuestMemoryMappingState) -> Self {
+        Self { state }
+    }
+
+    pub(crate) fn flush(
+        &mut self,
+        range: GuestMemoryRange,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.state.flush_pmem_shadow(range)
     }
 }
 
@@ -1069,6 +1114,16 @@ impl HvfHostMemoryMapping {
         writeback
             .write_shadow_to_backing(&self.memory)
             .map_err(|source| self.flush_failure(source))
+    }
+
+    fn pmem_shadow_range(&self) -> Option<GuestMemoryRange> {
+        match &self.writeback {
+            #[cfg(test)]
+            HvfHostMemoryWriteback::None => None,
+            HvfHostMemoryWriteback::PmemShadow(_) => {
+                self.memory.regions().first().map(GuestMemoryRegion::range)
+            }
+        }
     }
 
     fn flush_failure(&self, source: BackendError) -> HvfGuestMemoryFlushFailure {
@@ -2895,7 +2950,7 @@ mod tests {
             &file,
             false,
         )];
-        let mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
             guest_memory,
             HvfMemoryPermissions::GUEST_RAM,
             host_mappings,
@@ -2903,9 +2958,12 @@ mod tests {
         )
         .expect("guest and pmem memory should map");
 
-        mapping
-            .flush_host_memory_now()
-            .expect("explicit flush should write writable pmem shadow");
+        let (_, mut executor) = mapping
+            .memory_and_pmem_flush_executor_mut()
+            .expect("pmem flush executor should borrow mapped memory");
+        executor
+            .flush(pmem_range)
+            .expect("targeted flush should write writable pmem shadow");
 
         assert_eq!(file.read_all(), b"after!");
     }
@@ -2926,7 +2984,7 @@ mod tests {
             &file,
             true,
         )];
-        let mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
             guest_memory,
             HvfMemoryPermissions::GUEST_RAM,
             host_mappings,
@@ -2934,10 +2992,161 @@ mod tests {
         )
         .expect("guest and read-only pmem memory should map");
 
-        mapping
-            .flush_host_memory_now()
-            .expect("explicit flush should skip read-only pmem shadow");
+        let (_, mut executor) = mapping
+            .memory_and_pmem_flush_executor_mut()
+            .expect("pmem flush executor should borrow mapped memory");
+        executor
+            .flush(pmem_range)
+            .expect("targeted flush should skip read-only pmem shadow");
 
+        assert_eq!(file.read_all(), b"before");
+    }
+
+    #[test]
+    fn explicit_pmem_shadow_flush_writes_only_selected_shadow() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let first_range = range(page_size * 8, page_size);
+        let second_range = range(page_size * 9, page_size);
+        let first_file = TempFile::with_bytes("first-targeted-pmem-flush", b"first-old");
+        let second_file = TempFile::with_bytes("second-targeted-pmem-flush", b"second-old");
+        let host_mappings = vec![
+            host_pmem_mapping(
+                "pmem device `pmem0`",
+                memory_for_ranges(vec![first_range]),
+                first_range,
+                b"first-new",
+                &first_file,
+                false,
+            ),
+            host_pmem_mapping(
+                "pmem device `pmem1`",
+                memory_for_ranges(vec![second_range]),
+                second_range,
+                b"second-new",
+                &second_file,
+                false,
+            ),
+        ];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            Arc::new(RecordingMapper::default()),
+        )
+        .expect("guest and pmem memory should map");
+
+        let (_, mut executor) = mapping
+            .memory_and_pmem_flush_executor_mut()
+            .expect("pmem flush executor should borrow mapped memory");
+        executor
+            .flush(second_range)
+            .expect("targeted flush should write only the selected pmem shadow");
+
+        assert_eq!(first_file.read_all(), b"first-old");
+        assert_eq!(second_file.read_all(), b"second-new");
+    }
+
+    #[test]
+    fn explicit_pmem_shadow_flush_failure_does_not_flush_peer_shadow() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let selected_range = range(page_size * 8, page_size);
+        let peer_range = range(page_size * 9, page_size);
+        let selected_file = TempFile::with_bytes("secret-selected-pmem-flush", b"selected-old");
+        let peer_file = TempFile::with_bytes("peer-targeted-pmem-flush", b"peer-old");
+        let mut selected_memory = memory_for_ranges(vec![selected_range]);
+        selected_memory
+            .write_slice(b"selected-new", selected_range.start())
+            .expect("test should write selected pmem shadow contents");
+        let host_mappings = vec![
+            HvfHostMemoryMapping::new_pmem_shadow(
+                "pmem device `pmem0`",
+                selected_memory,
+                writable_pmem_permissions(),
+                selected_file
+                    .open_read_only()
+                    .expect("test should open selected backing read-only"),
+                12,
+                false,
+            ),
+            host_pmem_mapping(
+                "pmem device `pmem1`",
+                memory_for_ranges(vec![peer_range]),
+                peer_range,
+                b"peer-new",
+                &peer_file,
+                false,
+            ),
+        ];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            Arc::new(RecordingMapper::default()),
+        )
+        .expect("guest and pmem memory should map");
+
+        let (_, mut executor) = mapping
+            .memory_and_pmem_flush_executor_mut()
+            .expect("pmem flush executor should borrow mapped memory");
+        let err = executor
+            .flush(selected_range)
+            .expect_err("selected read-only backing descriptor should fail writeback");
+        let message = err.to_string();
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::FlushFailed { failures }
+                if failures.len() == 1
+                    && failures.first().is_some_and(|failure| {
+                        failure.label() == "pmem device `pmem0`"
+                            && failure.range() == Some(selected_range)
+                    })
+        ));
+        assert!(message.contains("pmem device `pmem0`"));
+        assert!(message.contains(&selected_range.to_string()));
+        assert!(!message.contains("pmem device `pmem1`"));
+        assert!(!message.contains(&selected_file.path_text()));
+        assert_eq!(selected_file.read_all(), b"selected-old");
+        assert_eq!(peer_file.read_all(), b"peer-old");
+    }
+
+    #[test]
+    fn explicit_pmem_shadow_flush_rejects_missing_range_without_flushing() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let pmem_range = range(page_size * 8, page_size);
+        let missing_range = range(page_size * 9, page_size);
+        let file = TempFile::with_bytes("missing-targeted-pmem-flush", b"before");
+        let host_mappings = vec![host_pmem_mapping(
+            "pmem device `pmem0`",
+            memory_for_ranges(vec![pmem_range]),
+            pmem_range,
+            b"after!",
+            &file,
+            false,
+        )];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            Arc::new(RecordingMapper::default()),
+        )
+        .expect("guest and pmem memory should map");
+
+        let (_, mut executor) = mapping
+            .memory_and_pmem_flush_executor_mut()
+            .expect("pmem flush executor should borrow mapped memory");
+        let err = executor
+            .flush(missing_range)
+            .expect_err("unknown pmem range should fail closed");
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::PmemShadowMissing { range }
+                if range == missing_range
+        ));
         assert_eq!(file.read_all(), b"before");
     }
 

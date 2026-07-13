@@ -35,7 +35,7 @@ use bangbang_runtime::metrics::{
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
-use bangbang_runtime::pmem::{PmemMmioLayout, VirtioPmemFlushStatus};
+use bangbang_runtime::pmem::{PmemMmioDeviceRegistration, PmemMmioLayout, VirtioPmemFlushStatus};
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{SerialConfig, SharedSerialOutput, SharedSerialOutputBuffer};
 use bangbang_runtime::snapshot_device::{SnapshotV1BlockRetryState, SnapshotV1DeviceState};
@@ -50,9 +50,10 @@ use bangbang_runtime::startup::{
     Arm64BootMemoryHotplugNotificationDispatch, Arm64BootMemoryHotplugNotificationDispatchError,
     Arm64BootMemoryHotplugNotificationDispatches, Arm64BootNetworkNotificationDispatch,
     Arm64BootNetworkNotificationDispatchError, Arm64BootNetworkNotificationDispatches,
-    Arm64BootNetworkPacketIoProvider, Arm64BootPmemNotificationDispatch,
-    Arm64BootPmemNotificationDispatchError, Arm64BootPmemNotificationDispatches,
-    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResourceParts, Arm64BootResources,
+    Arm64BootNetworkPacketIoProvider, Arm64BootPmemFlushProvider,
+    Arm64BootPmemNotificationDispatch, Arm64BootPmemNotificationDispatchError,
+    Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
+    Arm64BootResourceParts, Arm64BootResources,
     Arm64BootRtcDeviceConfig as RuntimeArm64BootRtcDeviceConfig, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig, Arm64BootVmGenIdDevice,
     Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
@@ -69,7 +70,7 @@ use crate::gic::{
     HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator,
     HvfGicMetadata, HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
-use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
+use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions, HvfPmemFlushExecutor};
 use crate::psci::PsciCpuPowerCoordinator;
 use crate::runner::{
     HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1Restore, HvfVcpuRunCancelHandle,
@@ -6390,23 +6391,13 @@ fn dispatch_pmem_queue_notifications_and_signal_interrupts(
     gic: &HvfGicMetadata,
     metrics: &SharedPmemDeviceMetricsRegistry,
 ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
-    let flush_status = {
-        let mut mmio_dispatcher =
-            lock_boot_mmio_dispatcher_runtime(dispatcher).map_err(|source| {
-                HvfArm64BootPmemNotificationDispatchError::MmioDispatcher { source }
-            })?;
-
-        if runtime_resources.has_pending_pmem_queue_notifications(&mut mmio_dispatcher) {
-            VirtioPmemFlushStatus::from_result(backend.flush_mapped_pmem_shadows().is_ok())
-        } else {
-            VirtioPmemFlushStatus::Success
-        }
-    };
-
     let dispatches = {
-        let memory = backend.mapped_guest_memory_mut().map_err(|source| {
-            HvfArm64BootPmemNotificationDispatchError::MapGuestMemory { source }
-        })?;
+        let (memory, executor) = backend
+            .mapped_guest_memory_and_pmem_flush_executor_mut()
+            .map_err(
+                |source| HvfArm64BootPmemNotificationDispatchError::MapGuestMemory { source },
+            )?;
+        let mut flush_provider = HvfArm64BootPmemFlushProvider::new(executor);
         let mut mmio_dispatcher =
             lock_boot_mmio_dispatcher_runtime(dispatcher).map_err(|source| {
                 HvfArm64BootPmemNotificationDispatchError::MmioDispatcher { source }
@@ -6416,7 +6407,7 @@ fn dispatch_pmem_queue_notifications_and_signal_interrupts(
             memory,
             runtime_resources,
             &mut mmio_dispatcher,
-            flush_status,
+            &mut flush_provider,
         )?
     };
 
@@ -6433,13 +6424,30 @@ fn dispatch_pmem_runtime_notifications(
     memory: &mut GuestMemory,
     runtime_resources: &mut Arm64BootRuntimeResources,
     mmio_dispatcher: &mut MmioDispatcher,
-    flush_status: VirtioPmemFlushStatus,
+    flush_provider: &mut impl Arm64BootPmemFlushProvider,
 ) -> Result<Arm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
     runtime_resources
-        .dispatch_pmem_queue_notifications(memory, mmio_dispatcher, flush_status)
+        .dispatch_pmem_queue_notifications(memory, mmio_dispatcher, flush_provider)
         .map_err(
             |source| HvfArm64BootPmemNotificationDispatchError::DispatchNotifications { source },
         )
+}
+
+#[derive(Debug)]
+struct HvfArm64BootPmemFlushProvider<'a> {
+    executor: HvfPmemFlushExecutor<'a>,
+}
+
+impl<'a> HvfArm64BootPmemFlushProvider<'a> {
+    fn new(executor: HvfPmemFlushExecutor<'a>) -> Self {
+        Self { executor }
+    }
+}
+
+impl Arm64BootPmemFlushProvider for HvfArm64BootPmemFlushProvider<'_> {
+    fn flush(&mut self, registration: &PmemMmioDeviceRegistration) -> VirtioPmemFlushStatus {
+        VirtioPmemFlushStatus::from_result(self.executor.flush(registration.guest_range()).is_ok())
+    }
 }
 
 fn dispatch_network_runtime_notifications(
@@ -8012,8 +8020,9 @@ mod tests {
         VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
     use bangbang_runtime::pmem::{
-        PmemConfigInput, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT, VIRTIO_PMEM_REQUEST_SIZE,
-        VIRTIO_PMEM_REQUEST_TYPE_FLUSH, VIRTIO_PMEM_STATUS_SIZE, VirtioPmemFlushStatus,
+        PmemConfigInput, PmemMmioDeviceRegistration, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT,
+        VIRTIO_PMEM_REQUEST_SIZE, VIRTIO_PMEM_REQUEST_TYPE_FLUSH, VIRTIO_PMEM_STATUS_SIZE,
+        VirtioPmemFlushStatus,
     };
     use bangbang_runtime::rtc::RtcMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
@@ -8026,9 +8035,10 @@ mod tests {
         Arm64BootMemoryHotplugDeviceConfig, Arm64BootMemoryHotplugNotificationDispatches,
         Arm64BootNetworkNotificationDispatches, Arm64BootNetworkNotificationOutcome,
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
-        Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
-        Arm64BootRuntimeResources, Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError,
-        Arm64BootVsockNotificationDispatches, update_memory_hotplug_config_for_device,
+        Arm64BootPmemFlushProvider, Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig,
+        Arm64BootResources, Arm64BootRuntimeResources, Arm64BootVmGenIdDevice,
+        Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatches,
+        update_memory_hotplug_config_for_device,
     };
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -10499,12 +10509,23 @@ mod tests {
         runtime: &mut Arm64BootRuntimeResources,
         mmio_dispatcher: &mut MmioDispatcher,
     ) -> Arm64BootPmemNotificationDispatches {
+        let mut flush_provider = |_: &PmemMmioDeviceRegistration| VirtioPmemFlushStatus::Success;
+        dispatch_boot_pmem_notifications_with_provider(
+            memory,
+            runtime,
+            mmio_dispatcher,
+            &mut flush_provider,
+        )
+    }
+
+    fn dispatch_boot_pmem_notifications_with_provider(
+        memory: &mut GuestMemory,
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        flush_provider: &mut impl Arm64BootPmemFlushProvider,
+    ) -> Arm64BootPmemNotificationDispatches {
         runtime
-            .dispatch_pmem_queue_notifications(
-                memory,
-                mmio_dispatcher,
-                VirtioPmemFlushStatus::Success,
-            )
+            .dispatch_pmem_queue_notifications(memory, mmio_dispatcher, flush_provider)
             .expect("pmem notification dispatch result should allocate")
     }
 
@@ -12709,6 +12730,92 @@ mod tests {
         assert!(!device.queue_interrupt_signaled());
         assert!(device.signal_error().is_none());
         assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn pmem_notification_dispatch_flushes_only_notified_device_identity() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_pmem(&["pmem0", "pmem1"]);
+        configure_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 1, TEST_USED_RING);
+        write_queued_pmem_flush_request(&mut memory);
+        notify_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 1);
+        let selected = runtime.pmem_mmio_devices[1].registration.clone();
+        let mut flush_calls = Vec::new();
+        let mut flush_provider = |registration: &PmemMmioDeviceRegistration| {
+            flush_calls.push((
+                registration.pmem_id().to_string(),
+                registration.guest_range(),
+                registration.file_len(),
+            ));
+            VirtioPmemFlushStatus::Failure
+        };
+
+        let dispatches = dispatch_boot_pmem_notifications_with_provider(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut flush_provider,
+        );
+
+        assert_eq!(
+            flush_calls,
+            [(
+                selected.pmem_id().to_string(),
+                selected.guest_range(),
+                selected.file_len(),
+            )]
+        );
+        assert!(
+            dispatches.as_slice()[0]
+                .outcome()
+                .dispatched()
+                .expect("idle peer should dispatch as a no-op")
+                .queue_dispatch()
+                .is_none()
+        );
+        let selected_dispatch = dispatches.as_slice()[1]
+            .outcome()
+            .dispatched()
+            .expect("notified pmem device should dispatch")
+            .queue_dispatch()
+            .expect("notified pmem queue should be present");
+        assert_eq!(selected_dispatch.failed_flushes(), 1);
+        assert_eq!(selected_dispatch.successful_flushes(), 0);
+        assert_eq!(
+            read_guest_bytes(&memory, STATUS_ADDR, VIRTIO_PMEM_STATUS_SIZE as usize),
+            bangbang_runtime::pmem::VIRTIO_PMEM_STATUS_FAILURE.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn pmem_notification_dispatch_skips_flush_for_malformed_only_event() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_pmem(&["pmem0"]);
+        configure_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
+        write_partially_invalid_queued_pmem_flush_request(&mut memory);
+        notify_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let mut flush_calls = 0;
+        let mut flush_provider = |_: &PmemMmioDeviceRegistration| {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Success
+        };
+
+        let dispatches = dispatch_boot_pmem_notifications_with_provider(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut flush_provider,
+        );
+
+        assert_eq!(flush_calls, 0);
+        let dispatch = dispatches.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("malformed pmem event should still dispatch")
+            .queue_dispatch()
+            .expect("malformed pmem queue should be present");
+        assert_eq!(dispatch.parse_failures(), 1);
+        assert_eq!(dispatch.successful_flushes(), 0);
+        assert_eq!(dispatch.failed_flushes(), 0);
     }
 
     #[test]

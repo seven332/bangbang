@@ -2006,6 +2006,19 @@ pub struct Arm64BootPmemDevice {
     pub fdt_device: Arm64FdtVirtioMmioDevice,
 }
 
+pub trait Arm64BootPmemFlushProvider {
+    fn flush(&mut self, registration: &PmemMmioDeviceRegistration) -> VirtioPmemFlushStatus;
+}
+
+impl<F> Arm64BootPmemFlushProvider for F
+where
+    F: FnMut(&PmemMmioDeviceRegistration) -> VirtioPmemFlushStatus,
+{
+    fn flush(&mut self, registration: &PmemMmioDeviceRegistration) -> VirtioPmemFlushStatus {
+        self(registration)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootNetworkDevice {
     pub registration: NetworkMmioDeviceRegistration,
@@ -2240,23 +2253,11 @@ impl Arm64BootRuntimeResources {
         Ok(Arm64BootBlockNotificationDispatches::new(devices))
     }
 
-    pub fn has_pending_pmem_queue_notifications(
-        &self,
-        mmio_dispatcher: &mut MmioDispatcher,
-    ) -> bool {
-        self.pmem_mmio_devices.iter().any(|device| {
-            let region_id = device.registration.region_id();
-            mmio_dispatcher
-                .handler_mut::<VirtioPmemMmioHandler>(region_id)
-                .is_ok_and(|handler| handler.has_pending_queue_notifications())
-        })
-    }
-
     pub fn dispatch_pmem_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
         mmio_dispatcher: &mut MmioDispatcher,
-        flush_status: VirtioPmemFlushStatus,
+        flush_provider: &mut impl Arm64BootPmemFlushProvider,
     ) -> Result<Arm64BootPmemNotificationDispatches, Arm64BootPmemNotificationDispatchError> {
         let mut devices = Vec::new();
         devices
@@ -2269,7 +2270,8 @@ impl Arm64BootRuntimeResources {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioPmemMmioHandler>(region_id) {
                 Ok(handler) => {
-                    match handler.dispatch_pmem_queue_notifications(memory, flush_status) {
+                    let mut flush = || flush_provider.flush(&device.registration);
+                    match handler.dispatch_pmem_queue_notifications(memory, &mut flush) {
                         Ok(dispatch) => Arm64BootPmemNotificationOutcome::Dispatched(dispatch),
                         Err(source) => Arm64BootPmemNotificationOutcome::DispatchFailed(source),
                     }
