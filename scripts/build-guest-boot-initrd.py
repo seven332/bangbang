@@ -20,6 +20,11 @@ SMP_PROGRESS_READY_MARKER = b"BBSMPREADY\n"
 SMP_PROGRESS_CPU0_TOKEN = b"\xa5"
 SMP_PROGRESS_CPU1_TOKEN = b"\xd3"
 SMP_PROGRESS_CHILD_STACK_SIZE = 4096
+SMP_HOTPLUG_READY_MARKER = b"BBHOTREADY\n"
+SMP_HOTPLUG_OFF_MARKER = b"BBHOTOFF\n"
+SMP_HOTPLUG_DONE_MARKER = b"BBHOTDONE\n"
+SMP_HOTPLUG_CHILD_STACK_SIZE = 4096
+SMP_HOTPLUG_QUIESCENCE_ITERATIONS = 4095
 ROOTFS_OS_RELEASE_READ_SIZE = 256
 CMDLINE_BEGIN_MARKER = b"BANGBANG_CMDLINE_BEGIN\n"
 CMDLINE_END_MARKER = b"BANGBANG_CMDLINE_END\n"
@@ -29,6 +34,9 @@ MNT_PATH = b"/mnt\0"
 PROC_FS_NAME = b"proc\0"
 PROC_PATH = b"/proc\0"
 PROC_CMDLINE_PATH = b"/proc/cmdline\0"
+SYS_FS_NAME = b"sysfs\0"
+SYS_PATH = b"/sys\0"
+CPU1_ONLINE_PATH = b"/sys/devices/system/cpu/cpu1/online\0"
 SQUASHFS_NAME = b"squashfs\0"
 VDA_PATH = b"/dev/vda\0"
 ROOTFS_OS_RELEASE_PATH = b"/mnt/etc/os-release\0"
@@ -48,8 +56,10 @@ AARCH64_COND_NE = 1
 AARCH64_COND_MI = 4
 LINUX_MOUNT_FLAG_RDONLY = 1
 LINUX_OPEN_FLAG_RDWR = 2
+LINUX_OPEN_FLAG_WRONLY = 1
 LINUX_AARCH64_SYSCALL_MOUNT = 40
 LINUX_AARCH64_SYSCALL_OPENAT = 56
+LINUX_AARCH64_SYSCALL_CLOSE = 57
 LINUX_AARCH64_SYSCALL_READ = 63
 LINUX_AARCH64_SYSCALL_WRITE = 64
 LINUX_AARCH64_SYSCALL_FSYNC = 82
@@ -113,6 +123,35 @@ def cmp_imm_64(register: int, immediate: int) -> bytes:
     if not 0 <= immediate <= 0xFFF:
         raise RuntimeError(f"unsupported CMP immediate: {immediate}")
     instruction = 0xF100001F | ((immediate & 0xFFF) << 10) | (register << 5)
+    return struct.pack("<I", instruction)
+
+
+def add_imm_32(destination: int, source: int, immediate: int) -> bytes:
+    if not 0 <= immediate <= 0xFFF:
+        raise RuntimeError(f"unsupported ADD immediate: {immediate}")
+    instruction = (
+        0x11000000
+        | ((immediate & 0xFFF) << 10)
+        | (source << 5)
+        | destination
+    )
+    return struct.pack("<I", instruction)
+
+
+def sub_imm_64(destination: int, source: int, immediate: int) -> bytes:
+    if not 0 <= immediate <= 0xFFF:
+        raise RuntimeError(f"unsupported SUB immediate: {immediate}")
+    instruction = (
+        0xD1000000
+        | ((immediate & 0xFFF) << 10)
+        | (source << 5)
+        | destination
+    )
+    return struct.pack("<I", instruction)
+
+
+def cmp_reg_32(left: int, right: int) -> bytes:
+    instruction = 0x6B00001F | (right << 16) | (left << 5)
     return struct.pack("<I", instruction)
 
 
@@ -765,6 +804,356 @@ def build_smp_progress_init_elf() -> bytes:
     return build_guest_elf(code, data)
 
 
+def smp_hotplug_init_data(code_size: int) -> list[tuple[str, bytes]]:
+    data = [
+        ("cpu0_affinity_mask", struct.pack("<Q", 1 << 0)),
+        ("cpu1_affinity_mask", struct.pack("<Q", 1 << 1)),
+        ("cpu0_observed", bytes(4)),
+        ("cpu1_observed", bytes(4)),
+        ("child_ready", bytes(4)),
+        ("child_quiesced", bytes(4)),
+        ("start", bytes(4)),
+        ("cpu1_progress", bytes(4)),
+        ("offline_baseline", bytes(4)),
+        ("sysfs", SYS_FS_NAME),
+        ("sys", SYS_PATH),
+        ("cpu1_online", CPU1_ONLINE_PATH),
+        ("offline_value", b"0"),
+        ("online_value", b"1"),
+        ("ready_marker", SMP_HOTPLUG_READY_MARKER),
+        ("off_marker", SMP_HOTPLUG_OFF_MARKER),
+        ("done_marker", SMP_HOTPLUG_DONE_MARKER),
+    ]
+    stack_offset = ELF_CODE_OFFSET + code_size + sum(len(value) for _name, value in data)
+    data.append(("stack_padding", bytes((-stack_offset) % 16)))
+    data.append(("child_stack", bytes(SMP_HOTPLUG_CHILD_STACK_SIZE)))
+    return data
+
+
+def smp_hotplug_init_addresses(code_size: int) -> dict[str, int]:
+    addresses: dict[str, int] = {}
+    data_offset = ELF_CODE_OFFSET + code_size
+    for name, data in smp_hotplug_init_data(code_size):
+        addresses[name] = ELF_BASE_VADDR + data_offset
+        data_offset += len(data)
+    return addresses
+
+
+def emit_cpu1_online_write(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    value_name: str,
+) -> None:
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses["cpu1_online"]),
+                movz_64(2, LINUX_OPEN_FLAG_WRONLY),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_MI)
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(6, 0),
+                mov_imm_64(1, addresses[value_name]),
+                movz_64(2, 1),
+                movz_64(8, LINUX_AARCH64_SYSCALL_WRITE),
+                svc_0(),
+                cmp_imm_64(0, 1),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 6),
+                movz_64(8, LINUX_AARCH64_SYSCALL_CLOSE),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+
+
+def build_smp_hotplug_init_code(addresses: dict[str, int]) -> bytes:
+    code = Aarch64CodeBuilder()
+    emit_smp_progress_affinity_check(
+        code,
+        addresses,
+        affinity_mask="cpu0_affinity_mask",
+        observed_cpu="cpu0_observed",
+        expected_cpu=0,
+    )
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, addresses["sysfs"]),
+                mov_imm_64(1, addresses["sys"]),
+                mov_imm_64(2, addresses["sysfs"]),
+                movz_64(3, 0),
+                movz_64(4, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_MOUNT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, LINUX_CLONE_VM | LINUX_SIGCHLD),
+                mov_imm_64(
+                    1,
+                    addresses["child_stack"] + SMP_HOTPLUG_CHILD_STACK_SIZE,
+                ),
+                movz_64(2, 0),
+                movz_64(3, 0),
+                movz_64(4, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_CLONE),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_MI)
+    code.branch_cond("child", AARCH64_COND_EQ)
+
+    code.label("parent_wait_ready")
+    code.emit(mov_imm_64(1, addresses["child_ready"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(cmp_imm_64(0, 1))
+    code.branch_cond("parent_wait_ready", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 1),
+                mov_imm_64(1, addresses["start"]),
+                stlr_u32(0, 1),
+            )
+        )
+    )
+    code.label("parent_wait_baseline_progress")
+    code.emit(mov_imm_64(1, addresses["cpu1_progress"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(cmp_imm_64(0, 0))
+    code.branch_cond("parent_wait_baseline_progress", AARCH64_COND_EQ)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["ready_marker"],
+            len(SMP_HOTPLUG_READY_MARKER),
+        )
+    )
+
+    emit_cpu1_online_write(code, addresses, "offline_value")
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 2),
+                mov_imm_64(1, addresses["start"]),
+                stlr_u32(0, 1),
+            )
+        )
+    )
+    code.label("parent_wait_child_quiesced")
+    code.emit(mov_imm_64(1, addresses["child_quiesced"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(cmp_imm_64(0, 1))
+    code.branch_cond("parent_wait_child_quiesced", AARCH64_COND_NE)
+    code.emit(mov_imm_64(1, addresses["cpu1_progress"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(mov_imm_64(1, addresses["offline_baseline"]))
+    code.emit(stlr_u32(0, 1))
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["off_marker"],
+            len(SMP_HOTPLUG_OFF_MARKER),
+        )
+    )
+
+    code.emit(movz_64(5, SMP_HOTPLUG_QUIESCENCE_ITERATIONS))
+    code.label("offline_quiescence_work")
+    code.emit(
+        b"".join(
+            (
+                movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_YIELD),
+                svc_0(),
+                sub_imm_64(5, 5, 1),
+                cmp_imm_64(5, 0),
+            )
+        )
+    )
+    code.branch_cond("offline_quiescence_work", AARCH64_COND_NE)
+    code.emit(mov_imm_64(1, addresses["cpu1_progress"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(mov_imm_64(1, addresses["offline_baseline"]))
+    code.emit(ldar_u32(2, 1))
+    code.emit(cmp_reg_32(0, 2))
+    code.branch_cond("failure", AARCH64_COND_NE)
+
+    emit_cpu1_online_write(code, addresses, "online_value")
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 3),
+                mov_imm_64(1, addresses["start"]),
+                stlr_u32(0, 1),
+            )
+        )
+    )
+    code.label("parent_wait_reentry")
+    code.emit(mov_imm_64(1, addresses["cpu1_progress"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(mov_imm_64(1, addresses["offline_baseline"]))
+    code.emit(ldar_u32(2, 1))
+    code.emit(cmp_reg_32(0, 2))
+    code.branch_cond("parent_wait_reentry", AARCH64_COND_EQ)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["done_marker"],
+            len(SMP_HOTPLUG_DONE_MARKER),
+        )
+    )
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, LINUX_REBOOT_MAGIC1),
+                mov_imm_64(1, LINUX_REBOOT_MAGIC2),
+                mov_imm_64(2, LINUX_REBOOT_CMD_POWER_OFF),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_REBOOT),
+                svc_0(),
+                branch_to_self(),
+            )
+        )
+    )
+
+    code.label("child")
+    emit_smp_progress_affinity_check(
+        code,
+        addresses,
+        affinity_mask="cpu1_affinity_mask",
+        observed_cpu="cpu1_observed",
+        expected_cpu=1,
+    )
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 1),
+                mov_imm_64(1, addresses["child_ready"]),
+                stlr_u32(0, 1),
+            )
+        )
+    )
+    code.label("child_dispatch")
+    code.emit(mov_imm_64(1, addresses["start"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(cmp_imm_64(0, 1))
+    code.branch_cond("child_progress", AARCH64_COND_EQ)
+    code.emit(cmp_imm_64(0, 2))
+    code.branch_cond("child_quiesce", AARCH64_COND_EQ)
+    code.emit(cmp_imm_64(0, 3))
+    code.branch_cond("child_reenter", AARCH64_COND_EQ)
+    code.emit(
+        b"".join(
+            (
+                movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_YIELD),
+                svc_0(),
+            )
+        )
+    )
+    code.branch("child_dispatch")
+
+    code.label("child_progress")
+    code.emit(mov_imm_64(1, addresses["cpu1_progress"]))
+    code.emit(ldar_u32(0, 1))
+    code.emit(add_imm_32(0, 0, 1))
+    code.emit(stlr_u32(0, 1))
+    code.emit(
+        b"".join(
+            (
+                movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_YIELD),
+                svc_0(),
+            )
+        )
+    )
+    code.branch("child_dispatch")
+
+    code.label("child_quiesce")
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 1),
+                mov_imm_64(1, addresses["child_quiesced"]),
+                stlr_u32(0, 1),
+                movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_YIELD),
+                svc_0(),
+            )
+        )
+    )
+    code.branch("child_dispatch")
+
+    code.label("child_reenter")
+    emit_smp_progress_affinity_check(
+        code,
+        addresses,
+        affinity_mask="cpu1_affinity_mask",
+        observed_cpu="cpu1_observed",
+        expected_cpu=1,
+    )
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 4),
+                mov_imm_64(1, addresses["start"]),
+                stlr_u32(0, 1),
+            )
+        )
+    )
+    code.branch("child_progress")
+
+    code.label("failure")
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 1),
+                movz_64(8, LINUX_AARCH64_SYSCALL_EXIT),
+                svc_0(),
+                branch_to_self(),
+            )
+        )
+    )
+    return code.build()
+
+
+def build_smp_hotplug_init_elf() -> bytes:
+    placeholder_addresses = {
+        name: ELF_BASE_VADDR for name, _data in smp_hotplug_init_data(0)
+    }
+    code_size = len(build_smp_hotplug_init_code(placeholder_addresses))
+    addresses = smp_hotplug_init_addresses(code_size)
+    code = build_smp_hotplug_init_code(addresses)
+    if len(code) != code_size:
+        raise RuntimeError("guest SMP hotplug init code size changed after address assignment")
+    if addresses["child_stack"] % 16 != 0:
+        raise RuntimeError("guest SMP hotplug child stack is not 16-byte aligned")
+
+    data = b"".join(data for _name, data in smp_hotplug_init_data(code_size))
+    return build_guest_elf(code, data)
+
+
 def build_reboot_syscall_init_elf(command: int) -> bytes:
     code = b"".join(
         (
@@ -857,6 +1246,7 @@ def build_initrd() -> bytes:
     guest_init = build_guest_init_elf()
     smp_init = build_smp_init_elf()
     smp_progress_init = build_smp_progress_init_elf()
+    smp_hotplug_init = build_smp_hotplug_init_elf()
     poweroff_init = build_poweroff_init_elf()
     reboot_init = build_reboot_init_elf()
     archive = b"".join(
@@ -864,39 +1254,46 @@ def build_initrd() -> bytes:
             cpio_entry(name="dev", ino=1, mode=S_IFDIR | 0o755, nlink=2),
             cpio_entry(name="proc", ino=2, mode=S_IFDIR | 0o755, nlink=2),
             cpio_entry(name="mnt", ino=3, mode=S_IFDIR | 0o755, nlink=2),
+            cpio_entry(name="sys", ino=4, mode=S_IFDIR | 0o755, nlink=2),
             cpio_entry(
                 name="dev/console",
-                ino=4,
+                ino=5,
                 mode=S_IFCHR | 0o600,
                 rdevmajor=5,
                 rdevminor=1,
             ),
-            cpio_entry(name="init", ino=5, mode=S_IFREG | 0o755, data=guest_init),
+            cpio_entry(name="init", ino=6, mode=S_IFREG | 0o755, data=guest_init),
             cpio_entry(
                 name="poweroff-init",
-                ino=6,
+                ino=7,
                 mode=S_IFREG | 0o755,
                 data=poweroff_init,
             ),
             cpio_entry(
                 name="reboot-init",
-                ino=7,
+                ino=8,
                 mode=S_IFREG | 0o755,
                 data=reboot_init,
             ),
             cpio_entry(
                 name="smp-init",
-                ino=8,
+                ino=9,
                 mode=S_IFREG | 0o755,
                 data=smp_init,
             ),
             cpio_entry(
                 name="smp-progress-init",
-                ino=9,
+                ino=10,
                 mode=S_IFREG | 0o755,
                 data=smp_progress_init,
             ),
-            cpio_entry(name="TRAILER!!!", ino=10, mode=0, nlink=1),
+            cpio_entry(
+                name="smp-hotplug-init",
+                ino=11,
+                mode=S_IFREG | 0o755,
+                data=smp_hotplug_init,
+            ),
+            cpio_entry(name="TRAILER!!!", ino=12, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -1076,6 +1473,64 @@ def validate_smp_progress_init_entry(entries: dict[str, dict[str, object]]) -> N
         raise RuntimeError("guest initrd smp-progress-init payload does not contain SVC #0")
 
 
+def validate_smp_hotplug_init_entry(entries: dict[str, dict[str, object]]) -> None:
+    entry = required_entry(entries, "smp-hotplug-init")
+    if file_type(entry["mode"]) != S_IFREG:
+        raise RuntimeError("guest initrd smp-hotplug-init entry is not a regular file")
+    payload = bytes(entry["payload"])
+    if not payload.startswith(b"\x7fELF"):
+        raise RuntimeError("guest initrd smp-hotplug-init payload is not an ELF file")
+    if len(payload) < SMP_HOTPLUG_CHILD_STACK_SIZE:
+        raise RuntimeError("guest initrd smp-hotplug-init payload omits the child stack")
+    if (
+        SMP_HOTPLUG_READY_MARKER
+        + SMP_HOTPLUG_OFF_MARKER
+        + SMP_HOTPLUG_DONE_MARKER
+        not in payload
+    ):
+        raise RuntimeError("guest initrd smp-hotplug-init payload omits phase markers")
+    for guest_path in (SYS_FS_NAME, SYS_PATH, CPU1_ONLINE_PATH):
+        if guest_path not in payload:
+            raise RuntimeError(
+                f"guest initrd smp-hotplug-init payload omits {guest_path!r}"
+            )
+    if b"01" not in payload:
+        raise RuntimeError("guest initrd smp-hotplug-init payload omits online values")
+    affinity_masks = struct.pack("<Q", 1 << 0) + struct.pack("<Q", 1 << 1)
+    if affinity_masks not in payload:
+        raise RuntimeError(
+            "guest initrd smp-hotplug-init payload omits ordered CPU affinity masks"
+        )
+    for syscall, description in (
+        (LINUX_AARCH64_SYSCALL_MOUNT, "mount"),
+        (LINUX_AARCH64_SYSCALL_OPENAT, "openat"),
+        (LINUX_AARCH64_SYSCALL_WRITE, "write"),
+        (LINUX_AARCH64_SYSCALL_CLOSE, "close"),
+        (LINUX_AARCH64_SYSCALL_CLONE, "clone"),
+        (LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY, "sched_setaffinity"),
+        (LINUX_AARCH64_SYSCALL_SCHED_YIELD, "sched_yield"),
+        (LINUX_AARCH64_SYSCALL_GETCPU, "getcpu"),
+        (LINUX_AARCH64_SYSCALL_REBOOT, "reboot"),
+    ):
+        if movz_64(8, syscall) not in payload:
+            raise RuntimeError(
+                f"guest initrd smp-hotplug-init payload does not load {description}"
+            )
+    for instruction, description in (
+        (ldar_u32(0, 1), "acquire load"),
+        (stlr_u32(0, 1), "release store"),
+        (add_imm_32(0, 0, 1), "progress increment"),
+        (sub_imm_64(5, 5, 1), "quiescence decrement"),
+        (cmp_reg_32(0, 2), "shared progress comparison"),
+    ):
+        if instruction not in payload:
+            raise RuntimeError(
+                f"guest initrd smp-hotplug-init payload omits {description}"
+            )
+    if svc_0() not in payload:
+        raise RuntimeError("guest initrd smp-hotplug-init payload does not contain SVC #0")
+
+
 def validate_initrd(data: bytes) -> None:
     if not data:
         raise RuntimeError("guest initrd is empty")
@@ -1089,12 +1544,14 @@ def validate_initrd(data: bytes) -> None:
         "dev",
         "proc",
         "mnt",
+        "sys",
         "dev/console",
         "init",
         "poweroff-init",
         "reboot-init",
         "smp-init",
         "smp-progress-init",
+        "smp-hotplug-init",
         CPIO_TRAILER,
     ]
     if names != expected_names:
@@ -1111,6 +1568,10 @@ def validate_initrd(data: bytes) -> None:
     mnt = required_entry(entries, "mnt")
     if file_type(mnt["mode"]) != S_IFDIR:
         raise RuntimeError("guest initrd mnt entry is not a directory")
+
+    sysfs = required_entry(entries, "sys")
+    if file_type(sysfs["mode"]) != S_IFDIR:
+        raise RuntimeError("guest initrd sys entry is not a directory")
 
     console = required_entry(entries, "dev/console")
     if file_type(console["mode"]) != S_IFCHR:
@@ -1168,6 +1629,7 @@ def validate_initrd(data: bytes) -> None:
     )
     validate_smp_init_entry(entries)
     validate_smp_progress_init_entry(entries)
+    validate_smp_hotplug_init_entry(entries)
 
 
 def default_output_path() -> Path:

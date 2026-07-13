@@ -832,7 +832,12 @@ MPIDR metadata drives FDT CPU nodes, PSCI targets, run identities, and PPI
 routing. `CPU_ON` diagnostics expose only index, MPIDR, and transaction stage;
 the guest entry, context, registers, memory contents, and host pointers remain
 redacted. An entry is accepted only when four-byte aligned and contained in the
-already mapped guest RAM.
+already mapped guest RAM. `CPU_OFF` uses the same indexed transaction boundary:
+the exact pending token is required, success writes no return register, the last
+committed online CPU is denied, and scheduler removal completes before the
+power model publishes `OFF`. Later re-entry reuses the fixed owner and shared
+GIC, clears only the retained EL1 MMU enablement required by the Linux warm-entry
+contract, and does not claim a full architectural reset.
 
 Public `InstanceStart` now exposes the same topology for counts through
 `min(32, host_max)`; it does not add another owner or capacity authority. A

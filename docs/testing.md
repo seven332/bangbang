@@ -85,7 +85,12 @@ apply the Linux boot PSTATE, write PC last, stop at every injected failure, and
 require a complete retry while the target remains fail-closed. Session tests
 must also prove target-only admission precedes caller `SUCCESS`, a pending
 caller is not resubmitted, barrier acknowledgements retain ordinary work, and
-timer PPIs use the completing index.
+timer PPIs use the completing index. CPU_OFF coverage must prove the last
+committed online CPU receives `DENIED`, a successful call consumes only its
+exact pending runner token without writing X0, scheduler removal precedes the
+power-state `OFF` commit, abort restores `ON`, and a later CPU_ON reuses the same
+owner. Re-entry tests must prove `SCTLR_EL1` is cleared before the existing
+X0-X3, PSTATE, and PC-last publication and must not claim a complete cold reset.
 
 The signed `guest_boot` gate builds a deterministic `/smp-init`, boots with two
 internal vCPUs, verifies FDT CPU nodes and PSCI enable methods for MPIDRs
@@ -99,6 +104,13 @@ The public test pauses one two-vCPU process, uses both token streams from an
 isolated peer as an event-driven observation window, requires the paused serial
 bytes to stay exact, and requires both streams to resume. Native-v1 multi-vCPU
 acceptance remains a separate negative gate.
+
+The generated `/smp-hotplug-init` mounts sysfs, takes CPU1 offline through
+Linux's CPU hotplug interface, proves the migrated worker is quiescent with a
+phase/shared-counter handshake, brings CPU1 online, reapplies CPU1 affinity,
+and proves progress resumes before emitting `BBHOTDONE`. The signed guest and
+public executable tests must observe `BBHOTREADY`, `BBHOTOFF`, and `BBHOTDONE`
+with deadlines and deterministic yields rather than fixed sleeps.
 
 For virtio-pmem changes, unit tests should cover MMIO registration, FDT
 metadata, config-space `start`/`size`, deterministic multi-device layout,

@@ -5691,7 +5691,9 @@ fn run_boot_session_loop_with_observer(
             HvfVcpuRunStepOutcome::GuestReset { .. } => {
                 return Ok(HvfArm64BootRunLoopOutcome::GuestReset { steps });
             }
-            HvfVcpuRunStepOutcome::Hvc { .. } | HvfVcpuRunStepOutcome::Sys64 { .. } => {
+            HvfVcpuRunStepOutcome::Hvc { .. }
+            | HvfVcpuRunStepOutcome::CpuOff { .. }
+            | HvfVcpuRunStepOutcome::Sys64 { .. } => {
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }

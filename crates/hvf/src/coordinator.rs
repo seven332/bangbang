@@ -785,6 +785,8 @@ trait CoordinatorMember: fmt::Debug {
         response: PsciCoordinatorResponse,
     ) -> Result<(), HvfVcpuRunnerError>;
 
+    fn commit_cpu_off(&self, token: HvfVcpuPsciCallToken) -> Result<(), HvfVcpuRunnerError>;
+
     fn set_ppi_pending(&self, intid: u32) -> Result<(), HvfVcpuRunnerError>;
 
     fn clear_ppi_pending(&self, intid: u32) -> Result<(), HvfVcpuRunnerError>;
@@ -820,6 +822,10 @@ impl CoordinatorMember for HvfVcpuRunner<'_> {
         response: PsciCoordinatorResponse,
     ) -> Result<(), HvfVcpuRunnerError> {
         self.complete_psci_call(token, response)
+    }
+
+    fn commit_cpu_off(&self, token: HvfVcpuPsciCallToken) -> Result<(), HvfVcpuRunnerError> {
+        self.commit_psci_cpu_off(token)
     }
 
     fn set_ppi_pending(&self, intid: u32) -> Result<(), HvfVcpuRunnerError> {
@@ -1732,6 +1738,18 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
             })
     }
 
+    pub(crate) fn commit_cpu_off(
+        &self,
+        index: usize,
+        work: HvfVcpuCoordinatorWork,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        let (_, _, token, _) = work.into_parts();
+        self.inner
+            .member_operation(index, "PSCI CPU_OFF commit", true, |member| {
+                member.commit_cpu_off(token)
+            })
+    }
+
     /// Set one PPI pending on the selected vCPU owner thread.
     pub fn set_gic_ppi_pending(
         &self,
@@ -1873,6 +1891,7 @@ mod tests {
         ConfigurePrimary(HvfArm64BootRegisters),
         ConfigureSecondary(HvfArm64SecondaryBootRegisters),
         CompletePsci,
+        CommitCpuOff,
         SetPpi(u32),
         ClearPpi(u32),
     }
@@ -2025,6 +2044,15 @@ mod tests {
                 .expect("fake member state should lock")
                 .operations
                 .push(FakeOperation::CompletePsci);
+            Ok(())
+        }
+
+        fn commit_cpu_off(&self, _token: HvfVcpuPsciCallToken) -> Result<(), HvfVcpuRunnerError> {
+            self.state
+                .lock()
+                .expect("fake member state should lock")
+                .operations
+                .push(FakeOperation::CommitCpuOff);
             Ok(())
         }
 

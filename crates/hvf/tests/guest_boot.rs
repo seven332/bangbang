@@ -21,6 +21,12 @@ const ROOTFS_READ_MARKER: &[u8] = b"BANGBANG_ROOTFS_READ_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const SECONDARY_CPU_MARKER: &[u8] = b"BANGBANG_SECONDARY_CPU_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SMP_HOTPLUG_READY_MARKER: &[u8] = b"BBHOTREADY";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SMP_HOTPLUG_OFF_MARKER: &[u8] = b"BBHOTOFF";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SMP_HOTPLUG_DONE_MARKER: &[u8] = b"BBHOTDONE";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const DIRECT_ROOTFS_BOOT_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VMGENID_GUEST_CHECK_MARKER: &[u8] = b"BANGBANG_VMGENID_GUEST_CHECK_OK";
@@ -44,6 +50,9 @@ const CMDLINE_END_MARKER: &[u8] = b"BANGBANG_CMDLINE_END";
 const INITRD_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const SMP_INITRD_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/smp-init";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SMP_HOTPLUG_INITRD_BOOT_ARGS: &str =
+    "console=ttyS0 reboot=k panic=1 rdinit=/smp-hotplug-init";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const DIRECT_ROOTFS_BOOT_ARGS: &str =
     "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
@@ -119,6 +128,44 @@ fn boots_firecracker_kernel_and_executes_userspace_on_secondary_cpu() {
     assert!(
         observation.run_diagnostics.hvc_steps > 0,
         "two-vCPU guest boot should observe PSCI HVC work\n{}\nserial output:\n{}",
+        GuestBootFailureReport::new(&observation.boot_diagnostics, &observation.run_diagnostics),
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_and_reenters_a_hotplugged_secondary_cpu() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::machine::MachineConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let initrd_path = env_path("BANGBANG_GUEST_INITRD_PATH");
+    let observation = run_guest_boot_with_boot_source(
+        "guest-smp-hotplug",
+        SMP_HOTPLUG_DONE_MARKER,
+        Some(initrd_path),
+        SMP_HOTPLUG_INITRD_BOOT_ARGS,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 128)))
+                .expect("two-vCPU guest machine config should store");
+        },
+    );
+
+    for (marker, description) in [
+        (SMP_HOTPLUG_READY_MARKER, "hotplug ready marker"),
+        (SMP_HOTPLUG_OFF_MARKER, "CPU1 offline marker"),
+        (SMP_HOTPLUG_DONE_MARKER, "CPU1 re-entry marker"),
+    ] {
+        assert_guest_boot_observed_marker(&observation, marker, description);
+    }
+    assert_eq!(observation.boot_diagnostics.vcpu_mpidrs, [0, 1]);
+    assert!(
+        observation.run_diagnostics.cpu_off_steps > 0,
+        "guest hotplug should observe a non-returning CPU_OFF step\n{}\nserial output:\n{}",
         GuestBootFailureReport::new(&observation.boot_diagnostics, &observation.run_diagnostics),
         String::from_utf8_lossy(&observation.serial_bytes)
     );
@@ -853,6 +900,7 @@ struct GuestBootRunDiagnostics {
     completed_steps: usize,
     resumable_outcomes: usize,
     hvc_steps: usize,
+    cpu_off_steps: usize,
     sys64_steps: usize,
     mmio_steps: usize,
     virtual_timer_steps: usize,
@@ -880,6 +928,9 @@ impl GuestBootRunDiagnostics {
             }
             bangbang_hvf::HvfVcpuRunStepOutcome::Hvc { .. } => {
                 self.hvc_steps += 1;
+            }
+            bangbang_hvf::HvfVcpuRunStepOutcome::CpuOff { .. } => {
+                self.cpu_off_steps += 1;
             }
             bangbang_hvf::HvfVcpuRunStepOutcome::GuestShutdown { .. }
             | bangbang_hvf::HvfVcpuRunStepOutcome::GuestReset { .. } => {}
@@ -1003,8 +1054,9 @@ impl std::fmt::Display for GuestBootFailureReport<'_> {
         writeln!(f, "  resumable outcomes: {}", self.run.resumable_outcomes)?;
         writeln!(
             f,
-            "  raw step counts: hvc={}, sys64={}, mmio={}, vtimer={}, canceled={}, unknown={}",
+            "  raw step counts: hvc={}, cpu_off={}, sys64={}, mmio={}, vtimer={}, canceled={}, unknown={}",
             self.run.hvc_steps,
+            self.run.cpu_off_steps,
             self.run.sys64_steps,
             self.run.mmio_steps,
             self.run.virtual_timer_steps,

@@ -123,6 +123,8 @@ const PSCI_CALL_NOT_PENDING_MESSAGE: &str = "vCPU runner has no deferred PSCI ca
 const PSCI_CALL_TOKEN_MISMATCH_MESSAGE: &str = "deferred PSCI call token does not match";
 const PSCI_CALL_RESPONSE_MISMATCH_MESSAGE: &str =
     "deferred PSCI response does not match the request";
+const PSCI_CALL_REQUEST_MISMATCH_MESSAGE: &str =
+    "deferred PSCI request does not match the completion operation";
 const PSCI_COMPLETION_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has PSCI completion in flight";
 const PSCI_CALL_TOKEN_EXHAUSTED_MESSAGE: &str = "deferred PSCI call token space is exhausted";
 const ARM64_INSTRUCTION_SIZE: u64 = 4;
@@ -443,6 +445,12 @@ pub enum HvfVcpuRunStepOutcome {
         exit: HvfHvcExit,
         function_id: u64,
         return_value: u64,
+    },
+    CpuOff {
+        index: usize,
+        mpidr: u64,
+        exit: HvfHvcExit,
+        function_id: u64,
     },
     GuestShutdown {
         exit: HvfHvcExit,
@@ -911,6 +919,10 @@ enum RunnerCommand {
     CompletePsciCall {
         token: HvfVcpuPsciCallToken,
         response: PsciCoordinatorResponse,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
+    CommitPsciCpuOff {
+        token: HvfVcpuPsciCallToken,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     DispatchMmioAccess {
@@ -2729,6 +2741,22 @@ impl<'vm> HvfVcpuRunner<'vm> {
         result
     }
 
+    pub(crate) fn commit_psci_cpu_off(
+        &self,
+        token: HvfVcpuPsciCallToken,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let mut completion = self.start_psci_cpu_off_commit(token, response_sender)?;
+
+        let result = response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+        if result.is_ok() {
+            completion.mark_cpu_off_committed();
+        }
+        result
+    }
+
     /// Dispatch one resolved HVF MMIO access on the vCPU-owning runner thread.
     pub fn dispatch_mmio_access(
         &self,
@@ -4135,7 +4163,55 @@ impl<'vm> HvfVcpuRunner<'vm> {
         response: PsciCoordinatorResponse,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     ) -> Result<InFlightPsciCompletion, HvfVcpuRunnerError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.reserve_psci_completion(token)?;
+        state.psci_completion_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::CompletePsciCall {
+                token,
+                response,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.psci_completion_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightPsciCompletion::new(&self.state, token))
+    }
+
+    fn start_psci_cpu_off_commit(
+        &self,
+        token: HvfVcpuPsciCallToken,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<InFlightPsciCompletion, HvfVcpuRunnerError> {
+        let mut state = self.reserve_psci_completion(token)?;
+        state.psci_completion_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::CommitPsciCpuOff {
+                token,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.psci_completion_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightPsciCompletion::new(&self.state, token))
+    }
+
+    fn reserve_psci_completion(
+        &self,
+        token: HvfVcpuPsciCallToken,
+    ) -> Result<MutexGuard<'_, RunnerHandleState>, HvfVcpuRunnerError> {
+        let state = self.lock_state()?;
         if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
         }
@@ -4190,24 +4266,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
-
-        state.psci_completion_in_flight = true;
-        if self
-            .command_sender
-            .send(RunnerCommand::CompletePsciCall {
-                token,
-                response,
-                response_sender,
-            })
-            .is_err()
-        {
-            state.psci_completion_in_flight = false;
-            return Err(HvfVcpuRunnerError::ChannelClosed(
-                COMMAND_CHANNEL_CLOSED_MESSAGE,
-            ));
-        }
-
-        Ok(InFlightPsciCompletion::new(&self.state, token))
+        Ok(state)
     }
 
     fn start_mmio_dispatch(
@@ -5859,6 +5918,7 @@ struct InFlightPsciCompletion {
     state: RunnerState,
     token: HvfVcpuPsciCallToken,
     completed: bool,
+    cpu_off_committed: bool,
 }
 
 impl InFlightPsciCompletion {
@@ -5867,11 +5927,17 @@ impl InFlightPsciCompletion {
             state: Arc::clone(state),
             token,
             completed: false,
+            cpu_off_committed: false,
         }
     }
 
     fn mark_completed(&mut self) {
         self.completed = true;
+    }
+
+    fn mark_cpu_off_committed(&mut self) {
+        self.completed = true;
+        self.cpu_off_committed = true;
     }
 }
 
@@ -5881,6 +5947,11 @@ impl Drop for InFlightPsciCompletion {
             state.psci_completion_in_flight = false;
             if self.completed && state.pending_psci_call == Some(self.token) {
                 state.pending_psci_call = None;
+                if self.cpu_off_committed {
+                    state.boot_register_setup_failed = false;
+                    state.boot_registers_configured = false;
+                    state.run_started = false;
+                }
             }
         }
     }
@@ -6248,6 +6319,16 @@ fn run_runner_thread<C, V>(
                     token,
                     response,
                 );
+                let sent = response_sender.send(result.clone()).is_ok();
+                if sent && result.is_ok() {
+                    psci_state.pending = None;
+                }
+            }
+            RunnerCommand::CommitPsciCpuOff {
+                token,
+                response_sender,
+            } => {
+                let result = commit_psci_cpu_off_on_runner_thread(&psci_state, token);
                 let sent = response_sender.send(result.clone()).is_ok();
                 if sent && result.is_ok() {
                     psci_state.pending = None;
@@ -7191,6 +7272,28 @@ fn complete_psci_call_on_runner_thread(
     Ok(())
 }
 
+fn commit_psci_cpu_off_on_runner_thread(
+    psci_state: &RunnerThreadPsciState,
+    token: HvfVcpuPsciCallToken,
+) -> Result<(), HvfVcpuRunnerError> {
+    let Some(pending) = psci_state.pending.as_ref() else {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_NOT_PENDING_MESSAGE,
+        ));
+    };
+    if pending.token != token {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_TOKEN_MISMATCH_MESSAGE,
+        ));
+    }
+    if pending.request != PsciCoordinatorRequest::CpuOff || pending.written_response.is_some() {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_REQUEST_MISMATCH_MESSAGE,
+        ));
+    }
+    Ok(())
+}
+
 const fn psci_call_result_outcome(
     exit: HvfHvcExit,
     function_id: u64,
@@ -7344,6 +7447,7 @@ pub(crate) mod tests {
     const ESR_ISS_WNR: u64 = 1 << 6;
     const ESR_ISS_SF: u64 = 1 << 15;
     const PSCI_VERSION: u64 = 0x8400_0000;
+    const PSCI_CPU_OFF: u64 = 0x8400_0002;
     const PSCI_CPU_ON: u64 = 0x8400_0003;
     const PSCI_CPU_ON_64: u64 = 0xc400_0003;
     const PSCI_AFFINITY_INFO: u64 = 0x8400_0004;
@@ -15541,6 +15645,13 @@ pub(crate) mod tests {
         fn configure_arm64_boot_registers(
             &mut self,
             _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn configure_arm64_secondary_boot_registers(
+            &mut self,
+            _registers: HvfArm64SecondaryBootRegisters,
         ) -> Result<(), BackendError> {
             Ok(())
         }
@@ -32302,6 +32413,86 @@ pub(crate) mod tests {
             register_write_receiver.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         );
+    }
+
+    #[test]
+    fn coordinated_cpu_off_commits_without_x0_and_reopens_secondary_execution_epoch() {
+        let (runner, register_read_receiver, register_write_receiver) =
+            start_coordinated_psci_run_step_recording_runner(PSCI_CPU_OFF, [u64::MAX; 3], 0, false);
+        let registers =
+            HvfArm64SecondaryBootRegisters::new(GuestAddress::new(0x8020_0000), 0xfeed_face);
+
+        for cycle in 0..2 {
+            let HvfVcpuCoordinatedRunStepOutcome::Psci {
+                token,
+                request: PsciCoordinatorRequest::CpuOff,
+                ..
+            } = runner
+                .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+                .expect("CPU_OFF should defer")
+            else {
+                panic!("CPU_OFF should return typed coordinator work");
+            };
+            assert_eq!(
+                runner.configure_arm64_secondary_boot_registers(registers),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::PSCI_CALL_PENDING_MESSAGE
+                ))
+            );
+            runner
+                .commit_psci_cpu_off(token)
+                .expect("CPU_OFF should commit without a response");
+            assert_eq!(
+                register_write_receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty),
+                "CPU_OFF cycle {cycle} must not write X0"
+            );
+            runner
+                .configure_arm64_secondary_boot_registers(registers)
+                .expect("committed CPU_OFF should open the next entry epoch");
+        }
+        assert_eq!(
+            register_read_receiver.try_iter().collect::<Vec<_>>(),
+            vec![HvfRegister::X0, HvfRegister::X0]
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn cpu_off_commit_rejects_a_different_pending_psci_request() {
+        let (runner, _, register_write_receiver) = start_coordinated_psci_run_step_recording_runner(
+            PSCI_CPU_ON,
+            [1, 0x8020_0000, 0],
+            0,
+            false,
+        );
+        let HvfVcpuCoordinatedRunStepOutcome::Psci { token, .. } = runner
+            .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+            .expect("CPU_ON should defer")
+        else {
+            panic!("CPU_ON should return coordinator work");
+        };
+        assert_eq!(
+            runner.commit_psci_cpu_off(token),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_REQUEST_MISMATCH_MESSAGE
+            ))
+        );
+        runner
+            .complete_psci_call(
+                token,
+                PsciCoordinatorResponse::CpuOn(PsciCpuOnResponse::InternalFailure),
+            )
+            .expect("original CPU_ON response should remain retryable");
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("CPU_ON completion should write X0"),
+            (HvfRegister::X0, 0xffff_fffa)
+        );
+
+        runner.shutdown().expect("runner should shut down");
     }
 
     #[test]

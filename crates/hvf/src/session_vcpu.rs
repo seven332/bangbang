@@ -14,8 +14,8 @@ use crate::coordinator::{
 };
 use crate::memory::HvfGuestMemoryMappingError;
 use crate::psci::{
-    PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOnBegin, PsciCpuOnToken, PsciCpuOnWork,
-    PsciCpuPowerCoordinator,
+    PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOffBegin, PsciCpuOnBegin,
+    PsciCpuOnToken, PsciCpuOnWork, PsciCpuPowerCoordinator,
 };
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::vcpu::HvfArm64SecondaryBootRegisters;
@@ -308,6 +308,9 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
     ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
         let (exit, function_id, _, request) = work.into_parts();
         let response = match request {
+            PsciCoordinatorRequest::CpuOff => {
+                return self.process_cpu_off(caller_index, work);
+            }
             PsciCoordinatorRequest::AffinityInfo(request) => {
                 PsciCoordinatorResponse::AffinityInfo(self.power.affinity_info(request))
             }
@@ -332,6 +335,68 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
             exit,
             function_id,
             return_value: response.return_value(),
+        })
+    }
+
+    fn process_cpu_off(
+        &mut self,
+        caller_index: usize,
+        work: HvfVcpuCoordinatorWork,
+    ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        let (exit, function_id, _, _) = work.into_parts();
+        let begin = self
+            .power
+            .begin_cpu_off(caller_index)
+            .map_err(|_| self.power_error("CPU_OFF validation", caller_index))?;
+        let PsciCpuOffBegin::Pending(cpu_off) = begin else {
+            let PsciCpuOffBegin::Complete(response) = begin else {
+                return Err(self.power_error("CPU_OFF validation", caller_index));
+            };
+            let response = PsciCoordinatorResponse::CpuOff(response);
+            self.complete_caller(
+                caller_index,
+                work,
+                response,
+                "CPU_OFF failure completion",
+                false,
+            )?;
+            return Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit,
+                function_id,
+                return_value: response.return_value(),
+            });
+        };
+        let off_index = cpu_off.caller_index();
+
+        if let Err(source) = self.coordinator.commit_cpu_off(off_index, work) {
+            let cleanup_failed = self.power.abort_cpu_off(cpu_off.token()).is_err();
+            return Err(HvfArm64BootVcpuError::Coordinator {
+                stage: "CPU_OFF caller commit",
+                index: off_index,
+                mpidr: self.mpidr(off_index),
+                cleanup_failed,
+                source: Box::new(source),
+            });
+        }
+        if let Err(source) = self.coordinator.set_online(off_index, false) {
+            let cleanup_failed = self.power.abort_cpu_off(cpu_off.token()).is_err();
+            return Err(HvfArm64BootVcpuError::Coordinator {
+                stage: "CPU_OFF scheduler removal",
+                index: off_index,
+                mpidr: self.mpidr(off_index),
+                cleanup_failed,
+                source: Box::new(source),
+            });
+        }
+        self.power
+            .commit_cpu_off(cpu_off.token())
+            .map_err(|_| self.power_error("CPU_OFF power commit", off_index))?;
+
+        Ok(HvfVcpuRunStepOutcome::CpuOff {
+            index: off_index,
+            mpidr: self.mpidr(off_index),
+            exit,
+            function_id,
         })
     }
 
@@ -603,7 +668,10 @@ mod tests {
     use super::{HvfArm64BootVcpuSession, barrier_cpu_on_admission};
     use crate::HvfVcpuRunStepOutcome;
     use crate::coordinator::{HvfVcpuRunControlReason, HvfVcpuRunCoordinator, HvfVcpuRunEvent};
-    use crate::psci::{PsciCpuPowerCoordinator, PsciStatus};
+    use crate::psci::{
+        PsciCall, PsciCoordinatedDispatch, PsciCoordinatorRequest, PsciCpuOnBegin,
+        PsciCpuPowerCoordinator, PsciCpuPowerState, PsciStatus, handle_coordinated_call,
+    };
     use crate::runner::tests::{
         start_coordinated_psci_run_step_recording_runner,
         start_secondary_configure_recording_runner,
@@ -611,6 +679,7 @@ mod tests {
     use crate::vcpu::{HvfArm64SecondaryBootRegisters, HvfRegister};
 
     const PSCI_CPU_ON_64: u64 = 0xc400_0003;
+    const PSCI_CPU_OFF: u64 = 0x8400_0002;
     const SECONDARY_ENTRY: u64 = 0x8020_0000;
     const SECONDARY_CONTEXT: u64 = 0xfeed_face_cafe_beef;
 
@@ -648,6 +717,35 @@ mod tests {
         )
     }
 
+    fn power_with_secondary_online() -> PsciCpuPowerCoordinator {
+        let mut power =
+            PsciCpuPowerCoordinator::new(&[0, 1]).expect("test power topology should build");
+        let PsciCoordinatedDispatch::Coordinate(PsciCoordinatorRequest::CpuOn(request)) =
+            handle_coordinated_call(PsciCall::from_arguments(
+                PSCI_CPU_ON_64,
+                [1, SECONDARY_ENTRY, SECONDARY_CONTEXT],
+            ))
+        else {
+            panic!("test CPU_ON should decode");
+        };
+        let PsciCpuOnBegin::Pending(work) = power
+            .begin_cpu_on(request, |_| true)
+            .expect("test CPU_ON should begin")
+        else {
+            panic!("test secondary should begin pending");
+        };
+        power
+            .finish_target_setup(work.token(), true)
+            .expect("test secondary setup should finish");
+        power
+            .commit_caller_completion(work.token())
+            .expect("test caller completion should commit");
+        power
+            .mark_target_entered(work.token())
+            .expect("test secondary should enter");
+        power
+    }
+
     #[test]
     fn barrier_policy_admits_rejects_or_abandons_cpu_on_by_reason() {
         assert_eq!(
@@ -666,6 +764,79 @@ mod tests {
             barrier_cpu_on_admission(HvfVcpuRunControlReason::Shutdown),
             None
         );
+    }
+
+    #[test]
+    fn cpu_off_session_denies_the_last_online_cpu_with_a_normal_response() {
+        let (runner, reads, writes) =
+            start_coordinated_psci_run_step_recording_runner(PSCI_CPU_OFF, [u64::MAX; 3], 0, false);
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let coordinator =
+            HvfVcpuRunCoordinator::from_test_runners(vec![runner], vec![0], dispatcher, &[0])
+                .expect("single test coordinator should build");
+        let power = PsciCpuPowerCoordinator::new(&[0]).expect("test power topology should build");
+        let mut session = HvfArm64BootVcpuSession::new(coordinator, power);
+
+        assert!(matches!(
+            session.run_step(|_| true),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_CPU_OFF,
+                return_value,
+                ..
+            }) if return_value == PsciStatus::Denied.return_value()
+        ));
+        assert_eq!(reads.try_iter().collect::<Vec<_>>(), [HvfRegister::X0]);
+        assert_eq!(
+            writes.recv().expect("denied CPU_OFF should write X0"),
+            (HvfRegister::X0, PsciStatus::Denied.return_value())
+        );
+        assert_eq!(session.power.power_state(0), Some(PsciCpuPowerState::On));
+        session.shutdown().expect("test session should shut down");
+    }
+
+    #[test]
+    fn cpu_off_session_removes_secondary_before_publishing_off() {
+        let (primary, _configured) = start_secondary_configure_recording_runner(false);
+        let (secondary, reads, writes) =
+            start_coordinated_psci_run_step_recording_runner(PSCI_CPU_OFF, [u64::MAX; 3], 0, false);
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let coordinator = HvfVcpuRunCoordinator::from_test_runners(
+            vec![primary, secondary],
+            vec![0, 1],
+            dispatcher,
+            &[0, 1],
+        )
+        .expect("two-member test coordinator should build");
+        let mut session = HvfArm64BootVcpuSession::new(coordinator, power_with_secondary_online());
+
+        let mut observed = None;
+        for _ in 0..4 {
+            let outcome = session
+                .run_step(|_| true)
+                .expect("test topology step should succeed");
+            if matches!(outcome, HvfVcpuRunStepOutcome::CpuOff { index: 1, .. }) {
+                observed = Some(outcome);
+                break;
+            }
+        }
+        assert!(matches!(
+            observed,
+            Some(HvfVcpuRunStepOutcome::CpuOff {
+                index: 1,
+                mpidr: 1,
+                function_id: PSCI_CPU_OFF,
+                ..
+            })
+        ));
+        assert_eq!(session.power.power_state(1), Some(PsciCpuPowerState::Off));
+        assert_eq!(reads.try_iter().collect::<Vec<_>>(), [HvfRegister::X0]);
+        assert_eq!(writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        let _ = session
+            .run_step(|_| true)
+            .expect("remaining primary should continue after CPU1 off");
+        assert!(reads.try_iter().next().is_none());
+        session.shutdown().expect("test session should shut down");
     }
 
     #[test]
