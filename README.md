@@ -294,6 +294,17 @@ curl --unix-socket /tmp/bangbang.socket \
 
 Set a bucket's `size` or `refill_time` to `0` to disable only that bucket.
 
+The configured `mtu` is advertised to the guest virtio-net device. Current
+signed Network/MMDS scenarios select every configured interface in MMDS config,
+so startup uses process-local MMDS-only packet I/O without opening vmnet; they
+do not prove direct vmnet or external packet movement. Non-MMDS-only startup
+conditionally uses the internal direct-vmnet foundation, which requires
+Apple's restricted networking authorization plus operator-owned firewall,
+routing/NAT, resource, and distribution policy. See the
+[compatibility scope](docs/firecracker-compatibility.md#internal-network-interface-configuration),
+[vmnet security boundary](docs/security.md#vmnet-host-policy-boundary), and
+[testing guide](docs/testing.md) for the exact supported subset and exclusions.
+
 Record a pre-boot vsock configuration:
 
 ```sh

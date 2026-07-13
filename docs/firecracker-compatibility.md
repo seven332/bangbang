@@ -460,7 +460,10 @@ Firecracker behavior:
 - `src/firecracker/swagger/firecracker.yaml` for the published HTTP API surface
 - `src/firecracker/src/api_server/parsed_request.rs` for method and path routing
 - `src/vmm/src/rpc_interface.rs` for VMM actions and state-dependent behavior
+- `src/vmm/src/vmm_config/net.rs` for network MTU and rate-limiter construction
 - `docs/device-api.md` for endpoint, device, input, and output dependencies
+- `docs/device-hotplug.md` for the Developer Preview PCI attach/remove boundary
+- `docs/mmds/mmds-design.md` for guest packet handling and security constraints
 - `docs/design.md` for process model, thread model, and threat-containment
   expectations
 
@@ -629,7 +632,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /network-interfaces/{iface_id}` | body `iface_id` | required | The API parser rejects requests where this does not match the path `iface_id`. |
 | `PUT /network-interfaces/{iface_id}` | `host_dev_name` | required | The API/VMM path records this value only after rejecting empty values and enforcing the current 16-interface bangbang limit; it does not open, stat, or otherwise touch host networking resources during configuration. `InstanceStart` later accepts only `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` for vmnet packet I/O startup. |
 | `PUT /network-interfaces/{iface_id}` | `guest_mac` | optional | The internal model accepts six colon-separated two-hex-digit octets, normalizes display to lowercase hex, and rejects duplicate configured MAC addresses across different interface IDs. |
-| `PUT /network-interfaces/{iface_id}` | `mtu` | optional | The internal model accepts Firecracker-compatible `68..=65535` values, stores them with the interface config, advertises `VIRTIO_NET_F_MTU`, and exposes the value through virtio-net config space. Host vmnet MTU changes remain out of scope. |
+| `PUT /network-interfaces/{iface_id}` | `mtu` | optional | The internal model accepts Firecracker-compatible `68..=65535` values, stores them with the interface config, advertises `VIRTIO_NET_F_MTU`, and exposes the value through virtio-net config space. This guest-advertised value is not reconciled with Apple's separately returned vmnet MTU; host vmnet MTU changes remain out of scope. |
 | `PUT /network-interfaces/{iface_id}` | `rx_rate_limiter`, `tx_rate_limiter` | optional; initial enabled buckets implemented | Missing, `null`, empty, and all-null limiter objects are unconfigured. Buckets with zero `size`, zero `refill_time`, or an overflowing millisecond conversion are explicit disabled controls and normalize away. Enabled bandwidth/ops values round-trip through `GET /vm/config` and create independent directional device budgets. Admission consumes one op plus complete guest-visible frame bytes atomically; one oversized frame can progress from a full byte bucket, and only successful MMDS TX detours refund the reservation. Runtime bucket updates and per-session HVF timed retry wakeups are implemented; pending work is retried on the boot-session owner thread after earliest-deadline replenishment without claiming Firecracker's Linux timerfd/eventfd identity. |
 | `PUT /network-interfaces/{iface_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /network-interfaces/{iface_id}` | path `iface_id` | required | The API parser captures this value before routing valid requests through the runtime lifecycle policy. |
@@ -1162,11 +1165,12 @@ previous backing and stored config.
 
 ## Internal Network Interface Configuration
 
-The API and runtime crates implement pre-boot, Firecracker-shaped network
-interface configuration storage for future virtio-net work. The API parser
-accepts `PUT /network-interfaces/{iface_id}`, rejects path/body ID mismatches
-and unknown fields, and forwards the supported request shape through the VMM
-action boundary. The runtime validates path and body `iface_id` values as
+The API, runtime, process, and HVF crates implement the supported
+virtio-MMIO/MMDS-only network subset from Firecracker-shaped pre-boot
+configuration through guest-visible packet handling. The API parser accepts
+`PUT /network-interfaces/{iface_id}`, rejects path/body ID mismatches and
+unknown fields, and forwards the supported request shape through the VMM action
+boundary. The runtime validates path and body `iface_id` values as
 nonempty alphanumeric strings with `_`, requires the two IDs to match, requires
 a nonempty `host_dev_name`, accepts optional `guest_mac` values only when they
 are six colon-separated two-hex-digit octets, replaces existing entries with
@@ -1199,7 +1203,8 @@ cancel pending publication. Limiter-specific metrics, snapshot state, and
 direct vmnet rate-limit evidence remain deferred. bangbang currently limits
 stored network interfaces to 16.
 Firecracker `v1.16.0` does not publish a separate network-interface count
-limit; this is a macOS/HVF host-resource boundary for the current scaffold.
+limit. The bangbang value is a generic scaffold cap, not enforcement of
+Apple's separate vmnet provisioning limits.
 Configuration storage does not open host networking resources or change host
 vmnet MTU settings. Stored network interface configs are returned from
 `GET /vm/config` in the `network-interfaces` array. During `InstanceStart`, the
@@ -1224,6 +1229,28 @@ shared data store and top-level `mmds` metrics remain process-local aggregates;
 second-interface packet I/O also retains its own interrupt line and network
 metric key. The case completes without opening vmnet resources or using the
 restricted direct-network entitlement.
+A signed two-process MMDS-only case gives each executable unique API sockets,
+interface IDs, V2 data and token authority, packet/session state, metrics, and
+scratch drives. A process-local release gate keeps the surviving guest pending
+while its peer exits; after teardown, the survivor uses the same token to
+re-fetch its retained value and publish a terminal marker. File-byte and metric
+key assertions detect cross-process writers, peer socket cleanup cannot remove
+the survivor, and failure diagnostics omit tokens, values, guest bytes, private
+paths, and raw worker output.
+
+Direct vmnet remains a separate conditional foundation. Apple's current
+[vmnet documentation](https://developer.apple.com/documentation/vmnet)
+describes returned guest MAC/MTU values and limits of 32 interfaces overall,
+four per guest operating system, and bounded read/write batches. The current
+bangbang start callback discards vmnet's MAC, MTU, and maximum-packet-size
+parameters; the FFI does not register the packet-available callback, so it has
+no asynchronous RX-readiness integration. It does retain synchronous
+single-packet adapters, injected start/stop/read/write tests, and stop-on-drop
+cleanup. No signed guest test uses Apple's restricted
+[`com.apple.vm.networking`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.vm.networking)
+authorization or proves external packet movement, and the 16-interface config
+cap does not enforce Apple's per-guest resource policy.
+
 The operator-owned live vmnet host policy boundary is documented in
 [`docs/security.md`](security.md#vmnet-host-policy-boundary).
 
@@ -2501,11 +2528,10 @@ and tested.
 The following Firecracker features are outside the first compatibility tier.
 Their eventual support level should follow the endpoint matrix:
 
-- packet networking beyond pre-boot `network-interfaces` configuration storage,
-  internal virtio-net config-space, activation, TX frame parser, RX buffer
-  parser, prepared device resources, MMIO registration, startup FDT metadata,
-  TX/RX notification dispatch metadata helpers, and startup-time vmnet packet
-  I/O selection for supported `host_dev_name` forms
+- packet networking beyond the implemented supported virtio-MMIO/MMDS-only
+  subset, including direct-vmnet start-parameter reconciliation, asynchronous
+  RX readiness, entitled guest connectivity, host firewall/resource policy,
+  limiter-specific metrics, network snapshot state, and PCI attach/remove
 - virtio-vsock socket lifecycle beyond connection setup, forceful guest
   reset/full-shutdown cleanup, current narrow signed guest-initiated and
   host-initiated EOF cleanup, and signed guest-initiated and host-initiated
@@ -2533,8 +2559,8 @@ Their eventual support level should follow the endpoint matrix:
   guest-memory registration, the internal guest-range config-space foundation,
   and queue-driven flush writeback
 - full Firecracker active timerfd/eventfd rate-limiter wakeup parity beyond the
-  current HVF block and entropy retry schedulers, including shared event-source
-  behavior
+  current HVF block, entropy, and network retry schedulers, including shared
+  event-source behavior
 - serial input, public serial streaming, and Firecracker serial counter
   producers beyond the implemented TX output path
 - full logger integration, and full Firecracker metrics counters beyond the
@@ -2543,7 +2569,8 @@ Their eventual support level should follow the endpoint matrix:
 - complete HVF vCPU state capture/restore and snapshot-ready paused ownership
   beyond the current topology-wide supervisor plus block and
   entropy retry-scheduler barrier
-- PATCH and DELETE hotplug/update behavior
+- runtime device attach/remove behavior beyond implemented in-place updates and
+  stable unsupported paths
 
 Non-initial features should be introduced through narrower capability work that
 covers behavior, validation, documentation, security, and performance together.
