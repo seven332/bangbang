@@ -1176,9 +1176,12 @@ host device names, and MAC strings.
 
 The internal model accepts configured `mtu` values in the Firecracker-compatible
 `68..=65535` range, preserves them in stored configs and `GET /vm/config`,
-and exposes them to the guest through `VIRTIO_NET_F_MTU`. The internal model
-still rejects configured `rx_rate_limiter` and `tx_rate_limiter` fields as
-unsupported. bangbang currently limits stored network interfaces to 16.
+and exposes them to the guest through `VIRTIO_NET_F_MTU`. A signed executable
+MMDS-only case configures `1280`, requires the Linux interface to report that
+value, and then completes the guest MMDS fetch through the same device. The
+internal model still rejects configured `rx_rate_limiter` and
+`tx_rate_limiter` fields as unsupported. bangbang currently limits stored
+network interfaces to 16.
 Firecracker `v1.16.0` does not publish a separate network-interface count
 limit; this is a macOS/HVF host-resource boundary for the current scaffold.
 Configuration storage does not open host networking resources or change host

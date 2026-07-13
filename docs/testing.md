@@ -736,6 +736,9 @@ e2e target also includes direct-rootfs MMDS v1 and v2 token-flow scenarios that
 configure a `vmnet:shared` network interface, configure MMDS for that
 interface, fetch a deterministic MMDS value from the guest through
 `169.254.169.254`, and write host-observable markers to unique scratch drives.
+The API-driven v1 case also configures a nondefault `1280` MTU and requires the
+guest's selected Linux interface to report that value before the MMDS fetch can
+write its success marker.
 It also includes a direct-rootfs entropy scenario that configures `/entropy`,
 checks that the guest selected `virtio_rng` as the current hardware RNG, reads
 from `/dev/hwrng`, and writes a host-observable marker only after a non-empty
@@ -858,7 +861,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v28.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v29.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test

@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v28"
+direct_boot_variant="direct-boot-v29"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -399,6 +399,23 @@ prepare_mmds_network() {
     emit_line "${1}_NO_IFACE"
     write_vdb_marker "$2"
     return 1
+  fi
+
+  if cmdline_has bangbang.mmds-mtu=1280; then
+    mmds_mtu_path="/sys/class/net/$mmds_iface/mtu"
+    if [ ! -r "$mmds_mtu_path" ]; then
+      emit_line "${1}_MTU_UNREADABLE"
+      write_vdb_marker "$2"
+      return 1
+    fi
+
+    mmds_actual_mtu=$(cat "$mmds_mtu_path" 2>/dev/null || true)
+    if [ "$mmds_actual_mtu" != 1280 ]; then
+      emit_line "${1}_MTU_MISMATCH"
+      write_vdb_marker "$2"
+      return 1
+    fi
+    emit_line BANGBANG_MMDS_MTU_OK
   fi
 
   if ! ip link set dev "$mmds_iface" up 2>/dev/null; then
