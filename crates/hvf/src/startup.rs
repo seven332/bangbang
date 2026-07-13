@@ -104,6 +104,7 @@ use crate::vcpu::{
 const SINGLE_VCPU_COUNT: u8 = 1;
 const BLOCK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME: &str = "bangbang-hvf-block-retry-wakeup";
 const ENTROPY_RETRY_WAKEUP_SCHEDULER_THREAD_NAME: &str = "bangbang-hvf-entropy-retry-wakeup";
+const NETWORK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME: &str = "bangbang-hvf-network-retry-wakeup";
 const VSOCK_WAKEUP_MONITOR_THREAD_NAME: &str = "bangbang-hvf-vsock-wakeup";
 const VSOCK_WAKEUP_MONITOR_STOP_BYTE: [u8; 1] = [0];
 const POLL_FOREVER: libc::c_int = -1;
@@ -279,6 +280,8 @@ pub struct HvfArm64BootSession<'vm> {
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     block_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
     block_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
+    network_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
+    network_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
     entropy_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
     entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
     entropy_source: VirtioRngOsEntropySource,
@@ -312,6 +315,8 @@ pub struct OwnedHvfArm64BootSession {
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     block_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
     block_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
+    network_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
+    network_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
     entropy_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
     entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
     entropy_source: VirtioRngOsEntropySource,
@@ -494,6 +499,17 @@ impl HvfArm64BootLimiterRetryWakeupScheduler {
             state.deferred_publication = false;
         }
         self.shared.condvar.notify_one();
+    }
+
+    fn cancel_and_wait(&self) {
+        let mut state = lock_limiter_retry_wakeup_state(&self.shared);
+        state.deadline = None;
+        state.deferred_publication = false;
+        self.shared.condvar.notify_all();
+
+        while state.publication_in_flight {
+            state = wait_limiter_retry_wakeup_state(&self.shared, state);
+        }
     }
 
     fn quiesce(
@@ -1491,6 +1507,7 @@ impl HvfArm64BootSession<'_> {
 
     pub fn shutdown(&mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
         self.block_retry_wakeup_scheduler.stop();
+        self.network_retry_wakeup_scheduler.stop();
         self.entropy_retry_wakeup_scheduler.stop();
         let runner_result = self.runner.shutdown();
         let destroy_result = <HvfBackend as VmBackend>::destroy_vm(self.backend);
@@ -2572,6 +2589,8 @@ impl OwnedHvfArm64BootSession {
             run_loop_wakeup: prepared.run_loop_wakeup,
             block_retry_wakeup: prepared.block_retry_wakeup,
             block_retry_wakeup_scheduler: prepared.block_retry_wakeup_scheduler,
+            network_retry_wakeup: prepared.network_retry_wakeup,
+            network_retry_wakeup_scheduler: prepared.network_retry_wakeup_scheduler,
             entropy_retry_wakeup: prepared.entropy_retry_wakeup,
             entropy_retry_wakeup_scheduler: prepared.entropy_retry_wakeup_scheduler,
             entropy_source: VirtioRngOsEntropySource::new(),
@@ -2844,6 +2863,7 @@ impl OwnedHvfArm64BootSession {
             }
         };
         let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let session = Self {
             runner,
             backend,
@@ -2853,6 +2873,8 @@ impl OwnedHvfArm64BootSession {
             run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
             block_retry_wakeup,
             block_retry_wakeup_scheduler,
+            network_retry_wakeup,
+            network_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
             entropy_retry_wakeup,
             entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
             entropy_source: VirtioRngOsEntropySource::new(),
@@ -2985,6 +3007,7 @@ impl OwnedHvfArm64BootSession {
 
     pub fn shutdown(&mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
         self.block_retry_wakeup_scheduler.stop();
+        self.network_retry_wakeup_scheduler.stop();
         self.entropy_retry_wakeup_scheduler.stop();
         let runner_result = self.runner.shutdown();
         let destroy_result = <HvfBackend as VmBackend>::destroy_vm(&mut self.backend);
@@ -3002,6 +3025,10 @@ impl OwnedHvfArm64BootSession {
             .block_retry_wakeup_scheduler
             .stop_with_result()
             .is_err()
+            | self
+                .network_retry_wakeup_scheduler
+                .stop_with_result()
+                .is_err()
             | self
                 .entropy_retry_wakeup_scheduler
                 .stop_with_result()
@@ -4051,6 +4078,23 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
             .schedule_after(retry_after);
     }
 
+    fn take_run_loop_network_retry_wakeup_request(&mut self) -> bool {
+        self.network_retry_wakeup.take_wakeup_request()
+    }
+
+    fn schedule_run_loop_network_retry_wakeup(&mut self, retry_after: Option<Duration>) {
+        if retry_after.is_none() {
+            let _ = self.network_retry_wakeup.take_wakeup_request();
+        }
+        self.network_retry_wakeup_scheduler
+            .schedule_after(retry_after);
+    }
+
+    fn cancel_run_loop_network_retry_wakeup(&mut self) {
+        self.network_retry_wakeup_scheduler.cancel_and_wait();
+        let _ = self.network_retry_wakeup.take_wakeup_request();
+    }
+
     fn take_run_loop_entropy_retry_wakeup_request(&mut self) -> bool {
         self.entropy_retry_wakeup.take_wakeup_request()
     }
@@ -4182,6 +4226,19 @@ where
     fn schedule_run_loop_block_retry_wakeup(&mut self, retry_after: Option<Duration>) {
         self.session
             .schedule_run_loop_block_retry_wakeup(retry_after);
+    }
+
+    fn take_run_loop_network_retry_wakeup_request(&mut self) -> bool {
+        self.session.take_run_loop_network_retry_wakeup_request()
+    }
+
+    fn schedule_run_loop_network_retry_wakeup(&mut self, retry_after: Option<Duration>) {
+        self.session
+            .schedule_run_loop_network_retry_wakeup(retry_after);
+    }
+
+    fn cancel_run_loop_network_retry_wakeup(&mut self) {
+        self.session.cancel_run_loop_network_retry_wakeup();
     }
 
     fn take_run_loop_entropy_retry_wakeup_request(&mut self) -> bool {
@@ -4434,6 +4491,14 @@ impl HvfArm64BootNetworkNotificationDispatches {
         Self {
             devices,
             rate_limiter_retry_after,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_rate_limiter_retry_after(retry_after: Duration) -> Self {
+        Self {
+            devices: Vec::new(),
+            rate_limiter_retry_after: Some(retry_after),
         }
     }
 
@@ -5325,6 +5390,12 @@ trait BootSessionRunLoopSession {
 
     fn schedule_run_loop_block_retry_wakeup(&mut self, _retry_after: Option<Duration>) {}
 
+    fn take_run_loop_network_retry_wakeup_request(&mut self) -> bool;
+
+    fn schedule_run_loop_network_retry_wakeup(&mut self, retry_after: Option<Duration>);
+
+    fn cancel_run_loop_network_retry_wakeup(&mut self);
+
     fn take_run_loop_entropy_retry_wakeup_request(&mut self) -> bool {
         false
     }
@@ -5406,6 +5477,23 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
         }
         self.block_retry_wakeup_scheduler
             .schedule_after(retry_after);
+    }
+
+    fn take_run_loop_network_retry_wakeup_request(&mut self) -> bool {
+        self.network_retry_wakeup.take_wakeup_request()
+    }
+
+    fn schedule_run_loop_network_retry_wakeup(&mut self, retry_after: Option<Duration>) {
+        if retry_after.is_none() {
+            let _ = self.network_retry_wakeup.take_wakeup_request();
+        }
+        self.network_retry_wakeup_scheduler
+            .schedule_after(retry_after);
+    }
+
+    fn cancel_run_loop_network_retry_wakeup(&mut self) {
+        self.network_retry_wakeup_scheduler.cancel_and_wait();
+        let _ = self.network_retry_wakeup.take_wakeup_request();
     }
 
     fn take_run_loop_entropy_retry_wakeup_request(&mut self) -> bool {
@@ -5532,6 +5620,36 @@ fn dispatch_run_loop_block_retry_notifications_for_step(
     Ok(true)
 }
 
+fn dispatch_run_loop_network_notifications_for_step(
+    session: &mut impl BootSessionRunLoopSession,
+    steps_completed: usize,
+) -> Result<(), HvfArm64BootRunLoopError> {
+    let dispatches = session
+        .dispatch_run_loop_network_notifications()
+        .map_err(
+            |source| HvfArm64BootRunLoopError::DispatchNetworkNotifications {
+                steps_completed,
+                source: Box::new(source),
+            },
+        )?;
+    session.schedule_run_loop_network_retry_wakeup(dispatches.rate_limiter_retry_after());
+
+    Ok(())
+}
+
+fn dispatch_run_loop_network_retry_notifications_for_step(
+    session: &mut impl BootSessionRunLoopSession,
+    steps_completed: usize,
+) -> Result<bool, HvfArm64BootRunLoopError> {
+    if !session.take_run_loop_network_retry_wakeup_request() {
+        return Ok(false);
+    }
+
+    dispatch_run_loop_network_notifications_for_step(session, steps_completed)?;
+
+    Ok(true)
+}
+
 fn dispatch_run_loop_entropy_notifications_for_step(
     session: &mut impl BootSessionRunLoopSession,
     steps_completed: usize,
@@ -5582,12 +5700,35 @@ fn run_boot_session_loop_with_observer(
     session: &mut impl BootSessionRunLoopSession,
     stop_token: &HvfArm64BootRunLoopStopToken,
     max_steps: NonZeroUsize,
+    observe_step: impl FnMut(&HvfVcpuRunStepOutcome),
+) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
+    let result =
+        run_boot_session_loop_with_observer_inner(session, stop_token, max_steps, observe_step);
+    if !matches!(
+        &result,
+        Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { .. })
+            | Ok(HvfArm64BootRunLoopOutcome::Wakeup { .. })
+    ) {
+        session.cancel_run_loop_network_retry_wakeup();
+    }
+
+    result
+}
+
+fn run_boot_session_loop_with_observer_inner(
+    session: &mut impl BootSessionRunLoopSession,
+    stop_token: &HvfArm64BootRunLoopStopToken,
+    max_steps: NonZeroUsize,
     mut observe_step: impl FnMut(&HvfVcpuRunStepOutcome),
 ) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
     let max_steps = max_steps.get();
     let mut steps = 0usize;
 
     loop {
+        if stop_token.is_stop_requested() {
+            return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+        }
+        let _ = dispatch_run_loop_network_retry_notifications_for_step(session, steps)?;
         if stop_token.is_stop_requested() {
             return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
         }
@@ -5635,10 +5776,18 @@ fn run_boot_session_loop_with_observer(
                     session.take_run_loop_wakeup_request() || monitor_wakeup_requested;
                 let block_retry_wakeup_requested =
                     session.take_run_loop_block_retry_wakeup_request();
+                let network_retry_wakeup_requested =
+                    session.take_run_loop_network_retry_wakeup_request();
                 let entropy_retry_wakeup_requested =
                     session.take_run_loop_entropy_retry_wakeup_request();
                 if block_retry_wakeup_requested {
                     dispatch_run_loop_block_notifications_for_step(session, steps)?;
+                    if stop_token.is_stop_requested() {
+                        return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                    }
+                }
+                if network_retry_wakeup_requested {
+                    dispatch_run_loop_network_notifications_for_step(session, steps)?;
                     if stop_token.is_stop_requested() {
                         return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                     }
@@ -5660,6 +5809,7 @@ fn run_boot_session_loop_with_observer(
                 }
                 if wakeup_requested
                     || block_retry_wakeup_requested
+                    || network_retry_wakeup_requested
                     || entropy_retry_wakeup_requested
                 {
                     if steps == max_steps {
@@ -5680,6 +5830,10 @@ fn run_boot_session_loop_with_observer(
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
                 let _ = dispatch_run_loop_block_retry_notifications_for_step(session, steps)?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                let _ = dispatch_run_loop_network_retry_notifications_for_step(session, steps)?;
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
@@ -5715,6 +5869,10 @@ fn run_boot_session_loop_with_observer(
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
+                let _ = dispatch_run_loop_network_retry_notifications_for_step(session, steps)?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
                 let _ = dispatch_run_loop_entropy_retry_notifications_for_step(session, steps)?;
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
@@ -5729,6 +5887,7 @@ fn run_boot_session_loop_with_observer(
             }
             HvfVcpuRunStepOutcome::Mmio { .. } => {
                 let _ = session.take_run_loop_block_retry_wakeup_request();
+                let _ = session.take_run_loop_network_retry_wakeup_request();
                 let _ = session.take_run_loop_entropy_retry_wakeup_request();
                 dispatch_run_loop_block_notifications_for_step(session, steps)?;
                 if stop_token.is_stop_requested() {
@@ -5745,14 +5904,7 @@ fn run_boot_session_loop_with_observer(
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
-                session
-                    .dispatch_run_loop_network_notifications()
-                    .map_err(
-                        |source| HvfArm64BootRunLoopError::DispatchNetworkNotifications {
-                            steps_completed: steps,
-                            source: Box::new(source),
-                        },
-                    )?;
+                dispatch_run_loop_network_notifications_for_step(session, steps)?;
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
@@ -7039,6 +7191,9 @@ pub enum HvfArm64BootSessionError {
     StartEntropyRetryWakeupScheduler {
         source: io::Error,
     },
+    StartNetworkRetryWakeupScheduler {
+        source: io::Error,
+    },
     ReadMpidr {
         source: HvfVcpuRunnerError,
     },
@@ -7108,6 +7263,12 @@ impl fmt::Display for HvfArm64BootSessionError {
                     "failed to start HVF entropy retry wakeup scheduler: {source}"
                 )
             }
+            Self::StartNetworkRetryWakeupScheduler { source } => {
+                write!(
+                    f,
+                    "failed to start HVF network retry wakeup scheduler: {source}"
+                )
+            }
             Self::ReadMpidr { source } => {
                 write!(f, "failed to read primary vCPU MPIDR_EL1: {source}")
             }
@@ -7146,6 +7307,7 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::RunCoordinator { source } => Some(source),
             Self::StartBlockRetryWakeupScheduler { source } => Some(source),
             Self::StartEntropyRetryWakeupScheduler { source } => Some(source),
+            Self::StartNetworkRetryWakeupScheduler { source } => Some(source),
             Self::ReadMpidr { source } => Some(source),
             Self::AssembleResources { source } => Some(source),
             Self::RegisterBootTimerMmio { source } => Some(source),
@@ -7284,6 +7446,8 @@ struct PreparedHvfArm64BootSession<'vm> {
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     block_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
     block_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
+    network_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
+    network_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
     entropy_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
     entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
@@ -7359,6 +7523,8 @@ impl HvfBackend {
             run_loop_wakeup: prepared.run_loop_wakeup,
             block_retry_wakeup: prepared.block_retry_wakeup,
             block_retry_wakeup_scheduler: prepared.block_retry_wakeup_scheduler,
+            network_retry_wakeup: prepared.network_retry_wakeup,
+            network_retry_wakeup_scheduler: prepared.network_retry_wakeup_scheduler,
             entropy_retry_wakeup: prepared.entropy_retry_wakeup,
             entropy_retry_wakeup_scheduler: prepared.entropy_retry_wakeup_scheduler,
             entropy_source: VirtioRngOsEntropySource::new(),
@@ -7537,6 +7703,18 @@ fn prepare_arm64_boot_session_parts<'vm>(
         )
         .map_err(|source| HvfArm64BootSessionError::StartEntropyRetryWakeupScheduler { source })?
     };
+    let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+    let network_retry_wakeup_scheduler = if runtime.network_devices.is_empty() {
+        HvfArm64BootLimiterRetryWakeupScheduler::inactive()
+    } else {
+        let vcpu_control = runner.control();
+        HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+            NETWORK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+            network_retry_wakeup.clone(),
+            move || vcpu_control.request_wakeup(),
+        )
+        .map_err(|source| HvfArm64BootSessionError::StartNetworkRetryWakeupScheduler { source })?
+    };
 
     Ok(PreparedHvfArm64BootSession {
         runner,
@@ -7546,6 +7724,8 @@ fn prepare_arm64_boot_session_parts<'vm>(
         run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
         block_retry_wakeup,
         block_retry_wakeup_scheduler,
+        network_retry_wakeup,
+        network_retry_wakeup_scheduler,
         entropy_retry_wakeup,
         entropy_retry_wakeup_scheduler,
         block_device_metrics,
@@ -7844,6 +8024,25 @@ mod tests {
     const TEST_MEMORY_MIB: u64 = 8;
     const ARM64_IMAGE_HEADER_SIZE: usize = 64;
     const ARM64_IMAGE_TEXT_OFFSET_OFFSET: usize = 8;
+
+    #[test]
+    fn network_retry_scheduler_start_error_preserves_source() {
+        let error = HvfArm64BootSessionError::StartNetworkRetryWakeupScheduler {
+            source: std::io::Error::other("fake network retry scheduler failure"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "failed to start HVF network retry wakeup scheduler: fake network retry scheduler failure"
+        );
+        assert_eq!(
+            error
+                .source()
+                .expect("network scheduler start error should retain its source")
+                .to_string(),
+            "fake network retry scheduler failure"
+        );
+    }
 
     fn vmgenid_restore_test_memory_and_device() -> (GuestMemory, Arm64BootVmGenIdDevice) {
         let layout = GuestMemoryLayout::new(vec![
@@ -8273,6 +8472,125 @@ mod tests {
         );
 
         scheduler.stop();
+    }
+
+    #[test]
+    fn limiter_retry_schedule_replaces_deadline_earlier_and_later() {
+        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+            "bangbang-hvf-test-limiter-retry-replace",
+            HvfArm64BootLimiterRetryWakeupToken::default(),
+            || {},
+        )
+        .expect("test retry wakeup scheduler should start");
+
+        scheduler.schedule_after(Some(Duration::from_secs(3_600)));
+        let first = super::lock_limiter_retry_wakeup_state(&scheduler.shared)
+            .deadline
+            .expect("first future deadline should be stored");
+        scheduler.schedule_after(Some(Duration::from_secs(7_200)));
+        let later = super::lock_limiter_retry_wakeup_state(&scheduler.shared)
+            .deadline
+            .expect("later replacement deadline should be stored");
+        scheduler.schedule_after(Some(Duration::from_secs(1_800)));
+        let earlier = super::lock_limiter_retry_wakeup_state(&scheduler.shared)
+            .deadline
+            .expect("earlier replacement deadline should be stored");
+
+        assert!(later > first);
+        assert!(earlier < first);
+        scheduler.stop();
+    }
+
+    #[test]
+    fn limiter_retry_cancel_waits_for_in_flight_publication() {
+        let wakeup_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let (publication_sender, publication_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+            "bangbang-hvf-test-limiter-retry-strong-cancel",
+            wakeup_token.clone(),
+            move || {
+                publication_sender
+                    .send(())
+                    .expect("test should observe retry wakeup publication");
+                release_receiver
+                    .recv()
+                    .expect("test should release retry wakeup publication");
+            },
+        )
+        .expect("test retry wakeup scheduler should start");
+        scheduler.schedule_after(Some(Duration::ZERO));
+        publication_receiver
+            .recv()
+            .expect("scheduled retry wakeup should begin publication");
+
+        thread::scope(|scope| {
+            let (canceled_sender, canceled_receiver) = mpsc::channel();
+            let scheduler_ref = &scheduler;
+            scope.spawn(move || {
+                scheduler_ref.cancel_and_wait();
+                canceled_sender
+                    .send(())
+                    .expect("test should observe completed cancellation");
+            });
+
+            assert_eq!(canceled_receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+            release_sender
+                .send(())
+                .expect("test should release in-flight publication");
+            canceled_receiver
+                .recv()
+                .expect("cancellation should finish after publication");
+        });
+
+        assert!(wakeup_token.take_wakeup_request());
+        assert!(!wakeup_token.take_wakeup_request());
+        let state = super::lock_limiter_retry_wakeup_state(&scheduler.shared);
+        assert_eq!(state.deadline, None);
+        assert!(!state.publication_in_flight);
+        assert!(!state.deferred_publication);
+        drop(state);
+        scheduler.stop();
+    }
+
+    #[test]
+    fn limiter_retry_schedulers_publish_only_their_own_tokens() {
+        let first_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let second_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let (first_sender, first_receiver) = mpsc::channel();
+        let (second_sender, second_receiver) = mpsc::channel();
+        let mut first = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+            "bangbang-hvf-test-limiter-retry-first",
+            first_token.clone(),
+            move || first_sender.send(()),
+        )
+        .expect("first retry wakeup scheduler should start");
+        let mut second = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+            "bangbang-hvf-test-limiter-retry-second",
+            second_token.clone(),
+            move || second_sender.send(()),
+        )
+        .expect("second retry wakeup scheduler should start");
+
+        first.schedule_after(Some(Duration::ZERO));
+        first_receiver
+            .recv()
+            .expect("first scheduler should publish");
+        wait_for_limiter_retry_publication_idle(&first);
+        assert!(first_token.take_wakeup_request());
+        assert!(!second_token.take_wakeup_request());
+        assert_eq!(second_receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        second.schedule_after(Some(Duration::ZERO));
+        second_receiver
+            .recv()
+            .expect("second scheduler should publish");
+        wait_for_limiter_retry_publication_idle(&second);
+        assert!(!first_token.take_wakeup_request());
+        assert!(second_token.take_wakeup_request());
+
+        first.stop();
+        second.stop();
     }
 
     #[test]
@@ -8860,12 +9178,16 @@ mod tests {
         request_stop_on_memory_hotplug_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_entropy_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_timer: Option<HvfArm64BootRunLoopStopToken>,
+        request_network_retry_wakeup_on_run: bool,
         control_wakeup_requested: bool,
         wakeup_requested: bool,
         block_retry_wakeup_requested: bool,
+        network_retry_wakeup_requested: bool,
         entropy_retry_wakeup_requested: bool,
         scheduled_block_retry_wakeups: Vec<Option<Duration>>,
+        scheduled_network_retry_wakeups: Vec<Option<Duration>>,
         scheduled_entropy_retry_wakeups: Vec<Option<Duration>>,
+        network_retry_cancel_count: usize,
     }
 
     impl RecordingBootSessionRunLoopSession {
@@ -8891,12 +9213,16 @@ mod tests {
                 request_stop_on_memory_hotplug_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
+                request_network_retry_wakeup_on_run: false,
                 control_wakeup_requested: false,
                 wakeup_requested: false,
                 block_retry_wakeup_requested: false,
+                network_retry_wakeup_requested: false,
                 entropy_retry_wakeup_requested: false,
                 scheduled_block_retry_wakeups: Vec::new(),
+                scheduled_network_retry_wakeups: Vec::new(),
                 scheduled_entropy_retry_wakeups: Vec::new(),
+                network_retry_cancel_count: 0,
             }
         }
 
@@ -8922,12 +9248,16 @@ mod tests {
                 request_stop_on_memory_hotplug_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
+                request_network_retry_wakeup_on_run: false,
                 control_wakeup_requested: false,
                 wakeup_requested: false,
                 block_retry_wakeup_requested: false,
+                network_retry_wakeup_requested: false,
                 entropy_retry_wakeup_requested: false,
                 scheduled_block_retry_wakeups: Vec::new(),
+                scheduled_network_retry_wakeups: Vec::new(),
                 scheduled_entropy_retry_wakeups: Vec::new(),
+                network_retry_cancel_count: 0,
             }
         }
 
@@ -8938,6 +9268,14 @@ mod tests {
         fn push_block_retry_dispatch(&mut self, retry_after: Duration) {
             self.dispatch_results.push_back(Ok(
                 super::HvfArm64BootBlockNotificationDispatches::new_for_test_with_rate_limiter_retry_after(
+                    retry_after,
+                ),
+            ));
+        }
+
+        fn push_network_retry_dispatch(&mut self, retry_after: Duration) {
+            self.network_dispatch_results.push_back(Ok(
+                super::HvfArm64BootNetworkNotificationDispatches::new_for_test_with_rate_limiter_retry_after(
                     retry_after,
                 ),
             ));
@@ -9045,6 +9383,14 @@ mod tests {
             self.block_retry_wakeup_requested = true;
         }
 
+        const fn request_run_loop_network_retry_wakeup(&mut self) {
+            self.network_retry_wakeup_requested = true;
+        }
+
+        const fn request_network_retry_wakeup_on_run(&mut self) {
+            self.request_network_retry_wakeup_on_run = true;
+        }
+
         const fn request_run_loop_entropy_retry_wakeup(&mut self) {
             self.entropy_retry_wakeup_requested = true;
         }
@@ -9093,6 +9439,21 @@ mod tests {
             self.scheduled_block_retry_wakeups.push(retry_after);
         }
 
+        fn take_run_loop_network_retry_wakeup_request(&mut self) -> bool {
+            let wakeup_requested = self.network_retry_wakeup_requested;
+            self.network_retry_wakeup_requested = false;
+            wakeup_requested
+        }
+
+        fn schedule_run_loop_network_retry_wakeup(&mut self, retry_after: Option<Duration>) {
+            self.scheduled_network_retry_wakeups.push(retry_after);
+        }
+
+        fn cancel_run_loop_network_retry_wakeup(&mut self) {
+            self.network_retry_wakeup_requested = false;
+            self.network_retry_cancel_count += 1;
+        }
+
         fn take_run_loop_entropy_retry_wakeup_request(&mut self) -> bool {
             let wakeup_requested = self.entropy_retry_wakeup_requested;
             self.entropy_retry_wakeup_requested = false;
@@ -9107,6 +9468,10 @@ mod tests {
             &mut self,
         ) -> Result<HvfVcpuRunStepOutcome, super::HvfArm64BootVcpuError> {
             self.events.push("run");
+            if self.request_network_retry_wakeup_on_run {
+                self.network_retry_wakeup_requested = true;
+                self.request_network_retry_wakeup_on_run = false;
+            }
             if let Some(stop_token) = self.request_stop_on_run.take() {
                 stop_token.request_stop();
             }
@@ -13848,6 +14213,77 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_cancels_network_retry_for_every_terminal_outcome() {
+        for step in [
+            HvfVcpuRunStepOutcome::Canceled,
+            HvfVcpuRunStepOutcome::Unknown { reason: 99 },
+            guest_shutdown_run_step_outcome(),
+            guest_reset_run_step_outcome(),
+        ] {
+            let stop_token = HvfArm64BootRunLoopStopToken::new();
+            let publish_pending_wakeup = !matches!(step, HvfVcpuRunStepOutcome::Canceled);
+            let mut session = RecordingBootSessionRunLoopSession::new([step]);
+            if publish_pending_wakeup {
+                session.request_network_retry_wakeup_on_run();
+            }
+
+            run_boot_session_loop(&mut session, &stop_token, max_steps(2))
+                .expect("terminal run-loop outcome should be returned");
+
+            assert_eq!(session.network_retry_cancel_count, 1);
+            assert!(!session.network_retry_wakeup_requested);
+        }
+
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        stop_token.request_stop();
+        let mut session = RecordingBootSessionRunLoopSession::new([]);
+        session.request_run_loop_network_retry_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("pre-step stop should be returned");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 0 });
+        assert_eq!(session.network_retry_cancel_count, 1);
+        assert!(!session.network_retry_wakeup_requested);
+    }
+
+    #[test]
+    fn boot_session_run_loop_retains_network_retry_for_continuation_outcomes() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut step_limited = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        step_limited.push_network_retry_dispatch(Duration::from_millis(25));
+
+        let outcome = run_boot_session_loop(&mut step_limited, &stop_token, max_steps(1))
+            .expect("step-limited run loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(step_limited.network_retry_cancel_count, 0);
+        assert_eq!(
+            step_limited.scheduled_network_retry_wakeups,
+            [Some(Duration::from_millis(25))]
+        );
+
+        let mut control_wakeup =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        control_wakeup.request_network_retry_wakeup_on_run();
+        control_wakeup.request_run_loop_control_wakeup();
+        control_wakeup.push_network_retry_dispatch(Duration::from_millis(40));
+
+        let outcome = run_boot_session_loop(&mut control_wakeup, &stop_token, max_steps(1))
+            .expect("control wakeup run loop should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Wakeup { steps: 1 });
+        assert_eq!(control_wakeup.network_retry_cancel_count, 0);
+        assert_eq!(
+            control_wakeup.scheduled_network_retry_wakeups,
+            [Some(Duration::from_millis(40))]
+        );
+    }
+
+    #[test]
     fn boot_session_run_loop_continues_after_sys64_until_step_limit() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([
@@ -14299,6 +14735,124 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_dispatches_network_after_network_retry_cancel() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.request_network_retry_wakeup_on_run();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("network retry cancel loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(session.events, ["run", "network-dispatch"]);
+        assert_eq!(session.scheduled_network_retry_wakeups, [None]);
+        assert_eq!(session.network_retry_cancel_count, 0);
+    }
+
+    #[test]
+    fn boot_session_run_loop_reschedules_repeated_network_retry_after_cancel() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.request_network_retry_wakeup_on_run();
+        session.push_network_retry_dispatch(Duration::from_millis(25));
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("repeated network retry cancel loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(session.events, ["run", "network-dispatch"]);
+        assert_eq!(
+            session.scheduled_network_retry_wakeups,
+            [Some(Duration::from_millis(25))]
+        );
+        assert_eq!(session.network_retry_cancel_count, 0);
+    }
+
+    #[test]
+    fn boot_session_run_loop_consumes_delayed_network_retry_after_non_canceled_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
+        session.request_network_retry_wakeup_on_run();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("delayed network retry after HVC should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(
+            session.events,
+            ["run", "network-dispatch", "vsock-dispatch"]
+        );
+        assert_eq!(session.scheduled_network_retry_wakeups, [None]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_dispatches_published_network_retry_before_first_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
+        session.request_run_loop_network_retry_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("pre-published network retry should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(
+            session.events,
+            ["network-dispatch", "run", "vsock-dispatch"]
+        );
+        assert_eq!(session.scheduled_network_retry_wakeups, [None]);
+        assert_eq!(session.network_retry_cancel_count, 0);
+    }
+
+    #[test]
+    fn boot_session_run_loop_stop_after_published_network_retry_prevents_first_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
+        session.request_run_loop_network_retry_wakeup();
+        session.request_stop_on_network_dispatch(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after pre-published network retry should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 0 });
+        assert_eq!(session.events, ["network-dispatch"]);
+        assert_eq!(session.scheduled_network_retry_wakeups, [None]);
+        assert_eq!(session.network_retry_cancel_count, 1);
+    }
+
+    #[test]
+    fn boot_session_run_loop_schedules_network_retry_after_mmio_dispatch() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.push_network_retry_dispatch(Duration::from_millis(10));
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("MMIO dispatch with network retry should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(
+            session.scheduled_network_retry_wakeups,
+            [Some(Duration::from_millis(10))]
+        );
+    }
+
+    #[test]
     fn boot_session_run_loop_dispatches_entropy_after_entropy_retry_cancel() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session =
@@ -14458,6 +15012,7 @@ mod tests {
             other => panic!("expected run-step error, got {other:?}"),
         }
         assert_eq!(session.events, ["run"]);
+        assert_eq!(session.network_retry_cancel_count, 1);
     }
 
     #[test]
@@ -14546,6 +15101,7 @@ mod tests {
             session.events,
             ["run", "dispatch", "pmem-dispatch", "network-dispatch"]
         );
+        assert_eq!(session.network_retry_cancel_count, 1);
     }
 
     #[test]
