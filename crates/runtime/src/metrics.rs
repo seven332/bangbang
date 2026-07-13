@@ -1817,6 +1817,10 @@ impl SharedPmemDeviceMetrics {
                 .parse_failures()
                 .saturating_add(dispatch.status_write_failures()),
         ));
+        self.record_rate_limiter_throttled_events(usize_to_u64_saturating(
+            dispatch.rate_limiter_throttled_events(),
+        ));
+        self.record_rate_limiter_events(usize_to_u64_saturating(dispatch.rate_limiter_events()));
     }
 
     pub fn record_queue_events(&self, count: u64) {
@@ -1846,6 +1850,18 @@ impl SharedPmemDeviceMetrics {
     fn record_event_failures(&self, count: u64) {
         if count != 0 {
             record_atomic_metric(&self.inner.event_fails, count);
+        }
+    }
+
+    fn record_rate_limiter_throttled_events(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.rate_limiter_throttled_events, count);
+        }
+    }
+
+    fn record_rate_limiter_events(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.rate_limiter_event_count, count);
         }
     }
 }

@@ -13,6 +13,7 @@ use std::ptr::{self, NonNull};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
@@ -23,6 +24,7 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
+use crate::token_bucket::{TokenBucket, TokenBucketConfig};
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
@@ -435,6 +437,21 @@ impl VirtioPmemQueue {
         &self.used
     }
 
+    fn has_available_work(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<bool, VirtqueueAvailableRingError> {
+        let available_index = self.available.available_index(memory)?;
+        let available_len = available_index.wrapping_sub(self.available.next_avail());
+        if available_len > self.available.queue_size() {
+            return Err(VirtqueueAvailableRingError::AvailableRingLengthTooLarge {
+                queue_size: self.available.queue_size(),
+                available_len,
+            });
+        }
+        Ok(available_len != 0)
+    }
+
     pub fn dispatch(
         &mut self,
         memory: &mut GuestMemory,
@@ -538,6 +555,9 @@ pub struct VirtioPmemQueueDispatch {
     status_write_failures: usize,
     first_parse_failure: Option<VirtioPmemRequestError>,
     needs_queue_interrupt: bool,
+    rate_limiter_throttled_events: usize,
+    rate_limiter_events: usize,
+    rate_limiter_retry_after: Option<Duration>,
 }
 
 impl VirtioPmemQueueDispatch {
@@ -567,6 +587,30 @@ impl VirtioPmemQueueDispatch {
 
     pub const fn needs_queue_interrupt(&self) -> bool {
         self.needs_queue_interrupt
+    }
+
+    pub const fn rate_limiter_throttled_events(&self) -> usize {
+        self.rate_limiter_throttled_events
+    }
+
+    pub const fn rate_limiter_events(&self) -> usize {
+        self.rate_limiter_events
+    }
+
+    pub const fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.rate_limiter_retry_after
+    }
+
+    fn record_rate_limiter_throttle(&mut self, retry_after: Duration) {
+        self.rate_limiter_throttled_events += 1;
+        self.rate_limiter_retry_after = Some(match self.rate_limiter_retry_after {
+            Some(current) => current.min(retry_after),
+            None => retry_after,
+        });
+    }
+
+    fn record_rate_limiter_event(&mut self) {
+        self.rate_limiter_events += 1;
     }
 
     fn record(
@@ -682,16 +726,126 @@ impl VirtioPmemQueueDispatchError {
             } => completed_dispatch,
         }
     }
+
+    fn completed_dispatch_mut(&mut self) -> &mut VirtioPmemQueueDispatch {
+        match self {
+            Self::AvailableRing {
+                completed_dispatch, ..
+            }
+            | Self::EmptyDescriptorChain {
+                completed_dispatch, ..
+            }
+            | Self::UsedRing {
+                completed_dispatch, ..
+            } => completed_dispatch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VirtioPmemRateLimiter {
+    bandwidth: Option<TokenBucket>,
+    ops: Option<TokenBucket>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtioPmemRateLimiterReduction {
+    Allowed,
+    Throttled { retry_after: Duration },
+}
+
+impl VirtioPmemRateLimiter {
+    fn new_at(config: PmemRateLimiterConfig, now: Instant) -> Option<Self> {
+        let bandwidth = config
+            .bandwidth()
+            .and_then(|bucket| TokenBucket::new_at(bucket.token_bucket_config(), now));
+        let ops = config
+            .ops()
+            .and_then(|bucket| TokenBucket::new_at(bucket.token_bucket_config(), now));
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
+
+    fn updated_at(
+        existing: Option<&Self>,
+        update: PmemRateLimiterConfig,
+        now: Instant,
+    ) -> Option<Self> {
+        let bandwidth = match update.bandwidth() {
+            Some(config) => TokenBucket::new_at(config.token_bucket_config(), now),
+            None => existing.and_then(|limiter| limiter.bandwidth.clone()),
+        };
+        let ops = match update.ops() {
+            Some(config) => TokenBucket::new_at(config.token_bucket_config(), now),
+            None => existing.and_then(|limiter| limiter.ops.clone()),
+        };
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
+
+    fn reduce_at(&mut self, bytes: u64, now: Instant) -> VirtioPmemRateLimiterReduction {
+        let ops_snapshot = self.ops.as_ref().map(TokenBucket::snapshot);
+
+        if let Some(ops) = self.ops.as_mut()
+            && let Some(retry_after) = ops.reduce_with_retry_at(1, now).retry_after()
+        {
+            return VirtioPmemRateLimiterReduction::Throttled { retry_after };
+        }
+        if let Some(bandwidth) = self.bandwidth.as_mut()
+            && let Some(retry_after) = bandwidth
+                .reduce_allow_overconsumption_with_retry_at(bytes, now)
+                .retry_after()
+        {
+            if let (Some(ops), Some(snapshot)) = (self.ops.as_mut(), ops_snapshot) {
+                ops.restore(snapshot);
+            }
+            return VirtioPmemRateLimiterReduction::Throttled { retry_after };
+        }
+
+        VirtioPmemRateLimiterReduction::Allowed
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct VirtioPmemDevice {
     active_queue: Option<VirtioPmemQueue>,
+    file_len: u64,
+    rate_limiter: Option<VirtioPmemRateLimiter>,
+    pending_rate_limited_queue: bool,
 }
 
 impl VirtioPmemDevice {
     pub const fn new() -> Self {
-        Self { active_queue: None }
+        Self {
+            active_queue: None,
+            file_len: 0,
+            rate_limiter: None,
+            pending_rate_limited_queue: false,
+        }
+    }
+
+    pub fn with_rate_limiter(file_len: u64, rate_limiter: Option<PmemRateLimiterConfig>) -> Self {
+        Self::with_rate_limiter_at(file_len, rate_limiter, Instant::now())
+    }
+
+    fn with_rate_limiter_at(
+        file_len: u64,
+        rate_limiter: Option<PmemRateLimiterConfig>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            active_queue: None,
+            file_len,
+            rate_limiter: rate_limiter
+                .and_then(|rate_limiter| VirtioPmemRateLimiter::new_at(rate_limiter, now)),
+            pending_rate_limited_queue: false,
+        }
     }
 
     pub fn is_activated(&self) -> bool {
@@ -706,13 +860,40 @@ impl VirtioPmemDevice {
         self.active_queue.as_mut()
     }
 
+    pub const fn has_pending_rate_limited_queue(&self) -> bool {
+        self.pending_rate_limited_queue
+    }
+
+    fn update_rate_limiter_at(&mut self, update: &PmemUpdate, now: Instant) -> bool {
+        if let Some(config) = update.rate_limiter() {
+            self.rate_limiter =
+                VirtioPmemRateLimiter::updated_at(self.rate_limiter.as_ref(), config, now);
+        }
+        self.pending_rate_limited_queue
+    }
+
     fn dispatch_drained_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
         flush: &mut impl FnMut() -> VirtioPmemFlushStatus,
     ) -> Result<VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError> {
-        if drained_notifications.is_empty() {
+        self.dispatch_drained_queue_notifications_at(
+            memory,
+            drained_notifications,
+            flush,
+            Instant::now(),
+        )
+    }
+
+    fn dispatch_drained_queue_notifications_at(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+        flush: &mut impl FnMut() -> VirtioPmemFlushStatus,
+        now: Instant,
+    ) -> Result<VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError> {
+        if drained_notifications.is_empty() && !self.pending_rate_limited_queue {
             return Ok(VirtioPmemDeviceNotificationDispatch::new(
                 drained_notifications,
                 None,
@@ -736,15 +917,66 @@ impl VirtioPmemDevice {
             });
         };
 
+        let had_pending_rate_limited_queue = self.pending_rate_limited_queue;
+        let mut admission_dispatch = VirtioPmemQueueDispatch::default();
+        if had_pending_rate_limited_queue {
+            admission_dispatch.record_rate_limiter_event();
+        }
+        let has_available_work = match queue.has_available_work(memory) {
+            Ok(has_available_work) => has_available_work,
+            Err(source) => {
+                self.pending_rate_limited_queue = false;
+                return Err(VirtioPmemDeviceNotificationError::QueueDispatch {
+                    drained_notifications,
+                    source: VirtioPmemQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(admission_dispatch),
+                        source,
+                    },
+                });
+            }
+        };
+
+        if !has_available_work {
+            self.pending_rate_limited_queue = false;
+            return Ok(VirtioPmemDeviceNotificationDispatch::new(
+                drained_notifications,
+                Some(admission_dispatch),
+            ));
+        }
+
+        if let Some(rate_limiter) = self.rate_limiter.as_mut()
+            && let VirtioPmemRateLimiterReduction::Throttled { retry_after } =
+                rate_limiter.reduce_at(self.file_len, now)
+        {
+            admission_dispatch.record_rate_limiter_throttle(retry_after);
+            self.pending_rate_limited_queue = true;
+            return Ok(VirtioPmemDeviceNotificationDispatch::new(
+                drained_notifications,
+                Some(admission_dispatch),
+            ));
+        }
+
         match queue.dispatch(memory, flush) {
-            Ok(dispatch) => Ok(VirtioPmemDeviceNotificationDispatch::new(
-                drained_notifications,
-                Some(dispatch),
-            )),
-            Err(source) => Err(VirtioPmemDeviceNotificationError::QueueDispatch {
-                drained_notifications,
-                source,
-            }),
+            Ok(mut dispatch) => {
+                self.pending_rate_limited_queue = false;
+                if had_pending_rate_limited_queue {
+                    dispatch.record_rate_limiter_event();
+                }
+                Ok(VirtioPmemDeviceNotificationDispatch::new(
+                    drained_notifications,
+                    Some(dispatch),
+                ))
+            }
+            Err(mut source) => {
+                self.pending_rate_limited_queue = false;
+                if had_pending_rate_limited_queue {
+                    source.completed_dispatch_mut().record_rate_limiter_event();
+                }
+                Err(VirtioPmemDeviceNotificationError::QueueDispatch {
+                    drained_notifications,
+                    source,
+                })
+            }
         }
     }
 
@@ -778,10 +1010,21 @@ impl VirtioPmemDevice {
 
     pub fn reset(&mut self) {
         self.active_queue = None;
+        self.pending_rate_limited_queue = false;
     }
 }
 
 impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioPmemDevice> {
+    pub fn update_pmem_rate_limiter(&mut self, update: &PmemUpdate) -> bool {
+        self.activation_handler_mut()
+            .update_rate_limiter_at(update, Instant::now())
+    }
+
+    pub fn has_pending_pmem_queue_work(&self) -> bool {
+        self.has_pending_queue_notifications()
+            || self.activation_handler().has_pending_rate_limited_queue()
+    }
+
     pub fn dispatch_pmem_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
@@ -848,6 +1091,12 @@ impl VirtioPmemDeviceNotificationDispatch {
             .as_ref()
             .is_some_and(VirtioPmemQueueDispatch::needs_queue_interrupt)
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.queue_dispatch
+            .as_ref()
+            .and_then(VirtioPmemQueueDispatch::rate_limiter_retry_after)
+    }
 }
 
 #[derive(Debug)]
@@ -887,6 +1136,11 @@ impl VirtioPmemDeviceNotificationError {
             Self::QueueDispatch { source, .. } => Some(source.completed_dispatch()),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
+    }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.completed_dispatch()
+            .and_then(VirtioPmemQueueDispatch::rate_limiter_retry_after)
     }
 }
 
@@ -1052,20 +1306,125 @@ fn validate_status_descriptor(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmemRateLimiterConfig {
+    bandwidth: Option<PmemTokenBucketConfig>,
+    ops: Option<PmemTokenBucketConfig>,
+}
+
+impl PmemRateLimiterConfig {
+    pub const fn new(
+        bandwidth: Option<PmemTokenBucketConfig>,
+        ops: Option<PmemTokenBucketConfig>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
+    pub const fn bandwidth(self) -> Option<PmemTokenBucketConfig> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<PmemTokenBucketConfig> {
+        self.ops
+    }
+
+    pub const fn is_configured(self) -> bool {
+        self.bandwidth.is_some() || self.ops.is_some()
+    }
+
+    const fn normalized(self) -> Option<Self> {
+        let bandwidth = enabled_pmem_token_bucket(self.bandwidth);
+        let ops = enabled_pmem_token_bucket(self.ops);
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
+
+    fn applied_to(self, existing: Option<Self>) -> Option<Self> {
+        let bandwidth =
+            updated_pmem_token_bucket(existing.and_then(Self::bandwidth), self.bandwidth);
+        let ops = updated_pmem_token_bucket(existing.and_then(Self::ops), self.ops);
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmemTokenBucketConfig {
+    size: u64,
+    one_time_burst: Option<u64>,
+    refill_time: u64,
+}
+
+impl PmemTokenBucketConfig {
+    pub const fn new(size: u64, one_time_burst: Option<u64>, refill_time: u64) -> Self {
+        Self {
+            size,
+            one_time_burst,
+            refill_time,
+        }
+    }
+
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    pub const fn one_time_burst(self) -> Option<u64> {
+        self.one_time_burst
+    }
+
+    pub const fn refill_time(self) -> u64 {
+        self.refill_time
+    }
+
+    const fn token_bucket_config(self) -> TokenBucketConfig {
+        TokenBucketConfig::new(self.size, self.one_time_burst, self.refill_time)
+    }
+
+    const fn is_enabled(self) -> bool {
+        self.token_bucket_config().is_enabled()
+    }
+}
+
+const fn enabled_pmem_token_bucket(
+    bucket: Option<PmemTokenBucketConfig>,
+) -> Option<PmemTokenBucketConfig> {
+    match bucket {
+        Some(bucket) if bucket.is_enabled() => Some(bucket),
+        Some(_) | None => None,
+    }
+}
+
+const fn updated_pmem_token_bucket(
+    existing: Option<PmemTokenBucketConfig>,
+    update: Option<PmemTokenBucketConfig>,
+) -> Option<PmemTokenBucketConfig> {
+    match update {
+        Some(bucket) if bucket.is_enabled() => Some(bucket),
+        Some(_) => None,
+        None => existing,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmemConfigInput {
     id: String,
     path_on_host: String,
     root_device: bool,
     read_only: bool,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<PmemRateLimiterConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmemUpdateInput {
     path_pmem_id: String,
     body_pmem_id: String,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<PmemRateLimiterConfig>,
 }
 
 impl PmemConfigInput {
@@ -1075,7 +1434,7 @@ impl PmemConfigInput {
             path_on_host: path_on_host.into(),
             root_device: false,
             read_only: false,
-            rate_limiter_configured: false,
+            rate_limiter: None,
         }
     }
 
@@ -1095,8 +1454,12 @@ impl PmemConfigInput {
         self.read_only
     }
 
+    pub const fn rate_limiter(&self) -> Option<PmemRateLimiterConfig> {
+        self.rate_limiter
+    }
+
     pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+        self.rate_limiter.is_some()
     }
 
     pub const fn with_root_device(mut self, root_device: bool) -> Self {
@@ -1109,8 +1472,8 @@ impl PmemConfigInput {
         self
     }
 
-    pub const fn with_rate_limiter_configured(mut self) -> Self {
-        self.rate_limiter_configured = true;
+    pub const fn with_rate_limiter(mut self, rate_limiter: PmemRateLimiterConfig) -> Self {
+        self.rate_limiter = Some(rate_limiter);
         self
     }
 }
@@ -1120,7 +1483,7 @@ impl PmemUpdateInput {
         Self {
             path_pmem_id: path_pmem_id.into(),
             body_pmem_id: body_pmem_id.into(),
-            rate_limiter_configured: false,
+            rate_limiter: None,
         }
     }
 
@@ -1132,12 +1495,16 @@ impl PmemUpdateInput {
         &self.body_pmem_id
     }
 
-    pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+    pub const fn rate_limiter(&self) -> Option<PmemRateLimiterConfig> {
+        self.rate_limiter
     }
 
-    pub const fn with_rate_limiter_configured(mut self) -> Self {
-        self.rate_limiter_configured = true;
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter.is_some()
+    }
+
+    pub const fn with_rate_limiter(mut self, rate_limiter: PmemRateLimiterConfig) -> Self {
+        self.rate_limiter = Some(rate_limiter);
         self
     }
 
@@ -1152,11 +1519,13 @@ pub struct PmemConfig {
     path_on_host: String,
     root_device: bool,
     read_only: bool,
+    rate_limiter: Option<PmemRateLimiterConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmemUpdate {
     id: String,
+    rate_limiter: Option<PmemRateLimiterConfig>,
 }
 
 impl PmemConfig {
@@ -1175,11 +1544,37 @@ impl PmemConfig {
     pub const fn read_only(&self) -> bool {
         self.read_only
     }
+
+    pub const fn rate_limiter(&self) -> Option<PmemRateLimiterConfig> {
+        self.rate_limiter
+    }
+
+    fn updated(&self, update: &PmemUpdate) -> Self {
+        let rate_limiter = match update.rate_limiter() {
+            Some(rate_limiter) => rate_limiter.applied_to(self.rate_limiter),
+            None => self.rate_limiter,
+        };
+        Self {
+            id: self.id.clone(),
+            path_on_host: self.path_on_host.clone(),
+            root_device: self.root_device,
+            read_only: self.read_only,
+            rate_limiter,
+        }
+    }
 }
 
 impl PmemUpdate {
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub const fn rate_limiter(&self) -> Option<PmemRateLimiterConfig> {
+        self.rate_limiter
+    }
+
+    pub const fn is_noop(&self) -> bool {
+        self.rate_limiter.is_none()
     }
 }
 
@@ -1193,10 +1588,6 @@ impl TryFrom<PmemConfigInput> for PmemConfig {
             return Err(PmemConfigError::EmptyPathOnHost);
         }
 
-        if input.rate_limiter_configured {
-            return Err(PmemConfigError::UnsupportedRateLimiter);
-        }
-
         if input.root_device {
             return Err(PmemConfigError::UnsupportedRootDevice);
         }
@@ -1206,6 +1597,9 @@ impl TryFrom<PmemConfigInput> for PmemConfig {
             path_on_host: input.path_on_host,
             root_device: input.root_device,
             read_only: input.read_only,
+            rate_limiter: input
+                .rate_limiter
+                .and_then(PmemRateLimiterConfig::normalized),
         })
     }
 }
@@ -1220,12 +1614,9 @@ impl TryFrom<PmemUpdateInput> for PmemUpdate {
             return Err(PmemUpdateError::MismatchedPmemId);
         }
 
-        if input.rate_limiter_configured {
-            return Err(PmemUpdateError::UnsupportedRateLimiter);
-        }
-
         Ok(Self {
             id: input.path_pmem_id,
+            rate_limiter: input.rate_limiter,
         })
     }
 }
@@ -1266,6 +1657,33 @@ impl PmemConfigs {
         }
 
         Ok(update)
+    }
+
+    pub fn prepare_update(
+        &self,
+        input: PmemUpdateInput,
+    ) -> Result<(PmemUpdate, PmemConfig), PmemUpdateError> {
+        let update = self.validate_update(input)?;
+        let Some(existing) = self
+            .configs
+            .iter()
+            .find(|config| config.id() == update.id())
+        else {
+            return Err(PmemUpdateError::UnknownPmem);
+        };
+        Ok((update.clone(), existing.updated(&update)))
+    }
+
+    pub fn commit_update(&mut self, config: PmemConfig) -> Result<(), PmemUpdateError> {
+        let Some(existing) = self
+            .configs
+            .iter_mut()
+            .find(|existing| existing.id() == config.id())
+        else {
+            return Err(PmemUpdateError::UnknownPmem);
+        };
+        *existing = config;
+        Ok(())
     }
 }
 
@@ -1805,6 +2223,7 @@ pub struct PreparedPmemDevice {
     mapping: PmemBackingMapping,
     guest_range: GuestMemoryRange,
     config_space: VirtioPmemConfigSpace,
+    rate_limiter: Option<PmemRateLimiterConfig>,
 }
 
 impl PreparedPmemDevice {
@@ -1841,6 +2260,7 @@ impl PreparedPmemDevice {
             mapping,
             guest_range,
             config_space,
+            rate_limiter: config.rate_limiter(),
         })
     }
 
@@ -1864,6 +2284,10 @@ impl PreparedPmemDevice {
         self.config_space
     }
 
+    pub const fn rate_limiter(&self) -> Option<PmemRateLimiterConfig> {
+        self.rate_limiter
+    }
+
     pub fn into_parts(
         self,
     ) -> (
@@ -1872,6 +2296,7 @@ impl PreparedPmemDevice {
         PmemBackingMapping,
         GuestMemoryRange,
         VirtioPmemConfigSpace,
+        Option<PmemRateLimiterConfig>,
     ) {
         (
             self.id,
@@ -1879,6 +2304,7 @@ impl PreparedPmemDevice {
             self.mapping,
             self.guest_range,
             self.config_space,
+            self.rate_limiter,
         )
     }
 }
@@ -2223,12 +2649,13 @@ impl PmemMmioDevices {
             let guest_range = prepared_device.guest_range();
             let file_len = prepared_device.mapping().file_len();
             let config_space = prepared_device.config_space();
+            let rate_limiter = prepared_device.rate_limiter();
             let handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
                 VIRTIO_PMEM_DEVICE_ID,
                 config_space.available_features(),
                 &VIRTIO_PMEM_QUEUE_SIZES,
                 config_space,
-                VirtioPmemDevice::new(),
+                VirtioPmemDevice::with_rate_limiter(file_len, rate_limiter),
             )
             .map_err(|source| PmemMmioRegistrationError::BuildHandler {
                 pmem_id: pmem_id.clone(),
@@ -2628,7 +3055,6 @@ pub enum PmemConfigError {
     EmptyPmemId,
     InvalidPmemId,
     EmptyPathOnHost,
-    UnsupportedRateLimiter,
     UnsupportedRootDevice,
 }
 
@@ -2649,11 +3075,24 @@ impl fmt::Display for PmemIdSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PmemUpdateError {
-    EmptyPmemId { source: PmemIdSource },
-    InvalidPmemId { source: PmemIdSource },
+    EmptyPmemId {
+        source: PmemIdSource,
+    },
+    InvalidPmemId {
+        source: PmemIdSource,
+    },
     MismatchedPmemId,
     UnknownPmem,
-    UnsupportedRateLimiter,
+    HandlerLookup {
+        pmem_id: String,
+        region_id: MmioRegionId,
+        message: String,
+    },
+    ActiveSessionCommand {
+        message: String,
+    },
+    ActiveSessionUnavailable,
+    MmioDispatcherUnavailable,
 }
 
 impl fmt::Display for PmemConfigError {
@@ -2664,7 +3103,6 @@ impl fmt::Display for PmemConfigError {
                 f.write_str("pmem id must contain only alphanumeric characters or '_'")
             }
             Self::EmptyPathOnHost => f.write_str("pmem path_on_host must not be empty"),
-            Self::UnsupportedRateLimiter => f.write_str("pmem rate_limiter is not supported"),
             Self::UnsupportedRootDevice => f.write_str("pmem root_device is not supported"),
         }
     }
@@ -2684,7 +3122,20 @@ impl fmt::Display for PmemUpdateError {
             }
             Self::MismatchedPmemId => f.write_str("path pmem id must match body id"),
             Self::UnknownPmem => f.write_str("pmem device is not configured"),
-            Self::UnsupportedRateLimiter => f.write_str("pmem rate_limiter is not supported"),
+            Self::HandlerLookup {
+                region_id, message, ..
+            } => write!(
+                f,
+                "failed to resolve pmem device handler for region id={region_id}: {message}"
+            ),
+            Self::ActiveSessionCommand { message } => {
+                write!(
+                    f,
+                    "failed to deliver pmem update to active session: {message}"
+                )
+            }
+            Self::ActiveSessionUnavailable => f.write_str("active pmem session is unavailable"),
+            Self::MmioDispatcherUnavailable => f.write_str("pmem MMIO dispatcher is unavailable"),
         }
     }
 }
@@ -2758,6 +3209,7 @@ fn config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigErr
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::error::Error as _;
     use std::ffi::CString;
     use std::fs;
@@ -2771,7 +3223,10 @@ mod tests {
     use super::*;
 
     use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange, aarch64};
-    use crate::metrics::{PmemDeviceMetrics, SharedPmemDeviceMetrics};
+    use crate::metrics::{
+        PmemDeviceMetrics, PmemDeviceMetricsByDevice, SharedPmemDeviceMetrics,
+        SharedPmemDeviceMetricsRegistry,
+    };
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_MAGIC_VALUE,
@@ -3443,9 +3898,9 @@ mod tests {
     fn pmem_queue_dispatch_skips_flush_for_empty_queue() {
         let mut memory = request_memory();
         let mut queue = pmem_queue();
-        let mut flush_calls = 0;
+        let flush_calls = Cell::new(0);
         let mut flush = || {
-            flush_calls += 1;
+            flush_calls.set(flush_calls.get() + 1);
             VirtioPmemFlushStatus::Success
         };
 
@@ -3453,7 +3908,7 @@ mod tests {
             .dispatch(&mut memory, &mut flush)
             .expect("empty pmem queue should dispatch");
 
-        assert_eq!(flush_calls, 0);
+        assert_eq!(flush_calls.get(), 0);
         assert_eq!(dispatch.processed_requests(), 0);
         assert!(!dispatch.needs_queue_interrupt());
         assert_eq!(read_used_index(&memory), 0);
@@ -3566,9 +4021,9 @@ mod tests {
             .expect("sentinel status should write");
         write_available_heads(&mut memory, &[0]);
         let mut queue = pmem_queue();
-        let mut flush_calls = 0;
+        let flush_calls = Cell::new(0);
         let mut flush = || {
-            flush_calls += 1;
+            flush_calls.set(flush_calls.get() + 1);
             VirtioPmemFlushStatus::Success
         };
 
@@ -3576,7 +4031,7 @@ mod tests {
             .dispatch(&mut memory, &mut flush)
             .expect("invalid pmem request should still publish a completion");
 
-        assert_eq!(flush_calls, 0);
+        assert_eq!(flush_calls.get(), 0);
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_flushes(), 0);
         assert_eq!(dispatch.failed_flushes(), 0);
@@ -3678,6 +4133,338 @@ mod tests {
             read_guest_i32(&memory, TEST_PMEM_STATUS_ADDR),
             VIRTIO_PMEM_STATUS_SUCCESS
         );
+    }
+
+    #[test]
+    fn pmem_device_rate_limiter_charges_exact_file_len_and_rolls_back_ops_on_byte_throttle() {
+        let now = Instant::now();
+        let mut memory = request_memory();
+        write_pmem_flush_chain(&mut memory);
+        let rate_limiter = PmemRateLimiterConfig::new(
+            Some(PmemTokenBucketConfig::new(100, None, 100)),
+            Some(PmemTokenBucketConfig::new(2, None, 100)),
+        );
+        let mut device = VirtioPmemDevice::with_rate_limiter_at(60, Some(rate_limiter), now);
+        device.active_queue = Some(pmem_queue());
+        let flush_calls = Cell::new(0);
+        let mut flush = || {
+            flush_calls.set(flush_calls.get() + 1);
+            VirtioPmemFlushStatus::Success
+        };
+
+        let first = device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("first pmem event should consume one op and the exact file length");
+        write_pmem_flush_chain_at(
+            &mut memory,
+            2,
+            3,
+            GuestAddress::new(0x2020),
+            GuestAddress::new(0x3020),
+        );
+        write_available_heads(&mut memory, &[0, 2]);
+        let throttled = device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("second pmem event should be throttled before popping the queue");
+
+        assert_eq!(
+            first
+                .queue_dispatch()
+                .expect("first queue dispatch should be present")
+                .processed_requests(),
+            1
+        );
+        let throttled_queue = throttled
+            .queue_dispatch()
+            .expect("throttled queue dispatch should be present");
+        assert_eq!(throttled_queue.processed_requests(), 0);
+        assert_eq!(
+            throttled_queue.rate_limiter_retry_after(),
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(flush_calls.get(), 1);
+        assert!(device.has_pending_rate_limited_queue());
+
+        let retry = device
+            .dispatch_drained_queue_notifications_at(
+                &mut memory,
+                Vec::new(),
+                &mut flush,
+                now + Duration::from_millis(20),
+            )
+            .expect("pending pmem queue should retry without another guest notification");
+        let retry_queue = retry
+            .queue_dispatch()
+            .expect("retry queue dispatch should be present");
+        assert!(retry.drained_notifications().is_empty());
+        assert_eq!(retry_queue.processed_requests(), 1);
+        assert_eq!(retry_queue.rate_limiter_events(), 1);
+        assert_eq!(read_used_index(&memory), 2);
+        assert_eq!(flush_calls.get(), 2);
+        assert!(!device.has_pending_rate_limited_queue());
+
+        write_pmem_flush_chain_at(
+            &mut memory,
+            4,
+            5,
+            GuestAddress::new(0x2040),
+            GuestAddress::new(0x3040),
+        );
+        write_available_heads(&mut memory, &[0, 2, 4]);
+        let ops_throttled = device
+            .dispatch_drained_queue_notifications_at(
+                &mut memory,
+                vec![0],
+                &mut flush,
+                now + Duration::from_millis(20),
+            )
+            .expect("rolled-back op should be consumed by the successful byte retry");
+        assert!(
+            ops_throttled
+                .rate_limiter_retry_after()
+                .is_some_and(|retry_after| !retry_after.is_zero())
+        );
+        assert_eq!(read_used_index(&memory), 2);
+        assert_eq!(flush_calls.get(), 2);
+
+        let metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(["pmem0"]);
+        metrics.record_notification_dispatch_for_device("pmem0", &throttled);
+        metrics.record_notification_dispatch_for_device("pmem0", &retry);
+        let expected_metrics = PmemDeviceMetrics::default()
+            .with_queue_event_count(1)
+            .with_rate_limiter_throttled_events(1)
+            .with_rate_limiter_event_count(1);
+        assert_eq!(metrics.aggregate_snapshot(), expected_metrics);
+        assert_eq!(
+            metrics.per_device_snapshot(),
+            PmemDeviceMetricsByDevice::new().with_device_metrics("pmem0", expected_metrics)
+        );
+    }
+
+    #[test]
+    fn pmem_device_rate_limiter_charges_malformed_nonempty_queue_without_flushing() {
+        let now = Instant::now();
+        let mut memory = request_memory();
+        write_request_type(&mut memory, VIRTIO_PMEM_REQUEST_TYPE_FLUSH);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(TEST_PMEM_REQUEST_ADDR, VIRTIO_PMEM_REQUEST_SIZE, None),
+        );
+        write_available_heads(&mut memory, &[0]);
+        let rate_limiter =
+            PmemRateLimiterConfig::new(None, Some(PmemTokenBucketConfig::new(1, None, 100)));
+        let mut device = VirtioPmemDevice::with_rate_limiter_at(4096, Some(rate_limiter), now);
+        device.active_queue = Some(pmem_queue());
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Success
+        };
+
+        let malformed = device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("malformed nonempty queue should still complete");
+        write_pmem_flush_chain_at(
+            &mut memory,
+            2,
+            3,
+            GuestAddress::new(0x2020),
+            GuestAddress::new(0x3020),
+        );
+        write_available_heads(&mut memory, &[0, 2]);
+        let throttled = device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("malformed request should have consumed the only op token");
+
+        let malformed_queue = malformed
+            .queue_dispatch()
+            .expect("malformed queue dispatch should be present");
+        assert_eq!(malformed_queue.parse_failures(), 1);
+        assert_eq!(flush_calls, 0);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(
+            throttled.rate_limiter_retry_after(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(read_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn pmem_device_rate_limiter_skips_empty_queue_and_charges_coalesced_event_once() {
+        let now = Instant::now();
+        let mut memory = request_memory();
+        let rate_limiter =
+            PmemRateLimiterConfig::new(None, Some(PmemTokenBucketConfig::new(1, None, 100)));
+        let mut device = VirtioPmemDevice::with_rate_limiter_at(4096, Some(rate_limiter), now);
+        device.active_queue = Some(pmem_queue());
+        let flush_calls = Cell::new(0);
+        let mut flush = || {
+            flush_calls.set(flush_calls.get() + 1);
+            VirtioPmemFlushStatus::Success
+        };
+
+        let empty = device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("empty pmem queue should not consume a limiter token");
+        assert_eq!(
+            empty
+                .queue_dispatch()
+                .expect("empty queue check should be reported")
+                .processed_requests(),
+            0
+        );
+
+        write_pmem_flush_chain(&mut memory);
+        write_pmem_flush_chain_at(
+            &mut memory,
+            2,
+            3,
+            GuestAddress::new(0x2020),
+            GuestAddress::new(0x3020),
+        );
+        write_available_heads(&mut memory, &[0, 2]);
+        let coalesced = device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("one admitted event should drain both coalesced requests");
+
+        assert_eq!(
+            coalesced
+                .queue_dispatch()
+                .expect("coalesced dispatch should be present")
+                .processed_requests(),
+            2
+        );
+        assert_eq!(flush_calls.get(), 1);
+        assert_eq!(read_used_index(&memory), 2);
+
+        write_pmem_flush_chain_at(
+            &mut memory,
+            4,
+            5,
+            GuestAddress::new(0x2040),
+            GuestAddress::new(0x3040),
+        );
+        write_available_heads(&mut memory, &[0, 2, 4]);
+        let throttled = device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("the next event should observe the single consumed op token");
+
+        assert_eq!(
+            throttled
+                .queue_dispatch()
+                .expect("throttled event should be reported")
+                .rate_limiter_retry_after(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(flush_calls.get(), 1);
+        assert_eq!(read_used_index(&memory), 2);
+    }
+
+    #[test]
+    fn pmem_bandwidth_limiter_retries_oversized_file_after_full_refill() {
+        let now = Instant::now();
+        let mut memory = request_memory();
+        write_pmem_flush_chain(&mut memory);
+        let rate_limiter =
+            PmemRateLimiterConfig::new(Some(PmemTokenBucketConfig::new(50, None, 100)), None);
+        let mut device = VirtioPmemDevice::with_rate_limiter_at(80, Some(rate_limiter), now);
+        device.active_queue = Some(pmem_queue());
+        let flush_calls = Cell::new(0);
+        let mut flush = || {
+            flush_calls.set(flush_calls.get() + 1);
+            VirtioPmemFlushStatus::Success
+        };
+
+        device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("a full bucket should admit one oversized file charge");
+        write_pmem_flush_chain_at(
+            &mut memory,
+            2,
+            3,
+            GuestAddress::new(0x2020),
+            GuestAddress::new(0x3020),
+        );
+        write_available_heads(&mut memory, &[0, 2]);
+        let throttled = device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("a drained oversized bucket should throttle without popping");
+        assert_eq!(
+            throttled.rate_limiter_retry_after(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(read_used_index(&memory), 1);
+
+        let retried = device
+            .dispatch_drained_queue_notifications_at(
+                &mut memory,
+                Vec::new(),
+                &mut flush,
+                now + Duration::from_millis(100),
+            )
+            .expect("a full refill should admit the pending oversized charge");
+        assert_eq!(
+            retried
+                .queue_dispatch()
+                .expect("retried queue dispatch should be present")
+                .processed_requests(),
+            1
+        );
+        assert_eq!(flush_calls.get(), 2);
+        assert_eq!(read_used_index(&memory), 2);
+    }
+
+    #[test]
+    fn live_pmem_rate_limiter_disable_reports_and_unblocks_pending_queue() {
+        let now = Instant::now();
+        let mut memory = request_memory();
+        write_pmem_flush_chain(&mut memory);
+        let rate_limiter =
+            PmemRateLimiterConfig::new(None, Some(PmemTokenBucketConfig::new(1, None, 100)));
+        let mut device = VirtioPmemDevice::with_rate_limiter_at(4096, Some(rate_limiter), now);
+        device.active_queue = Some(pmem_queue());
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Success
+        };
+        device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("first pmem event should dispatch");
+        write_pmem_flush_chain_at(
+            &mut memory,
+            2,
+            3,
+            GuestAddress::new(0x2020),
+            GuestAddress::new(0x3020),
+        );
+        write_available_heads(&mut memory, &[0, 2]);
+        device
+            .dispatch_drained_queue_notifications_at(&mut memory, vec![0], &mut flush, now)
+            .expect("second pmem event should throttle");
+        let disable =
+            PmemUpdate::try_from(PmemUpdateInput::new("pmem0", "pmem0").with_rate_limiter(
+                PmemRateLimiterConfig::new(None, Some(PmemTokenBucketConfig::new(0, None, 0))),
+            ))
+            .expect("pmem limiter disable should validate");
+
+        assert!(device.update_rate_limiter_at(&disable, now));
+        let retry = device
+            .dispatch_drained_queue_notifications_at(&mut memory, Vec::new(), &mut flush, now)
+            .expect("disabled limiter should immediately unblock pending work");
+
+        assert_eq!(
+            retry
+                .queue_dispatch()
+                .expect("retry queue dispatch should be present")
+                .processed_requests(),
+            1
+        );
+        assert_eq!(read_used_index(&memory), 2);
+        assert_eq!(flush_calls, 2);
+        assert!(!device.has_pending_rate_limited_queue());
     }
 
     #[test]
@@ -3888,6 +4675,20 @@ mod tests {
     }
 
     #[test]
+    fn config_normalizes_disabled_rate_limiter_buckets_to_absent() {
+        let config = pmem_config(
+            PmemConfigInput::new("pmem0", "/tmp/pmem.img").with_rate_limiter(
+                PmemRateLimiterConfig::new(
+                    Some(PmemTokenBucketConfig::new(0, Some(10), 100)),
+                    Some(PmemTokenBucketConfig::new(1, None, 0)),
+                ),
+            ),
+        );
+
+        assert_eq!(config.rate_limiter(), None);
+    }
+
+    #[test]
     fn config_accepts_firecracker_id_character_set() {
         let config = pmem_config(PmemConfigInput::new("pmem_\u{00e9}1", "/tmp/pmem.img"));
 
@@ -3977,19 +4778,62 @@ mod tests {
     }
 
     #[test]
-    fn update_rejects_configured_rate_limiter() {
+    fn update_accepts_configured_rate_limiter_without_committing() {
         let mut configs = PmemConfigs::new();
         configs.upsert(pmem_config(PmemConfigInput::new("pmem0", "/tmp/pmem.img")));
+        let rate_limiter =
+            PmemRateLimiterConfig::new(None, Some(PmemTokenBucketConfig::new(1, None, 100)));
 
-        let err = configs
-            .validate_update(PmemUpdateInput::new("pmem0", "pmem0").with_rate_limiter_configured())
-            .expect_err("configured pmem rate limiter should fail");
+        let update = configs
+            .validate_update(PmemUpdateInput::new("pmem0", "pmem0").with_rate_limiter(rate_limiter))
+            .expect("configured pmem rate limiter should validate");
 
-        assert_eq!(err, PmemUpdateError::UnsupportedRateLimiter);
-        assert_eq!(err.to_string(), "pmem rate_limiter is not supported");
+        assert_eq!(update.rate_limiter(), Some(rate_limiter));
         assert_eq!(configs.as_slice().len(), 1);
         assert_eq!(configs.as_slice()[0].id(), "pmem0");
         assert_eq!(configs.as_slice()[0].path_on_host(), "/tmp/pmem.img");
+        assert_eq!(configs.as_slice()[0].rate_limiter(), None);
+    }
+
+    #[test]
+    fn update_partially_disables_one_bucket_and_preserves_the_other() {
+        let bandwidth = PmemTokenBucketConfig::new(4096, Some(8192), 100);
+        let ops = PmemTokenBucketConfig::new(10, None, 1000);
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(
+            PmemConfigInput::new("pmem0", "/tmp/pmem.img")
+                .with_rate_limiter(PmemRateLimiterConfig::new(Some(bandwidth), Some(ops))),
+        ));
+
+        let (update, updated) = configs
+            .prepare_update(PmemUpdateInput::new("pmem0", "pmem0").with_rate_limiter(
+                PmemRateLimiterConfig::new(None, Some(PmemTokenBucketConfig::new(0, None, 0))),
+            ))
+            .expect("partial pmem limiter update should prepare");
+
+        assert_eq!(
+            update.rate_limiter(),
+            Some(PmemRateLimiterConfig::new(
+                None,
+                Some(PmemTokenBucketConfig::new(0, None, 0))
+            ))
+        );
+        assert_eq!(
+            updated.rate_limiter(),
+            Some(PmemRateLimiterConfig::new(Some(bandwidth), None))
+        );
+        assert_eq!(
+            configs.as_slice()[0].rate_limiter(),
+            Some(PmemRateLimiterConfig::new(Some(bandwidth), Some(ops)))
+        );
+
+        configs
+            .commit_update(updated)
+            .expect("prepared pmem limiter update should commit");
+        assert_eq!(
+            configs.as_slice()[0].rate_limiter(),
+            Some(PmemRateLimiterConfig::new(Some(bandwidth), None))
+        );
     }
 
     #[test]

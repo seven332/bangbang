@@ -2827,8 +2827,19 @@ mod macos_arm64 {
         let pmem_body = format!(
             r#"{{
                 "id":"pmem0",
-                "path_on_host":{pmem_backing_path_json}
-            }}"#
+                "path_on_host":{pmem_backing_path_json},
+                "rate_limiter":{{
+                    "bandwidth":{{
+                        "size":{},
+                        "refill_time":1000
+                    }},
+                    "ops":{{
+                        "size":1,
+                        "refill_time":1000
+                    }}
+                }}
+            }}"#,
+            bangbang_runtime::pmem::VIRTIO_PMEM_ALIGNMENT,
         );
         let pmem_response = http_put_json(&socket_path, "/pmem/pmem0", &pmem_body);
         assert_no_content_response(&pmem_response, "PUT /pmem/pmem0 direct rootfs");
@@ -2844,6 +2855,11 @@ mod macos_arm64 {
             &vm_config,
             &format!(r#""path_on_host":{pmem_backing_path_json}"#),
             "GET /vm/config after PUT /pmem/pmem0",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""rate_limiter":{"bandwidth":{"one_time_burst":null,"refill_time":1000,"size":2097152},"ops":{"one_time_burst":null,"refill_time":1000,"size":1}}"#,
+            "GET /vm/config after rate-limited PUT /pmem/pmem0",
         );
 
         let start_response = http_put_json(
@@ -2882,23 +2898,22 @@ mod macos_arm64 {
             &socket_path,
             "PATCH",
             "/pmem/pmem0",
-            r#"{"id":"pmem0","rate_limiter":{"ops":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
+            r#"{"id":"pmem0","rate_limiter":{"ops":{"size":2,"one_time_burst":1,"refill_time":100}}}"#,
         );
-        assert_bad_request_response(
+        assert_no_content_response(
             &pmem_rate_limiter_patch_response,
             "PATCH /pmem/pmem0 configured rate limiter after InstanceStart",
+        );
+        let patched_vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(
+            &patched_vm_config,
+            "GET /vm/config after live pmem limiter PATCH",
         );
         assert_response_contains(
-            &pmem_rate_limiter_patch_response,
-            r#"{"fault_message":"pmem rate_limiter is not supported"}"#,
-            "PATCH /pmem/pmem0 configured rate limiter after InstanceStart",
+            &patched_vm_config,
+            r#""rate_limiter":{"bandwidth":{"one_time_burst":null,"refill_time":1000,"size":2097152},"ops":{"one_time_burst":1,"refill_time":100,"size":2}}"#,
+            "GET /vm/config after live pmem limiter PATCH",
         );
-        for private_value in ["123456", "234567", "345678"] {
-            assert!(
-                !pmem_rate_limiter_patch_response.contains(private_value),
-                "PATCH /pmem/pmem0 configured rate limiter must not echo {private_value}: {pmem_rate_limiter_patch_response}"
-            );
-        }
 
         if let Err(err) = wait_for_file_prefix_marker(
             &data_backing_path,

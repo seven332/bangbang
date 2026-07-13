@@ -28,11 +28,12 @@ use bangbang_api::http::{
     MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest,
     MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
     NetworkInterfacePatchRequest, NetworkRateLimiterRequest, PmemConfigRequest, PmemConfigResponse,
-    PmemPatchRequest, RequestError, SerialConfigRequest, SnapshotCreateRequest,
-    SnapshotLoadRequest, SnapshotMemoryBackendType as ApiSnapshotMemoryBackendType,
-    SnapshotType as ApiSnapshotType, TokenBucketRequest, VmConfigResponse, VmStateUpdate,
-    VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse, api_request_metric_endpoint,
-    parse_request_with_limit, request_total_len_with_limit,
+    PmemPatchRequest, PmemRateLimiterRequest, RequestError, SerialConfigRequest,
+    SnapshotCreateRequest, SnapshotLoadRequest,
+    SnapshotMemoryBackendType as ApiSnapshotMemoryBackendType, SnapshotType as ApiSnapshotType,
+    TokenBucketRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest,
+    VsockConfigResponse, api_request_metric_endpoint, parse_request_with_limit,
+    request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
     BalloonConfig, BalloonConfigInput, BalloonHintingStartInput, BalloonHintingStatus,
@@ -71,7 +72,9 @@ use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigInput, NetworkInterfaceUpdateInput,
     NetworkRateLimiterConfig, NetworkTokenBucketConfig,
 };
-use bangbang_runtime::pmem::{PmemConfig, PmemConfigInput, PmemUpdateInput};
+use bangbang_runtime::pmem::{
+    PmemConfig, PmemConfigInput, PmemRateLimiterConfig, PmemTokenBucketConfig, PmemUpdateInput,
+};
 use bangbang_runtime::serial::{SerialConfigInput, SerialRateLimiterConfig};
 use bangbang_runtime::snapshot::{
     SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend,
@@ -1575,12 +1578,33 @@ fn entropy_token_bucket_response_from_runtime(
 }
 
 fn pmem_config_response_from_runtime(config: &PmemConfig) -> PmemConfigResponse {
-    PmemConfigResponse::new(
+    let response = PmemConfigResponse::new(
         config.id(),
         config.path_on_host(),
         config.root_device(),
         config.read_only(),
+    );
+    match config.rate_limiter() {
+        Some(rate_limiter) => {
+            response.with_rate_limiter(pmem_rate_limiter_response_from_runtime(rate_limiter))
+        }
+        None => response,
+    }
+}
+
+fn pmem_rate_limiter_response_from_runtime(
+    config: PmemRateLimiterConfig,
+) -> PmemRateLimiterRequest {
+    PmemRateLimiterRequest::new(
+        config
+            .bandwidth()
+            .map(pmem_token_bucket_response_from_runtime),
+        config.ops().map(pmem_token_bucket_response_from_runtime),
     )
+}
+
+fn pmem_token_bucket_response_from_runtime(config: PmemTokenBucketConfig) -> TokenBucketRequest {
+    TokenBucketRequest::new(config.size(), config.one_time_burst(), config.refill_time())
 }
 
 fn machine_config_response_from_runtime(config: MachineConfig) -> MachineConfigResponse {
@@ -2016,8 +2040,8 @@ fn pmem_config_input_from_request(config: &PmemConfigRequest) -> PmemConfigInput
         .with_root_device(config.root_device())
         .with_read_only(config.read_only());
 
-    if config.rate_limiter_configured() {
-        input = input.with_rate_limiter_configured();
+    if let Some(rate_limiter) = config.rate_limiter() {
+        input = input.with_rate_limiter(pmem_rate_limiter_config_from_request(rate_limiter));
     }
 
     input
@@ -2026,11 +2050,22 @@ fn pmem_config_input_from_request(config: &PmemConfigRequest) -> PmemConfigInput
 fn pmem_update_input_from_request(config: &PmemPatchRequest) -> PmemUpdateInput {
     let mut input = PmemUpdateInput::new(config.path_pmem_id(), config.body_pmem_id());
 
-    if config.rate_limiter_configured() {
-        input = input.with_rate_limiter_configured();
+    if let Some(rate_limiter) = config.rate_limiter() {
+        input = input.with_rate_limiter(pmem_rate_limiter_config_from_request(rate_limiter));
     }
 
     input
+}
+
+fn pmem_rate_limiter_config_from_request(config: PmemRateLimiterRequest) -> PmemRateLimiterConfig {
+    PmemRateLimiterConfig::new(
+        config.bandwidth().map(pmem_token_bucket_from_request),
+        config.ops().map(pmem_token_bucket_from_request),
+    )
+}
+
+fn pmem_token_bucket_from_request(config: TokenBucketRequest) -> PmemTokenBucketConfig {
+    PmemTokenBucketConfig::new(config.size(), config.one_time_burst(), config.refill_time())
 }
 
 fn balloon_config_input_from_request(config: BalloonConfigRequest) -> BalloonConfigInput {
@@ -8664,20 +8699,25 @@ mod tests {
         assert!(vm_config_response.contains(r#""root_device":false"#));
         assert!(vm_config_response.contains(r#""read_only":false"#));
 
+        let rate_limiter_response = request_over_socket(
+            &mut vmm,
+            "p-put-rate-limiter",
+            &request_with_body(
+                "PUT",
+                "/pmem/pmem0",
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem-new.img","rate_limiter":{"ops":{"size":1,"refill_time":1}}}"#,
+            ),
+        );
+        assert!(
+            rate_limiter_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{rate_limiter_response}"
+        );
+
         for (socket_name, request, fault_message) in [
             (
                 "p-put-bad",
                 request_with_body("PUT", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
                 "Malformed HTTP request.",
-            ),
-            (
-                "p-put-rate-limiter",
-                request_with_body(
-                    "PUT",
-                    "/pmem/pmem0",
-                    r#"{"id":"pmem0","path_on_host":"/tmp/pmem-new.img","rate_limiter":{"ops":{"size":1,"refill_time":1}}}"#,
-                ),
-                "pmem rate_limiter is not supported",
             ),
             (
                 "p-put-root-device",
@@ -8731,8 +8771,9 @@ mod tests {
             panic!("expected VM config");
         };
         assert_eq!(config.pmem_configs().len(), 1);
-        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem.img");
+        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem-new.img");
         assert!(!config.pmem_configs()[0].root_device());
+        assert!(config.pmem_configs()[0].rate_limiter().is_some());
     }
 
     #[test]
@@ -8764,7 +8805,7 @@ mod tests {
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","rate_limiter":{"ops":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
                 ),
-                "pmem rate_limiter is not supported",
+                "pmem device is not configured",
             ),
             (
                 "pm-pmiss-run",

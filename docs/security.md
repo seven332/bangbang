@@ -361,10 +361,14 @@ is resource-specific:
   not normalize stored host paths, and shadow allocation, HVF registration,
   MMIO attachment, flush, or writeback errors
   identify the pmem ID and guest range without echoing `path_on_host`.
-  Configured rate limiters are rejected without replacing stored pmem
-  configuration. Root-device boot semantics, runtime updates, direct
-  file-backed HVF mapping, dirty-range tracking, and hot-unplug remain
-  deferred.
+  Per-device bandwidth and operation rate limiters are validated before
+  startup, reported through `GET /vm/config`, and charged once per non-empty
+  coalesced flush event before the queue cursor advances. Throttled work stays
+  pending behind a dedicated per-session wakeup, and runtime
+  `PATCH /pmem/{id}` replaces the exact active device limiter before stored
+  configuration is committed. Diagnostics expose only counters and device IDs,
+  not bucket values or backing paths. Root-device boot semantics, direct
+  file-backed HVF mapping, dirty-range tracking, and hot-unplug remain deferred.
 - `/entropy` accepts Firecracker-shaped bandwidth and ops rate-limiter buckets.
   The limiter is process-local runtime state, is applied before host entropy is
   read or guest memory is written, and must not sleep or busy-wait while budget
