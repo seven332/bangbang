@@ -694,9 +694,9 @@ is resource-specific:
   through the host Mach timebase, and publishes the configured timer PPI only
   after an enabled, guest-unmasked due recheck wins exact cancellation
   arbitration. It does not log timer values, execute a guest trampoline, infer
-  a GIC route, or expose PSCI `CPU_SUSPEND`. Ambiguous counter distance,
-  invalid timebase data, owner read failure, and PPI failure remain typed
-  fail-closed errors; lifecycle cancellation never fabricates guest timer wake.
+  a GIC route, or expose PSCI `CPU_SUSPEND`. Invalid timebase data, duration
+  overflow, owner read failure, and PPI failure remain typed fail-closed
+  errors; lifecycle cancellation never fabricates guest timer wake.
   Native-v1 optional-state classification also fails closed when CPACR enables
   SVE/SME access, PSTATE.SM/ZA is active, or an implemented breakpoint or
   watchpoint is enabled. Category-only rejections expose no register value,

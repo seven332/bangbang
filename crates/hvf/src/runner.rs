@@ -136,8 +136,6 @@ const RETAINED_VTIMER_WAIT_SIGNAL_POISONED_MESSAGE: &str =
     "retained virtual-timer wait signal lock is poisoned";
 const RETAINED_VTIMER_WAIT_IDENTITY_MISMATCH_MESSAGE: &str =
     "retained virtual-timer wait identity does not match runner activity";
-const RETAINED_VTIMER_AMBIGUOUS_DEADLINE_MESSAGE: &str =
-    "virtual-timer deadline is exactly half the wrapping counter range away";
 const RETAINED_VTIMER_INVALID_TIMEBASE_MESSAGE: &str =
     "Mach timebase numerator or denominator is zero";
 const RETAINED_VTIMER_DURATION_OVERFLOW_MESSAGE: &str =
@@ -7590,18 +7588,16 @@ fn classify_retained_vtimer_deadline(
         return Ok(RetainedVtimerDeadline::Indefinite);
     }
 
-    let deadline = observation.compare_value.wrapping_add(observation.offset);
-    let remaining_ticks = deadline.wrapping_sub(observation.counter);
-    if remaining_ticks == 1_u64 << 63 {
-        return Err(retained_vtimer_invalid_state(
-            HvfVcpuRetainedVtimerWaitStage::Deadline,
-            RETAINED_VTIMER_AMBIGUOUS_DEADLINE_MESSAGE,
-        ));
-    }
-    if remaining_ticks == 0 || (remaining_ticks as i64) < 0 {
+    // Arm defines the timer condition as an unsigned `CVAL <= virtual count`.
+    // HVF exposes `virtual count = mach_absolute_time - offset`, including
+    // the architectural wrapping subtraction used to derive the current count.
+    let virtual_count = observation.counter.wrapping_sub(observation.offset);
+    if observation.compare_value <= virtual_count {
         Ok(RetainedVtimerDeadline::Due)
     } else {
-        Ok(RetainedVtimerDeadline::Future { remaining_ticks })
+        Ok(RetainedVtimerDeadline::Future {
+            remaining_ticks: observation.compare_value - virtual_count,
+        })
     }
 }
 
@@ -8137,21 +8133,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn retained_vtimer_deadline_rejects_exact_half_range() {
-        assert!(matches!(
+    fn retained_vtimer_deadline_keeps_large_unsigned_delta_in_the_future() {
+        assert_eq!(
             super::classify_retained_vtimer_deadline(retained_vtimer_observation(
                 1,
                 0,
                 1_u64 << 63,
                 0
             )),
-            Err(HvfVcpuRunnerError::RetainedVtimerWait {
-                stage: super::HvfVcpuRetainedVtimerWaitStage::Deadline,
-                source,
-            }) if *source == HvfVcpuRunnerError::InvalidState(
-                super::RETAINED_VTIMER_AMBIGUOUS_DEADLINE_MESSAGE
-            )
-        ));
+            Ok(super::RetainedVtimerDeadline::Future {
+                remaining_ticks: 1_u64 << 63,
+            })
+        );
+        assert_eq!(
+            super::classify_retained_vtimer_deadline(retained_vtimer_observation(
+                1,
+                0,
+                u64::MAX,
+                0
+            )),
+            Ok(super::RetainedVtimerDeadline::Future {
+                remaining_ticks: u64::MAX,
+            })
+        );
     }
 
     #[test]

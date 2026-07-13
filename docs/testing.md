@@ -74,8 +74,9 @@ and no fixed sleep, then collect two `Canceled` acknowledgements from one stop
 barrier. Repeat complete owner and VM teardown to catch stale cancellation or
 resource leaks.
 
-Retained virtual-timer owner waits require pure wrap-safe Mach-deadline and
-timebase tests, injected failure coverage for every owner read and PPI write,
+Retained virtual-timer owner waits require pure tests for the Arm unsigned
+`CVAL <= virtual count` condition, wrapping offset subtraction, Mach timebase
+conversion, injected failures for every owner read and PPI write,
 and deterministic timer-versus-cancel arbitration. If timer completion wins a
 control race, the next raw HVF exit must remain queued so coordinator
 cancellation debt can drain; if cancellation wins, the retained completion
