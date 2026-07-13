@@ -7447,13 +7447,8 @@ fn wait_for_retained_vtimer_on_runner_thread(
     signal: &RetainedVtimerWaitSignal,
     intid: u32,
 ) -> Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError> {
-    let timebase = vcpu.mach_timebase_info().map_err(|source| {
-        retained_vtimer_wait_error(
-            HvfVcpuRetainedVtimerWaitStage::Timebase,
-            HvfVcpuRunnerError::Backend(source),
-        )
-    })?;
     let mut initial = true;
+    let mut timebase = None;
 
     loop {
         {
@@ -7487,6 +7482,19 @@ fn wait_for_retained_vtimer_on_runner_thread(
                 }
             }
             RetainedVtimerDeadline::Future { remaining_ticks } => {
+                let timebase = match timebase {
+                    Some(timebase) => timebase,
+                    None => {
+                        let observed = vcpu.mach_timebase_info().map_err(|source| {
+                            retained_vtimer_wait_error(
+                                HvfVcpuRetainedVtimerWaitStage::Timebase,
+                                HvfVcpuRunnerError::Backend(source),
+                            )
+                        })?;
+                        timebase = Some(observed);
+                        observed
+                    }
+                };
                 let timeout = retained_vtimer_wait_duration(remaining_ticks, timebase)?;
                 let state = signal.lock()?;
                 if *state == RetainedVtimerWaitSignalState::Pending {
@@ -35148,6 +35156,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn retained_vtimer_wait_pre_cancellation_precedes_all_owner_reads() {
+        let mut vcpu = retained_vtimer_wait_test_vcpu(40, 1, 100);
+        vcpu.failure_stage = Some(super::HvfVcpuRetainedVtimerWaitStage::InitialExitMask);
+        vcpu.timebase = Err(BackendError::InvalidState(
+            "pre-canceled wait must not read the Mach timebase",
+        ));
+        let signal = super::RetainedVtimerWaitSignal::new(super::RetainedVtimerWaitIdentity(1));
+        assert_eq!(
+            signal.cancel(),
+            Ok(super::RetainedVtimerCancelDisposition::Canceled)
+        );
+
+        assert_eq!(
+            super::wait_for_retained_vtimer_on_runner_thread(&mut vcpu, &signal, 27),
+            Ok(super::HvfVcpuRetainedVtimerWaitOutcome::Canceled)
+        );
+        assert_eq!(vcpu.observation_round, 0);
+    }
+
+    #[test]
     fn retained_vtimer_wait_cancellation_wakes_indefinite_owner_without_hvf_exit() {
         let (sample_sender, sample_receiver) = mpsc::channel();
         let (raw_cancel_sender, raw_cancel_receiver) = mpsc::channel();
@@ -35349,14 +35377,18 @@ pub(crate) mod tests {
             Stage::RecheckCounter,
         ] {
             let mut vcpu = retained_vtimer_wait_test_vcpu(48, 1, 100);
-            if matches!(
+            let is_recheck = matches!(
                 stage,
                 Stage::RecheckExitMask
                     | Stage::RecheckOffset
                     | Stage::RecheckControl
                     | Stage::RecheckCompareValue
                     | Stage::RecheckCounter
-            ) {
+            );
+            if stage == Stage::Timebase {
+                vcpu.compare_value = 1;
+                vcpu.counter_samples = VecDeque::from([Ok(0)]);
+            } else if is_recheck {
                 vcpu.compare_value = 1;
                 vcpu.counter_samples = VecDeque::from([Ok(0), Ok(1)]);
                 vcpu.timebase = Ok(crate::ffi::MachTimebaseInfo::new(1, 1));
