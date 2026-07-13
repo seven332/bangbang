@@ -253,6 +253,46 @@ pub enum Arm64BootVsockWakeupFdsError {
     ResultAllocation { source: TryReserveError },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64BootVsockWakeup {
+    host_read_fds: Vec<RawFd>,
+    deadline: Option<Instant>,
+}
+
+impl Arm64BootVsockWakeup {
+    pub const fn empty() -> Self {
+        Self {
+            host_read_fds: Vec::new(),
+            deadline: None,
+        }
+    }
+
+    fn new(host_read_fds: Vec<RawFd>, deadline: Option<Instant>) -> Self {
+        Self {
+            host_read_fds,
+            deadline,
+        }
+    }
+
+    pub fn host_read_fds(&self) -> &[RawFd] {
+        &self.host_read_fds
+    }
+
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn into_parts(self) -> (Vec<RawFd>, Option<Instant>) {
+        (self.host_read_fds, self.deadline)
+    }
+}
+
+impl Default for Arm64BootVsockWakeup {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Arm64BootVmGenIdDevice {
     pub range: GuestMemoryRange,
@@ -2149,8 +2189,16 @@ impl Arm64BootRuntimeResources {
         &self,
         mmio_dispatcher: &mut MmioDispatcher,
     ) -> Result<Vec<RawFd>, Arm64BootVsockWakeupFdsError> {
+        self.vsock_wakeup(mmio_dispatcher)
+            .map(|wakeup| wakeup.into_parts().0)
+    }
+
+    pub fn vsock_wakeup(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Result<Arm64BootVsockWakeup, Arm64BootVsockWakeupFdsError> {
         let Some(device) = self.vsock_device.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(Arm64BootVsockWakeup::empty());
         };
 
         let region_id = device.registration.region_id();
@@ -2160,7 +2208,8 @@ impl Arm64BootRuntimeResources {
 
         handler
             .activation_handler()
-            .host_read_wakeup_fds()
+            .host_wakeup()
+            .map(|(fds, deadline)| Arm64BootVsockWakeup::new(fds, deadline))
             .map_err(|source| Arm64BootVsockWakeupFdsError::ResultAllocation { source })
     }
 

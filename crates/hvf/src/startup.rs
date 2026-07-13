@@ -5356,17 +5356,18 @@ fn start_run_loop_vsock_wakeup_monitor(
         return Ok(HvfArm64BootRunLoopWakeupMonitor::inactive());
     }
 
-    let fds = {
+    let (fds, deadline) = {
         let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(dispatcher)
             .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
         runtime_resources
-            .vsock_host_read_wakeup_fds(&mut mmio_dispatcher)
+            .vsock_wakeup(&mut mmio_dispatcher)
             .map_err(
                 |source| HvfArm64BootRunLoopWakeupMonitorError::CollectVsockWakeupFds { source },
             )?
+            .into_parts()
     };
 
-    HvfArm64BootRunLoopWakeupMonitor::start(fds, vcpu_control, wakeup_token)
+    HvfArm64BootRunLoopWakeupMonitor::start(fds, deadline, vcpu_control, wakeup_token)
 }
 
 trait BootSessionRunLoopSession {
@@ -5972,12 +5973,13 @@ impl HvfArm64BootRunLoopWakeupMonitor {
 
     fn start(
         mut fds: Vec<RawFd>,
+        deadline: Option<Instant>,
         vcpu_control: HvfVcpuRunControl,
         wakeup_token: HvfArm64BootRunLoopWakeupToken,
     ) -> Result<Self, HvfArm64BootRunLoopWakeupMonitorError> {
         fds.sort_unstable();
         fds.dedup();
-        if fds.is_empty() {
+        if fds.is_empty() && deadline.is_none() {
             return Ok(Self::inactive());
         }
 
@@ -5996,6 +5998,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
                     &mut pollfds,
                     pollfd_count,
                     stop_reader,
+                    deadline,
                     vcpu_control,
                     wakeup_token,
                 )
@@ -6073,24 +6076,58 @@ fn run_vsock_wakeup_monitor(
     pollfds: &mut [libc::pollfd],
     pollfd_count: libc::nfds_t,
     _stop_reader: UnixStream,
+    deadline: Option<Instant>,
     vcpu_control: HvfVcpuRunControl,
     wakeup_token: HvfArm64BootRunLoopWakeupToken,
+) -> bool {
+    run_vsock_wakeup_monitor_with(
+        pollfds,
+        pollfd_count,
+        deadline,
+        Instant::now,
+        |pollfds, pollfd_count, timeout| {
+            // SAFETY: `pollfds` is a valid mutable slice for `pollfd_count`
+            // entries and remains alive for the duration of this `poll` call.
+            let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfd_count, timeout) };
+            if result < 0 {
+                Err(io::Error::last_os_error().kind())
+            } else {
+                Ok(result)
+            }
+        },
+        || {
+            wakeup_token.request_wakeup();
+            let _ = vcpu_control.request_wakeup();
+        },
+    )
+}
+
+fn run_vsock_wakeup_monitor_with(
+    pollfds: &mut [libc::pollfd],
+    pollfd_count: libc::nfds_t,
+    deadline: Option<Instant>,
+    mut now: impl FnMut() -> Instant,
+    mut poll: impl FnMut(
+        &mut [libc::pollfd],
+        libc::nfds_t,
+        libc::c_int,
+    ) -> Result<libc::c_int, io::ErrorKind>,
+    mut request_wakeup: impl FnMut(),
 ) -> bool {
     loop {
         for pollfd in pollfds.iter_mut() {
             pollfd.revents = 0;
         }
 
-        // SAFETY: `pollfds` is a valid mutable slice for `pollfd_count` entries
-        // and remains alive for the duration of this blocking `poll` call.
-        let poll_result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfd_count, POLL_FOREVER) };
-        if poll_result < 0 {
-            let source = io::Error::last_os_error();
-            if source.kind() == io::ErrorKind::Interrupted {
-                continue;
+        let timeout = vsock_wakeup_poll_timeout(deadline, now());
+        let poll_result = match poll(pollfds, pollfd_count, timeout) {
+            Ok(result) => result,
+            Err(io::ErrorKind::Interrupted) => continue,
+            Err(_) => {
+                request_wakeup();
+                return true;
             }
-            return false;
-        }
+        };
 
         let Some(stop_pollfd) = pollfds.first() else {
             return false;
@@ -6098,16 +6135,35 @@ fn run_vsock_wakeup_monitor(
         if pollfd_has_wakeup_event(stop_pollfd.revents) {
             return false;
         }
-        if pollfds
+        let fd_wakeup = pollfds
             .iter()
             .skip(1)
-            .any(|pollfd| pollfd_has_wakeup_event(pollfd.revents))
-        {
-            wakeup_token.request_wakeup();
-            let _ = vcpu_control.request_wakeup();
+            .any(|pollfd| pollfd_has_wakeup_event(pollfd.revents));
+        if fd_wakeup || (poll_result == 0 && deadline.is_some()) {
+            request_wakeup();
             return true;
         }
     }
+}
+
+fn vsock_wakeup_poll_timeout(deadline: Option<Instant>, now: Instant) -> libc::c_int {
+    let Some(deadline) = deadline else {
+        return POLL_FOREVER;
+    };
+    let Some(remaining) = deadline.checked_duration_since(now) else {
+        return 0;
+    };
+    if remaining.is_zero() {
+        return 0;
+    }
+
+    let whole_millis = remaining.as_millis();
+    let rounded_millis =
+        whole_millis.saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+    rounded_millis
+        .min(libc::c_int::MAX as u128)
+        .try_into()
+        .unwrap_or(libc::c_int::MAX)
 }
 
 const fn pollfd_has_wakeup_event(revents: libc::c_short) -> bool {
@@ -7889,7 +7945,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::error::Error as _;
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -8024,6 +8080,196 @@ mod tests {
     const TEST_MEMORY_MIB: u64 = 8;
     const ARM64_IMAGE_HEADER_SIZE: usize = 64;
     const ARM64_IMAGE_TEXT_OFFSET_OFFSET: usize = 8;
+
+    #[test]
+    fn vsock_wakeup_poll_timeout_rounds_up_and_clamps_absolute_deadline() {
+        let now = Instant::now();
+
+        assert_eq!(super::vsock_wakeup_poll_timeout(None, now), -1);
+        assert_eq!(super::vsock_wakeup_poll_timeout(Some(now), now), 0);
+        assert_eq!(
+            super::vsock_wakeup_poll_timeout(Some(now - Duration::from_nanos(1)), now),
+            0
+        );
+        assert_eq!(
+            super::vsock_wakeup_poll_timeout(Some(now + Duration::from_nanos(1)), now),
+            1
+        );
+        assert_eq!(
+            super::vsock_wakeup_poll_timeout(Some(now + Duration::from_millis(1)), now),
+            1
+        );
+        assert_eq!(
+            super::vsock_wakeup_poll_timeout(
+                Some(now + Duration::from_millis(1) + Duration::from_nanos(1)),
+                now,
+            ),
+            2
+        );
+        assert_eq!(
+            super::vsock_wakeup_poll_timeout(
+                Some(now + Duration::from_millis(libc::c_int::MAX as u64 + 1)),
+                now,
+            ),
+            libc::c_int::MAX
+        );
+    }
+
+    #[test]
+    fn vsock_wakeup_monitor_recomputes_deadline_only_timeout_after_interrupt() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(5);
+        let mut pollfds = [libc::pollfd {
+            fd: 10,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let mut times = VecDeque::from([now, now + Duration::from_millis(2)]);
+        let mut outcomes = VecDeque::from([
+            Err(io::ErrorKind::Interrupted),
+            Ok::<libc::c_int, io::ErrorKind>(0),
+        ]);
+        let mut timeouts = Vec::new();
+        let mut wakeups = 0usize;
+
+        let woke = super::run_vsock_wakeup_monitor_with(
+            &mut pollfds,
+            1,
+            Some(deadline),
+            || times.pop_front().expect("each poll should sample time"),
+            |pollfds, count, timeout| {
+                assert_eq!(pollfds.len(), 1);
+                assert_eq!(count, 1);
+                timeouts.push(timeout);
+                outcomes.pop_front().expect("poll outcome should exist")
+            },
+            || wakeups += 1,
+        );
+
+        assert!(woke);
+        assert_eq!(timeouts, [5, 3]);
+        assert_eq!(wakeups, 1);
+        assert!(times.is_empty());
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn vsock_wakeup_monitor_preserves_stop_precedence_over_fd_and_deadline() {
+        let now = Instant::now();
+        let mut pollfds = [
+            libc::pollfd {
+                fd: 10,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: 11,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let mut wakeups = 0usize;
+
+        let woke = super::run_vsock_wakeup_monitor_with(
+            &mut pollfds,
+            2,
+            Some(now),
+            || now,
+            |pollfds, _, timeout| {
+                assert_eq!(timeout, 0);
+                pollfds[0].revents = libc::POLLIN;
+                pollfds[1].revents = libc::POLLERR;
+                Ok(2)
+            },
+            || wakeups += 1,
+        );
+
+        assert!(!woke);
+        assert_eq!(wakeups, 0);
+    }
+
+    #[test]
+    fn vsock_wakeup_monitor_coalesces_simultaneous_fd_and_deadline_readiness() {
+        let now = Instant::now();
+        let mut pollfds = [
+            libc::pollfd {
+                fd: 10,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: 11,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let mut wakeups = 0usize;
+
+        let woke = super::run_vsock_wakeup_monitor_with(
+            &mut pollfds,
+            2,
+            Some(now),
+            || now,
+            |pollfds, _, timeout| {
+                assert_eq!(timeout, 0);
+                pollfds[1].revents = libc::POLLIN;
+                Ok(1)
+            },
+            || wakeups += 1,
+        );
+
+        assert!(woke);
+        assert_eq!(wakeups, 1);
+    }
+
+    #[test]
+    fn vsock_wakeup_monitor_conservatively_wakes_owner_on_poll_error() {
+        let now = Instant::now();
+        let mut pollfds = [libc::pollfd {
+            fd: 10,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let mut wakeups = 0usize;
+
+        let woke = super::run_vsock_wakeup_monitor_with(
+            &mut pollfds,
+            1,
+            None,
+            || now,
+            |_, _, timeout| {
+                assert_eq!(timeout, -1);
+                Err(io::ErrorKind::PermissionDenied)
+            },
+            || wakeups += 1,
+        );
+
+        assert!(woke);
+        assert_eq!(wakeups, 1);
+    }
+
+    #[test]
+    fn vsock_deadline_only_monitor_stops_and_joins_without_waiting_for_deadline() {
+        let (runner, _configured) = start_secondary_configure_recording_runner(false);
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let mut coordinator =
+            HvfVcpuRunCoordinator::from_test_runners(vec![runner], vec![0], dispatcher, &[0])
+                .expect("test coordinator should build");
+        let wakeup = super::HvfArm64BootRunLoopWakeupToken::default();
+        let monitor = super::HvfArm64BootRunLoopWakeupMonitor::start(
+            Vec::new(),
+            Some(Instant::now() + Duration::from_secs(60 * 60)),
+            coordinator.control(),
+            wakeup.clone(),
+        )
+        .expect("deadline-only monitor should start");
+
+        assert!(!monitor.finish().expect("monitor should stop and join"));
+        assert!(!wakeup.take_wakeup_request());
+        coordinator
+            .shutdown()
+            .expect("test coordinator should shut down");
+    }
 
     #[test]
     fn network_retry_scheduler_start_error_preserves_source() {
@@ -14693,6 +14939,23 @@ mod tests {
 
         let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
             .expect("wakeup cancel loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(session.events, ["run", "vsock-dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_dispatches_vsock_after_monitor_deadline_wakeup() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.push_monitor_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("deadline monitor wakeup loop should succeed");
 
         assert_eq!(
             outcome,
