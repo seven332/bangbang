@@ -50,6 +50,13 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_MTU_MARKER: &[u8] = b"BANGBANG_MMDS_MTU_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_V2_MARKER: &[u8] = b"BANGBANG_MMDS_V2_GUEST_FETCH_OK";
+    const DIRECT_ROOTFS_MMDS_ETH0_MARKER: &[u8] = b"BANGBANG_MMDS_ETH0_GUEST_FETCH_OK";
+    const DIRECT_ROOTFS_MMDS_ETH0_FAILURE_MARKER: &[u8] = b"BANGBANG_MMDS_ETH0_FETCH_FAIL";
+    const DIRECT_ROOTFS_MMDS_ETH1_MARKER: &[u8] = b"BANGBANG_MMDS_ETH1_GUEST_FETCH_OK";
+    const DIRECT_ROOTFS_MMDS_ETH1_FAILURE_MARKER: &[u8] = b"BANGBANG_MMDS_ETH1_FETCH_FAIL";
+    const DIRECT_ROOTFS_MMDS_ETH0_MARKER_OFFSET: u64 = 0;
+    const DIRECT_ROOTFS_MMDS_ETH1_MARKER_OFFSET: u64 =
+        bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
     const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
     const DIRECT_ROOTFS_VSOCK_EXCHANGES: &[(&[u8], &[u8])] = &[
         (
@@ -124,6 +131,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
     const DIRECT_ROOTFS_MMDS_MTU_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1 bangbang.mmds-mtu=1280";
     const DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-v2-fetch=1";
+    const DIRECT_ROOTFS_MMDS_MULTI_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-multi-fetch=1";
     const DIRECT_ROOTFS_MMDS_CONTENT: &str =
         r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_GUEST_VALUE"}}"#;
     const DIRECT_ROOTFS_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-connect=1";
@@ -169,6 +177,13 @@ mod macos_arm64 {
     struct SmpProgressCounts {
         cpu0: usize,
         cpu1: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BlockMarkerState {
+        Pending,
+        Success,
+        Failure,
     }
 
     #[test]
@@ -2852,6 +2867,179 @@ mod macos_arm64 {
     }
 
     #[test]
+    fn signed_executable_serves_mmds_on_two_isolated_guest_interfaces() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let data_backing_path = test_dir.path().join("data.img");
+        let metrics_path = test_dir.path().join("metrics.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing_with_sectors(&data_backing_path, 2);
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(
+            &machine_response,
+            "PUT /machine-config multi-interface MMDS guest fetch",
+        );
+
+        for (iface_id, guest_mac) in [("eth0", "06:00:00:00:00:01"), ("eth1", "06:00:00:00:00:02")]
+        {
+            let endpoint = format!("/network-interfaces/{iface_id}");
+            let body = format!(
+                r#"{{"iface_id":"{iface_id}","host_dev_name":"vmnet:shared","guest_mac":"{guest_mac}"}}"#
+            );
+            let response = http_put_json(&socket_path, &endpoint, &body);
+            assert_no_content_response(
+                &response,
+                &format!("PUT /network-interfaces/{iface_id} multi-interface MMDS guest fetch"),
+            );
+        }
+
+        let mmds_config_response = http_put_json(
+            &socket_path,
+            "/mmds/config",
+            r#"{"network_interfaces":["eth0","eth1"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
+        );
+        assert_no_content_response(
+            &mmds_config_response,
+            "PUT /mmds/config multi-interface MMDS guest fetch",
+        );
+        let mmds_response = http_put_json(&socket_path, "/mmds", DIRECT_ROOTFS_MMDS_CONTENT);
+        assert_no_content_response(&mmds_response, "PUT /mmds multi-interface MMDS guest fetch");
+
+        let metrics_path_json = json_string(path_text(&metrics_path));
+        let metrics_response = http_put_json(
+            &socket_path,
+            "/metrics",
+            &format!(r#"{{"metrics_path":{metrics_path_json}}}"#),
+        );
+        assert_no_content_response(
+            &metrics_response,
+            "PUT /metrics multi-interface MMDS guest fetch",
+        );
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let boot_args_json = json_string(DIRECT_ROOTFS_MMDS_MULTI_BOOT_ARGS);
+        let boot_response = http_put_json(
+            &socket_path,
+            "/boot-source",
+            &format!(r#"{{"kernel_image_path":{kernel_path_json},"boot_args":{boot_args_json}}}"#),
+        );
+        assert_no_content_response(
+            &boot_response,
+            "PUT /boot-source multi-interface MMDS guest fetch",
+        );
+
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let rootfs_response = http_put_json(
+            &socket_path,
+            "/drives/rootfs",
+            &format!(
+                r#"{{"drive_id":"rootfs","path_on_host":{rootfs_path_json},"is_root_device":true,"is_read_only":true}}"#
+            ),
+        );
+        assert_no_content_response(
+            &rootfs_response,
+            "PUT /drives/rootfs multi-interface MMDS guest fetch",
+        );
+
+        let data_backing_path_json = json_string(path_text(&data_backing_path));
+        let data_drive_response = http_put_json(
+            &socket_path,
+            "/drives/data",
+            &format!(
+                r#"{{"drive_id":"data","path_on_host":{data_backing_path_json},"is_root_device":false,"is_read_only":false}}"#
+            ),
+        );
+        assert_no_content_response(
+            &data_drive_response,
+            "PUT /drives/data multi-interface MMDS guest fetch",
+        );
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(
+            &start_response,
+            "PUT /actions InstanceStart multi-interface MMDS guest fetch",
+        );
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(
+            &running_instance_info,
+            "GET / after multi-interface MMDS InstanceStart",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after multi-interface MMDS InstanceStart",
+        );
+
+        let marker_expectations = [
+            (
+                DIRECT_ROOTFS_MMDS_ETH0_MARKER_OFFSET,
+                DIRECT_ROOTFS_MMDS_ETH0_MARKER,
+                DIRECT_ROOTFS_MMDS_ETH0_FAILURE_MARKER,
+            ),
+            (
+                DIRECT_ROOTFS_MMDS_ETH1_MARKER_OFFSET,
+                DIRECT_ROOTFS_MMDS_ETH1_MARKER,
+                DIRECT_ROOTFS_MMDS_ETH1_FAILURE_MARKER,
+            ),
+        ];
+        if let Err(err) = wait_for_file_markers_at(
+            &data_backing_path,
+            &marker_expectations,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let eth0_prefix = file_bytes_at(
+                &data_backing_path,
+                DIRECT_ROOTFS_MMDS_ETH0_MARKER_OFFSET,
+                96,
+            );
+            let eth1_prefix = file_bytes_at(
+                &data_backing_path,
+                DIRECT_ROOTFS_MMDS_ETH1_MARKER_OFFSET,
+                96,
+            );
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not complete isolated multi-interface MMDS fetches: {err}; eth0 marker slot: {:?}; eth1 marker slot: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&eth0_prefix),
+                String::from_utf8_lossy(&eth1_prefix),
+                output.status,
+                output.stdout,
+                output.stderr
+            );
+        }
+
+        let flush_metrics_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"FlushMetrics"}"#,
+        );
+        assert_no_content_response(
+            &flush_metrics_response,
+            "PUT /actions FlushMetrics multi-interface MMDS guest fetch",
+        );
+        assert_multi_interface_network_metrics(&metrics_path, &["eth0", "eth1"]);
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang multi-interface MMDS direct rootfs",
+        );
+    }
+
+    #[test]
     fn signed_executable_serves_metadata_file_mmds_to_direct_rootfs_guest() {
         run_direct_rootfs_mmds_guest_fetch_test(DirectRootfsMmdsFetchCase {
             request_context: "metadata-file MMDS guest fetch",
@@ -4974,13 +5162,21 @@ mod macos_arm64 {
     }
 
     fn create_zeroed_block_backing(path: &Path) {
+        create_zeroed_block_backing_with_sectors(path, 1);
+    }
+
+    fn create_zeroed_block_backing_with_sectors(path: &Path, sectors: u64) {
+        let len = bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE
+            .checked_mul(sectors)
+            .expect("guest block backing sector count should not overflow");
+        assert!(len > 0, "guest block backing should not be empty");
         let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
             .expect("guest block backing should create");
-        file.set_len(bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE)
-            .expect("guest block backing should be one sector");
+        file.set_len(len)
+            .expect("guest block backing should have requested sectors");
     }
 
     fn create_pmem_backing(path: &Path, marker: &[u8]) {
@@ -5054,6 +5250,60 @@ mod macos_arm64 {
         assert!(
             !output.contains(r#""boot_run_loop_status":"failed""#),
             "metrics output should not report failed boot run-loop status; output:\n{output}"
+        );
+    }
+
+    fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str]) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "metrics output {} should be readable for multi-interface network metrics: {err}",
+                path.display()
+            )
+        });
+        let latest_line = output
+            .lines()
+            .rev()
+            .find(|line| !line.is_empty())
+            .unwrap_or_else(|| panic!("metrics output should contain a JSON line: {output}"));
+        let latest: serde_json::Value = serde_json::from_str(latest_line).unwrap_or_else(|err| {
+            panic!("latest metrics output line should be valid JSON: {err}; line:\n{latest_line}")
+        });
+
+        for iface_id in iface_ids {
+            let key = format!("net_{iface_id}");
+            let metrics = latest.get(&key).unwrap_or_else(|| {
+                panic!("latest metrics output should include {key}; line:\n{latest_line}")
+            });
+            for field in [
+                "rx_count",
+                "rx_packets_count",
+                "tx_count",
+                "tx_packets_count",
+            ] {
+                let value = metrics
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "latest metrics output should include numeric {key}.{field}; line:\n{latest_line}"
+                        )
+                    });
+                assert!(
+                    value > 0,
+                    "latest metrics output should report nonzero {key}.{field}; line:\n{latest_line}"
+                );
+            }
+            assert_eq!(
+                metrics
+                    .get("event_fails")
+                    .and_then(serde_json::Value::as_u64),
+                Some(0),
+                "latest metrics output should report no {key} event failures; line:\n{latest_line}"
+            );
+        }
+        assert!(
+            latest.get("mmds").is_some(),
+            "latest metrics output should include shared MMDS activity; line:\n{latest_line}"
         );
     }
 
@@ -5435,6 +5685,57 @@ mod macos_arm64 {
         }
     }
 
+    fn wait_for_file_markers_at(
+        path: &Path,
+        expectations: &[(u64, &[u8], &[u8])],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let file = fs::File::open(path).map_err(|err| {
+            format!(
+                "failed to open block backing {} for marker wait: {err}",
+                path.display()
+            )
+        })?;
+        let kqueue = Kqueue::new()?;
+        kqueue.watch_writes(&file)?;
+        let started_at = Instant::now();
+
+        loop {
+            let states = expectations
+                .iter()
+                .map(|(offset, success, failure)| {
+                    file_marker_state_at(path, *offset, success, failure)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if states
+                .iter()
+                .all(|state| *state != BlockMarkerState::Pending)
+            {
+                if states
+                    .iter()
+                    .all(|state| *state == BlockMarkerState::Success)
+                {
+                    return Ok(());
+                }
+
+                let offsets: Vec<_> = expectations.iter().map(|(offset, _, _)| *offset).collect();
+                return Err(format!(
+                    "observed terminal marker states {states:?} at offsets {offsets:?} in {}",
+                    path.display()
+                ));
+            }
+
+            let Some(remaining) = timeout.checked_sub(started_at.elapsed()) else {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for terminal marker states in {}; latest states: {states:?}",
+                    path.display()
+                ));
+            };
+
+            kqueue.wait_for_write(remaining)?;
+        }
+    }
+
     fn wait_for_file_prefix_marker(
         path: &Path,
         marker: &[u8],
@@ -5604,6 +5905,41 @@ mod macos_arm64 {
             )),
             Err(err) => Err(format!(
                 "failed to read EOF from Unix stream {}: {err}",
+                path.display()
+            )),
+        }
+    }
+
+    fn file_marker_state_at(
+        path: &Path,
+        offset: u64,
+        success: &[u8],
+        failure: &[u8],
+    ) -> Result<BlockMarkerState, String> {
+        if file_matches_marker_at(path, offset, success)? {
+            return Ok(BlockMarkerState::Success);
+        }
+        if file_matches_marker_at(path, offset, failure)? {
+            return Ok(BlockMarkerState::Failure);
+        }
+        Ok(BlockMarkerState::Pending)
+    }
+
+    fn file_matches_marker_at(path: &Path, offset: u64, marker: &[u8]) -> Result<bool, String> {
+        let mut file = fs::File::open(path)
+            .map_err(|err| format!("failed to open block backing {}: {err}", path.display()))?;
+        file.seek(SeekFrom::Start(offset)).map_err(|err| {
+            format!(
+                "failed to seek block backing {} to offset {offset}: {err}",
+                path.display()
+            )
+        })?;
+        let mut buffer = vec![0; marker.len()];
+        match file.read_exact(&mut buffer) {
+            Ok(()) => Ok(buffer == marker),
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(err) => Err(format!(
+                "failed to read block backing {} at offset {offset}: {err}",
                 path.display()
             )),
         }
