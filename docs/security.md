@@ -772,8 +772,10 @@ is resource-specific:
   write. The edge-rising SPI is asserted only afterward; signal failure means
   the new value is already committed and requires another complete replacement
   and notification or session discard, never a claimed rollback.
-- `/vsock` stores the configured Unix socket path during configuration. Startup
-  can attach a guest-visible virtio-vsock device whose internal MMIO handler
+- `/vsock` is an **implemented supported live virtio-MMIO/Unix-socket subset**
+  that stores the configured Unix socket path during repeatable pre-boot
+  configuration and stably rejects post-start replacement. Startup can attach a
+  guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the
   runtime has an internal Firecracker-shaped packet header model plus TX
   descriptor packet parser. Startup-level dispatch can drain RX, TX, and no-op
@@ -819,14 +821,28 @@ is resource-specific:
   guest `VSOCK_OP_CREDIT_UPDATE` packets for established retained streams are
   consumed without queuing a reset, and valid guest `VSOCK_OP_CREDIT_REQUEST`
   packets queue zero-payload guest-visible `VSOCK_OP_CREDIT_UPDATE` headers on
-  the existing RX path. Host-stream EOF or read failures drop the retained
-  stream and queue a guest-visible `VSOCK_OP_RST`.
+  the existing RX path. Each direction uses a dynamic 64-KiB credit window with
+  wrapping counters; queued data reserves credit before publication, forwarded
+  bytes release local credit, and exhausted peer credit requests an update
+  without unbounded buffering. Host-stream clean EOF queues a guest-visible
+  shutdown and a two-second terminal cleanup deadline after queued payloads
+  drain; terminal read/write failures queue a reset. Incomplete host requests
+  use the same two-second bounded-cleanup policy. Host- and guest-initiated
+  tables each retain at most 256 connections.
   Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
-  does not route CIDs beyond current host/guest checks, dispatch real event
-  payloads, implement Firecracker's full graceful-shutdown timeout/kill-queue
-  behavior, or implement full virtio-vsock credit accounting yet.
+  never treats a configured path as globally unique, and transport failures and
+  signed test diagnostics omit Unix paths and payload bytes. `EVENT_IDX` is
+  implemented for RX/TX notification suppression; indirect descriptors are a
+  supported bangbang extension, while the event queue otherwise remains a no-op
+  live notification surface. Signed Apple Silicon cases incrementally verify at
+  least 1 MiB in each direction for both initiation paths, write-half-close/EOF,
+  terminal cleanup, and two-stream isolation. PATCH, DELETE, runtime hotplug,
+  broader CID routing, general performance/artifact parity, and full event
+  payload dispatch remain outside this boundary. Native-v1 snapshot UDS
+  override, event-queue `TRANSPORT_RESET`, and post-restore RX gating are the
+  stable #543 exclusions; the live subset is not a snapshot-containment claim.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink. The `--metrics-path` startup CLI flag uses the same
   sink and host-path error redaction rules before the API socket is served.
@@ -1222,16 +1238,21 @@ The current scaffold does not implement:
   guest-visible reset. Valid guest `VSOCK_OP_CREDIT_UPDATE` packets for
   established retained streams are consumed without queuing a reset, and valid
   guest `VSOCK_OP_CREDIT_REQUEST` packets queue zero-payload guest-visible
-  `VSOCK_OP_CREDIT_UPDATE` headers on the existing RX path. Host-stream EOF or
-  read failures drop the retained stream before queuing a guest-visible reset.
+  `VSOCK_OP_CREDIT_UPDATE` headers on the existing RX path. Dynamic 64-KiB
+  credit windows use wrapping counters and bounded reservations; clean host EOF
+  queues shutdown after pending payloads, while terminal read/write failures
+  queue a reset. Request and shutdown cleanup are bounded to two seconds, and
+  each initiation direction retains at most 256 connections.
   Startup preparation
   creates a nonblocking host Unix listener at `uds_path` and cleans it up only
-  while the path still matches the created socket inode. It can accept event
-  queue notifications as no-op
-  dispatch metadata, but it still does not route CIDs beyond current host/guest
-  checks, dispatch real event payloads, implement Firecracker's full
-  graceful-shutdown timeout/kill-queue behavior, or implement full virtio-vsock
-  credit accounting.
+  while the path still matches the created socket inode. `EVENT_IDX` is active
+  on RX/TX, indirect descriptors are a supported bangbang extension, and event
+  queue notifications otherwise remain no-op dispatch metadata. This
+  **implemented supported live virtio-MMIO/Unix-socket subset** still is not full
+  containment: there is no global host-path broker, PATCH/DELETE/runtime
+  hotplug, broader CID routing, or full event payload dispatch. Native-v1
+  snapshot UDS override, event-queue `TRANSPORT_RESET`, and post-restore RX
+  gating remain #543 exclusions.
 - complete production logging or metrics policy
 - public run-loop control or serial input, rate-limiting, and streaming policy
 

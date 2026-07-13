@@ -6,7 +6,7 @@ use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -412,16 +412,24 @@ impl HvfArm64BootRunLoopStopToken {
 
 #[derive(Debug, Clone, Default)]
 struct HvfArm64BootRunLoopWakeupToken {
-    wakeup_requested: Arc<AtomicBool>,
+    pending_wakeups: Arc<AtomicUsize>,
 }
 
 impl HvfArm64BootRunLoopWakeupToken {
     fn request_wakeup(&self) {
-        self.wakeup_requested.store(true, Ordering::Relaxed);
+        let _ =
+            self.pending_wakeups
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                    Some(pending.saturating_add(1))
+                });
     }
 
     fn take_wakeup_request(&self) -> bool {
-        self.wakeup_requested.swap(false, Ordering::Relaxed)
+        self.pending_wakeups
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                pending.checked_sub(1)
+            })
+            .is_ok()
     }
 }
 
@@ -5760,10 +5768,6 @@ fn run_boot_session_loop_with_observer_inner(
             steps_completed: steps,
             source: Box::new(source),
         })?;
-        let canceled = matches!(outcome, HvfVcpuRunStepOutcome::Canceled);
-        if !canceled && !monitor_wakeup_requested {
-            let _ = session.take_run_loop_wakeup_request();
-        }
         observe_step(&outcome);
         steps += 1;
 
@@ -5818,7 +5822,10 @@ fn run_boot_session_loop_with_observer_inner(
                     }
                     continue;
                 }
-                return Ok(HvfArm64BootRunLoopOutcome::Canceled { steps });
+                if steps == max_steps {
+                    return Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { steps });
+                }
+                continue;
             }
             HvfVcpuRunStepOutcome::VtimerActivated => {
                 session.handle_run_loop_virtual_timer().map_err(|source| {
@@ -6096,8 +6103,9 @@ fn run_vsock_wakeup_monitor(
             }
         },
         || {
-            wakeup_token.request_wakeup();
-            let _ = vcpu_control.request_wakeup();
+            if vcpu_control.request_wakeup().is_ok() {
+                wakeup_token.request_wakeup();
+            }
         },
     )
 }
@@ -8082,6 +8090,19 @@ mod tests {
     const ARM64_IMAGE_TEXT_OFFSET_OFFSET: usize = 8;
 
     #[test]
+    fn vsock_run_loop_wakeup_token_retains_each_pending_request() {
+        let token = super::HvfArm64BootRunLoopWakeupToken::default();
+
+        assert!(!token.take_wakeup_request());
+        token.request_wakeup();
+        token.request_wakeup();
+
+        assert!(token.take_wakeup_request());
+        assert!(token.take_wakeup_request());
+        assert!(!token.take_wakeup_request());
+    }
+
+    #[test]
     fn vsock_wakeup_poll_timeout_rounds_up_and_clamps_absolute_deadline() {
         let now = Instant::now();
 
@@ -9426,7 +9447,7 @@ mod tests {
         request_stop_on_timer: Option<HvfArm64BootRunLoopStopToken>,
         request_network_retry_wakeup_on_run: bool,
         control_wakeup_requested: bool,
-        wakeup_requested: bool,
+        wakeup_request_count: usize,
         block_retry_wakeup_requested: bool,
         network_retry_wakeup_requested: bool,
         entropy_retry_wakeup_requested: bool,
@@ -9461,7 +9482,7 @@ mod tests {
                 request_stop_on_timer: None,
                 request_network_retry_wakeup_on_run: false,
                 control_wakeup_requested: false,
-                wakeup_requested: false,
+                wakeup_request_count: 0,
                 block_retry_wakeup_requested: false,
                 network_retry_wakeup_requested: false,
                 entropy_retry_wakeup_requested: false,
@@ -9496,7 +9517,7 @@ mod tests {
                 request_stop_on_timer: None,
                 request_network_retry_wakeup_on_run: false,
                 control_wakeup_requested: false,
-                wakeup_requested: false,
+                wakeup_request_count: 0,
                 block_retry_wakeup_requested: false,
                 network_retry_wakeup_requested: false,
                 entropy_retry_wakeup_requested: false,
@@ -9622,7 +9643,7 @@ mod tests {
         }
 
         const fn request_run_loop_wakeup(&mut self) {
-            self.wakeup_requested = true;
+            self.wakeup_request_count = self.wakeup_request_count.saturating_add(1);
         }
 
         const fn request_run_loop_block_retry_wakeup(&mut self) {
@@ -9655,7 +9676,7 @@ mod tests {
         > {
             let completed_wakeup = self.monitor_wakeup_results.pop_front().unwrap_or(false);
             if completed_wakeup {
-                self.wakeup_requested = true;
+                self.wakeup_request_count = self.wakeup_request_count.saturating_add(1);
             }
 
             Ok(super::HvfArm64BootRunLoopWakeupMonitor::completed_for_test(
@@ -9664,9 +9685,11 @@ mod tests {
         }
 
         fn take_run_loop_wakeup_request(&mut self) -> bool {
-            let wakeup_requested = self.wakeup_requested;
-            self.wakeup_requested = false;
-            wakeup_requested
+            let Some(remaining) = self.wakeup_request_count.checked_sub(1) else {
+                return false;
+            };
+            self.wakeup_request_count = remaining;
+            true
         }
 
         fn take_run_loop_control_wakeup_request(&mut self) -> bool {
@@ -14554,17 +14577,13 @@ mod tests {
     #[test]
     fn boot_session_run_loop_cancels_network_retry_for_every_terminal_outcome() {
         for step in [
-            HvfVcpuRunStepOutcome::Canceled,
             HvfVcpuRunStepOutcome::Unknown { reason: 99 },
             guest_shutdown_run_step_outcome(),
             guest_reset_run_step_outcome(),
         ] {
             let stop_token = HvfArm64BootRunLoopStopToken::new();
-            let publish_pending_wakeup = !matches!(step, HvfVcpuRunStepOutcome::Canceled);
             let mut session = RecordingBootSessionRunLoopSession::new([step]);
-            if publish_pending_wakeup {
-                session.request_network_retry_wakeup_on_run();
-            }
+            session.request_network_retry_wakeup_on_run();
 
             run_boot_session_loop(&mut session, &stop_token, max_steps(2))
                 .expect("terminal run-loop outcome should be returned");
@@ -14874,15 +14893,18 @@ mod tests {
     }
 
     #[test]
-    fn boot_session_run_loop_reports_canceled_without_stop_request() {
+    fn boot_session_run_loop_continues_after_unattributed_canceled_step() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session =
             RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
 
         let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
-            .expect("canceled loop should succeed");
+            .expect("unattributed canceled step should remain non-terminal");
 
-        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Canceled { steps: 1 });
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
         assert_eq!(session.events, ["run"]);
     }
 
@@ -15040,6 +15062,67 @@ mod tests {
         assert_eq!(
             session.events,
             ["run", "vsock-dispatch", "run", "vsock-dispatch"]
+        );
+    }
+
+    #[test]
+    fn boot_session_run_loop_keeps_wakeup_across_intervening_non_canceled_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([
+            hvc_run_step_outcome(),
+            hvc_run_step_outcome(),
+            HvfVcpuRunStepOutcome::Canceled,
+        ]);
+        session.push_monitor_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(3))
+            .expect("an intervening member outcome should not consume a pending wakeup");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 3 }
+        );
+        assert_eq!(
+            session.events,
+            [
+                "run",
+                "vsock-dispatch",
+                "run",
+                "vsock-dispatch",
+                "run",
+                "vsock-dispatch",
+            ]
+        );
+    }
+
+    #[test]
+    fn boot_session_run_loop_retains_each_wakeup_across_multiple_delayed_cancels() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([
+            hvc_run_step_outcome(),
+            HvfVcpuRunStepOutcome::Canceled,
+            HvfVcpuRunStepOutcome::Canceled,
+        ]);
+        session.push_monitor_wakeup();
+        session.push_monitor_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(3))
+            .expect("each delayed wakeup cancel should remain attributable");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 3 }
+        );
+        assert_eq!(
+            session.events,
+            [
+                "run",
+                "vsock-dispatch",
+                "run",
+                "vsock-dispatch",
+                "run",
+                "vsock-dispatch",
+            ]
         );
     }
 
