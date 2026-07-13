@@ -34,10 +34,14 @@ and later `CPU_ON` re-entry reuse the fixed owner topology. PSCI
 guest-unmasked EL1 virtual timer: affinity remains `ON`, all three call
 arguments are ignored, the timer PPI is made pending before `SUCCESS`, and
 lifecycle cancellation rearms the same transaction without fabricating a
-wake. FDT idle-state discovery and SGI/SPI/direct IRQ/FIQ wake are not exposed.
-Dynamic CPU topology, SMT, non-`None` CPU templates, and cross-host CPU
-portability remain unsupported. The native-v1 snapshot profile below remains
-restricted to exactly one vCPU.
+wake. Runtime discovery reports PSCI 1.0 and a minimal safe SMCCC 1.1 surface:
+`PSCI_FEATURES` advertises only delivered calls, `SMCCC_ARCH_FEATURES` reports
+only its mandatory VERSION/self results, and optional firmware services remain
+unsupported. The FDT deliberately keeps Firecracker v1.15.1's
+`arm,psci-0.2`/HVC binding. FDT idle-state discovery and SGI/SPI/direct IRQ/FIQ
+wake are not exposed. Dynamic CPU topology, SMT, non-`None` CPU templates, and
+cross-host CPU portability remain unsupported. The native-v1 snapshot profile
+below remains restricted to exactly one vCPU.
 
 Firecracker-shaped `PUT /cpu-config` input is fully syntax-validated. Empty
 custom templates remain successful no-ops; non-empty KVM capability,

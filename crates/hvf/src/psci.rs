@@ -14,7 +14,10 @@ const PSCI_FEATURES: u64 = 0x8400_000a;
 const PSCI_CPU_SUSPEND_64: u64 = 0xc400_0001;
 const PSCI_CPU_ON_64: u64 = 0xc400_0003;
 const PSCI_AFFINITY_INFO_64: u64 = 0xc400_0004;
-const PSCI_VERSION_0_2: u64 = 0x0000_0002;
+const ARM_SMCCC_VERSION: u64 = 0x8000_0000;
+const ARM_SMCCC_ARCH_FEATURES: u64 = 0x8000_0001;
+const PSCI_VERSION_1_0: u64 = 0x0001_0000;
+const ARM_SMCCC_VERSION_1_1: u64 = 0x0001_0001;
 const PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED: u64 = 2;
 const PSCI_MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
 const PSCI_MPIDR_32_RESERVED_MASK: u64 = 0xff00_0000;
@@ -44,16 +47,82 @@ impl PsciCall {
 }
 
 pub(crate) const fn call_uses_arg0(function_id: u64) -> bool {
-    matches!(function_id, PSCI_FEATURES)
+    matches!(function_id, PSCI_FEATURES | ARM_SMCCC_ARCH_FEATURES)
 }
 
 pub(crate) const fn coordinated_call_argument_count(function_id: u64) -> usize {
     match function_id {
         PSCI_CPU_SUSPEND_32 | PSCI_CPU_SUSPEND_64 | PSCI_CPU_ON_32 | PSCI_CPU_ON_64 => 3,
         PSCI_AFFINITY_INFO_32 | PSCI_AFFINITY_INFO_64 => 2,
-        PSCI_FEATURES => 1,
+        PSCI_FEATURES | ARM_SMCCC_ARCH_FEATURES => 1,
         _ => 0,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PsciFeatureAvailability {
+    Immediate,
+    Coordinated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PsciFunctionFeatures {
+    flags: u64,
+    availability: PsciFeatureAvailability,
+}
+
+impl PsciFunctionFeatures {
+    const fn immediate(flags: u64) -> Self {
+        Self {
+            flags,
+            availability: PsciFeatureAvailability::Immediate,
+        }
+    }
+
+    const fn coordinated(flags: u64) -> Self {
+        Self {
+            flags,
+            availability: PsciFeatureAvailability::Coordinated,
+        }
+    }
+
+    const fn requires_coordination(self) -> bool {
+        matches!(self.availability, PsciFeatureAvailability::Coordinated)
+    }
+
+    const fn available(self, coordinated: bool) -> bool {
+        !self.requires_coordination() || coordinated
+    }
+}
+
+const fn psci_function_features(function_id: u64) -> Option<PsciFunctionFeatures> {
+    match function_id {
+        PSCI_VERSION
+        | PSCI_MIGRATE_INFO_TYPE
+        | PSCI_SYSTEM_OFF
+        | PSCI_SYSTEM_RESET
+        | PSCI_FEATURES
+        | ARM_SMCCC_VERSION => Some(PsciFunctionFeatures::immediate(0)),
+        PSCI_CPU_SUSPEND_32
+        | PSCI_CPU_SUSPEND_64
+        | PSCI_CPU_OFF
+        | PSCI_CPU_ON_32
+        | PSCI_CPU_ON_64
+        | PSCI_AFFINITY_INFO_32
+        | PSCI_AFFINITY_INFO_64 => Some(PsciFunctionFeatures::coordinated(0)),
+        _ => None,
+    }
+}
+
+const fn advertised_psci_features(function_id: u64, coordinated: bool) -> Option<u64> {
+    match psci_function_features(function_id) {
+        Some(features) if features.available(coordinated) => Some(features.flags),
+        Some(_) | None => None,
+    }
+}
+
+const fn narrow_u32(value: u64) -> u64 {
+    (value as u32) as u64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,8 +194,29 @@ impl PsciCallResult {
 }
 
 pub(crate) const fn handle_call(call: PsciCall) -> PsciCallResult {
+    if call.function_id != ARM_SMCCC_ARCH_FEATURES {
+        let Some(features) = psci_function_features(call.function_id) else {
+            return not_supported_result();
+        };
+        if features.requires_coordination() {
+            return not_supported_result();
+        }
+    }
+
     match call.function_id {
-        PSCI_VERSION => PsciCallResult::returned(PSCI_VERSION_0_2),
+        PSCI_VERSION => PsciCallResult::returned(PSCI_VERSION_1_0),
+        ARM_SMCCC_VERSION => PsciCallResult::returned(ARM_SMCCC_VERSION_1_1),
+        ARM_SMCCC_ARCH_FEATURES => {
+            let status = if matches!(
+                narrow_u32(call.arg0),
+                ARM_SMCCC_VERSION | ARM_SMCCC_ARCH_FEATURES
+            ) {
+                PsciStatus::Success
+            } else {
+                PsciStatus::NotSupported
+            };
+            PsciCallResult::returned(status.return_value())
+        }
         PSCI_MIGRATE_INFO_TYPE => {
             PsciCallResult::returned(PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED)
         }
@@ -139,37 +229,14 @@ pub(crate) const fn handle_call(call: PsciCall) -> PsciCallResult {
             PsciCallAction::SystemReset,
         ),
         PSCI_FEATURES => {
-            let status = if supports_legacy_function(call.arg0) {
-                PsciStatus::Success
-            } else {
-                PsciStatus::NotSupported
+            let return_value = match advertised_psci_features(narrow_u32(call.arg0), false) {
+                Some(flags) => flags,
+                None => PsciStatus::NotSupported.return_value(),
             };
-            PsciCallResult::returned(status.return_value())
+            PsciCallResult::returned(return_value)
         }
-        PSCI_CPU_OFF => not_supported_result(),
         _ => not_supported_result(),
     }
-}
-
-const fn supports_legacy_function(function_id: u64) -> bool {
-    matches!(
-        function_id,
-        PSCI_VERSION | PSCI_MIGRATE_INFO_TYPE | PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET | PSCI_FEATURES
-    )
-}
-
-const fn supports_coordinated_function(function_id: u64) -> bool {
-    supports_legacy_function(function_id)
-        || matches!(
-            function_id,
-            PSCI_CPU_SUSPEND_32
-                | PSCI_CPU_SUSPEND_64
-                | PSCI_CPU_OFF
-                | PSCI_CPU_ON_32
-                | PSCI_CPU_ON_64
-                | PSCI_AFFINITY_INFO_32
-                | PSCI_AFFINITY_INFO_64
-        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,12 +375,22 @@ pub(crate) enum PsciCoordinatedDispatch {
 
 pub(crate) const fn handle_coordinated_call(call: PsciCall) -> PsciCoordinatedDispatch {
     if call.function_id == PSCI_FEATURES {
-        let status = if supports_coordinated_function(call.arg0) {
-            PsciStatus::Success
-        } else {
-            PsciStatus::NotSupported
+        let return_value = match advertised_psci_features(narrow_u32(call.arg0), true) {
+            Some(flags) => flags,
+            None => PsciStatus::NotSupported.return_value(),
         };
-        return PsciCoordinatedDispatch::Immediate(PsciCallResult::returned(status.return_value()));
+        return PsciCoordinatedDispatch::Immediate(PsciCallResult::returned(return_value));
+    }
+
+    if call.function_id == ARM_SMCCC_ARCH_FEATURES {
+        return PsciCoordinatedDispatch::Immediate(handle_call(call));
+    }
+
+    let Some(features) = psci_function_features(call.function_id) else {
+        return PsciCoordinatedDispatch::Immediate(not_supported_result());
+    };
+    if !features.requires_coordination() {
+        return PsciCoordinatedDispatch::Immediate(handle_call(call));
     }
 
     if call.function_id == PSCI_CPU_OFF {
@@ -367,7 +444,7 @@ pub(crate) const fn handle_coordinated_call(call: PsciCall) -> PsciCoordinatedDi
                 },
             ))
         }
-        _ => PsciCoordinatedDispatch::Immediate(handle_call(call)),
+        _ => PsciCoordinatedDispatch::Immediate(not_supported_result()),
     }
 }
 
@@ -1052,10 +1129,11 @@ impl PsciCpuPowerCoordinator {
 #[cfg(test)]
 mod tests {
     use super::{
-        PSCI_AFFINITY_INFO_32, PSCI_AFFINITY_INFO_64, PSCI_CPU_OFF, PSCI_CPU_ON_32, PSCI_CPU_ON_64,
-        PSCI_CPU_SUSPEND_32, PSCI_CPU_SUSPEND_64, PSCI_FEATURES, PSCI_MIGRATE_INFO_TYPE,
+        ARM_SMCCC_ARCH_FEATURES, ARM_SMCCC_VERSION, ARM_SMCCC_VERSION_1_1, PSCI_AFFINITY_INFO_32,
+        PSCI_AFFINITY_INFO_64, PSCI_CPU_OFF, PSCI_CPU_ON_32, PSCI_CPU_ON_64, PSCI_CPU_SUSPEND_32,
+        PSCI_CPU_SUSPEND_64, PSCI_FEATURES, PSCI_MIGRATE_INFO_TYPE,
         PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED, PSCI_SYSTEM_OFF, PSCI_SYSTEM_RESET,
-        PSCI_VERSION, PSCI_VERSION_0_2, PsciAffinityInfoRequest, PsciAffinityInfoResponse,
+        PSCI_VERSION, PSCI_VERSION_1_0, PsciAffinityInfoRequest, PsciAffinityInfoResponse,
         PsciCall, PsciCallAction, PsciCoordinatedDispatch, PsciCoordinatorRequest, PsciCpuOffBegin,
         PsciCpuOffResponse, PsciCpuOnBegin, PsciCpuOnRequest, PsciCpuOnResponse,
         PsciCpuPowerCoordinator, PsciCpuPowerError, PsciCpuPowerState, PsciCpuSuspendToken,
@@ -1111,10 +1189,14 @@ mod tests {
     }
 
     #[test]
-    fn preserves_legacy_psci_version_migration_and_terminal_actions() {
+    fn reports_psci_1_0_smccc_1_1_and_preserves_existing_immediate_actions() {
         assert_eq!(
             handle_call(PsciCall::new(PSCI_VERSION, 0)).return_value(),
-            PSCI_VERSION_0_2
+            PSCI_VERSION_1_0
+        );
+        assert_eq!(
+            handle_call(PsciCall::new(ARM_SMCCC_VERSION, 0)).return_value(),
+            ARM_SMCCC_VERSION_1_1
         );
         assert_eq!(
             handle_call(PsciCall::new(PSCI_MIGRATE_INFO_TYPE, 0)).return_value(),
@@ -1130,7 +1212,50 @@ mod tests {
     }
 
     #[test]
-    fn legacy_features_and_cpu_power_calls_stay_unsupported() {
+    fn smccc_arch_features_exposes_only_the_mandatory_minimum() {
+        for function_id in [ARM_SMCCC_VERSION, ARM_SMCCC_ARCH_FEATURES] {
+            assert_eq!(
+                handle_call(PsciCall::new(ARM_SMCCC_ARCH_FEATURES, function_id)).return_value(),
+                PsciStatus::Success.return_value()
+            );
+            assert_eq!(
+                handle_call(PsciCall::new(
+                    ARM_SMCCC_ARCH_FEATURES,
+                    0xfeed_face_0000_0000 | function_id,
+                ))
+                .return_value(),
+                PsciStatus::Success.return_value()
+            );
+        }
+
+        for function_id in [0x8000_0002, 0x8000_7fff, 0x8000_8000, 0xc000_0000] {
+            assert_eq!(
+                handle_call(PsciCall::new(ARM_SMCCC_ARCH_FEATURES, function_id)).return_value(),
+                PsciStatus::NotSupported.return_value()
+            );
+            assert_eq!(
+                handle_call(PsciCall::new(function_id, 0)).return_value(),
+                PsciStatus::NotSupported.return_value()
+            );
+        }
+    }
+
+    #[test]
+    fn immediate_features_advertise_only_immediate_calls() {
+        for function_id in [
+            PSCI_VERSION,
+            PSCI_MIGRATE_INFO_TYPE,
+            PSCI_SYSTEM_OFF,
+            PSCI_SYSTEM_RESET,
+            PSCI_FEATURES,
+            ARM_SMCCC_VERSION,
+        ] {
+            assert_eq!(
+                handle_call(PsciCall::new(PSCI_FEATURES, function_id)).return_value(),
+                0
+            );
+        }
+
         for function_id in [
             PSCI_CPU_SUSPEND_32,
             PSCI_CPU_SUSPEND_64,
@@ -1147,11 +1272,25 @@ mod tests {
                 PsciStatus::NotSupported.return_value()
             );
         }
+
+        assert_eq!(
+            handle_call(PsciCall::new(PSCI_FEATURES, ARM_SMCCC_ARCH_FEATURES)).return_value(),
+            PsciStatus::NotSupported.return_value()
+        );
+        assert_eq!(
+            handle_call(PsciCall::new(
+                PSCI_FEATURES,
+                0xfeed_face_0000_0000 | ARM_SMCCC_VERSION,
+            ))
+            .return_value(),
+            0
+        );
     }
 
     #[test]
-    fn coordinated_features_advertise_cpu_off_cpu_on_and_affinity_info() {
+    fn coordinated_features_match_the_complete_delivered_psci_1_0_matrix() {
         for function_id in [
+            PSCI_VERSION,
             PSCI_CPU_SUSPEND_32,
             PSCI_CPU_SUSPEND_64,
             PSCI_CPU_OFF,
@@ -1159,21 +1298,65 @@ mod tests {
             PSCI_CPU_ON_64,
             PSCI_AFFINITY_INFO_32,
             PSCI_AFFINITY_INFO_64,
+            PSCI_MIGRATE_INFO_TYPE,
+            PSCI_SYSTEM_OFF,
+            PSCI_SYSTEM_RESET,
+            PSCI_FEATURES,
+            ARM_SMCCC_VERSION,
         ] {
             let PsciCoordinatedDispatch::Immediate(result) =
                 handle_coordinated_call(PsciCall::new(PSCI_FEATURES, function_id))
             else {
                 panic!("PSCI_FEATURES should complete immediately");
             };
-            assert_eq!(result.return_value(), PsciStatus::Success.return_value());
+            assert_eq!(result.return_value(), 0);
+        }
+
+        for function_id in [
+            ARM_SMCCC_ARCH_FEATURES,
+            0x8400_0005, // MIGRATE32
+            0xc400_0005, // MIGRATE64
+            0x8400_0007, // MIGRATE_INFO_UP_CPU32
+            0xc400_0007, // MIGRATE_INFO_UP_CPU64
+            0x8400_000b, // CPU_FREEZE
+            0x8400_000c, // CPU_DEFAULT_SUSPEND32
+            0xc400_000c, // CPU_DEFAULT_SUSPEND64
+            0x8400_000d, // NODE_HW_STATE32
+            0xc400_000d, // NODE_HW_STATE64
+            0x8400_000e, // SYSTEM_SUSPEND32
+            0xc400_000e, // SYSTEM_SUSPEND64
+            0x8400_000f, // PSCI_SET_SUSPEND_MODE
+            0x8400_0010, // PSCI_STAT_RESIDENCY32
+            0xc400_0010, // PSCI_STAT_RESIDENCY64
+            0x8400_0011, // PSCI_STAT_COUNT32
+            0xc400_0011, // PSCI_STAT_COUNT64
+            0x8400_0012, // SYSTEM_RESET2_32
+            0xc400_0012, // SYSTEM_RESET2_64
+            0x8400_0013, // MEM_PROTECT
+            0x8400_0014, // MEM_PROTECT_CHECK_RANGE32
+            0xc400_0014, // MEM_PROTECT_CHECK_RANGE64
+            0xdead_beef,
+        ] {
+            let PsciCoordinatedDispatch::Immediate(result) =
+                handle_coordinated_call(PsciCall::new(PSCI_FEATURES, function_id))
+            else {
+                panic!("PSCI_FEATURES should complete immediately");
+            };
+            assert_eq!(
+                result.return_value(),
+                PsciStatus::NotSupported.return_value()
+            );
         }
     }
 
     #[test]
-    fn identifies_legacy_and_coordinated_argument_counts() {
+    fn identifies_immediate_and_coordinated_argument_counts() {
         assert!(call_uses_arg0(PSCI_FEATURES));
+        assert!(call_uses_arg0(ARM_SMCCC_ARCH_FEATURES));
         assert!(!call_uses_arg0(PSCI_CPU_ON_32));
         assert_eq!(coordinated_call_argument_count(PSCI_VERSION), 0);
+        assert_eq!(coordinated_call_argument_count(ARM_SMCCC_VERSION), 0);
+        assert_eq!(coordinated_call_argument_count(ARM_SMCCC_ARCH_FEATURES), 1);
         assert_eq!(coordinated_call_argument_count(PSCI_CPU_OFF), 0);
         assert_eq!(coordinated_call_argument_count(PSCI_CPU_SUSPEND_32), 3);
         assert_eq!(coordinated_call_argument_count(PSCI_CPU_SUSPEND_64), 3);

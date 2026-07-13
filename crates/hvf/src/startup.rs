@@ -8462,7 +8462,7 @@ mod tests {
     const PSCI_VERSION: u64 = 0x8400_0000;
     const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
     const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
-    const PSCI_VERSION_0_2: u64 = 0x0000_0002;
+    const PSCI_VERSION_1_0: u64 = 0x0001_0000;
     const PSCI_RET_SUCCESS: u64 = 0;
     const TEST_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_4000);
     const TEST_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
@@ -9283,7 +9283,7 @@ mod tests {
         HvfVcpuRunStepOutcome::Hvc {
             exit: hvc_exit(0),
             function_id: PSCI_VERSION,
-            return_value: PSCI_VERSION_0_2,
+            return_value: PSCI_VERSION_1_0,
         }
     }
 
