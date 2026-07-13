@@ -131,8 +131,10 @@ Public process startup now uses this capability for the host-limited range
 profile. Guest CPU off/re-entry does not change public topology; `CPU_SUSPEND`
 is limited to retained EL1 virtual-timer wake without FDT idle-state discovery;
 dynamic CPU add/remove and writable CPU-template feature configuration remain
-deferred. Firecracker delegates equivalent PSCI 0.2 behavior to KVM; bangbang
-coordinates it explicitly above Hypervisor.framework's per-vCPU owner threads.
+deferred. Firecracker v1.15.1 enables KVM's PSCI 0.2 vCPU feature while KVM
+exposes its latest compatible PSCI 1.0 revision; bangbang matches that runtime
+contract and coordinates it explicitly above Hypervisor.framework's per-vCPU
+owner threads.
 
 ## Internal Concurrent vCPU Run Coordination
 
@@ -1410,27 +1412,34 @@ descriptors. The optional RTC node uses Firecracker's aarch64 PL031 shape with
 `clock-names = "apb_pclk"`, and intentionally omits `interrupts` because the
 minimal RTC device does not implement alarm interrupts. PCI and other device
 nodes remain deferred until the corresponding emulation paths exist.
-Because the FDT advertises PSCI with `method = "hvc"`, the HVF backend decodes
-arm64 HVC exception exits and handles `HVC #0` through its PSCI 0.2 responder.
-The aggregate boot-session path coordinates `CPU_SUSPEND32/64`, `CPU_ON32/64`,
-`CPU_OFF`, and `AFFINITY_INFO32/64` against the ordered topology; the immediate responder
-returns `PSCI_VERSION`, reports feature support for implemented calls, returns
-`MIGRATE_INFO_TYPE` as the PSCI value for a trusted OS that is MP-capable or
-not present, where migration is not required, and translates `SYSTEM_OFF` and
-`SYSTEM_RESET` into guest-requested terminal boot run-loop outcomes. Successful
+The FDT deliberately retains Firecracker v1.15.1's `arm,psci-0.2` compatible
+string and `method = "hvc"`. As in that Firecracker/KVM baseline, the runtime
+`PSCI_VERSION` call reports PSCI 1.0. The HVF backend decodes arm64 HVC
+exception exits and handles `HVC #0` through one PSCI/SMCCC responder. The
+aggregate boot-session path coordinates `CPU_SUSPEND32/64`, `CPU_ON32/64`,
+`CPU_OFF`, and `AFFINITY_INFO32/64` against the ordered topology. The immediate
+path returns `MIGRATE_INFO_TYPE` as the PSCI value for a trusted OS that is
+MP-capable or not present, where migration is not required, and translates
+`SYSTEM_OFF` and `SYSTEM_RESET` into guest-requested terminal boot run-loop
+outcomes. `PSCI_FEATURES` returns zero only for the delivered PSCI functions
+and `SMCCC_VERSION`; both CPU_SUSPEND IDs therefore declare original
+power-state format and platform-coordinated mode. `SMCCC_VERSION` reports 1.1,
+and its mandatory `SMCCC_ARCH_FEATURES` query returns success only for VERSION
+and itself. Optional architecture workarounds, SoC ID, KVM paravirtual time,
+vendor calls, and TRNG remain safely unsupported. Successful
 `CPU_OFF` does not return to the caller or write X0; the last committed online
 CPU receives `DENIED`. `CPU_SUSPEND` retains the caller's context and power
 affinity, deliberately ignores all three ABI arguments like KVM's retained
 standby path, and defers X0 `SUCCESS` until the caller's enabled,
 guest-unmasked EL1 virtual timer becomes due and its PPI is pending. Wakeup and
 pause cancellation keep the exact call pending for rearm; stop, shutdown, and
-terminal drains do not synthesize success. PSCI remains version 0.2, the FDT
-does not publish CPU idle states, and SGI/SPI/direct IRQ/FIQ wake is outside
-this timer-only subset. Other unsupported PSCI calls and HVC immediates write
-`NOT_SUPPORTED` to X0.
+terminal drains do not synthesize success. The FDT does not publish CPU idle
+states, and SGI/SPI/direct IRQ/FIQ wake is outside this timer-only subset.
+Optional PSCI 1.0 power/statistics calls, PSCI 1.1+, other unsupported firmware
+calls, and nonzero HVC immediates write `NOT_SUPPORTED` to X0.
 Early boot also traps the guest's `OSDLR_EL1` and `OSLAR_EL1` OS lock
 system-register accesses through the AArch64 SYS64 exception class (`0x18`),
-not through SMC/SMCCC. The HVF runner handles only those observed
+not through SMCCC. The HVF runner handles only those observed
 debug-register accesses with KVM-like RAZ/WI semantics: reads return zero,
 writes are ignored, and other trapped system registers still fail closed.
 

@@ -99,7 +99,21 @@ AFFINITY_INFO checkpoint while CPU1 has made no post-call progress, then CPU1
 must complete two real virtual-timer suspend cycles with preserved non-result
 register sentinels. Use guest publications, observed run-loop steps, and a
 bounded watchdog rather than fixed sleeps. Do not claim FDT idle discovery,
-SGI/SPI/direct IRQ/FIQ wake, PSCI 1.0, or powerdown resume from this gate.
+SGI/SPI/direct IRQ/FIQ wake, discovery revision changes, or powerdown resume
+from this gate.
+
+PSCI 1.0 discovery validation is a separate gate after CPU_OFF/re-entry and
+CPU_SUSPEND retention pass. Table tests must cover every advertised PSCI ID,
+both CPU_SUSPEND feature values, optional PSCI 1.0 and PSCI 1.1+ exclusions,
+SMCCC_VERSION, mandatory SMCCC_ARCH_FEATURES VERSION/self queries, optional
+architecture IDs, unknown calls, 32-bit zero extension, and direct versus
+coordinated availability. Runner tests must prove exact X1 reads and X0 writes
+without deferred PSCI work while preserving nonzero-HVC rejection. The signed
+one-vCPU guest stores the complete supported/unsupported query table and both
+revision results in guest memory before SYSTEM_OFF; drive it with observed
+steps and a bounded watchdog, never fixed sleeps. Retain the Firecracker
+`arm,psci-0.2` FDT binding and do not infer host mitigation, KVM PV/vendor,
+TRNG, PSCI 1.1+, or optional power-service support from this gate.
 
 Validation for internal PSCI secondary-power changes must cover both CPU_ON calling
 conventions, exact X1-X3 reads and 32-bit truncation, MPIDR reserved-bit

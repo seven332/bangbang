@@ -8188,7 +8188,10 @@ pub(crate) mod tests {
     const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
     const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
     const PSCI_FEATURES: u64 = 0x8400_000a;
-    const PSCI_VERSION_0_2: u64 = 0x0000_0002;
+    const ARM_SMCCC_VERSION: u64 = 0x8000_0000;
+    const ARM_SMCCC_ARCH_FEATURES: u64 = 0x8000_0001;
+    const PSCI_VERSION_1_0: u64 = 0x0001_0000;
+    const ARM_SMCCC_VERSION_1_1: u64 = 0x0001_0001;
     const PSCI_RET_SUCCESS: u64 = 0;
     const PSCI_RET_NOT_SUPPORTED: u64 = 0xffff_ffff;
     const GIC_DEVICE_STATE_TEST_BYTES: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
@@ -33699,6 +33702,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn coordinated_smccc_arch_features_reads_one_argument_without_deferred_work() {
+        for queried_function in [ARM_SMCCC_VERSION, ARM_SMCCC_ARCH_FEATURES, 0x8000_8000] {
+            let expected = if matches!(
+                queried_function,
+                ARM_SMCCC_VERSION | ARM_SMCCC_ARCH_FEATURES
+            ) {
+                PSCI_RET_SUCCESS
+            } else {
+                PSCI_RET_NOT_SUPPORTED
+            };
+            let (runner, register_read_receiver, register_write_receiver) =
+                start_coordinated_psci_run_step_recording_runner(
+                    ARM_SMCCC_ARCH_FEATURES,
+                    [queried_function, 0xfeed_face, 0xcafe_beef],
+                    0,
+                    false,
+                );
+
+            assert_eq!(
+                runner.run_once_and_handle_mmio_coordinated(shared_dispatcher()),
+                Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                    HvfVcpuRunStepOutcome::Hvc {
+                        exit: hvc_exit(0),
+                        function_id: ARM_SMCCC_ARCH_FEATURES,
+                        return_value: expected,
+                    }
+                ))
+            );
+            assert_eq!(
+                register_read_receiver.try_iter().collect::<Vec<_>>(),
+                vec![HvfRegister::X0, HvfRegister::X1]
+            );
+            assert_eq!(
+                register_write_receiver
+                    .recv()
+                    .expect("SMCCC_ARCH_FEATURES should write X0"),
+                (HvfRegister::X0, expected)
+            );
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
     fn deferred_psci_completion_retries_x0_write_without_repeating_run() {
         let (runner, _, register_write_receiver) = start_coordinated_psci_run_step_recording_runner(
             PSCI_CPU_ON,
@@ -33817,7 +33863,8 @@ pub(crate) mod tests {
     #[test]
     fn coordinated_immediate_and_nonzero_hvc_calls_do_not_read_extra_arguments() {
         for (function_id, immediate, return_value) in [
-            (PSCI_VERSION, 0, PSCI_VERSION_0_2),
+            (PSCI_VERSION, 0, PSCI_VERSION_1_0),
+            (ARM_SMCCC_VERSION, 0, ARM_SMCCC_VERSION_1_1),
             (PSCI_CPU_ON, 1, PSCI_RET_NOT_SUPPORTED),
         ] {
             let (runner, register_read_receiver, register_write_receiver) =
@@ -33999,7 +34046,7 @@ pub(crate) mod tests {
             Ok(HvfVcpuRunStepOutcome::Hvc {
                 exit: hvc_exit(0),
                 function_id: PSCI_VERSION,
-                return_value: PSCI_VERSION_0_2,
+                return_value: PSCI_VERSION_1_0,
             })
         );
         drop(dispatcher_guard);
@@ -34007,7 +34054,7 @@ pub(crate) mod tests {
             register_write_receiver
                 .recv()
                 .expect("PSCI HVC should write X0"),
-            (HvfRegister::X0, PSCI_VERSION_0_2)
+            (HvfRegister::X0, PSCI_VERSION_1_0)
         );
         assert_eq!(
             register_write_receiver.try_recv(),
@@ -34020,7 +34067,7 @@ pub(crate) mod tests {
     #[test]
     fn run_once_and_handle_mmio_reads_psci_features_argument() {
         let (runner, register_write_receiver) =
-            start_psci_run_step_recording_runner(PSCI_FEATURES, PSCI_VERSION);
+            start_psci_run_step_recording_runner(PSCI_FEATURES, ARM_SMCCC_VERSION);
 
         assert_eq!(
             runner.run_once_and_handle_mmio(shared_dispatcher()),
@@ -34035,6 +34082,75 @@ pub(crate) mod tests {
                 .recv()
                 .expect("PSCI_FEATURES should write X0"),
             (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_reports_smccc_1_1_without_reading_x1() {
+        let (runner, register_write_receiver) = start_psci_run_step_recording_runner_with_x1(
+            ARM_SMCCC_VERSION,
+            Err(BackendError::InvalidState("X1 should not be read")),
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(0),
+                function_id: ARM_SMCCC_VERSION,
+                return_value: ARM_SMCCC_VERSION_1_1,
+            })
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("SMCCC_VERSION should write X0"),
+            (HvfRegister::X0, ARM_SMCCC_VERSION_1_1)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_reads_smccc_arch_features_argument() {
+        let (runner, register_write_receiver) =
+            start_psci_run_step_recording_runner(ARM_SMCCC_ARCH_FEATURES, ARM_SMCCC_VERSION);
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(0),
+                function_id: ARM_SMCCC_ARCH_FEATURES,
+                return_value: PSCI_RET_SUCCESS,
+            })
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("SMCCC_ARCH_FEATURES should write X0"),
+            (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_propagates_smccc_arch_features_x1_read_failure() {
+        let (runner, register_write_receiver) = start_psci_run_step_recording_runner_with_x1(
+            ARM_SMCCC_ARCH_FEATURES,
+            Err(BackendError::InvalidState("fake SMCCC X1 read failed")),
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake SMCCC X1 read failed"
+            )))
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
         );
 
         runner.shutdown().expect("runner should shut down");

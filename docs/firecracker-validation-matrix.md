@@ -499,7 +499,21 @@ suspended scheduling, cancellation debt, and session teardown. The signed
 two-vCPU bare guest proves CPU0 can observe CPU1 as `ON` while CPU1 makes no
 post-call progress, then proves two real timer wakes preserve non-result
 context and return success without fixed sleeps. FDT idle-state discovery,
-SGI/SPI/direct IRQ/FIQ wake, PSCI 1.0, and powerdown resume remain deferred.
+SGI/SPI/direct IRQ/FIQ wake and powerdown resume remain deferred.
+
+#1300 completes the dependency-ordered PSCI discovery layer after the power
+calls are real. `PSCI_VERSION` reports 1.0, and one metadata table defines the
+exact `PSCI_FEATURES` matrix plus immediate/coordinated availability; both
+CPU_SUSPEND IDs return zero feature bits for original power-state format and
+platform-coordinated mode. The retained
+Firecracker v1.15.1 `arm,psci-0.2`/HVC FDT binding discovers that runtime
+revision just as its KVM baseline does. `SMCCC_VERSION` reports 1.1 with the
+mandatory minimum `SMCCC_ARCH_FEATURES` VERSION/self results; optional
+architecture workarounds, SoC ID, KVM PV/vendor calls, and TRNG remain
+unsupported. Unit coverage exhausts supported and excluded IDs, runner reads
+and writes, unknown calls, and nonzero HVC immediates. A signed one-vCPU bare
+guest stores 36 feature-query results plus both version and architecture
+discovery results before terminating through SYSTEM_OFF without fixed sleeps.
 
 ## Update Rule
 

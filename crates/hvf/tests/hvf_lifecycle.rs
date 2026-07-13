@@ -4073,7 +4073,7 @@ fn psci_cpu_suspend_retains_context_until_two_virtual_timer_wakeups() {
             } => suspend_completions += 1,
             HvfVcpuRunStepOutcome::Hvc {
                 function_id: PSCI_VERSION,
-                return_value: 2,
+                return_value: 0x0001_0000,
                 ..
             } => {
                 peer_checkpoint_seen = true;
@@ -4112,6 +4112,283 @@ fn psci_cpu_suspend_retains_context_until_two_virtual_timer_wakeups() {
     session
         .shutdown()
         .expect("CPU_SUSPEND session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use bangbang_hvf::{
+        HvfArm64BootRunLoopOutcome, HvfArm64BootSessionConfig, HvfVcpuRunStepOutcome,
+        OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    const RESULTS_OFFSET: u64 = 0x1000;
+    const QUERIES_OFFSET: u64 = 0x2000;
+    const NOT_SUPPORTED: u64 = 0x0000_0000_ffff_ffff;
+    const FEATURE_QUERIES: [(u32, u64); 36] = [
+        (0x8400_0000, 0),             // PSCI_VERSION
+        (0x8400_0001, 0),             // CPU_SUSPEND32
+        (0xc400_0001, 0),             // CPU_SUSPEND64
+        (0x8400_0002, 0),             // CPU_OFF
+        (0x8400_0003, 0),             // CPU_ON32
+        (0xc400_0003, 0),             // CPU_ON64
+        (0x8400_0004, 0),             // AFFINITY_INFO32
+        (0xc400_0004, 0),             // AFFINITY_INFO64
+        (0x8400_0006, 0),             // MIGRATE_INFO_TYPE
+        (0x8400_0008, 0),             // SYSTEM_OFF
+        (0x8400_0009, 0),             // SYSTEM_RESET
+        (0x8400_000a, 0),             // PSCI_FEATURES
+        (0x8000_0000, 0),             // SMCCC_VERSION
+        (0x8000_0001, NOT_SUPPORTED), // SMCCC_ARCH_FEATURES is not a PSCI query
+        (0x8400_0005, NOT_SUPPORTED), // MIGRATE32
+        (0xc400_0005, NOT_SUPPORTED), // MIGRATE64
+        (0x8400_0007, NOT_SUPPORTED), // MIGRATE_INFO_UP_CPU32
+        (0xc400_0007, NOT_SUPPORTED), // MIGRATE_INFO_UP_CPU64
+        (0x8400_000b, NOT_SUPPORTED), // CPU_FREEZE
+        (0x8400_000c, NOT_SUPPORTED), // CPU_DEFAULT_SUSPEND32
+        (0xc400_000c, NOT_SUPPORTED), // CPU_DEFAULT_SUSPEND64
+        (0x8400_000d, NOT_SUPPORTED), // NODE_HW_STATE32
+        (0xc400_000d, NOT_SUPPORTED), // NODE_HW_STATE64
+        (0x8400_000e, NOT_SUPPORTED), // SYSTEM_SUSPEND32
+        (0xc400_000e, NOT_SUPPORTED), // SYSTEM_SUSPEND64
+        (0x8400_000f, NOT_SUPPORTED), // PSCI_SET_SUSPEND_MODE
+        (0x8400_0010, NOT_SUPPORTED), // PSCI_STAT_RESIDENCY32
+        (0xc400_0010, NOT_SUPPORTED), // PSCI_STAT_RESIDENCY64
+        (0x8400_0011, NOT_SUPPORTED), // PSCI_STAT_COUNT32
+        (0xc400_0011, NOT_SUPPORTED), // PSCI_STAT_COUNT64
+        (0x8400_0012, NOT_SUPPORTED), // SYSTEM_RESET2_32
+        (0xc400_0012, NOT_SUPPORTED), // SYSTEM_RESET2_64
+        (0x8400_0013, NOT_SUPPORTED), // MEM_PROTECT
+        (0x8400_0014, NOT_SUPPORTED), // MEM_PROTECT_CHECK_RANGE32
+        (0xc400_0014, NOT_SUPPORTED), // MEM_PROTECT_CHECK_RANGE64
+        (0xdead_beef, NOT_SUPPORTED), // unknown
+    ];
+    const EXTRA_RESULT_COUNT: usize = 5;
+    const RESULT_COUNT: usize = FEATURE_QUERIES.len() + EXTRA_RESULT_COUNT;
+    const RESULTS_SIZE: usize = RESULT_COUNT * size_of::<u64>();
+    const PSCI_VERSION: u64 = 0x8400_0000;
+    const PSCI_FEATURES: u64 = 0x8400_000a;
+    const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+    const ARM_SMCCC_VERSION: u64 = 0x8000_0000;
+    const ARM_SMCCC_ARCH_FEATURES: u64 = 0x8000_0001;
+
+    // Loop over the host-supplied PSCI_FEATURES table, then query PSCI and
+    // SMCCC versions plus the mandatory minimum SMCCC_ARCH_FEATURES boundary.
+    let guest_code = [
+        0x1000_8013, // adr x19, results (+0x1000)
+        0x1000_fff4, // adr x20, queries (+0x2000)
+        0x5280_0495, // mov w21, #36
+        0xb840_4681, // ldr w1, [x20], #4
+        0xd280_0140, // mov x0, #0xa
+        0xf2b0_8000, // movk x0, #0x8400, lsl #16 (PSCI_FEATURES)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0x7100_06b5, // subs w21, w21, #1
+        0x54ff_ff41, // b.ne feature loop
+        0xd280_0000, // mov x0, #0
+        0xf2b0_8000, // movk x0, #0x8400, lsl #16 (PSCI_VERSION)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd280_0000, // mov x0, #0
+        0xf2b0_0000, // movk x0, #0x8000, lsl #16 (SMCCC_VERSION)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd280_0001, // mov x1, #0
+        0xf2b0_0001, // movk x1, #0x8000, lsl #16 (SMCCC_VERSION query)
+        0xd280_0020, // mov x0, #1
+        0xf2b0_0000, // movk x0, #0x8000, lsl #16 (SMCCC_ARCH_FEATURES)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd280_0021, // mov x1, #1
+        0xf2b0_0001, // movk x1, #0x8000, lsl #16 (self query)
+        0xd280_0020, // mov x0, #1
+        0xf2b0_0000, // movk x0, #0x8000, lsl #16 (SMCCC_ARCH_FEATURES)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd290_0001, // mov x1, #0x8000
+        0xf2b0_0001, // movk x1, #0x8000, lsl #16 (WORKAROUND_1 query)
+        0xd280_0020, // mov x0, #1
+        0xf2b0_0000, // movk x0, #0x8000, lsl #16 (SMCCC_ARCH_FEATURES)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd280_0100, // mov x0, #8
+        0xf2b0_8000, // movk x0, #0x8400, lsl #16 (SYSTEM_OFF)
+        0xd400_0002, // hvc #0
+        0x1400_0000, // b .
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect::<Vec<_>>();
+    let query_bytes = FEATURE_QUERIES
+        .into_iter()
+        .flat_map(|(function_id, _)| function_id.to_le_bytes())
+        .collect::<Vec<_>>();
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("psci-discovery-kernel", &image)
+        .expect("temporary PSCI discovery kernel should be created");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("boot source config should be stored");
+    controller
+        .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(1, 16)))
+        .expect("one-vCPU discovery machine should configure");
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    );
+    let mut session = OwnedHvfArm64BootSession::new(&controller, config)
+        .expect("PSCI discovery session should prepare");
+    let entry = GuestAddress::new(
+        session
+            .capture_arm64_general_register_state()
+            .expect("discovery entry registers should capture")
+            .pc(),
+    );
+    let results = entry
+        .checked_add(RESULTS_OFFSET)
+        .expect("discovery results should fit");
+    let queries = entry
+        .checked_add(QUERIES_OFFSET)
+        .expect("discovery queries should fit");
+    {
+        let memory = session
+            .guest_memory_mut()
+            .expect("discovery guest memory should be mutable before execution");
+        memory
+            .write_slice(&guest_code, entry)
+            .expect("discovery guest code should fit");
+        memory
+            .write_slice(&query_bytes, queries)
+            .expect("discovery query table should fit");
+        memory
+            .write_slice(&[0; RESULTS_SIZE], results)
+            .expect("discovery result table should fit");
+    }
+
+    let control = session.run_loop_control();
+    let stop_token = control.stop_token();
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let watchdog_done_for_thread = Arc::clone(&watchdog_done);
+    let watchdog = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !watchdog_done_for_thread.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if !watchdog_done_for_thread.load(Ordering::Acquire) {
+            let _ = control.request_stop();
+        }
+    });
+
+    let mut observed = Vec::new();
+    let outcome = session
+        .run_loop_with_observer(
+            &stop_token,
+            NonZeroUsize::new(64).expect("step limit should be nonzero"),
+            |step| observed.push(*step),
+        )
+        .expect("bounded PSCI discovery guest should run");
+    watchdog_done.store(true, Ordering::Release);
+    watchdog
+        .join()
+        .expect("PSCI discovery watchdog should join");
+    assert!(matches!(
+        outcome,
+        HvfArm64BootRunLoopOutcome::GuestShutdown { .. }
+    ));
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|step| matches!(
+                step,
+                HvfVcpuRunStepOutcome::Hvc {
+                    function_id: PSCI_FEATURES,
+                    ..
+                }
+            ))
+            .count(),
+        FEATURE_QUERIES.len()
+    );
+    assert!(observed.iter().any(|step| matches!(
+        step,
+        HvfVcpuRunStepOutcome::Hvc {
+            function_id: PSCI_VERSION,
+            return_value: 0x0001_0000,
+            ..
+        }
+    )));
+    assert!(observed.iter().any(|step| matches!(
+        step,
+        HvfVcpuRunStepOutcome::Hvc {
+            function_id: ARM_SMCCC_VERSION,
+            return_value: 0x0001_0001,
+            ..
+        }
+    )));
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|step| matches!(
+                step,
+                HvfVcpuRunStepOutcome::Hvc {
+                    function_id: ARM_SMCCC_ARCH_FEATURES,
+                    ..
+                }
+            ))
+            .count(),
+        3
+    );
+    assert!(matches!(
+        observed.last(),
+        Some(HvfVcpuRunStepOutcome::GuestShutdown {
+            function_id: PSCI_SYSTEM_OFF,
+            ..
+        })
+    ));
+
+    let mut result_bytes = [0; RESULTS_SIZE];
+    session
+        .guest_memory()
+        .expect("discovery guest memory should remain mapped")
+        .read_slice(&mut result_bytes, results)
+        .expect("discovery results should read after terminal exit");
+    let actual = result_bytes
+        .chunks_exact(size_of::<u64>())
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("result chunk should be u64")))
+        .collect::<Vec<_>>();
+    let mut expected = FEATURE_QUERIES
+        .iter()
+        .map(|(_, result)| *result)
+        .collect::<Vec<_>>();
+    expected.extend([0x0001_0000, 0x0001_0001, 0, 0, NOT_SUPPORTED]);
+    assert_eq!(actual, expected);
+
+    session
+        .shutdown()
+        .expect("PSCI discovery session should shut down");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4223,7 +4500,7 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         session.run_once_and_handle_mmio(),
         Ok(HvfVcpuRunStepOutcome::Hvc {
             function_id: 0x8400_0000,
-            return_value: 2,
+            return_value: 0x0001_0000,
             ..
         })
     ));
@@ -4334,7 +4611,7 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         session.run_once_and_handle_mmio(),
         Ok(HvfVcpuRunStepOutcome::Hvc {
             function_id: 0x8400_0000,
-            return_value: 2,
+            return_value: 0x0001_0000,
             ..
         })
     ));
@@ -4416,7 +4693,7 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         restored_session.run_once_and_handle_mmio(),
         Ok(HvfVcpuRunStepOutcome::Hvc {
             function_id: 0x8400_0000,
-            return_value: 2,
+            return_value: 0x0001_0000,
             ..
         })
     ));

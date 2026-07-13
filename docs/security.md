@@ -862,6 +862,16 @@ and any pending raw HVF cancellation is absorbed by a later identified run
 before guest execution resumes. Diagnostics retain only index, MPIDR, and
 transaction stage, not ignored guest arguments or timer values.
 
+PSCI/SMCCC discovery is a fixed guest ABI, not a probe of Apple host firmware
+or vulnerability state. PSCI 1.0 feature results come from one reviewed static
+table and expose only delivered function IDs plus zero CPU_SUSPEND mode/format
+flags. SMCCC 1.1 architecture discovery returns success only for VERSION and
+the discovery function itself; workaround, SoC ID, KVM PV/vendor, and TRNG
+queries return `NOT_SUPPORTED`. No call reads host mitigation policy, logs a
+guest query, mutates vCPU power state, or creates deferred coordinator work.
+Unknown IDs and nonzero HVC immediates retain the same zero-extended,
+fail-closed `NOT_SUPPORTED` result.
+
 Public `InstanceStart` now exposes the same topology for counts through
 `min(32, host_max)`; it does not add another owner or capacity authority. A
 capacity or later construction failure publishes no partial session and cannot
