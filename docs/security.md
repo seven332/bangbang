@@ -96,7 +96,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented normal and App Sandbox validation paths | Keep real HVF tests in signed targets and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
-| vmnet networking | Implemented boundary with operator-owned host policy | Keep supported `host_dev_name` forms, startup validation, MMDS-only behavior, entitlement requirements, and non-goals documented when network behavior changes. |
+| Network and vmnet | Implemented virtio-MMIO/MMDS-only subset; direct vmnet conditional | Keep supported `host_dev_name` forms, startup validation, MMDS-only behavior, entitlement requirements, and non-goals documented when network behavior changes. |
 | macOS App Sandbox | Signed feasibility and resource-denial boundary validated | Keep the integration app bundles minimal and do not claim that the ordinary CLI or a production distribution is sandboxed. |
 | Launcher or resource broker | Unimplemented product architecture | Keep host-path and shared-resource authority as operator responsibility unless a separately approved broker design is implemented. |
 
@@ -259,17 +259,33 @@ configured interfaces and retains stop-on-drop cleanup ownership inside the
 process.
 
 The vmnet path requires the host to satisfy macOS vmnet authorization,
-entitlement, and code-signing requirements. That requirement allows the process
-to call vmnet APIs; it is not a guest containment boundary. Operators remain
-responsible for host firewalling, routing, NAT exposure, bridged-interface
-selection, and avoiding unintended sharing across multiple `bangbang`
-processes. Use unique interface configurations and host resources for separate
-VMs unless sharing is intentional and externally coordinated.
+entitlement, and code-signing requirements. Apple's
+[`com.apple.vm.networking`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.vm.networking)
+entitlement is restricted to virtualization developers. That authorization
+allows a process to call vmnet APIs; it is not a guest containment boundary.
+Operators remain responsible for host firewalling, routing, NAT exposure,
+bridged-interface selection, and avoiding unintended sharing across multiple
+`bangbang` processes. Use unique interface configurations and host resources
+for separate VMs unless sharing is intentional and externally coordinated.
 
-The current boundary does not implement packet filtering, production network
-isolation, a sandbox profile, a launcher/resource broker, runtime network
-hotplug, configured network rate limiting, or full Firecracker public packet
-movement parity.
+Apple's current [vmnet contract](https://developer.apple.com/documentation/vmnet)
+returns the MAC address and MTU that the guest should use and documents limits
+of 32 interfaces overall, four per guest operating system, and read/write calls
+of at most 200 packets and 256 KB. The current bangbang system backend discards
+vmnet's start-completion MAC, MTU, and maximum-packet-size values and does not
+register the packet-available event callback. It retains synchronous
+single-packet read/write adapters, injected backend tests, and stop-on-drop
+cleanup, but its generic 16-interface configuration cap is not enforcement of
+Apple's per-guest resource policy. No signed test uses the restricted
+networking entitlement or proves direct-vmnet guest connectivity.
+
+Configured RX/TX token buckets are implemented as device-local queue admission
+with retained work and session-owned retry wakeups. They are not packet
+filters, a host firewall, or a NAT policy, and current signed limiter evidence
+uses MMDS-only packet I/O rather than direct vmnet. The boundary still lacks
+packet filtering, production network isolation, a sandbox profile, a
+launcher/resource broker, runtime network hotplug, limiter-specific metrics,
+network snapshot state, and full Firecracker public packet-movement parity.
 
 ## API Socket Handling
 
@@ -1091,9 +1107,13 @@ not manage a full ARP cache, emit gratuitous ARP, implement ARP
 timeouts/retries, validate broader TCP ACK numbers beyond the narrow ACK-only
 and non-empty payload SYN-ACK acknowledgement paths, reassemble out-of-order TCP
 data, track TCP state, implement retransmission policy, implement a full
-stateful RST policy, or handle session timeouts. Future
-guest-visible MMDS work must continue validating device, packet, token, and
-TCP/session inputs before expanding the guest-visible data path.
+stateful RST policy, or handle session timeouts. Consistent with Firecracker
+v1.16.0's
+[MMDS security considerations](https://github.com/firecracker-microvm/firecracker/blob/v1.16.0/docs/mmds/mmds-design.md#security-considerations),
+this detour is not an outbound firewall: guest traffic remains untrusted, and
+host policy must block access to restricted host addresses. Future guest-visible
+MMDS work must continue validating device, packet, token, and TCP/session inputs
+before expanding the guest-visible data path.
 
 ## Multi-Process Operation
 

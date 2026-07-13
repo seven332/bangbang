@@ -989,6 +989,19 @@ interrupts, VMClock restore signaling, VMClock guest e2e observation,
 or broader RTC-adjacent time/identity behavior is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 
+For Network/MMDS specifically, this evidence validates the supported
+virtio-MMIO/MMDS-only subset: guest-visible MTU, MMDS v1 and v2 through API and
+metadata-file/no-api startup, limiter-driven guest progress without a second
+queue notification, two MAC-selected interfaces, and two process-local V2
+token/value/queue/metrics/cleanup domains with post-peer-exit survivor
+progress. The signed cases use bounded marker/event synchronization, redact
+private values and diagnostics, select every configured interface in MMDS
+config, and therefore do not open vmnet or require its restricted entitlement.
+They do not execute direct-vmnet external connectivity, returned MAC, MTU, or
+maximum-packet reconciliation, packet-available callbacks, Firecracker v1.16.0
+PCI attach/remove, broader MMDS TCP behavior, limiter-specific metrics, or
+network snapshot state.
+
 For block specifically, this evidence validates the supported file-backed
 virtio-MMIO subset, including initial attachment, guest I/O, root/data ordering,
 cache/flush behavior, runtime refresh and limiter updates, and stable rejected
