@@ -681,6 +681,30 @@ impl VmmController {
             .map_err(VmmActionError::DriveUpdate)
     }
 
+    pub fn prepare_network_interface_update(
+        &self,
+        input: network::NetworkInterfaceUpdateInput,
+    ) -> Result<
+        (
+            network::NetworkInterfaceUpdate,
+            network::NetworkInterfaceConfig,
+        ),
+        VmmActionError,
+    > {
+        self.network_interface_configs
+            .prepare_update(input)
+            .map_err(VmmActionError::NetworkInterfaceUpdate)
+    }
+
+    pub fn commit_network_interface_update(
+        &mut self,
+        config: network::NetworkInterfaceConfig,
+    ) -> Result<(), VmmActionError> {
+        self.network_interface_configs
+            .commit_update(config)
+            .map_err(VmmActionError::NetworkInterfaceUpdate)
+    }
+
     fn validate_balloon_config_target_against_memory(
         amount_mib: u32,
         mem_size_mib: u64,
@@ -1586,9 +1610,10 @@ impl VmmController {
                     });
                 }
 
-                self.network_interface_configs
-                    .validate_update(input)
-                    .map_err(VmmActionError::NetworkInterfaceUpdate)?;
+                let (update, _) = self.prepare_network_interface_update(input)?;
+                if !update.is_noop() {
+                    return Err(VmmActionError::NetworkInterfaceUpdateUnsupported);
+                }
 
                 Ok(VmmData::Empty)
             }
@@ -1715,6 +1740,7 @@ mod tests {
         network::{
             GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
             NetworkInterfaceConfigInput, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
+            NetworkRateLimiterConfig, NetworkTokenBucketConfig,
         },
         pmem::{PmemConfigError, PmemConfigInput, PmemUpdateError, PmemUpdateInput},
         serial::{SerialConfigError, SerialConfigInput, SerialRateLimiterConfig},
@@ -6512,20 +6538,16 @@ mod tests {
 
     #[test]
     fn update_network_interface_rejects_rate_limiters_after_start_without_mutating() {
+        let rate_limiter = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(1024, None, 100)),
+            None,
+        );
         let cases = [
-            (
-                NetworkInterfaceUpdateInput::new("eth0", "eth0").with_rx_rate_limiter_configured(),
-                NetworkInterfaceUpdateError::UnsupportedRxRateLimiter,
-                "network rx_rate_limiter is not supported",
-            ),
-            (
-                NetworkInterfaceUpdateInput::new("eth0", "eth0").with_tx_rate_limiter_configured(),
-                NetworkInterfaceUpdateError::UnsupportedTxRateLimiter,
-                "network tx_rate_limiter is not supported",
-            ),
+            NetworkInterfaceUpdateInput::new("eth0", "eth0").with_rx_rate_limiter(rate_limiter),
+            NetworkInterfaceUpdateInput::new("eth0", "eth0").with_tx_rate_limiter(rate_limiter),
         ];
 
-        for (input, expected_error, expected_message) in cases {
+        for input in cases {
             let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
             controller
                 .handle_action(VmmAction::PutNetworkInterface(network_input(
@@ -6538,8 +6560,11 @@ mod tests {
                 .handle_action(VmmAction::UpdateNetworkInterface(input))
                 .expect_err("configured network rate limiter should fail");
 
-            assert_eq!(err, VmmActionError::NetworkInterfaceUpdate(expected_error));
-            assert_eq!(err.to_string(), expected_message);
+            assert_eq!(err, VmmActionError::NetworkInterfaceUpdateUnsupported);
+            assert_eq!(
+                err.to_string(),
+                "Network interface updates are not supported."
+            );
             assert_eq!(controller.instance_info().state, InstanceState::Running);
             assert_eq!(controller.network_interface_configs().len(), 1);
             assert_eq!(controller.network_interface_configs()[0].iface_id(), "eth0");
@@ -6913,10 +6938,13 @@ mod tests {
     #[test]
     fn displays_network_interface_update_error() {
         let err = VmmActionError::NetworkInterfaceUpdate(
-            NetworkInterfaceUpdateError::UnsupportedRxRateLimiter,
+            NetworkInterfaceUpdateError::ActiveSessionUnavailable,
         );
 
-        assert_eq!(err.to_string(), "network rx_rate_limiter is not supported");
+        assert_eq!(
+            err.to_string(),
+            "active network interface update session is unavailable"
+        );
         assert!(err.source().is_some());
     }
 

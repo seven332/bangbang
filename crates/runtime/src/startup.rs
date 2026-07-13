@@ -55,8 +55,9 @@ use crate::mmio::{
     MmioRegionId,
 };
 use crate::network::{
-    NetworkMmioDeviceRegistration, NetworkMmioLayout, NetworkMmioRegistrationError,
-    PreparedNetworkDeviceError, PreparedNetworkDevices, VirtioNetworkDeviceNotificationDispatch,
+    NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioDeviceRegistration,
+    NetworkMmioLayout, NetworkMmioRegistrationError, PreparedNetworkDeviceError,
+    PreparedNetworkDevices, VirtioNetworkDeviceNotificationDispatch,
     VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource,
     VirtioNetworkTxPacketSink,
 };
@@ -2113,6 +2114,18 @@ impl Arm64BootRuntimeResources {
         update_block_device_backing_for_devices(&self.block_devices, mmio_dispatcher, config)
     }
 
+    pub fn update_network_interface_rate_limiters(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        update_network_interface_rate_limiters_for_devices(
+            &self.network_devices,
+            mmio_dispatcher,
+            update,
+        )
+    }
+
     pub fn vsock_host_read_wakeup_fds(
         &self,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -2506,6 +2519,32 @@ pub fn update_block_device_backing_for_devices(
         })?;
 
     update_block_device_backing_for_region_with_opened(mmio_dispatcher, region_id, config, backing)
+}
+
+pub fn update_network_interface_rate_limiters_for_devices(
+    network_devices: &[Arm64BootNetworkDevice],
+    mmio_dispatcher: &mut MmioDispatcher,
+    update: &NetworkInterfaceUpdate,
+) -> Result<(), NetworkInterfaceUpdateError> {
+    let Some(device) = network_devices
+        .iter()
+        .find(|device| device.registration.iface_id() == update.iface_id())
+    else {
+        return Err(NetworkInterfaceUpdateError::UnknownInterface {
+            iface_id: update.iface_id().to_string(),
+        });
+    };
+    let region_id = device.registration.region_id();
+    let handler = mmio_dispatcher
+        .handler_mut::<VirtioNetworkMmioHandler>(region_id)
+        .map_err(|source| NetworkInterfaceUpdateError::HandlerLookup {
+            iface_id: update.iface_id().to_string(),
+            region_id,
+            message: source.to_string(),
+        })?;
+
+    handler.update_network_rate_limiters(update);
+    Ok(())
 }
 
 pub fn update_block_device_backing_for_devices_with_opened(
@@ -3993,10 +4032,11 @@ mod tests {
         MmioHandler, MmioHandlerError, MmioOperation, MmioRegionId,
     };
     use crate::network::{
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioDeviceRegistration,
-        NetworkMmioLayout, NetworkRateLimiterConfig, NetworkTokenBucketConfig,
-        PreparedNetworkDevices, VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX,
-        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRxPacket,
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkInterfaceUpdateError,
+        NetworkInterfaceUpdateInput, NetworkMmioDeviceRegistration, NetworkMmioLayout,
+        NetworkRateLimiterConfig, NetworkTokenBucketConfig, PreparedNetworkDevices,
+        VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
+        VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkMmioHandler, VirtioNetworkRxPacket,
         VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
         VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
         VirtioNetworkTxPacketSinkError,
@@ -11148,6 +11188,202 @@ mod tests {
             handler.read_register(VirtioMmioRegister::ConfigGeneration),
             Ok(0)
         );
+    }
+
+    #[test]
+    fn boot_runtime_network_rate_limiter_update_mutates_matching_device_only() {
+        let kernel = temp_file("kernel-network-rate-limiter-update", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        add_network(&mut controller, "eth1", "tap1");
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                network_interrupt_lines: &[line(33), line(34)],
+                ..valid_config(&[])
+            },
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let runtime = parts.runtime;
+        let update = NetworkInterfaceUpdateInput::new("eth1", "eth1")
+            .with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                Some(NetworkTokenBucketConfig::new(1024, Some(2048), 100)),
+                None,
+            ))
+            .validate()
+            .expect("network limiter update should validate");
+
+        runtime
+            .update_network_interface_rate_limiters(&mut mmio_dispatcher, &update)
+            .expect("matching network limiter should update");
+
+        let first_region = runtime.network_devices[0].registration.region_id();
+        let first = mmio_dispatcher
+            .handler_mut::<VirtioNetworkMmioHandler>(first_region)
+            .expect("first network handler should exist");
+        assert!(first.activation_handler().rx_rate_limiter().is_none());
+        assert!(first.activation_handler().tx_rate_limiter().is_none());
+        assert_eq!(
+            first.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(
+            first.read_register(VirtioMmioRegister::InterruptStatus),
+            Ok(0)
+        );
+
+        let second_region = runtime.network_devices[1].registration.region_id();
+        let second = mmio_dispatcher
+            .handler_mut::<VirtioNetworkMmioHandler>(second_region)
+            .expect("second network handler should exist");
+        assert!(second.activation_handler().rx_rate_limiter().is_some());
+        assert!(second.activation_handler().tx_rate_limiter().is_none());
+        assert_eq!(
+            second.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(
+            second.read_register(VirtioMmioRegister::InterruptStatus),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn boot_runtime_network_rate_limiter_update_rejects_unknown_interface() {
+        let kernel = temp_file("kernel-network-rate-limiter-unknown", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                network_interrupt_lines: &[line(33)],
+                ..valid_config(&[])
+            },
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let runtime = parts.runtime;
+        let update = NetworkInterfaceUpdateInput::new("missing", "missing")
+            .with_tx_rate_limiter(NetworkRateLimiterConfig::new(
+                None,
+                Some(NetworkTokenBucketConfig::new(8, None, 100)),
+            ))
+            .validate()
+            .expect("network limiter update should validate");
+
+        let err = runtime
+            .update_network_interface_rate_limiters(&mut mmio_dispatcher, &update)
+            .expect_err("unknown interface should fail");
+
+        assert_eq!(
+            err,
+            NetworkInterfaceUpdateError::UnknownInterface {
+                iface_id: "missing".to_string()
+            }
+        );
+        assert!(!err.to_string().contains("missing"));
+        let region = runtime.network_devices[0].registration.region_id();
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioNetworkMmioHandler>(region)
+            .expect("network handler should exist");
+        assert!(handler.activation_handler().rx_rate_limiter().is_none());
+        assert!(handler.activation_handler().tx_rate_limiter().is_none());
+    }
+
+    #[test]
+    fn boot_runtime_network_rate_limiter_update_reports_missing_handler() {
+        let kernel = temp_file(
+            "kernel-network-rate-limiter-missing-handler",
+            &arm64_image(),
+        );
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                network_interrupt_lines: &[line(33)],
+                ..valid_config(&[])
+            },
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        drop(parts.mmio_dispatcher);
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        let runtime = parts.runtime;
+        let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                Some(NetworkTokenBucketConfig::new(1024, None, 100)),
+                None,
+            ))
+            .validate()
+            .expect("network limiter update should validate");
+
+        let err = runtime
+            .update_network_interface_rate_limiters(&mut mmio_dispatcher, &update)
+            .expect_err("missing handler should fail");
+
+        assert!(matches!(
+            &err,
+            NetworkInterfaceUpdateError::HandlerLookup {
+                iface_id,
+                region_id,
+                ..
+            } if iface_id == "eth0" && *region_id == runtime.network_devices[0].registration.region_id()
+        ));
+        assert!(!err.to_string().contains("eth0"));
+    }
+
+    #[test]
+    fn boot_runtime_network_rate_limiter_update_reports_wrong_handler_type() {
+        let kernel = temp_file("kernel-network-rate-limiter-wrong-handler", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                network_interrupt_lines: &[line(33)],
+                ..valid_config(&[])
+            },
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        drop(parts.mmio_dispatcher);
+        let runtime = parts.runtime;
+        let region = runtime.network_devices[0].registration.region();
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        mmio_dispatcher
+            .insert_region(region.id(), region.range().start(), region.range().size())
+            .expect("replacement region should insert");
+        mmio_dispatcher
+            .register_handler(
+                region.id(),
+                SerialMmioDevice::new(SharedSerialOutputBuffer::default()),
+            )
+            .expect("serial handler should register under network region id for test");
+        let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_tx_rate_limiter(NetworkRateLimiterConfig::new(
+                None,
+                Some(NetworkTokenBucketConfig::new(8, None, 100)),
+            ))
+            .validate()
+            .expect("network limiter update should validate");
+
+        let err = runtime
+            .update_network_interface_rate_limiters(&mut mmio_dispatcher, &update)
+            .expect_err("wrong handler type should fail");
+
+        assert!(matches!(
+            &err,
+            NetworkInterfaceUpdateError::HandlerLookup {
+                iface_id,
+                region_id,
+                ..
+            } if iface_id == "eth0" && *region_id == region.id()
+        ));
+        assert!(!err.to_string().contains("eth0"));
     }
 
     #[test]

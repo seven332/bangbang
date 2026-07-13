@@ -90,6 +90,17 @@ impl NetworkRateLimiterConfig {
             Some(Self { bandwidth, ops })
         }
     }
+
+    fn applied_to(self, existing: Option<Self>) -> Option<Self> {
+        let bandwidth =
+            updated_network_token_bucket(existing.and_then(Self::bandwidth), self.bandwidth);
+        let ops = updated_network_token_bucket(existing.and_then(Self::ops), self.ops);
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +149,17 @@ const fn enabled_network_token_bucket(
     }
 }
 
+const fn updated_network_token_bucket(
+    existing: Option<NetworkTokenBucketConfig>,
+    update: Option<NetworkTokenBucketConfig>,
+) -> Option<NetworkTokenBucketConfig> {
+    match update {
+        Some(bucket) if bucket.is_enabled() => Some(bucket),
+        Some(_) => None,
+        None => existing,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInterfaceConfigInput {
     path_iface_id: String,
@@ -153,8 +175,8 @@ pub struct NetworkInterfaceConfigInput {
 pub struct NetworkInterfaceUpdateInput {
     path_iface_id: String,
     body_iface_id: String,
-    rx_rate_limiter_configured: bool,
-    tx_rate_limiter_configured: bool,
+    rx_rate_limiter: Option<NetworkRateLimiterConfig>,
+    tx_rate_limiter: Option<NetworkRateLimiterConfig>,
 }
 
 impl NetworkInterfaceConfigInput {
@@ -232,8 +254,8 @@ impl NetworkInterfaceUpdateInput {
         Self {
             path_iface_id: path_iface_id.into(),
             body_iface_id: body_iface_id.into(),
-            rx_rate_limiter_configured: false,
-            tx_rate_limiter_configured: false,
+            rx_rate_limiter: None,
+            tx_rate_limiter: None,
         }
     }
 
@@ -245,21 +267,21 @@ impl NetworkInterfaceUpdateInput {
         &self.body_iface_id
     }
 
-    pub const fn rx_rate_limiter_configured(&self) -> bool {
-        self.rx_rate_limiter_configured
+    pub const fn rx_rate_limiter(&self) -> Option<NetworkRateLimiterConfig> {
+        self.rx_rate_limiter
     }
 
-    pub const fn tx_rate_limiter_configured(&self) -> bool {
-        self.tx_rate_limiter_configured
+    pub const fn tx_rate_limiter(&self) -> Option<NetworkRateLimiterConfig> {
+        self.tx_rate_limiter
     }
 
-    pub const fn with_rx_rate_limiter_configured(mut self) -> Self {
-        self.rx_rate_limiter_configured = true;
+    pub const fn with_rx_rate_limiter(mut self, rate_limiter: NetworkRateLimiterConfig) -> Self {
+        self.rx_rate_limiter = Some(rate_limiter);
         self
     }
 
-    pub const fn with_tx_rate_limiter_configured(mut self) -> Self {
-        self.tx_rate_limiter_configured = true;
+    pub const fn with_tx_rate_limiter(mut self, rate_limiter: NetworkRateLimiterConfig) -> Self {
+        self.tx_rate_limiter = Some(rate_limiter);
         self
     }
 
@@ -301,6 +323,23 @@ impl NetworkInterfaceConfig {
 
     pub const fn tx_rate_limiter(&self) -> Option<NetworkRateLimiterConfig> {
         self.tx_rate_limiter
+    }
+
+    fn updated(&self, update: &NetworkInterfaceUpdate) -> Self {
+        Self {
+            iface_id: self.iface_id.clone(),
+            host_dev_name: self.host_dev_name.clone(),
+            guest_mac: self.guest_mac,
+            mtu: self.mtu,
+            rx_rate_limiter: match update.rx_rate_limiter() {
+                Some(rate_limiter) => rate_limiter.applied_to(self.rx_rate_limiter),
+                None => self.rx_rate_limiter,
+            },
+            tx_rate_limiter: match update.tx_rate_limiter() {
+                Some(rate_limiter) => rate_limiter.applied_to(self.tx_rate_limiter),
+                None => self.tx_rate_limiter,
+            },
+        }
     }
 }
 
@@ -349,11 +388,25 @@ impl TryFrom<NetworkInterfaceConfigInput> for NetworkInterfaceConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInterfaceUpdate {
     iface_id: String,
+    rx_rate_limiter: Option<NetworkRateLimiterConfig>,
+    tx_rate_limiter: Option<NetworkRateLimiterConfig>,
 }
 
 impl NetworkInterfaceUpdate {
     pub fn iface_id(&self) -> &str {
         &self.iface_id
+    }
+
+    pub const fn rx_rate_limiter(&self) -> Option<NetworkRateLimiterConfig> {
+        self.rx_rate_limiter
+    }
+
+    pub const fn tx_rate_limiter(&self) -> Option<NetworkRateLimiterConfig> {
+        self.tx_rate_limiter
+    }
+
+    pub const fn is_noop(&self) -> bool {
+        self.rx_rate_limiter.is_none() && self.tx_rate_limiter.is_none()
     }
 }
 
@@ -370,15 +423,14 @@ impl TryFrom<NetworkInterfaceUpdateInput> for NetworkInterfaceUpdate {
             });
         }
 
-        if input.rx_rate_limiter_configured {
-            return Err(NetworkInterfaceUpdateError::UnsupportedRxRateLimiter);
-        }
-        if input.tx_rate_limiter_configured {
-            return Err(NetworkInterfaceUpdateError::UnsupportedTxRateLimiter);
-        }
-
         Ok(Self {
             iface_id: input.path_iface_id,
+            rx_rate_limiter: input
+                .rx_rate_limiter
+                .filter(|rate_limiter| rate_limiter.is_configured()),
+            tx_rate_limiter: input
+                .tx_rate_limiter
+                .filter(|rate_limiter| rate_limiter.is_configured()),
         })
     }
 }
@@ -445,6 +497,42 @@ impl NetworkInterfaceConfigs {
         }
 
         Ok(update)
+    }
+
+    pub fn prepare_update(
+        &self,
+        input: NetworkInterfaceUpdateInput,
+    ) -> Result<(NetworkInterfaceUpdate, NetworkInterfaceConfig), NetworkInterfaceUpdateError> {
+        let update = self.validate_update(input)?;
+        let Some(existing) = self
+            .configs
+            .iter()
+            .find(|config| config.iface_id() == update.iface_id())
+        else {
+            return Err(NetworkInterfaceUpdateError::UnknownInterface {
+                iface_id: update.iface_id().to_string(),
+            });
+        };
+        let config = existing.updated(&update);
+
+        Ok((update, config))
+    }
+
+    pub fn commit_update(
+        &mut self,
+        config: NetworkInterfaceConfig,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        let iface_id = config.iface_id().to_string();
+        let Some(existing) = self
+            .configs
+            .iter_mut()
+            .find(|existing| existing.iface_id() == iface_id)
+        else {
+            return Err(NetworkInterfaceUpdateError::UnknownInterface { iface_id });
+        };
+
+        *existing = config;
+        Ok(())
     }
 }
 
@@ -743,6 +831,27 @@ impl VirtioNetworkRateLimiter {
         let ops = config
             .ops()
             .and_then(|bucket| TokenBucket::new_at(bucket.token_bucket_config(), now));
+
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
+
+    fn updated_at(
+        existing: Option<&Self>,
+        update: NetworkRateLimiterConfig,
+        now: Instant,
+    ) -> Option<Self> {
+        let bandwidth = match update.bandwidth() {
+            Some(config) => TokenBucket::new_at(config.token_bucket_config(), now),
+            None => existing.and_then(|limiter| limiter.bandwidth.clone()),
+        };
+        let ops = match update.ops() {
+            Some(config) => TokenBucket::new_at(config.token_bucket_config(), now),
+            None => existing.and_then(|limiter| limiter.ops.clone()),
+        };
 
         if bandwidth.is_none() && ops.is_none() {
             None
@@ -1305,6 +1414,28 @@ impl VirtioNetworkDevice {
 
     pub const fn has_pending_rate_limited_queue_work(&self) -> bool {
         self.pending_rate_limited_rx_queue || self.pending_rate_limited_tx_queue
+    }
+
+    pub fn update_rate_limiters(&mut self, update: &NetworkInterfaceUpdate) {
+        self.update_rate_limiters_at(update, Instant::now());
+    }
+
+    fn update_rate_limiters_at(&mut self, update: &NetworkInterfaceUpdate, now: Instant) {
+        let rx_rate_limiter = match update.rx_rate_limiter() {
+            Some(config) => {
+                VirtioNetworkRateLimiter::updated_at(self.rx_rate_limiter.as_ref(), config, now)
+            }
+            None => self.rx_rate_limiter.clone(),
+        };
+        let tx_rate_limiter = match update.tx_rate_limiter() {
+            Some(config) => {
+                VirtioNetworkRateLimiter::updated_at(self.tx_rate_limiter.as_ref(), config, now)
+            }
+            None => self.tx_rate_limiter.clone(),
+        };
+
+        self.rx_rate_limiter = rx_rate_limiter;
+        self.tx_rate_limiter = tx_rate_limiter;
     }
 
     pub fn activate_network(
@@ -2816,6 +2947,10 @@ fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
 }
 
 impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetworkDevice> {
+    pub fn update_network_rate_limiters(&mut self, update: &NetworkInterfaceUpdate) {
+        self.activation_handler_mut().update_rate_limiters(update);
+    }
+
     pub fn has_pending_network_queue_work(&self) -> bool {
         self.has_pending_queue_notifications()
             || self
@@ -4197,8 +4332,16 @@ pub enum NetworkInterfaceUpdateError {
     UnknownInterface {
         iface_id: String,
     },
-    UnsupportedRxRateLimiter,
-    UnsupportedTxRateLimiter,
+    HandlerLookup {
+        iface_id: String,
+        region_id: MmioRegionId,
+        message: String,
+    },
+    ActiveSessionCommand {
+        message: String,
+    },
+    ActiveSessionUnavailable,
+    MmioDispatcherUnavailable,
 }
 
 impl fmt::Display for NetworkInterfaceConfigError {
@@ -4248,11 +4391,25 @@ impl fmt::Display for NetworkInterfaceUpdateError {
                 f.write_str("path iface_id must match body iface_id")
             }
             Self::UnknownInterface { .. } => f.write_str("network interface is not configured"),
-            Self::UnsupportedRxRateLimiter => {
-                f.write_str("network rx_rate_limiter is not supported")
+            Self::HandlerLookup {
+                region_id, message, ..
+            } => {
+                write!(
+                    f,
+                    "failed to find active network interface handler for MMIO region {region_id}: {message}"
+                )
             }
-            Self::UnsupportedTxRateLimiter => {
-                f.write_str("network tx_rate_limiter is not supported")
+            Self::ActiveSessionCommand { message } => {
+                write!(
+                    f,
+                    "active network interface update command failed: {message}"
+                )
+            }
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active network interface update session is unavailable")
+            }
+            Self::MmioDispatcherUnavailable => {
+                f.write_str("active network interface MMIO dispatcher is unavailable")
             }
         }
     }
@@ -5689,22 +5846,37 @@ mod tests {
 
     #[test]
     fn network_interface_update_input_exposes_firecracker_shape() {
+        let rx_rate_limiter = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(1024, Some(2048), 100)),
+            None,
+        );
+        let tx_rate_limiter = NetworkRateLimiterConfig::new(
+            None,
+            Some(NetworkTokenBucketConfig::new(10, None, 1000)),
+        );
         let input = NetworkInterfaceUpdateInput::new("eth0", "eth0")
-            .with_rx_rate_limiter_configured()
-            .with_tx_rate_limiter_configured();
+            .with_rx_rate_limiter(rx_rate_limiter)
+            .with_tx_rate_limiter(tx_rate_limiter);
 
         assert_eq!(input.path_iface_id(), "eth0");
         assert_eq!(input.body_iface_id(), "eth0");
-        assert!(input.rx_rate_limiter_configured());
-        assert!(input.tx_rate_limiter_configured());
+        assert_eq!(input.rx_rate_limiter(), Some(rx_rate_limiter));
+        assert_eq!(input.tx_rate_limiter(), Some(tx_rate_limiter));
     }
 
     #[test]
-    fn network_interface_update_validates_ids_and_deferred_fields() {
+    fn network_interface_update_validates_ids_and_rate_limiters() {
         let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
             .validate()
             .expect("matching no-op update should validate");
         assert_eq!(update.iface_id(), "eth0");
+        assert!(update.is_noop());
+        let empty_update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_rx_rate_limiter(NetworkRateLimiterConfig::new(None, None))
+            .with_tx_rate_limiter(NetworkRateLimiterConfig::new(None, None))
+            .validate()
+            .expect("empty limiter objects should validate as a no-op");
+        assert!(empty_update.is_noop());
 
         assert_eq!(
             NetworkInterfaceUpdateInput::new("", "").validate(),
@@ -5726,18 +5898,17 @@ mod tests {
                 body_iface_id: "eth1".to_string(),
             })
         );
-        assert_eq!(
-            NetworkInterfaceUpdateInput::new("eth0", "eth0")
-                .with_rx_rate_limiter_configured()
-                .validate(),
-            Err(NetworkInterfaceUpdateError::UnsupportedRxRateLimiter)
+        let rx_rate_limiter = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(1024, None, 100)),
+            None,
         );
-        assert_eq!(
-            NetworkInterfaceUpdateInput::new("eth0", "eth0")
-                .with_tx_rate_limiter_configured()
-                .validate(),
-            Err(NetworkInterfaceUpdateError::UnsupportedTxRateLimiter)
-        );
+        let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_rx_rate_limiter(rx_rate_limiter)
+            .validate()
+            .expect("configured runtime limiter update should validate");
+        assert_eq!(update.rx_rate_limiter(), Some(rx_rate_limiter));
+        assert_eq!(update.tx_rate_limiter(), None);
+        assert!(!update.is_noop());
     }
 
     #[test]
@@ -5750,9 +5921,14 @@ mod tests {
 
     #[test]
     fn network_interface_update_errors_display_without_sources() {
-        let err = NetworkInterfaceUpdateError::UnsupportedRxRateLimiter;
+        let err = NetworkInterfaceUpdateError::ActiveSessionCommand {
+            message: "boot run loop command queue is full".to_string(),
+        };
 
-        assert_eq!(err.to_string(), "network rx_rate_limiter is not supported");
+        assert_eq!(
+            err.to_string(),
+            "active network interface update command failed: boot run loop command queue is full"
+        );
         assert!(std::error::Error::source(&err).is_none());
 
         let err = NetworkInterfaceUpdateError::UnknownInterface {
@@ -5828,6 +6004,104 @@ mod tests {
         );
         assert_eq!(configs.as_slice().len(), 1);
         assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
+    }
+
+    #[test]
+    fn network_interface_configs_prepare_partial_limiter_update_without_mutating() {
+        let rx_bandwidth = NetworkTokenBucketConfig::new(1024, Some(2048), 100);
+        let rx_ops = NetworkTokenBucketConfig::new(10, None, 1000);
+        let tx_bandwidth = NetworkTokenBucketConfig::new(4096, None, 200);
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(
+                input()
+                    .with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                        Some(rx_bandwidth),
+                        Some(rx_ops),
+                    ))
+                    .with_tx_rate_limiter(NetworkRateLimiterConfig::new(Some(tx_bandwidth), None)),
+            )
+            .expect("initial rate-limited interface should be stored");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second interface should be stored");
+        let updated_ops = NetworkTokenBucketConfig::new(20, Some(30), 2000);
+
+        let (update, candidate) = configs
+            .prepare_update(
+                NetworkInterfaceUpdateInput::new("eth0", "eth0")
+                    .with_rx_rate_limiter(NetworkRateLimiterConfig::new(None, Some(updated_ops))),
+            )
+            .expect("partial network limiter update should prepare");
+
+        assert_eq!(update.iface_id(), "eth0");
+        assert_eq!(
+            candidate.rx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(
+                Some(rx_bandwidth),
+                Some(updated_ops),
+            ))
+        );
+        assert_eq!(
+            candidate.tx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(Some(tx_bandwidth), None,))
+        );
+        assert_eq!(
+            configs.as_slice()[0].rx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(
+                Some(rx_bandwidth),
+                Some(rx_ops),
+            )),
+            "candidate preparation must not mutate stored config"
+        );
+
+        configs
+            .commit_update(candidate)
+            .expect("prepared network update should commit");
+        assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
+        assert_eq!(configs.as_slice()[1].iface_id(), "eth1");
+        assert_eq!(
+            configs.as_slice()[0].rx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(
+                Some(rx_bandwidth),
+                Some(updated_ops),
+            ))
+        );
+    }
+
+    #[test]
+    fn network_interface_configs_clear_only_explicitly_disabled_bucket() {
+        let bandwidth = NetworkTokenBucketConfig::new(1024, Some(2048), 100);
+        let ops = NetworkTokenBucketConfig::new(10, None, 1000);
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(
+                input().with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                    Some(bandwidth),
+                    Some(ops),
+                )),
+            )
+            .expect("initial rate-limited interface should be stored");
+
+        let (_, candidate) = configs
+            .prepare_update(
+                NetworkInterfaceUpdateInput::new("eth0", "eth0").with_rx_rate_limiter(
+                    NetworkRateLimiterConfig::new(
+                        Some(NetworkTokenBucketConfig::new(0, None, 100)),
+                        None,
+                    ),
+                ),
+            )
+            .expect("disabled bucket update should prepare");
+
+        assert_eq!(
+            candidate.rx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(None, Some(ops)))
+        );
+        assert_eq!(
+            configs.as_slice()[0].rx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(Some(bandwidth), Some(ops),))
+        );
     }
 
     #[test]
@@ -6105,6 +6379,154 @@ mod tests {
                 .expect("second TX limiter should exist"),
             &initial
         );
+    }
+
+    #[test]
+    fn network_rate_limiter_update_preserves_omitted_live_budget_and_queue_state() {
+        let initial_time = Instant::now();
+        let update_time = initial_time + Duration::from_millis(25);
+        let rx_bandwidth = NetworkTokenBucketConfig::new(64, Some(16), 100);
+        let rx_ops = NetworkTokenBucketConfig::new(4, None, 100);
+        let tx_bandwidth = NetworkTokenBucketConfig::new(128, None, 200);
+        let replacement_rx_ops = NetworkTokenBucketConfig::new(8, Some(2), 250);
+        let mut device = VirtioNetworkDevice::with_rate_limiters_at(
+            Some(NetworkRateLimiterConfig::new(
+                Some(rx_bandwidth),
+                Some(rx_ops),
+            )),
+            Some(NetworkRateLimiterConfig::new(Some(tx_bandwidth), None)),
+            initial_time,
+        );
+        let registers = network_device_registers();
+        let queues =
+            configured_network_queues(Some(TEST_QUEUE_SIZE), true, Some(TEST_QUEUE_SIZE), true);
+        device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect("network device should activate");
+        assert!(matches!(
+            device
+                .rx_rate_limiter
+                .as_mut()
+                .expect("RX limiter should exist")
+                .reduce_at(32, initial_time),
+            super::VirtioNetworkRateLimiterReduction::Allowed(_)
+        ));
+        device.pending_rate_limited_rx_queue = true;
+        device.pending_rate_limited_tx_queue = true;
+        let rx_queue_before = device.active_rx_queue();
+        let tx_queue_before = device.active_tx_queue();
+        let rx_bandwidth_before = device
+            .rx_rate_limiter()
+            .expect("RX limiter should exist")
+            .bandwidth
+            .clone();
+        let tx_limiter_before = device.tx_rate_limiter().cloned();
+        let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                None,
+                Some(replacement_rx_ops),
+            ))
+            .validate()
+            .expect("network limiter update should validate");
+
+        device.update_rate_limiters_at(&update, update_time);
+
+        let updated_rx = device
+            .rx_rate_limiter()
+            .expect("updated RX limiter should exist");
+        assert_eq!(
+            updated_rx.bandwidth, rx_bandwidth_before,
+            "omitted bucket must preserve its exact live budget"
+        );
+        let expected_replacement = VirtioNetworkRateLimiter::new_at(
+            NetworkRateLimiterConfig::new(None, Some(replacement_rx_ops)),
+            update_time,
+        )
+        .expect("replacement ops limiter should build");
+        assert_eq!(updated_rx.ops, expected_replacement.ops);
+        assert_eq!(device.tx_rate_limiter(), tx_limiter_before.as_ref());
+        assert_eq!(device.active_rx_queue(), rx_queue_before);
+        assert_eq!(device.active_tx_queue(), tx_queue_before);
+        assert!(device.has_pending_rate_limited_rx_queue());
+        assert!(device.has_pending_rate_limited_tx_queue());
+    }
+
+    #[test]
+    fn network_rate_limiter_update_clears_only_explicitly_disabled_bucket() {
+        let now = Instant::now();
+        let bandwidth = NetworkTokenBucketConfig::new(64, Some(16), 100);
+        let ops = NetworkTokenBucketConfig::new(4, None, 100);
+        let mut device = VirtioNetworkDevice::with_rate_limiters_at(
+            Some(NetworkRateLimiterConfig::new(Some(bandwidth), Some(ops))),
+            None,
+            now,
+        );
+        let original_ops = device
+            .rx_rate_limiter()
+            .expect("RX limiter should exist")
+            .ops
+            .clone();
+        let clear_bandwidth = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                Some(NetworkTokenBucketConfig::new(0, Some(999), 100)),
+                None,
+            ))
+            .validate()
+            .expect("disabled bandwidth update should validate");
+
+        device.update_rate_limiters_at(&clear_bandwidth, now);
+
+        let rx = device
+            .rx_rate_limiter()
+            .expect("ops bucket should keep direction configured");
+        assert!(rx.bandwidth.is_none());
+        assert_eq!(rx.ops, original_ops);
+
+        let clear_ops = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                None,
+                Some(NetworkTokenBucketConfig::new(4, None, 0)),
+            ))
+            .validate()
+            .expect("disabled ops update should validate");
+        device.update_rate_limiters_at(&clear_ops, now);
+
+        assert!(device.rx_rate_limiter().is_none());
+    }
+
+    #[test]
+    fn network_mmio_rate_limiter_update_does_not_signal_config_change() {
+        let now = Instant::now();
+        let mut handler = network_activation_handler_with_rate_limiters_at(
+            Some(NetworkRateLimiterConfig::new(
+                Some(NetworkTokenBucketConfig::new(64, None, 100)),
+                None,
+            )),
+            None,
+            now,
+        );
+        let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_tx_rate_limiter(NetworkRateLimiterConfig::new(
+                None,
+                Some(NetworkTokenBucketConfig::new(8, None, 250)),
+            ))
+            .validate()
+            .expect("network limiter update should validate");
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(read_interrupt_status(&handler), 0);
+
+        handler.update_network_rate_limiters(&update);
+
+        assert!(handler.activation_handler().rx_rate_limiter().is_some());
+        assert!(handler.activation_handler().tx_rate_limiter().is_some());
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(read_interrupt_status(&handler), 0);
     }
 
     #[test]
