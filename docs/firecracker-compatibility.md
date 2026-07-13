@@ -81,7 +81,7 @@ broader device-backed feature negotiation,
 device-backed runner-loop MMIO scheduling, complete device emulation,
 full Firecracker metrics counters, full logger integration beyond API request
 method/path, action, and boot-timer events,
-CPU_SUSPEND and broader PSCI power management, or successful actions beyond owned `InstanceStart`
+non-timer CPU-suspend wake and broader PSCI power management, or successful actions beyond owned `InstanceStart`
 startup with an internal boot run loop across bounded step windows and runtime
 `FlushMetrics` yet. Minimal startup metrics flushing writes the first metrics
 line when startup metrics are configured, and periodic metrics flushing uses the
@@ -94,7 +94,7 @@ recorded as pre-boot VM state and applied during startup preparation. Runtime
 virtio-block device through the process-owned boot session, but public
 block-device attachment, boot selection changes, and hotplug remain deferred.
 
-## Internal PSCI Secondary-Power Sessions
+## Internal PSCI Power Sessions
 
 Internal HVF boot sessions now compose the ordered owner topology, concurrent
 run coordinator, and PSCI power model. Every verified MPIDR feeds the arm64 FDT;
@@ -118,10 +118,19 @@ topology. Re-entry writes the retained `SCTLR_EL1` to zero before applying the
 existing Linux X0-X3, PSTATE, and PC-last entry contract; this is a narrow
 warm-entry reset and not a claim of complete architectural cold reset.
 
+`CPU_SUSPEND32/64` is a separate retained transaction for an online caller.
+The member stays logically `ON`, so peer `AFFINITY_INFO` remains `ON`, while
+normal guest execution is replaced by exact-token virtual-timer waits on the
+same owner thread. The implementation ignores power-state, entry, and context
+arguments, publishes the configured timer PPI before completing X0 with
+`SUCCESS`, and preserves the transaction across wakeup/pause cancellation.
+Stop, shutdown, and terminal drains do not invent a wake response.
+
 Public process startup now uses this capability for the host-limited range
 `1..=min(32, host_max)` while native-v1 capture/load remains a strict one-vCPU
-profile. Guest CPU off/re-entry does not change public topology; `CPU_SUSPEND`,
-dynamic CPU add/remove, and writable CPU-template feature configuration remain
+profile. Guest CPU off/re-entry does not change public topology; `CPU_SUSPEND`
+is limited to retained EL1 virtual-timer wake without FDT idle-state discovery;
+dynamic CPU add/remove and writable CPU-template feature configuration remain
 deferred. Firecracker delegates equivalent PSCI 0.2 behavior to KVM; bangbang
 coordinates it explicitly above Hypervisor.framework's per-vCPU owner threads.
 
@@ -1403,14 +1412,21 @@ minimal RTC device does not implement alarm interrupts. PCI and other device
 nodes remain deferred until the corresponding emulation paths exist.
 Because the FDT advertises PSCI with `method = "hvc"`, the HVF backend decodes
 arm64 HVC exception exits and handles `HVC #0` through its PSCI 0.2 responder.
-The aggregate boot-session path coordinates `CPU_ON32/64`, `CPU_OFF`, and
-`AFFINITY_INFO32/64` against the ordered topology; the immediate responder
+The aggregate boot-session path coordinates `CPU_SUSPEND32/64`, `CPU_ON32/64`,
+`CPU_OFF`, and `AFFINITY_INFO32/64` against the ordered topology; the immediate responder
 returns `PSCI_VERSION`, reports feature support for implemented calls, returns
 `MIGRATE_INFO_TYPE` as the PSCI value for a trusted OS that is MP-capable or
 not present, where migration is not required, and translates `SYSTEM_OFF` and
 `SYSTEM_RESET` into guest-requested terminal boot run-loop outcomes. Successful
 `CPU_OFF` does not return to the caller or write X0; the last committed online
-CPU receives `DENIED`. Other unsupported PSCI calls and HVC immediates write
+CPU receives `DENIED`. `CPU_SUSPEND` retains the caller's context and power
+affinity, deliberately ignores all three ABI arguments like KVM's retained
+standby path, and defers X0 `SUCCESS` until the caller's enabled,
+guest-unmasked EL1 virtual timer becomes due and its PPI is pending. Wakeup and
+pause cancellation keep the exact call pending for rearm; stop, shutdown, and
+terminal drains do not synthesize success. PSCI remains version 0.2, the FDT
+does not publish CPU idle states, and SGI/SPI/direct IRQ/FIQ wake is outside
+this timer-only subset. Other unsupported PSCI calls and HVC immediates write
 `NOT_SUPPORTED` to X0.
 Early boot also traps the guest's `OSDLR_EL1` and `OSLAR_EL1` OS lock
 system-register accesses through the AArch64 SYS64 exception class (`0x18`),
@@ -1745,8 +1761,12 @@ IRQ/FIQ commands expose and can reapply complete pending injection levels; and
 GIC PPI pending commands can set or clear a validated timer PPI bit on the
 runner thread. The internal boot-session
 run-loop now handles virtual timer exits by asserting the EL1 virtual timer PPI
-through that runner-thread command. Full timer delivery policy, including how to
-detect EOI/deactivation and unmask the HVF virtual timer, remains future work.
+through that runner-thread command. The same owner-local state backs PSCI
+`CPU_SUSPEND` retained standby: the suspended online member participates in
+normal coordinator generations through an interruptible timer wait, and a due
+timer publishes the PPI before the deferred PSCI result. Full timer delivery
+policy, including how to detect EOI/deactivation and unmask the HVF virtual
+timer, and non-timer suspend wake sources remain future work.
 These commands reject overlapping metadata reads, runs, boot-register setup,
 MMIO dispatches, core-register operations, timer operations, or generalized
 interrupt operations. The general-register capture command returns only after
@@ -2191,8 +2211,9 @@ startup preparation. Topology tests inject host-capacity and partial-owner
 failures; process/API tests prove those failures retain no session and do not
 commit `Running`; signed executable tests prove public CPU0/CPU1 execution and
 guest-directed CPU1 off/re-entry. The current scaffold still does not provide
-full public run-loop control beyond pause/resume, PSCI `CPU_SUSPEND`, dynamic CPU
-topology, or full process exit-code parity for error power actions. Like
+full public run-loop control beyond pause/resume, non-timer PSCI suspend wake,
+FDT CPU idle-state discovery, dynamic CPU topology, or full process exit-code
+parity for error power actions. Like
 Firecracker's aarch64 process boundary, `SYSTEM_RESET` is terminal rather than
 an in-process reboot. Public
 machine configuration rejects `mem_size_mib` above the current 1022 GiB Apple

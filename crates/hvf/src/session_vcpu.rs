@@ -15,9 +15,10 @@ use crate::coordinator::{
 use crate::memory::HvfGuestMemoryMappingError;
 use crate::psci::{
     PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOffBegin, PsciCpuOnBegin,
-    PsciCpuOnToken, PsciCpuOnWork, PsciCpuPowerCoordinator,
+    PsciCpuOnToken, PsciCpuOnWork, PsciCpuPowerCoordinator, PsciCpuSuspendResponse,
+    PsciCpuSuspendToken,
 };
-use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
+use crate::runner::{HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::vcpu::HvfArm64SecondaryBootRegisters;
 
 /// Failure while translating aggregate vCPU events into boot-session steps.
@@ -115,24 +116,36 @@ struct IndexedBootStep {
     outcome: HvfVcpuRunStepOutcome,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingCpuSuspend {
+    power_token: PsciCpuSuspendToken,
+    coordinator_work: HvfVcpuCoordinatorWork,
+}
+
 /// Boot-session aggregate that owns every vCPU runner and its PSCI power model.
 #[derive(Debug)]
 pub(crate) struct HvfArm64BootVcpuSession<'vm> {
     coordinator: HvfVcpuRunCoordinator<'vm>,
     power: PsciCpuPowerCoordinator,
+    virtual_timer_intid: u32,
+    pending_cpu_suspends: Vec<Option<PendingCpuSuspend>>,
     pending_steps: VecDeque<Result<IndexedBootStep, HvfArm64BootVcpuError>>,
     last_step_index: usize,
     last_terminal_report: Option<HvfVcpuRunTerminalReport>,
 }
 
 impl<'vm> HvfArm64BootVcpuSession<'vm> {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         coordinator: HvfVcpuRunCoordinator<'vm>,
         power: PsciCpuPowerCoordinator,
+        virtual_timer_intid: u32,
     ) -> Self {
+        let pending_cpu_suspends = vec![None; coordinator.member_count()];
         Self {
             coordinator,
             power,
+            virtual_timer_intid,
+            pending_cpu_suspends,
             pending_steps: VecDeque::new(),
             last_step_index: 0,
             last_terminal_report: None,
@@ -143,6 +156,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         runner: HvfVcpuRunner<'vm>,
         mpidr: u64,
         dispatcher: Arc<Mutex<MmioDispatcher>>,
+        virtual_timer_intid: u32,
     ) -> Result<Self, HvfVcpuRunCoordinatorError> {
         let coordinator = HvfVcpuRunCoordinator::from_runner(runner, mpidr, dispatcher, true)?;
         let power = PsciCpuPowerCoordinator::new(&[mpidr]).map_err(|_| {
@@ -150,7 +164,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
                 "restored vCPU power topology is incompatible with its MPIDR",
             )
         })?;
-        Ok(Self::new(coordinator, power))
+        Ok(Self::new(coordinator, power, virtual_timer_intid))
     }
 
     pub(crate) fn member_count(&self) -> usize {
@@ -236,6 +250,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
                 for member in report.acknowledgements().iter().cloned() {
                     sentinel_index = member.index();
                     if member_is_canceled(&member)
+                        || (cpu_on_admission.is_none() && member_has_retained_vtimer(&member))
                         || (cpu_on_admission.is_none() && member_has_coordinator_work(&member))
                     {
                         continue;
@@ -259,6 +274,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
                     if (member.index(), member.generation()) == primary
                         || member_is_canceled(&member)
                         || member_is_terminal(&member)
+                        || member_has_retained_vtimer(&member)
                         || member_has_coordinator_work(&member)
                     {
                         continue;
@@ -287,6 +303,9 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
             Ok(HvfVcpuRunMemberOutcome::Coordinator(work)) => {
                 self.process_coordinator_work(index, *work, entry_is_valid, cpu_on_admission)?
             }
+            Ok(HvfVcpuRunMemberOutcome::RetainedVtimer(outcome)) => {
+                self.process_cpu_suspend_wakeup(index, *outcome)?
+            }
             Err(source) => {
                 return Err(HvfArm64BootVcpuError::Member {
                     index,
@@ -308,6 +327,9 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
     ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
         let (exit, function_id, _, request) = work.into_parts();
         let response = match request {
+            PsciCoordinatorRequest::CpuSuspend => {
+                return self.process_cpu_suspend(caller_index, work);
+            }
             PsciCoordinatorRequest::CpuOff => {
                 return self.process_cpu_off(caller_index, work);
             }
@@ -331,6 +353,110 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
             "AFFINITY_INFO completion",
             false,
         )?;
+        Ok(HvfVcpuRunStepOutcome::Hvc {
+            exit,
+            function_id,
+            return_value: response.return_value(),
+        })
+    }
+
+    fn process_cpu_suspend(
+        &mut self,
+        caller_index: usize,
+        work: HvfVcpuCoordinatorWork,
+    ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        let (exit, function_id, _, _) = work.into_parts();
+        if !matches!(self.pending_cpu_suspends.get(caller_index), Some(None)) {
+            return Err(self.power_error("CPU_SUSPEND activation", caller_index));
+        }
+        let suspend = self
+            .power
+            .begin_cpu_suspend(caller_index)
+            .map_err(|_| self.power_error("CPU_SUSPEND validation", caller_index))?;
+        let suspend_index = suspend.caller_index();
+        if suspend_index != caller_index {
+            let _ = self.power.abort_cpu_suspend(suspend.token());
+            return Err(self.power_error("CPU_SUSPEND identity", caller_index));
+        }
+        if let Err(source) =
+            self.coordinator
+                .suspend_for_cpu_suspend(suspend_index, work, self.virtual_timer_intid)
+        {
+            let cleanup_failed = self.power.abort_cpu_suspend(suspend.token()).is_err();
+            return Err(HvfArm64BootVcpuError::Coordinator {
+                stage: "CPU_SUSPEND scheduler activation",
+                index: suspend_index,
+                mpidr: self.mpidr(suspend_index),
+                cleanup_failed,
+                source: Box::new(source),
+            });
+        }
+        let Some(slot) = self.pending_cpu_suspends.get_mut(suspend_index) else {
+            return Err(self.power_error("CPU_SUSPEND activation", caller_index));
+        };
+        *slot = Some(PendingCpuSuspend {
+            power_token: suspend.token(),
+            coordinator_work: work,
+        });
+
+        Ok(HvfVcpuRunStepOutcome::CpuSuspend {
+            index: suspend_index,
+            mpidr: self.mpidr(suspend_index),
+            exit,
+            function_id,
+        })
+    }
+
+    fn process_cpu_suspend_wakeup(
+        &mut self,
+        caller_index: usize,
+        outcome: HvfVcpuRetainedVtimerWaitOutcome,
+    ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
+        if outcome == HvfVcpuRetainedVtimerWaitOutcome::Canceled {
+            return Ok(HvfVcpuRunStepOutcome::Canceled);
+        }
+        let pending = self
+            .pending_cpu_suspends
+            .get(caller_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| self.power_error("CPU_SUSPEND wakeup", caller_index))?;
+        self.power
+            .validate_cpu_suspend(pending.power_token, caller_index)
+            .map_err(|_| self.power_error("CPU_SUSPEND wakeup validation", caller_index))?;
+        self.coordinator
+            .resume_from_cpu_suspend(caller_index, pending.coordinator_work)
+            .map_err(|source| {
+                self.coordinator_error("CPU_SUSPEND scheduler wakeup", caller_index, source)
+            })?;
+
+        let (exit, function_id, _, _) = pending.coordinator_work.into_parts();
+        let response = PsciCoordinatorResponse::CpuSuspend(PsciCpuSuspendResponse::Success);
+        if let Err(error) = self.complete_caller(
+            caller_index,
+            pending.coordinator_work,
+            response,
+            "CPU_SUSPEND completion",
+            false,
+        ) {
+            let cleanup_failed = self
+                .coordinator
+                .suspend_for_cpu_suspend(
+                    caller_index,
+                    pending.coordinator_work,
+                    self.virtual_timer_intid,
+                )
+                .is_err();
+            return Err(with_cleanup_evidence(error, cleanup_failed));
+        }
+        self.power
+            .commit_cpu_suspend(pending.power_token)
+            .map_err(|_| self.power_error("CPU_SUSPEND power commit", caller_index))?;
+        let Some(slot) = self.pending_cpu_suspends.get_mut(caller_index) else {
+            return Err(self.power_error("CPU_SUSPEND completion", caller_index));
+        };
+        *slot = None;
+
         Ok(HvfVcpuRunStepOutcome::Hvc {
             exit,
             function_id,
@@ -600,6 +726,8 @@ fn member_is_canceled(member: &HvfVcpuRunMemberResult) -> bool {
         member.result(),
         Ok(HvfVcpuRunMemberOutcome::Handled(
             HvfVcpuRunStepOutcome::Canceled
+        )) | Ok(HvfVcpuRunMemberOutcome::RetainedVtimer(
+            HvfVcpuRetainedVtimerWaitOutcome::Canceled
         ))
     )
 }
@@ -614,6 +742,13 @@ const fn barrier_cpu_on_admission(reason: HvfVcpuRunControlReason) -> Option<boo
 
 fn member_has_coordinator_work(member: &HvfVcpuRunMemberResult) -> bool {
     matches!(member.result(), Ok(HvfVcpuRunMemberOutcome::Coordinator(_)))
+}
+
+fn member_has_retained_vtimer(member: &HvfVcpuRunMemberResult) -> bool {
+    matches!(
+        member.result(),
+        Ok(HvfVcpuRunMemberOutcome::RetainedVtimer(_))
+    )
 }
 
 fn member_is_terminal(member: &HvfVcpuRunMemberResult) -> bool {
@@ -661,6 +796,7 @@ impl<'vm> Deref for HvfArm64BootVcpuSession<'vm> {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
 
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioDispatcher;
@@ -673,12 +809,13 @@ mod tests {
         PsciCpuPowerCoordinator, PsciCpuPowerState, PsciStatus, handle_coordinated_call,
     };
     use crate::runner::tests::{
-        start_coordinated_psci_run_step_recording_runner,
+        start_coordinated_psci_run_step_recording_runner, start_cpu_suspend_retained_runner,
         start_secondary_configure_recording_runner,
     };
     use crate::vcpu::{HvfArm64SecondaryBootRegisters, HvfRegister};
 
     const PSCI_CPU_ON_64: u64 = 0xc400_0003;
+    const PSCI_CPU_SUSPEND: u64 = 0x8400_0001;
     const PSCI_CPU_OFF: u64 = 0x8400_0002;
     const SECONDARY_ENTRY: u64 = 0x8020_0000;
     const SECONDARY_CONTEXT: u64 = 0xfeed_face_cafe_beef;
@@ -710,7 +847,7 @@ mod tests {
         let power =
             PsciCpuPowerCoordinator::new(&[0, 1]).expect("test power topology should build");
         (
-            HvfArm64BootVcpuSession::new(coordinator, power),
+            HvfArm64BootVcpuSession::new(coordinator, power, 27),
             reads,
             writes,
             configured,
@@ -767,6 +904,120 @@ mod tests {
     }
 
     #[test]
+    fn cpu_suspend_session_defers_success_until_timer_ppi_wakeup() {
+        let arguments = [0xfeed_face, 0x1234_5678, u64::MAX];
+        let (runner, reads, writes, timer_samples, ppi) =
+            start_cpu_suspend_retained_runner(PSCI_CPU_SUSPEND, arguments, 1, 100, [Ok(100)]);
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let coordinator =
+            HvfVcpuRunCoordinator::from_test_runners(vec![runner], vec![0], dispatcher, &[0])
+                .expect("single test coordinator should build");
+        let power = PsciCpuPowerCoordinator::new(&[0]).expect("test power topology should build");
+        let mut session = HvfArm64BootVcpuSession::new(coordinator, power, 27);
+
+        assert!(matches!(
+            session.run_step(|_| true),
+            Ok(HvfVcpuRunStepOutcome::CpuSuspend {
+                index: 0,
+                mpidr: 0,
+                function_id: PSCI_CPU_SUSPEND,
+                ..
+            })
+        ));
+        assert_eq!(session.power.power_state(0), Some(PsciCpuPowerState::On));
+        assert_eq!(writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(timer_samples.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        assert!(matches!(
+            session.run_step(|_| true),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_CPU_SUSPEND,
+                return_value: 0,
+                ..
+            })
+        ));
+        timer_samples
+            .recv()
+            .expect("suspended member should sample its retained timer");
+        assert_eq!(
+            ppi.recv()
+                .expect("timer wake should publish the configured PPI"),
+            (27, true)
+        );
+        assert_eq!(
+            writes
+                .recv()
+                .expect("timer wake should complete CPU_SUSPEND X0"),
+            (HvfRegister::X0, 0)
+        );
+        assert_eq!(
+            reads.try_iter().collect::<Vec<_>>(),
+            vec![
+                HvfRegister::X0,
+                HvfRegister::X1,
+                HvfRegister::X2,
+                HvfRegister::X3,
+            ]
+        );
+        assert_eq!(session.power.power_state(0), Some(PsciCpuPowerState::On));
+        assert!(session.pending_cpu_suspends[0].is_none());
+        session.shutdown().expect("test session should shut down");
+    }
+
+    #[test]
+    fn cpu_suspend_control_cancellation_rearms_without_completing_x0() {
+        let (runner, _reads, writes, timer_samples, _ppi) =
+            start_cpu_suspend_retained_runner(PSCI_CPU_SUSPEND, [1, 2, 3], 0, 100, [Ok(1), Ok(2)]);
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let coordinator =
+            HvfVcpuRunCoordinator::from_test_runners(vec![runner], vec![0], dispatcher, &[0])
+                .expect("single test coordinator should build");
+        let power = PsciCpuPowerCoordinator::new(&[0]).expect("test power topology should build");
+        let mut session = HvfArm64BootVcpuSession::new(coordinator, power, 27);
+        assert!(matches!(
+            session.run_step(|_| true),
+            Ok(HvfVcpuRunStepOutcome::CpuSuspend { .. })
+        ));
+
+        let wakeup_control = session.control();
+        thread::scope(|scope| {
+            let step = scope.spawn(|| session.run_step(|_| true));
+            timer_samples
+                .recv()
+                .expect("first retained wait should sample");
+            let waiter = wakeup_control
+                .request_wakeup()
+                .expect("wakeup should cancel retained wait");
+            assert!(matches!(
+                step.join().expect("session step should not panic"),
+                Ok(HvfVcpuRunStepOutcome::Canceled)
+            ));
+            waiter.wait().expect("wakeup barrier should complete");
+        });
+        assert!(session.pending_cpu_suspends[0].is_some());
+        assert_eq!(writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        let stop_control = session.control();
+        thread::scope(|scope| {
+            let step = scope.spawn(|| session.run_step(|_| true));
+            timer_samples
+                .recv()
+                .expect("wakeup should rearm the retained wait");
+            let waiter = stop_control
+                .request_stop()
+                .expect("stop should cancel retained wait");
+            assert!(matches!(
+                step.join().expect("session step should not panic"),
+                Ok(HvfVcpuRunStepOutcome::Canceled)
+            ));
+            waiter.wait().expect("stop barrier should complete");
+        });
+        assert!(session.pending_cpu_suspends[0].is_some());
+        assert_eq!(writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+        session.shutdown().expect("test session should shut down");
+    }
+
+    #[test]
     fn cpu_off_session_denies_the_last_online_cpu_with_a_normal_response() {
         let (runner, reads, writes) =
             start_coordinated_psci_run_step_recording_runner(PSCI_CPU_OFF, [u64::MAX; 3], 0, false);
@@ -775,7 +1026,7 @@ mod tests {
             HvfVcpuRunCoordinator::from_test_runners(vec![runner], vec![0], dispatcher, &[0])
                 .expect("single test coordinator should build");
         let power = PsciCpuPowerCoordinator::new(&[0]).expect("test power topology should build");
-        let mut session = HvfArm64BootVcpuSession::new(coordinator, power);
+        let mut session = HvfArm64BootVcpuSession::new(coordinator, power, 27);
 
         assert!(matches!(
             session.run_step(|_| true),
@@ -807,7 +1058,8 @@ mod tests {
             &[0, 1],
         )
         .expect("two-member test coordinator should build");
-        let mut session = HvfArm64BootVcpuSession::new(coordinator, power_with_secondary_online());
+        let mut session =
+            HvfArm64BootVcpuSession::new(coordinator, power_with_secondary_online(), 27);
 
         let mut observed = None;
         for _ in 0..4 {

@@ -87,6 +87,20 @@ drains an indefinite wait. Use Mach deadlines, admission observations, and
 completion acknowledgements rather than fixed sleeps. This foundation does not
 by itself advertise or validate PSCI `CPU_SUSPEND`.
 
+Guest-facing PSCI `CPU_SUSPEND` validation must additionally cover both calling
+conventions and all three ignored arguments, exact pending runner/power tokens,
+unchanged `ON` affinity, no X0 write before wake, and PPI publication before
+deferred `SUCCESS`. Suspended members must share normal run generations with
+runnable peers. Wakeup and pause cancellation must retain and rearm the exact
+transaction; timer-won cancellation debt must be consumed before later guest
+execution; stop, shutdown, and terminal drains must not synthesize success.
+The signed `hvf_lifecycle` proof uses a two-vCPU bare guest: CPU0 provides an
+AFFINITY_INFO checkpoint while CPU1 has made no post-call progress, then CPU1
+must complete two real virtual-timer suspend cycles with preserved non-result
+register sentinels. Use guest publications, observed run-loop steps, and a
+bounded watchdog rather than fixed sleeps. Do not claim FDT idle discovery,
+SGI/SPI/direct IRQ/FIQ wake, PSCI 1.0, or powerdown resume from this gate.
+
 Validation for internal PSCI secondary-power changes must cover both CPU_ON calling
 conventions, exact X1-X3 reads and 32-bit truncation, MPIDR reserved-bit
 validation, all `OFF`/`ON_PENDING`/`ON` transitions and affinity results,
