@@ -5,6 +5,7 @@
     clippy::unwrap_used
 )]
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -309,6 +310,19 @@ impl BangbangProcess {
         output
     }
 
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn run_with_args_expect_exit(
+        args: &[&OsStr],
+        expected_exit: &str,
+    ) -> CompletedProcess {
+        let mut process = Self::spawn_with_args(args);
+
+        process.wait_for_startup_exit(expected_exit)
+    }
+
     fn wait_for_startup_failure(&mut self) -> CompletedProcess {
         self.wait_for_startup_exit("startup failure")
     }
@@ -349,12 +363,27 @@ impl BangbangProcess {
 
     fn spawn_with_extra_args(socket_path: &Path, instance_id: &str, extra_args: &[&str]) -> Self {
         let binary_path = bangbang_bin();
-        let mut child = Command::new(&binary_path)
+        let mut command = Command::new(&binary_path);
+        command
             .arg("--api-sock")
             .arg(socket_path)
             .arg("--id")
             .arg(instance_id)
-            .args(extra_args)
+            .args(extra_args);
+
+        Self::spawn_command(binary_path, command)
+    }
+
+    fn spawn_with_args(args: &[&OsStr]) -> Self {
+        let binary_path = bangbang_bin();
+        let mut command = Command::new(&binary_path);
+        command.args(args);
+
+        Self::spawn_command(binary_path, command)
+    }
+
+    fn spawn_command(binary_path: PathBuf, mut command: Command) -> Self {
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

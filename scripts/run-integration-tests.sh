@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-supported_tests=(hvf_lifecycle guest_boot executable_hvf_e2e)
+supported_tests=(hvf_lifecycle guest_boot executable_hvf_e2e app_sandbox)
 
 usage() {
   cat <<'EOF'
@@ -15,7 +15,7 @@ Options:
   --allow-unsupported  Exit 0 instead of 1 when the host cannot execute HVF.
   --test NAME          Run one integration test target. Can be repeated.
                        Supported values: hvf_lifecycle, guest_boot,
-                       executable_hvf_e2e.
+                       executable_hvf_e2e, app_sandbox.
   -h, --help           Show this help.
 
 Arguments after -- are passed to each signed Rust test binary or executable
@@ -130,7 +130,7 @@ finish_unsupported() {
   exit 1
 }
 
-build_and_sign_test() {
+build_test_executables() {
   local test_name="$1"
   local cargo_messages="$tmp_dir/cargo-test-$test_name.json"
   local test_bins_file="$tmp_dir/test-bins-$test_name"
@@ -167,27 +167,65 @@ with open(sys.argv[1], encoding="utf-8") as messages:
             sys.stdout.write("\0")
 PY
 
-  local test_bins=()
+  built_test_bins=()
   local test_bin
   while IFS= read -r -d "" test_bin; do
     if [[ -n "$test_bin" ]]; then
-      test_bins+=("$test_bin")
+      built_test_bins+=("$test_bin")
     fi
   done < "$test_bins_file"
 
-  if [[ "${#test_bins[@]}" -eq 0 ]]; then
+  if [[ "${#built_test_bins[@]}" -eq 0 ]]; then
     echo "failed to locate bangbang-hvf integration test executable: $test_name" >&2
     exit 1
   fi
+}
 
+build_and_sign_test() {
+  local test_name="$1"
+  build_test_executables "$test_name"
+
+  local test_bin
   local index
-  for index in "${!test_bins[@]}"; do
-    test_bin="${test_bins[$index]}"
+  for index in "${!built_test_bins[@]}"; do
+    test_bin="${built_test_bins[$index]}"
     signed_test_bin="$tmp_dir/$(basename "$test_bin").$index"
     scripts/sign-hvf-binary.sh "$test_bin" "$signed_test_bin"
     signed_test_names+=("$test_name")
     signed_test_bins+=("$signed_test_bin")
   done
+}
+
+build_app_sandbox_tests() {
+  build_test_executables hvf_lifecycle
+  if [[ "${#built_test_bins[@]}" -ne 1 ]]; then
+    echo "App Sandbox validation requires exactly one hvf_lifecycle executable" >&2
+    exit 1
+  fi
+
+  app_sandbox_hvf_bin="$(scripts/sign-app-sandbox-bundle.sh \
+    "${built_test_bins[0]}" \
+    "$tmp_dir/BangbangHvfLifecycleSandbox.app" \
+    scripts/app-sandbox/hvf-lifecycle-Info.plist)"
+
+  cargo build \
+    -p bangbang \
+    --all-features \
+    --locked \
+    --target "$target_triple"
+
+  app_sandbox_bangbang_bin="$(scripts/sign-app-sandbox-bundle.sh \
+    "$repo_root/target/$target_triple/debug/bangbang" \
+    "$tmp_dir/BangbangProcessSandbox.app" \
+    scripts/app-sandbox/bangbang-Info.plist)"
+
+  cargo test \
+    -p bangbang \
+    --test app_sandbox_process_e2e \
+    --all-features \
+    --locked \
+    --target "$target_triple" \
+    --no-run
 }
 
 build_executable_hvf_e2e() {
@@ -234,12 +272,18 @@ fi
 
 target_triple="aarch64-apple-darwin"
 
+built_test_bins=()
 signed_test_names=()
 signed_test_bins=()
 executable_hvf_e2e_bangbang=""
+app_sandbox_hvf_bin=""
+app_sandbox_bangbang_bin=""
 
 for test_name in "${selected_tests[@]}"; do
   case "$test_name" in
+    app_sandbox)
+      build_app_sandbox_tests
+      ;;
     executable_hvf_e2e)
       build_executable_hvf_e2e
       ;;
@@ -307,6 +351,37 @@ for index in "${!signed_test_bins[@]}"; do
       ;;
   esac
 done
+
+if contains app_sandbox "${selected_tests[@]}"; then
+  if [[ "${#test_args[@]}" -eq 0 ]]; then
+    "$app_sandbox_hvf_bin" --test-threads=1
+  else
+    "$app_sandbox_hvf_bin" --test-threads=1 "${test_args[@]}"
+  fi
+
+  if [[ "${#test_args[@]}" -eq 0 ]]; then
+    BANGBANG_PROCESS_E2E_BIN="$app_sandbox_bangbang_bin" \
+      cargo test \
+        -p bangbang \
+        --test app_sandbox_process_e2e \
+        --all-features \
+        --locked \
+        --target "$target_triple" \
+        -- \
+        --test-threads=1
+  else
+    BANGBANG_PROCESS_E2E_BIN="$app_sandbox_bangbang_bin" \
+      cargo test \
+        -p bangbang \
+        --test app_sandbox_process_e2e \
+        --all-features \
+        --locked \
+        --target "$target_triple" \
+        -- \
+        --test-threads=1 \
+        "${test_args[@]}"
+  fi
+fi
 
 if contains executable_hvf_e2e "${selected_tests[@]}"; then
   if [[ "${#test_args[@]}" -eq 0 ]]; then

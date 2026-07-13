@@ -38,8 +38,17 @@ map to the current macOS/HVF scaffold:
 - privilege dropping after privileged resource preparation
 
 bangbang currently rejects Linux-specific Firecracker process options rather
-than silently accepting them. There is no macOS sandbox profile, resource broker,
-launcher process, or Firecracker-jailer replacement yet.
+than silently accepting them. There is no production sandboxed distribution,
+resource broker, launcher process, or Firecracker-jailer replacement yet.
+
+Apple App Sandbox is a supportable containment building block, not a direct
+jailer port. The signed integration runner packages real binaries as minimal app
+bundles with only App Sandbox and Hypervisor entitlements. The complete HVF
+lifecycle suite runs inside that boundary. Process tests prove that a socket in
+the app container is usable and cleaned on `SIGINT`, while the default `/tmp`
+socket and a config path outside the container are denied without path leakage.
+The shipped CLI remains an ordinary non-sandboxed executable; no production app
+bundle or resource policy is provided.
 
 ## Platform-Limit Taxonomy
 
@@ -86,10 +95,10 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Platform-limited unsupported | Reject matching Firecracker process options or document a concrete macOS replacement before accepting any no-op behavior. |
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
-| HVF entitlement and code signing | Implemented validation path | Keep real HVF tests in signed targets and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
+| HVF entitlement and code signing | Implemented normal and App Sandbox validation paths | Keep real HVF tests in signed targets and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
 | vmnet networking | Implemented boundary with operator-owned host policy | Keep supported `host_dev_name` forms, startup validation, MMDS-only behavior, entitlement requirements, and non-goals documented when network behavior changes. |
-| macOS sandboxing | Deferred feasible macOS work | Do not claim production containment until a sandbox profile and resource policy are designed and tested. |
-| Launcher or resource broker | Deferred feasible macOS work | Keep host-path and shared-resource isolation as operator responsibility until a separate broker owns privileged preparation and cleanup. |
+| macOS App Sandbox | Signed feasibility and resource-denial boundary validated | Keep the integration app bundles minimal and do not claim that the ordinary CLI or a production distribution is sandboxed. |
+| Launcher or resource broker | Unimplemented product architecture | Keep host-path and shared-resource authority as operator responsibility unless a separately approved broker design is implemented. |
 
 ## Native Snapshot Composite and Device Boundary
 
@@ -196,7 +205,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | --- | --- | --- |
 | Operator-owned private directories | Required for API sockets, vsock sockets, observability sinks, and other configured paths that should not be shared. | A launcher or broker could create and own these directories before starting a VM process. |
 | HVF entitlement and code signing | Required to execute Hypervisor.framework code paths; signed integration wrappers cover the validation path. | A production launcher may control which executable receives the entitlement, but the entitlement itself is not guest containment. |
-| macOS sandbox profile | Not implemented. | A future profile must be resource-specific and tested against configured host paths, HVF access, vmnet use, logging, metrics, and guest artifacts before it is a claimed security boundary. |
+| macOS App Sandbox | Integration-only app bundles run all signed HVF lifecycle tests and explicit process allow/deny checks. The ordinary CLI is not sandboxed. | A production bundle must define resource-specific container, bookmark, entitlement, and distribution policy before it is a claimed deployed boundary. |
 | Launcher or resource broker | Not implemented. | A future process could prepare privileged or shared host resources, pass owned descriptors to the VMM, and centralize cleanup policy. |
 | Firecracker Linux jailer model | Platform-limited unsupported as a direct port. | Keep Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege-drop flags rejected or documented until macOS replacements exist. |
 
@@ -204,6 +213,30 @@ This document intentionally does not define a sandbox profile, broker protocol,
 privilege-dropping flow, or new public API. PRs that add host resource types
 should state which current boundary protects the resource and whether a future
 launcher, broker, or sandbox profile would need to own it.
+
+## App Sandbox Validation Boundary
+
+Apple documents Hypervisor.framework for entitled sandboxed user-space
+processes. `scripts/run-integration-tests.sh --test app_sandbox` validates that
+contract with real app bundles rather than adding an entitlement to a naked
+command-line binary. One bundle reruns every `hvf_lifecycle` test. The other
+launches the real VMM executable and proves both sides of the filesystem
+boundary:
+
+- `GET /` succeeds through an owner-cleaned Unix socket under the app
+  container's `Data/tmp` directory.
+- The default `/tmp/bangbang.socket` is denied with process-failure exit status
+  `1`, without publishing readiness or echoing the path.
+- A config file outside the container is denied with bad-configuration exit
+  status `152`, without publishing readiness or echoing the path.
+
+The test entitlements contain only `com.apple.security.app-sandbox` and
+`com.apple.security.hypervisor`. They do not grant vmnet, arbitrary files,
+full-disk access, or a private sandbox profile. Apple requires user-selected
+access or security-scoped URLs/bookmarks for many external files; a production
+sandboxed bangbang would therefore need a container-only resource policy or a
+separately designed launcher/broker that transfers authorized resources. This
+repository does not claim or ship either architecture.
 
 ## vmnet Host Policy Boundary
 
@@ -1078,7 +1111,7 @@ or resource broker exists.
 
 The current scaffold does not implement:
 
-- a macOS sandbox profile
+- a production macOS App Sandbox distribution or resource policy
 - a Firecracker-jailer replacement
 - privilege dropping
 - host resource brokering

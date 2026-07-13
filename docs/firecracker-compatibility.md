@@ -2647,8 +2647,12 @@ macOS design work instead of direct implementation:
 
 The initial compatibility scope should document these differences without
 pretending they are solved. See [macOS Host Security Model](security.md) for the
-current host isolation boundary and the deferred macOS sandbox, launcher, and
-resource-broker design options.
+current host isolation boundary. The integration-only App Sandbox target proves
+that all signed HVF lifecycle tests run in an entitled app bundle, that a
+container API socket works and cleans up, and that the default `/tmp` socket plus
+an outside config file are denied with redacted errors. It does not turn the
+ordinary CLI into a sandboxed product or select a launcher, security-scoped
+bookmark, vmnet-provisioning, or resource-broker architecture.
 
 ## Validation Expectations
 

@@ -579,6 +579,7 @@ cargo test --workspace --all-targets --all-features --locked --exclude bangbang-
 cargo test -p bangbang-hvf --lib --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo clippy -p bangbang --test executable_hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
+cargo clippy -p bangbang --test app_sandbox_process_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
@@ -601,7 +602,25 @@ Run one signed integration test target when the change is narrower:
 scripts/run-integration-tests.sh --test hvf_lifecycle
 scripts/run-integration-tests.sh --test guest_boot
 scripts/run-integration-tests.sh --test executable_hvf_e2e
+scripts/run-integration-tests.sh --test app_sandbox
 ```
+
+The `app_sandbox` target is integration-only. It packages the existing
+`hvf_lifecycle` binary and the real `bangbang` executable as minimal app
+bundles signed with `com.apple.security.app-sandbox` and
+`com.apple.security.hypervisor`. On supported Apple Silicon it reruns the
+complete lifecycle suite inside App Sandbox, then runs the disabled-by-default
+`app_sandbox_process_e2e` target. The process target proves help execution,
+path-redacted denial of the default `/tmp` API socket and a config file outside
+the app container, HTTP service through a unique container socket, graceful
+`SIGINT`, and owned-socket cleanup. Readiness channels and bounded child
+deadlines are used instead of fixed sleeps.
+
+The target deliberately excludes vmnet, guest fixture files, production app
+distribution, security-scoped bookmarks, and launcher/resource-broker
+protocols. A naked CLI binary is not a valid App Sandbox artifact; bundle
+identity is part of this test contract. `--allow-unsupported` still builds and
+signs both app bundles before runtime validation may be skipped.
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
