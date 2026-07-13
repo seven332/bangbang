@@ -78,6 +78,10 @@ const NONBLOCKING_CONNECT_INTERRUPTED_RETRY_LIMIT: usize = 4;
 const VSOCK_GUEST_RW_PENDING_PACKET_LIMIT: usize = 4;
 const VSOCK_HOST_RW_PENDING_PACKET_LIMIT: usize = 4;
 const VSOCK_HOST_RW_POLL_BATCH_LIMIT: usize = VSOCK_HOST_RW_PENDING_PACKET_LIMIT;
+// Host stream bytes are prefetched before the next guest RX descriptor is available. Keep each
+// prefetched payload small enough for the supported Linux guest's receive buffers, including the
+// virtio-vsock packet header.
+const VSOCK_HOST_RW_PREFETCH_PAYLOAD_LIMIT: usize = 2 * 1024;
 const VSOCK_CONNECTION_BUFFER_SIZE_USIZE: usize = VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE as usize;
 const VSOCK_CREDIT_UPDATE_THRESHOLD: u32 = 4 * 1024;
 const VSOCK_CONNECTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -7011,7 +7015,7 @@ impl VirtioVsockDevice {
             return;
         }
 
-        let mut scratch = vec![0; VSOCK_HOST_RW_READ_LIMIT];
+        let mut scratch = vec![0; VSOCK_HOST_RW_PREFETCH_PAYLOAD_LIMIT];
         let mut reset_headers =
             self.guest_connections
                 .poll_host_rw_payloads(&mut scratch, self.guest_cid, now);
@@ -11644,6 +11648,41 @@ mod tests {
             Some(b"fghij".as_slice())
         );
         assert_eq!(reader.position(), 10);
+    }
+
+    #[test]
+    fn vsock_host_reads_are_packetized_to_prefetch_limit() {
+        let input_len = super::VSOCK_HOST_RW_PREFETCH_PAYLOAD_LIMIT
+            .checked_mul(super::VSOCK_HOST_RW_POLL_BATCH_LIMIT + 1)
+            .expect("test input length should fit");
+        let mut reader = io::Cursor::new(vec![0x5a; input_len]);
+        let mut pending = VecDeque::new();
+        let mut credit = super::VsockConnectionCredit::from_peer_header(
+            VirtioVsockPacketHeader::new()
+                .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE),
+        );
+        let mut scratch = [0; super::VSOCK_HOST_RW_PREFETCH_PAYLOAD_LIMIT];
+
+        assert_eq!(
+            super::poll_host_rw_payloads_from_stream(
+                &mut reader,
+                &mut pending,
+                &mut credit,
+                &mut scratch,
+            ),
+            super::VsockHostRwPollOutcome::Queued
+        );
+        assert_eq!(pending.len(), super::VSOCK_HOST_RW_POLL_BATCH_LIMIT);
+        assert!(
+            pending
+                .iter()
+                .all(|payload| payload.len() == super::VSOCK_HOST_RW_PREFETCH_PAYLOAD_LIMIT)
+        );
+        let queued_len = super::VSOCK_HOST_RW_PREFETCH_PAYLOAD_LIMIT
+            .checked_mul(super::VSOCK_HOST_RW_POLL_BATCH_LIMIT)
+            .expect("queued test length should fit");
+        assert_eq!(reader.position(), queued_len as u64);
+        assert_eq!(credit.reserved_peer_bytes, queued_len as u32);
     }
 
     #[test]

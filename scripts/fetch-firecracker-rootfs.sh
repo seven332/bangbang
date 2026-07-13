@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v32"
+direct_boot_variant="direct-boot-v33"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -1236,10 +1236,11 @@ import sys
 
 HOST_CID = getattr(socket, "VMADDR_CID_HOST", 2)
 PORT = 5005
-PAYLOAD_PAIRS = (
-    (b"BANGBANG_VSOCK_GUEST_STREAM_ONE", b"BANGBANG_VSOCK_HOST_STREAM_ONE"),
-    (b"BANGBANG_VSOCK_GUEST_STREAM_TWO", b"BANGBANG_VSOCK_HOST_STREAM_TWO"),
-)
+TRANSFER_BYTES = 1024 * 1024
+CHUNK_BYTES = 16 * 1024
+GUEST_STREAM_SEED = 0x3D
+HOST_STREAM_SEED = 0xA7
+SOCKET_TIMEOUT = 10.0
 
 
 def fail(reason):
@@ -1248,7 +1249,7 @@ def fail(reason):
 
 
 def recv_exact(stream, size):
-    data = b""
+    data = bytearray()
     while len(data) < size:
         try:
             chunk = stream.recv(size - len(data))
@@ -1256,8 +1257,53 @@ def recv_exact(stream, size):
             fail("RECV")
         if not chunk:
             fail("EOF")
-        data += chunk
-    return data
+        data.extend(chunk)
+    return bytes(data)
+
+
+def deterministic_chunk(offset, size, seed):
+    return bytes(
+        (
+            ((position * 131 + seed) ^ (position >> 8) ^ (position >> 16))
+            & 0xFF
+        )
+        for position in range(offset, offset + size)
+    )
+
+
+def send_deterministic_stream(stream, seed):
+    sent = 0
+    while sent < TRANSFER_BYTES:
+        chunk_size = min(CHUNK_BYTES, TRANSFER_BYTES - sent)
+        chunk = deterministic_chunk(sent, chunk_size, seed)
+        try:
+            stream.sendall(chunk)
+        except OSError:
+            fail("SEND")
+        sent += chunk_size
+    if sent != TRANSFER_BYTES:
+        fail("SEND_COUNT")
+
+
+def receive_and_verify_deterministic_stream(stream, seed):
+    received = 0
+    while received < TRANSFER_BYTES:
+        chunk_size = min(CHUNK_BYTES, TRANSFER_BYTES - received)
+        chunk = recv_exact(stream, chunk_size)
+        if chunk != deterministic_chunk(received, chunk_size, seed):
+            fail("CONTENT")
+        received += chunk_size
+    if received != TRANSFER_BYTES:
+        fail("RECV_COUNT")
+
+
+def expect_eof(stream):
+    try:
+        trailing = stream.recv(1)
+    except OSError:
+        fail("EOF_READ")
+    if trailing:
+        fail("TRAILING_DATA")
 
 
 if not hasattr(socket, "AF_VSOCK"):
@@ -1269,21 +1315,19 @@ except OSError:
     fail("SOCKET")
 
 try:
-    stream.settimeout(5.0)
+    stream.settimeout(SOCKET_TIMEOUT)
     try:
         stream.connect((HOST_CID, PORT))
     except OSError:
         fail("CONNECT")
 
-    for index, (guest_payload, host_reply) in enumerate(PAYLOAD_PAIRS, start=1):
-        try:
-            stream.sendall(guest_payload)
-        except OSError:
-            fail(f"SEND_{index}")
-
-        reply = recv_exact(stream, len(host_reply))
-        if reply != host_reply:
-            fail(f"REPLY_{index}")
+    send_deterministic_stream(stream, GUEST_STREAM_SEED)
+    receive_and_verify_deterministic_stream(stream, HOST_STREAM_SEED)
+    try:
+        stream.shutdown(socket.SHUT_WR)
+    except OSError:
+        fail("SHUTDOWN_WRITE")
+    expect_eof(stream)
 
     print("BANGBANG_VSOCK_GUEST_CONNECT_OK")
 finally:
@@ -1296,7 +1340,7 @@ PY
     write_vdb_marker BANGBANG_VSOCK_GUEST_CONNECT_OK
   elif [ -n "$vsock_result" ]; then
     emit_line "$vsock_result"
-    write_vdb_marker BANGBANG_VSOCK_GUEST_CONNECT_FAIL
+    write_vdb_marker "$vsock_result"
   else
     emit_line BANGBANG_VSOCK_GUEST_CONNECT_FAIL_EMPTY
     write_vdb_marker BANGBANG_VSOCK_GUEST_CONNECT_FAIL
@@ -1411,10 +1455,10 @@ import sys
 
 CID_ANY = getattr(socket, "VMADDR_CID_ANY", -1)
 PORT = 5006
-PAYLOAD_PAIRS = (
-    (b"BANGBANG_VSOCK_GUEST_STREAM_ONE", b"BANGBANG_VSOCK_HOST_STREAM_ONE"),
-    (b"BANGBANG_VSOCK_GUEST_STREAM_TWO", b"BANGBANG_VSOCK_HOST_STREAM_TWO"),
-)
+TRANSFER_BYTES = 1024 * 1024
+CHUNK_BYTES = 16 * 1024
+GUEST_STREAM_SEED = 0x3D
+HOST_STREAM_SEED = 0xA7
 READY_MARKER = b"BANGBANG_VSOCK_HOST_CONNECT_READY"
 SUCCESS_MARKER = b"BANGBANG_VSOCK_HOST_CONNECT_OK"
 FAIL_MARKER = b"BANGBANG_VSOCK_HOST_CONNECT_FAIL"
@@ -1441,7 +1485,7 @@ def fail(reason):
 
 
 def recv_exact(stream, size):
-    data = b""
+    data = bytearray()
     while len(data) < size:
         try:
             chunk = stream.recv(size - len(data))
@@ -1449,8 +1493,53 @@ def recv_exact(stream, size):
             fail("RECV")
         if not chunk:
             fail("EOF")
-        data += chunk
-    return data
+        data.extend(chunk)
+    return bytes(data)
+
+
+def deterministic_chunk(offset, size, seed):
+    return bytes(
+        (
+            ((position * 131 + seed) ^ (position >> 8) ^ (position >> 16))
+            & 0xFF
+        )
+        for position in range(offset, offset + size)
+    )
+
+
+def send_deterministic_stream(stream, seed):
+    sent = 0
+    while sent < TRANSFER_BYTES:
+        chunk_size = min(CHUNK_BYTES, TRANSFER_BYTES - sent)
+        chunk = deterministic_chunk(sent, chunk_size, seed)
+        try:
+            stream.sendall(chunk)
+        except OSError:
+            fail("SEND")
+        sent += chunk_size
+    if sent != TRANSFER_BYTES:
+        fail("SEND_COUNT")
+
+
+def receive_and_verify_deterministic_stream(stream, seed):
+    received = 0
+    while received < TRANSFER_BYTES:
+        chunk_size = min(CHUNK_BYTES, TRANSFER_BYTES - received)
+        chunk = recv_exact(stream, chunk_size)
+        if chunk != deterministic_chunk(received, chunk_size, seed):
+            fail("CONTENT")
+        received += chunk_size
+    if received != TRANSFER_BYTES:
+        fail("RECV_COUNT")
+
+
+def expect_eof(stream):
+    try:
+        trailing = stream.recv(1)
+    except OSError:
+        fail("EOF_READ")
+    if trailing:
+        fail("TRAILING_DATA")
 
 
 if not hasattr(socket, "AF_VSOCK"):
@@ -1483,14 +1572,13 @@ try:
 
     try:
         connection.settimeout(SOCKET_TIMEOUT)
-        for index, (guest_payload, host_payload) in enumerate(PAYLOAD_PAIRS, start=1):
-            try:
-                connection.sendall(guest_payload)
-            except OSError:
-                fail(f"SEND_{index}")
-            payload = recv_exact(connection, len(host_payload))
-            if payload != host_payload:
-                fail(f"PAYLOAD_{index}")
+        send_deterministic_stream(connection, GUEST_STREAM_SEED)
+        receive_and_verify_deterministic_stream(connection, HOST_STREAM_SEED)
+        try:
+            connection.shutdown(socket.SHUT_WR)
+        except OSError:
+            fail("SHUTDOWN_WRITE")
+        expect_eof(connection)
     finally:
         connection.close()
 

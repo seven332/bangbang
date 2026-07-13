@@ -13,6 +13,7 @@ mod support;
 mod macos_arm64 {
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::net::Shutdown;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -78,16 +79,10 @@ mod macos_arm64 {
     const CONCURRENT_MMDS_PROCESS_B_TERMINAL_OFFSET: u64 =
         bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
     const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
-    const DIRECT_ROOTFS_VSOCK_EXCHANGES: &[(&[u8], &[u8])] = &[
-        (
-            b"BANGBANG_VSOCK_GUEST_STREAM_ONE",
-            b"BANGBANG_VSOCK_HOST_STREAM_ONE",
-        ),
-        (
-            b"BANGBANG_VSOCK_GUEST_STREAM_TWO",
-            b"BANGBANG_VSOCK_HOST_STREAM_TWO",
-        ),
-    ];
+    const DIRECT_ROOTFS_VSOCK_STREAM_BYTES: usize = 1024 * 1024;
+    const DIRECT_ROOTFS_VSOCK_STREAM_CHUNK_BYTES: usize = 16 * 1024;
+    const DIRECT_ROOTFS_VSOCK_GUEST_STREAM_SEED: u8 = 0x3d;
+    const DIRECT_ROOTFS_VSOCK_HOST_STREAM_SEED: u8 = 0xa7;
     const DIRECT_ROOTFS_VSOCK_PORT: u32 = 5005;
     const DIRECT_ROOTFS_VSOCK_MULTISTREAM_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_MULTISTREAM_OK";
     const DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES: &[(u32, &[u8], &[u8])] = &[
@@ -104,16 +99,6 @@ mod macos_arm64 {
     ];
     const DIRECT_ROOTFS_HOST_VSOCK_READY_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_READY";
     const DIRECT_ROOTFS_HOST_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_OK";
-    const DIRECT_ROOTFS_HOST_VSOCK_EXCHANGES: &[(&[u8], &[u8])] = &[
-        (
-            b"BANGBANG_VSOCK_GUEST_STREAM_ONE",
-            b"BANGBANG_VSOCK_HOST_STREAM_ONE",
-        ),
-        (
-            b"BANGBANG_VSOCK_GUEST_STREAM_TWO",
-            b"BANGBANG_VSOCK_HOST_STREAM_TWO",
-        ),
-    ];
     const DIRECT_ROOTFS_HOST_VSOCK_PORT: u32 = 5006;
     const DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_READY_MARKER: &[u8] =
         b"BANGBANG_VSOCK_HOST_MULTISTREAM_READY";
@@ -3438,8 +3423,8 @@ mod macos_arm64 {
         create_zeroed_block_backing(&data_backing_path);
         let host_listener = UnixListener::bind(&host_port_path).unwrap_or_else(|err| {
             panic!(
-                "host vsock port listener {} should bind before guest startup: {err}",
-                host_port_path.display()
+                "host vsock port listener should bind before guest startup: {:?}",
+                err.kind()
             )
         });
         host_listener
@@ -3516,27 +3501,22 @@ mod macos_arm64 {
 
         let mut host_stream = match wait_for_unix_listener_accept(
             &host_listener,
-            &host_port_path,
             GUEST_EXECUTION_TIMEOUT,
         ) {
             Ok(stream) => stream,
             Err(err) => {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "guest did not initiate vsock connection to host listener {}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    host_port_path.display(),
-                    output.status,
-                    output.stdout,
-                    output.stderr
+                    "guest did not initiate vsock connection to host listener: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
                 );
             }
         };
         drop(host_listener);
         fs::remove_file(&host_port_path).unwrap_or_else(|err| {
             panic!(
-                "host vsock port listener path {} should be removed after accept: {err}",
-                host_port_path.display()
+                "host vsock port listener path should be removed after accept: {:?}",
+                err.kind()
             )
         });
 
@@ -3550,52 +3530,69 @@ mod macos_arm64 {
             .set_write_timeout(Some(GUEST_EXECUTION_TIMEOUT))
             .expect("host vsock stream write timeout should set");
 
-        for (exchange_index, &(guest_payload, host_payload)) in
-            DIRECT_ROOTFS_VSOCK_EXCHANGES.iter().enumerate()
-        {
-            let exchange_number = exchange_index + 1;
-            let mut received_guest_payload = vec![0; guest_payload.len()];
-            if let Err(err) = host_stream.read_exact(&mut received_guest_payload) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
-                let output = bangbang.force_stop_and_collect();
-                panic!(
-                    "host side did not receive guest vsock payload {exchange_number}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
-                );
-            }
-            assert_eq!(
-                received_guest_payload, guest_payload,
-                "host side should receive deterministic guest vsock payload {exchange_number}"
-            );
-
-            if let Err(err) = host_stream.write_all(host_payload) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
-                let output = bangbang.force_stop_and_collect();
-                panic!(
-                    "host side did not write guest vsock reply {exchange_number}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
-                );
-            }
-        }
-
-        if let Err(err) = wait_for_file_prefix_marker(
-            &data_backing_path,
-            DIRECT_ROOTFS_VSOCK_MARKER,
-            GUEST_EXECUTION_TIMEOUT,
+        let received_guest_bytes = match read_and_verify_deterministic_vsock_stream(
+            &mut host_stream,
+            DIRECT_ROOTFS_VSOCK_GUEST_STREAM_SEED,
         ) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            Ok(received) => received,
+            Err(err) => {
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "host side did not verify the guest-initiated guest-to-host vsock stream: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+        };
+        assert_eq!(
+            received_guest_bytes, DIRECT_ROOTFS_VSOCK_STREAM_BYTES,
+            "host side should verify the complete guest-to-host vsock byte count"
+        );
+
+        let written_host_bytes = match write_deterministic_vsock_stream(
+            &mut host_stream,
+            DIRECT_ROOTFS_VSOCK_HOST_STREAM_SEED,
+        ) {
+            Ok(written) => written,
+            Err(err) => {
+                let guest_failure = direct_rootfs_vsock_failure_phase(&data_backing_path);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "host side did not write the guest-initiated host-to-guest vsock stream: {err}; guest failure phase: {guest_failure}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+        };
+        assert_eq!(
+            written_host_bytes, DIRECT_ROOTFS_VSOCK_STREAM_BYTES,
+            "host side should write the complete host-to-guest vsock byte count"
+        );
+        if let Err(err) = shutdown_unix_stream_write(&host_stream) {
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not complete guest-initiated vsock through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "host side did not write-half-close the guest-initiated vsock stream: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
 
-        if let Err(err) = read_unix_stream_eof(&mut host_stream, &host_port_path) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        if wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_VSOCK_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .is_err()
+        {
+            let guest_failure = direct_rootfs_vsock_failure_phase(&data_backing_path);
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "host side did not observe guest vsock EOF after guest close: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not complete guest-initiated sustained vsock through signed bangbang executable; guest failure phase: {guest_failure}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        if let Err(err) = read_unix_stream_eof(&mut host_stream) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "host side did not observe guest vsock EOF after guest half-close and terminal close: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -3628,8 +3625,8 @@ mod macos_arm64 {
             let host_port_path = vsock_port_path(&uds_path, port);
             let host_listener = UnixListener::bind(&host_port_path).unwrap_or_else(|err| {
                 panic!(
-                    "host vsock multistream port listener {} should bind before guest startup: {err}",
-                    host_port_path.display()
+                    "host vsock multistream port listener should bind before guest startup: {:?}",
+                    err.kind()
                 )
             });
             host_listener
@@ -3725,27 +3722,22 @@ mod macos_arm64 {
         for (port, host_port_path, host_listener) in host_listeners {
             let host_stream = match wait_for_unix_listener_accept(
                 &host_listener,
-                &host_port_path,
                 GUEST_EXECUTION_TIMEOUT,
             ) {
                 Ok(stream) => stream,
                 Err(err) => {
-                    let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                     let output = bangbang.force_stop_and_collect();
                     panic!(
-                        "guest did not initiate multistream vsock connection for port {port} to host listener {}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                        host_port_path.display(),
-                        output.status,
-                        output.stdout,
-                        output.stderr
+                        "guest did not initiate multistream vsock connection for port {port}: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                        output.status, output.stdout, output.stderr
                     );
                 }
             };
             drop(host_listener);
             fs::remove_file(&host_port_path).unwrap_or_else(|err| {
                 panic!(
-                    "host vsock multistream port listener path {} should be removed after accept: {err}",
-                    host_port_path.display()
+                    "host vsock multistream port listener path should be removed after accept: {:?}",
+                    err.kind()
                 )
             });
 
@@ -3758,16 +3750,14 @@ mod macos_arm64 {
             host_stream
                 .set_write_timeout(Some(GUEST_EXECUTION_TIMEOUT))
                 .expect("host vsock multistream stream write timeout should set");
-            host_streams.push((port, host_port_path, host_stream));
+            host_streams.push((port, host_stream));
         }
 
-        for (
-            stream_index,
-            ((port, _host_port_path, host_stream), &(expected_port, guest_payload, _)),
-        ) in host_streams
-            .iter_mut()
-            .zip(DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES.iter())
-            .enumerate()
+        for (stream_index, ((port, host_stream), &(expected_port, guest_payload, _))) in
+            host_streams
+                .iter_mut()
+                .zip(DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES.iter())
+                .enumerate()
         {
             assert_eq!(
                 *port, expected_port,
@@ -3776,23 +3766,23 @@ mod macos_arm64 {
             let stream_number = stream_index + 1;
             let mut received_guest_payload = vec![0; guest_payload.len()];
             if let Err(err) = host_stream.read_exact(&mut received_guest_payload) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not receive guest multistream payload {stream_number} for port {expected_port}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
+                    "host side did not receive guest multistream payload {stream_number} for port {expected_port}: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    err.kind(),
+                    output.status,
+                    output.stdout,
+                    output.stderr
                 );
             }
-            assert_eq!(
-                received_guest_payload, guest_payload,
-                "host side should receive isolated guest multistream payload {stream_number}"
-            );
+            if received_guest_payload != guest_payload {
+                panic!(
+                    "host side did not verify isolated guest multistream payload {stream_number}"
+                );
+            }
         }
 
-        for (
-            stream_index,
-            ((port, _host_port_path, host_stream), &(expected_port, _, host_payload)),
-        ) in host_streams
+        for (stream_index, ((port, host_stream), &(expected_port, _, host_payload))) in host_streams
             .iter_mut()
             .zip(DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES.iter())
             .enumerate()
@@ -3803,34 +3793,36 @@ mod macos_arm64 {
             );
             let stream_number = stream_index + 1;
             if let Err(err) = host_stream.write_all(host_payload) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not write guest multistream reply {stream_number} for port {expected_port}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
+                    "host side did not write guest multistream reply {stream_number} for port {expected_port}: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    err.kind(),
+                    output.status,
+                    output.stdout,
+                    output.stderr
                 );
             }
         }
 
-        if let Err(err) = wait_for_file_prefix_marker(
+        if wait_for_file_prefix_marker(
             &data_backing_path,
             DIRECT_ROOTFS_VSOCK_MULTISTREAM_MARKER,
             GUEST_EXECUTION_TIMEOUT,
-        ) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        )
+        .is_err()
+        {
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not complete guest-initiated vsock multistream through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not complete guest-initiated vsock multistream through signed bangbang executable; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
 
-        for (port, host_port_path, host_stream) in &mut host_streams {
-            if let Err(err) = read_unix_stream_eof(host_stream, host_port_path) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        for (port, host_stream) in &mut host_streams {
+            if let Err(err) = read_unix_stream_eof(host_stream) {
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not observe guest multistream EOF for port {port} after guest close: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "host side did not observe guest multistream EOF for port {port} after guest close: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                     output.status, output.stdout, output.stderr
                 );
             }
@@ -3939,15 +3931,16 @@ mod macos_arm64 {
             "GET / after host-initiated vsock start",
         );
 
-        if let Err(err) = wait_for_file_prefix_marker(
+        if wait_for_file_prefix_marker(
             &data_backing_path,
             DIRECT_ROOTFS_HOST_VSOCK_READY_MARKER,
             GUEST_EXECUTION_TIMEOUT,
-        ) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        )
+        .is_err()
+        {
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not publish host-initiated vsock ready marker: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not publish host-initiated vsock ready marker; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -3955,11 +3948,10 @@ mod macos_arm64 {
         let mut host_stream = match UnixStream::connect(&uds_path) {
             Ok(stream) => stream,
             Err(err) => {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not connect to main vsock listener {}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    uds_path.display(),
+                    "host side did not connect to the main vsock listener: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    err.kind(),
                     output.status,
                     output.stdout,
                     output.stderr
@@ -3975,67 +3967,83 @@ mod macos_arm64 {
 
         let connect_request = format!("CONNECT {DIRECT_ROOTFS_HOST_VSOCK_PORT}\n");
         if let Err(err) = host_stream.write_all(connect_request.as_bytes()) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "host side did not write vsock CONNECT request: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status, output.stdout, output.stderr
+                "host side did not write the vsock CONNECT request: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                err.kind(),
+                output.status,
+                output.stdout,
+                output.stderr
             );
         }
         if let Err(err) = read_vsock_connect_ok(&mut host_stream) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "host side did not receive vsock CONNECT OK response: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "host side did not receive the vsock CONNECT OK response: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
-        for (exchange_index, &(guest_payload, host_payload)) in
-            DIRECT_ROOTFS_HOST_VSOCK_EXCHANGES.iter().enumerate()
-        {
-            let exchange_number = exchange_index + 1;
-            let mut received_guest_payload = vec![0; guest_payload.len()];
-            if let Err(err) = host_stream.read_exact(&mut received_guest_payload) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        let received_guest_bytes = match read_and_verify_deterministic_vsock_stream(
+            &mut host_stream,
+            DIRECT_ROOTFS_VSOCK_GUEST_STREAM_SEED,
+        ) {
+            Ok(received) => received,
+            Err(err) => {
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not receive guest payload {exchange_number} over host-initiated vsock: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "host side did not verify the host-initiated guest-to-host vsock stream: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                     output.status, output.stdout, output.stderr
                 );
             }
-            assert_eq!(
-                received_guest_payload, guest_payload,
-                "host side should receive deterministic guest payload {exchange_number}"
-            );
+        };
+        assert_eq!(
+            received_guest_bytes, DIRECT_ROOTFS_VSOCK_STREAM_BYTES,
+            "host side should verify the complete host-initiated guest-to-host byte count"
+        );
 
-            if let Err(err) = host_stream.write_all(host_payload) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        let written_host_bytes = match write_deterministic_vsock_stream(
+            &mut host_stream,
+            DIRECT_ROOTFS_VSOCK_HOST_STREAM_SEED,
+        ) {
+            Ok(written) => written,
+            Err(err) => {
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not write host-initiated vsock reply {exchange_number}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "host side did not write the host-initiated host-to-guest vsock stream: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                     output.status, output.stdout, output.stderr
                 );
             }
+        };
+        assert_eq!(
+            written_host_bytes, DIRECT_ROOTFS_VSOCK_STREAM_BYTES,
+            "host side should write the complete host-initiated host-to-guest byte count"
+        );
+        if let Err(err) = shutdown_unix_stream_write(&host_stream) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "host side did not write-half-close the host-initiated vsock stream: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
         }
 
-        if let Err(err) = wait_for_file_prefix_marker(
+        if wait_for_file_prefix_marker(
             &data_backing_path,
             DIRECT_ROOTFS_HOST_VSOCK_MARKER,
             GUEST_EXECUTION_TIMEOUT,
-        ) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        )
+        .is_err()
+        {
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not complete host-initiated vsock through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not complete host-initiated sustained vsock through signed bangbang executable; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
 
-        if let Err(err) = read_unix_stream_eof(&mut host_stream, &uds_path) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        if let Err(err) = read_unix_stream_eof(&mut host_stream) {
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "host side did not observe host-initiated vsock EOF after guest close: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "host side did not observe host-initiated vsock EOF after guest half-close and terminal close: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -4147,15 +4155,16 @@ mod macos_arm64 {
             "GET / after host multistream vsock start",
         );
 
-        if let Err(err) = wait_for_file_prefix_marker(
+        if wait_for_file_prefix_marker(
             &data_backing_path,
             DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_READY_MARKER,
             GUEST_EXECUTION_TIMEOUT,
-        ) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        )
+        .is_err()
+        {
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not publish host multistream vsock ready marker: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not publish host multistream vsock ready marker; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -4165,11 +4174,10 @@ mod macos_arm64 {
             let mut host_stream = match UnixStream::connect(&uds_path) {
                 Ok(stream) => stream,
                 Err(err) => {
-                    let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                     let output = bangbang.force_stop_and_collect();
                     panic!(
-                        "host side did not connect multistream port {port} to main vsock listener {}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                        uds_path.display(),
+                        "host side did not connect multistream port {port} to the main vsock listener: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                        err.kind(),
                         output.status,
                         output.stdout,
                         output.stderr
@@ -4185,11 +4193,13 @@ mod macos_arm64 {
 
             let connect_request = format!("CONNECT {port}\n");
             if let Err(err) = host_stream.write_all(connect_request.as_bytes()) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not write multistream vsock CONNECT request for port {port}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
+                    "host side did not write multistream vsock CONNECT request for port {port}: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    err.kind(),
+                    output.status,
+                    output.stdout,
+                    output.stderr
                 );
             }
             host_streams.push((port, host_stream));
@@ -4200,10 +4210,9 @@ mod macos_arm64 {
             let local_port = match read_vsock_connect_ok(host_stream) {
                 Ok(local_port) => local_port,
                 Err(err) => {
-                    let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                     let output = bangbang.force_stop_and_collect();
                     panic!(
-                        "host side did not receive multistream vsock CONNECT OK response for port {port}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                        "host side did not receive multistream vsock CONNECT OK response for port {port}: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                         output.status, output.stdout, output.stderr
                     );
                 }
@@ -4228,17 +4237,20 @@ mod macos_arm64 {
             let stream_number = stream_index + 1;
             let mut received_guest_payload = vec![0; guest_payload.len()];
             if let Err(err) = host_stream.read_exact(&mut received_guest_payload) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not receive guest multistream payload {stream_number} for host port {expected_port}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
+                    "host side did not receive guest multistream payload {stream_number} for host port {expected_port}: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    err.kind(),
+                    output.status,
+                    output.stdout,
+                    output.stderr
                 );
             }
-            assert_eq!(
-                received_guest_payload, guest_payload,
-                "host side should receive isolated host multistream payload {stream_number}"
-            );
+            if received_guest_payload != guest_payload {
+                panic!(
+                    "host side did not verify isolated host multistream payload {stream_number}"
+                );
+            }
         }
 
         for (stream_index, ((port, host_stream), &(expected_port, _guest_payload, host_payload))) in
@@ -4253,34 +4265,36 @@ mod macos_arm64 {
             );
             let stream_number = stream_index + 1;
             if let Err(err) = host_stream.write_all(host_payload) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not write multistream vsock reply {stream_number} for host port {expected_port}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
+                    "host side did not write multistream vsock reply {stream_number} for host port {expected_port}: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    err.kind(),
+                    output.status,
+                    output.stdout,
+                    output.stderr
                 );
             }
         }
 
-        if let Err(err) = wait_for_file_prefix_marker(
+        if wait_for_file_prefix_marker(
             &data_backing_path,
             DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_MARKER,
             GUEST_EXECUTION_TIMEOUT,
-        ) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+        )
+        .is_err()
+        {
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not complete host-initiated vsock multistream through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not complete host-initiated vsock multistream through signed bangbang executable; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
 
         for (port, host_stream) in &mut host_streams {
-            if let Err(err) = read_unix_stream_eof(host_stream, &uds_path) {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            if let Err(err) = read_unix_stream_eof(host_stream) {
                 let output = bangbang.force_stop_and_collect();
                 panic!(
-                    "host side did not observe host multistream EOF for port {port} after guest close: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "host side did not observe host multistream EOF for port {port} after guest close: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                     output.status, output.stdout, output.stderr
                 );
             }
@@ -6413,18 +6427,100 @@ mod macos_arm64 {
         }
     }
 
+    fn fill_deterministic_vsock_stream_chunk(chunk: &mut [u8], stream_offset: usize, seed: u8) {
+        for (index, byte) in chunk.iter_mut().enumerate() {
+            let absolute_offset = stream_offset
+                .checked_add(index)
+                .expect("bounded vsock stream offset should fit usize");
+            let mixed = absolute_offset
+                .wrapping_mul(131)
+                .wrapping_add(usize::from(seed))
+                ^ (absolute_offset >> 8)
+                ^ (absolute_offset >> 16);
+            *byte = mixed.to_le_bytes()[0];
+        }
+    }
+
+    fn write_deterministic_vsock_stream(
+        stream: &mut UnixStream,
+        seed: u8,
+    ) -> Result<usize, String> {
+        let mut chunk = [0; DIRECT_ROOTFS_VSOCK_STREAM_CHUNK_BYTES];
+        let mut written = 0;
+
+        while written < DIRECT_ROOTFS_VSOCK_STREAM_BYTES {
+            let chunk_len = (DIRECT_ROOTFS_VSOCK_STREAM_BYTES - written).min(chunk.len());
+            fill_deterministic_vsock_stream_chunk(&mut chunk[..chunk_len], written, seed);
+            stream.write_all(&chunk[..chunk_len]).map_err(|err| {
+                format!(
+                    "deterministic vsock stream write failed after {written} of {} bytes: {:?}",
+                    DIRECT_ROOTFS_VSOCK_STREAM_BYTES,
+                    err.kind()
+                )
+            })?;
+            written += chunk_len;
+        }
+
+        Ok(written)
+    }
+
+    fn read_and_verify_deterministic_vsock_stream(
+        stream: &mut UnixStream,
+        seed: u8,
+    ) -> Result<usize, String> {
+        let mut received_chunk = [0; DIRECT_ROOTFS_VSOCK_STREAM_CHUNK_BYTES];
+        let mut expected_chunk = [0; DIRECT_ROOTFS_VSOCK_STREAM_CHUNK_BYTES];
+        let mut received = 0;
+
+        while received < DIRECT_ROOTFS_VSOCK_STREAM_BYTES {
+            let chunk_len = (DIRECT_ROOTFS_VSOCK_STREAM_BYTES - received).min(received_chunk.len());
+            stream
+                .read_exact(&mut received_chunk[..chunk_len])
+                .map_err(|err| {
+                    format!(
+                        "deterministic vsock stream read failed after {received} of {} bytes: {:?}",
+                        DIRECT_ROOTFS_VSOCK_STREAM_BYTES,
+                        err.kind()
+                    )
+                })?;
+            fill_deterministic_vsock_stream_chunk(&mut expected_chunk[..chunk_len], received, seed);
+            if let Some(index) = received_chunk[..chunk_len]
+                .iter()
+                .zip(&expected_chunk[..chunk_len])
+                .position(|(received, expected)| received != expected)
+            {
+                return Err(format!(
+                    "deterministic vsock stream content mismatch at byte {} of {}",
+                    received + index,
+                    DIRECT_ROOTFS_VSOCK_STREAM_BYTES
+                ));
+            }
+            received += chunk_len;
+        }
+
+        Ok(received)
+    }
+
+    fn shutdown_unix_stream_write(stream: &UnixStream) -> Result<(), String> {
+        stream.shutdown(Shutdown::Write).map_err(|err| {
+            format!(
+                "failed to write-half-close deterministic vsock stream: {:?}",
+                err.kind()
+            )
+        })
+    }
+
     fn wait_for_unix_listener_accept(
         listener: &UnixListener,
-        path: &Path,
         timeout: Duration,
     ) -> Result<UnixStream, String> {
         listener.set_nonblocking(true).map_err(|err| {
             format!(
-                "failed to set listener {} nonblocking before accept wait: {err}",
-                path.display()
+                "failed to set vsock listener nonblocking before accept wait: {:?}",
+                err.kind()
             )
         })?;
-        if let Some(stream) = try_accept_unix_listener(listener, path)? {
+        if let Some(stream) = try_accept_unix_listener(listener)? {
             return Ok(stream);
         }
 
@@ -6433,15 +6529,13 @@ mod macos_arm64 {
         let started_at = Instant::now();
 
         loop {
-            if let Some(stream) = try_accept_unix_listener(listener, path)? {
+            if let Some(stream) = try_accept_unix_listener(listener)? {
                 return Ok(stream);
             }
 
             let Some(remaining) = timeout.checked_sub(started_at.elapsed()) else {
                 return Err(format!(
-                    "timed out after {:?} waiting for Unix listener {} to accept",
-                    timeout,
-                    path.display()
+                    "timed out after {timeout:?} waiting for vsock listener accept"
                 ));
             };
 
@@ -6449,18 +6543,12 @@ mod macos_arm64 {
         }
     }
 
-    fn try_accept_unix_listener(
-        listener: &UnixListener,
-        path: &Path,
-    ) -> Result<Option<UnixStream>, String> {
+    fn try_accept_unix_listener(listener: &UnixListener) -> Result<Option<UnixStream>, String> {
         match listener.accept() {
             Ok((stream, _addr)) => Ok(Some(stream)),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => Ok(None),
-            Err(err) => Err(format!(
-                "failed to accept Unix listener {}: {err}",
-                path.display()
-            )),
+            Err(err) => Err(format!("failed to accept vsock listener: {:?}", err.kind())),
         }
     }
 
@@ -6478,37 +6566,36 @@ mod macos_arm64 {
 
             stream
                 .read_exact(&mut byte)
-                .map_err(|err| format!("failed to read CONNECT OK response: {err}"))?;
+                .map_err(|err| format!("failed to read CONNECT OK response: {:?}", err.kind()))?;
             line.push(byte[0]);
             if byte[0] == b'\n' {
                 break;
             }
         }
 
-        let response = String::from_utf8(line)
-            .map_err(|err| format!("CONNECT OK response is not UTF-8: {err}"))?;
+        let response =
+            String::from_utf8(line).map_err(|_| "CONNECT OK response is not UTF-8".to_owned())?;
         let Some(port_text) = response
             .strip_prefix("OK ")
             .and_then(|suffix| suffix.strip_suffix('\n'))
         else {
-            return Err(format!("unexpected CONNECT OK response {response:?}"));
+            return Err("unexpected CONNECT OK response".to_owned());
         };
         port_text
             .parse::<u32>()
-            .map_err(|err| format!("CONNECT OK response has invalid local port: {err}"))
+            .map_err(|_| "CONNECT OK response has invalid local port".to_owned())
     }
 
-    fn read_unix_stream_eof(stream: &mut UnixStream, path: &Path) -> Result<(), String> {
+    fn read_unix_stream_eof(stream: &mut UnixStream) -> Result<(), String> {
         let mut byte = [0; 1];
         match stream.read(&mut byte) {
             Ok(0) => Ok(()),
             Ok(read) => Err(format!(
-                "expected EOF from Unix stream {}, read {read} byte(s)",
-                path.display()
+                "expected EOF from vsock stream, read {read} extra byte(s)"
             )),
             Err(err) => Err(format!(
-                "failed to read EOF from Unix stream {}: {err}",
-                path.display()
+                "failed to read EOF from vsock stream: {:?}",
+                err.kind()
             )),
         }
     }
@@ -6557,6 +6644,39 @@ mod macos_arm64 {
             .map_err(|err| format!("failed to read block backing {}: {err}", path.display()))?;
 
         Ok(bytes_read == marker.len() && buffer == marker)
+    }
+
+    fn direct_rootfs_vsock_failure_phase(path: &Path) -> &'static str {
+        const FAILURE_MARKERS: &[(&[u8], &str)] = &[
+            (b"BANGBANG_VSOCK_GUEST_CONNECT_FAIL_CONTENT", "content"),
+            (b"BANGBANG_VSOCK_GUEST_CONNECT_FAIL_RECV", "receive"),
+            (b"BANGBANG_VSOCK_GUEST_CONNECT_FAIL_SEND", "send"),
+            (
+                b"BANGBANG_VSOCK_GUEST_CONNECT_FAIL_SHUTDOWN_WRITE",
+                "write-half close",
+            ),
+            (
+                b"BANGBANG_VSOCK_GUEST_CONNECT_FAIL_EOF_READ",
+                "terminal EOF read",
+            ),
+            (b"BANGBANG_VSOCK_GUEST_CONNECT_FAIL_EOF", "early EOF"),
+            (
+                b"BANGBANG_VSOCK_GUEST_CONNECT_FAIL_TRAILING_DATA",
+                "trailing data",
+            ),
+        ];
+        let Ok(mut file) = fs::File::open(path) else {
+            return "unavailable";
+        };
+        let mut prefix = [0; 128];
+        let Ok(bytes_read) = file.read(&mut prefix) else {
+            return "unavailable";
+        };
+
+        FAILURE_MARKERS
+            .iter()
+            .find_map(|(marker, phase)| prefix[..bytes_read].starts_with(marker).then_some(*phase))
+            .unwrap_or("not published")
     }
 
     fn file_contains_marker(path: &Path, marker: &[u8]) -> Result<bool, String> {
