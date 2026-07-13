@@ -29,10 +29,15 @@ On supported macOS Apple Silicon hosts, the public machine configuration accepts
 `1..=min(32, host_max)`. Counts above the runtime host maximum fail before a
 session is retained or the instance becomes `Running`. Public pause/resume uses
 a topology-wide active-run barrier for every online vCPU. Guest PSCI `CPU_OFF`
-and later `CPU_ON` re-entry reuse the fixed owner topology; dynamic CPU topology,
-`CPU_SUSPEND`, SMT, non-`None` CPU templates, and cross-host CPU portability
-remain unsupported. The native-v1 snapshot profile below remains restricted to
-exactly one vCPU.
+and later `CPU_ON` re-entry reuse the fixed owner topology. PSCI
+`CPU_SUSPEND32/64` provides KVM-style retained standby for an enabled,
+guest-unmasked EL1 virtual timer: affinity remains `ON`, all three call
+arguments are ignored, the timer PPI is made pending before `SUCCESS`, and
+lifecycle cancellation rearms the same transaction without fabricating a
+wake. FDT idle-state discovery and SGI/SPI/direct IRQ/FIQ wake are not exposed.
+Dynamic CPU topology, SMT, non-`None` CPU templates, and cross-host CPU
+portability remain unsupported. The native-v1 snapshot profile below remains
+restricted to exactly one vCPU.
 
 Firecracker-shaped `PUT /cpu-config` input is fully syntax-validated. Empty
 custom templates remain successful no-ops; non-empty KVM capability,

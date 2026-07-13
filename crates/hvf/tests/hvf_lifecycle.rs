@@ -3828,6 +3828,294 @@ fn prepares_owned_hvf_arm64_boot_session() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn psci_cpu_suspend_retains_context_until_two_virtual_timer_wakeups() {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use bangbang_hvf::{
+        HvfArm64BootRunLoopOutcome, HvfArm64BootSessionConfig, HvfVcpuRunStepOutcome,
+        OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    const SECONDARY_OFFSET: u64 = 0x1000;
+    const FLAGS_OFFSET: u64 = 0x4000;
+    const FLAGS_SIZE: usize = 0x48;
+    const CPU_ON_RESULT: usize = 0x00;
+    const AFFINITY_RESULT: usize = 0x08;
+    const PRE_SUSPEND_1: usize = 0x10;
+    const POST_SUSPEND_1: usize = 0x14;
+    const SUSPEND_RESULT_1: usize = 0x18;
+    const SENTINEL_1: usize = 0x20;
+    const PRE_SUSPEND_2: usize = 0x28;
+    const POST_SUSPEND_2: usize = 0x2c;
+    const SUSPEND_RESULT_2: usize = 0x30;
+    const SENTINEL_2: usize = 0x38;
+    const PEER_OBSERVATION: usize = 0x40;
+    const PSCI_CPU_SUSPEND_64: u64 = 0xc400_0001;
+    const PSCI_VERSION: u64 = 0x8400_0000;
+    const SENTINEL: u64 = 0x5a5a;
+
+    // CPU0 starts CPU1, waits for CPU1's pre-suspend publication, observes
+    // AFFINITY_INFO, and emits PSCI_VERSION as an event-driven host checkpoint.
+    let primary_code = [
+        0x1002_0013, // adr x19, flags (+0x4000)
+        0xd280_0060, // mov x0, #3
+        0xf2b8_8000, // movk x0, #0xc400, lsl #16 (CPU_ON64)
+        0xd280_0021, // mov x1, #1
+        0x1000_7f82, // adr x2, secondary (+0x1000)
+        0x1001_ff63, // adr x3, flags (+0x4000)
+        0xd400_0002, // hvc #0
+        0xf900_0260, // str x0, [x19]
+        0xb940_1264, // ldr w4, [x19, #0x10]
+        0x34ff_ffe4, // cbz w4, previous instruction
+        0xd280_0080, // mov x0, #4
+        0xf2b8_8000, // movk x0, #0xc400, lsl #16 (AFFINITY_INFO64)
+        0xd280_0021, // mov x1, #1
+        0xd280_0002, // mov x2, #0
+        0xd400_0002, // hvc #0
+        0xf900_0660, // str x0, [x19, #8]
+        0x5280_0024, // mov w4, #1
+        0xb900_4264, // str w4, [x19, #0x40]
+        0xd280_0000, // mov x0, #0
+        0xf2b0_8000, // movk x0, #0x8400, lsl #16 (PSCI_VERSION)
+        0xd400_0002, // hvc #0
+        0x1400_0000, // b .
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect::<Vec<_>>();
+
+    // CPU1 uses one counter-frequency interval per retained wait, preserves
+    // x20 across both calls, and terminates the guest only after both returns.
+    let secondary_code = [
+        0xaa00_03f3, // mov x19, x0
+        0xd28b_4b54, // mov x20, #0x5a5a
+        0xd53b_e044, // mrs x4, CNTVCT_EL0
+        0xd53b_e005, // mrs x5, CNTFRQ_EL0
+        0x8b05_0084, // add x4, x4, x5
+        0xd51b_e344, // msr CNTV_CVAL_EL0, x4
+        0xd280_0024, // mov x4, #1
+        0xd51b_e324, // msr CNTV_CTL_EL0, x4
+        0xd503_3fdf, // isb
+        0x5280_0026, // mov w6, #1
+        0xb900_1266, // str w6, [x19, #0x10]
+        0xd280_0020, // mov x0, #1
+        0xf2b8_8000, // movk x0, #0xc400, lsl #16 (CPU_SUSPEND64)
+        0xd295_5541, // mov x1, #0xaaaa (ignored)
+        0xd282_4682, // mov x2, #0x1234 (ignored)
+        0xd297_dde3, // mov x3, #0xbeef (ignored)
+        0xd400_0002, // hvc #0
+        0xf900_0e60, // str x0, [x19, #0x18]
+        0xf900_1274, // str x20, [x19, #0x20]
+        0xb900_1666, // str w6, [x19, #0x14]
+        0xd53b_e044, // mrs x4, CNTVCT_EL0
+        0xd53b_e005, // mrs x5, CNTFRQ_EL0
+        0x8b05_0084, // add x4, x4, x5
+        0xd51b_e344, // msr CNTV_CVAL_EL0, x4
+        0xd280_0024, // mov x4, #1
+        0xd51b_e324, // msr CNTV_CTL_EL0, x4
+        0xd503_3fdf, // isb
+        0xb900_2a66, // str w6, [x19, #0x28]
+        0xd280_0020, // mov x0, #1
+        0xf2b8_8000, // movk x0, #0xc400, lsl #16 (CPU_SUSPEND64)
+        0xd297_7761, // mov x1, #0xbbbb (ignored)
+        0xd28a_cf02, // mov x2, #0x5678 (ignored)
+        0xd299_5fc3, // mov x3, #0xcafe (ignored)
+        0xd400_0002, // hvc #0
+        0xf900_1a60, // str x0, [x19, #0x30]
+        0xf900_1e74, // str x20, [x19, #0x38]
+        0xb900_2e66, // str w6, [x19, #0x2c]
+        0xd280_0100, // mov x0, #8
+        0xf2b0_8000, // movk x0, #0x8400, lsl #16 (SYSTEM_OFF)
+        0xd400_0002, // hvc #0
+        0x1400_0000, // b .
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect::<Vec<_>>();
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel =
+        TempFile::new("psci-cpu-suspend-kernel", &image).expect("temp kernel should be created");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("boot source config should be stored");
+    controller
+        .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 16)))
+        .expect("two-vCPU machine should configure");
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    );
+    let mut session = OwnedHvfArm64BootSession::new(&controller, config)
+        .expect("two-vCPU CPU_SUSPEND session should prepare");
+    let primary_entry = GuestAddress::new(
+        session
+            .capture_arm64_general_register_state()
+            .expect("primary entry registers should capture")
+            .pc(),
+    );
+    let secondary_entry = primary_entry
+        .checked_add(SECONDARY_OFFSET)
+        .expect("secondary entry should fit");
+    let flags = primary_entry
+        .checked_add(FLAGS_OFFSET)
+        .expect("shared flags should fit");
+    {
+        let memory = session
+            .guest_memory_mut()
+            .expect("guest memory should be mutable before execution");
+        memory
+            .write_slice(&primary_code, primary_entry)
+            .expect("primary guest code should fit");
+        memory
+            .write_slice(&secondary_code, secondary_entry)
+            .expect("secondary guest code should fit");
+        memory
+            .write_slice(&[0; FLAGS_SIZE], flags)
+            .expect("shared guest flags should fit");
+    }
+    let flags_host = {
+        let memory = session
+            .guest_memory()
+            .expect("mapped guest memory should remain available");
+        let region = memory
+            .regions()
+            .iter()
+            .find(|region| region.range().contains(flags))
+            .expect("shared flags should belong to mapped DRAM");
+        let offset = flags
+            .raw_value()
+            .checked_sub(region.range().start().raw_value())
+            .and_then(|offset| usize::try_from(offset).ok())
+            .expect("shared flag host offset should fit");
+        region.host_address().as_ptr().cast::<u8>() as usize + offset
+    };
+    let read_u32 = |offset: usize| {
+        // SAFETY: each aligned address remains inside the mapped shared flag
+        // area for the session lifetime; volatile reads observe guest stores.
+        unsafe { std::ptr::read_volatile((flags_host + offset) as *const u32) }
+    };
+    let read_u64 = |offset: usize| {
+        // SAFETY: each aligned address remains inside the mapped shared flag
+        // area for the session lifetime; volatile reads observe guest stores.
+        unsafe { std::ptr::read_volatile((flags_host + offset) as *const u64) }
+    };
+
+    let control = session.run_loop_control();
+    let stop_token = control.stop_token();
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let watchdog_done_for_thread = Arc::clone(&watchdog_done);
+    let watchdog = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !watchdog_done_for_thread.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if !watchdog_done_for_thread.load(Ordering::Acquire) {
+            let _ = control.request_stop();
+        }
+    });
+
+    let one_step = NonZeroUsize::new(1).expect("one is nonzero");
+    let mut observed = Vec::new();
+    let mut peer_checkpoint_seen = false;
+    let mut suspend_entries = 0;
+    let mut suspend_completions = 0;
+    let mut terminal = None;
+    for _ in 0..16 {
+        let outcome = session
+            .run_loop_with_observer(&stop_token, one_step, |step| observed.push(*step))
+            .expect("bounded CPU_SUSPEND run-loop step should succeed");
+        let step = *observed
+            .last()
+            .expect("each non-stopped run-loop call should observe one step");
+        match step {
+            HvfVcpuRunStepOutcome::CpuSuspend {
+                function_id: PSCI_CPU_SUSPEND_64,
+                ..
+            } => {
+                suspend_entries += 1;
+                if suspend_entries == 1 {
+                    assert_eq!(read_u32(PRE_SUSPEND_1), 1);
+                    assert_eq!(read_u32(POST_SUSPEND_1), 0);
+                } else if suspend_entries == 2 {
+                    assert_eq!(read_u32(POST_SUSPEND_1), 1);
+                    assert_eq!(read_u64(SUSPEND_RESULT_1), 0);
+                    assert_eq!(read_u64(SENTINEL_1), SENTINEL);
+                    assert_eq!(read_u32(PRE_SUSPEND_2), 1);
+                    assert_eq!(read_u32(POST_SUSPEND_2), 0);
+                }
+            }
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_CPU_SUSPEND_64,
+                return_value: 0,
+                ..
+            } => suspend_completions += 1,
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_VERSION,
+                return_value: 2,
+                ..
+            } => {
+                peer_checkpoint_seen = true;
+                assert_eq!(read_u64(CPU_ON_RESULT), 0);
+                assert_eq!(read_u64(AFFINITY_RESULT), 0);
+                assert_eq!(read_u32(PEER_OBSERVATION), 1);
+                assert_eq!(read_u32(POST_SUSPEND_1), 0);
+            }
+            _ => {}
+        }
+        if matches!(outcome, HvfArm64BootRunLoopOutcome::GuestShutdown { .. }) {
+            terminal = Some(outcome);
+            break;
+        }
+        assert!(matches!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        ));
+    }
+
+    watchdog_done.store(true, Ordering::Release);
+    watchdog.join().expect("CPU_SUSPEND watchdog should join");
+    assert!(
+        peer_checkpoint_seen,
+        "CPU0 should publish its ON-affinity checkpoint"
+    );
+    assert_eq!(suspend_entries, 2);
+    assert_eq!(suspend_completions, 2);
+    assert!(matches!(
+        terminal,
+        Some(HvfArm64BootRunLoopOutcome::GuestShutdown { .. })
+    ));
+    assert_eq!(read_u32(POST_SUSPEND_2), 1);
+    assert_eq!(read_u64(SUSPEND_RESULT_2), 0);
+    assert_eq!(read_u64(SENTINEL_2), SENTINEL);
+    session
+        .shutdown()
+        .expect("CPU_SUSPEND session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_native_v1_composite_and_keeps_source_session_usable() {
     use std::io::Cursor;
     use std::time::Instant;

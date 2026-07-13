@@ -694,9 +694,15 @@ is resource-specific:
   through the host Mach timebase, and publishes the configured timer PPI only
   after an enabled, guest-unmasked due recheck wins exact cancellation
   arbitration. It does not log timer values, execute a guest trampoline, infer
-  a GIC route, or expose PSCI `CPU_SUSPEND`. Invalid timebase data, duration
-  overflow, owner read failure, and PPI failure remain typed fail-closed
-  errors; lifecycle cancellation never fabricates guest timer wake.
+  a GIC route, or by itself expose PSCI `CPU_SUSPEND`. The guest-facing
+  `CPU_SUSPEND32/64` layer binds only the exact deferred PSCI token to that
+  wait, keeps affinity `ON`, ignores guest power-state/entry/context values,
+  and writes `SUCCESS` only after the selected PPI is pending. Invalid timebase
+  data, duration overflow, owner read failure, PPI failure, stale tokens, and
+  dispatch-mode mismatches remain typed fail-closed errors; lifecycle
+  cancellation retains the transaction and never fabricates guest timer wake.
+  Stop, shutdown, and terminal drains deliberately abandon completion. No FDT
+  idle states or SGI/SPI/direct IRQ/FIQ wake path is exposed.
   Native-v1 optional-state classification also fails closed when CPACR enables
   SVE/SME access, PSTATE.SM/ZA is active, or an implemented breakpoint or
   watchpoint is enabled. Category-only rejections expose no register value,
@@ -846,6 +852,15 @@ committed online CPU is denied, and scheduler removal completes before the
 power model publishes `OFF`. Later re-entry reuses the fixed owner and shared
 GIC, writes the retained `SCTLR_EL1` to zero for the Linux warm-entry contract,
 and does not claim a full architectural reset.
+
+`CPU_SUSPEND` never transfers owner authority or marks the caller offline. Its
+power token and runner token are both exact, and coordinator mode transitions
+are accepted only while that online member is idle. A suspended generation can
+read timer state and publish only its configured PPI; it cannot run guest code.
+Timer wake restores runnable scheduling before the original owner writes X0,
+and any pending raw HVF cancellation is absorbed by a later identified run
+before guest execution resumes. Diagnostics retain only index, MPIDR, and
+transaction stage, not ignored guest arguments or timer values.
 
 Public `InstanceStart` now exposes the same topology for counts through
 `min(32, host_max)`; it does not add another owner or capacity authority. A

@@ -7,8 +7,9 @@ use bangbang_runtime::mmio::MmioDispatcher;
 
 use crate::psci::{PsciCoordinatorRequest, PsciCoordinatorResponse};
 use crate::runner::{
-    HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken, HvfVcpuRunCompletion, HvfVcpuRunToken,
-    HvfVcpuRunner, HvfVcpuRunnerError, cancel_vcpu_run_batch_with,
+    HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken, HvfVcpuRetainedVtimerWaitOutcome,
+    HvfVcpuRunCompletion, HvfVcpuRunToken, HvfVcpuRunner, HvfVcpuRunnerError,
+    cancel_vcpu_run_batch_with,
 };
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError, shutdown_runner_topology};
 use crate::vcpu::{HvfArm64BootRegisters, HvfArm64SecondaryBootRegisters};
@@ -31,6 +32,8 @@ const UNEXPECTED_DRAIN_RESULT_MESSAGE: &str =
     "vCPU run coordinator returned an unexpected result while draining";
 const BATCH_CANCEL_INDEX_MESSAGE: &str =
     "vCPU batch cancellation referenced an unknown topology member";
+const MEMBER_DISPATCH_MISMATCH_MESSAGE: &str =
+    "vCPU run completion does not match the member dispatch mode";
 
 type BatchCancel = Arc<dyn Fn(&[usize]) -> Result<(), HvfVcpuRunnerError> + Send + Sync + 'static>;
 
@@ -106,6 +109,8 @@ pub enum HvfVcpuRunMemberOutcome {
     Handled(HvfVcpuRunStepOutcome),
     /// Cross-vCPU work that must be completed by the aggregate coordinator.
     Coordinator(HvfVcpuCoordinatorWork),
+    /// A suspended member's retained virtual timer either woke or was canceled.
+    RetainedVtimer(HvfVcpuRetainedVtimerWaitOutcome),
 }
 
 impl From<HvfVcpuCoordinatedRunStepOutcome> for HvfVcpuRunMemberOutcome {
@@ -123,6 +128,9 @@ impl From<HvfVcpuCoordinatedRunStepOutcome> for HvfVcpuRunMemberOutcome {
                 runner_token: token,
                 request,
             }),
+            HvfVcpuCoordinatedRunStepOutcome::RetainedVtimer { outcome, .. } => {
+                Self::RetainedVtimer(outcome)
+            }
         }
     }
 }
@@ -171,13 +179,16 @@ impl HvfVcpuRunMemberResult {
         self.result.as_ref()
     }
 
-    fn is_canceled(&self) -> bool {
-        matches!(
-            self.result,
-            Ok(HvfVcpuRunMemberOutcome::Handled(
-                HvfVcpuRunStepOutcome::Canceled
-            ))
-        )
+    fn acknowledges_cancellation_debt(&self, debt: u64) -> bool {
+        match self.result {
+            Ok(HvfVcpuRunMemberOutcome::Handled(HvfVcpuRunStepOutcome::Canceled)) => {
+                debt <= self.generation
+            }
+            Ok(HvfVcpuRunMemberOutcome::RetainedVtimer(
+                HvfVcpuRetainedVtimerWaitOutcome::Canceled,
+            )) => debt == self.generation,
+            _ => false,
+        }
     }
 
     fn terminal_priority(&self) -> Option<u8> {
@@ -451,9 +462,19 @@ impl std::error::Error for HvfVcpuRunCoordinatorError {
 #[derive(Debug)]
 struct MemberState {
     online: bool,
+    dispatch: MemberDispatch,
     active: Option<HvfVcpuRunToken>,
     next_generation: u64,
     cancellation_debt: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberDispatch {
+    Runnable,
+    Suspended {
+        psci_token: HvfVcpuPsciCallToken,
+        timer_intid: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -771,6 +792,14 @@ trait CoordinatorMember: fmt::Debug {
         completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
     ) -> Result<(), HvfVcpuRunnerError>;
 
+    fn submit_retained_vtimer_wait(
+        &self,
+        run_token: HvfVcpuRunToken,
+        psci_token: HvfVcpuPsciCallToken,
+        timer_intid: u32,
+        completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
+    ) -> Result<(), HvfVcpuRunnerError>;
+
     fn configure_primary(&self, registers: HvfArm64BootRegisters)
     -> Result<(), HvfVcpuRunnerError>;
 
@@ -800,6 +829,21 @@ impl CoordinatorMember for HvfVcpuRunner<'_> {
         completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
     ) -> Result<(), HvfVcpuRunnerError> {
         self.submit_run_once_and_handle_mmio_coordinated(token, dispatcher, completion_sender)
+    }
+
+    fn submit_retained_vtimer_wait(
+        &self,
+        run_token: HvfVcpuRunToken,
+        psci_token: HvfVcpuPsciCallToken,
+        timer_intid: u32,
+        completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.submit_psci_cpu_suspend_wait_coordinated(
+            run_token,
+            psci_token,
+            timer_intid,
+            completion_sender,
+        )
     }
 
     fn configure_primary(
@@ -920,6 +964,7 @@ where
         let mut member_states = (0..members.len())
             .map(|_| MemberState {
                 online: false,
+                dispatch: MemberDispatch::Runnable,
                 active: None,
                 next_generation: 1,
                 cancellation_debt: None,
@@ -1041,6 +1086,11 @@ where
                         "vCPU activation target is already online",
                     ));
                 }
+                if activating && member_state.dispatch != MemberDispatch::Runnable {
+                    return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                        "vCPU activation target is not runnable",
+                    ));
+                }
                 let generation = member_state.next_generation;
                 let next_generation = generation
                     .checked_add(1)
@@ -1056,11 +1106,23 @@ where
                 if activating {
                     member_state.online = true;
                 }
-                match member.submit(
-                    token,
-                    Arc::clone(&self.dispatcher),
-                    self.completion_sender.clone(),
-                ) {
+                let submit_result = match member_state.dispatch {
+                    MemberDispatch::Runnable => member.submit(
+                        token,
+                        Arc::clone(&self.dispatcher),
+                        self.completion_sender.clone(),
+                    ),
+                    MemberDispatch::Suspended {
+                        psci_token,
+                        timer_intid,
+                    } => member.submit_retained_vtimer_wait(
+                        token,
+                        psci_token,
+                        timer_intid,
+                        self.completion_sender.clone(),
+                    ),
+                };
+                match submit_result {
                     Ok(()) => {
                         member_state.active = Some(token);
                         member_state.next_generation = next_generation;
@@ -1140,6 +1202,13 @@ where
         completion: HvfVcpuRunCompletion,
     ) -> Result<Option<HvfVcpuRunEvent>, HvfVcpuRunCoordinatorError> {
         let (token, result) = completion.into_parts();
+        let retained_psci_token = match &result {
+            Ok(HvfVcpuCoordinatedRunStepOutcome::RetainedVtimer { psci_token, .. }) => {
+                Some(*psci_token)
+            }
+            _ => None,
+        };
+        let completion_failed = result.is_err();
         let index = token.member_index();
         let generation = token.generation();
         let member_count = self.members.len();
@@ -1160,92 +1229,105 @@ where
         );
         let mut should_resubmit = false;
 
-        let event =
-            {
-                let mut state = self.shared.lock_state()?;
-                let member = state.members.get_mut(index).ok_or(
-                    HvfVcpuRunCoordinatorError::InvalidMember {
+        let event = {
+            let mut state = self.shared.lock_state()?;
+            let member =
+                state
+                    .members
+                    .get_mut(index)
+                    .ok_or(HvfVcpuRunCoordinatorError::InvalidMember {
                         index,
                         member_count,
-                    },
-                )?;
-                if member.active != Some(token) {
-                    return Err(HvfVcpuRunCoordinatorError::CompletionIdentity {
-                        index,
-                        generation,
-                        expected: member.active.map(HvfVcpuRunToken::generation),
-                    });
+                    })?;
+            if member.active != Some(token) {
+                return Err(HvfVcpuRunCoordinatorError::CompletionIdentity {
+                    index,
+                    generation,
+                    expected: member.active.map(HvfVcpuRunToken::generation),
+                });
+            }
+            let dispatch_matches = match (member.dispatch, retained_psci_token, completion_failed) {
+                (_, _, true) => true,
+                (MemberDispatch::Runnable, None, false) => true,
+                (MemberDispatch::Suspended { psci_token, .. }, Some(completion_token), false) => {
+                    psci_token == completion_token
                 }
-                member.active = None;
+                _ => false,
+            };
+            if !dispatch_matches {
+                return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                    MEMBER_DISPATCH_MISMATCH_MESSAGE,
+                ));
+            }
+            member.active = None;
 
-                let absorbed_cancellation = if member_result.is_canceled()
-                    && member
-                        .cancellation_debt
-                        .is_some_and(|debt| debt <= generation)
-                {
-                    member.cancellation_debt = None;
-                    true
-                } else {
-                    false
-                };
+            let absorbed_cancellation = if member
+                .cancellation_debt
+                .is_some_and(|debt| member_result.acknowledges_cancellation_debt(debt))
+            {
+                member.cancellation_debt = None;
+                true
+            } else {
+                false
+            };
 
-                match &mut state.phase {
-                    CoordinatorPhase::Running => {
-                        if member_result.terminal_priority().is_some() {
-                            begin_terminal_drain(&self.shared, &mut state, member_result.clone())?
-                        } else if absorbed_cancellation {
-                            should_resubmit = true;
-                            None
-                        } else {
-                            Some(HvfVcpuRunEvent::Member(member_result.clone()))
-                        }
+            match &mut state.phase {
+                CoordinatorPhase::Running => {
+                    if member_result.terminal_priority().is_some() {
+                        begin_terminal_drain(&self.shared, &mut state, member_result.clone())?
+                    } else if absorbed_cancellation {
+                        should_resubmit = true;
+                        None
+                    } else {
+                        Some(HvfVcpuRunEvent::Member(member_result.clone()))
                     }
-                    CoordinatorPhase::Draining(drain) => {
-                        let Some(position) = drain
-                            .remaining
-                            .iter()
-                            .position(|candidate| *candidate == token)
-                        else {
-                            return Err(HvfVcpuRunCoordinatorError::CompletionIdentity {
-                                index,
-                                generation,
-                                expected: None,
-                            });
-                        };
-                        let _ = drain.remaining.remove(position);
-
-                        if member_result.terminal_priority().is_some()
-                            && matches!(drain.reason, DrainReason::Control(_))
-                        {
-                            let DrainReason::Control(reason) = drain.reason else {
-                                return Err(HvfVcpuRunCoordinatorError::InvalidState(
-                                    TERMINAL_REPORT_MISSING_MESSAGE,
-                                ));
-                            };
-                            drain.reason = DrainReason::Terminal {
-                                superseded_control: Some(reason),
-                            };
-                        }
-
-                        drain.acknowledgements.push(member_result.clone());
-                        if drain.remaining.is_empty() {
-                            finish_drain(&mut state)?
-                        } else {
-                            None
-                        }
-                    }
-                    CoordinatorPhase::Paused
-                    | CoordinatorPhase::Stopped
-                    | CoordinatorPhase::Failed
-                    | CoordinatorPhase::ShutDown => {
+                }
+                CoordinatorPhase::Draining(drain) => {
+                    let Some(position) = drain
+                        .remaining
+                        .iter()
+                        .position(|candidate| *candidate == token)
+                    else {
                         return Err(HvfVcpuRunCoordinatorError::CompletionIdentity {
                             index,
                             generation,
                             expected: None,
                         });
+                    };
+                    let _ = drain.remaining.remove(position);
+
+                    if member_result.terminal_priority().is_some()
+                        && matches!(drain.reason, DrainReason::Control(_))
+                    {
+                        let DrainReason::Control(reason) = drain.reason else {
+                            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                                TERMINAL_REPORT_MISSING_MESSAGE,
+                            ));
+                        };
+                        drain.reason = DrainReason::Terminal {
+                            superseded_control: Some(reason),
+                        };
+                    }
+
+                    drain.acknowledgements.push(member_result.clone());
+                    if drain.remaining.is_empty() {
+                        finish_drain(&mut state)?
+                    } else {
+                        None
                     }
                 }
-            };
+                CoordinatorPhase::Paused
+                | CoordinatorPhase::Stopped
+                | CoordinatorPhase::Failed
+                | CoordinatorPhase::ShutDown => {
+                    return Err(HvfVcpuRunCoordinatorError::CompletionIdentity {
+                        index,
+                        generation,
+                        expected: None,
+                    });
+                }
+            }
+        };
 
         if should_resubmit {
             let _ = self.submit_indexes(&[index], false)?;
@@ -1294,7 +1376,96 @@ where
                 OFFLINE_CANCELLATION_DEBT_MESSAGE,
             ));
         }
+        if !online && member.dispatch != MemberDispatch::Runnable {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "suspended vCPU run coordinator member cannot go offline",
+            ));
+        }
         member.online = online;
+        Ok(())
+    }
+
+    fn suspend_member(
+        &mut self,
+        index: usize,
+        psci_token: HvfVcpuPsciCallToken,
+        timer_intid: u32,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        let mut state = self.shared.lock_state()?;
+        if !matches!(
+            state.phase,
+            CoordinatorPhase::Running | CoordinatorPhase::Paused
+        ) {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                RUNNING_PHASE_REQUIRED_MESSAGE,
+            ));
+        }
+        let member_count = state.members.len();
+        let member =
+            state
+                .members
+                .get_mut(index)
+                .ok_or(HvfVcpuRunCoordinatorError::InvalidMember {
+                    index,
+                    member_count,
+                })?;
+        if !member.online || member.active.is_some() {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                MEMBER_NOT_IDLE_MESSAGE,
+            ));
+        }
+        if member.dispatch != MemberDispatch::Runnable {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "vCPU run coordinator member is already suspended",
+            ));
+        }
+        member.dispatch = MemberDispatch::Suspended {
+            psci_token,
+            timer_intid,
+        };
+        Ok(())
+    }
+
+    fn resume_suspended_member(
+        &mut self,
+        index: usize,
+        psci_token: HvfVcpuPsciCallToken,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        let mut state = self.shared.lock_state()?;
+        if !matches!(
+            state.phase,
+            CoordinatorPhase::Running | CoordinatorPhase::Paused
+        ) {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                RUNNING_PHASE_REQUIRED_MESSAGE,
+            ));
+        }
+        let member_count = state.members.len();
+        let member =
+            state
+                .members
+                .get_mut(index)
+                .ok_or(HvfVcpuRunCoordinatorError::InvalidMember {
+                    index,
+                    member_count,
+                })?;
+        if !member.online || member.active.is_some() {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                MEMBER_NOT_IDLE_MESSAGE,
+            ));
+        }
+        if !matches!(
+            member.dispatch,
+            MemberDispatch::Suspended {
+                psci_token: active_token,
+                ..
+            } if active_token == psci_token
+        ) {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "vCPU run coordinator suspended PSCI token does not match",
+            ));
+        }
+        member.dispatch = MemberDispatch::Runnable;
         Ok(())
     }
 
@@ -1702,6 +1873,35 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         self.inner.set_online(index, online)
     }
 
+    pub(crate) fn suspend_for_cpu_suspend(
+        &mut self,
+        index: usize,
+        work: HvfVcpuCoordinatorWork,
+        timer_intid: u32,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        let (_, _, psci_token, request) = work.into_parts();
+        if request != PsciCoordinatorRequest::CpuSuspend {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "vCPU suspension requires PSCI CPU_SUSPEND work",
+            ));
+        }
+        self.inner.suspend_member(index, psci_token, timer_intid)
+    }
+
+    pub(crate) fn resume_from_cpu_suspend(
+        &mut self,
+        index: usize,
+        work: HvfVcpuCoordinatorWork,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        let (_, _, psci_token, request) = work.into_parts();
+        if request != PsciCoordinatorRequest::CpuSuspend {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "vCPU resume requires PSCI CPU_SUSPEND work",
+            ));
+        }
+        self.inner.resume_suspended_member(index, psci_token)
+    }
+
     /// Configure primary-style arm64 entry registers on one idle owner thread.
     pub fn configure_arm64_boot_registers(
         &self,
@@ -1866,11 +2066,11 @@ mod tests {
     };
     use crate::HvfVcpuRunStepOutcome;
     use crate::exit::{HvfExceptionExit, HvfHvcExit};
-    use crate::psci::PsciCoordinatorResponse;
+    use crate::psci::{PsciCoordinatorRequest, PsciCoordinatorResponse};
     use crate::runner::tests::start_destroy_order_recording_runner;
     use crate::runner::{
-        HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken, HvfVcpuRunCompletion,
-        HvfVcpuRunToken, HvfVcpuRunnerError,
+        HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken, HvfVcpuRetainedVtimerWaitOutcome,
+        HvfVcpuRunCompletion, HvfVcpuRunToken, HvfVcpuRunnerError,
     };
     use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError, HvfVcpuTopologyOperation};
     use crate::vcpu::{HvfArm64BootRegisters, HvfArm64SecondaryBootRegisters};
@@ -1882,7 +2082,9 @@ mod tests {
     #[derive(Debug, Clone)]
     struct FakePendingRun {
         token: HvfVcpuRunToken,
-        dispatcher: Arc<Mutex<MmioDispatcher>>,
+        dispatcher: Option<Arc<Mutex<MmioDispatcher>>>,
+        psci_token: Option<HvfVcpuPsciCallToken>,
+        timer_intid: Option<u32>,
         completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
     }
 
@@ -1946,15 +2148,33 @@ mod tests {
 
         fn dispatcher(&self, generation: u64) -> Arc<Mutex<MmioDispatcher>> {
             Arc::clone(
-                &self
-                    .state
+                self.state
                     .lock()
                     .expect("fake member state should lock")
                     .pending
                     .iter()
                     .find(|pending| pending.token.generation() == generation)
                     .expect("requested fake run should be pending")
-                    .dispatcher,
+                    .dispatcher
+                    .as_ref()
+                    .expect("requested fake run should carry a dispatcher"),
+            )
+        }
+
+        fn retained_wait(&self, generation: u64) -> (HvfVcpuPsciCallToken, u32) {
+            let state = self.state.lock().expect("fake member state should lock");
+            let pending = state
+                .pending
+                .iter()
+                .find(|pending| pending.token.generation() == generation)
+                .expect("requested fake retained wait should be pending");
+            (
+                pending
+                    .psci_token
+                    .expect("retained wait should carry a PSCI token"),
+                pending
+                    .timer_intid
+                    .expect("retained wait should carry a timer INTID"),
             )
         }
 
@@ -2004,7 +2224,31 @@ mod tests {
             state.submissions.push(token);
             state.pending.push_back(FakePendingRun {
                 token,
-                dispatcher,
+                dispatcher: Some(dispatcher),
+                psci_token: None,
+                timer_intid: None,
+                completion_sender,
+            });
+            Ok(())
+        }
+
+        fn submit_retained_vtimer_wait(
+            &self,
+            run_token: HvfVcpuRunToken,
+            psci_token: HvfVcpuPsciCallToken,
+            timer_intid: u32,
+            completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
+        ) -> Result<(), HvfVcpuRunnerError> {
+            let mut state = self.state.lock().expect("fake member state should lock");
+            if let Some(result) = state.submit_results.pop_front() {
+                result?;
+            }
+            state.submissions.push(run_token);
+            state.pending.push_back(FakePendingRun {
+                token: run_token,
+                dispatcher: None,
+                psci_token: Some(psci_token),
+                timer_intid: Some(timer_intid),
                 completion_sender,
             });
             Ok(())
@@ -2147,6 +2391,25 @@ mod tests {
 
     fn progressed() -> FakeRunResult {
         handled(HvfVcpuRunStepOutcome::VtimerActivated)
+    }
+
+    fn cpu_suspend(token: HvfVcpuPsciCallToken) -> FakeRunResult {
+        Ok(HvfVcpuCoordinatedRunStepOutcome::Psci {
+            exit: test_hvc_exit(),
+            function_id: 0x8400_0001,
+            token,
+            request: PsciCoordinatorRequest::CpuSuspend,
+        })
+    }
+
+    fn retained_vtimer(
+        psci_token: HvfVcpuPsciCallToken,
+        outcome: HvfVcpuRetainedVtimerWaitOutcome,
+    ) -> FakeRunResult {
+        Ok(HvfVcpuCoordinatedRunStepOutcome::RetainedVtimer {
+            psci_token,
+            outcome,
+        })
     }
 
     fn unknown(reason: u32) -> FakeRunResult {
@@ -2411,6 +2674,236 @@ mod tests {
             panic!("expected one non-terminal member result");
         };
         assert_eq!(result.index(), 0);
+    }
+
+    #[test]
+    fn dispatches_mixed_runnable_and_exact_suspended_members() {
+        let members = fake_members(2);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0, 1], batch.callback()).expect("coordinator should build");
+        let suspend_token = HvfVcpuPsciCallToken::new(10, 1);
+        coordinator
+            .dispatch_online()
+            .expect("initial runnable members should dispatch");
+
+        let event = coordinator
+            .process_completion(members[0].completion(1, cpu_suspend(suspend_token)))
+            .expect("CPU_SUSPEND completion should process");
+        assert!(matches!(event, Some(HvfVcpuRunEvent::Member(_))));
+        coordinator
+            .suspend_member(0, suspend_token, 27)
+            .expect("idle online member should enter retained suspension");
+        assert!(matches!(
+            coordinator.process_completion(members[1].completion(1, progressed())),
+            Ok(Some(HvfVcpuRunEvent::Member(_)))
+        ));
+
+        assert_eq!(coordinator.dispatch_online(), Ok(2));
+        assert_eq!(members[0].retained_wait(2), (suspend_token, 27));
+        let _ = members[1].dispatcher(2);
+
+        let runnable = coordinator
+            .process_completion(members[1].completion(2, progressed()))
+            .expect("runnable completion should process");
+        let timer = coordinator
+            .process_completion(members[0].completion(
+                2,
+                retained_vtimer(
+                    suspend_token,
+                    HvfVcpuRetainedVtimerWaitOutcome::TimerPending,
+                ),
+            ))
+            .expect("retained timer completion should process");
+        assert!(matches!(runnable, Some(HvfVcpuRunEvent::Member(_))));
+        assert!(matches!(
+            timer,
+            Some(HvfVcpuRunEvent::Member(ref result))
+                if matches!(
+                    result.result(),
+                    Ok(super::HvfVcpuRunMemberOutcome::RetainedVtimer(
+                        HvfVcpuRetainedVtimerWaitOutcome::TimerPending
+                    ))
+                )
+        ));
+
+        coordinator
+            .resume_suspended_member(0, suspend_token)
+            .expect("matching timer wake should restore runnable mode");
+        assert_eq!(coordinator.dispatch_online(), Ok(2));
+        let _ = members[0].dispatcher(3);
+        let _ = members[1].dispatcher(3);
+    }
+
+    #[test]
+    fn suspended_member_rejects_wrong_tokens_offline_and_stale_completions() {
+        let members = fake_members(1);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        let suspend_token = HvfVcpuPsciCallToken::new(11, 1);
+        let wrong_token = HvfVcpuPsciCallToken::new(11, 2);
+        coordinator
+            .suspend_member(0, suspend_token, 27)
+            .expect("idle member should suspend");
+        assert!(matches!(
+            coordinator.suspend_member(0, suspend_token, 27),
+            Err(HvfVcpuRunCoordinatorError::InvalidState(_))
+        ));
+        assert!(matches!(
+            coordinator.resume_suspended_member(0, wrong_token),
+            Err(HvfVcpuRunCoordinatorError::InvalidState(_))
+        ));
+        assert!(matches!(
+            coordinator.set_online(0, false),
+            Err(HvfVcpuRunCoordinatorError::InvalidState(_))
+        ));
+
+        coordinator
+            .dispatch_online()
+            .expect("suspended member should submit a retained wait");
+        let completion = members[0].completion(
+            1,
+            retained_vtimer(wrong_token, HvfVcpuRetainedVtimerWaitOutcome::TimerPending),
+        );
+        assert_eq!(
+            coordinator.process_completion(completion),
+            Err(HvfVcpuRunCoordinatorError::InvalidState(
+                super::MEMBER_DISPATCH_MISMATCH_MESSAGE
+            ))
+        );
+    }
+
+    #[test]
+    fn suspended_member_error_remains_typed_and_terminal() {
+        let members = fake_members(1);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        let suspend_token = HvfVcpuPsciCallToken::new(14, 1);
+        coordinator
+            .suspend_member(0, suspend_token, 27)
+            .expect("idle member should suspend");
+        coordinator
+            .dispatch_online()
+            .expect("retained wait should dispatch");
+        let error = HvfVcpuRunnerError::InvalidState(TEST_ERROR_MESSAGE);
+        let event = coordinator
+            .process_completion(members[0].completion(1, Err(error.clone())))
+            .expect("retained wait error should remain collectable");
+        let Some(HvfVcpuRunEvent::Terminal(report)) = event else {
+            panic!("retained wait error should stop the coordinator");
+        };
+        assert_eq!(report.primary().result(), Err(&error));
+    }
+
+    #[test]
+    fn timer_won_control_debt_is_consumed_before_guest_execution_rearms() {
+        let members = fake_members(1);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        let suspend_token = HvfVcpuPsciCallToken::new(12, 1);
+        coordinator
+            .suspend_member(0, suspend_token, 27)
+            .expect("idle member should suspend");
+        coordinator
+            .dispatch_online()
+            .expect("retained wait should dispatch");
+        let waiter = coordinator
+            .control()
+            .request_wakeup()
+            .expect("wakeup should cancel retained wait");
+        assert_eq!(batch.calls(), vec![vec![0]]);
+
+        let barrier = coordinator
+            .process_completion(members[0].completion(
+                1,
+                retained_vtimer(
+                    suspend_token,
+                    HvfVcpuRetainedVtimerWaitOutcome::TimerPending,
+                ),
+            ))
+            .expect("timer winner should complete wakeup barrier");
+        assert!(matches!(barrier, Some(HvfVcpuRunEvent::Barrier(_))));
+        waiter
+            .wait()
+            .expect("timer winner should acknowledge wakeup barrier");
+        coordinator
+            .resume_suspended_member(0, suspend_token)
+            .expect("timer winner should become runnable");
+
+        coordinator
+            .dispatch_online()
+            .expect("runnable debt-drain generation should dispatch");
+        assert_eq!(
+            coordinator
+                .process_completion(members[0].completion(2, canceled()))
+                .expect("pending HVF cancellation should be absorbed"),
+            None
+        );
+        assert_eq!(
+            members[0].pending_tokens(),
+            vec![HvfVcpuRunToken::new(0, 3)]
+        );
+        assert!(matches!(
+            coordinator
+                .process_completion(members[0].completion(3, progressed()))
+                .expect("fresh runnable generation should surface"),
+            Some(HvfVcpuRunEvent::Member(_))
+        ));
+    }
+
+    #[test]
+    fn pause_rearms_suspended_wait_but_stop_does_not() {
+        let members = fake_members(1);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        let suspend_token = HvfVcpuPsciCallToken::new(13, 1);
+        coordinator
+            .suspend_member(0, suspend_token, 27)
+            .expect("idle member should suspend");
+        coordinator
+            .dispatch_online()
+            .expect("retained wait should dispatch");
+        let pause = coordinator
+            .control()
+            .request_pause()
+            .expect("pause should cancel retained wait");
+        let barrier = coordinator
+            .process_completion(members[0].completion(
+                1,
+                retained_vtimer(suspend_token, HvfVcpuRetainedVtimerWaitOutcome::Canceled),
+            ))
+            .expect("canceled retained wait should complete pause");
+        assert!(matches!(barrier, Some(HvfVcpuRunEvent::Barrier(_))));
+        pause.wait().expect("pause should complete");
+        coordinator
+            .resume()
+            .expect("paused coordinator should resume");
+        assert_eq!(coordinator.dispatch_online(), Ok(1));
+        assert_eq!(members[0].retained_wait(2), (suspend_token, 27));
+
+        let stop = coordinator
+            .control()
+            .request_stop()
+            .expect("stop should cancel rearmed wait");
+        let barrier = coordinator
+            .process_completion(members[0].completion(
+                2,
+                retained_vtimer(suspend_token, HvfVcpuRetainedVtimerWaitOutcome::Canceled),
+            ))
+            .expect("canceled retained wait should complete stop");
+        assert!(matches!(barrier, Some(HvfVcpuRunEvent::Barrier(_))));
+        stop.wait().expect("stop should complete");
+        assert!(matches!(
+            coordinator.dispatch_online(),
+            Err(HvfVcpuRunCoordinatorError::InvalidState(
+                super::RUNNING_PHASE_REQUIRED_MESSAGE
+            ))
+        ));
+        assert!(members[0].pending_tokens().is_empty());
     }
 
     #[test]

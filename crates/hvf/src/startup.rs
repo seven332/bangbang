@@ -2830,6 +2830,7 @@ impl OwnedHvfArm64BootSession {
             runner,
             primary_mpidr,
             Arc::clone(&mmio_dispatcher),
+            gic.timer_interrupts.el1_virtual_timer_intid,
         ) {
             Ok(runner) => runner,
             Err(source) => {
@@ -5693,6 +5694,7 @@ fn run_boot_session_loop_with_observer(
             }
             HvfVcpuRunStepOutcome::Hvc { .. }
             | HvfVcpuRunStepOutcome::CpuOff { .. }
+            | HvfVcpuRunStepOutcome::CpuSuspend { .. }
             | HvfVcpuRunStepOutcome::Sys64 { .. } => {
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
@@ -7479,7 +7481,11 @@ fn prepare_arm64_boot_session_parts<'vm>(
     coordinator
         .configure_arm64_boot_registers(0, boot_registers)
         .map_err(|source| HvfArm64BootSessionError::ConfigureBootRegisters { source })?;
-    let runner = HvfArm64BootVcpuSession::new(coordinator, power);
+    let runner = HvfArm64BootVcpuSession::new(
+        coordinator,
+        power,
+        gic.timer_interrupts.el1_virtual_timer_intid,
+    );
     let block_device_metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(
         runtime
             .block_devices

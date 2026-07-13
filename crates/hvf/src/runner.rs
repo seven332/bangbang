@@ -521,6 +521,12 @@ pub enum HvfVcpuRunStepOutcome {
         exit: HvfHvcExit,
         function_id: u64,
     },
+    CpuSuspend {
+        index: usize,
+        mpidr: u64,
+        exit: HvfHvcExit,
+        function_id: u64,
+    },
     GuestShutdown {
         exit: HvfHvcExit,
         function_id: u64,
@@ -550,6 +556,13 @@ pub(crate) struct HvfVcpuPsciCallToken {
     sequence: u64,
 }
 
+#[cfg(test)]
+impl HvfVcpuPsciCallToken {
+    pub(crate) const fn new(vcpu: crate::ffi::HvVcpu, sequence: u64) -> Self {
+        Self { vcpu, sequence }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HvfVcpuCoordinatedRunStepOutcome {
     Handled(HvfVcpuRunStepOutcome),
@@ -558,6 +571,10 @@ pub(crate) enum HvfVcpuCoordinatedRunStepOutcome {
         function_id: u64,
         token: HvfVcpuPsciCallToken,
         request: PsciCoordinatorRequest,
+    },
+    RetainedVtimer {
+        psci_token: HvfVcpuPsciCallToken,
+        outcome: HvfVcpuRetainedVtimerWaitOutcome,
     },
 }
 
@@ -1093,7 +1110,7 @@ enum RunnerCommand {
         admission: InFlightRetainedVtimerWait,
         signal: Arc<RetainedVtimerWaitSignal>,
         intid: u32,
-        response_sender: mpsc::Sender<Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError>>,
+        response: RetainedVtimerWaitResponse,
     },
     CompletePsciCall {
         token: HvfVcpuPsciCallToken,
@@ -1376,6 +1393,37 @@ enum RunnerCommand {
     Shutdown {
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
+}
+
+enum RetainedVtimerWaitResponse {
+    Direct(mpsc::Sender<Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError>>),
+    Coordinated {
+        run_token: HvfVcpuRunToken,
+        psci_token: HvfVcpuPsciCallToken,
+        completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
+    },
+}
+
+impl RetainedVtimerWaitResponse {
+    fn send(self, result: Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError>) {
+        match self {
+            Self::Direct(response_sender) => {
+                let _ = response_sender.send(result);
+            }
+            Self::Coordinated {
+                run_token,
+                psci_token,
+                completion_sender,
+            } => {
+                let result =
+                    result.map(|outcome| HvfVcpuCoordinatedRunStepOutcome::RetainedVtimer {
+                        psci_token,
+                        outcome,
+                    });
+                let _ = completion_sender.send(HvfVcpuRunCompletion::new(run_token, result));
+            }
+        }
+    }
 }
 
 struct StartedRunner {
@@ -2892,7 +2940,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         intid: u32,
     ) -> Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
-        self.start_retained_vtimer_wait(intid, response_sender)?;
+        self.start_retained_vtimer_wait(
+            intid,
+            None,
+            RetainedVtimerWaitResponse::Direct(response_sender),
+        )?;
 
         response_receiver
             .recv()
@@ -2937,6 +2989,24 @@ impl<'vm> HvfVcpuRunner<'vm> {
         completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
     ) -> Result<(), HvfVcpuRunnerError> {
         self.start_run_once_and_handle_mmio_coordinated(token, dispatcher, completion_sender)
+    }
+
+    pub(crate) fn submit_psci_cpu_suspend_wait_coordinated(
+        &self,
+        run_token: HvfVcpuRunToken,
+        psci_token: HvfVcpuPsciCallToken,
+        intid: u32,
+        completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_retained_vtimer_wait(
+            intid,
+            Some(psci_token),
+            RetainedVtimerWaitResponse::Coordinated {
+                run_token,
+                psci_token,
+                completion_sender,
+            },
+        )
     }
 
     pub(crate) fn complete_psci_call(
@@ -4377,7 +4447,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
     fn start_retained_vtimer_wait(
         &self,
         intid: u32,
-        response_sender: mpsc::Sender<Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError>>,
+        psci_token: Option<HvfVcpuPsciCallToken>,
+        response: RetainedVtimerWaitResponse,
     ) -> Result<(), HvfVcpuRunnerError> {
         validate_gic_ppi_pending_intid(intid).map_err(HvfVcpuRunnerError::Gic)?;
 
@@ -4390,7 +4461,22 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 MPIDR_NOT_CONFIGURED_MESSAGE,
             ));
         }
-        ensure_no_pending_psci_call(&state)?;
+        match psci_token {
+            None => ensure_no_pending_psci_call(&state)?,
+            Some(token) => match state.pending_psci_call {
+                None => {
+                    return Err(HvfVcpuRunnerError::InvalidState(
+                        PSCI_CALL_NOT_PENDING_MESSAGE,
+                    ));
+                }
+                Some(pending) if pending != token => {
+                    return Err(HvfVcpuRunnerError::InvalidState(
+                        PSCI_CALL_TOKEN_MISMATCH_MESSAGE,
+                    ));
+                }
+                Some(_) => {}
+            },
+        }
         if state.retained_vtimer_wait.is_some() {
             return Err(HvfVcpuRunnerError::InvalidState(
                 RETAINED_VTIMER_WAIT_IN_FLIGHT_MESSAGE,
@@ -4456,7 +4542,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             admission: InFlightRetainedVtimerWait::new(&self.state, identity),
             signal,
             intid,
-            response_sender,
+            response,
         };
         if let Err(error) = self.command_sender.send(command) {
             state.in_flight_runs = 0;
@@ -6673,19 +6759,22 @@ fn run_runner_thread<C, V>(
                 admission,
                 signal,
                 intid,
-                response_sender,
+                response,
             } => {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let RetainedVtimerWaitResponse::Coordinated { psci_token, .. } = &response {
+                        validate_psci_cpu_suspend_wait_on_runner_thread(&psci_state, *psci_token)?;
+                    }
                     wait_for_retained_vtimer_on_runner_thread(&mut vcpu, &signal, intid)
                 }));
                 match result {
                     Ok(result) => {
                         drop(admission);
-                        let _ = response_sender.send(result);
+                        response.send(result);
                     }
                     Err(payload) => {
                         drop(admission);
-                        let _ = response_sender.send(Err(HvfVcpuRunnerError::ThreadPanicked));
+                        response.send(Err(HvfVcpuRunnerError::ThreadPanicked));
                         std::panic::resume_unwind(payload);
                     }
                 }
@@ -7892,6 +7981,28 @@ fn complete_psci_call_on_runner_thread(
     Ok(())
 }
 
+fn validate_psci_cpu_suspend_wait_on_runner_thread(
+    psci_state: &RunnerThreadPsciState,
+    token: HvfVcpuPsciCallToken,
+) -> Result<(), HvfVcpuRunnerError> {
+    let Some(pending) = psci_state.pending.as_ref() else {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_NOT_PENDING_MESSAGE,
+        ));
+    };
+    if pending.token != token {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_TOKEN_MISMATCH_MESSAGE,
+        ));
+    }
+    if pending.request != PsciCoordinatorRequest::CpuSuspend || pending.written_response.is_some() {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_REQUEST_MISMATCH_MESSAGE,
+        ));
+    }
+    Ok(())
+}
+
 fn commit_psci_cpu_off_on_runner_thread(
     psci_state: &RunnerThreadPsciState,
     token: HvfVcpuPsciCallToken,
@@ -8017,7 +8128,7 @@ pub(crate) mod tests {
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
     use crate::psci::{
         PsciAffinityInfoResponse, PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOnBegin,
-        PsciCpuOnResponse, PsciCpuPowerCoordinator, PsciCpuPowerState,
+        PsciCpuOnResponse, PsciCpuPowerCoordinator, PsciCpuPowerState, PsciCpuSuspendResponse,
     };
     use crate::snapshot::{
         HvfArm64SnapshotOptionalStateRejection, HvfArm64SnapshotTimerPolicyError,
@@ -8068,6 +8179,8 @@ pub(crate) mod tests {
     const ESR_ISS_WNR: u64 = 1 << 6;
     const ESR_ISS_SF: u64 = 1 << 15;
     const PSCI_VERSION: u64 = 0x8400_0000;
+    const PSCI_CPU_SUSPEND: u64 = 0x8400_0001;
+    const PSCI_CPU_SUSPEND_64: u64 = 0xc400_0001;
     const PSCI_CPU_OFF: u64 = 0x8400_0002;
     const PSCI_CPU_ON: u64 = 0x8400_0003;
     const PSCI_CPU_ON_64: u64 = 0xc400_0003;
@@ -9729,6 +9842,11 @@ pub(crate) mod tests {
         register_read_sender: mpsc::Sender<HvfRegister>,
         register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
         fail_next_x0_write: bool,
+        vtimer_control: u64,
+        vtimer_compare_value: u64,
+        vtimer_counter_samples: VecDeque<Result<u64, BackendError>>,
+        vtimer_sample_sender: Option<mpsc::Sender<()>>,
+        ppi_sender: Option<mpsc::Sender<(u32, bool)>>,
     }
 
     struct SecondaryConfigureRecordingVcpu {
@@ -16435,6 +16553,44 @@ pub(crate) mod tests {
             Ok(())
         }
 
+        fn get_vtimer_mask(&mut self) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+
+        fn get_vtimer_offset(&mut self) -> Result<u64, BackendError> {
+            Ok(0)
+        }
+
+        fn get_vtimer_control(&mut self) -> Result<u64, BackendError> {
+            Ok(self.vtimer_control)
+        }
+
+        fn get_vtimer_compare_value(&mut self) -> Result<u64, BackendError> {
+            Ok(self.vtimer_compare_value)
+        }
+
+        fn snapshot_timer_counter_sample(&mut self) -> Result<u64, BackendError> {
+            if let Some(sender) = &self.vtimer_sample_sender {
+                let _ = sender.send(());
+            }
+            self.vtimer_counter_samples
+                .pop_front()
+                .unwrap_or(Err(BackendError::InvalidState(
+                    "fake coordinated PSCI timer samples are exhausted",
+                )))
+        }
+
+        fn mach_timebase_info(&mut self) -> Result<crate::ffi::MachTimebaseInfo, BackendError> {
+            Ok(crate::ffi::MachTimebaseInfo::new(1, 1))
+        }
+
+        fn set_gic_ppi_pending(&mut self, intid: u32, pending: bool) -> Result<(), HvfGicError> {
+            if let Some(sender) = &self.ppi_sender {
+                let _ = sender.send((intid, pending));
+            }
+            Ok(())
+        }
+
         fn destroy(&mut self) -> Result<(), BackendError> {
             Ok(())
         }
@@ -18003,6 +18159,11 @@ pub(crate) mod tests {
                 register_read_sender,
                 register_write_sender,
                 fail_next_x0_write,
+                vtimer_control: 1,
+                vtimer_compare_value: 100,
+                vtimer_counter_samples: VecDeque::from([Ok(100)]),
+                vtimer_sample_sender: None,
+                ppi_sender: None,
             })
         })
         .expect("fake coordinated PSCI runner should start");
@@ -18012,6 +18173,52 @@ pub(crate) mod tests {
                 .expect("runner should be created"),
             register_read_receiver,
             register_write_receiver,
+        )
+    }
+
+    pub(crate) type CpuSuspendRetainedRunnerFixture = (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<HvfRegister>,
+        mpsc::Receiver<(HvfRegister, u64)>,
+        mpsc::Receiver<()>,
+        mpsc::Receiver<(u32, bool)>,
+    );
+
+    pub(crate) fn start_cpu_suspend_retained_runner(
+        function_id: u64,
+        arguments: [u64; 3],
+        vtimer_control: u64,
+        vtimer_compare_value: u64,
+        vtimer_counter_samples: impl IntoIterator<Item = Result<u64, BackendError>>,
+    ) -> CpuSuspendRetainedRunnerFixture {
+        let (register_read_sender, register_read_receiver) = mpsc::channel();
+        let (register_write_sender, register_write_receiver) = mpsc::channel();
+        let (vtimer_sample_sender, vtimer_sample_receiver) = mpsc::channel();
+        let (ppi_sender, ppi_receiver) = mpsc::channel();
+        let vtimer_counter_samples = vtimer_counter_samples.into_iter().collect();
+        let started = spawn_runner_thread(move || {
+            Ok(CoordinatedPsciRecordingVcpu {
+                run_once_result: Ok(hvc_exception_exit(0)),
+                registers: [function_id, arguments[0], arguments[1], arguments[2]],
+                register_read_sender,
+                register_write_sender,
+                fail_next_x0_write: false,
+                vtimer_control,
+                vtimer_compare_value,
+                vtimer_counter_samples,
+                vtimer_sample_sender: Some(vtimer_sample_sender),
+                ppi_sender: Some(ppi_sender),
+            })
+        })
+        .expect("fake CPU_SUSPEND runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("CPU_SUSPEND runner should be created"),
+            register_read_receiver,
+            register_write_receiver,
+            vtimer_sample_receiver,
+            ppi_receiver,
         )
     }
 
@@ -33071,6 +33278,189 @@ pub(crate) mod tests {
 
             runner.shutdown().expect("runner should shut down");
         }
+    }
+
+    #[test]
+    fn coordinated_cpu_suspend_wait_preserves_x0_until_identified_timer_wakeup() {
+        for function_id in [PSCI_CPU_SUSPEND, PSCI_CPU_SUSPEND_64] {
+            let arguments = [0xfeed_face, 0x1234_5678_9abc_def0, u64::MAX];
+            let (runner, register_reads, register_writes, timer_samples, ppi) =
+                start_cpu_suspend_retained_runner(function_id, arguments, 1, 100, [Ok(100)]);
+            let HvfVcpuCoordinatedRunStepOutcome::Psci {
+                token: psci_token,
+                request: PsciCoordinatorRequest::CpuSuspend,
+                ..
+            } = runner
+                .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+                .expect("CPU_SUSPEND should defer")
+            else {
+                panic!("CPU_SUSPEND should return typed coordinator work");
+            };
+            assert_eq!(
+                register_reads.try_iter().collect::<Vec<_>>(),
+                vec![
+                    HvfRegister::X0,
+                    HvfRegister::X1,
+                    HvfRegister::X2,
+                    HvfRegister::X3,
+                ]
+            );
+            assert_eq!(register_writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+            let run_token = HvfVcpuRunToken::new(0, 7);
+            let (completion_sender, completion_receiver) = mpsc::channel();
+            runner
+                .submit_psci_cpu_suspend_wait_coordinated(
+                    run_token,
+                    psci_token,
+                    27,
+                    completion_sender,
+                )
+                .expect("exact CPU_SUSPEND wait should submit");
+            timer_samples
+                .recv()
+                .expect("retained timer should be sampled");
+            let (actual_run_token, result) = completion_receiver
+                .recv()
+                .expect("retained timer completion should publish")
+                .into_parts();
+            assert_eq!(actual_run_token, run_token);
+            assert_eq!(
+                result,
+                Ok(HvfVcpuCoordinatedRunStepOutcome::RetainedVtimer {
+                    psci_token,
+                    outcome: super::HvfVcpuRetainedVtimerWaitOutcome::TimerPending,
+                })
+            );
+            assert_eq!(
+                ppi.recv().expect("timer completion should publish its PPI"),
+                (27, true)
+            );
+            assert_eq!(register_writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+            runner
+                .complete_psci_call(
+                    psci_token,
+                    PsciCoordinatorResponse::CpuSuspend(PsciCpuSuspendResponse::Success),
+                )
+                .expect("timer wake should complete CPU_SUSPEND");
+            assert_eq!(
+                register_writes
+                    .recv()
+                    .expect("CPU_SUSPEND completion should write X0"),
+                (HvfRegister::X0, PSCI_RET_SUCCESS)
+            );
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn coordinated_cpu_suspend_wait_rejects_stale_and_wrong_requests() {
+        let (runner, _, register_writes) = start_coordinated_psci_run_step_recording_runner(
+            PSCI_CPU_ON,
+            [1, 0x8020_0000, 0],
+            0,
+            false,
+        );
+        let HvfVcpuCoordinatedRunStepOutcome::Psci {
+            token: psci_token, ..
+        } = runner
+            .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+            .expect("CPU_ON should defer")
+        else {
+            panic!("CPU_ON should return coordinator work");
+        };
+        let stale = HvfVcpuPsciCallToken {
+            vcpu: psci_token.vcpu,
+            sequence: psci_token.sequence + 1,
+        };
+        let (completion_sender, _completion_receiver) = mpsc::channel();
+        assert_eq!(
+            runner.submit_psci_cpu_suspend_wait_coordinated(
+                HvfVcpuRunToken::new(0, 1),
+                stale,
+                27,
+                completion_sender,
+            ),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_TOKEN_MISMATCH_MESSAGE
+            ))
+        );
+
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        runner
+            .submit_psci_cpu_suspend_wait_coordinated(
+                HvfVcpuRunToken::new(0, 2),
+                psci_token,
+                27,
+                completion_sender,
+            )
+            .expect("exact token should reach owner validation");
+        let (_, result) = completion_receiver
+            .recv()
+            .expect("wrong request should publish an identified error")
+            .into_parts();
+        assert_eq!(
+            result,
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_REQUEST_MISMATCH_MESSAGE
+            ))
+        );
+        assert_eq!(register_writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+        runner
+            .complete_psci_call(
+                psci_token,
+                PsciCoordinatorResponse::CpuOn(PsciCpuOnResponse::InternalFailure),
+            )
+            .expect("original CPU_ON should remain completable");
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn canceled_cpu_suspend_wait_retains_exact_transaction_for_rearm() {
+        let (runner, _, register_writes, timer_samples, _ppi) =
+            start_cpu_suspend_retained_runner(PSCI_CPU_SUSPEND, [1, 2, 3], 0, 100, [Ok(1), Ok(2)]);
+        let HvfVcpuCoordinatedRunStepOutcome::Psci {
+            token: psci_token, ..
+        } = runner
+            .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+            .expect("CPU_SUSPEND should defer")
+        else {
+            panic!("CPU_SUSPEND should return coordinator work");
+        };
+        let cancel = runner.run_cancel_handle();
+
+        for generation in [1, 2] {
+            let run_token = HvfVcpuRunToken::new(0, generation);
+            let (completion_sender, completion_receiver) = mpsc::channel();
+            runner
+                .submit_psci_cpu_suspend_wait_coordinated(
+                    run_token,
+                    psci_token,
+                    27,
+                    completion_sender,
+                )
+                .expect("CPU_SUSPEND wait should rearm");
+            timer_samples
+                .recv()
+                .expect("rearmed wait should sample the timer");
+            cancel.cancel().expect("rearmed wait should cancel");
+            let (actual_token, result) = completion_receiver
+                .recv()
+                .expect("canceled wait should publish")
+                .into_parts();
+            assert_eq!(actual_token, run_token);
+            assert_eq!(
+                result,
+                Ok(HvfVcpuCoordinatedRunStepOutcome::RetainedVtimer {
+                    psci_token,
+                    outcome: super::HvfVcpuRetainedVtimerWaitOutcome::Canceled,
+                })
+            );
+            assert_eq!(register_writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+        }
+
+        runner.shutdown().expect("runner should shut down");
     }
 
     #[test]
