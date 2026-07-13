@@ -5,6 +5,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::mem;
+use std::num::Wrapping;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -76,6 +77,8 @@ const NONBLOCKING_CONNECT_INTERRUPTED_RETRY_LIMIT: usize = 4;
 const VSOCK_GUEST_RW_PENDING_PACKET_LIMIT: usize = 4;
 const VSOCK_HOST_RW_PENDING_PACKET_LIMIT: usize = 4;
 const VSOCK_HOST_RW_POLL_BATCH_LIMIT: usize = VSOCK_HOST_RW_PENDING_PACKET_LIMIT;
+const VSOCK_CONNECTION_BUFFER_SIZE_USIZE: usize = VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE as usize;
+const VSOCK_CREDIT_UPDATE_THRESHOLD: u32 = 4 * 1024;
 const VSOCK_HOST_CONNECT_COMMAND: &str = "connect";
 
 pub type VirtioVsockMmioHandler =
@@ -760,12 +763,174 @@ enum VsockConnectionShutdownTransition {
     FullyClosed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VsockConnectionCredit {
+    received_count: Wrapping<u32>,
+    forwarded_count: Wrapping<u32>,
+    last_reported_forwarded_count: Wrapping<u32>,
+    peer_buffer_allocation: u32,
+    peer_forwarded_count: Wrapping<u32>,
+    sent_count: Wrapping<u32>,
+    reserved_peer_bytes: u32,
+    pending_credit_request_packet: bool,
+    credit_request_outstanding: bool,
+    pending_credit_update_packet: bool,
+}
+
+impl VsockConnectionCredit {
+    const fn new() -> Self {
+        Self {
+            received_count: Wrapping(0),
+            forwarded_count: Wrapping(0),
+            last_reported_forwarded_count: Wrapping(0),
+            peer_buffer_allocation: 0,
+            peer_forwarded_count: Wrapping(0),
+            sent_count: Wrapping(0),
+            reserved_peer_bytes: 0,
+            pending_credit_request_packet: false,
+            credit_request_outstanding: false,
+            pending_credit_update_packet: false,
+        }
+    }
+
+    fn from_peer_header(header: VirtioVsockPacketHeader) -> Self {
+        let mut credit = Self::new();
+        credit.refresh_peer(header);
+        credit
+    }
+
+    fn refresh_peer(&mut self, header: VirtioVsockPacketHeader) {
+        self.peer_buffer_allocation = header.buffer_allocation();
+        self.peer_forwarded_count = Wrapping(header.forwarded_count());
+        if self.peer_available_credit() != 0 {
+            self.pending_credit_request_packet = false;
+            self.credit_request_outstanding = false;
+        }
+    }
+
+    fn peer_outstanding_bytes(self) -> u32 {
+        (self.sent_count - self.peer_forwarded_count).0
+    }
+
+    fn peer_available_credit(self) -> u32 {
+        self.peer_buffer_allocation
+            .saturating_sub(self.peer_outstanding_bytes())
+            .saturating_sub(self.reserved_peer_bytes)
+    }
+
+    fn local_outstanding_bytes(self) -> u32 {
+        (self.received_count - self.forwarded_count).0
+    }
+
+    fn local_available_credit(self) -> u32 {
+        VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE.saturating_sub(self.local_outstanding_bytes())
+    }
+
+    fn accept_guest_bytes(&mut self, len: u32) -> Result<(), VsockGuestRwForwardError> {
+        self.check_guest_bytes(len)?;
+        self.received_count += Wrapping(len);
+        Ok(())
+    }
+
+    fn check_guest_bytes(self, len: u32) -> Result<(), VsockGuestRwForwardError> {
+        let available = self.local_available_credit();
+        if len > available {
+            return Err(VsockGuestRwForwardError::CreditExceeded {
+                available,
+                requested: len,
+            });
+        }
+        Ok(())
+    }
+
+    fn record_forwarded_bytes(&mut self, len: u32) {
+        self.forwarded_count += Wrapping(len);
+        let unreported = (self.forwarded_count - self.last_reported_forwarded_count).0;
+        if unreported
+            > VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE.saturating_sub(VSOCK_CREDIT_UPDATE_THRESHOLD)
+        {
+            self.pending_credit_update_packet = true;
+        }
+    }
+
+    fn reserve_peer_bytes(&mut self, len: u32) -> bool {
+        if len > self.peer_available_credit() {
+            return false;
+        }
+        let Some(reserved_peer_bytes) = self.reserved_peer_bytes.checked_add(len) else {
+            return false;
+        };
+        self.reserved_peer_bytes = reserved_peer_bytes;
+        self.ensure_credit_request_if_exhausted();
+        true
+    }
+
+    fn commit_reserved_peer_bytes(&mut self, len: u32) -> bool {
+        let Some(reserved_peer_bytes) = self.reserved_peer_bytes.checked_sub(len) else {
+            return false;
+        };
+        self.reserved_peer_bytes = reserved_peer_bytes;
+        self.sent_count += Wrapping(len);
+        self.ensure_credit_request_if_exhausted();
+        true
+    }
+
+    fn release_reserved_peer_bytes(&mut self, len: u32) -> bool {
+        let Some(reserved_peer_bytes) = self.reserved_peer_bytes.checked_sub(len) else {
+            return false;
+        };
+        self.reserved_peer_bytes = reserved_peer_bytes;
+        true
+    }
+
+    fn ensure_credit_request_if_exhausted(&mut self) {
+        if self.peer_available_credit() == 0 && !self.credit_request_outstanding {
+            self.pending_credit_request_packet = true;
+            self.credit_request_outstanding = true;
+        }
+    }
+
+    const fn has_pending_credit_request_packet(self) -> bool {
+        self.pending_credit_request_packet
+    }
+
+    const fn has_pending_credit_update_packet(self) -> bool {
+        self.pending_credit_update_packet
+    }
+
+    fn queue_credit_update_packet(&mut self) {
+        self.pending_credit_update_packet = true;
+    }
+
+    fn apply_to_header(self, header: VirtioVsockPacketHeader) -> VirtioVsockPacketHeader {
+        header
+            .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
+            .with_forwarded_count(self.forwarded_count.0)
+    }
+
+    fn mark_packet_delivered(&mut self, operation: u16) {
+        self.last_reported_forwarded_count = self.forwarded_count;
+        if operation == VIRTIO_VSOCK_OP_CREDIT_UPDATE {
+            self.pending_credit_update_packet = false;
+        }
+        if operation == VIRTIO_VSOCK_OP_CREDIT_REQUEST {
+            self.pending_credit_request_packet = false;
+        }
+    }
+}
+
+impl Default for VsockConnectionCredit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct VsockHostConnection {
     accepted: VsockHostAcceptedConnection,
     request_packet_pending: bool,
     host_ack_sent: bool,
-    pending_credit_update_packet: bool,
+    credit: VsockConnectionCredit,
     pending_guest_rw_writes: VsockGuestRwPendingWrites,
     pending_host_rw_payloads: VecDeque<Vec<u8>>,
     shutdown: VsockConnectionShutdownState,
@@ -777,7 +942,7 @@ impl VsockHostConnection {
             accepted,
             request_packet_pending: true,
             host_ack_sent: false,
-            pending_credit_update_packet: false,
+            credit: VsockConnectionCredit::new(),
             pending_guest_rw_writes: VsockGuestRwPendingWrites::new(),
             pending_host_rw_payloads: VecDeque::new(),
             shutdown: VsockConnectionShutdownState::default(),
@@ -792,12 +957,27 @@ impl VsockHostConnection {
         self.request_packet_pending
     }
 
+    fn pending_request_packet_header(
+        &self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.request_packet_pending.then(|| {
+            self.credit
+                .apply_to_header(host_connection_request_packet_header(key, guest_cid))
+        })
+    }
+
     fn has_pending_host_rw_packet(&self) -> bool {
         !self.shutdown.receive_closed() && !self.pending_host_rw_payloads.is_empty()
     }
 
+    const fn has_pending_credit_request_packet(&self) -> bool {
+        self.credit.has_pending_credit_request_packet()
+    }
+
     const fn has_pending_credit_update_packet(&self) -> bool {
-        self.pending_credit_update_packet
+        self.credit.has_pending_credit_update_packet()
     }
 
     const fn is_established(&self) -> bool {
@@ -814,6 +994,7 @@ impl VsockHostConnection {
             && self.host_ack_sent
             && !self.shutdown.receive_closed()
             && self.pending_host_rw_payloads.len() < VSOCK_HOST_RW_PENDING_PACKET_LIMIT
+            && self.credit.peer_available_credit() != 0
     }
 
     fn guest_send_shutdown(&self) -> bool {
@@ -823,20 +1004,102 @@ impl VsockHostConnection {
     fn apply_guest_shutdown_flags(&mut self, flags: u32) -> VsockConnectionShutdownTransition {
         let transition = self.shutdown.apply_guest_shutdown_flags(flags);
         if self.shutdown.receive_closed() {
+            let released = self
+                .pending_host_rw_payloads
+                .iter()
+                .map(Vec::len)
+                .fold(0u32, |total, len| {
+                    total.saturating_add(payload_len_u32(len))
+                });
             self.pending_host_rw_payloads.clear();
+            let released = self.credit.release_reserved_peer_bytes(released);
+            debug_assert!(released);
         }
         transition
     }
 
+    fn refresh_peer_credit(&mut self, header: VirtioVsockPacketHeader) {
+        self.credit.refresh_peer(header);
+    }
+
+    fn check_guest_rw_credit(&self, len: u32) -> Result<(), VsockGuestRwForwardError> {
+        self.credit.check_guest_bytes(len)
+    }
+
+    fn reset_packet_header(
+        &self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> VirtioVsockPacketHeader {
+        self.credit
+            .apply_to_header(host_connection_reset_packet_header(key, guest_cid))
+    }
+
+    fn pending_credit_update_packet_header(
+        &self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.credit.has_pending_credit_update_packet().then(|| {
+            self.credit
+                .apply_to_header(host_connection_credit_update_packet_header(key, guest_cid))
+        })
+    }
+
+    fn pending_credit_request_packet_header(
+        &self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.credit.has_pending_credit_request_packet().then(|| {
+            self.credit
+                .apply_to_header(host_connection_credit_request_packet_header(key, guest_cid))
+        })
+    }
+
     fn write_guest_rw_payload(&mut self, payload: Vec<u8>) -> Result<(), VsockGuestRwForwardError> {
+        self.credit
+            .accept_guest_bytes(payload_len_u32(payload.len()))?;
         let mut stream = self.accepted.stream();
-        self.pending_guest_rw_writes
+        match self
+            .pending_guest_rw_writes
             .write_or_queue(&mut stream, payload)
+        {
+            Ok(forwarded_bytes) => {
+                self.credit
+                    .record_forwarded_bytes(forwarded_byte_count_u32(forwarded_bytes));
+                debug_assert_eq!(
+                    self.credit.local_outstanding_bytes() as usize,
+                    self.pending_guest_rw_writes.pending_bytes()
+                );
+                Ok(())
+            }
+            Err(failure) => {
+                self.credit
+                    .record_forwarded_bytes(forwarded_byte_count_u32(failure.forwarded_bytes));
+                Err(failure.source)
+            }
+        }
     }
 
     fn flush_pending_guest_rw_writes(&mut self) -> Result<(), VsockGuestRwForwardError> {
         let mut stream = self.accepted.stream();
-        self.pending_guest_rw_writes.flush(&mut stream)
+        match self.pending_guest_rw_writes.flush(&mut stream) {
+            Ok(forwarded_bytes) => {
+                self.credit
+                    .record_forwarded_bytes(forwarded_byte_count_u32(forwarded_bytes));
+                debug_assert_eq!(
+                    self.credit.local_outstanding_bytes() as usize,
+                    self.pending_guest_rw_writes.pending_bytes()
+                );
+                Ok(())
+            }
+            Err(failure) => {
+                self.credit
+                    .record_forwarded_bytes(forwarded_byte_count_u32(failure.forwarded_bytes));
+                Err(failure.source)
+            }
+        }
     }
 
     fn has_pending_guest_rw_writes(&self) -> bool {
@@ -856,6 +1119,7 @@ impl VsockHostConnection {
         match stream.write(message.as_bytes()) {
             Ok(written) if written == message.len() => {
                 self.host_ack_sent = true;
+                self.credit.ensure_credit_request_if_exhausted();
                 Ok(())
             }
             Ok(written) => Err(VsockHostConnectionAcknowledgeError::ShortWrite {
@@ -874,13 +1138,15 @@ impl VsockHostConnection {
         if !self.request_packet_pending {
             return None;
         }
+        let header = self.pending_request_packet_header(key, guest_cid)?;
         self.request_packet_pending = false;
+        self.credit.mark_packet_delivered(VIRTIO_VSOCK_OP_REQUEST);
 
-        Some(host_connection_request_packet_header(key, guest_cid))
+        Some(header)
     }
 
     fn queue_pending_credit_update_packet(&mut self) {
-        self.pending_credit_update_packet = true;
+        self.credit.queue_credit_update_packet();
     }
 
     fn take_pending_credit_update_packet_header(
@@ -888,12 +1154,28 @@ impl VsockHostConnection {
         key: VsockHostConnectionKey,
         guest_cid: u32,
     ) -> Option<VirtioVsockPacketHeader> {
-        if !self.pending_credit_update_packet {
+        if !self.credit.has_pending_credit_update_packet() {
             return None;
         }
-        self.pending_credit_update_packet = false;
+        let header = self.pending_credit_update_packet_header(key, guest_cid)?;
+        self.credit
+            .mark_packet_delivered(VIRTIO_VSOCK_OP_CREDIT_UPDATE);
 
-        Some(host_connection_credit_update_packet_header(key, guest_cid))
+        Some(header)
+    }
+
+    fn take_pending_credit_request_packet_header(
+        &mut self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        if !self.credit.has_pending_credit_request_packet() {
+            return None;
+        }
+        let header = self.pending_credit_request_packet_header(key, guest_cid)?;
+        self.credit
+            .mark_packet_delivered(VIRTIO_VSOCK_OP_CREDIT_REQUEST);
+        Some(header)
     }
 
     fn pending_host_rw_packet(
@@ -904,13 +1186,24 @@ impl VsockHostConnection {
         let payload = self.pending_host_rw_payloads.front()?.clone();
         Some(VirtioVsockRxPacket::new(
             VirtioVsockRxPacketKind::HostRw,
-            host_connection_rw_packet_header(key, guest_cid, payload_len_u32(payload.len())),
+            self.credit
+                .apply_to_header(host_connection_rw_packet_header(
+                    key,
+                    guest_cid,
+                    payload_len_u32(payload.len()),
+                )),
             payload,
         ))
     }
 
     fn take_pending_host_rw_payload(&mut self) -> Option<Vec<u8>> {
-        self.pending_host_rw_payloads.pop_front()
+        let payload = self.pending_host_rw_payloads.pop_front()?;
+        let committed = self
+            .credit
+            .commit_reserved_peer_bytes(payload_len_u32(payload.len()));
+        debug_assert!(committed);
+        self.credit.mark_packet_delivered(VIRTIO_VSOCK_OP_RW);
+        Some(payload)
     }
 
     fn poll_host_rw_payloads(&mut self, scratch: &mut [u8]) -> VsockHostRwPollOutcome {
@@ -919,7 +1212,12 @@ impl VsockHostConnection {
         }
 
         let mut stream = self.accepted.stream();
-        poll_host_rw_payloads_from_stream(&mut stream, &mut self.pending_host_rw_payloads, scratch)
+        poll_host_rw_payloads_from_stream(
+            &mut stream,
+            &mut self.pending_host_rw_payloads,
+            &mut self.credit,
+            scratch,
+        )
     }
 }
 
@@ -934,6 +1232,7 @@ enum VsockHostRwPollOutcome {
 fn poll_host_rw_payloads_from_stream(
     stream: &mut impl io::Read,
     pending_host_rw_payloads: &mut VecDeque<Vec<u8>>,
+    credit: &mut VsockConnectionCredit,
     scratch: &mut [u8],
 ) -> VsockHostRwPollOutcome {
     let had_pending_payload = !pending_host_rw_payloads.is_empty();
@@ -944,7 +1243,18 @@ fn poll_host_rw_payloads_from_stream(
             break;
         }
 
-        match stream.read(scratch) {
+        let read_len = usize::try_from(credit.peer_available_credit())
+            .unwrap_or(usize::MAX)
+            .min(scratch.len());
+        if read_len == 0 {
+            credit.ensure_credit_request_if_exhausted();
+            break;
+        }
+        let Some(read_buffer) = scratch.get_mut(..read_len) else {
+            return VsockHostRwPollOutcome::ReadError;
+        };
+
+        match stream.read(read_buffer) {
             Ok(0) => {
                 return if had_pending_payload || queued_payload {
                     VsockHostRwPollOutcome::Queued
@@ -960,6 +1270,13 @@ fn poll_host_rw_payloads_from_stream(
                         VsockHostRwPollOutcome::ReadError
                     };
                 };
+                if !credit.reserve_peer_bytes(payload_len_u32(read_len)) {
+                    return if had_pending_payload || queued_payload {
+                        VsockHostRwPollOutcome::Queued
+                    } else {
+                        VsockHostRwPollOutcome::ReadError
+                    };
+                }
                 pending_host_rw_payloads.push_back(bytes.to_vec());
                 queued_payload = true;
             }
@@ -1076,6 +1393,20 @@ fn host_connection_credit_update_packet_header(
         .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
 }
 
+fn host_connection_credit_request_packet_header(
+    key: VsockHostConnectionKey,
+    guest_cid: u32,
+) -> VirtioVsockPacketHeader {
+    VirtioVsockPacketHeader::new()
+        .with_src_cid(VIRTIO_VSOCK_HOST_CID)
+        .with_dst_cid(u64::from(guest_cid))
+        .with_src_port(key.local_port().raw())
+        .with_dst_port(key.peer_port())
+        .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+        .with_operation(VIRTIO_VSOCK_OP_CREDIT_REQUEST)
+        .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
+}
+
 fn guest_connection_response_packet_header(
     key: VsockGuestConnectionKey,
     guest_cid: u32,
@@ -1131,6 +1462,20 @@ fn guest_connection_credit_update_packet_header(
         .with_dst_port(key.guest_port())
         .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
         .with_operation(VIRTIO_VSOCK_OP_CREDIT_UPDATE)
+        .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
+}
+
+fn guest_connection_credit_request_packet_header(
+    key: VsockGuestConnectionKey,
+    guest_cid: u32,
+) -> VirtioVsockPacketHeader {
+    VirtioVsockPacketHeader::new()
+        .with_src_cid(VIRTIO_VSOCK_HOST_CID)
+        .with_dst_cid(u64::from(guest_cid))
+        .with_src_port(key.host_port())
+        .with_dst_port(key.guest_port())
+        .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+        .with_operation(VIRTIO_VSOCK_OP_CREDIT_REQUEST)
         .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
 }
 
@@ -1456,6 +1801,16 @@ impl VsockHostConnectionTable {
             .take_pending_request_packet_header(key, guest_cid)
     }
 
+    fn pending_request_packet_header(
+        &self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get(&key)?
+            .pending_request_packet_header(key, guest_cid)
+    }
+
     #[cfg(test)]
     fn has_pending_credit_update_packet(&self, key: VsockHostConnectionKey) -> bool {
         self.connections
@@ -1466,6 +1821,7 @@ impl VsockHostConnectionTable {
     fn queue_pending_credit_update_packet(
         &mut self,
         key: VsockHostConnectionKey,
+        header: VirtioVsockPacketHeader,
     ) -> Result<(), VsockGuestCreditError> {
         let Some(connection) = self.connections.get_mut(&key) else {
             return Err(VsockGuestCreditError::MissingConnection);
@@ -1474,21 +1830,24 @@ impl VsockHostConnectionTable {
             return Err(VsockGuestCreditError::ConnectionNotEstablished);
         }
 
+        connection.refresh_peer_credit(header);
         connection.queue_pending_credit_update_packet();
         Ok(())
     }
 
     fn consume_credit_update_packet(
-        &self,
+        &mut self,
         key: VsockHostConnectionKey,
+        header: VirtioVsockPacketHeader,
     ) -> Result<(), VsockGuestCreditError> {
-        let Some(connection) = self.connections.get(&key) else {
+        let Some(connection) = self.connections.get_mut(&key) else {
             return Err(VsockGuestCreditError::MissingConnection);
         };
         if !connection.is_established() {
             return Err(VsockGuestCreditError::ConnectionNotEstablished);
         }
 
+        connection.refresh_peer_credit(header);
         Ok(())
     }
 
@@ -1511,6 +1870,47 @@ impl VsockHostConnectionTable {
                     .then_some(*key)
             })
             .min()
+    }
+
+    fn pending_credit_update_packet_header(
+        &self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get(&key)?
+            .pending_credit_update_packet_header(key, guest_cid)
+    }
+
+    fn take_pending_credit_request_packet_header(
+        &mut self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get_mut(&key)?
+            .take_pending_credit_request_packet_header(key, guest_cid)
+    }
+
+    fn first_pending_credit_request_packet_key(&self) -> Option<VsockHostConnectionKey> {
+        self.connections
+            .iter()
+            .filter_map(|(key, connection)| {
+                connection
+                    .has_pending_credit_request_packet()
+                    .then_some(*key)
+            })
+            .min()
+    }
+
+    fn pending_credit_request_packet_header(
+        &self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get(&key)?
+            .pending_credit_request_packet_header(key, guest_cid)
     }
 
     fn first_pending_host_rw_packet_key(&self) -> Option<VsockHostConnectionKey> {
@@ -1574,9 +1974,10 @@ impl VsockHostConnectionTable {
             match connection.poll_host_rw_payloads(scratch) {
                 VsockHostRwPollOutcome::NoData | VsockHostRwPollOutcome::Queued => {}
                 VsockHostRwPollOutcome::Closed | VsockHostRwPollOutcome::ReadError => {
+                    let header = connection.reset_packet_header(key, guest_cid);
                     let removed = self.remove(key);
                     debug_assert!(removed);
-                    reset_headers.push(host_connection_reset_packet_header(key, guest_cid));
+                    reset_headers.push(header);
                 }
             }
         }
@@ -1597,9 +1998,10 @@ impl VsockHostConnectionTable {
             }
 
             if connection.flush_pending_guest_rw_writes().is_err() {
+                let header = connection.reset_packet_header(key, guest_cid);
                 let removed = self.remove(key);
                 debug_assert!(removed);
-                reset_headers.push(host_connection_reset_packet_header(key, guest_cid));
+                reset_headers.push(header);
             }
         }
 
@@ -1636,13 +2038,15 @@ impl VsockHostConnectionTable {
             return None;
         };
         let key = VsockHostConnectionKey::new(local_port, header.src_port());
-        let connection = self.connections.get(&key)?;
+        let connection = self.connections.get_mut(&key)?;
         if !connection.is_established() {
+            let reset_header = connection.reset_packet_header(key, guest_cid);
             let removed = self.remove(key);
             debug_assert!(removed);
             return Some(VsockGuestRwOutcome::Dropped {
                 key: VsockGuestRwConnectionKey::Host(key),
                 source: VsockGuestRwForwardError::ResponseStillPending,
+                reset_header: Some(reset_header),
             });
         }
         if connection.guest_send_shutdown() {
@@ -1651,15 +2055,31 @@ impl VsockHostConnectionTable {
                 reason: VsockGuestRwSuppressReason::GuestSendShutdown,
             });
         }
+        connection.refresh_peer_credit(header);
+        if let Err(source) = connection.check_guest_rw_credit(header.payload_len()) {
+            let reset_header = connection.reset_packet_header(key, guest_cid);
+            let removed = self.remove(key);
+            debug_assert!(removed);
+            return Some(VsockGuestRwOutcome::Dropped {
+                key: VsockGuestRwConnectionKey::Host(key),
+                source,
+                reset_header: Some(reset_header),
+            });
+        }
 
         let payload = match read_vsock_tx_payload_bytes(memory, packet) {
             Ok(payload) => payload,
             Err(source) => {
+                let reset_header = self
+                    .connections
+                    .get(&key)
+                    .map(|connection| connection.reset_packet_header(key, guest_cid));
                 let removed = self.remove(key);
                 debug_assert!(removed);
                 return Some(VsockGuestRwOutcome::Dropped {
                     key: VsockGuestRwConnectionKey::Host(key),
                     source,
+                    reset_header,
                 });
             }
         };
@@ -1668,6 +2088,7 @@ impl VsockHostConnectionTable {
             return Some(VsockGuestRwOutcome::Dropped {
                 key: VsockGuestRwConnectionKey::Host(key),
                 source: VsockGuestRwForwardError::MissingConnection,
+                reset_header: None,
             });
         };
         let payload_len = payload.len();
@@ -1678,11 +2099,13 @@ impl VsockHostConnectionTable {
                 bytes: payload_len,
             }),
             Err(source) => {
+                let reset_header = connection.reset_packet_header(key, guest_cid);
                 let removed = self.remove(key);
                 debug_assert!(removed);
                 Some(VsockGuestRwOutcome::Dropped {
                     key: VsockGuestRwConnectionKey::Host(key),
                     source,
+                    reset_header: Some(reset_header),
                 })
             }
         }
@@ -1735,6 +2158,7 @@ impl VsockHostConnectionTable {
                 reason: VsockHostGuestResponseIgnoreReason::RequestStillPending,
             });
         }
+        connection.refresh_peer_credit(header);
 
         match connection.acknowledge_guest_response(key) {
             Ok(()) => Some(VsockHostGuestResponseOutcome::Acknowledged { key }),
@@ -1744,9 +2168,14 @@ impl VsockHostConnectionTable {
                 })
             }
             Err(source) => {
+                let reset_header = connection.reset_packet_header(key, guest_cid);
                 let removed = self.remove(key);
                 debug_assert!(removed);
-                Some(VsockHostGuestResponseOutcome::Dropped { key, source })
+                Some(VsockHostGuestResponseOutcome::Dropped {
+                    key,
+                    source,
+                    reset_header,
+                })
             }
         }
     }
@@ -1788,6 +2217,7 @@ enum VsockHostGuestResponseOutcome {
     Dropped {
         key: VsockHostConnectionKey,
         source: VsockHostConnectionAcknowledgeError,
+        reset_header: VirtioVsockPacketHeader,
     },
 }
 
@@ -1800,6 +2230,13 @@ impl VsockHostGuestResponseOutcome {
                     reason: VsockHostGuestResponseIgnoreReason::AlreadyAcknowledged,
                 }
         )
+    }
+
+    const fn reset_header(self) -> Option<VirtioVsockPacketHeader> {
+        match self {
+            Self::Dropped { reset_header, .. } => Some(reset_header),
+            Self::Acknowledged { .. } | Self::Ignored { .. } => None,
+        }
     }
 }
 
@@ -1965,6 +2402,7 @@ enum VsockGuestRwOutcome {
     Dropped {
         key: VsockGuestRwConnectionKey,
         source: VsockGuestRwForwardError,
+        reset_header: Option<VirtioVsockPacketHeader>,
     },
 }
 
@@ -1977,6 +2415,13 @@ enum VsockGuestRwConnectionKey {
 impl VsockGuestRwOutcome {
     const fn suppresses_guest_reset(&self) -> bool {
         matches!(self, Self::Forwarded { .. } | Self::Suppressed { .. })
+    }
+
+    const fn reset_header(&self) -> Option<VirtioVsockPacketHeader> {
+        match self {
+            Self::Dropped { reset_header, .. } => *reset_header,
+            Self::Forwarded { .. } | Self::Suppressed { .. } | Self::Ignored { .. } => None,
+        }
     }
 }
 
@@ -2017,8 +2462,16 @@ enum VsockGuestRwForwardError {
         len: u32,
         source: GuestMemoryAccessError,
     },
+    CreditExceeded {
+        available: u32,
+        requested: u32,
+    },
     PendingBufferFull {
         limit: usize,
+    },
+    PendingBufferByteLimit {
+        limit: usize,
+        attempted: usize,
     },
     PendingOffsetOutOfBounds {
         offset: usize,
@@ -2070,12 +2523,23 @@ impl fmt::Display for VsockGuestRwForwardError {
                 f,
                 "failed to read guest RW payload segment {descriptor_index} at {address} ({len} bytes): {source}"
             ),
+            Self::CreditExceeded {
+                available,
+                requested,
+            } => write!(
+                f,
+                "guest RW payload length {requested} exceeds available vsock credit {available}"
+            ),
             Self::PendingBufferFull { limit } => {
                 write!(
                     f,
                     "guest RW host stream pending write buffer limit {limit} reached"
                 )
             }
+            Self::PendingBufferByteLimit { limit, attempted } => write!(
+                f,
+                "guest RW host stream pending write byte limit {limit} exceeded by {attempted} bytes"
+            ),
             Self::PendingOffsetOutOfBounds { offset, len } => write!(
                 f,
                 "guest RW host stream pending write offset {offset} exceeds payload length {len}"
@@ -2108,7 +2572,9 @@ impl std::error::Error for VsockGuestRwForwardError {
             | Self::PayloadLenTooLarge { .. }
             | Self::PayloadSegmentTooLarge { .. }
             | Self::PayloadLengthMismatch { .. }
+            | Self::CreditExceeded { .. }
             | Self::PendingBufferFull { .. }
+            | Self::PendingBufferByteLimit { .. }
             | Self::PendingOffsetOutOfBounds { .. }
             | Self::InvalidWriteCount { .. }
             | Self::StreamWrite(_)
@@ -2119,29 +2585,41 @@ impl std::error::Error for VsockGuestRwForwardError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VsockGuestRwWriteOutcome {
-    Complete,
+    Complete { written: usize },
     Blocked { written: usize },
+}
+
+#[derive(Debug)]
+struct VsockGuestRwForwardFailure {
+    forwarded_bytes: usize,
+    source: VsockGuestRwForwardError,
 }
 
 fn write_guest_rw_payload_to_stream(
     stream: &mut impl io::Write,
     payload: &[u8],
-) -> Result<VsockGuestRwWriteOutcome, VsockGuestRwForwardError> {
+) -> Result<VsockGuestRwWriteOutcome, VsockGuestRwForwardFailure> {
     let mut remaining = payload;
     let mut total_written = 0;
 
     while !remaining.is_empty() {
         match stream.write(remaining) {
             Ok(0) => {
-                return Err(VsockGuestRwForwardError::WriteZero {
-                    expected: remaining.len(),
+                return Err(VsockGuestRwForwardFailure {
+                    forwarded_bytes: total_written,
+                    source: VsockGuestRwForwardError::WriteZero {
+                        expected: remaining.len(),
+                    },
                 });
             }
             Ok(written) => {
                 let Some(next_remaining) = remaining.get(written..) else {
-                    return Err(VsockGuestRwForwardError::InvalidWriteCount {
-                        attempted: remaining.len(),
-                        actual: written,
+                    return Err(VsockGuestRwForwardFailure {
+                        forwarded_bytes: total_written,
+                        source: VsockGuestRwForwardError::InvalidWriteCount {
+                            attempted: remaining.len(),
+                            actual: written,
+                        },
                     });
                 };
 
@@ -2158,17 +2636,25 @@ fn write_guest_rw_payload_to_stream(
                     written: total_written,
                 });
             }
-            Err(error) => return Err(VsockGuestRwForwardError::StreamWrite(error.kind())),
+            Err(error) => {
+                return Err(VsockGuestRwForwardFailure {
+                    forwarded_bytes: total_written,
+                    source: VsockGuestRwForwardError::StreamWrite(error.kind()),
+                });
+            }
         }
     }
 
-    Ok(VsockGuestRwWriteOutcome::Complete)
+    Ok(VsockGuestRwWriteOutcome::Complete {
+        written: total_written,
+    })
 }
 
 #[derive(Debug)]
 struct VsockGuestRwPendingWrites {
     payloads: VecDeque<Vec<u8>>,
     front_offset: usize,
+    pending_bytes: usize,
 }
 
 impl VsockGuestRwPendingWrites {
@@ -2176,6 +2662,7 @@ impl VsockGuestRwPendingWrites {
         Self {
             payloads: VecDeque::new(),
             front_offset: 0,
+            pending_bytes: 0,
         }
     }
 
@@ -2188,34 +2675,58 @@ impl VsockGuestRwPendingWrites {
         self.payloads.len()
     }
 
+    const fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
     fn write_or_queue(
         &mut self,
         stream: &mut impl io::Write,
         payload: Vec<u8>,
-    ) -> Result<(), VsockGuestRwForwardError> {
+    ) -> Result<usize, VsockGuestRwForwardFailure> {
         if payload.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
-        self.flush(stream)?;
+        let forwarded_bytes = self.flush(stream)?;
         if !self.is_empty() {
-            return self.push_payload(&payload);
+            return self
+                .push_payload(&payload)
+                .map(|()| forwarded_bytes)
+                .map_err(|source| VsockGuestRwForwardFailure {
+                    forwarded_bytes,
+                    source,
+                });
         }
 
-        match write_guest_rw_payload_to_stream(stream, &payload)? {
-            VsockGuestRwWriteOutcome::Complete => Ok(()),
-            VsockGuestRwWriteOutcome::Blocked { written } => {
-                self.push_payload_suffix(payload, written)
+        match write_guest_rw_payload_to_stream(stream, &payload) {
+            Ok(VsockGuestRwWriteOutcome::Complete { written }) => {
+                Ok(forwarded_bytes.saturating_add(written))
+            }
+            Ok(VsockGuestRwWriteOutcome::Blocked { written }) => self
+                .push_payload_suffix(payload, written)
+                .map(|()| forwarded_bytes.saturating_add(written))
+                .map_err(|source| VsockGuestRwForwardFailure {
+                    forwarded_bytes: forwarded_bytes.saturating_add(written),
+                    source,
+                }),
+            Err(mut failure) => {
+                failure.forwarded_bytes = failure.forwarded_bytes.saturating_add(forwarded_bytes);
+                Err(failure)
             }
         }
     }
 
-    fn flush(&mut self, stream: &mut impl io::Write) -> Result<(), VsockGuestRwForwardError> {
+    fn flush(&mut self, stream: &mut impl io::Write) -> Result<usize, VsockGuestRwForwardFailure> {
+        let mut forwarded_bytes = 0usize;
         while let Some(payload) = self.payloads.front() {
             let Some(remaining) = payload.get(self.front_offset..) else {
-                return Err(VsockGuestRwForwardError::PendingOffsetOutOfBounds {
-                    offset: self.front_offset,
-                    len: payload.len(),
+                return Err(VsockGuestRwForwardFailure {
+                    forwarded_bytes,
+                    source: VsockGuestRwForwardError::PendingOffsetOutOfBounds {
+                        offset: self.front_offset,
+                        len: payload.len(),
+                    },
                 });
             };
 
@@ -2225,19 +2736,66 @@ impl VsockGuestRwPendingWrites {
                 continue;
             }
 
-            match write_guest_rw_payload_to_stream(stream, remaining)? {
-                VsockGuestRwWriteOutcome::Complete => {
-                    self.payloads.pop_front();
-                    self.front_offset = 0;
+            match write_guest_rw_payload_to_stream(stream, remaining) {
+                Ok(VsockGuestRwWriteOutcome::Complete { written }) => {
+                    self.advance_front(written)
+                        .map_err(|source| VsockGuestRwForwardFailure {
+                            forwarded_bytes,
+                            source,
+                        })?;
+                    forwarded_bytes = forwarded_bytes.saturating_add(written);
                 }
-                VsockGuestRwWriteOutcome::Blocked { written } => {
-                    self.front_offset += written;
-                    return Ok(());
+                Ok(VsockGuestRwWriteOutcome::Blocked { written }) => {
+                    self.advance_front(written)
+                        .map_err(|source| VsockGuestRwForwardFailure {
+                            forwarded_bytes,
+                            source,
+                        })?;
+                    forwarded_bytes = forwarded_bytes.saturating_add(written);
+                    return Ok(forwarded_bytes);
+                }
+                Err(mut failure) => {
+                    self.advance_front(failure.forwarded_bytes)
+                        .map_err(|source| VsockGuestRwForwardFailure {
+                            forwarded_bytes,
+                            source,
+                        })?;
+                    failure.forwarded_bytes =
+                        failure.forwarded_bytes.saturating_add(forwarded_bytes);
+                    return Err(failure);
                 }
             }
         }
 
         self.front_offset = 0;
+        Ok(forwarded_bytes)
+    }
+
+    fn advance_front(&mut self, written: usize) -> Result<(), VsockGuestRwForwardError> {
+        let Some(payload) = self.payloads.front() else {
+            return if written == 0 {
+                Ok(())
+            } else {
+                Err(VsockGuestRwForwardError::InvalidWriteCount {
+                    attempted: 0,
+                    actual: written,
+                })
+            };
+        };
+        let remaining = payload.len().saturating_sub(self.front_offset);
+        if written > remaining {
+            return Err(VsockGuestRwForwardError::InvalidWriteCount {
+                attempted: remaining,
+                actual: written,
+            });
+        }
+
+        self.front_offset = self.front_offset.saturating_add(written);
+        self.pending_bytes = self.pending_bytes.saturating_sub(written);
+        if self.front_offset == payload.len() {
+            self.payloads.pop_front();
+            self.front_offset = 0;
+        }
         Ok(())
     }
 
@@ -2251,6 +2809,13 @@ impl VsockGuestRwPendingWrites {
                 limit: VSOCK_GUEST_RW_PENDING_PACKET_LIMIT,
             });
         }
+        let attempted = self.pending_bytes.saturating_add(payload.len());
+        if attempted > VSOCK_CONNECTION_BUFFER_SIZE_USIZE {
+            return Err(VsockGuestRwForwardError::PendingBufferByteLimit {
+                limit: VSOCK_CONNECTION_BUFFER_SIZE_USIZE,
+                attempted,
+            });
+        }
 
         let mut pending_payload = Vec::new();
         pending_payload
@@ -2261,6 +2826,7 @@ impl VsockGuestRwPendingWrites {
             })?;
         pending_payload.extend_from_slice(payload);
         self.payloads.push_back(pending_payload);
+        self.pending_bytes = attempted;
         Ok(())
     }
 
@@ -2284,18 +2850,18 @@ impl VsockGuestRwPendingWrites {
 pub struct VsockGuestConnection {
     stream: UnixStream,
     response_packet_pending: bool,
-    pending_credit_update_packet: bool,
+    credit: VsockConnectionCredit,
     pending_guest_rw_writes: VsockGuestRwPendingWrites,
     pending_host_rw_payloads: VecDeque<Vec<u8>>,
     shutdown: VsockConnectionShutdownState,
 }
 
 impl VsockGuestConnection {
-    fn from_stream(stream: UnixStream) -> Self {
+    fn from_stream(stream: UnixStream, request_header: VirtioVsockPacketHeader) -> Self {
         Self {
             stream,
             response_packet_pending: true,
-            pending_credit_update_packet: false,
+            credit: VsockConnectionCredit::from_peer_header(request_header),
             pending_guest_rw_writes: VsockGuestRwPendingWrites::new(),
             pending_host_rw_payloads: VecDeque::new(),
             shutdown: VsockConnectionShutdownState::default(),
@@ -2310,12 +2876,27 @@ impl VsockGuestConnection {
         self.response_packet_pending
     }
 
+    fn pending_response_packet_header(
+        &self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.response_packet_pending.then(|| {
+            self.credit
+                .apply_to_header(guest_connection_response_packet_header(key, guest_cid))
+        })
+    }
+
     fn has_pending_host_rw_packet(&self) -> bool {
         !self.shutdown.receive_closed() && !self.pending_host_rw_payloads.is_empty()
     }
 
+    const fn has_pending_credit_request_packet(&self) -> bool {
+        self.credit.has_pending_credit_request_packet()
+    }
+
     const fn has_pending_credit_update_packet(&self) -> bool {
-        self.pending_credit_update_packet
+        self.credit.has_pending_credit_update_packet()
     }
 
     const fn is_established(&self) -> bool {
@@ -2326,6 +2907,7 @@ impl VsockGuestConnection {
         !self.response_packet_pending
             && !self.shutdown.receive_closed()
             && self.pending_host_rw_payloads.len() < VSOCK_HOST_RW_PENDING_PACKET_LIMIT
+            && self.credit.peer_available_credit() != 0
     }
 
     fn guest_send_shutdown(&self) -> bool {
@@ -2335,18 +2917,102 @@ impl VsockGuestConnection {
     fn apply_guest_shutdown_flags(&mut self, flags: u32) -> VsockConnectionShutdownTransition {
         let transition = self.shutdown.apply_guest_shutdown_flags(flags);
         if self.shutdown.receive_closed() {
+            let released = self
+                .pending_host_rw_payloads
+                .iter()
+                .map(Vec::len)
+                .fold(0u32, |total, len| {
+                    total.saturating_add(payload_len_u32(len))
+                });
             self.pending_host_rw_payloads.clear();
+            let released = self.credit.release_reserved_peer_bytes(released);
+            debug_assert!(released);
         }
         transition
     }
 
+    fn refresh_peer_credit(&mut self, header: VirtioVsockPacketHeader) {
+        self.credit.refresh_peer(header);
+    }
+
+    fn check_guest_rw_credit(&self, len: u32) -> Result<(), VsockGuestRwForwardError> {
+        self.credit.check_guest_bytes(len)
+    }
+
+    fn reset_packet_header(
+        &self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> VirtioVsockPacketHeader {
+        self.credit
+            .apply_to_header(guest_connection_reset_packet_header(key, guest_cid))
+    }
+
+    fn pending_credit_update_packet_header(
+        &self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.credit.has_pending_credit_update_packet().then(|| {
+            self.credit
+                .apply_to_header(guest_connection_credit_update_packet_header(key, guest_cid))
+        })
+    }
+
+    fn pending_credit_request_packet_header(
+        &self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.credit.has_pending_credit_request_packet().then(|| {
+            self.credit
+                .apply_to_header(guest_connection_credit_request_packet_header(
+                    key, guest_cid,
+                ))
+        })
+    }
+
     fn write_guest_rw_payload(&mut self, payload: Vec<u8>) -> Result<(), VsockGuestRwForwardError> {
-        self.pending_guest_rw_writes
+        self.credit
+            .accept_guest_bytes(payload_len_u32(payload.len()))?;
+        match self
+            .pending_guest_rw_writes
             .write_or_queue(&mut self.stream, payload)
+        {
+            Ok(forwarded_bytes) => {
+                self.credit
+                    .record_forwarded_bytes(forwarded_byte_count_u32(forwarded_bytes));
+                debug_assert_eq!(
+                    self.credit.local_outstanding_bytes() as usize,
+                    self.pending_guest_rw_writes.pending_bytes()
+                );
+                Ok(())
+            }
+            Err(failure) => {
+                self.credit
+                    .record_forwarded_bytes(forwarded_byte_count_u32(failure.forwarded_bytes));
+                Err(failure.source)
+            }
+        }
     }
 
     fn flush_pending_guest_rw_writes(&mut self) -> Result<(), VsockGuestRwForwardError> {
-        self.pending_guest_rw_writes.flush(&mut self.stream)
+        match self.pending_guest_rw_writes.flush(&mut self.stream) {
+            Ok(forwarded_bytes) => {
+                self.credit
+                    .record_forwarded_bytes(forwarded_byte_count_u32(forwarded_bytes));
+                debug_assert_eq!(
+                    self.credit.local_outstanding_bytes() as usize,
+                    self.pending_guest_rw_writes.pending_bytes()
+                );
+                Ok(())
+            }
+            Err(failure) => {
+                self.credit
+                    .record_forwarded_bytes(forwarded_byte_count_u32(failure.forwarded_bytes));
+                Err(failure.source)
+            }
+        }
     }
 
     fn has_pending_guest_rw_writes(&self) -> bool {
@@ -2358,6 +3024,8 @@ impl VsockGuestConnection {
         &mut self,
         payload: &[u8],
     ) -> Result<(), VsockGuestRwForwardError> {
+        self.credit
+            .accept_guest_bytes(payload_len_u32(payload.len()))?;
         self.pending_guest_rw_writes.push_payload(payload)
     }
 
@@ -2374,13 +3042,16 @@ impl VsockGuestConnection {
         if !self.response_packet_pending {
             return None;
         }
+        let header = self.pending_response_packet_header(key, guest_cid)?;
         self.response_packet_pending = false;
+        self.credit.mark_packet_delivered(VIRTIO_VSOCK_OP_RESPONSE);
+        self.credit.ensure_credit_request_if_exhausted();
 
-        Some(guest_connection_response_packet_header(key, guest_cid))
+        Some(header)
     }
 
     fn queue_pending_credit_update_packet(&mut self) {
-        self.pending_credit_update_packet = true;
+        self.credit.queue_credit_update_packet();
     }
 
     fn take_pending_credit_update_packet_header(
@@ -2388,12 +3059,28 @@ impl VsockGuestConnection {
         key: VsockGuestConnectionKey,
         guest_cid: u32,
     ) -> Option<VirtioVsockPacketHeader> {
-        if !self.pending_credit_update_packet {
+        if !self.credit.has_pending_credit_update_packet() {
             return None;
         }
-        self.pending_credit_update_packet = false;
+        let header = self.pending_credit_update_packet_header(key, guest_cid)?;
+        self.credit
+            .mark_packet_delivered(VIRTIO_VSOCK_OP_CREDIT_UPDATE);
 
-        Some(guest_connection_credit_update_packet_header(key, guest_cid))
+        Some(header)
+    }
+
+    fn take_pending_credit_request_packet_header(
+        &mut self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        if !self.credit.has_pending_credit_request_packet() {
+            return None;
+        }
+        let header = self.pending_credit_request_packet_header(key, guest_cid)?;
+        self.credit
+            .mark_packet_delivered(VIRTIO_VSOCK_OP_CREDIT_REQUEST);
+        Some(header)
     }
 
     fn pending_host_rw_packet(
@@ -2404,13 +3091,24 @@ impl VsockGuestConnection {
         let payload = self.pending_host_rw_payloads.front()?.clone();
         Some(VirtioVsockRxPacket::new(
             VirtioVsockRxPacketKind::HostRw,
-            guest_connection_rw_packet_header(key, guest_cid, payload_len_u32(payload.len())),
+            self.credit
+                .apply_to_header(guest_connection_rw_packet_header(
+                    key,
+                    guest_cid,
+                    payload_len_u32(payload.len()),
+                )),
             payload,
         ))
     }
 
     fn take_pending_host_rw_payload(&mut self) -> Option<Vec<u8>> {
-        self.pending_host_rw_payloads.pop_front()
+        let payload = self.pending_host_rw_payloads.pop_front()?;
+        let committed = self
+            .credit
+            .commit_reserved_peer_bytes(payload_len_u32(payload.len()));
+        debug_assert!(committed);
+        self.credit.mark_packet_delivered(VIRTIO_VSOCK_OP_RW);
+        Some(payload)
     }
 
     fn poll_host_rw_payloads(&mut self, scratch: &mut [u8]) -> VsockHostRwPollOutcome {
@@ -2421,6 +3119,7 @@ impl VsockGuestConnection {
         poll_host_rw_payloads_from_stream(
             &mut self.stream,
             &mut self.pending_host_rw_payloads,
+            &mut self.credit,
             scratch,
         )
     }
@@ -2463,12 +3162,14 @@ impl VsockGuestConnectionTable {
         &mut self,
         key: VsockGuestConnectionKey,
         stream: UnixStream,
+        request_header: VirtioVsockPacketHeader,
     ) -> Result<(), VsockGuestConnectionTableError> {
         self.check_insert(key)?;
 
-        let replaced = self
-            .connections
-            .insert(key, VsockGuestConnection::from_stream(stream));
+        let replaced = self.connections.insert(
+            key,
+            VsockGuestConnection::from_stream(stream, request_header),
+        );
         debug_assert!(replaced.is_none());
         Ok(())
     }
@@ -2517,6 +3218,16 @@ impl VsockGuestConnectionTable {
             .take_pending_response_packet_header(key, guest_cid)
     }
 
+    fn pending_response_packet_header(
+        &self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get(&key)?
+            .pending_response_packet_header(key, guest_cid)
+    }
+
     #[cfg(test)]
     fn has_pending_credit_update_packet(&self, key: VsockGuestConnectionKey) -> bool {
         self.connections
@@ -2527,6 +3238,7 @@ impl VsockGuestConnectionTable {
     fn queue_pending_credit_update_packet(
         &mut self,
         key: VsockGuestConnectionKey,
+        header: VirtioVsockPacketHeader,
     ) -> Result<(), VsockGuestCreditError> {
         let Some(connection) = self.connections.get_mut(&key) else {
             return Err(VsockGuestCreditError::MissingConnection);
@@ -2535,21 +3247,24 @@ impl VsockGuestConnectionTable {
             return Err(VsockGuestCreditError::ConnectionNotEstablished);
         }
 
+        connection.refresh_peer_credit(header);
         connection.queue_pending_credit_update_packet();
         Ok(())
     }
 
     fn consume_credit_update_packet(
-        &self,
+        &mut self,
         key: VsockGuestConnectionKey,
+        header: VirtioVsockPacketHeader,
     ) -> Result<(), VsockGuestCreditError> {
-        let Some(connection) = self.connections.get(&key) else {
+        let Some(connection) = self.connections.get_mut(&key) else {
             return Err(VsockGuestCreditError::MissingConnection);
         };
         if !connection.is_established() {
             return Err(VsockGuestCreditError::ConnectionNotEstablished);
         }
 
+        connection.refresh_peer_credit(header);
         Ok(())
     }
 
@@ -2572,6 +3287,47 @@ impl VsockGuestConnectionTable {
                     .then_some(*key)
             })
             .min()
+    }
+
+    fn pending_credit_update_packet_header(
+        &self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get(&key)?
+            .pending_credit_update_packet_header(key, guest_cid)
+    }
+
+    fn take_pending_credit_request_packet_header(
+        &mut self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get_mut(&key)?
+            .take_pending_credit_request_packet_header(key, guest_cid)
+    }
+
+    fn first_pending_credit_request_packet_key(&self) -> Option<VsockGuestConnectionKey> {
+        self.connections
+            .iter()
+            .filter_map(|(key, connection)| {
+                connection
+                    .has_pending_credit_request_packet()
+                    .then_some(*key)
+            })
+            .min()
+    }
+
+    fn pending_credit_request_packet_header(
+        &self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get(&key)?
+            .pending_credit_request_packet_header(key, guest_cid)
     }
 
     fn first_pending_host_rw_packet_key(&self) -> Option<VsockGuestConnectionKey> {
@@ -2635,9 +3391,10 @@ impl VsockGuestConnectionTable {
             match connection.poll_host_rw_payloads(scratch) {
                 VsockHostRwPollOutcome::NoData | VsockHostRwPollOutcome::Queued => {}
                 VsockHostRwPollOutcome::Closed | VsockHostRwPollOutcome::ReadError => {
+                    let header = connection.reset_packet_header(key, guest_cid);
                     let removed = self.remove(key);
                     debug_assert!(removed);
-                    reset_headers.push(guest_connection_reset_packet_header(key, guest_cid));
+                    reset_headers.push(header);
                 }
             }
         }
@@ -2658,9 +3415,10 @@ impl VsockGuestConnectionTable {
             }
 
             if connection.flush_pending_guest_rw_writes().is_err() {
+                let header = connection.reset_packet_header(key, guest_cid);
                 let removed = self.remove(key);
                 debug_assert!(removed);
-                reset_headers.push(guest_connection_reset_packet_header(key, guest_cid));
+                reset_headers.push(header);
             }
         }
 
@@ -2695,18 +3453,21 @@ impl VsockGuestConnectionTable {
         }
 
         let key = VsockGuestConnectionKey::new(header.dst_port(), header.src_port());
-        let Some(connection) = self.connections.get(&key) else {
+        let Some(connection) = self.connections.get_mut(&key) else {
             return Some(VsockGuestRwOutcome::Dropped {
                 key: VsockGuestRwConnectionKey::Guest(key),
                 source: VsockGuestRwForwardError::MissingConnection,
+                reset_header: None,
             });
         };
         if connection.has_pending_response_packet() {
+            let reset_header = connection.reset_packet_header(key, guest_cid);
             let removed = self.remove(key);
             debug_assert!(removed);
             return Some(VsockGuestRwOutcome::Dropped {
                 key: VsockGuestRwConnectionKey::Guest(key),
                 source: VsockGuestRwForwardError::ResponseStillPending,
+                reset_header: Some(reset_header),
             });
         }
         if connection.guest_send_shutdown() {
@@ -2715,15 +3476,31 @@ impl VsockGuestConnectionTable {
                 reason: VsockGuestRwSuppressReason::GuestSendShutdown,
             });
         }
+        connection.refresh_peer_credit(header);
+        if let Err(source) = connection.check_guest_rw_credit(header.payload_len()) {
+            let reset_header = connection.reset_packet_header(key, guest_cid);
+            let removed = self.remove(key);
+            debug_assert!(removed);
+            return Some(VsockGuestRwOutcome::Dropped {
+                key: VsockGuestRwConnectionKey::Guest(key),
+                source,
+                reset_header: Some(reset_header),
+            });
+        }
 
         let payload = match read_vsock_tx_payload_bytes(memory, packet) {
             Ok(payload) => payload,
             Err(source) => {
+                let reset_header = self
+                    .connections
+                    .get(&key)
+                    .map(|connection| connection.reset_packet_header(key, guest_cid));
                 let removed = self.remove(key);
                 debug_assert!(removed);
                 return Some(VsockGuestRwOutcome::Dropped {
                     key: VsockGuestRwConnectionKey::Guest(key),
                     source,
+                    reset_header,
                 });
             }
         };
@@ -2732,6 +3509,7 @@ impl VsockGuestConnectionTable {
             return Some(VsockGuestRwOutcome::Dropped {
                 key: VsockGuestRwConnectionKey::Guest(key),
                 source: VsockGuestRwForwardError::MissingConnection,
+                reset_header: None,
             });
         };
         let payload_len = payload.len();
@@ -2742,11 +3520,13 @@ impl VsockGuestConnectionTable {
                 bytes: payload_len,
             }),
             Err(source) => {
+                let reset_header = connection.reset_packet_header(key, guest_cid);
                 let removed = self.remove(key);
                 debug_assert!(removed);
                 Some(VsockGuestRwOutcome::Dropped {
                     key: VsockGuestRwConnectionKey::Guest(key),
                     source,
+                    reset_header: Some(reset_header),
                 })
             }
         }
@@ -3659,6 +4439,11 @@ fn payload_len_u32(payload_len: usize) -> u32 {
     payload_len as u32
 }
 
+fn forwarded_byte_count_u32(byte_count: usize) -> u32 {
+    debug_assert!(byte_count <= VSOCK_CONNECTION_BUFFER_SIZE_USIZE.saturating_mul(2));
+    byte_count as u32
+}
+
 fn validate_vsock_tx_payload_len(
     descriptor_head: u16,
     total_readable_len: u64,
@@ -4014,6 +4799,7 @@ pub enum VirtioVsockRxPacketKind {
     HostRequest,
     GuestResponse,
     GuestReset,
+    CreditRequest,
     CreditUpdate,
     HostRw,
 }
@@ -4024,6 +4810,7 @@ pub struct VirtioVsockRxQueueDispatch {
     delivered_requests: usize,
     delivered_responses: usize,
     delivered_reset_packets: usize,
+    delivered_credit_requests: usize,
     delivered_credit_updates: usize,
     delivered_host_rw_packets: usize,
     delivered_host_rw_bytes: usize,
@@ -4042,6 +4829,7 @@ impl VirtioVsockRxQueueDispatch {
             delivered_requests: 0,
             delivered_responses: 0,
             delivered_reset_packets: 0,
+            delivered_credit_requests: 0,
             delivered_credit_updates: 0,
             delivered_host_rw_packets: 0,
             delivered_host_rw_bytes: 0,
@@ -4069,6 +4857,7 @@ impl VirtioVsockRxQueueDispatch {
             delivered_requests: 0,
             delivered_responses: 0,
             delivered_reset_packets: 0,
+            delivered_credit_requests: 0,
             delivered_credit_updates: 0,
             delivered_host_rw_packets: 0,
             delivered_host_rw_bytes: 0,
@@ -4101,6 +4890,10 @@ impl VirtioVsockRxQueueDispatch {
         self.delivered_credit_updates
     }
 
+    pub const fn delivered_credit_requests(&self) -> usize {
+        self.delivered_credit_requests
+    }
+
     pub const fn delivered_host_rw_packets(&self) -> usize {
         self.delivered_host_rw_packets
     }
@@ -4114,6 +4907,7 @@ impl VirtioVsockRxQueueDispatch {
             VirtioVsockRxPacketKind::HostRequest => self.delivered_requests,
             VirtioVsockRxPacketKind::GuestResponse => self.delivered_responses,
             VirtioVsockRxPacketKind::GuestReset => self.delivered_reset_packets,
+            VirtioVsockRxPacketKind::CreditRequest => self.delivered_credit_requests,
             VirtioVsockRxPacketKind::CreditUpdate => self.delivered_credit_updates,
             VirtioVsockRxPacketKind::HostRw => self.delivered_host_rw_packets,
         }
@@ -4161,6 +4955,9 @@ impl VirtioVsockRxQueueDispatch {
                     }
                     VirtioVsockRxPacketKind::GuestReset => {
                         self.delivered_reset_packets += 1;
+                    }
+                    VirtioVsockRxPacketKind::CreditRequest => {
+                        self.delivered_credit_requests += 1;
                     }
                     VirtioVsockRxPacketKind::CreditUpdate => {
                         self.delivered_credit_updates += 1;
@@ -5223,6 +6020,14 @@ enum VirtioVsockPendingRxPacket {
         key: VsockHostConnectionKey,
         header: VirtioVsockPacketHeader,
     },
+    GuestConnectionCreditRequest {
+        key: VsockGuestConnectionKey,
+        header: VirtioVsockPacketHeader,
+    },
+    HostConnectionCreditRequest {
+        key: VsockHostConnectionKey,
+        header: VirtioVsockPacketHeader,
+    },
     GuestConnectionRw {
         key: VsockGuestConnectionKey,
     },
@@ -5258,6 +6063,10 @@ impl VirtioVsockPendingRxPacket {
                 VirtioVsockRxPacketKind::CreditUpdate,
                 header,
             )),
+            Self::GuestConnectionCreditRequest { header, .. }
+            | Self::HostConnectionCreditRequest { header, .. } => Some(
+                Self::header_only_rx_packet(VirtioVsockRxPacketKind::CreditRequest, header),
+            ),
             Self::GuestConnectionRw { key } => device
                 .guest_connections
                 .pending_host_rw_packet(key, device.guest_cid),
@@ -5275,6 +6084,8 @@ impl VirtioVsockPendingRxPacket {
             Self::GuestConnectionCreditUpdate { .. } | Self::HostConnectionCreditUpdate { .. } => {
                 VirtioVsockRxPacketKind::CreditUpdate
             }
+            Self::GuestConnectionCreditRequest { .. }
+            | Self::HostConnectionCreditRequest { .. } => VirtioVsockRxPacketKind::CreditRequest,
             Self::GuestConnectionRw { .. } | Self::HostConnectionRw { .. } => {
                 VirtioVsockRxPacketKind::HostRw
             }
@@ -5579,18 +6390,24 @@ impl VirtioVsockDevice {
             return Some(VirtioVsockPendingRxPacket::GuestReset { header });
         }
 
-        if let Some(key) = self.guest_connections.first_pending_response_packet_key() {
-            return Some(VirtioVsockPendingRxPacket::GuestResponse {
-                key,
-                header: guest_connection_response_packet_header(key, self.guest_cid),
-            });
+        if let Some((key, header)) = self
+            .guest_connections
+            .first_pending_response_packet_key()
+            .and_then(|key| {
+                self.guest_connections
+                    .pending_response_packet_header(key, self.guest_cid)
+                    .map(|header| (key, header))
+            })
+        {
+            return Some(VirtioVsockPendingRxPacket::GuestResponse { key, header });
         }
 
         self.host_connections
             .first_pending_request_packet_key()
-            .map(|key| VirtioVsockPendingRxPacket::HostRequest {
-                key,
-                header: host_connection_request_packet_header(key, self.guest_cid),
+            .and_then(|key| {
+                self.host_connections
+                    .pending_request_packet_header(key, self.guest_cid)
+                    .map(|header| VirtioVsockPendingRxPacket::HostRequest { key, header })
             })
             .or_else(|| {
                 self.guest_connections
@@ -5604,29 +6421,59 @@ impl VirtioVsockDevice {
             })
             .or_else(|| {
                 self.guest_connections
+                    .first_pending_credit_request_packet_key()
+                    .and_then(|key| {
+                        self.guest_connections
+                            .pending_credit_request_packet_header(key, self.guest_cid)
+                            .map(|header| {
+                                VirtioVsockPendingRxPacket::GuestConnectionCreditRequest {
+                                    key,
+                                    header,
+                                }
+                            })
+                    })
+            })
+            .or_else(|| {
+                self.host_connections
+                    .first_pending_credit_request_packet_key()
+                    .and_then(|key| {
+                        self.host_connections
+                            .pending_credit_request_packet_header(key, self.guest_cid)
+                            .map(
+                                |header| VirtioVsockPendingRxPacket::HostConnectionCreditRequest {
+                                    key,
+                                    header,
+                                },
+                            )
+                    })
+            })
+            .or_else(|| {
+                self.guest_connections
                     .first_pending_credit_update_packet_key()
-                    .map(
-                        |key| VirtioVsockPendingRxPacket::GuestConnectionCreditUpdate {
-                            key,
-                            header: guest_connection_credit_update_packet_header(
-                                key,
-                                self.guest_cid,
-                            ),
-                        },
-                    )
+                    .and_then(|key| {
+                        self.guest_connections
+                            .pending_credit_update_packet_header(key, self.guest_cid)
+                            .map(
+                                |header| VirtioVsockPendingRxPacket::GuestConnectionCreditUpdate {
+                                    key,
+                                    header,
+                                },
+                            )
+                    })
             })
             .or_else(|| {
                 self.host_connections
                     .first_pending_credit_update_packet_key()
-                    .map(
-                        |key| VirtioVsockPendingRxPacket::HostConnectionCreditUpdate {
-                            key,
-                            header: host_connection_credit_update_packet_header(
-                                key,
-                                self.guest_cid,
-                            ),
-                        },
-                    )
+                    .and_then(|key| {
+                        self.host_connections
+                            .pending_credit_update_packet_header(key, self.guest_cid)
+                            .map(
+                                |header| VirtioVsockPendingRxPacket::HostConnectionCreditUpdate {
+                                    key,
+                                    header,
+                                },
+                            )
+                    })
             })
     }
 
@@ -5658,6 +6505,18 @@ impl VirtioVsockDevice {
                 let consumed = self
                     .host_connections
                     .take_pending_credit_update_packet_header(key, self.guest_cid);
+                debug_assert_eq!(consumed, Some(header));
+            }
+            VirtioVsockPendingRxPacket::GuestConnectionCreditRequest { key, header } => {
+                let consumed = self
+                    .guest_connections
+                    .take_pending_credit_request_packet_header(key, self.guest_cid);
+                debug_assert_eq!(consumed, Some(header));
+            }
+            VirtioVsockPendingRxPacket::HostConnectionCreditRequest { key, header } => {
+                let consumed = self
+                    .host_connections
+                    .take_pending_credit_request_packet_header(key, self.guest_cid);
                 debug_assert_eq!(consumed, Some(header));
             }
             VirtioVsockPendingRxPacket::GuestConnectionRw { key } => {
@@ -5858,7 +6717,7 @@ impl VirtioVsockDevice {
 
         match self
             .guest_connections
-            .insert_connected_guest_connection(key, stream)
+            .insert_connected_guest_connection(key, stream, header)
         {
             Ok(()) => Some(VsockGuestConnectionRequestOutcome::Retained { key }),
             Err(source) => Some(VsockGuestConnectionRequestOutcome::Dropped {
@@ -5871,13 +6730,17 @@ impl VirtioVsockDevice {
     fn remove_guest_stream_connections(&mut self, header: VirtioVsockPacketHeader) -> (bool, bool) {
         let host_connection_closed =
             VsockHostLocalPort::try_from_raw(header.dst_port()).is_ok_and(|local_port| {
-                self.host_connections
-                    .remove(VsockHostConnectionKey::new(local_port, header.src_port()))
+                let key = VsockHostConnectionKey::new(local_port, header.src_port());
+                if let Some(connection) = self.host_connections.connections.get_mut(&key) {
+                    connection.refresh_peer_credit(header);
+                }
+                self.host_connections.remove(key)
             });
-        let guest_connection_closed = self.guest_connections.remove(VsockGuestConnectionKey::new(
-            header.dst_port(),
-            header.src_port(),
-        ));
+        let guest_key = VsockGuestConnectionKey::new(header.dst_port(), header.src_port());
+        if let Some(connection) = self.guest_connections.connections.get_mut(&guest_key) {
+            connection.refresh_peer_credit(header);
+        }
+        let guest_connection_closed = self.guest_connections.remove(guest_key);
 
         (host_connection_closed, guest_connection_closed)
     }
@@ -5919,9 +6782,10 @@ impl VirtioVsockDevice {
             self.host_connections.contains(key).then(|| {
                 if operation == VIRTIO_VSOCK_OP_CREDIT_REQUEST {
                     self.host_connections
-                        .queue_pending_credit_update_packet(key)
+                        .queue_pending_credit_update_packet(key, header)
                 } else {
-                    self.host_connections.consume_credit_update_packet(key)
+                    self.host_connections
+                        .consume_credit_update_packet(key, header)
                 }
             })
         });
@@ -5932,10 +6796,10 @@ impl VirtioVsockDevice {
         let guest_key = VsockGuestConnectionKey::new(header.dst_port(), header.src_port());
         let guest_result = if operation == VIRTIO_VSOCK_OP_CREDIT_REQUEST {
             self.guest_connections
-                .queue_pending_credit_update_packet(guest_key)
+                .queue_pending_credit_update_packet(guest_key, header)
         } else {
             self.guest_connections
-                .consume_credit_update_packet(guest_key)
+                .consume_credit_update_packet(guest_key, header)
         };
         if guest_result != Err(VsockGuestCreditError::MissingConnection) {
             return Some(Self::guest_credit_outcome(operation, guest_result));
@@ -6049,13 +6913,19 @@ impl VirtioVsockDevice {
 
         let mut host_connection_updated = false;
         let mut host_connection_closed = false;
+        let mut connection_reset_header = None;
         if let Ok(local_port) = VsockHostLocalPort::try_from_raw(header.dst_port()) {
             let key = VsockHostConnectionKey::new(local_port, header.src_port());
             let transition = self
                 .host_connections
                 .connections
                 .get_mut(&key)
-                .map(|connection| connection.apply_guest_shutdown_flags(shutdown_flags));
+                .map(|connection| {
+                    connection.refresh_peer_credit(header);
+                    connection_reset_header =
+                        Some(connection.reset_packet_header(key, self.guest_cid));
+                    connection.apply_guest_shutdown_flags(shutdown_flags)
+                });
             match transition {
                 Some(VsockConnectionShutdownTransition::PartiallyClosed) => {
                     host_connection_updated = true;
@@ -6074,7 +6944,14 @@ impl VirtioVsockDevice {
             .guest_connections
             .connections
             .get_mut(&guest_key)
-            .map(|connection| connection.apply_guest_shutdown_flags(shutdown_flags));
+            .map(|connection| {
+                connection.refresh_peer_credit(header);
+                if connection_reset_header.is_none() {
+                    connection_reset_header =
+                        Some(connection.reset_packet_header(guest_key, self.guest_cid));
+                }
+                connection.apply_guest_shutdown_flags(shutdown_flags)
+            });
         match transition {
             Some(VsockConnectionShutdownTransition::PartiallyClosed) => {
                 guest_connection_updated = true;
@@ -6086,9 +6963,9 @@ impl VirtioVsockDevice {
         }
 
         if host_connection_closed || guest_connection_closed {
-            let reset_queued = self.queue_guest_reset_packet(
-                guest_reset_packet_header_for_tx_header(header, self.guest_cid),
-            );
+            let reset_header = connection_reset_header
+                .unwrap_or_else(|| guest_reset_packet_header_for_tx_header(header, self.guest_cid));
+            let reset_queued = self.queue_guest_reset_packet(reset_header);
             Some(VsockGuestShutdownOutcome::Closed {
                 host_connection_closed,
                 guest_connection_closed,
@@ -6127,6 +7004,14 @@ impl VirtioVsockDevice {
                 response_dispatch.record(outcome);
             }
 
+            if let Some(header) =
+                response_outcome.and_then(VsockHostGuestResponseOutcome::reset_header)
+            {
+                let queued = self.queue_guest_reset_packet(header);
+                reset_dispatch.record(queued);
+                continue;
+            }
+
             if response_outcome.is_some_and(VsockHostGuestResponseOutcome::suppresses_guest_reset) {
                 continue;
             }
@@ -6151,6 +7036,15 @@ impl VirtioVsockDevice {
                 });
             if let Some(outcome) = rw_outcome.as_ref() {
                 rw_dispatch.record(outcome);
+            }
+
+            if let Some(header) = rw_outcome
+                .as_ref()
+                .and_then(VsockGuestRwOutcome::reset_header)
+            {
+                let queued = self.queue_guest_reset_packet(header);
+                reset_dispatch.record(queued);
+                continue;
             }
 
             if rw_outcome
@@ -6726,8 +7620,12 @@ impl VirtioVsockGuestRwDispatch {
                 let _ = reason;
                 self.ignored_packets += 1;
             }
-            VsockGuestRwOutcome::Dropped { key, source } => {
-                let _ = (key, source);
+            VsockGuestRwOutcome::Dropped {
+                key,
+                source,
+                reset_header,
+            } => {
+                let _ = (key, source, reset_header);
                 self.dropped_connections += 1;
             }
         }
@@ -8064,7 +8962,8 @@ mod tests {
                 .with_src_port(guest_port)
                 .with_dst_port(host_port)
                 .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
-                .with_operation(VIRTIO_VSOCK_OP_REQUEST),
+                .with_operation(VIRTIO_VSOCK_OP_REQUEST)
+                .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE),
         )
     }
 
@@ -8076,7 +8975,8 @@ mod tests {
                 .with_src_port(guest_port)
                 .with_dst_port(host_port)
                 .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
-                .with_operation(VIRTIO_VSOCK_OP_RW),
+                .with_operation(VIRTIO_VSOCK_OP_RW)
+                .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE),
         )
     }
 
@@ -8093,7 +8993,8 @@ mod tests {
                 .with_src_port(guest_port)
                 .with_dst_port(host_port)
                 .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
-                .with_operation(operation),
+                .with_operation(operation)
+                .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE),
         )
     }
 
@@ -8109,7 +9010,8 @@ mod tests {
                 .with_src_port(peer_port)
                 .with_dst_port(local_port.raw())
                 .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
-                .with_operation(VIRTIO_VSOCK_OP_RESPONSE),
+                .with_operation(VIRTIO_VSOCK_OP_RESPONSE)
+                .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE),
         )
     }
 
@@ -9848,6 +10750,7 @@ mod tests {
 
         assert_eq!(writer.written, b"");
         assert_eq!(pending.len(), 2);
+        assert_eq!(pending.pending_bytes(), b"firstsecond".len());
 
         pending
             .flush(&mut writer)
@@ -9855,6 +10758,7 @@ mod tests {
 
         assert_eq!(writer.written, b"firstsecond");
         assert_eq!(pending.len(), 0);
+        assert_eq!(pending.pending_bytes(), 0);
     }
 
     #[test]
@@ -9873,7 +10777,7 @@ mod tests {
             .expect_err("blocked full buffer should reject another payload");
 
         assert!(matches!(
-            error,
+            error.source,
             super::VsockGuestRwForwardError::PendingBufferFull {
                 limit: VSOCK_GUEST_RW_PENDING_PACKET_LIMIT
             }
@@ -9895,10 +10799,283 @@ mod tests {
             .expect_err("terminal stream error should fail pending flush");
 
         assert!(matches!(
-            error,
+            error.source,
             super::VsockGuestRwForwardError::StreamWrite(io::ErrorKind::BrokenPipe)
         ));
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn vsock_connection_credit_initializes_peer_and_reports_local_window() {
+        let peer_header = VirtioVsockPacketHeader::new()
+            .with_buffer_allocation(8192)
+            .with_forwarded_count(0);
+        let mut credit = super::VsockConnectionCredit::from_peer_header(peer_header);
+
+        assert_eq!(credit.peer_buffer_allocation, 8192);
+        assert_eq!(credit.peer_forwarded_count.0, 0);
+        assert_eq!(credit.peer_available_credit(), 8192);
+
+        credit
+            .accept_guest_bytes(11)
+            .expect("local credit should accept bytes within the advertised window");
+        credit.record_forwarded_bytes(7);
+        let reported = credit.apply_to_header(VirtioVsockPacketHeader::new());
+
+        assert_eq!(
+            reported.buffer_allocation(),
+            VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
+        );
+        assert_eq!(reported.forwarded_count(), 7);
+        assert_eq!(credit.local_outstanding_bytes(), 4);
+    }
+
+    #[test]
+    fn vsock_connection_owned_headers_peek_current_credit_without_committing() {
+        let (stream, _peer) = UnixStream::pair().expect("test stream pair should open");
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let peer_header = VirtioVsockPacketHeader::new().with_buffer_allocation(32);
+        let mut connection = super::VsockGuestConnection::from_stream(stream, peer_header);
+        connection
+            .credit
+            .accept_guest_bytes(9)
+            .expect("test guest bytes should fit local credit");
+        connection.credit.record_forwarded_bytes(7);
+        connection.queue_pending_credit_update_packet();
+        connection.credit.pending_credit_request_packet = true;
+        connection.credit.credit_request_outstanding = true;
+        assert!(connection.credit.reserve_peer_bytes(3));
+        connection.pending_host_rw_payloads.push_back(vec![1, 2, 3]);
+
+        let response = connection
+            .pending_response_packet_header(key, 42)
+            .expect("response should remain pending");
+        let update = connection
+            .pending_credit_update_packet_header(key, 42)
+            .expect("credit update should remain pending");
+        let request = connection
+            .pending_credit_request_packet_header(key, 42)
+            .expect("credit request should remain pending");
+        let rw = connection
+            .pending_host_rw_packet(key, 42)
+            .expect("host RW should remain pending")
+            .header();
+        let reset = connection.reset_packet_header(key, 42);
+
+        for header in [response, update, request, rw, reset] {
+            assert_eq!(
+                header.buffer_allocation(),
+                VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
+            );
+            assert_eq!(header.forwarded_count(), 7);
+        }
+        assert_eq!(connection.credit.last_reported_forwarded_count.0, 0);
+        assert_eq!(connection.credit.sent_count.0, 0);
+        assert_eq!(connection.credit.reserved_peer_bytes, 3);
+
+        let delivered = connection
+            .take_pending_response_packet_header(key, 42)
+            .expect("response should deliver once");
+        assert_eq!(delivered, response);
+        assert_eq!(connection.credit.last_reported_forwarded_count.0, 7);
+
+        let (accepted, _client) = accepted_host_connection("dynamic-host-request");
+        let host_key = VsockHostConnectionKey::new(
+            VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE)
+                .expect("test local port should be valid"),
+            4000,
+        );
+        let mut host_connection = super::VsockHostConnection::from_accepted(accepted);
+        host_connection
+            .credit
+            .accept_guest_bytes(5)
+            .expect("test host connection bytes should fit");
+        host_connection.credit.record_forwarded_bytes(5);
+        let host_request = host_connection
+            .pending_request_packet_header(host_key, 42)
+            .expect("host request should remain pending");
+        assert_eq!(host_request.forwarded_count(), 5);
+    }
+
+    #[test]
+    fn vsock_connection_credit_wraps_deltas_and_clamps_invalid_peer_state() {
+        let mut credit = super::VsockConnectionCredit::new();
+        credit.peer_buffer_allocation = 16;
+        credit.sent_count = std::num::Wrapping(3);
+        credit.peer_forwarded_count = std::num::Wrapping(u32::MAX - 2);
+
+        assert_eq!(credit.peer_outstanding_bytes(), 6);
+        assert_eq!(credit.peer_available_credit(), 10);
+
+        credit.sent_count = std::num::Wrapping(100);
+        credit.peer_forwarded_count = std::num::Wrapping(0);
+        credit.peer_buffer_allocation = 64;
+
+        assert_eq!(credit.peer_outstanding_bytes(), 100);
+        assert_eq!(credit.peer_available_credit(), 0);
+    }
+
+    #[test]
+    fn vsock_connection_credit_coalesces_zero_window_requests_until_positive_update() {
+        let mut credit = super::VsockConnectionCredit::from_peer_header(
+            VirtioVsockPacketHeader::new().with_buffer_allocation(8),
+        );
+
+        assert!(credit.reserve_peer_bytes(8));
+        assert!(credit.commit_reserved_peer_bytes(8));
+        assert!(credit.has_pending_credit_request_packet());
+        credit.mark_packet_delivered(VIRTIO_VSOCK_OP_CREDIT_REQUEST);
+        assert!(!credit.has_pending_credit_request_packet());
+
+        credit.refresh_peer(
+            VirtioVsockPacketHeader::new()
+                .with_buffer_allocation(8)
+                .with_forwarded_count(0),
+        );
+        credit.ensure_credit_request_if_exhausted();
+        assert!(!credit.has_pending_credit_request_packet());
+
+        credit.refresh_peer(
+            VirtioVsockPacketHeader::new()
+                .with_buffer_allocation(8)
+                .with_forwarded_count(8),
+        );
+        assert_eq!(credit.peer_available_credit(), 8);
+        assert!(credit.reserve_peer_bytes(8));
+        assert!(credit.has_pending_credit_request_packet());
+    }
+
+    #[test]
+    fn vsock_connection_credit_queues_update_below_four_kibibytes_free() {
+        let mut credit = super::VsockConnectionCredit::new();
+        let boundary = VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
+            .saturating_sub(super::VSOCK_CREDIT_UPDATE_THRESHOLD);
+
+        credit
+            .accept_guest_bytes(boundary)
+            .expect("threshold bytes should fit local credit");
+        credit.record_forwarded_bytes(boundary);
+        assert!(!credit.has_pending_credit_update_packet());
+
+        credit
+            .accept_guest_bytes(1)
+            .expect("one more byte should fit local credit");
+        credit.record_forwarded_bytes(1);
+        assert!(credit.has_pending_credit_update_packet());
+    }
+
+    #[test]
+    fn vsock_host_reads_stop_at_reserved_peer_credit_and_resume_after_forwarding() {
+        let mut reader = io::Cursor::new(b"abcdefghij".to_vec());
+        let mut pending = VecDeque::new();
+        let mut credit = super::VsockConnectionCredit::from_peer_header(
+            VirtioVsockPacketHeader::new().with_buffer_allocation(5),
+        );
+        let mut scratch = [0; 64];
+
+        assert_eq!(
+            super::poll_host_rw_payloads_from_stream(
+                &mut reader,
+                &mut pending,
+                &mut credit,
+                &mut scratch,
+            ),
+            super::VsockHostRwPollOutcome::Queued
+        );
+        assert_eq!(
+            pending.front().map(Vec::as_slice),
+            Some(b"abcde".as_slice())
+        );
+        assert_eq!(reader.position(), 5);
+        assert_eq!(credit.reserved_peer_bytes, 5);
+        assert_eq!(credit.sent_count.0, 0);
+        assert!(credit.has_pending_credit_request_packet());
+
+        let delivered = pending.pop_front().expect("reserved payload should exist");
+        assert!(credit.commit_reserved_peer_bytes(
+            u32::try_from(delivered.len()).expect("test payload length should fit")
+        ));
+        credit.refresh_peer(
+            VirtioVsockPacketHeader::new()
+                .with_buffer_allocation(5)
+                .with_forwarded_count(5),
+        );
+
+        assert_eq!(
+            super::poll_host_rw_payloads_from_stream(
+                &mut reader,
+                &mut pending,
+                &mut credit,
+                &mut scratch,
+            ),
+            super::VsockHostRwPollOutcome::Queued
+        );
+        assert_eq!(
+            pending.front().map(Vec::as_slice),
+            Some(b"fghij".as_slice())
+        );
+        assert_eq!(reader.position(), 10);
+    }
+
+    #[test]
+    fn guest_rw_pending_writes_enforce_aggregate_byte_limit() {
+        let mut pending = super::VsockGuestRwPendingWrites::new();
+        let full_window = vec![0; VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE as usize];
+        pending
+            .push_payload(&full_window)
+            .expect("one full advertised window should fit");
+
+        let error = pending
+            .push_payload(b"x")
+            .expect_err("bytes beyond one advertised window should fail");
+
+        assert!(matches!(
+            error,
+            super::VsockGuestRwForwardError::PendingBufferByteLimit {
+                limit,
+                attempted
+            } if limit == VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE as usize
+                && attempted == limit + 1
+        ));
+        assert_eq!(
+            pending.pending_bytes(),
+            VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE as usize
+        );
+    }
+
+    #[test]
+    fn guest_rw_terminal_error_reports_partial_forwarding_progress() {
+        let mut pending = super::VsockGuestRwPendingWrites::new();
+        let mut writer = TestGuestRwWriter::with_actions([
+            TestWriteAction::Write(3),
+            TestWriteAction::Error(io::ErrorKind::BrokenPipe),
+        ]);
+
+        let failure = pending
+            .write_or_queue(&mut writer, b"abcdef".to_vec())
+            .expect_err("terminal error after a partial write should fail");
+
+        assert_eq!(failure.forwarded_bytes, 3);
+        assert!(matches!(
+            failure.source,
+            super::VsockGuestRwForwardError::StreamWrite(io::ErrorKind::BrokenPipe)
+        ));
+        assert_eq!(writer.written, b"abc");
+    }
+
+    #[test]
+    fn vsock_connection_credit_state_is_isolated_between_connections() {
+        let peer_header = VirtioVsockPacketHeader::new().with_buffer_allocation(16);
+        let mut first = super::VsockConnectionCredit::from_peer_header(peer_header);
+        let second = super::VsockConnectionCredit::from_peer_header(peer_header);
+
+        assert!(first.reserve_peer_bytes(12));
+        assert!(first.commit_reserved_peer_bytes(12));
+
+        assert_eq!(first.peer_available_credit(), 4);
+        assert_eq!(second.peer_available_credit(), 16);
+        assert_eq!(second.sent_count.0, 0);
+        assert_eq!(second.reserved_peer_bytes, 0);
     }
 
     #[test]
@@ -12807,6 +13984,14 @@ mod tests {
             .connections
             .get_mut(&key)
             .expect("host connection should exist")
+            .refresh_peer_credit(
+                guest_response_tx_packet(MIN_GUEST_CID, key.local_port(), key.peer_port()).header(),
+            );
+        device
+            .host_connections
+            .connections
+            .get_mut(&key)
+            .expect("host connection should exist")
             .acknowledge_guest_response(key)
             .expect("host response should acknowledge");
 
@@ -13995,6 +15180,76 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_notifications_deliver_one_credit_request_for_exhausted_window() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("credit-request-exhausted", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        {
+            let connection = handler
+                .activation_handler_mut()
+                .guest_connections
+                .connections
+                .get_mut(&key)
+                .expect("guest connection should remain retained");
+            connection.credit.sent_count = std::num::Wrapping(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE);
+            connection.credit.ensure_credit_request_if_exhausted();
+        }
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("exhausted connection should deliver one credit request");
+
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("credit request should dispatch through RX");
+        assert_eq!(rx.delivered_credit_requests(), 1);
+        assert_eq!(
+            rx.delivered_packets(VirtioVsockRxPacketKind::CreditRequest),
+            1
+        );
+        assert_eq!(rx.delivered_credit_updates(), 0);
+        let header = read_vsock_packet_header(&memory, TEST_VSOCK_RX_SECOND_BUFFER);
+        assert_eq!(header.operation(), VIRTIO_VSOCK_OP_CREDIT_REQUEST);
+        assert_eq!(
+            header.buffer_allocation(),
+            VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
+        );
+        assert_eq!(header.forwarded_count(), 0);
+        let credit = handler
+            .activation_handler()
+            .guest_connections
+            .connections
+            .get(&key)
+            .expect("guest connection should remain retained")
+            .credit;
+        assert!(!credit.has_pending_credit_request_packet());
+        assert!(credit.credit_request_outstanding);
+        assert_vsock_metrics_for_notification(
+            &notification,
+            VsockDeviceMetrics::default()
+                .with_rx_queue_event_count(1)
+                .with_rx_packets_count(1),
+        );
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close exhausted guest stream",
+        );
+    }
+
+    #[test]
     fn virtio_vsock_notifications_queue_credit_update_for_host_credit_request() {
         let (mut memory, mut handler, mut client, key) =
             established_host_connection_for_test("credit-request-host", 4000);
@@ -14416,7 +15671,9 @@ mod tests {
         let (mut memory, mut handler, mut accepted) =
             established_guest_connection_for_test("guest-rw", 52, 4000);
         let payload = b"payload";
-        let packet = guest_rw_tx_packet(42, 52, 4000).header();
+        let packet = guest_rw_tx_packet(42, 52, 4000)
+            .header()
+            .with_buffer_allocation(123);
 
         write_vsock_tx_packet_with_payload(
             &mut memory,
@@ -14459,11 +15716,70 @@ mod tests {
                 .activation_handler()
                 .has_guest_connection(VsockGuestConnectionKey::new(52, 4000))
         );
+        let credit = handler
+            .activation_handler()
+            .guest_connections
+            .connections
+            .get(&VsockGuestConnectionKey::new(52, 4000))
+            .expect("matching guest connection should remain retained")
+            .credit;
+        assert_eq!(credit.peer_buffer_allocation, 123);
+        assert_eq!(credit.peer_available_credit(), 123);
 
         drop(handler);
         assert_stream_closed(
             &mut accepted,
             "dropping handler should close forwarded guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_reset_over_credit_guest_rw_with_current_credit() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("guest-rw-over-credit", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        {
+            let connection = handler
+                .activation_handler_mut()
+                .guest_connections
+                .connections
+                .get_mut(&key)
+                .expect("guest connection should remain retained");
+            connection.credit.received_count =
+                std::num::Wrapping(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE + 9);
+            connection.credit.forwarded_count = std::num::Wrapping(9);
+        }
+        let packet = guest_rw_tx_packet(42, 52, 4000).header();
+        write_vsock_tx_packet_with_payload(&mut memory, 1, TEST_VSOCK_SECOND_HEADER, packet, b"x");
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("over-credit guest RW should take the bounded reset path");
+
+        assert_eq!(notification.guest_rw_dispatch().rw_packets(), 1);
+        assert_eq!(notification.guest_rw_dispatch().forwarded_packets(), 0);
+        assert_eq!(notification.guest_rw_dispatch().dropped_connections(), 1);
+        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 1);
+        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 1);
+        assert!(!handler.activation_handler().has_guest_connection(key));
+        let reset = handler
+            .activation_handler()
+            .pending_guest_reset_packets
+            .front()
+            .copied()
+            .expect("dynamic reset should remain pending without an RX buffer");
+        assert_eq!(reset.operation(), VIRTIO_VSOCK_OP_RST);
+        assert_eq!(reset.forwarded_count(), 9);
+        assert_eq!(
+            reset.buffer_allocation(),
+            VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
+        );
+
+        assert_stream_closed(
+            &mut accepted,
+            "over-credit reset should close the retained guest stream",
         );
     }
 
@@ -15246,6 +16562,19 @@ mod tests {
         );
         assert_eq!(read_vsock_rx_used_index(&memory), 2);
         assert_eq!(read_vsock_rx_used_element(&memory, 1), (1, 0));
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let credit = handler
+            .activation_handler()
+            .guest_connections
+            .connections
+            .get(&key)
+            .expect("retry connection should remain retained")
+            .credit;
+        assert_eq!(credit.sent_count.0, 0);
+        assert_eq!(
+            credit.reserved_peer_bytes,
+            u32::try_from(payload.len()).expect("test payload length should fit")
+        );
 
         write_vsock_rx_descriptor(
             &mut memory,
@@ -15290,6 +16619,18 @@ mod tests {
             read_vsock_rx_used_element(&memory, 2),
             (2, vsock_packet_len_with_payload(payload))
         );
+        let credit = handler
+            .activation_handler()
+            .guest_connections
+            .connections
+            .get(&key)
+            .expect("retried connection should remain retained")
+            .credit;
+        assert_eq!(
+            credit.sent_count.0,
+            u32::try_from(payload.len()).expect("test payload length should fit")
+        );
+        assert_eq!(credit.reserved_peer_bytes, 0);
 
         drop(handler);
         assert_stream_closed(
