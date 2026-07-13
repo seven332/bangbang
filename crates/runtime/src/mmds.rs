@@ -4068,6 +4068,24 @@ mod tests {
     }
 
     #[test]
+    fn mmds_state_guest_tokens_are_isolated_between_states() {
+        let mut first = MmdsState {
+            token_authority: MmdsTokenAuthority::with_manual_clock(1, 1_000),
+            ..MmdsState::default()
+        };
+        let second = MmdsState {
+            token_authority: MmdsTokenAuthority::with_manual_clock(1, 1_000),
+            ..MmdsState::default()
+        };
+        let token = first
+            .generate_guest_token(60)
+            .expect("first state should generate a guest token");
+
+        assert!(first.is_guest_token_valid(&token));
+        assert!(!second.is_guest_token_valid(&token));
+    }
+
+    #[test]
     fn mmds_state_equality_ignores_token_clock_origin() {
         assert_eq!(MmdsState::default(), MmdsState::default());
     }
