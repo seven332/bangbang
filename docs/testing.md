@@ -963,6 +963,12 @@ interrupts, VMClock restore signaling, VMClock guest e2e observation,
 or broader RTC-adjacent time/identity behavior is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 
+For block specifically, this evidence validates the supported file-backed
+virtio-MMIO subset, including initial attachment, guest I/O, root/data ordering,
+cache/flush behavior, runtime refresh and limiter updates, and stable rejected
+runtime PUT/DELETE and vhost-user paths. It does not execute Firecracker
+v1.16.0's optional PCI hotplug/hot-unplug flow or an external vhost-user backend.
+
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.
 Root drives with `partuuid` append `root=PARTUUID=<partuuid>`; other root

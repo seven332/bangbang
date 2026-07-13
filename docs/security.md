@@ -313,7 +313,16 @@ is resource-specific:
   dispatch opportunity instead of sleeping, busy-waiting, writing request
   status, publishing a used-ring entry, or mutating the backing file. Active
   HVF boot sessions schedule block retry wakeups with per-session state so one
-  VM cannot wake or share limiter state with another VM.
+  VM cannot wake or share limiter state with another VM. Firecracker v1.16.0's
+  optional runtime drive attach/remove instead requires PCI transport, a guest
+  rescan after attach, and guest removal before host DELETE. bangbang's current
+  MMIO path rejects runtime PUT and DELETE without using a proposed backing or
+  mutating device state; a future PCI design must make that guest/operator
+  coordination an explicit lifecycle boundary. Configured vhost-user sockets
+  also remain rejected. A future vhost-user frontend would grant an external
+  backend access to guest-memory mappings and queue notifications, so it needs
+  separate shared-memory authorization, backend containment, lifecycle,
+  cleanup, and failure policy rather than only accepting a socket path.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. Startup opens each configured path with nonblocking
