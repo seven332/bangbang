@@ -152,6 +152,8 @@ mod macos_arm64 {
         boot_args: &'a str,
         success_marker: &'a [u8],
         network_mtu: Option<u16>,
+        initial_rx_rate_limiter: Option<&'a str>,
+        wait_for_guest_completion_before_network_patch: bool,
         content_source: DirectRootfsMmdsContentSource,
     }
 
@@ -2827,6 +2829,24 @@ mod macos_arm64 {
             boot_args: DIRECT_ROOTFS_MMDS_MTU_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_MTU_MARKER,
             network_mtu: Some(1280),
+            initial_rx_rate_limiter: None,
+            wait_for_guest_completion_before_network_patch: false,
+            content_source: DirectRootfsMmdsContentSource::ApiRequest,
+        });
+    }
+
+    #[test]
+    fn signed_executable_retries_rate_limited_mmds_rx_without_second_guest_notification() {
+        run_direct_rootfs_mmds_guest_fetch_test(DirectRootfsMmdsFetchCase {
+            request_context: "rate-limited MMDS RX guest fetch",
+            mmds_config_body: r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
+            boot_args: DIRECT_ROOTFS_MMDS_BOOT_ARGS,
+            success_marker: DIRECT_ROOTFS_MMDS_MARKER,
+            network_mtu: None,
+            initial_rx_rate_limiter: Some(
+                r#"{"ops":{"size":1,"one_time_burst":0,"refill_time":1500}}"#,
+            ),
+            wait_for_guest_completion_before_network_patch: true,
             content_source: DirectRootfsMmdsContentSource::ApiRequest,
         });
     }
@@ -2839,6 +2859,8 @@ mod macos_arm64 {
             boot_args: DIRECT_ROOTFS_MMDS_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_MARKER,
             network_mtu: None,
+            initial_rx_rate_limiter: None,
+            wait_for_guest_completion_before_network_patch: false,
             content_source: DirectRootfsMmdsContentSource::MetadataFile,
         });
     }
@@ -2851,6 +2873,8 @@ mod macos_arm64 {
             boot_args: DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_V2_MARKER,
             network_mtu: None,
+            initial_rx_rate_limiter: None,
+            wait_for_guest_completion_before_network_patch: false,
             content_source: DirectRootfsMmdsContentSource::MetadataFile,
         });
     }
@@ -2873,6 +2897,8 @@ mod macos_arm64 {
             boot_args: DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS,
             success_marker: DIRECT_ROOTFS_MMDS_V2_MARKER,
             network_mtu: None,
+            initial_rx_rate_limiter: None,
+            wait_for_guest_completion_before_network_patch: false,
             content_source: DirectRootfsMmdsContentSource::ApiRequest,
         });
     }
@@ -3795,12 +3821,17 @@ mod macos_arm64 {
         let machine_context = format!("PUT /machine-config {}", case.request_context);
         assert_no_content_response(&machine_response, &machine_context);
 
-        let network_body = match case.network_mtu {
-            Some(mtu) => format!(
-                r#"{{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:01","mtu":{mtu}}}"#
-            ),
-            None => r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:01"}"#.to_string(),
-        };
+        let mtu_field = case
+            .network_mtu
+            .map(|mtu| format!(r#", "mtu":{mtu}"#))
+            .unwrap_or_default();
+        let rx_rate_limiter_field = case
+            .initial_rx_rate_limiter
+            .map(|rate_limiter| format!(r#", "rx_rate_limiter":{rate_limiter}"#))
+            .unwrap_or_default();
+        let network_body = format!(
+            r#"{{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:01"{mtu_field}{rx_rate_limiter_field}}}"#
+        );
         let network_response =
             http_put_json(&socket_path, "/network-interfaces/eth0", &network_body);
         let network_context = format!("PUT /network-interfaces/eth0 {}", case.request_context);
@@ -3867,6 +3898,10 @@ mod macos_arm64 {
         let get_context = format!("GET / after {} InstanceStart", case.request_context);
         assert_ok_response(&running_instance_info, &get_context);
         assert_response_contains(&running_instance_info, r#""state":"Running""#, &get_context);
+
+        if case.wait_for_guest_completion_before_network_patch {
+            assert_direct_rootfs_mmds_guest_completion(&mut bangbang, &data_backing_path, case);
+        }
 
         let network_patch_context = format!(
             "PATCH /network-interfaces/eth0 no-op {}",
@@ -3999,22 +4034,31 @@ mod macos_arm64 {
                 && !disabled_vm_config.contains("1234567"),
             "{disabled_vm_config_context} must clear only the disabled bandwidth bucket; response:\n{disabled_vm_config}"
         );
+        if !case.wait_for_guest_completion_before_network_patch {
+            assert_direct_rootfs_mmds_guest_completion(&mut bangbang, &data_backing_path, case);
+        }
 
+        let shutdown_context = format!("bangbang direct rootfs {}", case.request_context);
+        assert_clean_shutdown(bangbang.terminate(), &socket_path, &shutdown_context);
+    }
+
+    fn assert_direct_rootfs_mmds_guest_completion(
+        bangbang: &mut BangbangProcess,
+        data_backing_path: &Path,
+        case: DirectRootfsMmdsFetchCase<'_>,
+    ) {
         if let Err(err) = wait_for_file_prefix_marker(
-            &data_backing_path,
+            data_backing_path,
             case.success_marker,
             GUEST_EXECUTION_TIMEOUT,
         ) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let backing_prefix = file_prefix_lossy(data_backing_path, 128);
             let output = bangbang.force_stop_and_collect();
             panic!(
                 "direct rootfs guest did not complete {} through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 case.request_context, output.status, output.stdout, output.stderr
             );
         }
-
-        let shutdown_context = format!("bangbang direct rootfs {}", case.request_context);
-        assert_clean_shutdown(bangbang.terminate(), &socket_path, &shutdown_context);
     }
 
     fn run_direct_rootfs_no_api_mmds_guest_fetch_test(case: DirectRootfsNoApiMmdsFetchCase<'_>) {
