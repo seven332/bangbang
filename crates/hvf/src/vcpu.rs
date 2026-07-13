@@ -2177,6 +2177,7 @@ impl HvfVcpuOwner {
         &mut self,
         registers: HvfArm64SecondaryBootRegisters,
     ) -> Result<(), BackendError> {
+        self.set_system_register(HvfSystemRegister::SCTLR_EL1, 0)?;
         configure_arm64_secondary_boot_registers_with(registers, |register, value| {
             self.set_register(register, value)
         })
@@ -2478,6 +2479,19 @@ fn configure_arm64_secondary_boot_registers_with(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+fn configure_arm64_secondary_boot_state_with(
+    registers: HvfArm64SecondaryBootRegisters,
+    mut set_system_register: impl FnMut(HvfSystemRegister, u64) -> Result<(), BackendError>,
+    set_register: impl FnMut(HvfRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    // Linux enters the PSCI secondary entry by physical address with the MMU
+    // disabled. A previously-run vCPU retains its EL1 system state in HVF, so
+    // clear SCTLR_EL1 before the existing PC-last entry publication.
+    set_system_register(HvfSystemRegister::SCTLR_EL1, 0)?;
+    configure_arm64_secondary_boot_registers_with(registers, set_register)
 }
 
 pub(crate) fn capture_arm64_vcpu_general_register_state_with(
@@ -3397,7 +3411,7 @@ mod tests {
         capture_arm64_vcpu_translation_register_state_with,
         capture_arm64_vcpu_virtual_timer_state_with,
         capture_arm64_vcpu_watchpoint_register_state_with, configure_arm64_boot_registers_with,
-        configure_arm64_secondary_boot_registers_with,
+        configure_arm64_secondary_boot_registers_with, configure_arm64_secondary_boot_state_with,
         restore_arm64_vcpu_cache_selection_register_state_with,
         restore_arm64_vcpu_core_system_register_state_with,
         restore_arm64_vcpu_debug_control_register_state_with,
@@ -4098,6 +4112,52 @@ mod tests {
                 (HvfRegister::PC, 0x0000_0001_8028_0000),
             ]
         );
+    }
+
+    #[test]
+    fn arm64_secondary_boot_state_disables_the_el1_mmu_before_entry_publication() {
+        let mut system_writes = Vec::new();
+        let mut register_writes = Vec::new();
+
+        configure_arm64_secondary_boot_state_with(
+            secondary_boot_registers(),
+            |register, value| {
+                system_writes.push((register, value));
+                Ok(())
+            },
+            |register, value| {
+                register_writes.push((register, value));
+                Ok(())
+            },
+        )
+        .expect("secondary boot state should reset and publish");
+
+        assert_eq!(system_writes, [(HvfSystemRegister::SCTLR_EL1, 0)]);
+        assert_eq!(
+            register_writes,
+            [
+                (HvfRegister::X0, 0xfeed_face_cafe_beef),
+                (HvfRegister::X1, 0),
+                (HvfRegister::X2, 0),
+                (HvfRegister::X3, 0),
+                (HvfRegister::CPSR, ARM64_LINUX_BOOT_CPSR),
+                (HvfRegister::PC, 0x0000_0001_8028_0000),
+            ]
+        );
+
+        let mut general_writes = 0;
+        assert_eq!(
+            configure_arm64_secondary_boot_state_with(
+                secondary_boot_registers(),
+                |_, _| Err(BackendError::InvalidState("fake SCTLR reset failed")),
+                |_, _| {
+                    general_writes += 1;
+                    Ok(())
+                },
+            ),
+            Err(BackendError::InvalidState("fake SCTLR reset failed"))
+        );
+        assert_eq!(general_writes, 0);
     }
 
     #[test]

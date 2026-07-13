@@ -59,6 +59,7 @@ pub(crate) enum PsciStatus {
     Success,
     NotSupported,
     InvalidParameters,
+    Denied,
     AlreadyOn,
     OnPending,
     InternalFailure,
@@ -70,6 +71,7 @@ impl PsciStatus {
             Self::Success => 0_i32,
             Self::NotSupported => -1,
             Self::InvalidParameters => -2,
+            Self::Denied => -3,
             Self::AlreadyOn => -4,
             Self::OnPending => -5,
             Self::InternalFailure => -6,
@@ -158,7 +160,11 @@ const fn supports_coordinated_function(function_id: u64) -> bool {
     supports_legacy_function(function_id)
         || matches!(
             function_id,
-            PSCI_CPU_ON_32 | PSCI_CPU_ON_64 | PSCI_AFFINITY_INFO_32 | PSCI_AFFINITY_INFO_64
+            PSCI_CPU_OFF
+                | PSCI_CPU_ON_32
+                | PSCI_CPU_ON_64
+                | PSCI_AFFINITY_INFO_32
+                | PSCI_AFFINITY_INFO_64
         )
 }
 
@@ -243,12 +249,14 @@ impl PsciAffinityInfoRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PsciCoordinatorRequest {
+    CpuOff,
     CpuOn(PsciCpuOnRequest),
     AffinityInfo(PsciAffinityInfoRequest),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PsciCoordinatorResponse {
+    CpuOff(PsciCpuOffResponse),
     CpuOn(PsciCpuOnResponse),
     AffinityInfo(PsciAffinityInfoResponse),
 }
@@ -256,6 +264,7 @@ pub(crate) enum PsciCoordinatorResponse {
 impl PsciCoordinatorResponse {
     pub(crate) const fn return_value(self) -> u64 {
         match self {
+            Self::CpuOff(response) => response.status().return_value(),
             Self::CpuOn(response) => response.status().return_value(),
             Self::AffinityInfo(response) => response.return_value(),
         }
@@ -269,6 +278,9 @@ pub(crate) const fn response_matches_request(
     matches!(
         (request, response),
         (
+            PsciCoordinatorRequest::CpuOff,
+            PsciCoordinatorResponse::CpuOff(_)
+        ) | (
             PsciCoordinatorRequest::CpuOn(_),
             PsciCoordinatorResponse::CpuOn(_)
         ) | (
@@ -292,6 +304,10 @@ pub(crate) const fn handle_coordinated_call(call: PsciCall) -> PsciCoordinatedDi
             PsciStatus::NotSupported
         };
         return PsciCoordinatedDispatch::Immediate(PsciCallResult::returned(status.return_value()));
+    }
+
+    if call.function_id == PSCI_CPU_OFF {
+        return PsciCoordinatedDispatch::Coordinate(PsciCoordinatorRequest::CpuOff);
     }
 
     let convention = match call.function_id {
@@ -335,6 +351,46 @@ pub(crate) enum PsciCpuPowerState {
     On,
     Off,
     OnPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciCpuOffResponse {
+    Denied,
+    InternalFailure,
+}
+
+impl PsciCpuOffResponse {
+    pub(crate) const fn status(self) -> PsciStatus {
+        match self {
+            Self::Denied => PsciStatus::Denied,
+            Self::InternalFailure => PsciStatus::InternalFailure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PsciCpuOffToken(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PsciCpuOffWork {
+    token: PsciCpuOffToken,
+    caller_index: usize,
+}
+
+impl PsciCpuOffWork {
+    pub(crate) const fn token(self) -> PsciCpuOffToken {
+        self.token
+    }
+
+    pub(crate) const fn caller_index(self) -> usize {
+        self.caller_index
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsciCpuOffBegin {
+    Complete(PsciCpuOffResponse),
+    Pending(PsciCpuOffWork),
 }
 
 impl PsciCpuPowerState {
@@ -429,6 +485,8 @@ pub(crate) enum PsciCpuPowerError {
     TokenExhausted,
     UnknownTransaction { token: PsciCpuOnToken },
     InvalidTransactionPhase { token: PsciCpuOnToken },
+    InvalidCpuIndex { index: usize },
+    UnknownCpuOffTransaction { token: PsciCpuOffToken },
 }
 
 impl fmt::Display for PsciCpuPowerError {
@@ -447,6 +505,12 @@ impl fmt::Display for PsciCpuPowerError {
             }
             Self::InvalidTransactionPhase { token } => {
                 write!(f, "PSCI CPU_ON transaction {token:?} is in the wrong phase")
+            }
+            Self::InvalidCpuIndex { index } => {
+                write!(f, "PSCI CPU power topology has no vCPU index {index}")
+            }
+            Self::UnknownCpuOffTransaction { token } => {
+                write!(f, "PSCI CPU_OFF transaction {token:?} is unknown")
             }
         }
     }
@@ -476,6 +540,7 @@ struct PsciCpuState {
     mpidr: u64,
     power: PsciCpuPowerState,
     transaction: Option<PsciCpuOnTransaction>,
+    cpu_off_transaction: Option<PsciCpuOffWork>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,6 +573,7 @@ impl PsciCpuPowerCoordinator {
                     PsciCpuPowerState::Off
                 },
                 transaction: None,
+                cpu_off_transaction: None,
             });
         }
 
@@ -550,7 +616,9 @@ impl PsciCpuPowerCoordinator {
             PsciCpuPowerState::OnPending => {
                 return Ok(PsciCpuOnBegin::Complete(PsciCpuOnResponse::OnPending));
             }
-            PsciCpuPowerState::Off if target.transaction.is_some() => {
+            PsciCpuPowerState::Off
+                if target.transaction.is_some() || target.cpu_off_transaction.is_some() =>
+            {
                 return Ok(PsciCpuOnBegin::Complete(PsciCpuOnResponse::InternalFailure));
             }
             PsciCpuPowerState::Off => {}
@@ -577,6 +645,71 @@ impl PsciCpuPowerCoordinator {
         });
 
         Ok(PsciCpuOnBegin::Pending(work))
+    }
+
+    pub(crate) fn begin_cpu_off(
+        &mut self,
+        caller_index: usize,
+    ) -> Result<PsciCpuOffBegin, PsciCpuPowerError> {
+        let caller = self
+            .cpus
+            .get(caller_index)
+            .ok_or(PsciCpuPowerError::InvalidCpuIndex {
+                index: caller_index,
+            })?;
+        if caller.power != PsciCpuPowerState::On
+            || caller.transaction.is_some()
+            || caller.cpu_off_transaction.is_some()
+        {
+            return Ok(PsciCpuOffBegin::Complete(
+                PsciCpuOffResponse::InternalFailure,
+            ));
+        }
+        if self
+            .cpus
+            .iter()
+            .filter(|cpu| cpu.power == PsciCpuPowerState::On)
+            .count()
+            <= 1
+        {
+            return Ok(PsciCpuOffBegin::Complete(PsciCpuOffResponse::Denied));
+        }
+
+        let token = PsciCpuOffToken(self.next_token);
+        self.next_token = self
+            .next_token
+            .checked_add(1)
+            .ok_or(PsciCpuPowerError::TokenExhausted)?;
+        let work = PsciCpuOffWork {
+            token,
+            caller_index,
+        };
+        self.cpus
+            .get_mut(caller_index)
+            .ok_or(PsciCpuPowerError::InvalidCpuIndex {
+                index: caller_index,
+            })?
+            .cpu_off_transaction = Some(work);
+        Ok(PsciCpuOffBegin::Pending(work))
+    }
+
+    pub(crate) fn abort_cpu_off(
+        &mut self,
+        token: PsciCpuOffToken,
+    ) -> Result<(), PsciCpuPowerError> {
+        let caller = self.cpu_for_off_transaction_mut(token)?;
+        caller.cpu_off_transaction = None;
+        Ok(())
+    }
+
+    pub(crate) fn commit_cpu_off(
+        &mut self,
+        token: PsciCpuOffToken,
+    ) -> Result<(), PsciCpuPowerError> {
+        let caller = self.cpu_for_off_transaction_mut(token)?;
+        caller.power = PsciCpuPowerState::Off;
+        caller.cpu_off_transaction = None;
+        Ok(())
     }
 
     pub(crate) fn finish_target_setup(
@@ -738,6 +871,19 @@ impl PsciCpuPowerCoordinator {
             })
             .ok_or(PsciCpuPowerError::UnknownTransaction { token })
     }
+
+    fn cpu_for_off_transaction_mut(
+        &mut self,
+        token: PsciCpuOffToken,
+    ) -> Result<&mut PsciCpuState, PsciCpuPowerError> {
+        self.cpus
+            .iter_mut()
+            .find(|cpu| {
+                cpu.cpu_off_transaction
+                    .is_some_and(|transaction| transaction.token == token)
+            })
+            .ok_or(PsciCpuPowerError::UnknownCpuOffTransaction { token })
+    }
 }
 
 #[cfg(test)]
@@ -747,10 +893,11 @@ mod tests {
         PSCI_FEATURES, PSCI_MIGRATE_INFO_TYPE, PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED,
         PSCI_SYSTEM_OFF, PSCI_SYSTEM_RESET, PSCI_VERSION, PSCI_VERSION_0_2,
         PsciAffinityInfoRequest, PsciAffinityInfoResponse, PsciCall, PsciCallAction,
-        PsciCoordinatedDispatch, PsciCoordinatorRequest, PsciCpuOnBegin, PsciCpuOnRequest,
-        PsciCpuOnResponse, PsciCpuPowerCoordinator, PsciCpuPowerError, PsciCpuPowerState,
-        PsciStatus, call_uses_arg0, coordinated_call_argument_count, handle_call,
-        handle_coordinated_call, not_supported_result,
+        PsciCoordinatedDispatch, PsciCoordinatorRequest, PsciCpuOffBegin, PsciCpuOffResponse,
+        PsciCpuOnBegin, PsciCpuOnRequest, PsciCpuOnResponse, PsciCpuPowerCoordinator,
+        PsciCpuPowerError, PsciCpuPowerState, PsciStatus, call_uses_arg0,
+        coordinated_call_argument_count, handle_call, handle_coordinated_call,
+        not_supported_result,
     };
 
     fn coordinator() -> PsciCpuPowerCoordinator {
@@ -772,12 +919,26 @@ mod tests {
         work
     }
 
+    fn bring_secondary_online(coordinator: &mut PsciCpuPowerCoordinator) {
+        let work = pending_work(coordinator);
+        coordinator
+            .finish_target_setup(work.token(), true)
+            .expect("secondary setup should finish");
+        coordinator
+            .commit_caller_completion(work.token())
+            .expect("caller completion should commit");
+        coordinator
+            .mark_target_entered(work.token())
+            .expect("secondary should enter");
+    }
+
     #[test]
     fn encodes_all_psci_statuses_as_zero_extended_signed_32_bit_values() {
         for (status, expected) in [
             (PsciStatus::Success, 0x0000_0000),
             (PsciStatus::NotSupported, 0xffff_ffff),
             (PsciStatus::InvalidParameters, 0xffff_fffe),
+            (PsciStatus::Denied, 0xffff_fffd),
             (PsciStatus::AlreadyOn, 0xffff_fffc),
             (PsciStatus::OnPending, 0xffff_fffb),
             (PsciStatus::InternalFailure, 0xffff_fffa),
@@ -820,8 +981,9 @@ mod tests {
     }
 
     #[test]
-    fn coordinated_features_advertise_cpu_on_and_affinity_info_only() {
+    fn coordinated_features_advertise_cpu_off_cpu_on_and_affinity_info() {
         for function_id in [
+            PSCI_CPU_OFF,
             PSCI_CPU_ON_32,
             PSCI_CPU_ON_64,
             PSCI_AFFINITY_INFO_32,
@@ -834,16 +996,6 @@ mod tests {
             };
             assert_eq!(result.return_value(), PsciStatus::Success.return_value());
         }
-
-        let PsciCoordinatedDispatch::Immediate(result) =
-            handle_coordinated_call(PsciCall::new(PSCI_FEATURES, PSCI_CPU_OFF))
-        else {
-            panic!("unsupported PSCI_FEATURES should complete immediately");
-        };
-        assert_eq!(
-            result.return_value(),
-            PsciStatus::NotSupported.return_value()
-        );
     }
 
     #[test]
@@ -851,6 +1003,7 @@ mod tests {
         assert!(call_uses_arg0(PSCI_FEATURES));
         assert!(!call_uses_arg0(PSCI_CPU_ON_32));
         assert_eq!(coordinated_call_argument_count(PSCI_VERSION), 0);
+        assert_eq!(coordinated_call_argument_count(PSCI_CPU_OFF), 0);
         assert_eq!(coordinated_call_argument_count(PSCI_FEATURES), 1);
         assert_eq!(coordinated_call_argument_count(PSCI_AFFINITY_INFO_64), 2);
         assert_eq!(coordinated_call_argument_count(PSCI_CPU_ON_32), 3);
@@ -884,6 +1037,17 @@ mod tests {
         assert_eq!(request.target_mpidr(), 1);
         assert_eq!(request.entry_point(), 0x8020_0000);
         assert_eq!(request.context_id(), 0xcafe_beef);
+    }
+
+    #[test]
+    fn parses_cpu_off_as_zero_argument_coordinator_work() {
+        assert_eq!(
+            handle_coordinated_call(PsciCall::from_arguments(
+                PSCI_CPU_OFF,
+                [u64::MAX, 0xfeed_face, 0xcafe_beef],
+            )),
+            PsciCoordinatedDispatch::Coordinate(PsciCoordinatorRequest::CpuOff)
+        );
     }
 
     #[test]
@@ -1027,6 +1191,106 @@ mod tests {
                 .begin_cpu_on(secondary_request(), |_| true)
                 .expect("repeat should be modeled"),
             PsciCpuOnBegin::Complete(PsciCpuOnResponse::OnPending)
+        );
+    }
+
+    #[test]
+    fn cpu_off_denies_last_on_cpu_without_reserving_state() {
+        let mut coordinator = coordinator();
+        assert_eq!(
+            coordinator.begin_cpu_off(0),
+            Ok(PsciCpuOffBegin::Complete(PsciCpuOffResponse::Denied))
+        );
+        assert_eq!(coordinator.power_state(0), Some(PsciCpuPowerState::On));
+        assert_eq!(
+            coordinator.begin_cpu_off(1),
+            Ok(PsciCpuOffBegin::Complete(
+                PsciCpuOffResponse::InternalFailure
+            ))
+        );
+        assert_eq!(
+            coordinator.begin_cpu_off(3),
+            Err(PsciCpuPowerError::InvalidCpuIndex { index: 3 })
+        );
+    }
+
+    #[test]
+    fn cpu_off_reservation_keeps_affinity_on_until_commit_and_can_abort() {
+        let mut coordinator = coordinator();
+        bring_secondary_online(&mut coordinator);
+        let PsciCpuOffBegin::Pending(work) = coordinator
+            .begin_cpu_off(1)
+            .expect("online secondary CPU_OFF should be modeled")
+        else {
+            panic!("online secondary should reserve CPU_OFF");
+        };
+        assert_eq!(work.caller_index(), 1);
+        assert_eq!(coordinator.power_state(1), Some(PsciCpuPowerState::On));
+        assert_eq!(
+            coordinator.affinity_info(PsciAffinityInfoRequest::new(1, 0)),
+            PsciAffinityInfoResponse::State(PsciCpuPowerState::On)
+        );
+        assert_eq!(
+            coordinator.begin_cpu_off(1),
+            Ok(PsciCpuOffBegin::Complete(
+                PsciCpuOffResponse::InternalFailure
+            ))
+        );
+        coordinator
+            .abort_cpu_off(work.token())
+            .expect("reserved CPU_OFF should abort");
+        assert_eq!(coordinator.power_state(1), Some(PsciCpuPowerState::On));
+        assert_eq!(
+            coordinator.abort_cpu_off(work.token()),
+            Err(PsciCpuPowerError::UnknownCpuOffTransaction {
+                token: work.token()
+            })
+        );
+    }
+
+    #[test]
+    fn cpu_off_commit_publishes_off_and_later_cpu_on_is_admitted() {
+        let mut coordinator = coordinator();
+        bring_secondary_online(&mut coordinator);
+        let PsciCpuOffBegin::Pending(work) = coordinator
+            .begin_cpu_off(1)
+            .expect("online secondary CPU_OFF should be modeled")
+        else {
+            panic!("online secondary should reserve CPU_OFF");
+        };
+        coordinator
+            .commit_cpu_off(work.token())
+            .expect("reserved CPU_OFF should commit");
+        assert_eq!(coordinator.power_state(1), Some(PsciCpuPowerState::Off));
+        assert_eq!(
+            coordinator.affinity_info(PsciAffinityInfoRequest::new(1, 0)),
+            PsciAffinityInfoResponse::State(PsciCpuPowerState::Off)
+        );
+        assert!(matches!(
+            coordinator
+                .begin_cpu_on(secondary_request(), |_| true)
+                .expect("offlined secondary should be reusable"),
+            PsciCpuOnBegin::Pending(_)
+        ));
+    }
+
+    #[test]
+    fn cpu_off_allows_primary_only_while_secondary_is_on() {
+        let mut coordinator = coordinator();
+        bring_secondary_online(&mut coordinator);
+        let PsciCpuOffBegin::Pending(work) = coordinator
+            .begin_cpu_off(0)
+            .expect("primary CPU_OFF should be modeled while a peer is on")
+        else {
+            panic!("primary should reserve CPU_OFF while a peer is on");
+        };
+        coordinator
+            .commit_cpu_off(work.token())
+            .expect("primary CPU_OFF should commit");
+        assert_eq!(coordinator.power_state(0), Some(PsciCpuPowerState::Off));
+        assert_eq!(
+            coordinator.begin_cpu_off(1),
+            Ok(PsciCpuOffBegin::Complete(PsciCpuOffResponse::Denied))
         );
     }
 

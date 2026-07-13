@@ -106,10 +106,15 @@ mod macos_arm64 {
     const GUEST_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
     const GUEST_SMP_PROGRESS_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 rdinit=/smp-progress-init";
+    const GUEST_SMP_HOTPLUG_BOOT_ARGS: &str =
+        "console=ttyS0 reboot=k panic=1 rdinit=/smp-hotplug-init";
     const GUEST_POWEROFF_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init";
     const GUEST_RESET_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/reboot-init";
     const SMP_PROGRESS_CPU0_TOKEN: u8 = 0xa5;
     const SMP_PROGRESS_CPU1_TOKEN: u8 = 0xd3;
+    const SMP_HOTPLUG_READY_MARKER: &[u8] = b"BBHOTREADY";
+    const SMP_HOTPLUG_OFF_MARKER: &[u8] = b"BBHOTOFF";
+    const SMP_HOTPLUG_DONE_MARKER: &[u8] = b"BBHOTDONE";
     const DIRECT_ROOTFS_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
     const ROOTFS_BOOT_TIMER_BOOT_ARGS: &str =
@@ -1110,6 +1115,61 @@ mod macos_arm64 {
             output_b.stderr
         );
         assert_clean_shutdown(output_b, &socket_b, "public SMP process B after SIGTERM");
+    }
+
+    #[test]
+    fn signed_executable_reenters_a_guest_hotplugged_secondary_cpu() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("smp-hotplug.socket");
+        let serial_path = test_dir.path().join("smp-hotplug.serial");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let instance_id = format!("{}-smp-hotplug", test_dir.instance_id());
+
+        create_empty_file(&serial_path);
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+        configure_public_smp_hotplug(&socket_path, &kernel_path, &initrd_path, &serial_path);
+        if let Err(err) = wait_for_file_contains_marker(
+            &serial_path,
+            SMP_HOTPLUG_DONE_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "public SMP hotplug guest did not re-enter CPU1: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}\nserial:\n{}",
+                output.status,
+                output.stdout,
+                output.stderr,
+                String::from_utf8_lossy(&fs::read(&serial_path).unwrap_or_default())
+            );
+        }
+        let serial = fs::read(&serial_path).expect("SMP hotplug serial should read");
+        for marker in [
+            SMP_HOTPLUG_READY_MARKER,
+            SMP_HOTPLUG_OFF_MARKER,
+            SMP_HOTPLUG_DONE_MARKER,
+        ] {
+            assert!(
+                serial.windows(marker.len()).any(|window| window == marker),
+                "SMP hotplug serial should contain {:?}: {}",
+                String::from_utf8_lossy(marker),
+                String::from_utf8_lossy(&serial)
+            );
+        }
+
+        let output = bangbang
+            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "public SMP hotplug shutdown");
+        assert!(
+            output.status.success(),
+            "hotplug guest SYSTEM_OFF should exit successfully; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            !socket_path.exists(),
+            "hotplug guest shutdown should clean up the API socket"
+        );
     }
 
     #[test]
@@ -4762,6 +4822,46 @@ mod macos_arm64 {
             r#"{"action_type":"InstanceStart"}"#,
         );
         assert_no_content_response(&start, &format!("PUT {context} InstanceStart"));
+    }
+
+    fn configure_public_smp_hotplug(
+        socket_path: &Path,
+        kernel_path: &Path,
+        initrd_path: &Path,
+        serial_path: &Path,
+    ) {
+        let machine = http_put_json(
+            socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":2,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(&machine, "PUT hotplug /machine-config");
+        let boot = http_put_json(
+            socket_path,
+            "/boot-source",
+            &format!(
+                r#"{{"kernel_image_path":{},"initrd_path":{},"boot_args":{}}}"#,
+                json_string(path_text(kernel_path)),
+                json_string(path_text(initrd_path)),
+                json_string(GUEST_SMP_HOTPLUG_BOOT_ARGS),
+            ),
+        );
+        assert_no_content_response(&boot, "PUT hotplug /boot-source");
+        let serial = http_put_json(
+            socket_path,
+            "/serial",
+            &format!(
+                r#"{{"serial_out_path":{}}}"#,
+                json_string(path_text(serial_path))
+            ),
+        );
+        assert_no_content_response(&serial, "PUT hotplug /serial");
+        let start = http_put_json(
+            socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(&start, "PUT hotplug InstanceStart");
     }
 
     fn create_zeroed_block_backing(path: &Path) {
