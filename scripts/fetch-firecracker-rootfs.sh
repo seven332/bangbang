@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v30"
+direct_boot_variant="direct-boot-v31"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -358,11 +358,18 @@ cmdline_has() {
   esac
 }
 
-write_vdb_marker() {
+write_vdb_marker_at_sector() {
   marker=$1
+  sector=$2
   if [ -b /dev/vdb ]; then
-    printf '%-512s' "$marker" >/dev/vdb 2>/dev/null || true
+    printf '%-512s' "$marker" \
+      | dd of=/dev/vdb bs=512 seek="$sector" count=1 conv=notrunc 2>/dev/null \
+      || true
   fi
+}
+
+write_vdb_marker() {
+  write_vdb_marker_at_sector "$1" 0
 }
 
 first_network_iface() {
@@ -376,6 +383,37 @@ first_network_iface() {
       printf '%s\n' "$iface"
       return 0
     fi
+  done
+
+  return 1
+}
+
+network_iface_with_mac() {
+  expected_mac=$1
+  attempt=1
+
+  while [ "$attempt" -le 5 ]; do
+    for iface_path in /sys/class/net/*; do
+      if [ ! -d "$iface_path" ] || [ ! -r "$iface_path/address" ]; then
+        continue
+      fi
+
+      iface=${iface_path##*/}
+      if [ "$iface" = lo ]; then
+        continue
+      fi
+
+      actual_mac=$(cat "$iface_path/address" 2>/dev/null || true)
+      if [ "$actual_mac" = "$expected_mac" ]; then
+        printf '%s\n' "$iface"
+        return 0
+      fi
+    done
+
+    if [ "$attempt" -lt 5 ]; then
+      sleep 1
+    fi
+    attempt=$((attempt + 1))
   done
 
   return 1
@@ -456,6 +494,94 @@ fetch_mmds_marker() {
     emit_line BANGBANG_MMDS_FETCH_FAIL_RESPONSE
     write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
   fi
+}
+
+fetch_mmds_marker_for_interface() {
+  mmds_iface=$1
+  source_address=$2
+  success_marker=$3
+  failure_marker=$4
+  marker_sector=$5
+  failure_prefix=$6
+
+  if [ -z "$mmds_iface" ]; then
+    emit_line "${failure_prefix}_NO_IFACE"
+    write_vdb_marker_at_sector "$failure_marker" "$marker_sector"
+    return
+  fi
+
+  if ! ip link set dev "$mmds_iface" up 2>/dev/null; then
+    emit_line "${failure_prefix}_LINK"
+    write_vdb_marker_at_sector "$failure_marker" "$marker_sector"
+    return
+  fi
+
+  if ! ip addr add "$source_address/32" dev "$mmds_iface" 2>/dev/null; then
+    emit_line "${failure_prefix}_ADDRESS"
+    write_vdb_marker_at_sector "$failure_marker" "$marker_sector"
+    return
+  fi
+
+  if ! ip route replace 169.254.169.254/32 \
+    dev "$mmds_iface" src "$source_address" 2>/dev/null; then
+    emit_line "${failure_prefix}_ROUTE"
+    write_vdb_marker_at_sector "$failure_marker" "$marker_sector"
+    return
+  fi
+
+  mmds_value=$(
+    curl \
+      --fail \
+      --silent \
+      --show-error \
+      --connect-timeout 2 \
+      --max-time 5 \
+      --interface "$mmds_iface" \
+      http://169.254.169.254/meta-data/bangbang-marker \
+      2>/dev/null || true
+  )
+
+  if [ "$mmds_value" = BANGBANG_MMDS_GUEST_VALUE ]; then
+    emit_line "${success_marker}"
+    write_vdb_marker_at_sector "$success_marker" "$marker_sector"
+  else
+    emit_line "${failure_prefix}_RESPONSE"
+    write_vdb_marker_at_sector "$failure_marker" "$marker_sector"
+  fi
+}
+
+fetch_multi_interface_mmds_markers() {
+  if ! command -v ip >/dev/null 2>&1; then
+    emit_line BANGBANG_MMDS_MULTI_FETCH_FAIL_NO_IP
+    write_vdb_marker_at_sector BANGBANG_MMDS_ETH0_FETCH_FAIL 0
+    write_vdb_marker_at_sector BANGBANG_MMDS_ETH1_FETCH_FAIL 1
+    return
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    emit_line BANGBANG_MMDS_MULTI_FETCH_FAIL_NO_CURL
+    write_vdb_marker_at_sector BANGBANG_MMDS_ETH0_FETCH_FAIL 0
+    write_vdb_marker_at_sector BANGBANG_MMDS_ETH1_FETCH_FAIL 1
+    return
+  fi
+
+  mmds_eth0_iface=$(network_iface_with_mac 06:00:00:00:00:01 || true)
+  mmds_eth1_iface=$(network_iface_with_mac 06:00:00:00:00:02 || true)
+
+  fetch_mmds_marker_for_interface \
+    "$mmds_eth0_iface" \
+    169.254.100.2 \
+    BANGBANG_MMDS_ETH0_GUEST_FETCH_OK \
+    BANGBANG_MMDS_ETH0_FETCH_FAIL \
+    0 \
+    BANGBANG_MMDS_ETH0_FETCH_FAIL
+  fetch_mmds_marker_for_interface \
+    "$mmds_eth1_iface" \
+    169.254.101.2 \
+    BANGBANG_MMDS_ETH1_GUEST_FETCH_OK \
+    BANGBANG_MMDS_ETH1_FETCH_FAIL \
+    1 \
+    BANGBANG_MMDS_ETH1_FETCH_FAIL
 }
 
 read_entropy_marker() {
@@ -1430,6 +1556,8 @@ elif cmdline_has bangbang.block-writeback-flush=1; then
   flush_writeback_block_marker
 elif cmdline_has bangbang.pmem-read-flush=1; then
   read_flush_pmem_marker
+elif cmdline_has bangbang.mmds-multi-fetch=1; then
+  fetch_multi_interface_mmds_markers
 elif cmdline_has bangbang.mmds-v2-fetch=1; then
   fetch_mmds_v2_marker
 elif cmdline_has bangbang.mmds-fetch=1; then

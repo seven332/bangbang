@@ -861,7 +861,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v30.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v31.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -883,7 +883,15 @@ MMDS value is returned. With
 `/latest/api/token`, then fetches the same marker with the token header and
 writes `BANGBANG_MMDS_V2_GUEST_FETCH_OK`. The init script emits only static
 success or failure markers for this path; it must not print generated tokens or
-metadata values. When the boot args include `bangbang.entropy-read=1`, the same
+metadata values. With `bangbang.mmds-multi-fetch=1`, it instead finds two guest
+interfaces by their configured MAC addresses, gives them distinct link-local
+`/32` source addresses, replaces the MMDS host route before each device-bound
+request, and writes the `eth0` and `eth1` results to separate fixed sectors of
+the scratch drive. The host requires both static success markers under one
+deadline and checks that both API interface metric objects report RX and TX
+activity. This MMDS-only scenario does not open direct vmnet resources or need
+the restricted networking entitlement. When the boot args include
+`bangbang.entropy-read=1`, the same
 init script checks `/sys/class/misc/hw_random/rng_current` for `virtio_rng`,
 reads bytes from `/dev/hwrng`, and writes
 `BANGBANG_ENTROPY_GUEST_READ_OK` only after the read returns non-empty data.

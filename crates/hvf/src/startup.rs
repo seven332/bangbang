@@ -12980,6 +12980,99 @@ mod tests {
     }
 
     #[test]
+    fn network_notification_packet_io_keeps_second_interface_signal_and_metrics_associated() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_networks(&[("eth0", "tap0"), ("eth1", "tap1")]);
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 1);
+        write_network_tx_header(&mut memory);
+        memory
+            .write_slice(&[0xde, 0xad, 0xbe, 0xef], TEST_NETWORK_TX_PAYLOAD)
+            .expect("second-interface network TX payload should write");
+        write_network_tx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::readable(
+                    TEST_NETWORK_TX_HEADER,
+                    VIRTIO_NET_TX_HEADER_SIZE,
+                    Some(1),
+                ),
+                TestDescriptor::readable(TEST_NETWORK_TX_PAYLOAD, 4, None),
+            ],
+        );
+        write_network_tx_available_heads(&mut memory, &[0]);
+        notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 1);
+        let mut provider = RecordingNetworkPacketIoProvider::for_iface("eth1");
+        let dispatches = dispatch_boot_network_notifications_with_packet_io(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut provider,
+        );
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("two-interface network packet I/O dispatch should collect");
+
+        assert_eq!(provider.requested_ifaces, ["eth1".to_string()]);
+        assert_eq!(provider.tx_sink.packets, [vec![0xde, 0xad, 0xbe, 0xef]]);
+        assert_eq!(provider.rx_source.peek_calls, 0);
+        assert_eq!(result.len(), 2);
+        let first = &result.as_slice()[0];
+        assert_eq!(first.dispatch().device().registration.iface_id(), "eth0");
+        assert!(!first.dispatch().needs_queue_interrupt());
+        assert!(!first.queue_interrupt_signaled());
+        assert!(first.signal_error().is_none());
+        let second = &result.as_slice()[1];
+        assert_eq!(second.dispatch().device().registration.iface_id(), "eth1");
+        assert!(second.dispatch().needs_queue_interrupt());
+        assert!(second.queue_interrupt_signaled());
+        assert!(second.signal_error().is_none());
+        assert_eq!(recorded_lines(&lines), vec![33]);
+        let dispatch = second
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("second interface notification should dispatch");
+        let tx = dispatch
+            .tx_queue_dispatch()
+            .expect("second interface TX queue dispatch should be present");
+        assert_eq!(tx.processed_frames(), 1);
+        assert_eq!(tx.sink_successful_frames(), 1);
+        assert_eq!(
+            read_boot_network_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                0,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            0
+        );
+        assert_eq!(
+            read_boot_network_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                1,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0", "eth1"]);
+        super::record_network_dispatch_metrics(&metrics, &result);
+        let expected = NetworkInterfaceMetrics::default()
+            .with_tx_queue_event_count(1)
+            .with_tx_bytes_count(16)
+            .with_tx_packets_count(1)
+            .with_tx_count(1);
+        assert_eq!(metrics.aggregate_snapshot(), expected);
+        assert_eq!(
+            metrics.per_interface_snapshot(),
+            NetworkInterfaceMetricsByInterface::new().with_interface_metrics("eth1", expected)
+        );
+        assert_eq!(read_network_tx_used_index(&memory), 1);
+        assert_eq!(read_network_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
     fn network_notification_packet_io_dispatch_preserves_pending_on_provider_failure() {
         let (mut memory, mut runtime, mut mmio_dispatcher) =
             boot_runtime_with_networks(&[("eth0", "tap0")]);

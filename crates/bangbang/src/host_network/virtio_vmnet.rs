@@ -2189,9 +2189,29 @@ mod tests {
         iface_id: &str,
         response_queue: MmdsResponseQueue,
     ) -> MmdsOnlyVirtioNetworkPacketIoProviderEntry {
+        mmds_only_provider_entry_with_state(
+            iface_id,
+            MmdsStateHandle::default(),
+            response_queue,
+            SharedMmdsMetrics::default(),
+        )
+    }
+
+    fn mmds_only_provider_entry_with_state(
+        iface_id: &str,
+        mmds_state: MmdsStateHandle,
+        response_queue: MmdsResponseQueue,
+        metrics: SharedMmdsMetrics,
+    ) -> MmdsOnlyVirtioNetworkPacketIoProviderEntry {
+        let detour = MmdsPacketDetour::new(
+            mmds_state,
+            DEFAULT_MMDS_IPV4_ADDRESS,
+            response_queue,
+            metrics,
+        );
         MmdsOnlyVirtioNetworkPacketIoProviderEntry::new(
             iface_id,
-            mmds_only_packet_io(MmdsStateHandle::default(), response_queue),
+            MmdsOnlyVirtioNetworkPacketIo::new(detour).expect("MMDS-only packet I/O should build"),
         )
     }
 
@@ -5062,6 +5082,160 @@ mod tests {
         assert_eq!(
             error.message(),
             "missing MMDS-only packet I/O for interface eth1"
+        );
+    }
+
+    #[test]
+    fn mmds_only_provider_keeps_split_requests_and_responses_on_their_interface() {
+        let first_request_prefix = b"GET /meta-data/host";
+        let request_suffix = b"name HTTP/1.1\r\n\r\n";
+        let suffix_sequence_number = u32::try_from(first_request_prefix.len())
+            .expect("test request prefix length should fit u32");
+        let first_prefix_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, 0, first_request_prefix);
+        let request_suffix_packet = mmds_tcp_packet_from_source(
+            TEST_SOURCE_TCP_PORT,
+            suffix_sequence_number,
+            request_suffix,
+        );
+        let mut memory = tx_memory();
+        let shared_state = MmdsStateHandle::default();
+        let shared_metrics = SharedMmdsMetrics::default();
+        let eth0_response_queue = MmdsResponseQueue::with_capacity(2);
+        let eth1_response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut provider = MmdsOnlyVirtioNetworkPacketIoProvider::new(vec![
+            mmds_only_provider_entry_with_state(
+                "eth0",
+                shared_state.clone(),
+                eth0_response_queue.clone(),
+                shared_metrics.clone(),
+            ),
+            mmds_only_provider_entry_with_state(
+                "eth1",
+                shared_state,
+                eth1_response_queue.clone(),
+                shared_metrics,
+            ),
+        ])
+        .expect("two-interface MMDS-only provider should build");
+
+        let first_prefix_frame = tx_frame(&mut memory, &[(&first_prefix_packet, PAYLOAD_ADDRESS)]);
+        provider.entries[0]
+            .packet_io
+            .tx_sink
+            .transmit_frame(&memory, &first_prefix_frame)
+            .expect("eth0 split request prefix should detour");
+
+        assert!(
+            eth0_response_queue
+                .responses()
+                .expect("eth0 response queue should read")
+                .is_empty()
+        );
+        assert!(
+            eth1_response_queue
+                .responses()
+                .expect("eth1 response queue should read")
+                .is_empty()
+        );
+
+        let peer_suffix_frame = tx_frame(
+            &mut memory,
+            &[(&request_suffix_packet, SECOND_PAYLOAD_ADDRESS)],
+        );
+        provider.entries[1]
+            .packet_io
+            .tx_sink
+            .transmit_frame(&memory, &peer_suffix_frame)
+            .expect("eth1 peer suffix should detour independently");
+
+        assert!(
+            eth0_response_queue
+                .responses()
+                .expect("eth0 response queue should read")
+                .is_empty(),
+            "eth1 suffix must not complete eth0 buffered request"
+        );
+        let eth1_responses = eth1_response_queue
+            .responses()
+            .expect("eth1 response queue should read");
+        assert_eq!(eth1_responses.len(), 1);
+        assert_eq!(
+            mmds_response_body(&eth1_responses[0]),
+            b"MMDS guest HTTP request is malformed."
+        );
+
+        let matching_suffix_frame = tx_frame(
+            &mut memory,
+            &[(&request_suffix_packet, THIRD_PAYLOAD_ADDRESS)],
+        );
+        provider.entries[0]
+            .packet_io
+            .tx_sink
+            .transmit_frame(&memory, &matching_suffix_frame)
+            .expect("eth0 matching suffix should complete buffered request");
+
+        let eth0_responses = eth0_response_queue
+            .responses()
+            .expect("eth0 response queue should read");
+        assert_eq!(eth0_responses.len(), 1);
+        assert_eq!(
+            mmds_response_body(&eth0_responses[0]),
+            b"The MMDS data store is not initialized."
+        );
+        assert_eq!(
+            eth1_response_queue
+                .responses()
+                .expect("eth1 response queue should read"),
+            eth1_responses,
+            "eth0 completion must not mutate eth1 response queue"
+        );
+
+        {
+            let eth0_packet = provider.entries[0]
+                .packet_io
+                .rx_source
+                .peek_packet()
+                .expect("eth0 RX should succeed")
+                .expect("eth0 MMDS response should exist");
+            assert_eq!(
+                mmds_response_body(eth0_packet.bytes()),
+                b"The MMDS data store is not initialized."
+            );
+            provider.entries[0].packet_io.rx_source.consume_packet();
+        }
+        assert!(
+            eth0_response_queue
+                .responses()
+                .expect("eth0 response queue should read")
+                .is_empty()
+        );
+        assert_eq!(
+            eth1_response_queue
+                .responses()
+                .expect("eth1 response queue should read"),
+            eth1_responses,
+            "consuming eth0 RX must not consume eth1 response"
+        );
+
+        {
+            let eth1_packet = provider.entries[1]
+                .packet_io
+                .rx_source
+                .peek_packet()
+                .expect("eth1 RX should succeed")
+                .expect("eth1 MMDS response should exist");
+            assert_eq!(
+                mmds_response_body(eth1_packet.bytes()),
+                b"MMDS guest HTTP request is malformed."
+            );
+            provider.entries[1].packet_io.rx_source.consume_packet();
+        }
+        assert!(
+            eth1_response_queue
+                .responses()
+                .expect("eth1 response queue should read")
+                .is_empty()
         );
     }
 
