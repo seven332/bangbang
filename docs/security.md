@@ -689,6 +689,14 @@ is resource-specific:
   sample or discard it. Individual command admission is not a cross-step
   restore lease. Public snapshot create/load use the aggregate native-v1
   capture/restore commands rather than these raw standalone operations.
+  The retained virtual-timer wait foundation reads the same owner-local raw
+  mask/offset/control/comparator state, converts only the comparator distance
+  through the host Mach timebase, and publishes the configured timer PPI only
+  after an enabled, guest-unmasked due recheck wins exact cancellation
+  arbitration. It does not log timer values, execute a guest trampoline, infer
+  a GIC route, or expose PSCI `CPU_SUSPEND`. Invalid timebase data, duration
+  overflow, owner read failure, and PPI failure remain typed fail-closed
+  errors; lifecycle cancellation never fabricates guest timer wake.
   Native-v1 optional-state classification also fails closed when CPACR enables
   SVE/SME access, PSTATE.SM/ZA is active, or an implemented breakpoint or
   watchpoint is enabled. Category-only rejections expose no register value,

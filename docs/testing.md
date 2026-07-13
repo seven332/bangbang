@@ -74,6 +74,19 @@ and no fixed sleep, then collect two `Canceled` acknowledgements from one stop
 barrier. Repeat complete owner and VM teardown to catch stale cancellation or
 resource leaks.
 
+Retained virtual-timer owner waits require pure tests for the Arm unsigned
+`CVAL <= virtual count` condition, wrapping offset subtraction, Mach timebase
+conversion, injected failures for every owner read and PPI write,
+and deterministic timer-versus-cancel arbitration. If timer completion wins a
+control race, the next raw HVF exit must remain queued so coordinator
+cancellation debt can drain; if cancellation wins, the retained completion
+must consume that debt without setting a PPI. The signed `hvf_lifecycle` gate
+must program real due and future virtual timers under both HVF exit-mask
+states, verify guest-disabled and guest-IMASK waits cancel, and prove shutdown
+drains an indefinite wait. Use Mach deadlines, admission observations, and
+completion acknowledgements rather than fixed sleeps. This foundation does not
+by itself advertise or validate PSCI `CPU_SUSPEND`.
+
 Validation for internal PSCI secondary-power changes must cover both CPU_ON calling
 conventions, exact X1-X3 reads and 32-bit truncation, MPIDR reserved-bit
 validation, all `OFF`/`ON_PENDING`/`ON` transitions and affinity results,

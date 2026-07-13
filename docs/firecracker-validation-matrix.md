@@ -474,6 +474,19 @@ real SPI injection. The composite restore lease/schema, supervisor/public load
 wiring, VMClock restore, guest-observed VMGenID handling, timer EOI policy,
 active optional-state restore, and userspace secret rotation remain deferred.
 
+#1296 extends the lifecycle validation foundation without changing public PSCI
+support. One owner-thread retained virtual-timer wait derives an exact Mach
+deadline from raw offset/control/CVAL state, rechecks an enabled guest-unmasked
+timer, and sets its selected PPI before completion. Identity-bound condvar
+cancellation composes with active-run batch exits: a canceled wait consumes its
+own acknowledgement, while a timer-won race preserves the raw next-run exit
+needed for coordinator cancellation debt. Unit coverage exercises wrapping and
+timebase arithmetic, every owner/PPI failure, operation admission, mixed-batch
+races, and shutdown. Signed HVF coverage proves due/future timers under both
+HVF exit-mask states plus disabled/guest-IMASK cancel and shutdown without fixed
+sleeps. PSCI `CPU_SUSPEND`, coordinator suspended membership, SGI/SPI/direct
+IRQ/FIQ wake, and guest-visible discovery remain deferred to #1295.
+
 ## Update Rule
 
 When a PR changes Firecracker-facing behavior, update this matrix if it changes
