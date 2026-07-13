@@ -3098,6 +3098,7 @@ impl SharedVsockDeviceMetrics {
             .delivered_requests()
             .saturating_add(dispatch.delivered_responses())
             .saturating_add(dispatch.delivered_reset_packets())
+            .saturating_add(dispatch.delivered_shutdown_packets())
             .saturating_add(dispatch.delivered_credit_requests())
             .saturating_add(dispatch.delivered_credit_updates())
             .saturating_add(dispatch.delivered_host_rw_packets());
