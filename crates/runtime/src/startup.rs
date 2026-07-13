@@ -62,9 +62,10 @@ use crate::network::{
     VirtioNetworkTxPacketSink,
 };
 use crate::pmem::{
-    PmemMmioDeviceRegistration, PmemMmioLayout, PmemMmioRegistrationError, PreparedPmemDevice,
-    PreparedPmemDeviceError, PreparedPmemDevices, VirtioPmemDeviceNotificationDispatch,
-    VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus, VirtioPmemMmioHandler,
+    PmemMmioDeviceRegistration, PmemMmioLayout, PmemMmioRegistrationError, PmemUpdate,
+    PmemUpdateError, PreparedPmemDevice, PreparedPmemDeviceError, PreparedPmemDevices,
+    VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus,
+    VirtioPmemMmioHandler,
 };
 use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use crate::serial::{
@@ -1093,6 +1094,13 @@ impl Arm64BootPmemNotificationDispatches {
             .iter()
             .any(Arm64BootPmemNotificationDispatch::needs_queue_interrupt)
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.devices
+            .iter()
+            .filter_map(Arm64BootPmemNotificationDispatch::rate_limiter_retry_after)
+            .min()
+    }
 }
 
 #[derive(Debug)]
@@ -1117,6 +1125,10 @@ impl Arm64BootPmemNotificationDispatch {
     pub fn needs_queue_interrupt(&self) -> bool {
         self.outcome.needs_queue_interrupt()
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.outcome.rate_limiter_retry_after()
+    }
 }
 
 #[derive(Debug)]
@@ -1134,6 +1146,14 @@ impl Arm64BootPmemNotificationOutcome {
                 .completed_dispatch()
                 .is_some_and(crate::pmem::VirtioPmemQueueDispatch::needs_queue_interrupt),
             Self::HandlerLookupFailed(_) => false,
+        }
+    }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.rate_limiter_retry_after(),
+            Self::DispatchFailed(source) => source.rate_limiter_retry_after(),
+            Self::HandlerLookupFailed(_) => None,
         }
     }
 
@@ -2198,6 +2218,14 @@ impl Arm64BootRuntimeResources {
         )
     }
 
+    pub fn update_pmem_rate_limiter(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        update: &PmemUpdate,
+    ) -> Result<bool, PmemUpdateError> {
+        update_pmem_rate_limiter_for_devices(&self.pmem_mmio_devices, mmio_dispatcher, update)
+    }
+
     pub fn vsock_host_read_wakeup_fds(
         &self,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -2615,6 +2643,29 @@ pub fn update_network_interface_rate_limiters_for_devices(
 
     handler.update_network_rate_limiters(update);
     Ok(())
+}
+
+pub fn update_pmem_rate_limiter_for_devices(
+    pmem_devices: &[Arm64BootPmemDevice],
+    mmio_dispatcher: &mut MmioDispatcher,
+    update: &PmemUpdate,
+) -> Result<bool, PmemUpdateError> {
+    let Some(device) = pmem_devices
+        .iter()
+        .find(|device| device.registration.pmem_id() == update.id())
+    else {
+        return Err(PmemUpdateError::UnknownPmem);
+    };
+    let region_id = device.registration.region_id();
+    let handler = mmio_dispatcher
+        .handler_mut::<VirtioPmemMmioHandler>(region_id)
+        .map_err(|source| PmemUpdateError::HandlerLookup {
+            pmem_id: update.id().to_string(),
+            region_id,
+            message: source.to_string(),
+        })?;
+
+    Ok(handler.update_pmem_rate_limiter(update))
 }
 
 pub fn update_block_device_backing_for_devices_with_opened(

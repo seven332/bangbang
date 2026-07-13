@@ -62,7 +62,7 @@ use bangbang_runtime::network::{
     VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition,
     VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
-use bangbang_runtime::pmem::{PmemMmioLayout, PmemUpdateInput};
+use bangbang_runtime::pmem::{PmemMmioLayout, PmemUpdate, PmemUpdateError, PmemUpdateInput};
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
     SerialConfig, SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
@@ -83,11 +83,11 @@ use bangbang_runtime::snapshot_memory::{
 };
 use bangbang_runtime::startup::{
     Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
-    Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
+    Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootPmemDevice,
     balloon_hinting_status_for_device, balloon_stats_for_device, start_balloon_hinting_for_device,
     stop_balloon_hinting_for_device, update_balloon_config_for_device,
     update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
-    update_network_interface_rate_limiters_for_devices,
+    update_network_interface_rate_limiters_for_devices, update_pmem_rate_limiter_for_devices,
 };
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
@@ -393,6 +393,10 @@ pub(crate) trait ProcessSessionDiagnostics {
         Err(NetworkInterfaceUpdateError::ActiveSessionUnavailable)
     }
 
+    fn update_pmem(&mut self, _update: PmemUpdate) -> Result<(), PmemUpdateError> {
+        Err(PmemUpdateError::ActiveSessionUnavailable)
+    }
+
     fn update_balloon(&mut self, _config: BalloonConfig) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -468,6 +472,12 @@ pub(crate) struct BootRunLoopBlockDeviceUpdater {
 #[derive(Debug, Clone)]
 pub(crate) struct BootRunLoopNetworkInterfaceUpdater {
     network_devices: Vec<Arm64BootNetworkDevice>,
+    mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BootRunLoopPmemDeviceUpdater {
+    pmem_devices: Vec<Arm64BootPmemDevice>,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
 }
 
@@ -615,6 +625,27 @@ impl BootRunLoopNetworkInterfaceUpdater {
             &mut dispatcher,
             update,
         )
+    }
+}
+
+impl BootRunLoopPmemDeviceUpdater {
+    fn new(
+        pmem_devices: Vec<Arm64BootPmemDevice>,
+        mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    ) -> Self {
+        Self {
+            pmem_devices,
+            mmio_dispatcher,
+        }
+    }
+
+    fn update_pmem(&self, update: &PmemUpdate) -> Result<bool, PmemUpdateError> {
+        let mut dispatcher = self
+            .mmio_dispatcher
+            .lock()
+            .map_err(|_| PmemUpdateError::MmioDispatcherUnavailable)?;
+
+        update_pmem_rate_limiter_for_devices(&self.pmem_devices, &mut dispatcher, update)
     }
 }
 
@@ -1274,6 +1305,7 @@ where
             VmmAction::LoadSnapshot(input) => self.load_snapshot(input),
             VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
             VmmAction::UpdateNetworkInterface(input) => self.update_network_interface(input),
+            VmmAction::PatchPmem(input) => self.update_pmem(input),
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::PatchBalloonStats(input) => self.update_balloon_statistics(input),
             VmmAction::PatchMemoryHotplug(input) => self.update_memory_hotplug(input),
@@ -1492,6 +1524,31 @@ where
         }
         self.controller
             .commit_network_interface_update(updated_config)?;
+
+        Ok(VmmData::Empty)
+    }
+
+    fn update_pmem(&mut self, input: PmemUpdateInput) -> Result<VmmData, VmmActionError> {
+        if self.controller.instance_info().state == bangbang_runtime::InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::PatchPmem(input).name(),
+                state: self.controller.instance_info().state,
+            });
+        }
+
+        let (update, updated_config) = self.controller.prepare_pmem_update(input)?;
+        if !update.is_noop() {
+            let Some(session) = self.started_session.as_mut() else {
+                return Err(VmmActionError::PmemUpdate(
+                    PmemUpdateError::ActiveSessionUnavailable,
+                ));
+            };
+
+            session
+                .update_pmem(update)
+                .map_err(VmmActionError::PmemUpdate)?;
+        }
+        self.controller.commit_pmem_update(updated_config)?;
 
         Ok(VmmData::Empty)
     }
@@ -2796,6 +2853,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
+        None
+    }
+
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
         None
     }
@@ -2847,6 +2908,8 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         Err(MemoryHotplugStatusError::ActiveSessionUnavailable)
     }
 
+    fn schedule_pmem_retry_wakeup_after_live_update(&mut self, _has_pending_work: bool) {}
+
     fn run_loop_with_network_packet_io<P>(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -2885,6 +2948,13 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
         Some(BootRunLoopNetworkInterfaceUpdater::new(
             self.runtime_resources().network_devices.clone(),
+            self.mmio_dispatcher(),
+        ))
+    }
+
+    fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
+        Some(BootRunLoopPmemDeviceUpdater::new(
+            self.runtime_resources().pmem_mmio_devices.clone(),
             self.mmio_dispatcher(),
         ))
     }
@@ -2949,6 +3019,13 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         requested_size_mib: u64,
     ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
         OwnedHvfArm64BootSession::memory_hotplug_status(self, config, requested_size_mib)
+    }
+
+    fn schedule_pmem_retry_wakeup_after_live_update(&mut self, has_pending_work: bool) {
+        OwnedHvfArm64BootSession::schedule_pmem_retry_wakeup_after_live_update(
+            self,
+            has_pending_work,
+        );
     }
 
     fn run_loop_with_network_packet_io<P>(
@@ -3022,6 +3099,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
+        None
+    }
+
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
         None
     }
@@ -3077,6 +3158,8 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         Err(MemoryHotplugStatusError::ActiveSessionUnavailable)
     }
 
+    fn schedule_pmem_retry_wakeup_after_live_update(&mut self, _has_pending_work: bool) {}
+
     fn run_loop(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -3112,6 +3195,13 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
         Some(BootRunLoopNetworkInterfaceUpdater::new(
             self.runtime_resources().network_devices.clone(),
+            self.mmio_dispatcher(),
+        ))
+    }
+
+    fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
+        Some(BootRunLoopPmemDeviceUpdater::new(
+            self.runtime_resources().pmem_mmio_devices.clone(),
             self.mmio_dispatcher(),
         ))
     }
@@ -3182,6 +3272,13 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         OwnedHvfArm64BootSession::memory_hotplug_status(self, config, requested_size_mib)
     }
 
+    fn schedule_pmem_retry_wakeup_after_live_update(&mut self, has_pending_work: bool) {
+        OwnedHvfArm64BootSession::schedule_pmem_retry_wakeup_after_live_update(
+            self,
+            has_pending_work,
+        );
+    }
+
     fn run_loop(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -3225,6 +3322,10 @@ where
 
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
         self.session.network_interface_updater()
+    }
+
+    fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
+        self.session.pmem_device_updater()
     }
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
@@ -3281,6 +3382,11 @@ where
     ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
         self.session
             .memory_hotplug_status(config, requested_size_mib)
+    }
+
+    fn schedule_pmem_retry_wakeup_after_live_update(&mut self, has_pending_work: bool) {
+        self.session
+            .schedule_pmem_retry_wakeup_after_live_update(has_pending_work);
     }
 
     fn run_loop(
@@ -3779,6 +3885,20 @@ where
     }
 }
 
+fn pmem_update_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, PmemUpdateError>,
+) -> PmemUpdateError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        other => PmemUpdateError::ActiveSessionCommand {
+            message: other.to_string(),
+        },
+    }
+}
+
 fn balloon_update_error_from_boot_run_loop_command<C>(
     err: BootRunLoopCommandError<C, BalloonUpdateError>,
 ) -> BalloonUpdateError
@@ -4126,6 +4246,7 @@ where
     control: S::Control,
     block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
     network_interface_updater: Option<BootRunLoopNetworkInterfaceUpdater>,
+    pmem_device_updater: Option<BootRunLoopPmemDeviceUpdater>,
     balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
     block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
     pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
@@ -4224,6 +4345,7 @@ where
         let control = session.run_loop_control();
         let block_device_updater = session.block_device_updater();
         let network_interface_updater = session.network_interface_updater();
+        let pmem_device_updater = session.pmem_device_updater();
         let balloon_device_updater = session.balloon_device_updater();
         let block_device_metrics = session.shared_block_device_metrics();
         let pmem_device_metrics = session.shared_pmem_device_metrics();
@@ -4350,6 +4472,7 @@ where
             control,
             block_device_updater,
             network_interface_updater,
+            pmem_device_updater,
             balloon_device_updater,
             block_device_metrics,
             pmem_device_metrics,
@@ -4847,6 +4970,27 @@ where
             .map_err(network_interface_update_error_from_boot_run_loop_command)
     }
 
+    fn update_pmem(&mut self, update: PmemUpdate) -> Result<(), PmemUpdateError> {
+        let Some(updater) = self.pmem_device_updater.as_ref() else {
+            return Err(PmemUpdateError::ActiveSessionUnavailable);
+        };
+
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(PmemUpdateError::ActiveSessionUnavailable);
+        }
+
+        let updater = updater.clone();
+        self.run_command(move |session| {
+            let has_pending_work = updater.update_pmem(&update)?;
+            session.schedule_pmem_retry_wakeup_after_live_update(has_pending_work);
+            Ok(())
+        })
+        .map_err(pmem_update_error_from_boot_run_loop_command)
+    }
+
     fn update_balloon(&mut self, config: BalloonConfig) -> Result<(), BalloonUpdateError> {
         let Some(updater) = self.balloon_device_updater.as_ref() else {
             return Err(BalloonUpdateError::ActiveSessionUnavailable);
@@ -5121,6 +5265,10 @@ mod tests {
         NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput, NetworkMmioLayout,
         NetworkRateLimiterConfig, NetworkTokenBucketConfig, PreparedNetworkDevices,
     };
+    use bangbang_runtime::pmem::{
+        PmemConfig, PmemConfigInput, PmemConfigs, PmemMmioLayout, PmemRateLimiterConfig,
+        PmemTokenBucketConfig, PmemUpdate, PmemUpdateError, PmemUpdateInput, PreparedPmemDevices,
+    };
     use bangbang_runtime::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialConfigInput, SerialOutput,
         SerialOutputMetrics, SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
@@ -5140,7 +5288,7 @@ mod tests {
     use bangbang_runtime::snapshot_memory::{SnapshotMemoryBinding, write_snapshot_memory_image};
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
-        Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
+        Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootPmemDevice,
     };
     use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
     use bangbang_runtime::vsock::VsockConfigInput;
@@ -5158,9 +5306,9 @@ mod tests {
         BootRunLoopBlockDeviceUpdater, BootRunLoopCommandAdmission,
         BootRunLoopCommandAdmissionState, BootRunLoopCommandError,
         BootRunLoopCommandSubmissionError, BootRunLoopControl, BootRunLoopNetworkInterfaceUpdater,
-        BootRunLoopSession, BootRunLoopSupervisor, BootRunLoopWorkerStatus,
-        DEFAULT_BALLOON_MMIO_BASE, DEFAULT_BALLOON_MMIO_REGION_ID, DEFAULT_BLOCK_MMIO_BASE,
-        DEFAULT_BLOCK_MMIO_REGION_ID, DEFAULT_BOOT_TIMER_MMIO_BASE,
+        BootRunLoopPmemDeviceUpdater, BootRunLoopSession, BootRunLoopSupervisor,
+        BootRunLoopWorkerStatus, DEFAULT_BALLOON_MMIO_BASE, DEFAULT_BALLOON_MMIO_REGION_ID,
+        DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID, DEFAULT_BOOT_TIMER_MMIO_BASE,
         DEFAULT_BOOT_TIMER_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE,
         DEFAULT_ENTROPY_MMIO_REGION_ID, DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT,
         DEFAULT_MEMORY_HOTPLUG_MMIO_BASE, DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID,
@@ -5450,6 +5598,48 @@ mod tests {
         BootRunLoopNetworkInterfaceUpdater::new(network_devices, dispatcher)
     }
 
+    fn pmem_device_updater_fixture(pmem_id: &str) -> BootRunLoopPmemDeviceUpdater {
+        let backing = TempFilePath::create_with_bytes("pmem-updater", b"pmem");
+        let config = PmemConfig::try_from(PmemConfigInput::new(
+            pmem_id,
+            backing.path().display().to_string(),
+        ))
+        .expect("pmem config should validate");
+        let mut configs = PmemConfigs::new();
+        configs.upsert(config);
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), 0x10_000)
+                .expect("fixture guest memory range should validate"),
+        ])
+        .expect("fixture guest memory layout should validate");
+        let devices = PreparedPmemDevices::from_configs(&configs, &layout)
+            .expect("prepared pmem device should build")
+            .register_mmio(PmemMmioLayout::new(
+                DEFAULT_PMEM_MMIO_BASE,
+                DEFAULT_PMEM_MMIO_REGION_ID,
+            ))
+            .expect("pmem MMIO device should register");
+        let (dispatcher, registrations, _prepared) = devices.into_parts();
+        let pmem_devices = registrations
+            .into_iter()
+            .map(|registration| {
+                let range = registration.region().range();
+                Arm64BootPmemDevice {
+                    registration,
+                    fdt_device: Arm64FdtVirtioMmioDevice {
+                        region: Arm64FdtRegion {
+                            base: range.start().raw_value(),
+                            size: range.size(),
+                        },
+                        interrupt_line: GuestInterruptLine::new(32)
+                            .expect("test interrupt line should validate"),
+                    },
+                }
+            })
+            .collect();
+        BootRunLoopPmemDeviceUpdater::new(pmem_devices, Arc::new(Mutex::new(dispatcher)))
+    }
+
     impl Drop for TempFilePath {
         fn drop(&mut self) {
             let _ = remove_file(&self.path);
@@ -5482,6 +5672,9 @@ mod tests {
         network_update_count: usize,
         last_network_update: Option<NetworkInterfaceUpdate>,
         network_update_result: Option<NetworkInterfaceUpdateError>,
+        pmem_update_count: usize,
+        last_pmem_update: Option<PmemUpdate>,
+        pmem_update_result: Option<PmemUpdateError>,
         balloon_update_count: usize,
         last_balloon_update_mib: Option<u32>,
         balloon_update_result: Option<BalloonUpdateError>,
@@ -5529,6 +5722,9 @@ mod tests {
                 network_update_count: 0,
                 last_network_update: None,
                 network_update_result: None,
+                pmem_update_count: 0,
+                last_pmem_update: None,
+                pmem_update_result: None,
                 balloon_update_count: 0,
                 last_balloon_update_mib: None,
                 balloon_update_result: None,
@@ -5565,6 +5761,12 @@ mod tests {
         fn with_network_update_result(id: u64, result: NetworkInterfaceUpdateError) -> Self {
             let mut session = Self::new(id);
             session.network_update_result = Some(result);
+            session
+        }
+
+        fn with_pmem_update_result(id: u64, result: PmemUpdateError) -> Self {
+            let mut session = Self::new(id);
+            session.pmem_update_result = Some(result);
             session
         }
 
@@ -5705,6 +5907,15 @@ mod tests {
             self.network_update_count += 1;
             self.last_network_update = Some(update);
             match self.network_update_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn update_pmem(&mut self, update: PmemUpdate) -> Result<(), PmemUpdateError> {
+            self.pmem_update_count += 1;
+            self.last_pmem_update = Some(update);
+            match self.pmem_update_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
             }
@@ -6318,6 +6529,8 @@ mod tests {
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
         network_interface_updater: Option<BootRunLoopNetworkInterfaceUpdater>,
+        pmem_device_updater: Option<BootRunLoopPmemDeviceUpdater>,
+        pmem_retry_wakeup_after_updates: Arc<Mutex<Vec<bool>>>,
         block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
         pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
@@ -6354,6 +6567,8 @@ mod tests {
                 )]))),
                 block_device_updater: None,
                 network_interface_updater: None,
+                pmem_device_updater: None,
+                pmem_retry_wakeup_after_updates: Arc::default(),
                 block_device_metrics: None,
                 pmem_device_metrics: None,
                 balloon_device_metrics: None,
@@ -6385,6 +6600,10 @@ mod tests {
 
         fn memory_hotplug_status_requests(&self) -> Arc<Mutex<Vec<u64>>> {
             Arc::clone(&self.memory_hotplug_status_requests)
+        }
+
+        fn pmem_retry_wakeup_after_updates(&self) -> Arc<Mutex<Vec<bool>>> {
+            Arc::clone(&self.pmem_retry_wakeup_after_updates)
         }
 
         fn snapshot_auxiliary_quiescence(&self) -> Arc<FakeSnapshotAuxiliaryQuiescenceState> {
@@ -6467,6 +6686,11 @@ mod tests {
             updater: BootRunLoopNetworkInterfaceUpdater,
         ) -> Self {
             self.network_interface_updater = Some(updater);
+            self
+        }
+
+        fn with_pmem_device_updater(mut self, updater: BootRunLoopPmemDeviceUpdater) -> Self {
+            self.pmem_device_updater = Some(updater);
             self
         }
 
@@ -6586,6 +6810,17 @@ mod tests {
 
         fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
             self.network_interface_updater.clone()
+        }
+
+        fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
+            self.pmem_device_updater.clone()
+        }
+
+        fn schedule_pmem_retry_wakeup_after_live_update(&mut self, has_pending_work: bool) {
+            self.pmem_retry_wakeup_after_updates
+                .lock()
+                .expect("fake pmem retry updates should lock")
+                .push(has_pending_work);
         }
 
         fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
@@ -8087,6 +8322,7 @@ mod tests {
             | VmmActionError::MemoryHotplugUnsupported
             | VmmActionError::PmemConfig(_)
             | VmmActionError::PmemUpdate(_)
+            | VmmActionError::PmemUpdateUnsupported
             | VmmActionError::PmemUnsupported
             | VmmActionError::SerialConfig(_)
             | VmmActionError::SnapshotCreate(_)
@@ -10341,6 +10577,55 @@ mod tests {
     }
 
     #[test]
+    fn boot_run_loop_supervisor_updates_exact_pmem_and_schedules_retry_in_same_command() {
+        let updater = pmem_device_updater_fixture("pmem0");
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, _max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_pmem_device_updater(updater);
+        let scheduled = session.pmem_retry_wakeup_after_updates();
+        let mut supervisor = BootRunLoopSupervisor::start_paused(
+            session,
+            NonZeroUsize::new(70).expect("non-zero limit"),
+        )
+        .expect("paused supervisor should start");
+        let update =
+            PmemUpdate::try_from(PmemUpdateInput::new("pmem0", "pmem0").with_rate_limiter(
+                PmemRateLimiterConfig::new(None, Some(PmemTokenBucketConfig::new(8, None, 100))),
+            ))
+            .expect("pmem limiter update should validate");
+
+        supervisor
+            .update_pmem(update)
+            .expect("matching pmem update should run on worker");
+        let missing = PmemUpdate::try_from(
+            PmemUpdateInput::new("missing", "missing").with_rate_limiter(
+                PmemRateLimiterConfig::new(None, Some(PmemTokenBucketConfig::new(4, None, 100))),
+            ),
+        )
+        .expect("missing pmem update should validate structurally");
+        let err = supervisor
+            .update_pmem(missing)
+            .expect_err("non-owned pmem id should fail on the worker");
+
+        assert_eq!(err, PmemUpdateError::UnknownPmem);
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert_eq!(
+            *scheduled
+                .lock()
+                .expect("scheduled pmem retries should lock"),
+            [false]
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn boot_run_loop_supervisor_maps_full_network_update_command_queue() {
         let updater = network_interface_updater_fixture("eth0");
         let control = FakeRunLoopControl::default();
@@ -11922,6 +12207,188 @@ mod tests {
             .as_ref()
             .expect("started session should remain available");
         assert_eq!(session.network_update_count, 1);
+    }
+
+    #[test]
+    fn runtime_pmem_rate_limiter_update_commits_after_active_session_success() {
+        let initial_bandwidth = PmemTokenBucketConfig::new(4096, Some(8192), 100);
+        let replacement_ops = PmemTokenBucketConfig::new(16, Some(4), 250);
+        let mut vmm = configured_vmm(FakeStarter::success(41));
+        vmm.handle_action(VmmAction::PutPmem(
+            PmemConfigInput::new("pmem0", "/tmp/pmem.img")
+                .with_rate_limiter(PmemRateLimiterConfig::new(Some(initial_bandwidth), None)),
+        ))
+        .expect("initial pmem should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        let limiter_update = PmemRateLimiterConfig::new(None, Some(replacement_ops));
+
+        let data = vmm
+            .handle_action(VmmAction::PatchPmem(
+                PmemUpdateInput::new("pmem0", "pmem0").with_rate_limiter(limiter_update),
+            ))
+            .expect("runtime pmem limiter update should succeed");
+
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(
+            vmm.controller.pmem_configs()[0].rate_limiter(),
+            Some(PmemRateLimiterConfig::new(
+                Some(initial_bandwidth),
+                Some(replacement_ops),
+            ))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pmem_update_count, 1);
+        let active_update = session
+            .last_pmem_update
+            .as_ref()
+            .expect("active pmem update should be recorded");
+        assert_eq!(active_update.id(), "pmem0");
+        assert_eq!(active_update.rate_limiter(), Some(limiter_update));
+    }
+
+    #[test]
+    fn runtime_pmem_rate_limiter_noop_skips_active_session() {
+        let bandwidth = PmemTokenBucketConfig::new(4096, None, 100);
+        let mut vmm = configured_vmm(FakeStarter::success(42));
+        vmm.handle_action(VmmAction::PutPmem(
+            PmemConfigInput::new("pmem0", "/tmp/pmem.img")
+                .with_rate_limiter(PmemRateLimiterConfig::new(Some(bandwidth), None)),
+        ))
+        .expect("initial pmem should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let data = vmm
+            .handle_action(VmmAction::PatchPmem(PmemUpdateInput::new("pmem0", "pmem0")))
+            .expect("runtime pmem no-op should succeed");
+
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(
+            vmm.controller.pmem_configs()[0].rate_limiter(),
+            Some(PmemRateLimiterConfig::new(Some(bandwidth), None))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pmem_update_count, 0);
+        assert!(session.last_pmem_update.is_none());
+    }
+
+    #[test]
+    fn runtime_pmem_rate_limiter_update_failure_preserves_stored_config() {
+        let initial_bandwidth = PmemTokenBucketConfig::new(4096, None, 100);
+        let replacement_ops = PmemTokenBucketConfig::new(16, None, 250);
+        let expected_error = PmemUpdateError::ActiveSessionCommand {
+            message: "test worker rejected pmem update".to_string(),
+        };
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_pmem_update_result(43, expected_error.clone()),
+        ));
+        vmm.handle_action(VmmAction::PutPmem(
+            PmemConfigInput::new("pmem0", "/tmp/pmem.img")
+                .with_rate_limiter(PmemRateLimiterConfig::new(Some(initial_bandwidth), None)),
+        ))
+        .expect("initial pmem should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::PatchPmem(
+                PmemUpdateInput::new("pmem0", "pmem0")
+                    .with_rate_limiter(PmemRateLimiterConfig::new(None, Some(replacement_ops))),
+            ))
+            .expect_err("failed active pmem update should fail action");
+
+        assert_eq!(err, VmmActionError::PmemUpdate(expected_error));
+        assert_eq!(
+            vmm.controller.pmem_configs()[0].rate_limiter(),
+            Some(PmemRateLimiterConfig::new(Some(initial_bandwidth), None))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pmem_update_count, 1);
+        assert_eq!(
+            session
+                .last_pmem_update
+                .as_ref()
+                .and_then(PmemUpdate::rate_limiter),
+            Some(PmemRateLimiterConfig::new(None, Some(replacement_ops)))
+        );
+    }
+
+    #[test]
+    fn runtime_pmem_rate_limiter_unknown_device_skips_active_session() {
+        let mut vmm = configured_vmm(FakeStarter::success(44));
+        vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            "/tmp/pmem.img",
+        )))
+        .expect("initial pmem should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::PatchPmem(
+                PmemUpdateInput::new("missing", "missing").with_rate_limiter(
+                    PmemRateLimiterConfig::new(
+                        None,
+                        Some(PmemTokenBucketConfig::new(8, None, 100)),
+                    ),
+                ),
+            ))
+            .expect_err("unknown pmem should fail action");
+
+        assert_eq!(
+            err,
+            VmmActionError::PmemUpdate(PmemUpdateError::UnknownPmem)
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pmem_update_count, 0);
+        assert!(session.last_pmem_update.is_none());
+    }
+
+    #[test]
+    fn runtime_pmem_rate_limiter_update_succeeds_while_paused() {
+        let ops = PmemTokenBucketConfig::new(8, None, 100);
+        let mut vmm = configured_vmm(FakeStarter::success(45));
+        vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            "/tmp/pmem.img",
+        )))
+        .expect("initial pmem should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+
+        let data = vmm
+            .handle_action(VmmAction::PatchPmem(
+                PmemUpdateInput::new("pmem0", "pmem0")
+                    .with_rate_limiter(PmemRateLimiterConfig::new(None, Some(ops))),
+            ))
+            .expect("paused runtime pmem limiter update should succeed");
+
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert_eq!(
+            vmm.controller.pmem_configs()[0].rate_limiter(),
+            Some(PmemRateLimiterConfig::new(None, Some(ops)))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pmem_update_count, 1);
     }
 
     #[test]

@@ -398,6 +398,7 @@ pub enum VmmActionError {
     MemoryHotplugUnsupported,
     PmemConfig(pmem::PmemConfigError),
     PmemUpdate(pmem::PmemUpdateError),
+    PmemUpdateUnsupported,
     PmemUnsupported,
     SerialConfig(serial::SerialConfigError),
     SnapshotCreate(BackendError),
@@ -455,6 +456,7 @@ impl fmt::Display for VmmActionError {
             Self::MemoryHotplugUnsupported => f.write_str("Memory hotplug is not supported."),
             Self::PmemConfig(err) => write!(f, "{err}"),
             Self::PmemUpdate(err) => write!(f, "{err}"),
+            Self::PmemUpdateUnsupported => f.write_str("Pmem updates are not supported."),
             Self::PmemUnsupported => f.write_str("Pmem device is not supported."),
             Self::SerialConfig(err) => write!(f, "{err}"),
             Self::SnapshotCreate(err) => write!(f, "failed to create snapshot: {err}"),
@@ -505,6 +507,7 @@ impl std::error::Error for VmmActionError {
             | Self::MissingBootSource
             | Self::NetworkInterfaceUpdateUnsupported
             | Self::MemoryHotplugUnsupported
+            | Self::PmemUpdateUnsupported
             | Self::PmemUnsupported
             | Self::SnapshotUnsupported
             | Self::UnsupportedAction(_)
@@ -703,6 +706,21 @@ impl VmmController {
         self.network_interface_configs
             .commit_update(config)
             .map_err(VmmActionError::NetworkInterfaceUpdate)
+    }
+
+    pub fn prepare_pmem_update(
+        &self,
+        input: pmem::PmemUpdateInput,
+    ) -> Result<(pmem::PmemUpdate, pmem::PmemConfig), VmmActionError> {
+        self.pmem_configs
+            .prepare_update(input)
+            .map_err(VmmActionError::PmemUpdate)
+    }
+
+    pub fn commit_pmem_update(&mut self, config: pmem::PmemConfig) -> Result<(), VmmActionError> {
+        self.pmem_configs
+            .commit_update(config)
+            .map_err(VmmActionError::PmemUpdate)
     }
 
     fn validate_balloon_config_target_against_memory(
@@ -1387,9 +1405,10 @@ impl VmmController {
                     });
                 }
 
-                self.pmem_configs
-                    .validate_update(input)
-                    .map_err(VmmActionError::PmemUpdate)?;
+                let (update, _) = self.prepare_pmem_update(input)?;
+                if !update.is_noop() {
+                    return Err(VmmActionError::PmemUpdateUnsupported);
+                }
 
                 Ok(VmmData::Empty)
             }
@@ -1742,7 +1761,10 @@ mod tests {
             NetworkInterfaceConfigInput, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
             NetworkRateLimiterConfig, NetworkTokenBucketConfig,
         },
-        pmem::{PmemConfigError, PmemConfigInput, PmemUpdateError, PmemUpdateInput},
+        pmem::{
+            PmemConfigError, PmemConfigInput, PmemRateLimiterConfig, PmemTokenBucketConfig,
+            PmemUpdateError, PmemUpdateInput,
+        },
         serial::{SerialConfigError, SerialConfigInput, SerialRateLimiterConfig},
         snapshot::{
             SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend,
@@ -1805,6 +1827,10 @@ mod tests {
 
     fn pmem_update_input(id: &str) -> PmemUpdateInput {
         PmemUpdateInput::new(id, id)
+    }
+
+    const fn pmem_rate_limiter() -> PmemRateLimiterConfig {
+        PmemRateLimiterConfig::new(None, Some(PmemTokenBucketConfig::new(1, None, 100)))
     }
 
     fn vsock_input(guest_cid: u32, uds_path: &str) -> VsockConfigInput {
@@ -3741,26 +3767,27 @@ mod tests {
     }
 
     #[test]
-    fn put_pmem_rejects_rate_limiter_without_mutating() {
+    fn put_pmem_accepts_rate_limiter_and_replaces_existing_config() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem-old.img")))
             .expect("pmem config should be stored");
 
-        let err = controller
+        let data = controller
             .handle_action(VmmAction::PutPmem(
-                pmem_input("pmem0", "/tmp/pmem-new.img").with_rate_limiter_configured(),
+                pmem_input("pmem0", "/tmp/pmem-new.img").with_rate_limiter(pmem_rate_limiter()),
             ))
-            .expect_err("configured pmem rate limiter should fail");
+            .expect("configured pmem rate limiter should be stored");
 
-        assert_eq!(
-            err,
-            VmmActionError::PmemConfig(PmemConfigError::UnsupportedRateLimiter)
-        );
+        assert_eq!(data, VmmData::Empty);
         assert_eq!(controller.pmem_configs().len(), 1);
         assert_eq!(
             controller.pmem_configs()[0].path_on_host(),
-            "/tmp/pmem-old.img"
+            "/tmp/pmem-new.img"
+        );
+        assert_eq!(
+            controller.pmem_configs()[0].rate_limiter(),
+            Some(pmem_rate_limiter())
         );
     }
 
@@ -3938,7 +3965,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_pmem_rejects_configured_rate_limiter_without_mutating() {
+    fn patch_pmem_reaches_backend_boundary_without_mutating() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem.img")))
@@ -3947,15 +3974,11 @@ mod tests {
 
         let err = controller
             .handle_action(VmmAction::PatchPmem(
-                pmem_update_input("pmem0").with_rate_limiter_configured(),
+                pmem_update_input("pmem0").with_rate_limiter(pmem_rate_limiter()),
             ))
-            .expect_err("configured pmem rate limiter should fail");
+            .expect_err("standalone controller cannot apply a live pmem update");
 
-        assert_eq!(
-            err,
-            VmmActionError::PmemUpdate(PmemUpdateError::UnsupportedRateLimiter)
-        );
-        assert_eq!(err.to_string(), "pmem rate_limiter is not supported");
+        assert_eq!(err, VmmActionError::PmemUpdateUnsupported);
         assert_eq!(controller.instance_info().state, InstanceState::Running);
         assert_eq!(controller.pmem_configs().len(), 1);
         assert_eq!(controller.pmem_configs()[0].id(), "pmem0");

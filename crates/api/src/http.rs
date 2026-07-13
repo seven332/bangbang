@@ -588,6 +588,12 @@ pub struct NetworkRateLimiterRequest {
     ops: Option<TokenBucketRequest>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmemRateLimiterRequest {
+    bandwidth: Option<TokenBucketRequest>,
+    ops: Option<TokenBucketRequest>,
+}
+
 type RateLimiterBuckets = (Option<TokenBucketRequest>, Option<TokenBucketRequest>);
 
 impl DriveRateLimiterRequest {
@@ -625,6 +631,23 @@ impl EntropyRateLimiterRequest {
 }
 
 impl NetworkRateLimiterRequest {
+    pub const fn new(
+        bandwidth: Option<TokenBucketRequest>,
+        ops: Option<TokenBucketRequest>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
+    pub const fn bandwidth(self) -> Option<TokenBucketRequest> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<TokenBucketRequest> {
+        self.ops
+    }
+}
+
+impl PmemRateLimiterRequest {
     pub const fn new(
         bandwidth: Option<TokenBucketRequest>,
         ops: Option<TokenBucketRequest>,
@@ -1229,7 +1252,7 @@ pub struct PmemConfigRequest {
     path_on_host: String,
     root_device: bool,
     read_only: bool,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<PmemRateLimiterRequest>,
 }
 
 impl PmemConfigRequest {
@@ -1253,8 +1276,12 @@ impl PmemConfigRequest {
         self.read_only
     }
 
+    pub const fn rate_limiter(&self) -> Option<PmemRateLimiterRequest> {
+        self.rate_limiter
+    }
+
     pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+        self.rate_limiter.is_some()
     }
 }
 
@@ -1262,7 +1289,7 @@ impl PmemConfigRequest {
 pub struct PmemPatchRequest {
     path_pmem_id: String,
     body_pmem_id: String,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<PmemRateLimiterRequest>,
 }
 
 impl PmemPatchRequest {
@@ -1274,8 +1301,12 @@ impl PmemPatchRequest {
         &self.body_pmem_id
     }
 
+    pub const fn rate_limiter(&self) -> Option<PmemRateLimiterRequest> {
+        self.rate_limiter
+    }
+
     pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+        self.rate_limiter.is_some()
     }
 }
 
@@ -1463,6 +1494,7 @@ pub struct PmemConfigResponse {
     path_on_host: String,
     root_device: bool,
     read_only: bool,
+    rate_limiter: Option<PmemRateLimiterRequest>,
 }
 
 impl PmemConfigResponse {
@@ -1477,7 +1509,17 @@ impl PmemConfigResponse {
             path_on_host: path_on_host.into(),
             root_device,
             read_only,
+            rate_limiter: None,
         }
+    }
+
+    pub const fn with_rate_limiter(mut self, rate_limiter: PmemRateLimiterRequest) -> Self {
+        self.rate_limiter = Some(rate_limiter);
+        self
+    }
+
+    pub const fn rate_limiter(&self) -> Option<PmemRateLimiterRequest> {
+        self.rate_limiter
     }
 }
 
@@ -2605,12 +2647,21 @@ fn network_interface_config_response_value(
 }
 
 fn pmem_config_response_value(pmem: &PmemConfigResponse) -> serde_json::Value {
-    serde_json::json!({
-        "id": pmem.id.clone(),
-        "path_on_host": pmem.path_on_host.clone(),
-        "read_only": pmem.read_only,
-        "root_device": pmem.root_device,
-    })
+    let mut body = serde_json::Map::new();
+    body.insert("id".to_string(), serde_json::Value::String(pmem.id.clone()));
+    body.insert(
+        "path_on_host".to_string(),
+        serde_json::Value::String(pmem.path_on_host.clone()),
+    );
+    body.insert("read_only".to_string(), pmem.read_only.into());
+    body.insert("root_device".to_string(), pmem.root_device.into());
+    if let Some(rate_limiter) = pmem.rate_limiter() {
+        body.insert(
+            "rate_limiter".to_string(),
+            pmem_rate_limiter_response_value(rate_limiter),
+        );
+    }
+    serde_json::Value::Object(body)
 }
 
 fn memory_hotplug_config_response_value(config: &MemoryHotplugConfigResponse) -> serde_json::Value {
@@ -2645,6 +2696,10 @@ fn drive_rate_limiter_response_value(rate_limiter: DriveRateLimiterRequest) -> s
 fn network_rate_limiter_response_value(
     rate_limiter: NetworkRateLimiterRequest,
 ) -> serde_json::Value {
+    rate_limiter_response_value(rate_limiter.bandwidth(), rate_limiter.ops())
+}
+
+fn pmem_rate_limiter_response_value(rate_limiter: PmemRateLimiterRequest) -> serde_json::Value {
     rate_limiter_response_value(rate_limiter.bandwidth(), rate_limiter.ops())
 }
 
@@ -3424,13 +3479,7 @@ fn parse_drive_patch_request(path_drive_id: &str, body: &[u8]) -> Result<ApiRequ
 fn parse_pmem_config_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<PmemConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let rate_limiter_configured = match &body.rate_limiter {
-        Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
-            rate_limiter_configured(rate_limiter.as_value())?
-        }
-        None => false,
-    };
+    let rate_limiter = parse_pmem_rate_limiter(body.rate_limiter.as_ref())?;
     if path_pmem_id != body.id {
         return Err(RequestError::MismatchedPmemId);
     }
@@ -3441,20 +3490,14 @@ fn parse_pmem_config_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiReque
         path_on_host: body.path_on_host,
         root_device: body.root_device,
         read_only: body.read_only,
-        rate_limiter_configured,
+        rate_limiter,
     })))
 }
 
 fn parse_pmem_patch_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<PmemPatchRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let rate_limiter_configured = match &body.rate_limiter {
-        Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
-            rate_limiter_configured(rate_limiter.as_value())?
-        }
-        None => false,
-    };
+    let rate_limiter = parse_pmem_rate_limiter(body.rate_limiter.as_ref())?;
     if path_pmem_id != body.id {
         return Err(RequestError::MismatchedPmemId);
     }
@@ -3462,7 +3505,7 @@ fn parse_pmem_patch_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiReques
     Ok(ApiRequest::PatchPmem(Box::new(PmemPatchRequest {
         path_pmem_id: path_pmem_id.to_string(),
         body_pmem_id: body.id,
-        rate_limiter_configured,
+        rate_limiter,
     })))
 }
 
@@ -3672,17 +3715,6 @@ fn validate_rate_limiter_config(value: &serde_json::Value) -> Result<(), Request
     Ok(())
 }
 
-fn rate_limiter_configured(value: &serde_json::Value) -> Result<bool, RequestError> {
-    let rate_limiter = value.as_object().ok_or(RequestError::MalformedRequest)?;
-
-    Ok(rate_limiter
-        .get(RATE_LIMITER_BANDWIDTH_FIELD)
-        .is_some_and(|bucket| !bucket.is_null())
-        || rate_limiter
-            .get(RATE_LIMITER_OPS_FIELD)
-            .is_some_and(|bucket| !bucket.is_null()))
-}
-
 fn parse_serial_token_bucket(
     value: Option<&JsonValueWithoutDuplicateObjectKeys>,
 ) -> Result<Option<TokenBucketRequest>, RequestError> {
@@ -3723,6 +3755,13 @@ fn parse_network_rate_limiter(
     parse_rate_limiter_buckets(value).map(|buckets| {
         buckets.map(|(bandwidth, ops)| NetworkRateLimiterRequest::new(bandwidth, ops))
     })
+}
+
+fn parse_pmem_rate_limiter(
+    value: Option<&JsonValueWithoutDuplicateObjectKeys>,
+) -> Result<Option<PmemRateLimiterRequest>, RequestError> {
+    parse_rate_limiter_buckets(value)
+        .map(|buckets| buckets.map(|(bandwidth, ops)| PmemRateLimiterRequest::new(bandwidth, ops)))
 }
 
 fn parse_rate_limiter_buckets(
@@ -7578,6 +7617,23 @@ mod tests {
                 other => panic!("unexpected pmem request for {route}: {other:?}"),
             }
         }
+
+        let parsed = parse_request(&request_with_body(
+            "PATCH",
+            "/pmem/pmem0",
+            r#"{"id":"pmem0","rate_limiter":{"bandwidth":{"size":4096,"one_time_burst":8192,"refill_time":100},"ops":{"size":10,"one_time_burst":null,"refill_time":1000}}}"#,
+        ))
+        .expect("typed pmem limiter should parse");
+        let ApiRequest::PatchPmem(config) = parsed else {
+            panic!("expected pmem patch request");
+        };
+        assert_eq!(
+            config.rate_limiter(),
+            Some(PmemRateLimiterRequest::new(
+                Some(TokenBucketRequest::new(4096, Some(8192), 100)),
+                Some(TokenBucketRequest::new(10, None, 1000)),
+            ))
+        );
     }
 
     #[test]
@@ -8453,7 +8509,11 @@ mod tests {
         let vsock = VsockConfigResponse::new(3, "./v.sock");
         let memory_hotplug = MemoryHotplugConfigResponse::new(1024, 2, 128);
         let balloon = BalloonConfigResponse::new(128, true, 60, true, false);
-        let pmem = PmemConfigResponse::new("pmem0", "/tmp/pmem.img", true, false);
+        let pmem = PmemConfigResponse::new("pmem0", "/tmp/pmem.img", true, false)
+            .with_rate_limiter(PmemRateLimiterRequest::new(
+                Some(TokenBucketRequest::new(4096, Some(8192), 100)),
+                Some(TokenBucketRequest::new(10, None, 1000)),
+            ));
         let response = HttpResponse::vm_config(
             &VmConfigResponse::new(
                 MachineConfigResponse::new(2, 256, false, false, "None"),
@@ -8549,6 +8609,18 @@ mod tests {
                     {
                         "id": "pmem0",
                         "path_on_host": "/tmp/pmem.img",
+                        "rate_limiter": {
+                            "bandwidth": {
+                                "one_time_burst": 8192,
+                                "refill_time": 100,
+                                "size": 4096,
+                            },
+                            "ops": {
+                                "one_time_burst": null,
+                                "refill_time": 1000,
+                                "size": 10,
+                            },
+                        },
                         "read_only": false,
                         "root_device": true,
                     },

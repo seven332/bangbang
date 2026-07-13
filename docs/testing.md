@@ -763,9 +763,9 @@ non-root data drive with `cache_type=Writeback`, writes through `/dev/vdb`,
 calls `fsync` on the block-device file descriptor, and writes a host-observable
 marker only after that flush returns.
 It also includes a direct-rootfs pmem scenario that configures `/pmem/pmem0`
-through the public API, waits for `BANGBANG_PMEM_READ_FLUSH_OK` in a scratch
-drive, and then verifies the guest-written pmem marker in the host backing
-file.
+with a valid rate limiter through the public API, applies a live limiter
+replacement, waits for `BANGBANG_PMEM_READ_FLUSH_OK` in a scratch drive, and
+then verifies the guest-written pmem marker in the host backing file.
 Because every configured network interface is bound to MMDS in these scenarios,
 startup uses the process-local MMDS-only packet path and does not require
 external vmnet packet movement.
@@ -947,7 +947,9 @@ When the boot args include `bangbang.pmem-read-flush=1`, the same init script
 finds the first `/dev/pmem*` block device, reads a deterministic host marker,
 writes a deterministic guest marker at a fixed offset, runs `sync` for the
 device path, and emits `BANGBANG_PMEM_READ_FLUSH_OK` only after those steps
-complete.
+complete. The signed executable scenario configures a valid initial pmem
+limiter and applies a live partial replacement through `PATCH /pmem/{id}`;
+deterministic unit tests cover throttle timing, cursor retention, and retry.
 When the boot args include `bangbang.vsock-guest-connect=1`,
 the same init script uses the rootfs-provided Python `AF_VSOCK` support to
 connect to host CID 2 on the test port, stream and incrementally verify exactly

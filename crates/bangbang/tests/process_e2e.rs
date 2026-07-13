@@ -1086,31 +1086,21 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         "/pmem/pmem0",
         r#"{"id":"pmem0","path_on_host":"secret-new-pmem.img","rate_limiter":{"ops":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}"#,
     );
-    assert_bad_request_response(&pmem_rate_limiter_response, "PUT /pmem/pmem0 rate_limiter");
-    assert_response_contains(
-        &pmem_rate_limiter_response,
-        r#"{"fault_message":"pmem rate_limiter is not supported"}"#,
-        "PUT /pmem/pmem0 rate_limiter",
-    );
-    for private_value in ["secret-new-pmem.img", "123456789", "987654321", "777"] {
-        assert!(
-            !pmem_rate_limiter_response.contains(private_value),
-            "PUT /pmem/pmem0 rate_limiter must not echo private config value {private_value:?}; response:\n{pmem_rate_limiter_response}"
-        );
-    }
-    let pmem_vm_config_after_fault = http_get(&socket_path, "/vm/config");
+    assert_no_content_response(&pmem_rate_limiter_response, "PUT /pmem/pmem0 rate_limiter");
+    let pmem_vm_config_after_limiter = http_get(&socket_path, "/vm/config");
     assert_ok_response(
-        &pmem_vm_config_after_fault,
-        "GET /vm/config after rejected PUT /pmem/pmem0 rate_limiter",
+        &pmem_vm_config_after_limiter,
+        "GET /vm/config after PUT /pmem/pmem0 rate_limiter",
     );
     assert_response_contains(
-        &pmem_vm_config_after_fault,
-        r#""path_on_host":"secret-pmem.img""#,
-        "GET /vm/config after rejected PUT /pmem/pmem0 rate_limiter",
+        &pmem_vm_config_after_limiter,
+        r#""path_on_host":"secret-new-pmem.img""#,
+        "GET /vm/config after PUT /pmem/pmem0 rate_limiter",
     );
-    assert!(
-        !pmem_vm_config_after_fault.contains("secret-new-pmem.img"),
-        "rejected pmem update must not replace stored path: {pmem_vm_config_after_fault}"
+    assert_response_contains(
+        &pmem_vm_config_after_limiter,
+        r#""rate_limiter":{"ops":{"one_time_burst":987654321,"refill_time":777,"size":123456789}}"#,
+        "GET /vm/config after PUT /pmem/pmem0 rate_limiter",
     );
 
     let pmem_root_device_response = http_put_json(
@@ -1135,7 +1125,7 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
     );
     assert_response_contains(
         &pmem_vm_config_after_root_device,
-        r#""path_on_host":"secret-pmem.img""#,
+        r#""path_on_host":"secret-new-pmem.img""#,
         "GET /vm/config after rejected PUT /pmem/pmem0 root_device",
     );
     assert!(
@@ -1161,7 +1151,7 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
     );
     assert_response_contains(
         &pmem_vm_config_after_empty_path,
-        r#""path_on_host":"secret-pmem.img""#,
+        r#""path_on_host":"secret-new-pmem.img""#,
         "GET /vm/config after rejected PUT /pmem/pmem0 empty path",
     );
 
