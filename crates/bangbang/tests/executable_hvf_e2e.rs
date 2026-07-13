@@ -36,6 +36,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_BALLOON_MARKER: &[u8] = b"BANGBANG_BALLOON_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_READY";
+    const DIRECT_ROOTFS_MEMORY_HOTPLUG_GROWN_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_GROWN";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_RTC_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.rtc-check=1";
     const DIRECT_ROOTFS_RTC_MARKER: &[u8] = b"BANGBANG_RTC_GUEST_CHECK_OK";
@@ -2231,16 +2232,93 @@ mod macos_arm64 {
 
         if let Err(err) = wait_for_file_prefix_marker(
             &data_backing_path,
+            DIRECT_ROOTFS_MEMORY_HOTPLUG_GROWN_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not observe runtime virtio-mem grow request through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        let plugged_memory_hotplug = match wait_for_http_response_fragment(
+            &socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":128"#,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            Ok(response) => response,
+            Err(err) => {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "public API did not report the guest-completed virtio-mem grow: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+        };
+        assert_ok_response(
+            &plugged_memory_hotplug,
+            "GET /hotplug/memory after guest-completed grow",
+        );
+        assert_response_contains(
+            &plugged_memory_hotplug,
+            r#""requested_size_mib":128"#,
+            "GET /hotplug/memory after guest-completed grow",
+        );
+
+        let memory_hotplug_shrink = http_json_with_io_timeout(
+            &socket_path,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":0}"#,
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_no_content_response(
+            &memory_hotplug_shrink,
+            "PATCH /hotplug/memory shrink direct rootfs",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
             DIRECT_ROOTFS_MEMORY_HOTPLUG_MARKER,
             GUEST_EXECUTION_TIMEOUT,
         ) {
             let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not observe runtime virtio-mem requested-size update through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not observe runtime virtio-mem shrink request through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
+
+        let unplugged_memory_hotplug = match wait_for_http_response_fragment(
+            &socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":0"#,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            Ok(response) => response,
+            Err(err) => {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "public API did not report the guest-completed virtio-mem shrink: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+        };
+        assert_ok_response(
+            &unplugged_memory_hotplug,
+            "GET /hotplug/memory after guest-completed shrink",
+        );
+        assert_response_contains(
+            &unplugged_memory_hotplug,
+            r#""requested_size_mib":0"#,
+            "GET /hotplug/memory after guest-completed shrink",
+        );
 
         assert_clean_shutdown(
             bangbang.terminate(),
@@ -6350,6 +6428,29 @@ mod macos_arm64 {
             };
 
             kqueue.wait_for_write(remaining)?;
+        }
+    }
+
+    fn wait_for_http_response_fragment(
+        socket_path: &Path,
+        path: &str,
+        expected: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let started_at = Instant::now();
+
+        loop {
+            let response = http_get(socket_path, path);
+            if response.starts_with("HTTP/1.1 200 OK\r\n") && response.contains(expected) {
+                return Ok(response);
+            }
+            if started_at.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {path} response to contain {expected:?}; latest response:\n{response}"
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

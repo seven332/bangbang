@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v33"
+direct_boot_variant="direct-boot-v34"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -697,6 +697,7 @@ import time
 DEVICE = "/dev/vdb"
 EXPECTED_REQUESTED_SIZE = 128 * 1024 * 1024
 READY_MARKER = b"BANGBANG_MEMORY_HOTPLUG_GUEST_READY"
+GROWN_MARKER = b"BANGBANG_MEMORY_HOTPLUG_GUEST_GROWN"
 SUCCESS_MARKER = b"BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK"
 FAIL_MARKER = b"BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL"
 TIMEOUT_SECONDS = 20.0
@@ -755,19 +756,24 @@ try:
 
     deadline = time.monotonic() + TIMEOUT_SECONDS
     ready = False
+    grown = False
 
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            if ready:
-                fail("TIMEOUT")
-            fail("INIT_TIMEOUT")
+            if not ready:
+                fail("INIT_TIMEOUT")
+            if not grown:
+                fail("GROW_TIMEOUT")
+            fail("SHRINK_TIMEOUT")
 
         readable, _, _ = select.select([dmesg.stdout], [], [], remaining)
         if not readable:
-            if ready:
-                fail("TIMEOUT")
-            fail("INIT_TIMEOUT")
+            if not ready:
+                fail("INIT_TIMEOUT")
+            if not grown:
+                fail("GROW_TIMEOUT")
+            fail("SHRINK_TIMEOUT")
 
         line = dmesg.stdout.readline()
         if not line:
@@ -787,7 +793,14 @@ try:
             print(marker_text(READY_MARKER), flush=True)
             continue
 
-        if ready and requested_size == EXPECTED_REQUESTED_SIZE:
+        if ready and not grown and requested_size == EXPECTED_REQUESTED_SIZE:
+            grown = True
+            deadline = time.monotonic() + TIMEOUT_SECONDS
+            write_marker(GROWN_MARKER)
+            print(marker_text(GROWN_MARKER), flush=True)
+            continue
+
+        if grown and requested_size == 0:
             write_marker(SUCCESS_MARKER)
             print(marker_text(SUCCESS_MARKER))
             sys.exit(0)

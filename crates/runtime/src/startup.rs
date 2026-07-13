@@ -2922,6 +2922,9 @@ pub enum Arm64BootResourceError {
     MemoryHotplugDeviceMetadataAllocation {
         source: TryReserveError,
     },
+    MemoryHotplugRangeMetadataAllocation {
+        source: TryReserveError,
+    },
     EntropyDeviceMetadataAllocation {
         source: TryReserveError,
     },
@@ -3068,6 +3071,10 @@ impl fmt::Display for Arm64BootResourceError {
                     "failed to allocate memory hotplug device metadata: {source}"
                 )
             }
+            Self::MemoryHotplugRangeMetadataAllocation { source } => write!(
+                f,
+                "failed to allocate memory hotplug reserved-range metadata: {source}"
+            ),
             Self::EntropyDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate entropy device metadata: {source}")
             }
@@ -3108,6 +3115,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::VsockDeviceMetadataAllocation { source } => Some(source),
             Self::BalloonDeviceMetadataAllocation { source } => Some(source),
             Self::MemoryHotplugDeviceMetadataAllocation { source } => Some(source),
+            Self::MemoryHotplugRangeMetadataAllocation { source } => Some(source),
             Self::EntropyDeviceMetadataAllocation { source } => Some(source),
             Self::Fdt { source } => Some(source),
             Self::MissingBootSource
@@ -3370,10 +3378,27 @@ impl Arm64BootResources {
         let memory_hotplug_device =
             match (controller.memory_hotplug_config(), memory_hotplug_device) {
                 (Some(config), Some(device_config)) => {
-                    let prepared_mem =
-                        PreparedVirtioMemDevice::from_config(config).map_err(|source| {
-                            Arm64BootResourceError::PrepareMemoryHotplugDevice { source }
+                    let mut reserved_ranges = Vec::new();
+                    reserved_ranges
+                        .try_reserve_exact(layout.ranges().len())
+                        .map_err(|source| {
+                            Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
                         })?;
+                    reserved_ranges.extend_from_slice(layout.ranges());
+                    reserved_ranges
+                        .try_reserve_exact(pmem_devices.len())
+                        .map_err(|source| {
+                            Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
+                        })?;
+                    reserved_ranges
+                        .extend(pmem_devices.iter().map(PreparedPmemDevice::guest_range));
+                    let prepared_mem = PreparedVirtioMemDevice::from_config_with_reserved_ranges(
+                        config,
+                        &reserved_ranges,
+                    )
+                    .map_err(|source| {
+                        Arm64BootResourceError::PrepareMemoryHotplugDevice { source }
+                    })?;
                     let mem_mmio = prepared_mem
                         .register_mmio_with_dispatcher(device_config.mmio_layout, mmio_dispatcher)
                         .map_err(|source| Arm64BootResourceError::RegisterMemoryHotplugMmio {
@@ -8228,6 +8253,43 @@ mod tests {
 
         let tree = read_fdt(&resources);
         assert!(tree.find("/virtio_mmio@4000a000").is_some());
+    }
+
+    #[test]
+    fn memory_hotplug_region_skips_prepared_pmem_backing() {
+        let kernel = temp_file("kernel-memory-hotplug-pmem", &arm64_image());
+        let pmem = temp_file("memory-hotplug-pmem", b"pmem");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_pmem(&mut controller, "pmem0", pmem.path(), false);
+        add_memory_hotplug(&mut controller);
+        let pmem_lines = [line(32)];
+        let mut config = valid_config_with_pmem_lines(&[], &pmem_lines);
+        config.memory_hotplug_device = Some(super::Arm64BootMemoryHotplugDeviceConfig::new(
+            VirtioMemMmioLayout::new(TEST_MEMORY_HOTPLUG_MMIO_BASE, MmioRegionId::new(120)),
+            line(33),
+        ));
+
+        let mut resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("memory hotplug region should avoid prepared pmem backing");
+
+        assert_eq!(
+            resources.pmem_devices[0].guest_range().start(),
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS
+        );
+        let region_id = resources
+            .memory_hotplug_device
+            .as_ref()
+            .expect("memory hotplug metadata should exist")
+            .registration
+            .region_id();
+        let handler = resources
+            .mmio_dispatcher
+            .handler_mut::<VirtioMemMmioHandler>(region_id)
+            .expect("virtio-mem handler should be registered");
+        assert_eq!(
+            handler.device_config_handler().addr(),
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value() + 128 * MIB
+        );
     }
 
     #[test]

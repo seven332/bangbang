@@ -979,7 +979,8 @@ checks prove the kernel mounted the virtio-block root drive as `/`, give
 executable-boundary MMDS fetch coverage through the process-local MMDS-only
 packet path, prove guest-visible virtio-rng reads through `/dev/hwrng`, prove
 guest virtio-balloon driver binding, prove guest-visible virtio-mem driver
-binding plus the runtime requested-size signal, prove guest-visible PL031 RTC
+binding plus a guest-completed and public-API-observed requested/plugged
+`0 -> 128 MiB -> 0` lifecycle, prove guest-visible PL031 RTC
 device discovery, prove guest-visible VMGenID device-tree evidence, prove the
 current writeback virtio-block flush path, prove the current virtio-pmem
 read/flush path, and cover guest-initiated plus host-initiated virtio-vsock

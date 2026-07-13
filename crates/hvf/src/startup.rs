@@ -14205,9 +14205,9 @@ mod tests {
                 .expect("expected virtio-mem range should be valid");
         assert_eq!(
             mutation_executor.applied,
-            vec![VirtioMemMutation::new(VirtioMemMutationKind::Plug(
+            vec![VirtioMemMutation::new(VirtioMemMutationKind::Plug(vec![
                 expected_range
-            ))]
+            ]))]
         );
         assert!(mutation_executor.rolled_back.is_empty());
         assert_eq!(result.len(), 1);
