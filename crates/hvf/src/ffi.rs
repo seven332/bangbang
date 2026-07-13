@@ -21,6 +21,27 @@ pub(crate) type HvReg = u32;
 pub(crate) type HvSimdFpReg = u32;
 pub(crate) type HvSysReg = u16;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+impl MachTimebaseInfo {
+    pub(crate) const fn new(numer: u32, denom: u32) -> Self {
+        Self { numer, denom }
+    }
+
+    pub(crate) const fn numer(self) -> u32 {
+        self.numer
+    }
+
+    pub(crate) const fn denom(self) -> u32 {
+        self.denom
+    }
+}
+
 pub(crate) const HV_MEMORY_READ: HvMemoryFlags = 1 << 0;
 pub(crate) const HV_MEMORY_WRITE: HvMemoryFlags = 1 << 1;
 pub(crate) const HV_MEMORY_EXEC: HvMemoryFlags = 1 << 2;
@@ -207,7 +228,7 @@ mod imp {
 
     use super::{
         CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSimdFpValue,
-        HvSmeZt0Value, HvSysReg, HvVcpu, HvVcpuExit, HvVcpuSmeState,
+        HvSmeZt0Value, HvSysReg, HvVcpu, HvVcpuExit, HvVcpuSmeState, MachTimebaseInfo,
         SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE, SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
         SME_STATE_REQUIRES_MACOS_15_2_MESSAGE, SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
         SME_ZA_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, SME_ZT0_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
@@ -343,12 +364,26 @@ mod imp {
 
     unsafe extern "C" {
         fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
     }
 
     pub fn absolute_time() -> Result<u64, BackendError> {
         // SAFETY: `mach_absolute_time` takes no arguments and returns the
         // current monotonic counter without retaining caller-owned state.
         Ok(unsafe { mach_absolute_time() })
+    }
+
+    pub fn timebase_info() -> Result<MachTimebaseInfo, BackendError> {
+        let mut info = MachTimebaseInfo::new(0, 0);
+        // SAFETY: `info` remains valid and exclusively borrowed for the call.
+        let status = unsafe { mach_timebase_info(&mut info) };
+        if status == 0 {
+            Ok(info)
+        } else {
+            Err(BackendError::Hypervisor(format!(
+                "mach_timebase_info failed with status {status}"
+            )))
+        }
     }
 
     #[derive(Debug)]
@@ -2216,10 +2251,14 @@ mod imp {
 
     use super::{
         CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSysReg, HvVcpu,
-        UNSUPPORTED_TARGET_MESSAGE,
+        MachTimebaseInfo, UNSUPPORTED_TARGET_MESSAGE,
     };
 
     pub fn absolute_time() -> Result<u64, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn timebase_info() -> Result<MachTimebaseInfo, BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 
@@ -2378,6 +2417,7 @@ mod tests {
     use super::{
         HV_INTERRUPT_TYPE_FIQ, HV_INTERRUPT_TYPE_IRQ, HV_SIMD_FP_REG_Q0, HV_SIMD_FP_REG_Q31,
         HvSimdFpValue, HvSmeZt0Value, HvVcpuExit, HvVcpuExitException, HvVcpuSmeState,
+        MachTimebaseInfo,
     };
 
     #[test]
@@ -2406,6 +2446,14 @@ mod tests {
     fn interrupt_type_values_match_hvf_sdk() {
         assert_eq!(HV_INTERRUPT_TYPE_IRQ, 0);
         assert_eq!(HV_INTERRUPT_TYPE_FIQ, 1);
+    }
+
+    #[test]
+    fn mach_timebase_info_layout_matches_sdk() {
+        assert_eq!(size_of::<MachTimebaseInfo>(), 8);
+        assert_eq!(align_of::<MachTimebaseInfo>(), 4);
+        assert_eq!(offset_of!(MachTimebaseInfo, numer), 0);
+        assert_eq!(offset_of!(MachTimebaseInfo, denom), 4);
     }
 
     #[test]

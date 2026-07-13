@@ -1,8 +1,9 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
@@ -127,7 +128,23 @@ const PSCI_CALL_REQUEST_MISMATCH_MESSAGE: &str =
     "deferred PSCI request does not match the completion operation";
 const PSCI_COMPLETION_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has PSCI completion in flight";
 const PSCI_CALL_TOKEN_EXHAUSTED_MESSAGE: &str = "deferred PSCI call token space is exhausted";
+const RETAINED_VTIMER_WAIT_IN_FLIGHT_MESSAGE: &str =
+    "vCPU runner already has a retained virtual-timer wait in flight";
+const RETAINED_VTIMER_WAIT_TOKEN_EXHAUSTED_MESSAGE: &str =
+    "retained virtual-timer wait token space is exhausted";
+const RETAINED_VTIMER_WAIT_SIGNAL_POISONED_MESSAGE: &str =
+    "retained virtual-timer wait signal lock is poisoned";
+const RETAINED_VTIMER_WAIT_IDENTITY_MISMATCH_MESSAGE: &str =
+    "retained virtual-timer wait identity does not match runner activity";
+const RETAINED_VTIMER_AMBIGUOUS_DEADLINE_MESSAGE: &str =
+    "virtual-timer deadline is exactly half the wrapping counter range away";
+const RETAINED_VTIMER_INVALID_TIMEBASE_MESSAGE: &str =
+    "Mach timebase numerator or denominator is zero";
+const RETAINED_VTIMER_DURATION_OVERFLOW_MESSAGE: &str =
+    "virtual-timer wait duration exceeds std::time::Duration";
 const ARM64_INSTRUCTION_SIZE: u64 = 4;
+const CNTV_CTL_ENABLE: u64 = 1 << 0;
+const CNTV_CTL_IMASK: u64 = 1 << 1;
 
 type CancelVcpu = Arc<dyn Fn(crate::ffi::HvVcpu) -> Result<(), BackendError> + Send + Sync>;
 type SharedMmioDispatcher = Arc<Mutex<MmioDispatcher>>;
@@ -161,6 +178,10 @@ pub enum HvfVcpuRunnerError {
     },
     VcpuExitResolve(HvfVcpuExitResolveError),
     MmioDispatch(HvfMmioDispatchError),
+    RetainedVtimerWait {
+        stage: HvfVcpuRetainedVtimerWaitStage,
+        source: Box<HvfVcpuRunnerError>,
+    },
     MpidrAffinity {
         stage: HvfVcpuMpidrAffinityStage,
         expected: u64,
@@ -178,6 +199,56 @@ pub enum HvfVcpuRunnerError {
     ThreadSpawn(String),
     ChannelClosed(&'static str),
     ThreadPanicked,
+}
+
+/// Owner-thread stage for one retained virtual-timer wait failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfVcpuRetainedVtimerWaitStage {
+    InitialExitMask,
+    InitialOffset,
+    InitialControl,
+    InitialCompareValue,
+    InitialCounter,
+    Timebase,
+    Deadline,
+    RecheckExitMask,
+    RecheckOffset,
+    RecheckControl,
+    RecheckCompareValue,
+    RecheckCounter,
+    Signal,
+    PpiPublication,
+}
+
+impl fmt::Display for HvfVcpuRetainedVtimerWaitStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::InitialExitMask => "initial virtual-timer exit-mask read",
+            Self::InitialOffset => "initial virtual-timer offset read",
+            Self::InitialControl => "initial CNTV_CTL_EL0 read",
+            Self::InitialCompareValue => "initial CNTV_CVAL_EL0 read",
+            Self::InitialCounter => "initial Mach counter sample",
+            Self::Timebase => "Mach timebase read",
+            Self::Deadline => "virtual-timer deadline calculation",
+            Self::RecheckExitMask => "wake virtual-timer exit-mask recheck",
+            Self::RecheckOffset => "wake virtual-timer offset recheck",
+            Self::RecheckControl => "wake CNTV_CTL_EL0 recheck",
+            Self::RecheckCompareValue => "wake CNTV_CVAL_EL0 recheck",
+            Self::RecheckCounter => "wake Mach counter recheck",
+            Self::Signal => "retained-wait signal arbitration",
+            Self::PpiPublication => "virtual-timer PPI publication",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Completion of one owner-thread retained virtual-timer wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfVcpuRetainedVtimerWaitOutcome {
+    /// The admitted timer was due and its selected GIC PPI is pending.
+    TimerPending,
+    /// Host lifecycle cancellation won before timer publication.
+    Canceled,
 }
 
 /// Owner-thread stage that failed while assigning one vCPU's MPIDR affinity.
@@ -577,6 +648,9 @@ impl fmt::Display for HvfVcpuRunnerError {
             }
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
             Self::MmioDispatch(err) => write!(f, "{err}"),
+            Self::RetainedVtimerWait { stage, source } => {
+                write!(f, "retained virtual-timer wait {stage} failed: {source}")
+            }
             Self::MpidrAffinity {
                 stage,
                 expected,
@@ -639,6 +713,7 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::SnapshotRestore { source, .. } => Some(source.as_ref()),
             Self::VcpuExitResolve(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
+            Self::RetainedVtimerWait { source, .. } => Some(source.as_ref()),
             Self::MpidrAffinity {
                 source: Some(err), ..
             } => Some(err),
@@ -771,12 +846,22 @@ pub struct HvfVcpuRunCancelHandle {
 }
 
 impl HvfVcpuRunCancelHandle {
-    /// Request cancellation of the runner's current `hv_vcpu_run` step.
+    /// Request cancellation of the runner's active execution or retained wait.
     pub fn cancel(&self) -> Result<(), HvfVcpuRunnerError> {
         // Keep the state lock until the HVF exit request returns so shutdown
         // cannot destroy the vCPU while cancellation uses its raw id.
-        let _state_guard = prepare_cancel(&self.state)?;
-        cancel_vcpu(self.vcpu, &self.cancel_vcpu)
+        let state_guard = prepare_cancel(&self.state)?;
+        let requires_hvf_exit = match state_guard.retained_vtimer_wait.as_ref() {
+            Some(activity) => {
+                activity.signal.cancel()? == RetainedVtimerCancelDisposition::TimerWon
+            }
+            None => true,
+        };
+        if requires_hvf_exit {
+            cancel_vcpu(self.vcpu, &self.cancel_vcpu)?;
+        }
+        drop(state_guard);
+        Ok(())
     }
 }
 
@@ -813,10 +898,98 @@ pub(crate) fn cancel_vcpu_run_batch_with(
     for handle in handles {
         state_guards.push(prepare_cancel(&handle.state)?);
     }
-    let mut vcpus = handles.iter().map(|handle| handle.vcpu).collect::<Vec<_>>();
-    let result = cancel_vcpus(&mut vcpus).map_err(HvfVcpuRunnerError::Backend);
+    let mut vcpus = Vec::with_capacity(handles.len());
+    for (handle, state) in handles.iter().zip(&state_guards) {
+        let requires_hvf_exit = match state.retained_vtimer_wait.as_ref() {
+            Some(activity) => {
+                activity.signal.cancel()? == RetainedVtimerCancelDisposition::TimerWon
+            }
+            None => true,
+        };
+        if requires_hvf_exit {
+            vcpus.push(handle.vcpu);
+        }
+    }
+    let result = if vcpus.is_empty() {
+        Ok(())
+    } else {
+        cancel_vcpus(&mut vcpus).map_err(HvfVcpuRunnerError::Backend)
+    };
     drop(state_guards);
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RetainedVtimerWaitIdentity(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedVtimerWaitSignalState {
+    Pending,
+    Canceled,
+    TimerWon,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedVtimerCancelDisposition {
+    Canceled,
+    TimerWon,
+}
+
+struct RetainedVtimerWaitSignal {
+    identity: RetainedVtimerWaitIdentity,
+    state: Mutex<RetainedVtimerWaitSignalState>,
+    changed: Condvar,
+}
+
+impl RetainedVtimerWaitSignal {
+    fn new(identity: RetainedVtimerWaitIdentity) -> Self {
+        Self {
+            identity,
+            state: Mutex::new(RetainedVtimerWaitSignalState::Pending),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn cancel(&self) -> Result<RetainedVtimerCancelDisposition, HvfVcpuRunnerError> {
+        let mut state = self.lock()?;
+        match *state {
+            RetainedVtimerWaitSignalState::Pending => {
+                *state = RetainedVtimerWaitSignalState::Canceled;
+                self.changed.notify_all();
+                Ok(RetainedVtimerCancelDisposition::Canceled)
+            }
+            RetainedVtimerWaitSignalState::Canceled => {
+                Ok(RetainedVtimerCancelDisposition::Canceled)
+            }
+            RetainedVtimerWaitSignalState::TimerWon => {
+                Ok(RetainedVtimerCancelDisposition::TimerWon)
+            }
+        }
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, RetainedVtimerWaitSignalState>, HvfVcpuRunnerError> {
+        self.state.lock().map_err(|_| {
+            retained_vtimer_wait_error(
+                HvfVcpuRetainedVtimerWaitStage::Signal,
+                HvfVcpuRunnerError::InvalidState(RETAINED_VTIMER_WAIT_SIGNAL_POISONED_MESSAGE),
+            )
+        })
+    }
+}
+
+impl fmt::Debug for RetainedVtimerWaitSignal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedVtimerWaitSignal")
+            .field("identity", &self.identity)
+            .field("state", &self.state.lock().as_deref())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RunnerRetainedVtimerWaitActivity {
+    identity: RetainedVtimerWaitIdentity,
+    signal: Arc<RetainedVtimerWaitSignal>,
 }
 
 #[derive(Debug)]
@@ -834,6 +1007,8 @@ struct RunnerHandleState {
     interrupt_operation_in_flight: bool,
     psci_completion_in_flight: bool,
     pending_psci_call: Option<HvfVcpuPsciCallToken>,
+    next_retained_vtimer_wait: u64,
+    retained_vtimer_wait: Option<RunnerRetainedVtimerWaitActivity>,
     boot_register_setup_failed: bool,
     boot_registers_configured: bool,
     run_started: bool,
@@ -915,6 +1090,12 @@ enum RunnerCommand {
         token: HvfVcpuRunToken,
         dispatcher: SharedMmioDispatcher,
         completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
+    },
+    WaitForRetainedVtimer {
+        admission: InFlightRetainedVtimerWait,
+        signal: Arc<RetainedVtimerWaitSignal>,
+        intid: u32,
+        response_sender: mpsc::Sender<Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError>>,
     },
     CompletePsciCall {
         token: HvfVcpuPsciCallToken,
@@ -1654,6 +1835,11 @@ trait RunnerVcpu {
     fn snapshot_timer_counter_sample(&mut self) -> Result<u64, BackendError> {
         Err(BackendError::InvalidState(
             "vCPU does not support snapshot timer counter sampling",
+        ))
+    }
+    fn mach_timebase_info(&mut self) -> Result<crate::ffi::MachTimebaseInfo, BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support Mach timebase reads",
         ))
     }
     fn capture_arm64_snapshot_timer_state(
@@ -2402,6 +2588,10 @@ impl RunnerVcpu for RealRunnerVcpu {
         crate::ffi::absolute_time()
     }
 
+    fn mach_timebase_info(&mut self) -> Result<crate::ffi::MachTimebaseInfo, BackendError> {
+        crate::ffi::timebase_info()
+    }
+
     fn get_pending_interrupt(
         &mut self,
         interrupt_type: HvfInterruptType,
@@ -2693,6 +2883,33 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
+    /// Stop guest execution until its retained virtual timer is due or host control cancels it.
+    ///
+    /// Timer state is sampled and rechecked on the vCPU-owning thread. A timer
+    /// completion sets `intid` pending before returning; cancellation never
+    /// publishes the PPI. This low-level primitive does not implement or
+    /// advertise PSCI CPU_SUSPEND.
+    pub fn wait_for_retained_vtimer(
+        &self,
+        intid: u32,
+    ) -> Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_retained_vtimer_wait(intid, response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Report whether this runner currently owns one retained virtual-timer wait.
+    ///
+    /// The observation exposes no timer value or completion state and does not
+    /// participate in owner-command admission. It is intended for lifecycle
+    /// synchronization and diagnostics.
+    pub fn retained_vtimer_wait_active(&self) -> Result<bool, HvfVcpuRunnerError> {
+        Ok(self.lock_state()?.retained_vtimer_wait.is_some())
+    }
+
     #[cfg(test)]
     pub(crate) fn run_once_and_handle_mmio_coordinated(
         &self,
@@ -2775,7 +2992,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         self.run_cancel_handle().cancel()
     }
 
-    /// Return a cloneable handle that can request cancellation of an in-flight run step.
+    /// Return a cloneable handle that can cancel active guest execution or a retained wait.
     pub fn run_cancel_handle(&self) -> HvfVcpuRunCancelHandle {
         HvfVcpuRunCancelHandle {
             vcpu: self.vcpu,
@@ -3761,7 +3978,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Err(err) => return Err(err),
         };
 
-        if should_cancel && let Err(err) = self.cancel_vcpu() {
+        if should_cancel && let Err(err) = self.cancel_active_execution_for_shutdown() {
             self.cancel_shutdown();
             return Err(err);
         }
@@ -3816,6 +4033,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 interrupt_operation_in_flight: false,
                 psci_completion_in_flight: false,
                 pending_psci_call: None,
+                next_retained_vtimer_wait: 1,
+                retained_vtimer_wait: None,
                 boot_register_setup_failed: false,
                 boot_registers_configured: false,
                 run_started: false,
@@ -4154,6 +4373,103 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
 
         state.run_started = true;
+        Ok(())
+    }
+
+    fn start_retained_vtimer_wait(
+        &self,
+        intid: u32,
+        response_sender: mpsc::Sender<Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        validate_gic_ppi_pending_intid(intid).map_err(HvfVcpuRunnerError::Gic)?;
+
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() || state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if !state.mpidr_configured {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MPIDR_NOT_CONFIGURED_MESSAGE,
+            ));
+        }
+        ensure_no_pending_psci_call(&state)?;
+        if state.retained_vtimer_wait.is_some() {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RETAINED_VTIMER_WAIT_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.core_register_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.timer_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                TIMER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.interrupt_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.psci_completion_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                PSCI_COMPLETION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_FAILED_MESSAGE,
+            ));
+        }
+
+        let next_identity = state.next_retained_vtimer_wait.checked_add(1).ok_or(
+            HvfVcpuRunnerError::InvalidState(RETAINED_VTIMER_WAIT_TOKEN_EXHAUSTED_MESSAGE),
+        )?;
+        let identity = RetainedVtimerWaitIdentity(state.next_retained_vtimer_wait);
+        let signal = Arc::new(RetainedVtimerWaitSignal::new(identity));
+        state.next_retained_vtimer_wait = next_identity;
+        state.in_flight_runs = 1;
+        state.retained_vtimer_wait = Some(RunnerRetainedVtimerWaitActivity {
+            identity,
+            signal: Arc::clone(&signal),
+        });
+
+        let command = RunnerCommand::WaitForRetainedVtimer {
+            admission: InFlightRetainedVtimerWait::new(&self.state, identity),
+            signal,
+            intid,
+            response_sender,
+        };
+        if let Err(error) = self.command_sender.send(command) {
+            state.in_flight_runs = 0;
+            state.retained_vtimer_wait = None;
+            drop(state);
+            drop(error.0);
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
         Ok(())
     }
 
@@ -5754,6 +6070,19 @@ impl<'vm> HvfVcpuRunner<'vm> {
         cancel_vcpu(self.vcpu, &self.cancel_vcpu)
     }
 
+    fn cancel_active_execution_for_shutdown(&self) -> Result<(), HvfVcpuRunnerError> {
+        let state = self.lock_state()?;
+        if let Some(activity) = state.retained_vtimer_wait.as_ref() {
+            let _ = activity.signal.cancel()?;
+            return Ok(());
+        }
+        if state.in_flight_runs > 0 {
+            self.cancel_vcpu()?;
+        }
+        drop(state);
+        Ok(())
+    }
+
     fn take_thread(&self) -> Result<Option<JoinHandle<()>>, HvfVcpuRunnerError> {
         Ok(self.lock_state()?.thread.take())
     }
@@ -5847,6 +6176,10 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.interrupt_operation_in_flight,
                 state.psci_completion_in_flight,
                 state.pending_psci_call,
+                state
+                    .retained_vtimer_wait
+                    .as_ref()
+                    .map(|activity| activity.identity),
                 state.boot_register_setup_failed,
                 state.boot_registers_configured,
                 state.run_started,
@@ -5866,6 +6199,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 interrupt_operation_in_flight,
                 psci_completion_in_flight,
                 pending_psci_call,
+                retained_vtimer_wait,
                 boot_register_setup_failed,
                 boot_registers_configured,
                 run_started,
@@ -5891,6 +6225,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 )
                 .field("psci_completion_in_flight", &psci_completion_in_flight)
                 .field("pending_psci_call", &pending_psci_call)
+                .field("retained_vtimer_wait", &retained_vtimer_wait)
                 .field("boot_register_setup_failed", &boot_register_setup_failed)
                 .field("boot_registers_configured", &boot_registers_configured)
                 .field("run_started", &run_started)
@@ -6010,6 +6345,34 @@ impl InFlightRun {
 impl Drop for InFlightRun {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
+            state.in_flight_runs = state.in_flight_runs.saturating_sub(1);
+        }
+    }
+}
+
+struct InFlightRetainedVtimerWait {
+    state: RunnerState,
+    identity: RetainedVtimerWaitIdentity,
+}
+
+impl InFlightRetainedVtimerWait {
+    fn new(state: &RunnerState, identity: RetainedVtimerWaitIdentity) -> Self {
+        Self {
+            state: Arc::clone(state),
+            identity,
+        }
+    }
+}
+
+impl Drop for InFlightRetainedVtimerWait {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock()
+            && state
+                .retained_vtimer_wait
+                .as_ref()
+                .is_some_and(|activity| activity.identity == self.identity)
+        {
+            state.retained_vtimer_wait = None;
             state.in_flight_runs = state.in_flight_runs.saturating_sub(1);
         }
     }
@@ -6304,6 +6667,27 @@ fn run_runner_thread<C, V>(
                             token,
                             Err(HvfVcpuRunnerError::ThreadPanicked),
                         ));
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            }
+            RunnerCommand::WaitForRetainedVtimer {
+                admission,
+                signal,
+                intid,
+                response_sender,
+            } => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    wait_for_retained_vtimer_on_runner_thread(&mut vcpu, &signal, intid)
+                }));
+                match result {
+                    Ok(result) => {
+                        drop(admission);
+                        let _ = response_sender.send(result);
+                    }
+                    Err(payload) => {
+                        drop(admission);
+                        let _ = response_sender.send(Err(HvfVcpuRunnerError::ThreadPanicked));
                         std::panic::resume_unwind(payload);
                     }
                 }
@@ -7042,6 +7426,238 @@ fn run_runner_thread<C, V>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetainedVtimerObservation {
+    _exit_masked: bool,
+    offset: u64,
+    control: u64,
+    compare_value: u64,
+    counter: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedVtimerDeadline {
+    Indefinite,
+    Due,
+    Future { remaining_ticks: u64 },
+}
+
+fn wait_for_retained_vtimer_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    signal: &RetainedVtimerWaitSignal,
+    intid: u32,
+) -> Result<HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunnerError> {
+    let timebase = vcpu.mach_timebase_info().map_err(|source| {
+        retained_vtimer_wait_error(
+            HvfVcpuRetainedVtimerWaitStage::Timebase,
+            HvfVcpuRunnerError::Backend(source),
+        )
+    })?;
+    let mut initial = true;
+
+    loop {
+        {
+            let state = signal.lock()?;
+            match *state {
+                RetainedVtimerWaitSignalState::Pending => {}
+                RetainedVtimerWaitSignalState::Canceled => {
+                    return Ok(HvfVcpuRetainedVtimerWaitOutcome::Canceled);
+                }
+                RetainedVtimerWaitSignalState::TimerWon => {
+                    return Err(retained_vtimer_invalid_state(
+                        HvfVcpuRetainedVtimerWaitStage::Signal,
+                        RETAINED_VTIMER_WAIT_IDENTITY_MISMATCH_MESSAGE,
+                    ));
+                }
+            }
+        }
+
+        let observation = capture_retained_vtimer_observation(vcpu, initial)?;
+        initial = false;
+        match classify_retained_vtimer_deadline(observation)? {
+            RetainedVtimerDeadline::Indefinite => {
+                let state = signal.lock()?;
+                if *state == RetainedVtimerWaitSignalState::Pending {
+                    drop(signal.changed.wait(state).map_err(|_| {
+                        retained_vtimer_invalid_state(
+                            HvfVcpuRetainedVtimerWaitStage::Signal,
+                            RETAINED_VTIMER_WAIT_SIGNAL_POISONED_MESSAGE,
+                        )
+                    })?);
+                }
+            }
+            RetainedVtimerDeadline::Future { remaining_ticks } => {
+                let timeout = retained_vtimer_wait_duration(remaining_ticks, timebase)?;
+                let state = signal.lock()?;
+                if *state == RetainedVtimerWaitSignalState::Pending {
+                    drop(signal.changed.wait_timeout(state, timeout).map_err(|_| {
+                        retained_vtimer_invalid_state(
+                            HvfVcpuRetainedVtimerWaitStage::Signal,
+                            RETAINED_VTIMER_WAIT_SIGNAL_POISONED_MESSAGE,
+                        )
+                    })?);
+                }
+            }
+            RetainedVtimerDeadline::Due => {
+                let mut state = signal.lock()?;
+                match *state {
+                    RetainedVtimerWaitSignalState::Pending => {
+                        *state = RetainedVtimerWaitSignalState::TimerWon;
+                    }
+                    RetainedVtimerWaitSignalState::Canceled => {
+                        return Ok(HvfVcpuRetainedVtimerWaitOutcome::Canceled);
+                    }
+                    RetainedVtimerWaitSignalState::TimerWon => {
+                        return Err(retained_vtimer_invalid_state(
+                            HvfVcpuRetainedVtimerWaitStage::Signal,
+                            RETAINED_VTIMER_WAIT_IDENTITY_MISMATCH_MESSAGE,
+                        ));
+                    }
+                }
+                drop(state);
+
+                vcpu.set_gic_ppi_pending(intid, true).map_err(|source| {
+                    retained_vtimer_wait_error(
+                        HvfVcpuRetainedVtimerWaitStage::PpiPublication,
+                        HvfVcpuRunnerError::Gic(source),
+                    )
+                })?;
+                return Ok(HvfVcpuRetainedVtimerWaitOutcome::TimerPending);
+            }
+        }
+    }
+}
+
+fn capture_retained_vtimer_observation(
+    vcpu: &mut impl RunnerVcpu,
+    initial: bool,
+) -> Result<RetainedVtimerObservation, HvfVcpuRunnerError> {
+    let stages = if initial {
+        [
+            HvfVcpuRetainedVtimerWaitStage::InitialExitMask,
+            HvfVcpuRetainedVtimerWaitStage::InitialOffset,
+            HvfVcpuRetainedVtimerWaitStage::InitialControl,
+            HvfVcpuRetainedVtimerWaitStage::InitialCompareValue,
+            HvfVcpuRetainedVtimerWaitStage::InitialCounter,
+        ]
+    } else {
+        [
+            HvfVcpuRetainedVtimerWaitStage::RecheckExitMask,
+            HvfVcpuRetainedVtimerWaitStage::RecheckOffset,
+            HvfVcpuRetainedVtimerWaitStage::RecheckControl,
+            HvfVcpuRetainedVtimerWaitStage::RecheckCompareValue,
+            HvfVcpuRetainedVtimerWaitStage::RecheckCounter,
+        ]
+    };
+
+    let exit_masked = vcpu
+        .get_vtimer_mask()
+        .map_err(|source| retained_vtimer_backend_error(stages[0], source))?;
+    let offset = vcpu
+        .get_vtimer_offset()
+        .map_err(|source| retained_vtimer_backend_error(stages[1], source))?;
+    let control = vcpu
+        .get_vtimer_control()
+        .map_err(|source| retained_vtimer_backend_error(stages[2], source))?;
+    let compare_value = vcpu
+        .get_vtimer_compare_value()
+        .map_err(|source| retained_vtimer_backend_error(stages[3], source))?;
+    let counter = vcpu
+        .snapshot_timer_counter_sample()
+        .map_err(|source| retained_vtimer_backend_error(stages[4], source))?;
+
+    Ok(RetainedVtimerObservation {
+        _exit_masked: exit_masked,
+        offset,
+        control,
+        compare_value,
+        counter,
+    })
+}
+
+fn classify_retained_vtimer_deadline(
+    observation: RetainedVtimerObservation,
+) -> Result<RetainedVtimerDeadline, HvfVcpuRunnerError> {
+    if observation.control & CNTV_CTL_ENABLE == 0 || observation.control & CNTV_CTL_IMASK != 0 {
+        return Ok(RetainedVtimerDeadline::Indefinite);
+    }
+
+    let deadline = observation.compare_value.wrapping_add(observation.offset);
+    let remaining_ticks = deadline.wrapping_sub(observation.counter);
+    if remaining_ticks == 1_u64 << 63 {
+        return Err(retained_vtimer_invalid_state(
+            HvfVcpuRetainedVtimerWaitStage::Deadline,
+            RETAINED_VTIMER_AMBIGUOUS_DEADLINE_MESSAGE,
+        ));
+    }
+    if remaining_ticks == 0 || (remaining_ticks as i64) < 0 {
+        Ok(RetainedVtimerDeadline::Due)
+    } else {
+        Ok(RetainedVtimerDeadline::Future { remaining_ticks })
+    }
+}
+
+fn retained_vtimer_wait_duration(
+    ticks: u64,
+    timebase: crate::ffi::MachTimebaseInfo,
+) -> Result<Duration, HvfVcpuRunnerError> {
+    let denominator = u128::from(timebase.denom());
+    let numerator = u128::from(timebase.numer());
+    if numerator == 0 || denominator == 0 {
+        return Err(retained_vtimer_invalid_state(
+            HvfVcpuRetainedVtimerWaitStage::Deadline,
+            RETAINED_VTIMER_INVALID_TIMEBASE_MESSAGE,
+        ));
+    }
+    let nanoseconds = u128::from(ticks)
+        .checked_mul(numerator)
+        .and_then(|value| value.checked_add(denominator - 1))
+        .map(|value| value / denominator)
+        .ok_or_else(|| {
+            retained_vtimer_invalid_state(
+                HvfVcpuRetainedVtimerWaitStage::Deadline,
+                RETAINED_VTIMER_DURATION_OVERFLOW_MESSAGE,
+            )
+        })?;
+    let seconds = u64::try_from(nanoseconds / 1_000_000_000).map_err(|_| {
+        retained_vtimer_invalid_state(
+            HvfVcpuRetainedVtimerWaitStage::Deadline,
+            RETAINED_VTIMER_DURATION_OVERFLOW_MESSAGE,
+        )
+    })?;
+    let subsec_nanos = u32::try_from(nanoseconds % 1_000_000_000).map_err(|_| {
+        retained_vtimer_invalid_state(
+            HvfVcpuRetainedVtimerWaitStage::Deadline,
+            RETAINED_VTIMER_DURATION_OVERFLOW_MESSAGE,
+        )
+    })?;
+    Ok(Duration::new(seconds, subsec_nanos))
+}
+
+fn retained_vtimer_backend_error(
+    stage: HvfVcpuRetainedVtimerWaitStage,
+    source: BackendError,
+) -> HvfVcpuRunnerError {
+    retained_vtimer_wait_error(stage, HvfVcpuRunnerError::Backend(source))
+}
+
+fn retained_vtimer_invalid_state(
+    stage: HvfVcpuRetainedVtimerWaitStage,
+    message: &'static str,
+) -> HvfVcpuRunnerError {
+    retained_vtimer_wait_error(stage, HvfVcpuRunnerError::InvalidState(message))
+}
+
+fn retained_vtimer_wait_error(
+    stage: HvfVcpuRetainedVtimerWaitStage,
+    source: HvfVcpuRunnerError,
+) -> HvfVcpuRunnerError {
+    HvfVcpuRunnerError::RetainedVtimerWait {
+        stage,
+        source: Box::new(source),
+    }
+}
+
 fn run_once_and_handle_mmio_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     dispatcher: &SharedMmioDispatcher,
@@ -7371,6 +7987,7 @@ pub(crate) mod tests {
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
+    use std::time::Duration;
 
     use bangbang_runtime::BackendError;
     use bangbang_runtime::memory::GuestAddress;
@@ -7460,6 +8077,112 @@ pub(crate) mod tests {
     const GIC_DEVICE_STATE_TEST_BYTES: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
     const GIC_ICC_REGISTER_STATE_TEST_VALUES: [u64; 10] =
         [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9];
+
+    fn retained_vtimer_observation(
+        control: u64,
+        offset: u64,
+        compare_value: u64,
+        counter: u64,
+    ) -> super::RetainedVtimerObservation {
+        super::RetainedVtimerObservation {
+            _exit_masked: false,
+            offset,
+            control,
+            compare_value,
+            counter,
+        }
+    }
+
+    #[test]
+    fn retained_vtimer_deadline_classifies_control_and_wrapping_time() {
+        use super::{RetainedVtimerDeadline, classify_retained_vtimer_deadline};
+
+        assert_eq!(
+            classify_retained_vtimer_deadline(retained_vtimer_observation(0, 0, 10, 0)),
+            Ok(RetainedVtimerDeadline::Indefinite)
+        );
+        assert_eq!(
+            classify_retained_vtimer_deadline(retained_vtimer_observation(0b11, 0, 10, 0)),
+            Ok(RetainedVtimerDeadline::Indefinite)
+        );
+        assert_eq!(
+            classify_retained_vtimer_deadline(retained_vtimer_observation(1, 10, 20, 30)),
+            Ok(RetainedVtimerDeadline::Due)
+        );
+        assert_eq!(
+            classify_retained_vtimer_deadline(retained_vtimer_observation(1, 10, 20, 25)),
+            Ok(RetainedVtimerDeadline::Future { remaining_ticks: 5 })
+        );
+        assert_eq!(
+            classify_retained_vtimer_deadline(retained_vtimer_observation(1, 10, 20, 31)),
+            Ok(RetainedVtimerDeadline::Due)
+        );
+        assert_eq!(
+            classify_retained_vtimer_deadline(retained_vtimer_observation(
+                1,
+                5,
+                u64::MAX - 2,
+                u64::MAX
+            )),
+            Ok(RetainedVtimerDeadline::Future { remaining_ticks: 3 })
+        );
+    }
+
+    #[test]
+    fn retained_vtimer_deadline_rejects_exact_half_range() {
+        assert!(matches!(
+            super::classify_retained_vtimer_deadline(retained_vtimer_observation(
+                1,
+                0,
+                1_u64 << 63,
+                0
+            )),
+            Err(HvfVcpuRunnerError::RetainedVtimerWait {
+                stage: super::HvfVcpuRetainedVtimerWaitStage::Deadline,
+                source,
+            }) if *source == HvfVcpuRunnerError::InvalidState(
+                super::RETAINED_VTIMER_AMBIGUOUS_DEADLINE_MESSAGE
+            )
+        ));
+    }
+
+    #[test]
+    fn retained_vtimer_duration_rounds_up_and_rejects_invalid_ranges() {
+        assert_eq!(
+            super::retained_vtimer_wait_duration(3, crate::ffi::MachTimebaseInfo::new(2, 3)),
+            Ok(Duration::from_nanos(2))
+        );
+        assert!(matches!(
+            super::retained_vtimer_wait_duration(1, crate::ffi::MachTimebaseInfo::new(1, 0)),
+            Err(HvfVcpuRunnerError::RetainedVtimerWait {
+                stage: super::HvfVcpuRetainedVtimerWaitStage::Deadline,
+                source,
+            }) if *source == HvfVcpuRunnerError::InvalidState(
+                super::RETAINED_VTIMER_INVALID_TIMEBASE_MESSAGE
+            )
+        ));
+        assert!(matches!(
+            super::retained_vtimer_wait_duration(1, crate::ffi::MachTimebaseInfo::new(0, 1)),
+            Err(HvfVcpuRunnerError::RetainedVtimerWait {
+                stage: super::HvfVcpuRetainedVtimerWaitStage::Deadline,
+                source,
+            }) if *source == HvfVcpuRunnerError::InvalidState(
+                super::RETAINED_VTIMER_INVALID_TIMEBASE_MESSAGE
+            )
+        ));
+        assert!(matches!(
+            super::retained_vtimer_wait_duration(
+                u64::MAX,
+                crate::ffi::MachTimebaseInfo::new(u32::MAX, 1)
+            ),
+            Err(HvfVcpuRunnerError::RetainedVtimerWait {
+                stage: super::HvfVcpuRetainedVtimerWaitStage::Deadline,
+                source,
+            }) if *source == HvfVcpuRunnerError::InvalidState(
+                super::RETAINED_VTIMER_DURATION_OVERFLOW_MESSAGE
+            )
+        ));
+    }
 
     struct SnapshotV1AggregateRecordingVcpu {
         stage_sender: mpsc::Sender<HvfArm64SnapshotV1CaptureStage>,
@@ -34216,5 +34939,464 @@ pub(crate) mod tests {
         runner
             .shutdown()
             .expect("aggregate runner should shut down");
+    }
+
+    struct RetainedVtimerWaitTestVcpu {
+        raw_vcpu: crate::ffi::HvVcpu,
+        exit_masked: bool,
+        offset: u64,
+        control: u64,
+        compare_value: u64,
+        counter_samples: VecDeque<Result<u64, BackendError>>,
+        timebase: Result<crate::ffi::MachTimebaseInfo, BackendError>,
+        sample_sender: Option<mpsc::Sender<()>>,
+        ppi_sender: Option<mpsc::Sender<(u32, bool)>>,
+        ppi_entered_sender: Option<mpsc::Sender<()>>,
+        ppi_release_receiver: Option<mpsc::Receiver<()>>,
+        ppi_result: Result<(), HvfGicError>,
+        destroyed_sender: Option<mpsc::Sender<()>>,
+        failure_stage: Option<super::HvfVcpuRetainedVtimerWaitStage>,
+        observation_round: usize,
+    }
+
+    impl RetainedVtimerWaitTestVcpu {
+        fn fail_if_requested(
+            &self,
+            stage: super::HvfVcpuRetainedVtimerWaitStage,
+        ) -> Result<(), BackendError> {
+            if self.failure_stage == Some(stage) {
+                Err(BackendError::InvalidState(
+                    "injected retained-vtimer stage failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn observation_stage(
+            &self,
+            initial: super::HvfVcpuRetainedVtimerWaitStage,
+            recheck: super::HvfVcpuRetainedVtimerWaitStage,
+        ) -> super::HvfVcpuRetainedVtimerWaitStage {
+            if self.observation_round == 0 {
+                initial
+            } else {
+                recheck
+            }
+        }
+    }
+
+    impl RunnerVcpu for RetainedVtimerWaitTestVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(self.raw_vcpu)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Err(BackendError::InvalidState(
+                "retained-vtimer test vCPU must not execute the guest",
+            ))
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_vtimer_mask(&mut self) -> Result<bool, BackendError> {
+            self.fail_if_requested(self.observation_stage(
+                super::HvfVcpuRetainedVtimerWaitStage::InitialExitMask,
+                super::HvfVcpuRetainedVtimerWaitStage::RecheckExitMask,
+            ))?;
+            Ok(self.exit_masked)
+        }
+
+        fn get_vtimer_offset(&mut self) -> Result<u64, BackendError> {
+            self.fail_if_requested(self.observation_stage(
+                super::HvfVcpuRetainedVtimerWaitStage::InitialOffset,
+                super::HvfVcpuRetainedVtimerWaitStage::RecheckOffset,
+            ))?;
+            Ok(self.offset)
+        }
+
+        fn get_vtimer_control(&mut self) -> Result<u64, BackendError> {
+            self.fail_if_requested(self.observation_stage(
+                super::HvfVcpuRetainedVtimerWaitStage::InitialControl,
+                super::HvfVcpuRetainedVtimerWaitStage::RecheckControl,
+            ))?;
+            Ok(self.control)
+        }
+
+        fn get_vtimer_compare_value(&mut self) -> Result<u64, BackendError> {
+            self.fail_if_requested(self.observation_stage(
+                super::HvfVcpuRetainedVtimerWaitStage::InitialCompareValue,
+                super::HvfVcpuRetainedVtimerWaitStage::RecheckCompareValue,
+            ))?;
+            Ok(self.compare_value)
+        }
+
+        fn snapshot_timer_counter_sample(&mut self) -> Result<u64, BackendError> {
+            self.fail_if_requested(self.observation_stage(
+                super::HvfVcpuRetainedVtimerWaitStage::InitialCounter,
+                super::HvfVcpuRetainedVtimerWaitStage::RecheckCounter,
+            ))?;
+            if let Some(sender) = &self.sample_sender {
+                let _ = sender.send(());
+            }
+            let sample =
+                self.counter_samples
+                    .pop_front()
+                    .unwrap_or(Err(BackendError::InvalidState(
+                        "retained-vtimer test counter samples are exhausted",
+                    )));
+            self.observation_round += 1;
+            sample
+        }
+
+        fn mach_timebase_info(&mut self) -> Result<crate::ffi::MachTimebaseInfo, BackendError> {
+            self.fail_if_requested(super::HvfVcpuRetainedVtimerWaitStage::Timebase)?;
+            self.timebase.clone()
+        }
+
+        fn set_gic_ppi_pending(&mut self, intid: u32, pending: bool) -> Result<(), HvfGicError> {
+            if let Some(sender) = &self.ppi_entered_sender {
+                let _ = sender.send(());
+            }
+            if let Some(receiver) = &self.ppi_release_receiver {
+                receiver.recv().map_err(|_| {
+                    HvfGicError::InvalidState("retained-vtimer PPI release sender closed")
+                })?;
+            }
+            if let Some(sender) = &self.ppi_sender {
+                let _ = sender.send((intid, pending));
+            }
+            self.ppi_result.clone()
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            if let Some(sender) = &self.destroyed_sender {
+                let _ = sender.send(());
+            }
+            Ok(())
+        }
+    }
+
+    fn retained_vtimer_wait_test_vcpu(
+        raw_vcpu: crate::ffi::HvVcpu,
+        control: u64,
+        counter: u64,
+    ) -> RetainedVtimerWaitTestVcpu {
+        RetainedVtimerWaitTestVcpu {
+            raw_vcpu,
+            exit_masked: false,
+            offset: 0,
+            control,
+            compare_value: counter,
+            counter_samples: VecDeque::from([Ok(counter)]),
+            timebase: Ok(crate::ffi::MachTimebaseInfo::new(1, 1)),
+            sample_sender: None,
+            ppi_sender: None,
+            ppi_entered_sender: None,
+            ppi_release_receiver: None,
+            ppi_result: Ok(()),
+            destroyed_sender: None,
+            failure_stage: None,
+            observation_round: 0,
+        }
+    }
+
+    fn start_retained_vtimer_wait_test_runner(
+        vcpu: RetainedVtimerWaitTestVcpu,
+        cancel_vcpu: CancelVcpu,
+    ) -> HvfVcpuRunner<'static> {
+        let started = spawn_runner_thread(move || Ok::<_, BackendError>(vcpu))
+            .expect("retained-vtimer test runner should start");
+        HvfVcpuRunner::from_started(started, cancel_vcpu)
+            .expect("retained-vtimer test runner should be constructed")
+    }
+
+    #[test]
+    fn retained_vtimer_wait_publishes_ppi_before_timer_completion() {
+        for exit_masked in [false, true] {
+            let (ppi_sender, ppi_receiver) = mpsc::channel();
+            let mut vcpu = retained_vtimer_wait_test_vcpu(41, 1, 100);
+            vcpu.exit_masked = exit_masked;
+            vcpu.ppi_sender = Some(ppi_sender);
+            let runner = start_retained_vtimer_wait_test_runner(vcpu, Arc::new(|_| Ok(())));
+
+            assert_eq!(
+                runner.wait_for_retained_vtimer(27),
+                Ok(super::HvfVcpuRetainedVtimerWaitOutcome::TimerPending)
+            );
+            assert_eq!(
+                ppi_receiver
+                    .recv()
+                    .expect("timer PPI should be published before response"),
+                (27, true)
+            );
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn retained_vtimer_wait_cancellation_wakes_indefinite_owner_without_hvf_exit() {
+        let (sample_sender, sample_receiver) = mpsc::channel();
+        let (raw_cancel_sender, raw_cancel_receiver) = mpsc::channel();
+        let mut vcpu = retained_vtimer_wait_test_vcpu(42, 0, 100);
+        vcpu.sample_sender = Some(sample_sender);
+        let runner = start_retained_vtimer_wait_test_runner(
+            vcpu,
+            Arc::new(move |vcpu| {
+                raw_cancel_sender.send(vcpu).map_err(|_| {
+                    BackendError::InvalidState("raw cancel observation receiver closed")
+                })
+            }),
+        );
+        let cancel = runner.run_cancel_handle();
+
+        thread::scope(|scope| {
+            let wait = scope.spawn(|| runner.wait_for_retained_vtimer(27));
+            sample_receiver
+                .recv()
+                .expect("retained wait should sample before cancellation");
+            cancel.cancel().expect("retained wait should cancel");
+            assert_eq!(
+                wait.join().expect("wait caller should not panic"),
+                Ok(super::HvfVcpuRetainedVtimerWaitOutcome::Canceled)
+            );
+        });
+
+        assert!(matches!(
+            raw_cancel_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn retained_vtimer_wait_keeps_owner_operation_admission_exclusive() {
+        let (sample_sender, sample_receiver) = mpsc::channel();
+        let mut vcpu = retained_vtimer_wait_test_vcpu(49, 0, 100);
+        vcpu.sample_sender = Some(sample_sender);
+        let runner = start_retained_vtimer_wait_test_runner(vcpu, Arc::new(|_| Ok(())));
+        let cancel = runner.run_cancel_handle();
+
+        thread::scope(|scope| {
+            let wait = scope.spawn(|| runner.wait_for_retained_vtimer(27));
+            sample_receiver
+                .recv()
+                .expect("retained wait should sample before admission probes");
+            assert_eq!(runner.retained_vtimer_wait_active(), Ok(true));
+
+            assert_eq!(
+                runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.capture_arm64_virtual_timer_state(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.wait_for_retained_vtimer(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RETAINED_VTIMER_WAIT_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            cancel.cancel().expect("retained wait should cancel");
+            assert_eq!(
+                wait.join().expect("wait caller should not panic"),
+                Ok(super::HvfVcpuRetainedVtimerWaitOutcome::Canceled)
+            );
+        });
+
+        assert_eq!(runner.retained_vtimer_wait_active(), Ok(false));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn retained_vtimer_wait_timer_winner_preserves_raw_cancellation_debt() {
+        let (ppi_entered_sender, ppi_entered_receiver) = mpsc::channel();
+        let (ppi_release_sender, ppi_release_receiver) = mpsc::channel();
+        let mut vcpu = retained_vtimer_wait_test_vcpu(43, 1, 100);
+        vcpu.ppi_entered_sender = Some(ppi_entered_sender);
+        vcpu.ppi_release_receiver = Some(ppi_release_receiver);
+        let runner = start_retained_vtimer_wait_test_runner(vcpu, Arc::new(|_| Ok(())));
+        let cancel = runner.run_cancel_handle();
+
+        thread::scope(|scope| {
+            let wait = scope.spawn(|| runner.wait_for_retained_vtimer(27));
+            ppi_entered_receiver
+                .recv()
+                .expect("timer should win before its PPI blocks");
+            let mut canceled_vcpus = Vec::new();
+            cancel_vcpu_run_batch_with(&[cancel], |vcpus| {
+                canceled_vcpus.extend_from_slice(vcpus);
+                Ok(())
+            })
+            .expect("timer-won cancellation should queue an HVF exit");
+            assert_eq!(canceled_vcpus, [43]);
+            ppi_release_sender
+                .send(())
+                .expect("timer PPI should release");
+            assert_eq!(
+                wait.join().expect("wait caller should not panic"),
+                Ok(super::HvfVcpuRetainedVtimerWaitOutcome::TimerPending)
+            );
+        });
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn retained_vtimer_wait_mixed_batch_only_exits_non_waiting_member() {
+        let (sample_sender, sample_receiver) = mpsc::channel();
+        let mut waiting_vcpu = retained_vtimer_wait_test_vcpu(44, 0, 100);
+        waiting_vcpu.sample_sender = Some(sample_sender);
+        let waiting = start_retained_vtimer_wait_test_runner(waiting_vcpu, Arc::new(|_| Ok(())));
+        let idle = start_retained_vtimer_wait_test_runner(
+            retained_vtimer_wait_test_vcpu(45, 0, 100),
+            Arc::new(|_| Ok(())),
+        );
+
+        thread::scope(|scope| {
+            let wait = scope.spawn(|| waiting.wait_for_retained_vtimer(27));
+            sample_receiver
+                .recv()
+                .expect("retained wait should sample before batch cancellation");
+            let mut canceled_vcpus = Vec::new();
+            cancel_vcpu_run_batch_with(
+                &[waiting.run_cancel_handle(), idle.run_cancel_handle()],
+                |vcpus| {
+                    canceled_vcpus.extend_from_slice(vcpus);
+                    Ok(())
+                },
+            )
+            .expect("mixed cancellation batch should succeed");
+            assert_eq!(canceled_vcpus, [45]);
+            assert_eq!(
+                wait.join().expect("wait caller should not panic"),
+                Ok(super::HvfVcpuRetainedVtimerWaitOutcome::Canceled)
+            );
+        });
+
+        waiting.shutdown().expect("waiting runner should shut down");
+        idle.shutdown().expect("idle runner should shut down");
+    }
+
+    #[test]
+    fn retained_vtimer_wait_shutdown_signals_owner_before_destroy() {
+        let (sample_sender, sample_receiver) = mpsc::channel();
+        let (destroyed_sender, destroyed_receiver) = mpsc::channel();
+        let mut vcpu = retained_vtimer_wait_test_vcpu(46, 0, 100);
+        vcpu.sample_sender = Some(sample_sender);
+        vcpu.destroyed_sender = Some(destroyed_sender);
+        let runner = start_retained_vtimer_wait_test_runner(vcpu, Arc::new(|_| Ok(())));
+
+        thread::scope(|scope| {
+            let wait = scope.spawn(|| runner.wait_for_retained_vtimer(27));
+            sample_receiver
+                .recv()
+                .expect("retained wait should sample before shutdown");
+            runner
+                .shutdown()
+                .expect("shutdown should drain retained wait");
+            assert_eq!(
+                wait.join().expect("wait caller should not panic"),
+                Ok(super::HvfVcpuRetainedVtimerWaitOutcome::Canceled)
+            );
+        });
+        destroyed_receiver
+            .recv()
+            .expect("owner should be destroyed after retained wait drains");
+    }
+
+    #[test]
+    fn retained_vtimer_wait_reports_every_owner_read_failure_stage() {
+        use super::HvfVcpuRetainedVtimerWaitStage as Stage;
+
+        for stage in [
+            Stage::InitialExitMask,
+            Stage::InitialOffset,
+            Stage::InitialControl,
+            Stage::InitialCompareValue,
+            Stage::InitialCounter,
+            Stage::Timebase,
+            Stage::RecheckExitMask,
+            Stage::RecheckOffset,
+            Stage::RecheckControl,
+            Stage::RecheckCompareValue,
+            Stage::RecheckCounter,
+        ] {
+            let mut vcpu = retained_vtimer_wait_test_vcpu(48, 1, 100);
+            if matches!(
+                stage,
+                Stage::RecheckExitMask
+                    | Stage::RecheckOffset
+                    | Stage::RecheckControl
+                    | Stage::RecheckCompareValue
+                    | Stage::RecheckCounter
+            ) {
+                vcpu.compare_value = 1;
+                vcpu.counter_samples = VecDeque::from([Ok(0), Ok(1)]);
+                vcpu.timebase = Ok(crate::ffi::MachTimebaseInfo::new(1, 1));
+            }
+            vcpu.failure_stage = Some(stage);
+            let runner = start_retained_vtimer_wait_test_runner(vcpu, Arc::new(|_| Ok(())));
+
+            assert!(matches!(
+                runner.wait_for_retained_vtimer(27),
+                Err(HvfVcpuRunnerError::RetainedVtimerWait {
+                    stage: actual,
+                    source,
+                }) if actual == stage && *source == HvfVcpuRunnerError::Backend(
+                    BackendError::InvalidState("injected retained-vtimer stage failure")
+                )
+            ));
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn retained_vtimer_wait_ppi_failure_is_stage_specific_and_releases_admission() {
+        let expected = HvfGicError::InvalidState("injected retained-vtimer PPI failure");
+        let mut vcpu = retained_vtimer_wait_test_vcpu(47, 1, 100);
+        vcpu.ppi_result = Err(expected.clone());
+        let runner = start_retained_vtimer_wait_test_runner(vcpu, Arc::new(|_| Ok(())));
+
+        assert!(matches!(
+            runner.wait_for_retained_vtimer(27),
+            Err(HvfVcpuRunnerError::RetainedVtimerWait {
+                stage: super::HvfVcpuRetainedVtimerWaitStage::PpiPublication,
+                source,
+            }) if *source == HvfVcpuRunnerError::Gic(expected)
+        ));
+        assert!(matches!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "retained-vtimer test vCPU must not execute the guest"
+            )))
+        ));
+        runner.shutdown().expect("runner should shut down");
     }
 }

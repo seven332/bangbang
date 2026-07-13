@@ -22,6 +22,40 @@ const PHYSICAL_TIMER_ISTATUS_MASK: u64 = 0b100;
 const PHYSICAL_TIMER_DEFINED_CONTROL_MASK: u64 = 0b111;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mach_counter_sample() -> u64 {
+    // SAFETY: `mach_absolute_time` takes no arguments and returns one monotonic sample.
+    unsafe { mach_absolute_time() }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mach_ticks_for(duration: std::time::Duration) -> Option<u64> {
+    let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+    // SAFETY: `info` is a valid, exclusively borrowed output object for the call.
+    assert_eq!(unsafe { mach_timebase_info(&mut info) }, 0);
+    assert_ne!(info.numer, 0);
+    assert_ne!(info.denom, 0);
+
+    let nanoseconds = duration.as_nanos();
+    let numerator = nanoseconds.checked_mul(u128::from(info.denom))?;
+    let rounded = numerator.checked_add(u128::from(info.numer) - 1)?;
+    let ticks = rounded / u128::from(info.numer);
+    u64::try_from(ticks).ok()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn assert_normalized_timer_restore_equivalent(
     source: bangbang_hvf::HvfArm64SnapshotTimerState,
     recaptured: bangbang_hvf::HvfArm64SnapshotTimerState,
@@ -2825,6 +2859,134 @@ fn captures_runner_arm64_virtual_timer_state() {
         assert_eq!(restored.compare_value(), original.compare_value());
 
         runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn waits_for_retained_runner_virtual_timer_and_drains_control() {
+    use std::time::{Duration, Instant};
+
+    use bangbang_hvf::{HvfBackend, HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunner};
+    use bangbang_runtime::VmBackend;
+
+    fn wait_for_admission(runner: &HvfVcpuRunner<'_>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if runner
+                .retained_vtimer_wait_active()
+                .expect("retained-wait activity should be observable")
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "retained wait did not publish its admission"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+
+    backend.create_vm().expect("VM should be created");
+    let metadata = *backend.create_gic().expect("GIC should be created");
+    let virtual_timer_intid = metadata.timer_interrupts.el1_virtual_timer_intid;
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let original = runner
+            .capture_arm64_virtual_timer_state()
+            .expect("original runner vtimer state should be captured");
+
+        for exit_masked in [false, true] {
+            runner
+                .set_vtimer_control(0)
+                .expect("vtimer should be disabled before programming");
+            runner
+                .set_vtimer_mask(exit_masked)
+                .expect("vtimer exit mask should be selected");
+            let deadline = mach_counter_sample().wrapping_add(
+                mach_ticks_for(Duration::from_millis(100))
+                    .expect("test Mach deadline should fit u64"),
+            );
+            runner
+                .set_vtimer_compare_value(deadline.wrapping_sub(original.offset()))
+                .expect("future vtimer comparator should be programmed");
+            runner
+                .set_vtimer_control(1)
+                .expect("future vtimer should be enabled and guest-unmasked");
+
+            assert_eq!(
+                runner.wait_for_retained_vtimer(virtual_timer_intid),
+                Ok(HvfVcpuRetainedVtimerWaitOutcome::TimerPending)
+            );
+            let completed_at = mach_counter_sample();
+            assert!(
+                completed_at.wrapping_sub(deadline) < (1_u64 << 63),
+                "retained wait returned before its real Mach deadline"
+            );
+            runner
+                .clear_gic_ppi_pending(virtual_timer_intid)
+                .expect("published timer PPI should clear");
+        }
+
+        runner
+            .set_vtimer_control(0)
+            .expect("vtimer should be disabled before programming a due comparator");
+        runner
+            .set_vtimer_mask(false)
+            .expect("due vtimer exits should be unmasked");
+        let due = mach_counter_sample();
+        runner
+            .set_vtimer_compare_value(due.wrapping_sub(original.offset()))
+            .expect("due vtimer comparator should be programmed");
+        runner
+            .set_vtimer_control(1)
+            .expect("due vtimer should be enabled and guest-unmasked");
+        assert_eq!(
+            runner.wait_for_retained_vtimer(virtual_timer_intid),
+            Ok(HvfVcpuRetainedVtimerWaitOutcome::TimerPending)
+        );
+        runner
+            .clear_gic_ppi_pending(virtual_timer_intid)
+            .expect("due timer PPI should clear");
+
+        for control in [0, 0b11] {
+            runner
+                .set_vtimer_control(control)
+                .expect("indefinite retained timer control should be programmed");
+            let cancel = runner.run_cancel_handle();
+            std::thread::scope(|scope| {
+                let wait = scope.spawn(|| runner.wait_for_retained_vtimer(virtual_timer_intid));
+                wait_for_admission(&runner);
+                cancel.cancel().expect("retained wait should cancel");
+                assert_eq!(
+                    wait.join().expect("wait caller should not panic"),
+                    Ok(HvfVcpuRetainedVtimerWaitOutcome::Canceled)
+                );
+            });
+        }
+
+        runner
+            .set_vtimer_control(0)
+            .expect("shutdown retained timer should be disabled");
+        std::thread::scope(|scope| {
+            let wait = scope.spawn(|| runner.wait_for_retained_vtimer(virtual_timer_intid));
+            wait_for_admission(&runner);
+            runner
+                .shutdown()
+                .expect("shutdown should drain retained owner wait");
+            assert_eq!(
+                wait.join().expect("wait caller should not panic"),
+                Ok(HvfVcpuRetainedVtimerWaitOutcome::Canceled)
+            );
+        });
     }
     backend.destroy_vm().expect("VM should be destroyed");
 }

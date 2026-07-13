@@ -43,8 +43,9 @@ pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
 pub use runner::{
     HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1CaptureStage,
     HvfArm64SnapshotV1CompatibilityError, HvfArm64SnapshotV1Restore,
-    HvfArm64SnapshotV1RestoreStage, HvfVcpuMpidrAffinityStage, HvfVcpuRunCancelHandle,
-    HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
+    HvfArm64SnapshotV1RestoreStage, HvfVcpuMpidrAffinityStage, HvfVcpuRetainedVtimerWaitOutcome,
+    HvfVcpuRetainedVtimerWaitStage, HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner,
+    HvfVcpuRunnerError,
 };
 pub use session_vcpu::HvfArm64BootVcpuError;
 pub use sme::HvfArm64SmeConfiguration;
