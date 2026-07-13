@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
-    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange, aarch64,
 };
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
@@ -27,8 +27,10 @@ const MIB: u64 = 1024 * 1024;
 
 pub const MEMORY_HOTPLUG_DEFAULT_BLOCK_SIZE_MIB: u64 = 2;
 pub const MEMORY_HOTPLUG_DEFAULT_SLOT_SIZE_MIB: u64 = 128;
-// Current aarch64 DRAM layout tops out immediately below this address.
-pub const VIRTIO_MEM_DEFAULT_REGION_ADDRESS: GuestAddress = GuestAddress::new(0x0140_0000_0000);
+pub const VIRTIO_MEM_DEFAULT_REGION_ADDRESS: GuestAddress =
+    GuestAddress::new(aarch64::FIRST_ADDR_PAST_64BITS_MMIO);
+const VIRTIO_MEM_REGION_ADDRESS_SPACE_END: u64 =
+    aarch64::DRAM_MEM_START + aarch64::DRAM_MEM_MAX_SIZE;
 pub const VIRTIO_MEM_DEVICE_ID: u32 = 24;
 pub const VIRTIO_MEM_QUEUE_COUNT: usize = 1;
 pub const VIRTIO_MEM_QUEUE_SIZE: u16 = 256;
@@ -457,15 +459,27 @@ pub struct PreparedVirtioMemDevice {
 
 impl PreparedVirtioMemDevice {
     pub fn from_config(config: MemoryHotplugConfig) -> Result<Self, VirtioMemPrepareError> {
-        Self::from_config_at(config, VIRTIO_MEM_DEFAULT_REGION_ADDRESS)
+        Self::from_config_with_reserved_ranges(config, &[])
+    }
+
+    pub fn from_config_with_reserved_ranges(
+        config: MemoryHotplugConfig,
+        reserved_ranges: &[GuestMemoryRange],
+    ) -> Result<Self, VirtioMemPrepareError> {
+        mib_to_bytes(config.block_size_mib(), VirtioMemSizeField::Block)?;
+        let region_size = mib_to_bytes(config.total_size_mib(), VirtioMemSizeField::Total)?;
+        let alignment = mib_to_bytes(config.slot_size_mib(), VirtioMemSizeField::Slot)?;
+        let address = allocate_virtio_mem_region(region_size, alignment, reserved_ranges)?;
+
+        Self::from_config_at(config, address)
     }
 
     pub fn from_config_at(
         config: MemoryHotplugConfig,
         address: GuestAddress,
     ) -> Result<Self, VirtioMemPrepareError> {
-        let block_size = mib_to_bytes(config.block_size_mib(), VirtioMemSizeField::BlockSize)?;
-        let region_size = mib_to_bytes(config.total_size_mib(), VirtioMemSizeField::TotalSize)?;
+        let block_size = mib_to_bytes(config.block_size_mib(), VirtioMemSizeField::Block)?;
+        let region_size = mib_to_bytes(config.total_size_mib(), VirtioMemSizeField::Total)?;
         if address.checked_add(region_size).is_none() {
             return Err(VirtioMemPrepareError::RegionAddressOverflow {
                 address,
@@ -500,8 +514,9 @@ impl PreparedVirtioMemDevice {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VirtioMemSizeField {
-    BlockSize,
-    TotalSize,
+    Block,
+    Slot,
+    Total,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +528,15 @@ pub enum VirtioMemPrepareError {
     RegionAddressOverflow {
         address: GuestAddress,
         region_size: u64,
+    },
+    RegionAlignmentOverflow {
+        address: GuestAddress,
+        alignment: u64,
+    },
+    RegionUnavailable {
+        region_size: u64,
+        alignment: u64,
+        address_space_end: GuestAddress,
     },
 }
 
@@ -528,6 +552,18 @@ impl fmt::Display for VirtioMemPrepareError {
             } => write!(
                 f,
                 "virtio-mem region at {address} with size {region_size} bytes overflows guest address space"
+            ),
+            Self::RegionAlignmentOverflow { address, alignment } => write!(
+                f,
+                "virtio-mem region address {address} cannot be aligned to {alignment} bytes"
+            ),
+            Self::RegionUnavailable {
+                region_size,
+                alignment,
+                address_space_end,
+            } => write!(
+                f,
+                "no {alignment}-byte-aligned virtio-mem region of {region_size} bytes fits below guest address-space end {address_space_end}"
             ),
         }
     }
@@ -1537,8 +1573,8 @@ impl VirtioMemMutation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VirtioMemMutationKind {
-    Plug(GuestMemoryRange),
-    Unplug(GuestMemoryRange),
+    Plug(Vec<GuestMemoryRange>),
+    Unplug(Vec<GuestMemoryRange>),
     UnplugAll(Vec<GuestMemoryRange>),
 }
 
@@ -1649,26 +1685,14 @@ impl VirtioMemPendingMutation {
     ) -> Result<VirtioMemMutation, VirtioMemMutationError> {
         match self {
             Self::Plug(range) => Ok(VirtioMemMutation::new(VirtioMemMutationKind::Plug(
-                block_range_to_guest_range(range, config_space)?,
+                block_ranges_to_guest_ranges(&[range], config_space, "plug")?,
             ))),
             Self::Unplug(range) => Ok(VirtioMemMutation::new(VirtioMemMutationKind::Unplug(
-                block_range_to_guest_range(range, config_space)?,
+                block_ranges_to_guest_ranges(&[range], config_space, "unplug")?,
             ))),
-            Self::UnplugAll => {
-                let mut ranges = Vec::new();
-                ranges
-                    .try_reserve_exact(plugged_blocks.ranges.len())
-                    .map_err(|source| {
-                        VirtioMemMutationError::from_try_reserve_error("unplug-all", source)
-                    })?;
-                for range in plugged_blocks.ranges.iter().copied() {
-                    ranges.push(block_range_to_guest_range(range, config_space)?);
-                }
-
-                Ok(VirtioMemMutation::new(VirtioMemMutationKind::UnplugAll(
-                    ranges,
-                )))
-            }
+            Self::UnplugAll => Ok(VirtioMemMutation::new(VirtioMemMutationKind::UnplugAll(
+                block_ranges_to_guest_ranges(&plugged_blocks.ranges, config_space, "unplug-all")?,
+            ))),
         }
     }
 
@@ -1697,33 +1721,53 @@ impl VirtioMemMutationError {
     }
 }
 
-fn block_range_to_guest_range(
-    range: VirtioMemBlockRange,
+fn block_ranges_to_guest_ranges(
+    block_ranges: &[VirtioMemBlockRange],
     config_space: VirtioMemConfigSpace,
-) -> Result<GuestMemoryRange, VirtioMemMutationError> {
-    let block_size = config_space.block_size();
-    let Some(offset) = range.start().checked_mul(block_size) else {
-        return Err(VirtioMemMutationError::new(format!(
-            "virtio-mem block range start {} overflows block size {block_size}",
-            range.start()
-        )));
-    };
-    let Some(start) = config_space.addr().checked_add(offset) else {
-        return Err(VirtioMemMutationError::new(format!(
-            "virtio-mem block range start offset {offset} overflows base address {}",
-            config_space.addr()
-        )));
-    };
-    let Some(size) = range.len_bytes(block_size) else {
-        return Err(VirtioMemMutationError::new(format!(
-            "virtio-mem block range length {} overflows block size {block_size}",
-            range.block_count()
-        )));
-    };
+    context: &str,
+) -> Result<Vec<GuestMemoryRange>, VirtioMemMutationError> {
+    let block_count = block_ranges.iter().try_fold(0_u64, |count, range| {
+        count.checked_add(range.block_count()).ok_or_else(|| {
+            VirtioMemMutationError::new(format!(
+                "virtio-mem {context} block count overflows address space"
+            ))
+        })
+    })?;
+    let capacity = usize::try_from(block_count).map_err(|source| {
+        VirtioMemMutationError::new(format!(
+            "virtio-mem {context} block count {block_count} cannot be represented: {source}"
+        ))
+    })?;
+    let mut guest_ranges = Vec::new();
+    guest_ranges
+        .try_reserve_exact(capacity)
+        .map_err(|source| VirtioMemMutationError::from_try_reserve_error(context, source))?;
 
-    GuestMemoryRange::new(GuestAddress::new(start), size).map_err(|source| {
-        VirtioMemMutationError::new(format!("invalid virtio-mem mutation range: {source}"))
-    })
+    let block_size = config_space.block_size();
+    for range in block_ranges {
+        for block in range.start()..range.end() {
+            let Some(offset) = block.checked_mul(block_size) else {
+                return Err(VirtioMemMutationError::new(format!(
+                    "virtio-mem block {block} overflows block size {block_size}"
+                )));
+            };
+            let Some(start) = config_space.addr().checked_add(offset) else {
+                return Err(VirtioMemMutationError::new(format!(
+                    "virtio-mem block offset {offset} overflows base address {}",
+                    config_space.addr()
+                )));
+            };
+            let guest_range =
+                GuestMemoryRange::new(GuestAddress::new(start), block_size).map_err(|source| {
+                    VirtioMemMutationError::new(format!(
+                        "invalid virtio-mem mutation range: {source}"
+                    ))
+                })?;
+            guest_ranges.push(guest_range);
+        }
+    }
+
+    Ok(guest_ranges)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2882,12 +2926,68 @@ fn config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigErr
     }
 }
 
+fn allocate_virtio_mem_region(
+    region_size: u64,
+    alignment: u64,
+    reserved_ranges: &[GuestMemoryRange],
+) -> Result<GuestAddress, VirtioMemPrepareError> {
+    let mut address =
+        align_virtio_mem_region_address(VIRTIO_MEM_DEFAULT_REGION_ADDRESS, alignment)?;
+
+    loop {
+        let Some(end) = address.checked_add(region_size) else {
+            return Err(VirtioMemPrepareError::RegionAddressOverflow {
+                address,
+                region_size,
+            });
+        };
+        if end.raw_value() > VIRTIO_MEM_REGION_ADDRESS_SPACE_END {
+            return Err(VirtioMemPrepareError::RegionUnavailable {
+                region_size,
+                alignment,
+                address_space_end: GuestAddress::new(VIRTIO_MEM_REGION_ADDRESS_SPACE_END),
+            });
+        }
+        let candidate = GuestMemoryRange::new(address, region_size).map_err(|_| {
+            VirtioMemPrepareError::RegionAddressOverflow {
+                address,
+                region_size,
+            }
+        })?;
+        let Some(overlap) = reserved_ranges
+            .iter()
+            .copied()
+            .filter(|reserved| candidate.overlaps(*reserved))
+            .max_by_key(|reserved| reserved.end_exclusive().raw_value())
+        else {
+            return Ok(address);
+        };
+
+        address = align_virtio_mem_region_address(overlap.end_exclusive(), alignment)?;
+    }
+}
+
+fn align_virtio_mem_region_address(
+    address: GuestAddress,
+    alignment: u64,
+) -> Result<GuestAddress, VirtioMemPrepareError> {
+    let remainder = address.raw_value() % alignment;
+    if remainder == 0 {
+        return Ok(address);
+    }
+    let offset = alignment - remainder;
+    address
+        .checked_add(offset)
+        .ok_or(VirtioMemPrepareError::RegionAlignmentOverflow { address, alignment })
+}
+
 fn mib_to_bytes(mib: u64, field: VirtioMemSizeField) -> Result<u64, VirtioMemPrepareError> {
     mib.checked_mul(MIB)
         .ok_or(VirtioMemPrepareError::SizeOverflow {
             field: match field {
-                VirtioMemSizeField::BlockSize => "block_size_mib",
-                VirtioMemSizeField::TotalSize => "total_size_mib",
+                VirtioMemSizeField::Block => "block_size_mib",
+                VirtioMemSizeField::Slot => "slot_size_mib",
+                VirtioMemSizeField::Total => "total_size_mib",
             },
             mib,
         })
@@ -3043,6 +3143,45 @@ mod tests {
         assert_eq!(config_space.usable_region_size(), 0);
         assert_eq!(config_space.plugged_size(), 0);
         assert_eq!(config_space.requested_size(), 0);
+    }
+
+    #[test]
+    fn prepared_virtio_mem_device_allocates_after_reserved_ranges_on_slot_boundary() {
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(128, 2, 128))
+            .expect("valid memory hotplug config should convert");
+        let high_dram = GuestMemoryRange::new(VIRTIO_MEM_DEFAULT_REGION_ADDRESS, 256 * MIB)
+            .expect("high DRAM reservation should be valid");
+        let pmem = GuestMemoryRange::new(high_dram.end_exclusive(), 2 * MIB)
+            .expect("pmem reservation should be valid");
+
+        let prepared =
+            PreparedVirtioMemDevice::from_config_with_reserved_ranges(config, &[pmem, high_dram])
+                .expect("virtio-mem region should skip reserved DRAM and pmem");
+
+        assert_eq!(
+            prepared.config_space().addr(),
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value() + 384 * MIB
+        );
+    }
+
+    #[test]
+    fn prepared_virtio_mem_device_reports_exhausted_40_bit_region() {
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(128, 2, 128))
+            .expect("valid memory hotplug config should convert");
+        let reserved = GuestMemoryRange::new(
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS,
+            VIRTIO_MEM_REGION_ADDRESS_SPACE_END - VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value(),
+        )
+        .expect("post-MMIO64 address space reservation should be valid");
+
+        assert_eq!(
+            PreparedVirtioMemDevice::from_config_with_reserved_ranges(config, &[reserved]),
+            Err(VirtioMemPrepareError::RegionUnavailable {
+                region_size: 128 * MIB,
+                alignment: 128 * MIB,
+                address_space_end: GuestAddress::new(VIRTIO_MEM_REGION_ADDRESS_SPACE_END),
+            })
+        );
     }
 
     #[test]
@@ -4131,18 +4270,18 @@ mod tests {
     }
 
     #[test]
-    fn virtio_mem_queue_dispatch_calls_mutation_executor_for_plug() {
+    fn virtio_mem_queue_dispatch_expands_multi_block_plug_and_partial_unplug() {
         let mut memory = request_memory();
-        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 2);
         write_available_heads(&mut memory, &[0]);
         let mut queue = virtio_mem_queue();
         let mut config_space = virtio_mem_config_space()
-            .with_usable_region_size(0x20_0000)
-            .with_requested_size(0x20_0000);
+            .with_usable_region_size(0x40_0000)
+            .with_requested_size(0x40_0000);
         let mut plugged_blocks = VirtioMemPluggedBlocks::default();
         let mut executor = RecordingMutationExecutor::default();
 
-        let dispatch = queue
+        queue
             .dispatch_with_executor(
                 &mut memory,
                 &mut config_space,
@@ -4151,11 +4290,28 @@ mod tests {
             )
             .expect("plug should dispatch through executor");
 
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_UNPLUG, 0x4020_0000, 1);
+        write_available_heads(&mut memory, &[0, 0]);
+        let dispatch = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect("partial unplug should dispatch through executor");
+
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.mutation_failures(), 0);
         assert_eq!(
             executor.apply_calls,
-            [plug_mutation(0x4000_0000, 0x20_0000)]
+            [
+                plug_blocks_mutation(0x4000_0000, 0x20_0000, 2),
+                VirtioMemMutation::new(VirtioMemMutationKind::Unplug(vec![guest_range(
+                    0x4020_0000,
+                    0x20_0000,
+                )])),
+            ]
         );
         assert!(executor.rolled_back.is_empty());
         assert_eq!(config_space.plugged_size(), 0x20_0000);
@@ -4176,11 +4332,13 @@ mod tests {
         queue
             .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
             .expect("first plug should dispatch");
-        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4040_0000, 1);
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4020_0000, 1);
         write_available_heads(&mut memory, &[0, 0]);
         queue
             .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
             .expect("second plug should dispatch");
+        assert_eq!(plugged_blocks.ranges.len(), 1);
+        assert_eq!(plugged_blocks.ranges[0].block_count(), 2);
         let mut executor = RecordingMutationExecutor::default();
 
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_UNPLUG_ALL, 0, 0);
@@ -4200,12 +4358,96 @@ mod tests {
             [VirtioMemMutation::new(VirtioMemMutationKind::UnplugAll(
                 vec![
                     guest_range(0x4000_0000, 0x20_0000),
-                    guest_range(0x4040_0000, 0x20_0000),
+                    guest_range(0x4020_0000, 0x20_0000),
                 ]
             ))]
         );
         assert_eq!(config_space.plugged_size(), 0);
         assert_eq!(config_space.usable_region_size(), 0);
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_expands_request_across_conceptual_slot_boundary() {
+        let mut memory = request_memory();
+        let request_start = 0x47e0_0000;
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, request_start, 2);
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x820_0000)
+            .with_requested_size(0x820_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default();
+
+        queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect("boundary-crossing plug should dispatch");
+
+        assert_eq!(
+            executor.apply_calls,
+            [plug_blocks_mutation(request_start, 0x20_0000, 2)]
+        );
+        assert_eq!(
+            executor.apply_calls[0].kind(),
+            &VirtioMemMutationKind::Plug(vec![
+                guest_range(0x47e0_0000, 0x20_0000),
+                guest_range(0x4800_0000, 0x20_0000),
+            ])
+        );
+        assert_eq!(config_space.plugged_size(), 0x40_0000);
+    }
+
+    #[test]
+    fn virtio_mem_mutation_expansion_accepts_maximum_request_block_count() {
+        let block_size = 0x20_0000;
+        let block_count = u64::from(u16::MAX);
+        let region_size = block_count * block_size;
+        let config_space = VirtioMemConfigSpace::new(block_size, 0x4000_0000, region_size)
+            .with_usable_region_size(region_size)
+            .with_requested_size(region_size);
+        let mutation = VirtioMemPendingMutation::Plug(
+            VirtioMemBlockRange::new(0, block_count).expect("maximum request should be nonempty"),
+        )
+        .to_executable_mutation(config_space, &VirtioMemPluggedBlocks::default())
+        .expect("maximum request mutation metadata should be bounded");
+
+        let VirtioMemMutationKind::Plug(ranges) = mutation.kind() else {
+            panic!("expected plug mutation")
+        };
+        assert_eq!(ranges.len(), usize::from(u16::MAX));
+        assert_eq!(ranges[0], guest_range(0x4000_0000, block_size));
+        assert_eq!(
+            ranges.last(),
+            Some(&guest_range(
+                0x4000_0000 + (block_count - 1) * block_size,
+                block_size,
+            ))
+        );
+    }
+
+    #[test]
+    fn virtio_mem_mutation_expansion_reports_metadata_capacity_failure() {
+        let error = block_ranges_to_guest_ranges(
+            &[VirtioMemBlockRange {
+                start: 0,
+                end: u64::MAX,
+            }],
+            VirtioMemConfigSpace::new(1, 0, u64::MAX),
+            "plug",
+        )
+        .expect_err("unrepresentable mutation metadata should fail before range expansion");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to allocate plug mutation metadata"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -4314,7 +4556,7 @@ mod tests {
     #[test]
     fn virtio_mem_queue_dispatch_rolls_back_applied_mutation_after_response_write_failure() {
         let mut memory = request_memory();
-        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 2);
         write_descriptor(
             &mut memory,
             1,
@@ -4327,8 +4569,8 @@ mod tests {
         write_available_heads(&mut memory, &[0]);
         let mut queue = virtio_mem_queue();
         let mut config_space = virtio_mem_config_space()
-            .with_usable_region_size(0x20_0000)
-            .with_requested_size(0x20_0000);
+            .with_usable_region_size(0x40_0000)
+            .with_requested_size(0x40_0000);
         let mut plugged_blocks = VirtioMemPluggedBlocks::default();
         let mut executor = RecordingMutationExecutor::default();
 
@@ -4346,18 +4588,18 @@ mod tests {
         assert_eq!(config_space.plugged_size(), 0);
         assert_eq!(
             executor.apply_calls,
-            [plug_mutation(0x4000_0000, 0x20_0000)]
+            [plug_blocks_mutation(0x4000_0000, 0x20_0000, 2)]
         );
         assert_eq!(
             executor.rolled_back_mutations(),
-            [plug_mutation(0x4000_0000, 0x20_0000)]
+            [plug_blocks_mutation(0x4000_0000, 0x20_0000, 2)]
         );
     }
 
     #[test]
     fn virtio_mem_queue_dispatch_rolls_back_applied_mutation_after_used_ring_failure() {
         let mut memory = request_memory();
-        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 2);
         write_available_heads(&mut memory, &[0]);
         let available = VirtqueueAvailableRing::new(
             TEST_QUEUE_DESCRIPTOR_TABLE,
@@ -4369,8 +4611,8 @@ mod tests {
             .expect("used ring should build");
         let mut queue = VirtioMemQueue::new(available, used);
         let mut config_space = virtio_mem_config_space()
-            .with_usable_region_size(0x20_0000)
-            .with_requested_size(0x20_0000);
+            .with_usable_region_size(0x40_0000)
+            .with_requested_size(0x40_0000);
         let mut plugged_blocks = VirtioMemPluggedBlocks::default();
         let mut executor = RecordingMutationExecutor::default();
 
@@ -4392,11 +4634,11 @@ mod tests {
         assert_eq!(config_space.plugged_size(), 0);
         assert_eq!(
             executor.apply_calls,
-            [plug_mutation(0x4000_0000, 0x20_0000)]
+            [plug_blocks_mutation(0x4000_0000, 0x20_0000, 2)]
         );
         assert_eq!(
             executor.rolled_back_mutations(),
-            [plug_mutation(0x4000_0000, 0x20_0000)]
+            [plug_blocks_mutation(0x4000_0000, 0x20_0000, 2)]
         );
     }
 
@@ -5092,7 +5334,21 @@ mod tests {
     }
 
     fn plug_mutation(start: u64, size: u64) -> VirtioMemMutation {
-        VirtioMemMutation::new(VirtioMemMutationKind::Plug(guest_range(start, size)))
+        plug_blocks_mutation(start, size, 1)
+    }
+
+    fn plug_blocks_mutation(start: u64, block_size: u64, block_count: u16) -> VirtioMemMutation {
+        VirtioMemMutation::new(VirtioMemMutationKind::Plug(guest_block_ranges(
+            start,
+            block_size,
+            block_count,
+        )))
+    }
+
+    fn guest_block_ranges(start: u64, block_size: u64, block_count: u16) -> Vec<GuestMemoryRange> {
+        (0..u64::from(block_count))
+            .map(|block| guest_range(start + block * block_size, block_size))
+            .collect()
     }
 
     #[derive(Clone, Copy)]
