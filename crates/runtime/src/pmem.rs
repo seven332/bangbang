@@ -438,9 +438,10 @@ impl VirtioPmemQueue {
     pub fn dispatch(
         &mut self,
         memory: &mut GuestMemory,
-        flush_status: VirtioPmemFlushStatus,
+        flush: &mut impl FnMut() -> VirtioPmemFlushStatus,
     ) -> Result<VirtioPmemQueueDispatch, VirtioPmemQueueDispatchError> {
         let mut dispatch = VirtioPmemQueueDispatch::default();
+        let mut cached_flush_status = None;
         while let Some(chain) = self
             .available
             .pop_descriptor_chain(memory)
@@ -456,6 +457,14 @@ impl VirtioPmemQueue {
             })?;
             let (completion, outcome) = match VirtioPmemRequest::parse(memory, &chain) {
                 Ok(request) => {
+                    let flush_status = match cached_flush_status {
+                        Some(status) => status,
+                        None => {
+                            let status = flush();
+                            cached_flush_status = Some(status);
+                            status
+                        }
+                    };
                     let execution = request.execute(memory, flush_status);
                     (
                         execution.completion(),
@@ -701,7 +710,7 @@ impl VirtioPmemDevice {
         &mut self,
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
-        flush_status: VirtioPmemFlushStatus,
+        flush: &mut impl FnMut() -> VirtioPmemFlushStatus,
     ) -> Result<VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError> {
         if drained_notifications.is_empty() {
             return Ok(VirtioPmemDeviceNotificationDispatch::new(
@@ -727,7 +736,7 @@ impl VirtioPmemDevice {
             });
         };
 
-        match queue.dispatch(memory, flush_status) {
+        match queue.dispatch(memory, flush) {
             Ok(dispatch) => Ok(VirtioPmemDeviceNotificationDispatch::new(
                 drained_notifications,
                 Some(dispatch),
@@ -776,12 +785,12 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioPmemDe
     pub fn dispatch_pmem_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
-        flush_status: VirtioPmemFlushStatus,
+        flush: &mut impl FnMut() -> VirtioPmemFlushStatus,
     ) -> Result<VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError> {
         let drained_notifications = self.take_pending_queue_notifications();
         let dispatch = self
             .activation_handler_mut()
-            .dispatch_drained_queue_notifications(memory, drained_notifications, flush_status);
+            .dispatch_drained_queue_notifications(memory, drained_notifications, flush);
         let needs_queue_interrupt = match &dispatch {
             Ok(dispatch) => dispatch.needs_queue_interrupt(),
             Err(error) => error
@@ -2135,6 +2144,8 @@ pub struct PmemMmioDeviceRegistration {
     index: usize,
     pmem_id: String,
     region: MmioRegion,
+    guest_range: GuestMemoryRange,
+    file_len: u64,
     config_space: VirtioPmemConfigSpace,
 }
 
@@ -2149,6 +2160,14 @@ impl PmemMmioDeviceRegistration {
 
     pub const fn region(&self) -> MmioRegion {
         self.region
+    }
+
+    pub const fn guest_range(&self) -> GuestMemoryRange {
+        self.guest_range
+    }
+
+    pub const fn file_len(&self) -> u64 {
+        self.file_len
     }
 
     pub const fn region_id(&self) -> MmioRegionId {
@@ -2201,6 +2220,8 @@ impl PmemMmioDevices {
         let mut dispatcher = dispatcher;
         for (prepared_device, placement) in prepared.as_slice().iter().zip(placements) {
             let pmem_id = prepared_device.id().to_string();
+            let guest_range = prepared_device.guest_range();
+            let file_len = prepared_device.mapping().file_len();
             let config_space = prepared_device.config_space();
             let handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
                 VIRTIO_PMEM_DEVICE_ID,
@@ -2238,6 +2259,8 @@ impl PmemMmioDevices {
                 index: placement.index,
                 pmem_id,
                 region,
+                guest_range,
+                file_len,
                 config_space,
             });
         }
@@ -3085,8 +3108,12 @@ mod tests {
     }
 
     fn write_request_type(memory: &mut GuestMemory, request_type: u32) {
+        write_request_type_at(memory, TEST_PMEM_REQUEST_ADDR, request_type);
+    }
+
+    fn write_request_type_at(memory: &mut GuestMemory, address: GuestAddress, request_type: u32) {
         memory
-            .write_slice(&request_type.to_le_bytes(), TEST_PMEM_REQUEST_ADDR)
+            .write_slice(&request_type.to_le_bytes(), address)
             .expect("pmem request type should write");
     }
 
@@ -3215,18 +3242,32 @@ mod tests {
     }
 
     fn write_pmem_flush_chain(memory: &mut GuestMemory) {
-        write_request_type(memory, VIRTIO_PMEM_REQUEST_TYPE_FLUSH);
-        write_descriptor(
-            memory,
-            0,
-            TestDescriptor::readable(TEST_PMEM_REQUEST_ADDR, VIRTIO_PMEM_REQUEST_SIZE, Some(1)),
-        );
-        write_descriptor(
-            memory,
-            1,
-            TestDescriptor::writable(TEST_PMEM_STATUS_ADDR, VIRTIO_PMEM_STATUS_SIZE, None),
-        );
+        write_pmem_flush_chain_at(memory, 0, 1, TEST_PMEM_REQUEST_ADDR, TEST_PMEM_STATUS_ADDR);
         write_available_heads(memory, &[0]);
+    }
+
+    fn write_pmem_flush_chain_at(
+        memory: &mut GuestMemory,
+        request_index: u16,
+        status_index: u16,
+        request_address: GuestAddress,
+        status_address: GuestAddress,
+    ) {
+        write_request_type_at(memory, request_address, VIRTIO_PMEM_REQUEST_TYPE_FLUSH);
+        write_descriptor(
+            memory,
+            request_index,
+            TestDescriptor::readable(
+                request_address,
+                VIRTIO_PMEM_REQUEST_SIZE,
+                Some(status_index),
+            ),
+        );
+        write_descriptor(
+            memory,
+            status_index,
+            TestDescriptor::writable(status_address, VIRTIO_PMEM_STATUS_SIZE, None),
+        );
     }
 
     #[test]
@@ -3340,11 +3381,17 @@ mod tests {
         let mut memory = request_memory();
         write_pmem_flush_chain(&mut memory);
         let mut queue = pmem_queue();
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Success
+        };
 
         let dispatch = queue
-            .dispatch(&mut memory, VirtioPmemFlushStatus::Success)
+            .dispatch(&mut memory, &mut flush)
             .expect("pmem flush queue should dispatch");
 
+        assert_eq!(flush_calls, 1);
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_flushes(), 1);
         assert_eq!(dispatch.failed_flushes(), 0);
@@ -3367,11 +3414,17 @@ mod tests {
         let mut memory = request_memory();
         write_pmem_flush_chain(&mut memory);
         let mut queue = pmem_queue();
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Failure
+        };
 
         let dispatch = queue
-            .dispatch(&mut memory, VirtioPmemFlushStatus::Failure)
+            .dispatch(&mut memory, &mut flush)
             .expect("pmem flush queue should dispatch");
 
+        assert_eq!(flush_calls, 1);
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_flushes(), 0);
         assert_eq!(dispatch.failed_flushes(), 1);
@@ -3384,6 +3437,114 @@ mod tests {
         );
         assert_eq!(read_used_index(&memory), 1);
         assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_PMEM_STATUS_SIZE));
+    }
+
+    #[test]
+    fn pmem_queue_dispatch_skips_flush_for_empty_queue() {
+        let mut memory = request_memory();
+        let mut queue = pmem_queue();
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Success
+        };
+
+        let dispatch = queue
+            .dispatch(&mut memory, &mut flush)
+            .expect("empty pmem queue should dispatch");
+
+        assert_eq!(flush_calls, 0);
+        assert_eq!(dispatch.processed_requests(), 0);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(read_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn pmem_queue_dispatch_flushes_once_after_first_valid_chain() {
+        let mut memory = request_memory();
+        write_request_type(&mut memory, VIRTIO_PMEM_REQUEST_TYPE_FLUSH);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(TEST_PMEM_REQUEST_ADDR, VIRTIO_PMEM_REQUEST_SIZE, Some(1)),
+        );
+        write_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(TEST_PMEM_STATUS_ADDR, VIRTIO_PMEM_STATUS_SIZE, None),
+        );
+        let first_request = GuestAddress::new(0x2010);
+        let first_status = GuestAddress::new(0x3010);
+        let second_request = GuestAddress::new(0x2020);
+        let second_status = GuestAddress::new(0x3020);
+        write_pmem_flush_chain_at(&mut memory, 2, 3, first_request, first_status);
+        write_pmem_flush_chain_at(&mut memory, 4, 5, second_request, second_status);
+        memory
+            .write_slice(&99_i32.to_le_bytes(), TEST_PMEM_STATUS_ADDR)
+            .expect("invalid-chain status sentinel should write");
+        write_available_heads(&mut memory, &[0, 2, 4]);
+        let mut queue = pmem_queue();
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Success
+        };
+
+        let dispatch = queue
+            .dispatch(&mut memory, &mut flush)
+            .expect("mixed pmem chains should dispatch");
+
+        assert_eq!(flush_calls, 1);
+        assert_eq!(dispatch.processed_requests(), 3);
+        assert_eq!(dispatch.successful_flushes(), 2);
+        assert_eq!(dispatch.parse_failures(), 1);
+        assert_eq!(read_guest_i32(&memory, TEST_PMEM_STATUS_ADDR), 99);
+        assert_eq!(
+            read_guest_i32(&memory, first_status),
+            VIRTIO_PMEM_STATUS_SUCCESS
+        );
+        assert_eq!(
+            read_guest_i32(&memory, second_status),
+            VIRTIO_PMEM_STATUS_SUCCESS
+        );
+        assert_eq!(read_used_index(&memory), 3);
+        assert_eq!(read_used_element(&memory, 0), (0, 0));
+        assert_eq!(read_used_element(&memory, 1), (2, VIRTIO_PMEM_STATUS_SIZE));
+        assert_eq!(read_used_element(&memory, 2), (4, VIRTIO_PMEM_STATUS_SIZE));
+    }
+
+    #[test]
+    fn pmem_queue_dispatch_caches_failed_flush_for_all_valid_chains() {
+        let mut memory = request_memory();
+        let first_request = GuestAddress::new(0x2010);
+        let first_status = GuestAddress::new(0x3010);
+        let second_request = GuestAddress::new(0x2020);
+        let second_status = GuestAddress::new(0x3020);
+        write_pmem_flush_chain_at(&mut memory, 0, 1, first_request, first_status);
+        write_pmem_flush_chain_at(&mut memory, 2, 3, second_request, second_status);
+        write_available_heads(&mut memory, &[0, 2]);
+        let mut queue = pmem_queue();
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Failure
+        };
+
+        let dispatch = queue
+            .dispatch(&mut memory, &mut flush)
+            .expect("valid pmem chains should share failed flush result");
+
+        assert_eq!(flush_calls, 1);
+        assert_eq!(dispatch.processed_requests(), 2);
+        assert_eq!(dispatch.failed_flushes(), 2);
+        assert_eq!(
+            read_guest_i32(&memory, first_status),
+            VIRTIO_PMEM_STATUS_FAILURE
+        );
+        assert_eq!(
+            read_guest_i32(&memory, second_status),
+            VIRTIO_PMEM_STATUS_FAILURE
+        );
     }
 
     #[test]
@@ -3405,11 +3566,17 @@ mod tests {
             .expect("sentinel status should write");
         write_available_heads(&mut memory, &[0]);
         let mut queue = pmem_queue();
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Success
+        };
 
         let dispatch = queue
-            .dispatch(&mut memory, VirtioPmemFlushStatus::Success)
+            .dispatch(&mut memory, &mut flush)
             .expect("invalid pmem request should still publish a completion");
 
+        assert_eq!(flush_calls, 0);
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_flushes(), 0);
         assert_eq!(dispatch.failed_flushes(), 0);
@@ -3451,11 +3618,17 @@ mod tests {
         );
         write_available_heads(&mut memory, &[0]);
         let mut queue = pmem_queue();
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Success
+        };
 
         let dispatch = queue
-            .dispatch(&mut memory, VirtioPmemFlushStatus::Success)
+            .dispatch(&mut memory, &mut flush)
             .expect("status write failure should still publish a completion");
 
+        assert_eq!(flush_calls, 1);
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_flushes(), 0);
         assert_eq!(dispatch.failed_flushes(), 0);
@@ -3470,6 +3643,41 @@ mod tests {
         );
         assert_eq!(read_used_index(&memory), 1);
         assert_eq!(read_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn pmem_queue_dispatch_does_not_repeat_flush_after_used_ring_failure() {
+        let mut memory = request_memory();
+        write_pmem_flush_chain(&mut memory);
+        let available = VirtqueueAvailableRing::new(
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let used = VirtqueueUsedRing::new(GuestAddress::new(TEST_MEMORY_SIZE), TEST_QUEUE_SIZE)
+            .expect("used ring should build");
+        let mut queue = VirtioPmemQueue::new(available, used);
+        let mut flush_calls = 0;
+        let mut flush = || {
+            flush_calls += 1;
+            VirtioPmemFlushStatus::Success
+        };
+
+        let error = queue
+            .dispatch(&mut memory, &mut flush)
+            .expect_err("unmapped used ring should fail after one targeted flush");
+
+        assert_eq!(flush_calls, 1);
+        assert!(matches!(
+            error,
+            VirtioPmemQueueDispatchError::UsedRing { .. }
+        ));
+        assert_eq!(error.completed_dispatch().processed_requests(), 0);
+        assert_eq!(
+            read_guest_i32(&memory, TEST_PMEM_STATUS_ADDR),
+            VIRTIO_PMEM_STATUS_SUCCESS
+        );
     }
 
     #[test]
@@ -3496,6 +3704,14 @@ mod tests {
         assert_eq!(registration.pmem_id(), "pmem0");
         assert_eq!(registration.region_id(), TEST_PMEM_MMIO_REGION_ID);
         assert_eq!(registration.address(), TEST_PMEM_MMIO_BASE);
+        assert_eq!(
+            registration.guest_range(),
+            devices.pmem_devices()[0].guest_range()
+        );
+        assert_eq!(
+            registration.file_len(),
+            devices.pmem_devices()[0].mapping().file_len()
+        );
         assert_eq!(
             registration.region().range().size(),
             VIRTIO_MMIO_DEVICE_WINDOW_SIZE

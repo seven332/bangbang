@@ -9,7 +9,7 @@ use bangbang_runtime::{BackendError, VmBackend};
 use crate::gic::{HvfGicCreator, HvfGicError, HvfGicMetadata, RealHvfGicCreator};
 use crate::memory::{
     HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping, HvfMemoryMapper,
-    HvfMemoryPermissions, HvfVirtioMemMutationExecutor, RealHvfMemoryMapper,
+    HvfMemoryPermissions, HvfPmemFlushExecutor, HvfVirtioMemMutationExecutor, RealHvfMemoryMapper,
 };
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
@@ -129,6 +129,17 @@ impl HvfBackend {
             .memory_and_virtio_mem_executor_mut(permissions)
     }
 
+    pub(crate) fn mapped_guest_memory_and_pmem_flush_executor_mut(
+        &mut self,
+    ) -> Result<(&mut GuestMemory, HvfPmemFlushExecutor<'_>), HvfGuestMemoryMappingError> {
+        self.guest_memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+            ))?
+            .memory_and_pmem_flush_executor_mut()
+    }
+
     /// Insert one owned guest memory region and map it into the active HVF VM.
     ///
     /// This keeps the process-owned `GuestMemory` region and the HVF mapping in
@@ -181,15 +192,6 @@ impl HvfBackend {
                 GUEST_MEMORY_NOT_MAPPED_MESSAGE,
             ))?
             .unmap_dynamic_region(range)
-    }
-
-    pub(crate) fn flush_mapped_pmem_shadows(&self) -> Result<(), HvfGuestMemoryMappingError> {
-        self.guest_memory
-            .as_ref()
-            .ok_or(HvfGuestMemoryMappingError::InvalidState(
-                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
-            ))?
-            .flush_host_memory_now()
     }
 
     pub fn create_gic(&mut self) -> Result<&HvfGicMetadata, HvfGicError> {
