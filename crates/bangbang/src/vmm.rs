@@ -57,10 +57,10 @@ use bangbang_runtime::mmds::{
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkInterfaceConfigInput,
-    NetworkInterfaceUpdateInput, NetworkMmioLayout, VirtioNetworkRxPacket,
-    VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
-    VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
-    validate_network_interface_count,
+    NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
+    NetworkMmioLayout, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
+    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition,
+    VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
 use bangbang_runtime::pmem::{PmemMmioLayout, PmemUpdateInput};
 use bangbang_runtime::rtc::RtcMmioLayout;
@@ -87,6 +87,7 @@ use bangbang_runtime::startup::{
     balloon_hinting_status_for_device, balloon_stats_for_device, start_balloon_hinting_for_device,
     stop_balloon_hinting_for_device, update_balloon_config_for_device,
     update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
+    update_network_interface_rate_limiters_for_devices,
 };
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
@@ -385,6 +386,13 @@ pub(crate) trait ProcessSessionDiagnostics {
         Err(DriveUpdateError::ActiveSessionUnavailable)
     }
 
+    fn update_network_interface(
+        &mut self,
+        _update: NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        Err(NetworkInterfaceUpdateError::ActiveSessionUnavailable)
+    }
+
     fn update_balloon(&mut self, _config: BalloonConfig) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -454,6 +462,12 @@ impl ProcessSessionDiagnostics for () {}
 #[derive(Debug, Clone)]
 pub(crate) struct BootRunLoopBlockDeviceUpdater {
     block_devices: Vec<Arm64BootBlockDevice>,
+    mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BootRunLoopNetworkInterfaceUpdater {
+    network_devices: Vec<Arm64BootNetworkDevice>,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
 }
 
@@ -572,6 +586,34 @@ impl BootRunLoopBlockDeviceUpdater {
             config,
             backing,
             rate_limiter_update,
+        )
+    }
+}
+
+impl BootRunLoopNetworkInterfaceUpdater {
+    fn new(
+        network_devices: Vec<Arm64BootNetworkDevice>,
+        mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    ) -> Self {
+        Self {
+            network_devices,
+            mmio_dispatcher,
+        }
+    }
+
+    fn update_network_interface(
+        &self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        let mut dispatcher = self
+            .mmio_dispatcher
+            .lock()
+            .map_err(|_| NetworkInterfaceUpdateError::MmioDispatcherUnavailable)?;
+
+        update_network_interface_rate_limiters_for_devices(
+            &self.network_devices,
+            &mut dispatcher,
+            update,
         )
     }
 }
@@ -1204,6 +1246,11 @@ where
     }
 
     #[cfg(test)]
+    pub(crate) fn network_interface_configs(&self) -> &[NetworkInterfaceConfig] {
+        self.controller.network_interface_configs()
+    }
+
+    #[cfg(test)]
     pub(crate) const fn machine_config(&self) -> MachineConfig {
         self.controller.machine_config()
     }
@@ -1226,6 +1273,7 @@ where
             VmmAction::CreateSnapshot(input) => self.create_snapshot(input),
             VmmAction::LoadSnapshot(input) => self.load_snapshot(input),
             VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
+            VmmAction::UpdateNetworkInterface(input) => self.update_network_interface(input),
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::PatchBalloonStats(input) => self.update_balloon_statistics(input),
             VmmAction::PatchMemoryHotplug(input) => self.update_memory_hotplug(input),
@@ -1415,6 +1463,35 @@ where
                 .map_err(VmmActionError::DriveUpdate)?;
         }
         self.controller.commit_drive_update(updated_config)?;
+
+        Ok(VmmData::Empty)
+    }
+
+    fn update_network_interface(
+        &mut self,
+        input: NetworkInterfaceUpdateInput,
+    ) -> Result<VmmData, VmmActionError> {
+        if self.controller.instance_info().state == bangbang_runtime::InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::UpdateNetworkInterface(input).name(),
+                state: self.controller.instance_info().state,
+            });
+        }
+
+        let (update, updated_config) = self.controller.prepare_network_interface_update(input)?;
+        if !update.is_noop() {
+            let Some(session) = self.started_session.as_mut() else {
+                return Err(VmmActionError::NetworkInterfaceUpdate(
+                    NetworkInterfaceUpdateError::ActiveSessionUnavailable,
+                ));
+            };
+
+            session
+                .update_network_interface(update)
+                .map_err(VmmActionError::NetworkInterfaceUpdate)?;
+        }
+        self.controller
+            .commit_network_interface_update(updated_config)?;
 
         Ok(VmmData::Empty)
     }
@@ -2715,6 +2792,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
+        None
+    }
+
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
         None
     }
@@ -2797,6 +2878,13 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
         Some(BootRunLoopBlockDeviceUpdater::new(
             self.runtime_resources().block_devices.clone(),
+            self.mmio_dispatcher(),
+        ))
+    }
+
+    fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
+        Some(BootRunLoopNetworkInterfaceUpdater::new(
+            self.runtime_resources().network_devices.clone(),
             self.mmio_dispatcher(),
         ))
     }
@@ -2930,6 +3018,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
+        None
+    }
+
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
         None
     }
@@ -3013,6 +3105,13 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
         Some(BootRunLoopBlockDeviceUpdater::new(
             self.runtime_resources().block_devices.clone(),
+            self.mmio_dispatcher(),
+        ))
+    }
+
+    fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
+        Some(BootRunLoopNetworkInterfaceUpdater::new(
+            self.runtime_resources().network_devices.clone(),
             self.mmio_dispatcher(),
         ))
     }
@@ -3122,6 +3221,10 @@ where
 
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
         self.session.block_device_updater()
+    }
+
+    fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
+        self.session.network_interface_updater()
     }
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
@@ -3662,6 +3765,20 @@ where
     }
 }
 
+fn network_interface_update_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, NetworkInterfaceUpdateError>,
+) -> NetworkInterfaceUpdateError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        other => NetworkInterfaceUpdateError::ActiveSessionCommand {
+            message: other.to_string(),
+        },
+    }
+}
+
 fn balloon_update_error_from_boot_run_loop_command<C>(
     err: BootRunLoopCommandError<C, BalloonUpdateError>,
 ) -> BalloonUpdateError
@@ -4008,6 +4125,7 @@ where
 {
     control: S::Control,
     block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
+    network_interface_updater: Option<BootRunLoopNetworkInterfaceUpdater>,
     balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
     block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
     pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
@@ -4105,6 +4223,7 @@ where
     ) -> Result<Self, BootRunLoopStartError<S>> {
         let control = session.run_loop_control();
         let block_device_updater = session.block_device_updater();
+        let network_interface_updater = session.network_interface_updater();
         let balloon_device_updater = session.balloon_device_updater();
         let block_device_metrics = session.shared_block_device_metrics();
         let pmem_device_metrics = session.shared_pmem_device_metrics();
@@ -4230,6 +4349,7 @@ where
         Ok(Self {
             control,
             block_device_updater,
+            network_interface_updater,
             balloon_device_updater,
             block_device_metrics,
             pmem_device_metrics,
@@ -4707,6 +4827,26 @@ where
         result
     }
 
+    fn update_network_interface(
+        &mut self,
+        update: NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        let Some(updater) = self.network_interface_updater.as_ref() else {
+            return Err(NetworkInterfaceUpdateError::ActiveSessionUnavailable);
+        };
+
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(NetworkInterfaceUpdateError::ActiveSessionUnavailable);
+        }
+
+        let updater = updater.clone();
+        self.run_command(move |_| updater.update_network_interface(&update))
+            .map_err(network_interface_update_error_from_boot_run_loop_command)
+    }
+
     fn update_balloon(&mut self, config: BalloonConfig) -> Result<(), BalloonUpdateError> {
         let Some(updater) = self.balloon_device_updater.as_ref() else {
             return Err(BalloonUpdateError::ActiveSessionUnavailable);
@@ -4900,6 +5040,10 @@ where
                 "has_balloon_device_updater",
                 &self.balloon_device_updater.is_some(),
             )
+            .field(
+                "has_network_interface_updater",
+                &self.network_interface_updater.is_some(),
+            )
             .field("worker_active", &self.worker.is_some())
             .finish()
     }
@@ -4973,8 +5117,9 @@ mod tests {
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
         MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig, NetworkInterfaceConfigError,
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioLayout,
-        PreparedNetworkDevices,
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkInterfaceUpdate,
+        NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput, NetworkMmioLayout,
+        NetworkRateLimiterConfig, NetworkTokenBucketConfig, PreparedNetworkDevices,
     };
     use bangbang_runtime::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialConfigInput, SerialOutput,
@@ -5012,10 +5157,11 @@ mod tests {
     use super::{
         BootRunLoopBlockDeviceUpdater, BootRunLoopCommandAdmission,
         BootRunLoopCommandAdmissionState, BootRunLoopCommandError,
-        BootRunLoopCommandSubmissionError, BootRunLoopControl, BootRunLoopSession,
-        BootRunLoopSupervisor, BootRunLoopWorkerStatus, DEFAULT_BALLOON_MMIO_BASE,
-        DEFAULT_BALLOON_MMIO_REGION_ID, DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID,
-        DEFAULT_BOOT_TIMER_MMIO_BASE, DEFAULT_BOOT_TIMER_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE,
+        BootRunLoopCommandSubmissionError, BootRunLoopControl, BootRunLoopNetworkInterfaceUpdater,
+        BootRunLoopSession, BootRunLoopSupervisor, BootRunLoopWorkerStatus,
+        DEFAULT_BALLOON_MMIO_BASE, DEFAULT_BALLOON_MMIO_REGION_ID, DEFAULT_BLOCK_MMIO_BASE,
+        DEFAULT_BLOCK_MMIO_REGION_ID, DEFAULT_BOOT_TIMER_MMIO_BASE,
+        DEFAULT_BOOT_TIMER_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE,
         DEFAULT_ENTROPY_MMIO_REGION_ID, DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT,
         DEFAULT_MEMORY_HOTPLUG_MMIO_BASE, DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID,
         DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_PMEM_MMIO_BASE,
@@ -5270,6 +5416,40 @@ mod tests {
         (updater, config)
     }
 
+    fn network_interface_updater_fixture(iface_id: &str) -> BootRunLoopNetworkInterfaceUpdater {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new(iface_id, iface_id, "tap0"))
+            .expect("network config should insert");
+        let devices = PreparedNetworkDevices::from_configs(&configs)
+            .expect("prepared network devices should build")
+            .register_mmio(NetworkMmioLayout::new(
+                DEFAULT_NETWORK_MMIO_BASE,
+                DEFAULT_NETWORK_MMIO_REGION_ID,
+            ))
+            .expect("network MMIO devices should register");
+        let (dispatcher, registrations) = devices.into_parts();
+        let network_devices = registrations
+            .into_iter()
+            .map(|registration| {
+                let range = registration.region().range();
+                Arm64BootNetworkDevice {
+                    registration,
+                    fdt_device: Arm64FdtVirtioMmioDevice {
+                        region: Arm64FdtRegion {
+                            base: range.start().raw_value(),
+                            size: range.size(),
+                        },
+                        interrupt_line: GuestInterruptLine::new(32)
+                            .expect("test interrupt line should validate"),
+                    },
+                }
+            })
+            .collect();
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        BootRunLoopNetworkInterfaceUpdater::new(network_devices, dispatcher)
+    }
+
     impl Drop for TempFilePath {
         fn drop(&mut self) {
             let _ = remove_file(&self.path);
@@ -5299,6 +5479,9 @@ mod tests {
         last_block_update_refresh_backing: Option<bool>,
         last_block_update_rate_limiter: Option<Option<DriveRateLimiterConfig>>,
         block_update_result: Option<DriveUpdateError>,
+        network_update_count: usize,
+        last_network_update: Option<NetworkInterfaceUpdate>,
+        network_update_result: Option<NetworkInterfaceUpdateError>,
         balloon_update_count: usize,
         last_balloon_update_mib: Option<u32>,
         balloon_update_result: Option<BalloonUpdateError>,
@@ -5343,6 +5526,9 @@ mod tests {
                 last_block_update_refresh_backing: None,
                 last_block_update_rate_limiter: None,
                 block_update_result: None,
+                network_update_count: 0,
+                last_network_update: None,
+                network_update_result: None,
                 balloon_update_count: 0,
                 last_balloon_update_mib: None,
                 balloon_update_result: None,
@@ -5373,6 +5559,12 @@ mod tests {
         fn with_block_update_result(id: u64, result: DriveUpdateError) -> Self {
             let mut session = Self::new(id);
             session.block_update_result = Some(result);
+            session
+        }
+
+        fn with_network_update_result(id: u64, result: NetworkInterfaceUpdateError) -> Self {
+            let mut session = Self::new(id);
+            session.network_update_result = Some(result);
             session
         }
 
@@ -5501,6 +5693,18 @@ mod tests {
             self.last_block_update_refresh_backing = Some(refresh_backing);
             self.last_block_update_rate_limiter = Some(rate_limiter_update);
             match self.block_update_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn update_network_interface(
+            &mut self,
+            update: NetworkInterfaceUpdate,
+        ) -> Result<(), NetworkInterfaceUpdateError> {
+            self.network_update_count += 1;
+            self.last_network_update = Some(update);
+            match self.network_update_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
             }
@@ -6113,6 +6317,7 @@ mod tests {
         max_steps_sender: mpsc::Sender<usize>,
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
+        network_interface_updater: Option<BootRunLoopNetworkInterfaceUpdater>,
         block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
         pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
@@ -6148,6 +6353,7 @@ mod tests {
                     FakeRunLoopOutcome::Terminal,
                 )]))),
                 block_device_updater: None,
+                network_interface_updater: None,
                 block_device_metrics: None,
                 pmem_device_metrics: None,
                 balloon_device_metrics: None,
@@ -6253,6 +6459,14 @@ mod tests {
 
         fn with_block_device_updater(mut self, updater: BootRunLoopBlockDeviceUpdater) -> Self {
             self.block_device_updater = Some(updater);
+            self
+        }
+
+        fn with_network_interface_updater(
+            mut self,
+            updater: BootRunLoopNetworkInterfaceUpdater,
+        ) -> Self {
+            self.network_interface_updater = Some(updater);
             self
         }
 
@@ -6368,6 +6582,10 @@ mod tests {
 
         fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
             self.block_device_updater.clone()
+        }
+
+        fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
+            self.network_interface_updater.clone()
         }
 
         fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
@@ -10045,6 +10263,131 @@ mod tests {
     }
 
     #[test]
+    fn boot_run_loop_supervisor_updates_network_limiter_on_worker() {
+        let updater = network_interface_updater_fixture("eth0");
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_network_interface_updater(updater)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(67).expect("non-zero limit"))
+                .expect("supervisor should start");
+        let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                Some(NetworkTokenBucketConfig::new(1024, None, 100)),
+                None,
+            ))
+            .validate()
+            .expect("network limiter update should validate");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            67
+        );
+        supervisor
+            .update_network_interface(update)
+            .expect("network update should run on worker");
+
+        assert_eq!(control.request_wakeup_count(), 1);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_updates_network_limiter_while_paused() {
+        let updater = network_interface_updater_fixture("eth0");
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, _max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_network_interface_updater(updater);
+        let mut supervisor = BootRunLoopSupervisor::start_paused(
+            session,
+            NonZeroUsize::new(69).expect("non-zero limit"),
+        )
+        .expect("paused supervisor should start");
+        let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_tx_rate_limiter(NetworkRateLimiterConfig::new(
+                None,
+                Some(NetworkTokenBucketConfig::new(8, None, 100)),
+            ))
+            .validate()
+            .expect("network limiter update should validate");
+
+        supervisor
+            .update_network_interface(update)
+            .expect("paused network update should run on worker");
+
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_maps_full_network_update_command_queue() {
+        let updater = network_interface_updater_fixture("eth0");
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_network_interface_updater(updater);
+        let mut supervisor = BootRunLoopSupervisor::start_with_command_queue_capacity(
+            session,
+            NonZeroUsize::new(71).expect("non-zero limit"),
+            0,
+        )
+        .expect("supervisor should start");
+        let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                Some(NetworkTokenBucketConfig::new(1024, None, 100)),
+                None,
+            ))
+            .validate()
+            .expect("network limiter update should validate");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            71
+        );
+        let error = supervisor
+            .update_network_interface(update)
+            .expect_err("full command queue should fail");
+
+        assert_eq!(
+            error,
+            NetworkInterfaceUpdateError::ActiveSessionCommand {
+                message: "boot run loop command queue is full".to_string(),
+            }
+        );
+        assert_eq!(control.request_wakeup_count(), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn boot_run_loop_supervisor_keeps_status_running_across_step_limit() {
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
@@ -11387,6 +11730,198 @@ mod tests {
         assert_eq!(session.last_block_update, None);
         assert_eq!(session.last_block_update_refresh_backing, None);
         assert_eq!(session.last_block_update_rate_limiter, None);
+    }
+
+    #[test]
+    fn runtime_network_rate_limiter_update_commits_after_active_session_success() {
+        let initial_bandwidth = NetworkTokenBucketConfig::new(1024, Some(2048), 100);
+        let replacement_ops = NetworkTokenBucketConfig::new(16, Some(4), 250);
+        let tx_bandwidth = NetworkTokenBucketConfig::new(4096, None, 500);
+        let mut vmm = configured_vmm(FakeStarter::success(31));
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
+                .with_rx_rate_limiter(NetworkRateLimiterConfig::new(Some(initial_bandwidth), None)),
+        ))
+        .expect("initial network interface should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        let rx_update = NetworkRateLimiterConfig::new(None, Some(replacement_ops));
+        let tx_update = NetworkRateLimiterConfig::new(Some(tx_bandwidth), None);
+
+        let data = vmm
+            .handle_action(VmmAction::UpdateNetworkInterface(
+                NetworkInterfaceUpdateInput::new("eth0", "eth0")
+                    .with_rx_rate_limiter(rx_update)
+                    .with_tx_rate_limiter(tx_update),
+            ))
+            .expect("runtime network limiter update should succeed");
+
+        assert_eq!(data, VmmData::Empty);
+        let stored = &vmm.network_interface_configs()[0];
+        assert_eq!(
+            stored.rx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(
+                Some(initial_bandwidth),
+                Some(replacement_ops),
+            ))
+        );
+        assert_eq!(stored.tx_rate_limiter(), Some(tx_update));
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.network_update_count, 1);
+        let active_update = session
+            .last_network_update
+            .as_ref()
+            .expect("active update should be recorded");
+        assert_eq!(active_update.iface_id(), "eth0");
+        assert_eq!(active_update.rx_rate_limiter(), Some(rx_update));
+        assert_eq!(active_update.tx_rate_limiter(), Some(tx_update));
+    }
+
+    #[test]
+    fn runtime_network_rate_limiter_noop_skips_active_session() {
+        let initial_bandwidth = NetworkTokenBucketConfig::new(1024, None, 100);
+        let mut vmm = configured_vmm(FakeStarter::success(32));
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
+                .with_rx_rate_limiter(NetworkRateLimiterConfig::new(Some(initial_bandwidth), None)),
+        ))
+        .expect("initial network interface should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let data = vmm
+            .handle_action(VmmAction::UpdateNetworkInterface(
+                NetworkInterfaceUpdateInput::new("eth0", "eth0"),
+            ))
+            .expect("runtime network no-op should succeed");
+
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(
+            vmm.network_interface_configs()[0].rx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(Some(initial_bandwidth), None,))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.network_update_count, 0);
+        assert!(session.last_network_update.is_none());
+    }
+
+    #[test]
+    fn runtime_network_rate_limiter_update_failure_preserves_stored_config() {
+        let initial_bandwidth = NetworkTokenBucketConfig::new(1024, None, 100);
+        let replacement_ops = NetworkTokenBucketConfig::new(16, None, 250);
+        let expected_error = NetworkInterfaceUpdateError::ActiveSessionCommand {
+            message: "test worker rejected update".to_string(),
+        };
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_network_update_result(33, expected_error.clone()),
+        ));
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
+                .with_rx_rate_limiter(NetworkRateLimiterConfig::new(Some(initial_bandwidth), None)),
+        ))
+        .expect("initial network interface should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::UpdateNetworkInterface(
+                NetworkInterfaceUpdateInput::new("eth0", "eth0").with_rx_rate_limiter(
+                    NetworkRateLimiterConfig::new(None, Some(replacement_ops)),
+                ),
+            ))
+            .expect_err("failed active update should fail action");
+
+        assert_eq!(err, VmmActionError::NetworkInterfaceUpdate(expected_error));
+        assert_eq!(
+            vmm.network_interface_configs()[0].rx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(Some(initial_bandwidth), None,))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.network_update_count, 1);
+        assert_eq!(
+            session
+                .last_network_update
+                .as_ref()
+                .and_then(|update| update.rx_rate_limiter()),
+            Some(NetworkRateLimiterConfig::new(None, Some(replacement_ops)))
+        );
+    }
+
+    #[test]
+    fn runtime_network_rate_limiter_unknown_interface_skips_active_session() {
+        let mut vmm = configured_vmm(FakeStarter::success(34));
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"),
+        ))
+        .expect("initial network interface should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::UpdateNetworkInterface(
+                NetworkInterfaceUpdateInput::new("missing", "missing").with_tx_rate_limiter(
+                    NetworkRateLimiterConfig::new(
+                        None,
+                        Some(NetworkTokenBucketConfig::new(8, None, 100)),
+                    ),
+                ),
+            ))
+            .expect_err("unknown interface should fail action");
+
+        assert_eq!(
+            err,
+            VmmActionError::NetworkInterfaceUpdate(NetworkInterfaceUpdateError::UnknownInterface {
+                iface_id: "missing".to_string(),
+            })
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.network_update_count, 0);
+        assert!(session.last_network_update.is_none());
+    }
+
+    #[test]
+    fn runtime_network_rate_limiter_update_succeeds_while_paused() {
+        let ops = NetworkTokenBucketConfig::new(8, None, 100);
+        let mut vmm = configured_vmm(FakeStarter::success(35));
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"),
+        ))
+        .expect("initial network interface should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+
+        let data = vmm
+            .handle_action(VmmAction::UpdateNetworkInterface(
+                NetworkInterfaceUpdateInput::new("eth0", "eth0")
+                    .with_tx_rate_limiter(NetworkRateLimiterConfig::new(None, Some(ops))),
+            ))
+            .expect("paused runtime network limiter update should succeed");
+
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert_eq!(
+            vmm.network_interface_configs()[0].tx_rate_limiter(),
+            Some(NetworkRateLimiterConfig::new(None, Some(ops)))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.network_update_count, 1);
     }
 
     #[test]

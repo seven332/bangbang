@@ -1200,8 +1200,8 @@ impl NetworkInterfaceConfigRequest {
 pub struct NetworkInterfacePatchRequest {
     path_iface_id: String,
     body_iface_id: String,
-    rx_rate_limiter_configured: bool,
-    tx_rate_limiter_configured: bool,
+    rx_rate_limiter: Option<NetworkRateLimiterRequest>,
+    tx_rate_limiter: Option<NetworkRateLimiterRequest>,
 }
 
 impl NetworkInterfacePatchRequest {
@@ -1213,12 +1213,12 @@ impl NetworkInterfacePatchRequest {
         &self.body_iface_id
     }
 
-    pub const fn rx_rate_limiter_configured(&self) -> bool {
-        self.rx_rate_limiter_configured
+    pub const fn rx_rate_limiter(&self) -> Option<NetworkRateLimiterRequest> {
+        self.rx_rate_limiter
     }
 
-    pub const fn tx_rate_limiter_configured(&self) -> bool {
-        self.tx_rate_limiter_configured
+    pub const fn tx_rate_limiter(&self) -> Option<NetworkRateLimiterRequest> {
+        self.tx_rate_limiter
     }
 }
 
@@ -3500,27 +3500,15 @@ fn parse_network_interface_patch_request(
     if path_iface_id != body.iface_id {
         return Err(RequestError::MismatchedInterfaceId);
     }
-    let rx_rate_limiter_configured = match &body.rx_rate_limiter {
-        Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
-            rate_limiter_configured(rate_limiter.as_value())?
-        }
-        None => false,
-    };
-    let tx_rate_limiter_configured = match &body.tx_rate_limiter {
-        Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
-            rate_limiter_configured(rate_limiter.as_value())?
-        }
-        None => false,
-    };
+    let rx_rate_limiter = parse_network_rate_limiter(body.rx_rate_limiter.as_ref())?;
+    let tx_rate_limiter = parse_network_rate_limiter(body.tx_rate_limiter.as_ref())?;
 
     Ok(ApiRequest::PatchNetworkInterface(Box::new(
         NetworkInterfacePatchRequest {
             path_iface_id: path_iface_id.to_string(),
             body_iface_id: body.iface_id,
-            rx_rate_limiter_configured,
-            tx_rate_limiter_configured,
+            rx_rate_limiter,
+            tx_rate_limiter,
         },
     )))
 }
@@ -6510,7 +6498,7 @@ mod tests {
 
     #[test]
     fn parses_valid_network_interface_patch() {
-        for (body, rx_rate_limiter_configured, tx_rate_limiter_configured) in [
+        for (body, expected_rx, expected_tx) in [
             (r#"{"iface_id":"eth0"}"#, false, false),
             (
                 r#"{"iface_id":"eth0","rx_rate_limiter":null,"tx_rate_limiter":null}"#,
@@ -6546,17 +6534,43 @@ mod tests {
             };
             assert_eq!(config.path_iface_id(), "eth0", "{body}");
             assert_eq!(config.body_iface_id(), "eth0", "{body}");
-            assert_eq!(
-                config.rx_rate_limiter_configured(),
-                rx_rate_limiter_configured,
-                "{body}"
-            );
-            assert_eq!(
-                config.tx_rate_limiter_configured(),
-                tx_rate_limiter_configured,
-                "{body}"
-            );
+            assert_eq!(config.rx_rate_limiter().is_some(), expected_rx, "{body}");
+            assert_eq!(config.tx_rate_limiter().is_some(), expected_tx, "{body}");
         }
+    }
+
+    #[test]
+    fn parses_network_interface_patch_with_exact_and_disabled_bucket_values() {
+        let body = r#"{
+            "iface_id":"eth0",
+            "rx_rate_limiter":{
+                "bandwidth":{"size":1024,"one_time_burst":2048,"refill_time":100},
+                "ops":{"size":0,"one_time_burst":10,"refill_time":1000}
+            },
+            "tx_rate_limiter":{
+                "ops":{"size":10,"one_time_burst":null,"refill_time":0}
+            }
+        }"#;
+        let request = request_with_body("PATCH", "/network-interfaces/eth0", body);
+
+        let parsed = parse_request(&request).expect("network interface patch should parse");
+        let ApiRequest::PatchNetworkInterface(config) = parsed else {
+            panic!("expected network interface patch request");
+        };
+        assert_eq!(
+            config.rx_rate_limiter(),
+            Some(NetworkRateLimiterRequest::new(
+                Some(TokenBucketRequest::new(1024, Some(2048), 100)),
+                Some(TokenBucketRequest::new(0, Some(10), 1000)),
+            ))
+        );
+        assert_eq!(
+            config.tx_rate_limiter(),
+            Some(NetworkRateLimiterRequest::new(
+                None,
+                Some(TokenBucketRequest::new(10, None, 0)),
+            ))
+        );
     }
 
     #[test]

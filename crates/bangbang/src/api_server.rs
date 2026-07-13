@@ -64,7 +64,9 @@ use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsVersion as RuntimeMmdsVersion,
 };
 #[cfg(test)]
-use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
+use bangbang_runtime::network::{
+    MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceUpdate, NetworkInterfaceUpdateError,
+};
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigInput, NetworkInterfaceUpdateInput,
     NetworkRateLimiterConfig, NetworkTokenBucketConfig,
@@ -1943,11 +1945,11 @@ fn network_interface_update_input_from_request(
 ) -> NetworkInterfaceUpdateInput {
     let mut input =
         NetworkInterfaceUpdateInput::new(config.path_iface_id(), config.body_iface_id());
-    if config.rx_rate_limiter_configured() {
-        input = input.with_rx_rate_limiter_configured();
+    if let Some(rate_limiter) = config.rx_rate_limiter() {
+        input = input.with_rx_rate_limiter(network_rate_limiter_config_from_request(rate_limiter));
     }
-    if config.tx_rate_limiter_configured() {
-        input = input.with_tx_rate_limiter_configured();
+    if let Some(rate_limiter) = config.tx_rate_limiter() {
+        input = input.with_tx_rate_limiter(network_rate_limiter_config_from_request(rate_limiter));
     }
 
     input
@@ -2288,6 +2290,13 @@ mod tests {
                 Some(err) => Err(err),
                 None => Ok(()),
             }
+        }
+
+        fn update_network_interface(
+            &mut self,
+            _update: NetworkInterfaceUpdate,
+        ) -> Result<(), NetworkInterfaceUpdateError> {
+            Ok(())
         }
 
         fn update_balloon(&mut self, _config: BalloonConfig) -> Result<(), BalloonUpdateError> {
@@ -6167,8 +6176,8 @@ mod tests {
         );
         assert!(
             runtime_network_patch_response
-                .contains(r#"{"fault_message":"network rx_rate_limiter is not supported"}"#),
-            "running-state configured network patch should reject the limiter; response:\n{runtime_network_patch_response}"
+                .contains(r#"{"fault_message":"network interface is not configured"}"#),
+            "running-state network patch should reject the unknown interface; response:\n{runtime_network_patch_response}"
         );
         for private_value in ["223456", "334567", "445678"] {
             assert!(
@@ -6193,7 +6202,7 @@ mod tests {
     }
 
     #[test]
-    fn running_state_network_patch_noop_validates_existing_interface_over_socket() {
+    fn running_state_network_patch_updates_existing_interface_over_socket() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         vmm.handle_action(VmmAction::PutNetworkInterface(
             NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
@@ -6255,20 +6264,13 @@ mod tests {
             &request_with_body(
                 "PATCH",
                 "/network-interfaces/eth0",
-                r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":223456,"one_time_burst":334567,"refill_time":445678}}}"#,
+                r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":223456,"one_time_burst":334567,"refill_time":445678}},"tx_rate_limiter":{"ops":{"size":556789,"one_time_burst":667890,"refill_time":778901}}}"#,
             ),
         );
-        assert!(rate_limiter_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(
-            rate_limiter_response
-                .contains(r#"{"fault_message":"network rx_rate_limiter is not supported"}"#)
+            rate_limiter_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "configured runtime limiter update should succeed: {rate_limiter_response}"
         );
-        for private_value in ["223456", "334567", "445678"] {
-            assert!(
-                !rate_limiter_response.contains(private_value),
-                "rate-limiter rejection must not echo {private_value}: {rate_limiter_response}"
-            );
-        }
 
         let vm_config_response = request_over_socket(
             &mut vmm,
@@ -6280,6 +6282,12 @@ mod tests {
         assert!(vm_config_response.contains(r#""host_dev_name":"vmnet:shared""#));
         assert!(vm_config_response.contains(r#""guest_mac":"12:34:56:78:9a:bc""#));
         assert!(vm_config_response.contains(r#""mtu":1500"#));
+        assert!(vm_config_response.contains(
+            r#""rx_rate_limiter":{"bandwidth":{"one_time_burst":334567,"refill_time":445678,"size":223456}}"#
+        ));
+        assert!(vm_config_response.contains(
+            r#""tx_rate_limiter":{"ops":{"one_time_burst":667890,"refill_time":778901,"size":556789}}"#
+        ));
         assert!(
             !vm_config_response.contains(r#""iface_id":"eth9""#),
             "rejected unknown network PATCH must not add an interface; response:\n{vm_config_response}"

@@ -282,6 +282,18 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"12:34:56:78:9a:bc","mtu":1500}'
 ```
 
+After the VM starts, update individual RX/TX limiter buckets without resetting
+omitted buckets:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket \
+  -X PATCH http://localhost/network-interfaces/eth0 \
+  -H 'Content-Type: application/json' \
+  -d '{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":1048576,"refill_time":100}}}'
+```
+
+Set a bucket's `size` or `refill_time` to `0` to disable only that bucket.
+
 Record a pre-boot vsock configuration:
 
 ```sh

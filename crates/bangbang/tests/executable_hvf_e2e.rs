@@ -3903,30 +3903,34 @@ mod macos_arm64 {
         );
 
         let rate_limiter_network_patch_context = format!(
-            "PATCH /network-interfaces/eth0 rx_rate_limiter {}",
+            "PATCH /network-interfaces/eth0 configured rate limiters {}",
             case.request_context
         );
         let rate_limiter_network_patch_response = http_json(
             &socket_path,
             "PATCH",
             "/network-interfaces/eth0",
-            r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":223456,"one_time_burst":334567,"refill_time":445678}}}"#,
+            r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":223456,"one_time_burst":334567,"refill_time":445678}},"tx_rate_limiter":{"ops":{"size":556789,"one_time_burst":667890,"refill_time":778901}}}"#,
         );
-        assert_bad_request_response(
+        assert_no_content_response(
             &rate_limiter_network_patch_response,
             &rate_limiter_network_patch_context,
         );
-        assert_response_contains(
-            &rate_limiter_network_patch_response,
-            r#"{"fault_message":"network rx_rate_limiter is not supported"}"#,
-            &rate_limiter_network_patch_context,
+
+        let partial_network_patch_context = format!(
+            "PATCH /network-interfaces/eth0 partial rx_rate_limiter {}",
+            case.request_context
         );
-        for private_value in ["223456", "334567", "445678"] {
-            assert!(
-                !rate_limiter_network_patch_response.contains(private_value),
-                "{rate_limiter_network_patch_context} must not echo {private_value}; response:\n{rate_limiter_network_patch_response}"
-            );
-        }
+        let partial_network_patch_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/network-interfaces/eth0",
+            r#"{"iface_id":"eth0","rx_rate_limiter":{"ops":{"size":889012,"one_time_burst":990123,"refill_time":101234}}}"#,
+        );
+        assert_no_content_response(
+            &partial_network_patch_response,
+            &partial_network_patch_context,
+        );
 
         let vm_config_context = format!(
             "GET /vm/config after network PATCH {}",
@@ -3940,12 +3944,60 @@ mod macos_arm64 {
             r#""host_dev_name":"vmnet:shared""#,
             &vm_config_context,
         );
+        assert_response_contains(
+            &vm_config,
+            r#""rx_rate_limiter":{"bandwidth":{"one_time_burst":334567,"refill_time":445678,"size":223456},"ops":{"one_time_burst":990123,"refill_time":101234,"size":889012}}"#,
+            &vm_config_context,
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""tx_rate_limiter":{"ops":{"one_time_burst":667890,"refill_time":778901,"size":556789}}"#,
+            &vm_config_context,
+        );
         if let Some(mtu) = case.network_mtu {
             assert_response_contains(&vm_config, &format!(r#""mtu":{mtu}"#), &vm_config_context);
         }
         assert!(
             !vm_config.contains(r#""iface_id":"eth9""#),
             "{vm_config_context} must not add the rejected interface; response:\n{vm_config}"
+        );
+
+        let disable_network_patch_context = format!(
+            "PATCH /network-interfaces/eth0 disable RX bandwidth {}",
+            case.request_context
+        );
+        let disable_network_patch_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/network-interfaces/eth0",
+            r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":0,"one_time_burst":1234567,"refill_time":100}}}"#,
+        );
+        assert_no_content_response(
+            &disable_network_patch_response,
+            &disable_network_patch_context,
+        );
+        let disabled_vm_config_context = format!(
+            "GET /vm/config after disabled RX bandwidth {}",
+            case.request_context
+        );
+        let disabled_vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&disabled_vm_config, &disabled_vm_config_context);
+        assert_response_contains(
+            &disabled_vm_config,
+            r#""rx_rate_limiter":{"ops":{"one_time_burst":990123,"refill_time":101234,"size":889012}}"#,
+            &disabled_vm_config_context,
+        );
+        assert_response_contains(
+            &disabled_vm_config,
+            r#""tx_rate_limiter":{"ops":{"one_time_burst":667890,"refill_time":778901,"size":556789}}"#,
+            &disabled_vm_config_context,
+        );
+        assert!(
+            !disabled_vm_config.contains("223456")
+                && !disabled_vm_config.contains("334567")
+                && !disabled_vm_config.contains("445678")
+                && !disabled_vm_config.contains("1234567"),
+            "{disabled_vm_config_context} must clear only the disabled bandwidth bucket; response:\n{disabled_vm_config}"
         );
 
         if let Err(err) = wait_for_file_prefix_marker(
