@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use crate::{
     AuditMode, Baseline, Capability, CapabilityInventory, Counts, Disposition, FIRECRACKER_COMMIT,
@@ -70,7 +71,15 @@ pub fn validate(
     validate_inputs(&manifest.inputs, &mut errors);
     validate_source_items(manifest, &mut errors);
     validate_families(&inventory.families, &mut errors);
-    validate_capabilities(manifest, inventory, repository_root, mode, &mut errors);
+    let tracked_files = tracked_files_for_inventory(inventory, repository_root, &mut errors);
+    validate_capabilities(
+        manifest,
+        inventory,
+        repository_root,
+        &tracked_files,
+        mode,
+        &mut errors,
+    );
 
     errors.sort();
     errors.dedup();
@@ -312,6 +321,7 @@ fn validate_capabilities(
     manifest: &SourceManifest,
     inventory: &CapabilityInventory,
     repository_root: &Path,
+    tracked_files: &BTreeSet<PathBuf>,
     mode: AuditMode,
     errors: &mut Vec<String>,
 ) {
@@ -408,13 +418,14 @@ fn validate_capabilities(
                 ));
             }
         }
-        validate_disposition(capability, repository_root, mode, errors);
+        validate_disposition(capability, repository_root, tracked_files, mode, errors);
     }
 }
 
 fn validate_disposition(
     capability: &Capability,
     repository_root: &Path,
+    tracked_files: &BTreeSet<PathBuf>,
     mode: AuditMode,
     errors: &mut Vec<String>,
 ) {
@@ -475,9 +486,13 @@ fn validate_disposition(
                 ));
             }
             match &capability.exclusion {
-                Some(exclusion) => {
-                    validate_exclusion(&capability.id, exclusion, repository_root, errors)
-                }
+                Some(exclusion) => validate_exclusion(
+                    &capability.id,
+                    exclusion,
+                    repository_root,
+                    tracked_files,
+                    errors,
+                ),
                 None => errors.push(format!(
                     "proven-platform-impossible requires exclusion evidence: {}",
                     capability.id
@@ -490,6 +505,7 @@ fn validate_disposition(
         validate_reference(
             reference,
             repository_root,
+            tracked_files,
             &format!("{} implementation[{index}]", capability.id),
             errors,
         );
@@ -503,6 +519,7 @@ fn validate_disposition(
         validate_reference(
             reference,
             repository_root,
+            tracked_files,
             &format!("{} validation[{index}]", capability.id),
             errors,
         );
@@ -533,6 +550,7 @@ fn validate_exclusion(
     id: &str,
     exclusion: &PlatformExclusion,
     repository_root: &Path,
+    tracked_files: &BTreeSet<PathBuf>,
     errors: &mut Vec<String>,
 ) {
     let groups = [
@@ -556,6 +574,7 @@ fn validate_exclusion(
             validate_reference(
                 reference,
                 repository_root,
+                tracked_files,
                 &format!("{id} exclusion.{name}[{index}]"),
                 errors,
             );
@@ -579,6 +598,7 @@ fn validate_exclusion(
     validate_reference(
         &exclusion.challenge,
         repository_root,
+        tracked_files,
         &format!("{id} exclusion.challenge"),
         errors,
     );
@@ -596,6 +616,7 @@ fn validate_exclusion(
 fn validate_reference(
     reference: &Reference,
     repository_root: &Path,
+    tracked_files: &BTreeSet<PathBuf>,
     label: &str,
     errors: &mut Vec<String>,
 ) {
@@ -640,6 +661,16 @@ fn validate_reference(
             };
             if !canonical.starts_with(&canonical_root) {
                 errors.push(format!("local reference path escapes repository: {label}"));
+                return;
+            }
+            let Ok(relative) = canonical.strip_prefix(&canonical_root) else {
+                errors.push(format!("local reference path escapes repository: {label}"));
+                return;
+            };
+            if !tracked_files.contains(relative) {
+                errors.push(format!(
+                    "local reference must name a tracked repository file: {label}"
+                ));
             }
         }
         Reference::Github { url } => {
@@ -657,6 +688,65 @@ fn validate_reference(
             }
         }
     }
+}
+
+fn tracked_files_for_inventory(
+    inventory: &CapabilityInventory,
+    repository_root: &Path,
+    errors: &mut Vec<String>,
+) -> BTreeSet<PathBuf> {
+    if !inventory_has_local_references(inventory) {
+        return BTreeSet::new();
+    }
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["ls-files", "-z", "--cached", "--"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => {
+            errors.push("failed to enumerate tracked repository files".to_string());
+            return BTreeSet::new();
+        }
+    };
+    if !output.status.success() {
+        errors.push("failed to enumerate tracked repository files".to_string());
+        return BTreeSet::new();
+    }
+    let text = match String::from_utf8(output.stdout) {
+        Ok(text) => text,
+        Err(_) => {
+            errors.push("tracked repository paths are not valid UTF-8".to_string());
+            return BTreeSet::new();
+        }
+    };
+    text.split('\0')
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn inventory_has_local_references(inventory: &CapabilityInventory) -> bool {
+    inventory.capabilities.iter().any(|capability| {
+        references_contain_local(&capability.implementation)
+            || references_contain_local(&capability.validation)
+            || capability.exclusion.as_ref().is_some_and(|exclusion| {
+                references_contain_local(&exclusion.upstream_contract)
+                    || references_contain_local(&exclusion.platform_evidence)
+                    || references_contain_local(&exclusion.stable_behavior)
+                    || references_contain_local(&exclusion.focused_tests)
+                    || references_contain_local(&exclusion.compatibility_docs)
+                    || references_contain_local(&exclusion.security_docs)
+                    || matches!(&exclusion.challenge, Reference::Local { .. })
+            })
+    })
+}
+
+fn references_contain_local(references: &[Reference]) -> bool {
+    references
+        .iter()
+        .any(|reference| matches!(reference, Reference::Local { .. }))
 }
 
 fn is_safe_relative_path(path: &Path) -> bool {
@@ -789,7 +879,6 @@ fn check_sorted_unique_references(references: &[Reference], label: &str, errors:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -1176,6 +1265,52 @@ mod tests {
                 .messages()
                 .iter()
                 .any(|message| message.contains("duplicate") && message.contains("reference"))
+        );
+    }
+
+    #[test]
+    fn accepts_tracked_and_rejects_untracked_local_references() {
+        let root = TempDirectory::new();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["init", "--quiet"])
+            .status()
+            .expect("Git should execute");
+        assert!(status.success(), "fixture Git repository should initialize");
+        std::fs::write(root.path().join("tracked.md"), "tracked\n")
+            .expect("tracked evidence should be written");
+        std::fs::write(root.path().join("untracked.md"), "untracked\n")
+            .expect("untracked evidence should be written");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", "tracked.md"])
+            .status()
+            .expect("Git should execute");
+        assert!(status.success(), "fixture evidence should be staged");
+
+        let (manifest, mut inventory) = valid_fixture();
+        inventory.capabilities[0]
+            .implementation
+            .push(Reference::Local {
+                path: "tracked.md".to_string(),
+                anchor: None,
+            });
+        validate(&manifest, &inventory, root.path(), AuditMode::Delivery)
+            .expect("tracked local evidence should validate");
+
+        inventory.capabilities[0].implementation[0] = Reference::Local {
+            path: "untracked.md".to_string(),
+            anchor: None,
+        };
+        let errors = validate(&manifest, &inventory, root.path(), AuditMode::Delivery)
+            .expect_err("untracked local evidence should fail");
+        assert!(
+            errors
+                .messages()
+                .iter()
+                .any(|message| message.contains("tracked repository file"))
         );
     }
 

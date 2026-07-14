@@ -98,7 +98,9 @@ unreviewed behavior `audit-required`; use `missing-platform-feasible` only with
 a delivery issue; and use `proven-platform-impossible` only after the complete
 strict evidence and Challenge gate. Keep capability IDs, source references,
 evidence references, and exclusion alternatives in canonical sorted order and
-free of duplicates.
+free of duplicates. Local evidence must resolve to a tracked regular file
+inside the repository; ignored, untracked, symlinked, and escaping paths fail
+validation.
 
 Run the focused validator and the repository's normal checks before submission.
 The checked-in integration test also validates this inventory through the
