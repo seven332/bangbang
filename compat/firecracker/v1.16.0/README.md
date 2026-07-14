@@ -22,6 +22,11 @@ claims mechanically visible.
   identity has exactly one overlay, and additional `semantic.*` records cover
   cross-leaf guest, lifecycle, snapshot, observability, isolation, and
   specification behavior.
+- [`process-contract.md`](process-contract.md) is the human-owned semantic
+  audit for the 23 configured Firecracker arguments and the composite process
+  records. It traces arity, defaults, relationships, observable behavior,
+  cross-family ownership, implementation, and executable validation without
+  expanding the machine-owned identity extractor.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -52,6 +57,14 @@ Each capability has exactly one disposition:
 
 The initial inventory is deliberately conservative. Existing prose or issue
 closure does not automatically promote a record from `audit-required`.
+
+The #1352 process audit promotes exactly 20 of the 29 process-family records:
+18 complete argument leaves plus the complete CLI/readiness and
+signal/exit/fd/cleanup semantics. Five incomplete argument leaves, the
+snapshot-containing identity/output semantic, the aggregate run operation, and
+both broad source corpora remain `audit-required`. The checked
+[`process-contract.md`](process-contract.md) records those nine handoffs; a
+partially implemented composite is not a terminal claim.
 
 ## Commands
 
@@ -107,5 +120,5 @@ The checked-in integration test also validates this inventory through the
 ordinary workspace test command. A corpus reference records audit ownership;
 it does not by itself prove that every semantic statement is implemented.
 
-This inventory foundation changes no VM or process runtime behavior and makes
-no new compatibility claim.
+The inventory is not evidence by itself. Every terminal compatibility claim
+depends on its referenced production behavior and validation.

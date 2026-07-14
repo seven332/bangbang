@@ -596,6 +596,14 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 The workspace test suite includes an integration test of both checked-in files.
 Ordinary tests do not discover or require a sibling Firecracker checkout.
 
+Process-facing changes must also keep the checked
+[`process-contract.md`](../compat/firecracker/v1.16.0/process-contract.md)
+aligned with production code, executable tests, and the exact overlay records.
+The #1352 audit has 20 terminal and nine nonterminal process-family records;
+delivery validation permits those explicit handoffs, while final validation
+continues to reject them. Parser recognition or native snapshot output is not
+sufficient evidence for a Firecracker runtime or artifact claim.
+
 Maintainers can compare the machine-owned manifest with a clean explicit
 checkout at the exact pinned commit:
 
@@ -707,6 +715,16 @@ the `bangbang` process boundary:
 ```sh
 cargo test -p bangbang --test process_e2e --all-features --locked
 ```
+
+The process contract cases include a 64-byte multibyte Unicode ID returned
+unchanged through `GET /`, Unicode symbol and byte-overlong rejection with exit
+153 before socket publication, a zero HTTP body limit that preserves bodyless
+requests while returning 413 for nonempty bodies, a zero MMDS data-store limit
+that rejects every serialized object without preventing startup, and
+Firecracker's first-`--` behavior that ignores all following main-process
+tokens. Colocated parser unit tests also cover zero and `usize::MAX`, Unicode
+punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
+separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
 checks exact `v1.0.0` output for `--snapshot-version` and a valid

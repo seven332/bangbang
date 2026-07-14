@@ -2730,29 +2730,81 @@
     {
       "id": "firecracker-argument:api-sock",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --api-sock.",
+      "summary": "Provide the Firecracker v1.16 --api-sock process contract with the documented macOS default-path equivalent.",
       "source_refs": [
         "firecracker-argument:api-sock"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "Args::parse and run"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_serves_api_and_shuts_down_cleanly"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:boot-timer",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --boot-timer.",
+      "summary": "Provide the Firecracker v1.16 --boot-timer process contract for the supported aarch64 guest boot timer.",
       "source_refs": [
         "firecracker-argument:boot-timer"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "StartupConfig::boot_timer"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_boot_timer_guest_write_logs_boot_time"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_accepts_boot_timer_flag"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:config-file",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --config-file.",
+      "summary": "Provide the Firecracker v1.16 --config-file process startup contract while delegating section semantics to their capability families.",
       "source_refs": [
         "firecracker-argument:config-file"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "load_config_file and run"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_starts_from_config_file"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_config_file_failure_does_not_publish_socket"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:describe-snapshot",
@@ -2775,83 +2827,214 @@
     {
       "id": "firecracker-argument:http-api-max-payload-size",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --http-api-max-payload-size.",
+      "summary": "Provide the Firecracker v1.16 --http-api-max-payload-size non-negative usize and HTTP body-limit contract.",
       "source_refs": [
         "firecracker-argument:http-api-max-payload-size"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "parse_http_api_max_payload_size"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_zero_http_payload_limit_allows_bodyless_requests_only"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:id",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --id.",
+      "summary": "Provide the Firecracker v1.16 --id Unicode-alphanumeric identity and UTF-8 byte-bound contract.",
       "source_refs": [
         "firecracker-argument:id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "validate_instance_id"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_returns_unicode_instance_identity_at_byte_limit and executable_rejects_invalid_unicode_instance_ids_before_socket_publication"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:level",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --level.",
+      "summary": "Provide the Firecracker v1.16 --level process logger configuration contract.",
       "source_refs": [
         "firecracker-argument:level"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "LoggerConfigInput argument parsing"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_applies_startup_logger_arguments and executable_rejects_invalid_logger_level_as_bad_configuration"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:log-path",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --log-path.",
+      "summary": "Provide the Firecracker v1.16 --log-path process logger sink contract.",
       "source_refs": [
         "firecracker-argument:log-path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "process logger startup"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_applies_startup_logger_arguments"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:metadata",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --metadata.",
+      "summary": "Provide the Firecracker v1.16 --metadata process-local MMDS initialization contract.",
       "source_refs": [
         "firecracker-argument:metadata"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "load_metadata_file and initialize_metadata"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_metadata_startup_initializes_mmds"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:metrics-path",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --metrics-path.",
+      "summary": "Provide the Firecracker v1.16 --metrics-path process metrics sink contract.",
       "source_refs": [
         "firecracker-argument:metrics-path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "process metrics startup"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_startup_metrics_path_stays_empty_before_session"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:mmds-size-limit",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --mmds-size-limit.",
+      "summary": "Provide the Firecracker v1.16 --mmds-size-limit inheritance and non-negative usize contract.",
       "source_refs": [
         "firecracker-argument:mmds-size-limit"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "StartupConfig::effective_mmds_size_limit"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_zero_mmds_limit_rejects_every_serialized_object"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:module",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --module.",
+      "summary": "Provide the Firecracker v1.16 --module process logger prefix-filter contract.",
       "source_refs": [
         "firecracker-argument:module"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "LoggerConfigInput argument parsing"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_applies_startup_logger_arguments"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:no-api",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --no-api.",
+      "summary": "Provide the Firecracker v1.16 --no-api prerequisite, readiness, execution, and no-socket contract.",
       "source_refs": [
         "firecracker-argument:no-api"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "run_without_api"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_starts_no_api_from_config_file"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_no_api_config_file_failure_does_not_publish_socket"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:no-seccomp",
@@ -2865,11 +3048,25 @@
     {
       "id": "firecracker-argument:parent-cpu-time-us",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --parent-cpu-time-us.",
+      "summary": "Provide the Firecracker v1.16 --parent-cpu-time-us u64 process metrics contract.",
       "source_refs": [
         "firecracker-argument:parent-cpu-time-us"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "StartupTimeConfig"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_accepts_firecracker_startup_time_args"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:seccomp-filter",
@@ -2883,20 +3080,48 @@
     {
       "id": "firecracker-argument:show-level",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --show-level.",
+      "summary": "Provide the Firecracker v1.16 --show-level process logger presentation contract.",
       "source_refs": [
         "firecracker-argument:show-level"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "LoggerConfigInput argument parsing"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_applies_startup_logger_arguments"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:show-log-origin",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --show-log-origin.",
+      "summary": "Provide the Firecracker v1.16 --show-log-origin process logger presentation contract.",
       "source_refs": [
         "firecracker-argument:show-log-origin"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "LoggerConfigInput argument parsing"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_applies_startup_logger_arguments"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:snapshot-version",
@@ -2910,29 +3135,71 @@
     {
       "id": "firecracker-argument:start-time-cpu-us",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --start-time-cpu-us.",
+      "summary": "Provide the Firecracker v1.16 --start-time-cpu-us u64 process metrics contract.",
       "source_refs": [
         "firecracker-argument:start-time-cpu-us"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "StartupTimeConfig"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_accepts_firecracker_startup_time_args"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:start-time-us",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --start-time-us.",
+      "summary": "Provide the Firecracker v1.16 --start-time-us u64 process metrics contract.",
       "source_refs": [
         "firecracker-argument:start-time-us"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "StartupTimeConfig"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_accepts_firecracker_startup_time_args"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:version",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --version.",
+      "summary": "Provide the Firecracker v1.16 --version early product-version command contract.",
       "source_refs": [
         "firecracker-argument:version"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "Command::Version"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_prints_version_and_exits_before_socket_publication"
+        }
+      ]
     },
     {
       "id": "non-swagger-route:DELETE /drives/{drive_id}",
@@ -3155,12 +3422,31 @@
     {
       "id": "semantic.process:cli-config-readiness-and-api-socket",
       "family": "process",
-      "summary": "Audit CLI parsing, configuration-file/no-API startup, API socket ownership, readiness, and process startup ordering.",
+      "summary": "Provide CLI parsing, configuration-file/no-API startup, API socket ownership, readiness, and process startup ordering.",
       "source_refs": [
         "corpus:design",
         "corpus:getting-started"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "Args::parse, run, run_with_api, and run_without_api"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed API and no-api startup validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "API, config-file, no-api, failure, and concurrent process validation"
+        }
+      ]
     },
     {
       "id": "semantic.process:instance-identity-and-version-output",
@@ -3175,12 +3461,31 @@
     {
       "id": "semantic.process:signals-exits-fd-and-cleanup",
       "family": "process",
-      "summary": "Audit fatal and nonfatal signals, exit codes, descriptor-table behavior, terminal cleanup, and repeatable process ownership.",
+      "summary": "Provide fatal and nonfatal signal handling, exit classes, descriptor-table behavior, terminal cleanup, and repeatable process ownership.",
       "source_refs": [
         "corpus:getting-started",
         "corpus:specification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "signal, exit, fd-table, and ProcessCleanup ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "repeatable signed process lifecycle validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "signal, exit, socket cleanup, and repeatable ownership validation"
+        }
+      ]
     },
     {
       "id": "semantic.snapshot:diff-dirty-tracking-and-memory-backends",

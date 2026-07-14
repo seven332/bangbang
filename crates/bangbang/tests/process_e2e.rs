@@ -310,6 +310,95 @@ fn executable_serves_api_and_shuts_down_cleanly() {
 }
 
 #[test]
+fn executable_returns_unicode_instance_identity_at_byte_limit() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("unicode-id.socket");
+    let instance_id = "é".repeat(32);
+    assert_eq!(
+        instance_id.len(),
+        64,
+        "fixture must exercise the byte limit"
+    );
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / with Unicode instance ID");
+    assert_response_contains(
+        &instance_info,
+        &format!(r#""id":"{instance_id}""#),
+        "GET / with Unicode instance ID",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
+fn executable_rejects_invalid_unicode_instance_ids_before_socket_publication() {
+    for (case_name, instance_id, expected_error) in [
+        (
+            "unicode-symbol",
+            "vm💥1".to_string(),
+            "invalid --id: invalid character '💥' at position 2".to_string(),
+        ),
+        (
+            "multibyte-overlong",
+            "é".repeat(33),
+            "invalid --id: invalid length 66; length must be between 1 and 64".to_string(),
+        ),
+    ] {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join(format!("{case_name}.socket"));
+        let output = BangbangProcess::start_expect_failure(&socket_path, &instance_id);
+
+        assert_eq!(
+            output.status.code(),
+            Some(ARGUMENT_PARSING_EXIT_CODE),
+            "invalid {case_name} ID should use the argument exit class; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains(&expected_error),
+            "invalid {case_name} ID should report its stable validation error; stderr:\n{}",
+            output.stderr
+        );
+        assert!(
+            !output.stdout.contains("status: API server listening")
+                && !output.stdout.contains("status: VM running without API"),
+            "invalid {case_name} ID must not report readiness; stdout:\n{}",
+            output.stdout
+        );
+        assert!(
+            !socket_path.exists(),
+            "invalid {case_name} ID must not publish an API socket"
+        );
+    }
+}
+
+#[test]
+fn executable_ignores_tokens_after_end_of_options_separator() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("separator.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start_with_extra_args(
+        &socket_path,
+        &instance_id,
+        &["--", "--help", "--version", "--unknown", "positional"],
+    );
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after end-of-options separator");
+    assert_response_contains(
+        &instance_info,
+        &format!(r#""id":"{instance_id}""#),
+        "GET / after end-of-options separator",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_accepts_firecracker_startup_time_args() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
@@ -375,6 +464,121 @@ fn executable_accepts_boot_timer_flag() {
     );
 
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
+fn executable_applies_startup_logger_arguments() {
+    let test_dir = TestDir::new();
+    let instance_id = test_dir.instance_id();
+
+    let matching_socket_path = test_dir.path().join("matching-logger.socket");
+    let matching_logger_path = test_dir.path().join("matching-logger.out");
+    let matching_bangbang = BangbangProcess::start_with_extra_args(
+        &matching_socket_path,
+        &instance_id,
+        &[
+            "--log-path",
+            path_text(&matching_logger_path),
+            "--level",
+            "Info",
+            "--module",
+            "bangbang_runtime::api_server",
+            "--show-level",
+            "--show-log-origin",
+        ],
+    );
+
+    let version = http_get(&matching_socket_path, "/version");
+    assert_ok_response(&version, "GET /version with startup logger");
+    let matching_output = fs::read_to_string(&matching_logger_path)
+        .expect("startup logger output should be readable");
+    let matching_line = matching_output
+        .strip_suffix('\n')
+        .expect("startup logger output should end with one newline");
+    let matching_record = matching_line
+        .strip_prefix("level=Info origin=")
+        .expect("startup logger should include the configured level and origin");
+    let (origin, message) = matching_record
+        .split_once(' ')
+        .expect("startup logger origin should precede the message");
+    let (origin_file, origin_line) = origin
+        .rsplit_once(':')
+        .expect("startup logger origin should contain a file and line");
+    assert!(
+        !origin_file.is_empty(),
+        "logger origin file must not be empty"
+    );
+    assert!(
+        origin_line.parse::<u32>().is_ok(),
+        "logger origin line must be numeric: {origin_line}"
+    );
+    assert_eq!(
+        message,
+        "The API server received a Get request on \"/version\"."
+    );
+    assert_clean_shutdown(
+        matching_bangbang.terminate(),
+        &matching_socket_path,
+        "bangbang with matching startup logger",
+    );
+
+    let filtered_socket_path = test_dir.path().join("filtered-logger.socket");
+    let filtered_logger_path = test_dir.path().join("filtered-logger.out");
+    let filtered_bangbang = BangbangProcess::start_with_extra_args(
+        &filtered_socket_path,
+        &instance_id,
+        &[
+            "--log-path",
+            path_text(&filtered_logger_path),
+            "--level",
+            "Info",
+            "--module",
+            "bangbang_runtime::vmm_action",
+        ],
+    );
+
+    let version = http_get(&filtered_socket_path, "/version");
+    assert_ok_response(&version, "GET /version with filtered startup logger");
+    assert_eq!(
+        fs::read_to_string(&filtered_logger_path)
+            .expect("filtered startup logger output should be readable"),
+        "",
+        "the startup module filter should suppress nonmatching API request logs"
+    );
+    assert_clean_shutdown(
+        filtered_bangbang.terminate(),
+        &filtered_socket_path,
+        "bangbang with filtered startup logger",
+    );
+
+    let warning_socket_path = test_dir.path().join("warning-logger.socket");
+    let warning_logger_path = test_dir.path().join("warning-logger.out");
+    let warning_bangbang = BangbangProcess::start_with_extra_args(
+        &warning_socket_path,
+        &instance_id,
+        &[
+            "--log-path",
+            path_text(&warning_logger_path),
+            "--level",
+            "Warning",
+            "--module",
+            "bangbang_runtime::api_server",
+        ],
+    );
+
+    let version = http_get(&warning_socket_path, "/version");
+    assert_ok_response(&version, "GET /version with warning startup logger");
+    assert_eq!(
+        fs::read_to_string(&warning_logger_path)
+            .expect("warning startup logger output should be readable"),
+        "",
+        "the startup level should suppress informational API request logs"
+    );
+    assert_clean_shutdown(
+        warning_bangbang.terminate(),
+        &warning_socket_path,
+        "bangbang with warning startup logger",
+    );
 }
 
 #[test]
@@ -454,6 +658,60 @@ fn executable_rejects_api_payload_over_limit_without_stopping() {
         "GET / after oversized request",
     );
 
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
+fn executable_zero_http_payload_limit_allows_bodyless_requests_only() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("zero-http-limit.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start_with_extra_args(
+        &socket_path,
+        &instance_id,
+        &["--http-api-max-payload-size", "0"],
+    );
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "bodyless GET / with zero HTTP limit");
+
+    let response = http_put_json(&socket_path, "/mmds", "{}");
+    assert!(
+        response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+        "a nonempty body should exceed a zero HTTP limit; response:\n{response}"
+    );
+    assert_response_contains(
+        &response,
+        r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#,
+        "PUT /mmds with zero HTTP limit",
+    );
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "bodyless GET / after zero-limit rejection");
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
+fn executable_zero_mmds_limit_rejects_every_serialized_object() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("zero-mmds-limit.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start_with_extra_args(
+        &socket_path,
+        &instance_id,
+        &["--mmds-size-limit", "0"],
+    );
+
+    let response = http_put_json(&socket_path, "/mmds", "{}");
+    assert_bad_request_response(&response, "PUT /mmds with zero data-store limit");
+    assert_response_contains(
+        &response,
+        "The MMDS data store size limit was exceeded: 2 bytes > 0 bytes",
+        "PUT /mmds with zero data-store limit",
+    );
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after zero MMDS limit rejection");
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
 }
 
