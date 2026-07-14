@@ -210,6 +210,23 @@ machine/CPU topology, and x86 KVM MSR coverage
 non-applicable to arm64 HVF. Linux host-kernel support is likewise a platform
 boundary rather than a macOS device claim.
 
+Bangbang completion evidence is equally exact. The merged implementation PRs
+are [#1334 virtio-mem](https://github.com/seven332/bangbang/pull/1334),
+[#1335 targeted pmem flush](https://github.com/seven332/bangbang/pull/1335),
+[#1336 pmem limiting](https://github.com/seven332/bangbang/pull/1336),
+[#1337 Darwin discard](https://github.com/seven332/bangbang/pull/1337), and
+[#1338 free-page reporting](https://github.com/seven332/bangbang/pull/1338).
+The pinned signed executable source contains the exact
+[balloon reporting](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L1887),
+[virtio-mem lifecycle](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2127),
+[PL031](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2369),
+[VMClock discovery](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2465),
+[entropy](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2695),
+[pmem limiter/flush](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2808),
+and [native-v1 VMGenID replacement](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L5385)
+cases. These are guest-visible gates; the validation matrix keeps broader
+focused backend coverage separate.
+
 Firecracker's aarch64
 [PL031 node has no interrupt property](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/fdt.rs#L443-L456),
 so bangbang's no-alarm PL031 is an implemented Firecracker aarch64 subset rather
