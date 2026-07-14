@@ -464,16 +464,23 @@ fn directory_entries(fd: RawFd, limit: usize) -> Result<Vec<OsString>, RuntimeEr
     if limit == 0 {
         return Ok(Vec::new());
     }
-    // SAFETY: `fd` is live and `F_DUPFD_CLOEXEC` returns an independently owned fd.
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicate < 0 {
+    // SAFETY: `fd` is a live directory and the fixed relative path opens the
+    // same directory with an independent file description and directory cursor.
+    let independent = unsafe {
+        libc::openat(
+            fd,
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if independent < 0 {
         return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
     }
-    // SAFETY: `duplicate` is a fresh descriptor; `fdopendir` takes ownership on success.
-    let directory = unsafe { libc::fdopendir(duplicate) };
+    // SAFETY: `independent` is a fresh descriptor; `fdopendir` takes ownership on success.
+    let directory = unsafe { libc::fdopendir(independent) };
     if directory.is_null() {
-        // SAFETY: `fdopendir` failed and did not consume `duplicate`.
-        let _ = unsafe { libc::close(duplicate) };
+        // SAFETY: `fdopendir` failed and did not consume `independent`.
+        let _ = unsafe { libc::close(independent) };
         return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
     }
     let mut entries = Vec::new();
@@ -678,6 +685,19 @@ mod tests {
                 .expect("bounded entries should read")
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn repeated_directory_checks_restart_from_the_beginning() {
+        let root = TestRoot::new();
+        let directory = open_directory(root.path()).expect("test root should open");
+        assert!(directory_is_empty(directory.as_raw_fd()).expect("empty check should succeed"));
+
+        fs::write(root.path().join("later-entry"), b"").expect("later entry should be written");
+        assert!(
+            !directory_is_empty(directory.as_raw_fd()).expect("second check should succeed"),
+            "a repeated check must observe entries created after the first scan"
         );
     }
 
