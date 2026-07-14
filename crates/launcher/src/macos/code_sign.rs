@@ -12,6 +12,16 @@ type CfTypeId = usize;
 type OsStatus = i32;
 type SecCsFlags = u32;
 
+#[repr(C)]
+struct CfDictionaryKeyCallbacks {
+    fields: [usize; 6],
+}
+
+#[repr(C)]
+struct CfDictionaryValueCallbacks {
+    fields: [usize; 5],
+}
+
 const CF_STRING_ENCODING_UTF8: CfStringEncoding = 0x0800_0100;
 const CF_NUMBER_SINT32_TYPE: CfNumberType = 3;
 const CODE_SIGNATURE_RUNTIME: u32 = 0x0001_0000;
@@ -43,9 +53,24 @@ unsafe extern "C" {
     fn CFNumberGetTypeID() -> CfTypeId;
     fn CFNumberGetValue(number: *const c_void, number_type: CfNumberType, value: *mut c_void)
     -> u8;
+    fn CFNumberCreate(
+        allocator: *const c_void,
+        number_type: CfNumberType,
+        value: *const c_void,
+    ) -> *const c_void;
+    fn CFDictionaryCreate(
+        allocator: *const c_void,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        count: CfIndex,
+        key_callbacks: *const CfDictionaryKeyCallbacks,
+        value_callbacks: *const CfDictionaryValueCallbacks,
+    ) -> *const c_void;
     fn CFBooleanGetTypeID() -> CfTypeId;
     fn CFBooleanGetValue(boolean: *const c_void) -> u8;
     fn CFRelease(value: *const c_void);
+    static kCFTypeDictionaryKeyCallBacks: CfDictionaryKeyCallbacks;
+    static kCFTypeDictionaryValueCallBacks: CfDictionaryValueCallbacks;
 }
 
 #[link(name = "Security", kind = "framework")]
@@ -56,6 +81,17 @@ unsafe extern "C" {
         code: *mut *const c_void,
     ) -> OsStatus;
     fn SecStaticCodeCheckValidity(
+        code: *const c_void,
+        flags: SecCsFlags,
+        requirement: *const c_void,
+    ) -> OsStatus;
+    fn SecCodeCopyGuestWithAttributes(
+        host: *const c_void,
+        attributes: *const c_void,
+        flags: SecCsFlags,
+        code: *mut *const c_void,
+    ) -> OsStatus;
+    fn SecCodeCheckValidity(
         code: *const c_void,
         flags: SecCsFlags,
         requirement: *const c_void,
@@ -72,6 +108,7 @@ unsafe extern "C" {
     ) -> OsStatus;
     static kSecCodeInfoEntitlementsDict: *const c_void;
     static kSecCodeInfoFlags: *const c_void;
+    static kSecGuestAttributePid: *const c_void;
 }
 
 #[derive(Debug)]
@@ -112,6 +149,71 @@ pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<(), LauncherError
         &worker_requirement,
     )?;
     validate_entitlements(&worker, EntitlementProfile::Worker)
+}
+
+pub(crate) fn validate_worker_process(pid: libc::pid_t) -> Result<(), LauncherError> {
+    if pid <= 0 {
+        return Err(LauncherError::InvalidWorkerIdentity);
+    }
+    let pid_value = pid;
+    // SAFETY: `pid_value` remains live for the synchronous call and Core
+    // Foundation copies it into a retained number.
+    let pid_number = unsafe {
+        CFNumberCreate(
+            ptr::null(),
+            CF_NUMBER_SINT32_TYPE,
+            (&raw const pid_value).cast(),
+        )
+    };
+    let pid_number =
+        CfOwned(NonNull::new(pid_number.cast_mut()).ok_or(LauncherError::InvalidWorkerIdentity)?);
+    // SAFETY: Security.framework exports this immutable CFString key.
+    let pid_key = unsafe { kSecGuestAttributePid };
+    if pid_key.is_null() {
+        return Err(LauncherError::InvalidWorkerIdentity);
+    }
+    let keys = [pid_key];
+    let values = [pid_number.as_ptr()];
+    // SAFETY: Key/value arrays and exported callbacks remain live for this
+    // synchronous creation, which retains their CFType contents.
+    let attributes = unsafe {
+        CFDictionaryCreate(
+            ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            &raw const kCFTypeDictionaryKeyCallBacks,
+            &raw const kCFTypeDictionaryValueCallBacks,
+        )
+    };
+    let attributes =
+        CfOwned(NonNull::new(attributes.cast_mut()).ok_or(LauncherError::InvalidWorkerIdentity)?);
+    let mut code = ptr::null();
+    // SAFETY: `attributes` is a retained CFDictionary and `code` is writable
+    // storage for the retained dynamic SecCode result.
+    if unsafe {
+        SecCodeCopyGuestWithAttributes(
+            ptr::null(),
+            attributes.as_ptr(),
+            SEC_CS_DEFAULT_FLAGS,
+            &raw mut code,
+        )
+    } != 0
+    {
+        return Err(LauncherError::InvalidWorkerIdentity);
+    }
+    let code = CfOwned(NonNull::new(code.cast_mut()).ok_or(LauncherError::InvalidWorkerIdentity)?);
+    let requirement = requirement(&worker_requirement_text())
+        .map_err(|_| LauncherError::InvalidWorkerIdentity)?;
+    // SAFETY: `code` and `requirement` are live retained Security objects for
+    // this synchronous dynamic validity check.
+    if unsafe { SecCodeCheckValidity(code.as_ptr(), SEC_CS_DEFAULT_FLAGS, requirement.as_ptr()) }
+        != 0
+    {
+        return Err(LauncherError::InvalidWorkerIdentity);
+    }
+    validate_entitlements(&code, EntitlementProfile::Worker)
+        .map_err(|_| LauncherError::InvalidWorkerIdentity)
 }
 
 fn outer_requirement_text() -> String {

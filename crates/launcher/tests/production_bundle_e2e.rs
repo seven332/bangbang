@@ -13,7 +13,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 use bangbang_launcher::{
     LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME, OUTER_BUNDLE_NAME,
     WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
+};
+use bangbang_session::{
+    Frame, FrameDecoder, Message, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SessionId,
+    encode_frame,
 };
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
@@ -262,6 +266,179 @@ fn launcher_runs_real_sandboxed_hvf_guest_to_system_off() {
     assert!(!stdout.contains("status: API server listening"));
 }
 
+#[test]
+fn contained_worker_closes_unexpected_inherited_descriptor() {
+    let bundle = production_bundle();
+    let fixture = TestDir::new("inherited-fd");
+    let config = fixture.path().join("config.json");
+    fs::write(&config, b"{}").expect("probe config should be written");
+    let file = fs::File::open(&config).expect("probe config should open");
+    // SAFETY: `file` remains live and the returned descriptor is independently owned.
+    let inherited = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+    assert!(inherited >= 200, "high probe descriptor should duplicate");
+    // SAFETY: `inherited` is the fresh descriptor above and ownership transfers once.
+    let inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
+    // SAFETY: The test deliberately makes this descriptor inheritable by the
+    // launcher; the production launcher's default-close spawn must remove it
+    // from the worker image.
+    let result = unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_SETFD, 0) };
+    assert_eq!(result, 0);
+    let descriptor_path = format!("/dev/fd/{}", inherited.as_raw_fd());
+    let output = run_launcher(
+        &bundle,
+        &[
+            OsStr::new("--config-file"),
+            OsStr::new(&descriptor_path),
+            OsStr::new("--no-api"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(BAD_CONFIGURATION_EXIT_CODE));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to read config file"),
+        "closed descriptor should fail at read: {stderr}"
+    );
+    assert!(
+        !stderr.contains("missing required section"),
+        "worker must not read inherited fixture contents: {stderr}"
+    );
+    assert!(!stderr.contains(&descriptor_path));
+}
+
+#[test]
+fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
+    let bundle = production_bundle();
+    let (mut parent, child_endpoint) =
+        UnixStream::pair().expect("bootstrap socketpair should open");
+    parent
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bootstrap read timeout should set");
+    let child_fd = child_endpoint.as_raw_fd();
+    let mut command = Command::new(worker_executable(&bundle));
+    command
+        .env(SESSION_ENV_KEY, SESSION_ENV_VALUE)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: The closure performs only async-signal-safe `dup2` before exec,
+    // captures one raw descriptor kept live through spawn, and reports failure
+    // through `io::Error` without touching shared Rust state.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(child_fd, SESSION_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("forged worker should execute");
+    let stdout_reader = read_stream(child.stdout.take().expect("stdout should be piped"));
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    drop(child_endpoint);
+
+    let mut hello_bytes = vec![0_u8; 56];
+    parent
+        .read_exact(&mut hello_bytes)
+        .expect("fixed bootstrap hello should arrive");
+    let mut decoder = FrameDecoder::default();
+    decoder.push(&hello_bytes).expect("hello should be bounded");
+    let hello = decoder
+        .next_frame()
+        .expect("hello should decode")
+        .expect("hello should be complete");
+    assert_eq!(hello.message, Message::Hello);
+    assert_eq!(hello.session, SessionId::pre_session());
+
+    let mut malformed = encode_frame(Frame {
+        session: SessionId::from_bytes([7; 32]),
+        sequence: 0,
+        message: Message::Start,
+    })
+    .expect("start frame should encode");
+    malformed[4..6].copy_from_slice(&2_u16.to_be_bytes());
+    parent
+        .write_all(&malformed)
+        .expect("malformed bootstrap should write");
+    let status = wait_child_with_timeout(child, PROCESS_TIMEOUT, "malformed bootstrap worker");
+    let stdout = stdout_reader.join().expect("stdout reader should join");
+    let stderr = stderr_reader.join().expect("stderr reader should join");
+    assert_eq!(status.code(), Some(PROCESS_FAILURE_EXIT_CODE));
+    assert!(
+        stdout.is_empty(),
+        "public readiness must not be emitted: {stdout}"
+    );
+    assert_eq!(stderr, "bangbang: private launcher session failed\n");
+    assert!(!stderr.contains("BBS1") && !stderr.contains("session-"));
+}
+
+#[test]
+fn launcher_first_and_both_killed_orders_follow_namespace_ownership() {
+    let bundle = production_bundle();
+    recover_session_root(&bundle);
+
+    let mut launcher_first = spawn_ready_api_launcher(&bundle, "launcher-first");
+    let worker_pid = only_worker_pid(&launcher_first.child);
+    let worker_exit = ProcessExitWatch::new(worker_pid);
+    assert_eq!(session_entries().len(), 1);
+    let launcher_pid = i32::try_from(launcher_first.child.id()).expect("launcher PID should fit");
+    // SAFETY: This targets the one owned launcher while its unreaped Child
+    // prevents PID reuse. The worker remains alive to observe socket EOF.
+    assert_eq!(unsafe { libc::kill(launcher_pid, libc::SIGKILL) }, 0);
+    let launcher_status = launcher_first.wait("launcher-first SIGKILL");
+    assert_eq!(launcher_status.signal(), Some(libc::SIGKILL));
+    assert!(
+        worker_exit.wait(PROCESS_TIMEOUT),
+        "worker should exit after launcher EOF"
+    );
+    assert!(session_entries().is_empty());
+    assert!(!launcher_first.socket.exists());
+
+    let mut both_killed = spawn_ready_api_launcher(&bundle, "both-killed");
+    assert_eq!(session_entries().len(), 1);
+    kill_child_group(&mut both_killed.child);
+    let status = both_killed.wait("both processes SIGKILL");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert_eq!(
+        session_entries().len(),
+        1,
+        "both-killed residue should remain locked only until kernel teardown"
+    );
+    let _ = fs::remove_file(&both_killed.socket);
+
+    let recovery = run_launcher(&bundle, &[OsStr::new("--help")]);
+    assert_output_success(&recovery, "both-killed stale recovery");
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn concurrent_sessions_remain_independent_when_one_worker_crashes() {
+    let bundle = production_bundle();
+    recover_session_root(&bundle);
+    let mut first = spawn_ready_api_launcher(&bundle, "concurrent-first");
+    let mut second = spawn_ready_api_launcher(&bundle, "concurrent-second");
+    assert_eq!(session_entries().len(), 2);
+    assert!(http_get(&first.socket, "/").starts_with("HTTP/1.1 200 "));
+    assert!(http_get(&second.socket, "/").starts_with("HTTP/1.1 200 "));
+
+    let first_worker = only_worker_pid(&first.child);
+    // SAFETY: `first_worker` is the live child of the unreaped first launcher.
+    assert_eq!(unsafe { libc::kill(first_worker, libc::SIGKILL) }, 0);
+    let first_status = first.wait("first concurrent worker SIGKILL");
+    assert_eq!(first_status.signal(), None);
+    assert_eq!(first_status.code(), Some(128 + libc::SIGKILL));
+    assert_eq!(session_entries().len(), 1);
+    assert!(http_get(&second.socket, "/").starts_with("HTTP/1.1 200 "));
+
+    let second_pid = i32::try_from(second.child.id()).expect("launcher PID should fit");
+    // SAFETY: `second_pid` is the live unreaped second launcher.
+    assert_eq!(unsafe { libc::kill(second_pid, libc::SIGTERM) }, 0);
+    let second_status = second.wait("second concurrent graceful stop");
+    assert!(second_status.success());
+    assert!(session_entries().is_empty());
+    let _ = fs::remove_file(&first.socket);
+    assert!(!second.socket.exists());
+}
+
 fn run_graceful_signal_case(signal: i32, name: &str) {
     let bundle = production_bundle();
     initialize_worker_container(&bundle);
@@ -310,6 +487,213 @@ fn run_graceful_signal_case(signal: i32, name: &str) {
         !socket.exists(),
         "{name} should remove the owned API socket"
     );
+}
+
+#[derive(Debug)]
+struct RunningApiLauncher {
+    child: Child,
+    socket: PathBuf,
+    stdout_reader: Option<JoinHandle<String>>,
+    stderr_reader: Option<JoinHandle<String>>,
+    completed: bool,
+}
+
+impl RunningApiLauncher {
+    fn wait(&mut self, context: &str) -> ExitStatus {
+        let status = if wait_for_child_exit(&self.child, PROCESS_TIMEOUT) {
+            self.child.wait().expect("launcher wait should succeed")
+        } else {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+            panic!("timed out waiting for {context}");
+        };
+        self.completed = true;
+        let stdout = self
+            .stdout_reader
+            .take()
+            .expect("stdout reader should exist")
+            .join()
+            .expect("stdout reader should join");
+        let stderr = self
+            .stderr_reader
+            .take()
+            .expect("stderr reader should exist")
+            .join()
+            .expect("stderr reader should join");
+        assert!(
+            !stderr.contains("session-debug"),
+            "private diagnostics must stay absent\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        status
+    }
+}
+
+impl Drop for RunningApiLauncher {
+    fn drop(&mut self) {
+        if !self.completed {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn spawn_ready_api_launcher(bundle: &Path, name: &str) -> RunningApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket =
+        container_tmp_dir().join(format!("bbp-{:x}-{test_id:x}.sock", std::process::id(),));
+    let mut child = Command::new(launcher(bundle))
+        .args(["--api-sock", path_text(&socket), "--id"])
+        .arg(format!("{name}-{}", std::process::id()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("production launcher should start");
+    let (ready, stdout_reader) = read_stdout_until_ready(&mut child);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!("{name} should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    }
+    RunningApiLauncher {
+        child,
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        completed: false,
+    }
+}
+
+fn recover_session_root(bundle: &Path) {
+    let output = run_launcher(bundle, &[OsStr::new("--help")]);
+    assert_output_success(&output, "session-root recovery");
+    assert!(
+        session_entries().is_empty(),
+        "session root should start empty"
+    );
+}
+
+fn session_root() -> PathBuf {
+    container_tmp_dir().join("bangbang-sessions-v1")
+}
+
+fn session_entries() -> Vec<PathBuf> {
+    let root = session_root();
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut entries = entries
+        .collect::<Result<Vec<_>, _>>()
+        .expect("session root should be readable")
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b"session-")
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+fn only_worker_pid(launcher: &Child) -> libc::pid_t {
+    let parent = libc::pid_t::try_from(launcher.id()).expect("launcher PID should fit");
+    let mut pids = [0 as libc::pid_t; 16];
+    let buffer_bytes =
+        i32::try_from(std::mem::size_of_val(&pids)).expect("child PID buffer should fit");
+    // SAFETY: `pids` is writable for `buffer_bytes`, and the launcher remains
+    // live and unreaped while libproc takes this synchronous snapshot.
+    let returned =
+        unsafe { libc::proc_listchildpids(parent, pids.as_mut_ptr().cast(), buffer_bytes) };
+    assert!(returned > 0, "launcher should own one worker");
+    let count = usize::try_from(returned).expect("libproc child count should fit");
+    let children = pids
+        .get(..count)
+        .expect("libproc count should fit buffer")
+        .iter()
+        .copied()
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), 1, "launcher should own exactly one worker");
+    children[0]
+}
+
+#[derive(Debug)]
+struct ProcessExitWatch {
+    queue: OwnedFd,
+    pid: usize,
+}
+
+impl ProcessExitWatch {
+    fn new(pid: libc::pid_t) -> Self {
+        // SAFETY: `kqueue` returns a fresh descriptor on success.
+        let queue = unsafe { libc::kqueue() };
+        assert!(queue >= 0, "process watch kqueue should open");
+        // SAFETY: `queue` is a fresh owned descriptor.
+        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+        let pid = usize::try_from(pid).expect("watched PID should fit");
+        let change = libc::kevent {
+            ident: pid,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: `change` is one initialized registration and no output is requested.
+        let result = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &raw const change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(result, 0, "process exit watch should register");
+        Self { queue, pid }
+    }
+
+    fn wait(self, timeout: Duration) -> bool {
+        let timeout = libc::timespec {
+            tv_sec: libc::time_t::try_from(timeout.as_secs()).expect("timeout seconds should fit"),
+            tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+        };
+        let mut event = MaybeUninit::<libc::kevent>::uninit();
+        loop {
+            // SAFETY: `event` has room for one result and `timeout` remains live.
+            let count = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    &raw const timeout,
+                )
+            };
+            if count == 1 {
+                // SAFETY: One result was initialized above.
+                let event = unsafe { event.assume_init() };
+                return event.filter == libc::EVFILT_PROC
+                    && event.ident == self.pid
+                    && event.fflags & libc::NOTE_EXIT != 0;
+            }
+            if count == 0 {
+                return false;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return false;
+            }
+        }
+    }
 }
 
 fn initialize_worker_container(bundle: &Path) {

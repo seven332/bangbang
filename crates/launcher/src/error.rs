@@ -14,6 +14,14 @@ pub enum LauncherError {
     SignalSetup(io::ErrorKind),
     /// The embedded worker could not be started.
     WorkerSpawn(io::ErrorKind),
+    /// The private session transport or spawn allowlist could not be established.
+    SessionSetup(io::ErrorKind),
+    /// The live worker did not match the fixed signed identity.
+    InvalidWorkerIdentity,
+    /// The bounded private launcher-worker protocol failed.
+    SessionProtocol,
+    /// The private per-VM runtime namespace failed validation or cleanup.
+    RuntimeNamespace,
     /// Waiting for the embedded worker failed.
     WorkerWait(io::ErrorKind),
     /// A graceful signal could not be forwarded to the owned worker.
@@ -38,6 +46,19 @@ impl fmt::Display for LauncherError {
             }
             Self::WorkerSpawn(kind) => {
                 write!(formatter, "failed to start sandbox worker: {kind:?}")
+            }
+            Self::SessionSetup(kind) => {
+                write!(
+                    formatter,
+                    "failed to establish private worker session: {kind:?}"
+                )
+            }
+            Self::InvalidWorkerIdentity => {
+                formatter.write_str("sandbox worker identity validation failed")
+            }
+            Self::SessionProtocol => formatter.write_str("private worker session failed"),
+            Self::RuntimeNamespace => {
+                formatter.write_str("private worker runtime namespace failed")
             }
             Self::WorkerWait(kind) => {
                 write!(formatter, "failed to wait for sandbox worker: {kind:?}")

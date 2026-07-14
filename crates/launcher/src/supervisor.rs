@@ -1,8 +1,6 @@
 use std::ffi::OsString;
 #[cfg(any(target_os = "macos", test))]
 use std::os::unix::process::ExitStatusExt;
-#[cfg(target_os = "macos")]
-use std::process::Command;
 
 #[cfg(target_os = "macos")]
 use crate::BundleLayout;
@@ -27,21 +25,36 @@ where
 {
     #[cfg(target_os = "macos")]
     {
+        use std::os::fd::AsRawFd;
+
+        use bangbang_session::{LauncherLifecycle, SessionId};
+
         let executable = std::env::current_exe().map_err(|_| LauncherError::InvalidBundleLayout)?;
         let layout = BundleLayout::from_launcher_executable(&executable)?;
         crate::macos::code_sign::validate_bundle(&layout)?;
         let wakeups = crate::macos::supervise::SignalWakeups::install()?;
-        let mut child = Command::new(layout.worker_executable())
-            .args(args)
-            .spawn()
-            .map_err(|err| LauncherError::WorkerSpawn(err.kind()))?;
-        let status = match crate::macos::supervise::wait_and_forward(&mut child, wakeups) {
-            Ok(status) => status,
-            Err(err) => {
-                stop_and_reap_after_supervision_error(&mut child);
-                return Err(err);
-            }
-        };
+        let session_id = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
+        let mut lifecycle = LauncherLifecycle::new(session_id);
+        let mut spawned = crate::macos::spawn::spawn_suspended(
+            layout.worker_executable(),
+            args.into_iter().collect(),
+        )?;
+        crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?;
+        spawned.worker.resume()?;
+        crate::macos::supervise::read_bootstrap_hello(&mut spawned.session, &mut lifecycle)?;
+        bangbang_session::macos::verify_peer(spawned.session.as_raw_fd(), spawned.worker.pid())
+            .map_err(|_| LauncherError::InvalidWorkerIdentity)?;
+        crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?;
+        let start = lifecycle
+            .start()
+            .map_err(|_| LauncherError::SessionProtocol)?;
+        crate::macos::supervise::write_frame(&mut spawned.session, start)?;
+        let status = crate::macos::supervise::wait_session(
+            &mut spawned.worker,
+            &mut spawned.session,
+            lifecycle,
+            wakeups,
+        )?;
         map_exit_status(status)
     }
 
@@ -50,14 +63,6 @@ where
         let _ = args;
         Err(LauncherError::UnsupportedPlatform)
     }
-}
-
-#[cfg(target_os = "macos")]
-fn stop_and_reap_after_supervision_error(child: &mut std::process::Child) {
-    if !matches!(child.try_wait(), Ok(Some(_))) {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -79,11 +84,8 @@ fn map_exit_status(status: std::process::ExitStatus) -> Result<LauncherExit, Lau
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::process::ExitStatusExt;
-    #[cfg(target_os = "macos")]
-    use std::process::Command;
-
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn preserves_ordinary_worker_exit_codes() {
@@ -102,25 +104,6 @@ mod tests {
         assert_eq!(
             map_exit_status(status).expect("signal status should map"),
             LauncherExit(128 + u8::try_from(libc::SIGTERM).expect("signal should fit"))
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn supervision_failure_cleanup_terminates_and_reaps_owned_worker() {
-        let mut child = Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("test worker should start");
-
-        stop_and_reap_after_supervision_error(&mut child);
-
-        assert!(
-            child
-                .try_wait()
-                .expect("cleaned worker status should remain available")
-                .is_some(),
-            "cleanup must reap the owned worker"
         );
     }
 }

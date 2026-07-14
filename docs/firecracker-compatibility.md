@@ -371,15 +371,32 @@ inspects both code objects before exclusive publication, and runtime launch
 fails closed on wrong placement, symlinks, missing or modified code, signature,
 identifier, or required-entitlement failures.
 
-The launcher forwards worker arguments and inherited streams unchanged,
-forwards graceful `SIGINT`/`SIGTERM`, preserves ordinary worker status, and
-never signals after child reap. Signed Apple Silicon evidence covers strict
-nested validation, at-rest tamper rejection, outside-path denial/redaction,
-container API readiness and cleanup, both graceful signals, and a real
-sandboxed HVF guest ending through PSCI `SYSTEM_OFF`. This is macOS containment,
-not direct Linux jailer/seccomp equivalence. It does not yet provide external
-resource grants, vmnet provisioning, an authenticated session protocol, full
-crash coupling, launch constraints, Developer ID possession, or notarization.
+The launcher forwards worker arguments and standard streams unchanged but uses
+Darwin's default-close spawn policy so no unexpected inherited descriptors
+reach the worker. It validates the suspended live worker, resumes only the
+private bootstrap, authenticates the child-attributed socket peer and live code,
+and then binds a random 256-bit identity to a versioned, 4-KiB-bounded protocol
+with exact sequences and closed lifecycle messages. Worker authentication of the
+launcher is intentionally asymmetric: it verifies matching effective
+credentials and direct-parent PID before and after bootstrap, while App Sandbox
+denies its independent Security.framework lookup of the parent.
+
+The worker creates and locks one exact mode-0700 empty namespace in its
+container before `Prepared`; the launcher independently verifies name, owner,
+mode, device, inode, emptiness, and live lock before `Proceed`. `Starting`,
+committed API/no-API `Ready`, one cancellation, and path-free `Terminal` state
+are monotonic and sequence-checked. A surviving side performs exact-inode
+cleanup, and a later worker performs bounded unlocked-empty recovery after both
+sides are killed. Signed Apple Silicon evidence covers malformed bootstrap and
+fd closure, worker-first/launcher-first/both-killed cases, concurrent-session
+isolation, both graceful signals, container API service, and a real sandboxed
+HVF guest ending through PSCI `SYSTEM_OFF`.
+
+This is macOS containment, not direct Linux jailer/seccomp equivalence. The
+empty session namespace grants no host resource. Security-scoped bookmarks,
+external descriptor/resource authority, vmnet provisioning and policy, jailer
+limits/credentials, seccomp outcomes, launch constraints, Developer ID
+possession, automatic restart, and notarization remain later work.
 
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current

@@ -5,6 +5,7 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+bangbang-session = { path = "../session" }
 libc = "0.2"
 signal-hook = "0.3"
 
