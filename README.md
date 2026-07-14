@@ -277,10 +277,13 @@ that path independently and checks its exact name, owner, mode, device, inode,
 emptiness, and live lock before authorizing startup. Graceful signals become one
 session cancellation, readiness is reported only at the existing committed API
 or no-API seams, and structured terminal status must match the reaped public
-exit. A surviving worker cleans after launcher EOF; a surviving launcher cleans
-after worker exit; a later worker performs bounded identity-checked recovery
-when both were killed. Concurrent sessions retain independent identities,
-processes, namespaces, and API sockets.
+exit. Initial `Hello`, `Start`, and `Proceed` reads use absolute five-second
+deadlines; cancellation and post-`Terminal`/EOF process-exit waits use a
+five-second grace before owned-worker escalation. A surviving worker cleans
+after launcher EOF; a surviving launcher cleans after worker exit; a later
+worker performs bounded identity-checked recovery when both were killed.
+Concurrent sessions retain independent identities, processes, namespaces, and
+API sockets.
 
 Contained mode currently supports only app-container or sealed bundle
 resources. The session namespace is empty and carries no grant material. The

@@ -18,12 +18,18 @@ const DEFAULT_PASSWD_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_RECOVERY_ENTRIES: usize = 128;
 
 /// Device/inode proof sent in the bounded bootstrap protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NamespaceIdentity {
     /// Filesystem device number.
     pub device: u64,
     /// Filesystem inode number.
     pub inode: u64,
+}
+
+impl fmt::Debug for NamespaceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NamespaceIdentity(<redacted>)")
+    }
 }
 
 /// Redacted runtime namespace failure.
@@ -661,6 +667,12 @@ mod tests {
         assert!(valid_session_name(OsStr::from_bytes(name.as_bytes())));
         assert!(!valid_session_name(OsStr::new("session-AB")));
         assert!(!valid_session_name(OsStr::new("unrelated")));
+
+        let identity = NamespaceIdentity {
+            device: 1_234_567_891,
+            inode: 1_234_567_893,
+        };
+        assert_eq!(format!("{identity:?}"), "NamespaceIdentity(<redacted>)");
     }
 
     #[test]

@@ -361,18 +361,22 @@ mod platform {
         deadline: Instant,
     ) -> Result<Frame, ContainedSessionError> {
         loop {
-            if let Some(frame) = decoder.next_frame().map_err(|_| ContainedSessionError)? {
-                return Ok(frame);
-            }
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .filter(|remaining| !remaining.is_zero())
                 .ok_or(ContainedSessionError)?;
+            if let Some(frame) = decoder.next_frame().map_err(|_| ContainedSessionError)? {
+                return Ok(frame);
+            }
             stream
                 .set_read_timeout(Some(remaining))
                 .map_err(|_| ContainedSessionError)?;
             let mut bytes = [0_u8; 4096];
-            let length = stream.read(&mut bytes).map_err(|_| ContainedSessionError)?;
+            let length = match stream.read(&mut bytes) {
+                Ok(length) => length,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(ContainedSessionError),
+            };
             if length == 0 {
                 return Err(ContainedSessionError);
             }

@@ -415,6 +415,16 @@ mod tests {
         worker.receive(start).expect("start should receive");
         assert_eq!(worker.receive(start), Err(ProtocolError::InvalidPeerState));
 
+        let sequence_gap = Frame {
+            session: session(3),
+            sequence: 2,
+            message: Message::Proceed,
+        };
+        assert_eq!(
+            worker.receive(sequence_gap),
+            Err(ProtocolError::InvalidPeerState)
+        );
+
         let mut wrong_session = worker.prepared(8, 9).expect("prepared should send");
         wrong_session.session = session(4);
         assert_eq!(

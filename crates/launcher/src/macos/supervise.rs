@@ -18,7 +18,7 @@ use super::spawn::OwnedWorker;
 use crate::LauncherError;
 
 const CANCELLATION_GRACE: Duration = Duration::from_secs(5);
-const DISCONNECT_GRACE: Duration = Duration::from_secs(5);
+const SESSION_EXIT_GRACE: Duration = Duration::from_secs(5);
 const BOOTSTRAP_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -111,6 +111,10 @@ pub(crate) fn read_bootstrap_hello(
         let mut decoder = FrameDecoder::default();
         let mut buffer = [0_u8; 4096];
         loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(LauncherError::SessionProtocol)?;
             if let Some(frame) = decoder
                 .next_frame()
                 .map_err(|_| LauncherError::SessionProtocol)?
@@ -125,16 +129,14 @@ pub(crate) fn read_bootstrap_hello(
                 }
                 return Ok(());
             }
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or(LauncherError::SessionProtocol)?;
             stream
                 .set_read_timeout(Some(remaining))
                 .map_err(|error| LauncherError::SessionSetup(error.kind()))?;
-            let length = stream
-                .read(&mut buffer)
-                .map_err(|_| LauncherError::SessionProtocol)?;
+            let length = match stream.read(&mut buffer) {
+                Ok(length) => length,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(LauncherError::SessionProtocol),
+            };
             if length == 0 {
                 return Err(LauncherError::SessionProtocol);
             }
@@ -263,7 +265,7 @@ fn wait_session_inner(
                 session_closed =
                     drain_session(session, &mut decoder, lifecycle, namespace, terminal)?;
                 if session_closed {
-                    exit_deadline.get_or_insert(Instant::now() + DISCONNECT_GRACE);
+                    exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
                     register_events(
                         kqueue.as_raw_fd(),
                         &[event(session_fd, libc::EVFILT_READ, libc::EV_DELETE, 0)],
@@ -272,7 +274,7 @@ fn wait_session_inner(
             }
         }
         if terminal.is_some() {
-            exit_deadline.get_or_insert(Instant::now() + DISCONNECT_GRACE);
+            exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
         }
 
         for queued in &events {

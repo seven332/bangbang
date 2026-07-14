@@ -316,6 +316,8 @@ VM work. `Hello`, `Start`, `Prepared`, `Proceed`, `Starting`, optional committed
 `Ready(Api|NoApi)`, at most one `Cancel(SIGINT|SIGTERM)`, and path-free
 `Terminal(category, exit_code)` form the complete v1 lifecycle. Structured exit
 values must match the reaped public status; abrupt death may omit `Terminal`.
+The initial `Hello`, `Start`, and `Proceed` reads each use an absolute
+five-second deadline, including across interrupted or fragmented reads.
 
 After `Start`, the worker creates and locks an empty mode-0700 directory named
 only from the random identity beneath its fixed App Sandbox container temp root.
@@ -331,12 +333,15 @@ against a malicious same-bundle sibling with equivalent container authority.
 The launcher kqueue watches both graceful signals, the session stream, and the
 unreaped child. The first signal sends one bounded cancellation and starts a
 five-second grace deadline; later signals are coalesced, and expiry kills only
-the still-owned unreaped worker. Pending protocol bytes are drained before a
-same-batch child reap, ordinary status is preserved, and signaled status maps to
-`128 + signal`. Worker EOF cleanup handles launcher-first death; launcher
-identity-checked cleanup handles worker-first death; a later worker scans at
-most 128 names and removes only valid empty unlocked identity-stable residue
-after both were killed. There is no automatic restart or reconnect.
+the still-owned unreaped worker. A structured `Terminal` or session EOF starts
+the same bounded process-exit grace, so a peer cannot report completion or
+disconnect and then hold supervision indefinitely. Pending protocol bytes are
+drained before a same-batch child reap, ordinary status is preserved, and
+signaled status maps to `128 + signal`. Worker EOF cleanup handles
+launcher-first death; launcher identity-checked cleanup handles worker-first
+death; a later worker scans at most 128 names and removes only valid empty
+unlocked identity-stable residue after both were killed. There is no automatic
+restart or reconnect.
 
 The outer launcher, fixed metadata, and signed nested code are trusted package
 components. API requests, guest data, device input, host path arguments, and

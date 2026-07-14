@@ -94,5 +94,10 @@ mod tests {
         // A same-process socketpair reports the current process on Darwin.
         // SAFETY: `getpid` has no pointer or ownership contract.
         assert_eq!(peer.pid, unsafe { libc::getpid() });
+
+        let wrong_pid = peer.pid.checked_add(1).expect("test PID should fit");
+        let error = verify_peer(left.as_raw_fd(), wrong_pid)
+            .expect_err("a mismatched expected PID must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }

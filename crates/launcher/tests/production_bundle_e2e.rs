@@ -662,12 +662,17 @@ impl ProcessExitWatch {
     }
 
     fn wait(self, timeout: Duration) -> bool {
-        let timeout = libc::timespec {
-            tv_sec: libc::time_t::try_from(timeout.as_secs()).expect("timeout seconds should fit"),
-            tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
-        };
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .expect("process-watch deadline should fit Instant");
         let mut event = MaybeUninit::<libc::kevent>::uninit();
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = libc::timespec {
+                tv_sec: libc::time_t::try_from(remaining.as_secs())
+                    .expect("timeout seconds should fit"),
+                tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+            };
             // SAFETY: `event` has room for one result and `timeout` remains live.
             let count = unsafe {
                 libc::kevent(

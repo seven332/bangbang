@@ -146,7 +146,10 @@ mode, device/inode, emptiness, pathname identity, and lock state; missing,
 replaced, populated, ambiguous, live, or excess entries must be preserved.
 Later graceful signals must coalesce behind one cancellation and its bounded
 escalation, and concurrent launchers must never share session state or signal,
-reap, or clean each other's workers and namespaces.
+reap, or clean each other's workers and namespaces. Absolute handshake
+deadlines must survive fragmented reads and `EINTR`; `Terminal` or EOF must also
+start a bounded owned-process exit grace rather than permitting an indefinite
+wait.
 
 ## Performance Review
 

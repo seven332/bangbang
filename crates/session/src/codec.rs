@@ -120,7 +120,7 @@ pub enum TerminalCategory {
 }
 
 /// Closed v1 lifecycle message set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Message {
     /// Proves that the resumed worker reached its no-authority bootstrap.
     Hello,
@@ -141,6 +141,25 @@ pub enum Message {
         category: TerminalCategory,
         exit_code: u8,
     },
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hello => formatter.write_str("Hello"),
+            Self::Start => formatter.write_str("Start"),
+            Self::Proceed => formatter.write_str("Proceed"),
+            Self::Cancel(_) => formatter.write_str("Cancel(<redacted>)"),
+            Self::Prepared { .. } => {
+                formatter.write_str("Prepared { device: <redacted>, inode: <redacted> }")
+            }
+            Self::Starting => formatter.write_str("Starting"),
+            Self::Ready(_) => formatter.write_str("Ready(<redacted>)"),
+            Self::Terminal { .. } => {
+                formatter.write_str("Terminal { category: <redacted>, exit_code: <redacted> }")
+            }
+        }
+    }
 }
 
 impl Message {
@@ -508,6 +527,38 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_exact_frame_and_buffer_limits_before_shape_validation() {
+        let mut exact = encode_frame(Frame {
+            session: id(4),
+            sequence: 0,
+            message: Message::Start,
+        })
+        .expect("frame should encode");
+        exact[6..8].copy_from_slice(&99_u16.to_be_bytes());
+        exact[8..12].copy_from_slice(&(MAX_PAYLOAD_BYTES as u32).to_be_bytes());
+        exact.resize(MAX_FRAME_BYTES, 0);
+
+        let mut exact_decoder = FrameDecoder::default();
+        exact_decoder
+            .push(&exact)
+            .expect("the exact frame limit should buffer");
+        assert_eq!(
+            exact_decoder.next_frame(),
+            Err(ProtocolError::InvalidFrame),
+            "the closed message shape should be rejected after the size is admitted"
+        );
+
+        let mut buffer_decoder = FrameDecoder::default();
+        buffer_decoder
+            .push(&exact)
+            .expect("first maximum frame should buffer");
+        buffer_decoder
+            .push(&exact)
+            .expect("the exact two-frame buffer limit should buffer");
+        assert_eq!(buffer_decoder.push(&[0]), Err(ProtocolError::InvalidFrame));
+    }
+
+    #[test]
     fn rejects_incompatible_reserved_unknown_and_truncated_data() {
         let frame = Frame {
             session: id(5),
@@ -515,6 +566,7 @@ mod tests {
             message: Message::Start,
         };
         for (offset, bytes) in [
+            (0, b"FAIL".to_vec()),
             (4, 2_u16.to_be_bytes().to_vec()),
             (12, 1_u32.to_be_bytes().to_vec()),
         ] {
@@ -547,6 +599,23 @@ mod tests {
         assert_eq!(
             ProtocolError::InvalidPeerState.to_string(),
             "private session protocol failure"
+        );
+
+        let prepared = Message::Prepared {
+            device: 1_234_567_891,
+            inode: 1_234_567_893,
+        };
+        let terminal = Message::Terminal {
+            category: TerminalCategory::Configuration,
+            exit_code: 152,
+        };
+        assert_eq!(
+            format!("{prepared:?}"),
+            "Prepared { device: <redacted>, inode: <redacted> }"
+        );
+        assert_eq!(
+            format!("{terminal:?}"),
+            "Terminal { category: <redacted>, exit_code: <redacted> }"
         );
     }
 }

@@ -725,15 +725,16 @@ place guest resources in a normal product. Tests use readiness events and
 bounded deadlines rather than fixed sleeps.
 
 Portable `bangbang-session` tests exhaustively split and coalesce every v1
-message frame and cover header/version/reserved/size/EOF rejection, replay,
-sequence gaps, cross-session and wrong-role/state input, reserved identity use,
-monotonic API/early-command/cancellation state, and redacted formatting. Darwin
-unit tests cover kernel peer identity, exact namespace naming/root derivation,
-bounded directory iteration, stale empty-directory recovery, populated-entry
-preservation, and replacement-safe cleanup. These tests do not replace the
-signed target: default-close spawning, dynamic code identity, App Sandbox root
-resolution, crash order, and real HVF claims require the packaged execution
-above.
+message frame and cover wrong magic/version/reserved data, exact frame/buffer
+limits, oversized input, EOF rejection, replay, sequence gaps, cross-session and
+wrong-role/state input, reserved identity use, monotonic API/early-command/
+cancellation state, and payload/identity-redacted formatting. Darwin unit tests
+cover kernel peer acceptance and PID rejection, exact namespace naming/root
+derivation, bounded independent directory iteration across repeated checks,
+stale empty-directory recovery, populated-entry preservation, and
+replacement-safe cleanup. These tests do not replace the signed target:
+default-close spawning, dynamic code identity, App Sandbox root resolution,
+crash order, and real HVF claims require the packaged execution above.
 
 Build a local production bundle without running the integration suite:
 

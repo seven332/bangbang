@@ -73,6 +73,8 @@ graceful `Cancel`, and path-free `Terminal`. The worker verifies matching
 effective credentials and `LOCAL_PEERPID == getppid()` before and after the
 gate. App Sandbox denies its Security.framework lookup of the parent, so only
 the launcher code-validates its peer; this asymmetry is part of the contract.
+`Hello`, `Start`, and `Proceed` reads have absolute five-second deadlines, and
+`Terminal` or EOF starts a five-second owned-process exit grace.
 
 The worker creates and locks one exact mode-0700 empty namespace beneath its
 fixed container temp root. `Prepared` reports only device/inode. The launcher
