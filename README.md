@@ -15,6 +15,18 @@ and test rules:
 - [Testing Guide](docs/testing.md)
 - [Pull Request Review Guidelines](docs/review-guidelines.md)
 
+The reconciled Firecracker v1.16.0 remaining-device subset covers
+virtio-balloon reporting and zero-safe best-effort Darwin discard, bounded
+virtio-rng, targeted and rate-limited virtio-pmem flush, a block-granular
+virtio-mem plug/unplug lifecycle, the no-interrupt aarch64 PL031 RTC,
+DeviceTree VMGenID including native-v1 replacement notification, and startup
+VMClock discovery. Optional PCI runtime attach/delete, ARM PVTime, pmem root or
+direct file-backed mapping, optional-device snapshots, and mutable VMClock
+restore remain explicit limits. Host discard never promises synchronous RSS or
+footprint reduction. See the
+[pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
+for exact upstream sources and classifications.
+
 ## Layout
 
 ```text
