@@ -2005,12 +2005,22 @@ mod macos_arm64 {
             "GET / after balloon direct rootfs InstanceStart",
         );
 
-        let balloon_stats = http_get(&socket_path, "/balloon/statistics");
-        assert_ok_response(&balloon_stats, "GET /balloon/statistics direct rootfs");
+        let balloon_stats = match wait_for_nonzero_balloon_actual_pages(
+            &socket_path,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            Ok(response) => response,
+            Err(err) => {
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "direct rootfs guest did not inflate the configured balloon: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+        };
         for expected in [
             r#""target_pages":2048"#,
             r#""target_mib":8"#,
-            r#""actual_pages":"#,
             r#""actual_mib":"#,
         ] {
             assert_response_contains(
@@ -6443,6 +6453,33 @@ mod macos_arm64 {
             };
 
             kqueue.wait_for_write(remaining)?;
+        }
+    }
+
+    fn wait_for_nonzero_balloon_actual_pages(
+        socket_path: &Path,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let started_at = Instant::now();
+
+        loop {
+            let response = http_get(socket_path, "/balloon/statistics");
+            let actual_pages = response
+                .strip_prefix("HTTP/1.1 200 OK\r\n")
+                .and_then(|_| response.split_once("\r\n\r\n"))
+                .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+                .and_then(|body| body.get("actual_pages").cloned())
+                .and_then(|actual_pages| actual_pages.as_u64());
+            if actual_pages.is_some_and(|pages| pages > 0) {
+                return Ok(response);
+            }
+            if started_at.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for /balloon/statistics actual_pages > 0; latest actual_pages={actual_pages:?}; latest response:\n{response}"
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

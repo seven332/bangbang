@@ -984,24 +984,37 @@ generic no-ops.
 
 The current virtio-balloon foundation derives a startup-attached virtio-mmio/FDT
 shell from stored control-plane configuration. It exposes guest-visible
-identity, feature, queue, and config-space registers, but does not map guest
-memory or change host memory accounting. Guest config-space writes update only
-local device register state. The backend-neutral inflate notification dispatcher
-can read bounded PFN descriptor payloads, compact them into page ranges, and
-acknowledge descriptor heads with zero-length used-ring entries. The deflate
-notification dispatcher follows the same bounded PFN parsing and mapped guest
-memory validation path before acknowledging descriptor heads. Completed
-descriptors update only internal inflated-page accounting on the owning balloon
-device; they do not release, remap, or otherwise alter host memory. The HVF boot
-loop can drain these balloon notifications and signal the allocated balloon
-interrupt line. Bounded statistics queue reports can update only optional
-statistics fields, and a runtime policy trigger can complete the pending
-statistics descriptor with a zero-length used-ring entry plus queue-interrupt
-intent. Parsed PFNs, statistics descriptors, free-page hinting range
-descriptors, and reporting queue data remain untrusted guest input and must not
-change host memory accounting or reclaim behavior until those host-side paths
-are implemented and reviewed. Free-page hinting command descriptors are limited
-to 4-byte command identifiers stored in active device state.
+identity, feature, queue, and config-space registers without changing mapping
+ownership. Guest config-space writes update only local device register state.
+The backend-neutral inflate notification dispatcher reads bounded PFN payloads,
+compacts them into ranges, validates every completed range against owned guest
+memory, and acknowledges descriptor heads with zero-length used-ring entries.
+The deflate path follows the same validation/publication boundary. Completed
+inflate descriptors update owning-device inflated-page accounting and, before
+runtime dispatch returns, pass their byte ranges to the bounded discard owner.
+
+Discard validates the whole guest range before its first host operation, splits
+work at every independently owned mmap, and aligns each segment inward to the
+host page size. Partial host-page edges are skipped rather than zeroing adjacent
+live guest data; in particular, a 4-KiB guest range within one 16-KiB Darwin
+page produces no host advice. On Darwin, isolated checked wrappers issue
+`MADV_ZERO` and only then `MADV_FREE`. A zero failure suppresses free, later
+independent segments remain best effort, and diagnostics expose requested,
+actual advised, skipped, and failed bytes plus stage classes without host
+pointers. Unsupported targets report failure instead of substituting a
+different operation or simulating success. The non-paired operation retains no
+reusable ledger, so deflate/reset/pause/teardown has no cleanup transaction and
+no synchronous RSS or footprint reduction is promised.
+
+Free-page hinting command descriptors remain limited to 4-byte command
+identifiers stored in active device state. Range descriptors are accepted for
+discard only while the host command is active and the guest command matches it;
+missing, stale, STOP, and DONE ranges cannot trigger advice. Host advice failure
+does not rewrite used-ring publication, queue-interrupt intent, inflated-page
+accounting, or hint command state. The HVF boot loop owns mutable mapped memory
+through this synchronous dispatch and resumes only after it returns. Bounded
+statistics reports can update optional statistics fields, and reporting queue
+data remains untrusted and disabled until #1328 implements that separate path.
 Runtime balloon target-size updates change only the stored target and active
 virtio-balloon `num_pages` config-space value, then signal a config interrupt;
 they do not map, unmap, reclaim, or release host memory. Balloon statistics
@@ -1011,8 +1024,9 @@ Balloon hinting start and stop commands update only host-owned command state,
 mirror that state into active config space, and signal a config interrupt.
 Balloon hinting status queries read only the active device's internal host
 command identifier and latest 4-byte guest command identifier observed on the
-hinting queue. These paths do not trust guest config-space writes as host
-commands, parse hinting range descriptors, or reclaim host memory.
+hinting queue. These control-plane paths do not trust guest config-space writes
+as host commands or themselves perform host advice; only accepted runtime queue
+ranges reach the bounded discard owner.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures
@@ -1051,12 +1065,12 @@ summary, and minimal device counters such as block
 queue/update/throttling activity, virtio-pmem queue activity, virtio-net packet
 counters, and virtio-vsock queue, packet, byte, and connection cleanup counters,
 plus virtio-rng request, byte, host-randomness failure, and event-failure
-counters, plus PL031 RTC invalid read/write and error counters. Serial, vsock,
-block, pmem, entropy, and RTC metrics are counters only and must not expose Unix
+counters, PL031 RTC invalid read/write and error counters, and balloon
+inflate/hint discard attempts, actual advised bytes, skipped-edge bytes, and
+failed attempts. Device metrics are counters only and must not expose Unix
 socket paths, guest payload bytes, host stream data, worker error strings, host
-paths, guest serial bytes, randomness bytes, host
-entropy-source details, guest descriptors, guest memory addresses, or unexpected
-guest data.
+paths or pointers, guest serial bytes, randomness bytes, host entropy-source
+details, guest descriptors, guest memory addresses, or unexpected guest data.
 Future full logging and metrics support must preserve those redaction
 boundaries.
 

@@ -14690,6 +14690,14 @@ mod tests {
         );
         let dispatches =
             dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let inflate_discard = dispatches.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("balloon inflate notification should dispatch")
+            .inflate_queue_dispatch()
+            .expect("inflate queue dispatch should be present")
+            .inflate_discard();
+        assert_eq!(inflate_discard.attempts(), 1);
         let runtime_metrics = SharedBalloonDeviceMetrics::default();
         super::record_balloon_runtime_dispatch_metrics(
             &runtime_metrics,
@@ -14699,6 +14707,7 @@ mod tests {
         assert_eq!(
             runtime_metrics.snapshot(),
             BalloonDeviceMetrics::new(0, 1, 0, 0, 0, 0)
+                .with_discard_metrics(inflate_discard.into(), Default::default())
         );
         let (lines, sink) = RecordingSink::failing("injected balloon signal failure");
 
@@ -14729,6 +14738,7 @@ mod tests {
         assert_eq!(
             metrics.snapshot(),
             BalloonDeviceMetrics::new(0, 1, 0, 0, 0, 1)
+                .with_discard_metrics(inflate_discard.into(), Default::default())
         );
     }
 

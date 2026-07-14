@@ -745,19 +745,25 @@ from `/dev/hwrng`, and writes a host-observable marker only after a non-empty
 read succeeds.
 It also includes a direct-rootfs balloon scenario that configures `/balloon`,
 checks that the guest bound a virtio-balloon driver, exercises the minimal
-hinting start/stop command-state APIs, and writes a host-observable marker after
-the driver path is visible.
+hinting start/stop command-state APIs, requires the public statistics response
+to reach nonzero `actual_pages`, and writes a host-observable marker after the
+driver path is visible. This proves signed guest inflation reaches the runtime
+discard owner; it does not impose a process-footprint threshold.
 Runtime `PATCH /balloon` target-size updates are covered by unit, API socket,
 and process-session tests that verify stored config updates, active config-space
-generation changes, and config interrupt signaling; they do not require a
-separate signed guest scenario until periodic polling, host reclaim, or
-reporting behavior is added. Guest-reported statistics queue records are covered
-by runtime unit, API response, and process-session tests. Runtime statistics
-interval updates are covered by unit, API socket, and process-session tests
-because they update stored/active interval state without timer-driven guest
+generation changes, and config interrupt signaling. Guest-reported statistics
+queue records are covered by runtime unit, API response, and process-session
+tests. Runtime statistics interval updates are covered by unit, API socket, and
+process-session tests because they update stored/active interval state without
+timer-driven guest
 polling. Hinting queue guest-command acknowledgement, automatic host DONE
-acknowledgement, and active-run range descriptor validation/recording are
-covered by runtime unit and MMIO handler tests.
+acknowledgement, active/stale range selection, best-effort advice outcomes, and
+inflate/hint metrics are covered by runtime unit and MMIO handler tests.
+Guest-memory tests inject page sizes and zero/free failures to verify complete
+validation, per-region segmentation, inward alignment, 4-KiB-within-16-KiB
+neighbor safety, partial failures, byte accounting, repeats, and independent
+owners. A macOS-only real anonymous-mapping test requires zero contents after
+`MADV_ZERO` plus `MADV_FREE` reuse without asserting RSS.
 It also includes a direct-rootfs writeback block scenario that configures a
 non-root data drive with `cache_type=Writeback`, writes through `/dev/vdb`,
 calls `fsync` on the block-device file descriptor, and writes a host-observable
@@ -913,7 +919,8 @@ reads bytes from `/dev/hwrng`, and writes
 When the boot args include `bangbang.balloon-check=1`, the same init script
 checks the virtio bus for a device bound to the `virtio_balloon` driver and
 writes `BANGBANG_BALLOON_GUEST_CHECK_OK` only after that driver binding is
-visible.
+visible. The signed host test separately polls `/balloon/statistics` until
+`actual_pages` is nonzero before accepting the scenario.
 When the boot args include `bangbang.memory-hotplug-check=1`, the same init
 script checks the virtio bus for a device bound to `virtio_mem`, writes
 `BANGBANG_MEMORY_HOTPLUG_GUEST_READY`, follows `dmesg` for the runtime
