@@ -8,6 +8,9 @@ This is a Rust workspace for `bangbang`, a macOS-oriented VMM scaffold intended 
 - `crates/api` -> package `bangbang-api`: Firecracker-compatible API endpoint names.
 - `crates/runtime` -> package `bangbang-runtime`: backend-neutral VM trait and error type.
 - `crates/hvf` -> package `bangbang-hvf`: Apple Hypervisor.framework backend skeleton.
+- `tools/firecracker-capability-audit` -> package
+  `bangbang-firecracker-capability-audit`: checked v1.16.0 scope inventory validator.
+- `compat/firecracker/v1.16.0`: pinned machine source manifest and human capability overlays.
 - `README.md`: current project scope and build instructions.
 
 Unit tests live next to the code they exercise under each crate’s `src/` tree. There are no assets or generated source directories currently checked in.
@@ -15,6 +18,8 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 ## Build, Test, and Development Commands
 
 - `cargo fmt --all -- --check`: verify Rust formatting.
+- `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`: validate the
+  checked delivery-time Firecracker inventory without a sibling checkout.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.
 - `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.

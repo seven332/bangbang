@@ -580,12 +580,59 @@ hosted CI, use the signed integration runner with `--allow-unsupported` so CI
 still validates artifact preparation, compilation, and signing before skipping
 execution on unsupported runners.
 
+## Firecracker Capability Inventory
+
+The checked
+[Firecracker v1.16.0 capability inventory](../compat/firecracker/v1.16.0/README.md)
+is validated by a dedicated non-published workspace tool. Run its focused tests
+and delivery-time validation when changing the manifest, overlay, validator, or
+any Firecracker-facing capability:
+
+```sh
+cargo test -p bangbang-firecracker-capability-audit --all-targets --locked
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+```
+
+The workspace test suite includes an integration test of both checked-in files.
+Ordinary tests do not discover or require a sibling Firecracker checkout.
+
+Maintainers can compare the machine-owned manifest with a clean explicit
+checkout at the exact pinned commit:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- compare \
+  --firecracker /path/to/firecracker
+```
+
+Regeneration always targets an explicit candidate and refuses either checked-in
+inventory file:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- regenerate \
+  --firecracker /path/to/firecracker \
+  --output codex-work/tmp/firecracker-v1.16-source-manifest.candidate.json
+```
+
+Review exact identity changes before updating the machine-owned file. Never use
+regeneration to alter `capabilities.json`; missing and stale overlays must be
+resolved deliberately. The parent certification gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --final
+```
+
+Final mode is expected to fail while any `audit-required` or
+`missing-platform-feasible` record remains. Signed HVF integration remains
+regression evidence for an inventory-only change and does not promote a record
+without record-specific evidence.
+
 ## Running Tests
 
 Run the standard workspace checks before opening or updating a PR:
 
 ```sh
 cargo fmt --all -- --check
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 cargo test -p bangbang-hvf --lib --all-features --locked
