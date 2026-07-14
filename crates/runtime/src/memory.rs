@@ -530,19 +530,21 @@ impl GuestMemory {
 
             let advice_size = advice_end_address - advice_start_address;
             let skipped_size = segment_size - advice_size;
-            outcome.record_skipped(u64::try_from(skipped_size).unwrap_or(u64::MAX));
+            let (Ok(advice_size_u64), Ok(skipped_size_u64)) =
+                (u64::try_from(advice_size), u64::try_from(skipped_size))
+            else {
+                outcome.record_failed(segment.size, GuestMemoryDiscardFailureKind::HostAddress);
+                continue;
+            };
+            outcome.record_skipped(skipped_size_u64);
 
             let advice_address = segment_start
                 .with_addr(advice_start_address)
                 .cast::<c_void>();
             let Some(advice_address) = NonNull::new(advice_address) else {
-                outcome.record_failed(
-                    u64::try_from(advice_size).unwrap_or(u64::MAX),
-                    GuestMemoryDiscardFailureKind::HostAddress,
-                );
+                outcome.record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::HostAddress);
                 continue;
             };
-            let advice_size_u64 = u64::try_from(advice_size).unwrap_or(u64::MAX);
             if adviser.zero(advice_address, advice_size).is_err() {
                 outcome.record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::ZeroAdvice);
                 continue;
