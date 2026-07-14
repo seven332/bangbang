@@ -858,9 +858,10 @@ is resource-specific:
   sink and host-path error redaction rules before the API socket is served.
   Configuration writes nothing. A retained session makes one best-effort
   initial attempt, Running and Paused sessions make 60-second best-effort
-  attempts, explicit runtime `FlushMetrics` returns a sink error, and normal
-  convergence makes one best-effort final attempt without replacing the
-  process result. Ordinary handle drop closes the sink.
+  attempts, explicit runtime `FlushMetrics` propagates a configured-sink write
+  error to its caller, and normal convergence makes one best-effort final
+  attempt without replacing the process result. Ordinary handle drop closes
+  the sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
   present and keeps a per-process logger sink. Successfully parsed API requests
   can append method/path lines before dispatch, and successful `InstanceStart`
