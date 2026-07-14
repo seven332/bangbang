@@ -6047,12 +6047,19 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct DiagnosticSession {
         status: BootRunLoopMetricStatus,
+        block_update_count: u64,
     }
 
     impl ProcessSessionDiagnostics for DiagnosticSession {
         fn metrics_diagnostics(&self) -> bangbang_runtime::metrics::MetricsDiagnostics {
+            let block_metrics =
+                BlockDeviceMetrics::default().with_update_count(self.block_update_count);
             bangbang_runtime::metrics::MetricsDiagnostics::new()
                 .with_boot_run_loop_status(self.status)
+                .with_block_device_metrics(block_metrics)
+                .with_block_device_metrics_by_drive(
+                    BlockDeviceMetricsByDrive::new().with_drive_metrics("rootfs", block_metrics),
+                )
         }
     }
 
@@ -6088,6 +6095,7 @@ mod tests {
             self.calls += 1;
             Ok(DiagnosticSession {
                 status: self.status,
+                block_update_count: 0,
             })
         }
 
@@ -12410,6 +12418,55 @@ mod tests {
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"api_server\":{\"process_startup_time_us\":1000},\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
         );
+    }
+
+    #[test]
+    fn active_session_replacement_starts_a_fresh_metrics_generation() {
+        let metrics = TempFilePath::create("replacement-metrics");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            DiagnosticStarter::new(BootRunLoopMetricStatus::Running),
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("diagnostic session should start");
+
+        vmm.started_session = Some(DiagnosticSession {
+            status: BootRunLoopMetricStatus::Running,
+            block_update_count: 5,
+        });
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("first session metrics should flush");
+
+        // Native-v1 commit replaces the active producer at this same assignment seam.
+        vmm.started_session = Some(DiagnosticSession {
+            status: BootRunLoopMetricStatus::Paused,
+            block_update_count: 2,
+        });
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("replacement session metrics should flush");
+
+        let lines: Vec<serde_json::Value> = fs::read_to_string(metrics.path())
+            .expect("metrics output should read")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("metrics line should be valid JSON"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["block_rootfs"]["update_count"], 5);
+        assert_eq!(lines[0]["vmm"]["boot_run_loop_status"], "running");
+        assert_eq!(lines[0]["vmm"]["metrics_flush_count"], 1);
+        assert_eq!(lines[1]["block_rootfs"]["update_count"], 2);
+        assert_eq!(lines[1]["vmm"]["boot_run_loop_status"], "paused");
+        assert_eq!(lines[1]["vmm"]["metrics_flush_count"], 1);
     }
 
     #[test]

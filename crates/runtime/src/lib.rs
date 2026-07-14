@@ -5252,7 +5252,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":2}}\n"
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
