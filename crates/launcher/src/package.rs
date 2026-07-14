@@ -326,10 +326,17 @@ fn copy_resource_directory(
     if depth > MAX_TEST_RESOURCE_DEPTH {
         return Err(PackageError::InvalidTestResources);
     }
+    let remaining_entries = MAX_TEST_RESOURCE_ENTRIES
+        .checked_sub(budget.entries)
+        .ok_or(PackageError::InvalidTestResources)?;
     let entries = fs::read_dir(source).map_err(|_| PackageError::InvalidTestResources)?;
     let mut entries = entries
+        .take(remaining_entries + 1)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| PackageError::InvalidTestResources)?;
+    if entries.len() > remaining_entries {
+        return Err(PackageError::InvalidTestResources);
+    }
     entries.sort_by_key(fs::DirEntry::file_name);
 
     for entry in entries {
