@@ -1013,8 +1013,21 @@ missing, stale, STOP, and DONE ranges cannot trigger advice. Host advice failure
 does not rewrite used-ring publication, queue-interrupt intent, inflated-page
 accounting, or hint command state. The HVF boot loop owns mutable mapped memory
 through this synchronous dispatch and resumes only after it returns. Bounded
-statistics reports can update optional statistics fields, and reporting queue
-data remains untrusted and disabled until #1328 implements that separate path.
+statistics reports can update optional statistics fields.
+
+Free-page reporting descriptors are direct guest-memory range declarations, not
+trusted payloads. Dispatch accepts at most the queue's bounded 256-entry chain
+limit and requires every reporting descriptor to be device-writable. Empty
+ranges, wrong-direction descriptors, checked address-overflow failures, unmapped
+ranges, and platform advice failures are recorded as failed best-effort attempts
+without preventing later available chains from running. Each valid range is
+fully mapping-validated and passes through the same per-owner, inward host-page-
+aligned zero/free boundary as inflate and hinting. Discard completes before the
+descriptor is published used; if used-ring publication then fails, diagnostics
+retain the discard outcome but do not claim descriptor completion or interrupt
+intent. Reset retains no reporting ledger. Requested reporting bytes are
+observability input counts and must never be presented as advised or reclaimed
+bytes.
 Runtime balloon target-size updates change only the stored target and active
 virtio-balloon `num_pages` config-space value, then signal a config interrupt;
 they do not map, unmap, reclaim, or release host memory. Balloon statistics
@@ -1066,8 +1079,8 @@ queue/update/throttling activity, virtio-pmem queue activity, virtio-net packet
 counters, and virtio-vsock queue, packet, byte, and connection cleanup counters,
 plus virtio-rng request, byte, host-randomness failure, and event-failure
 counters, PL031 RTC invalid read/write and error counters, and balloon
-inflate/hint discard attempts, actual advised bytes, skipped-edge bytes, and
-failed attempts. Device metrics are counters only and must not expose Unix
+inflate/hint/report discard attempts, reporting-requested bytes, actual advised
+bytes, skipped-edge bytes, and failed attempts. Device metrics are counters only and must not expose Unix
 socket paths, guest payload bytes, host stream data, worker error strings, host
 paths or pointers, guest serial bytes, randomness bytes, host entropy-source
 details, guest descriptors, guest memory addresses, or unexpected guest data.

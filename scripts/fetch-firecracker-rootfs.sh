@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v34"
+direct_boot_variant="direct-boot-v35"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -651,8 +651,26 @@ check_balloon_marker() {
     return
   fi
 
-  emit_line BANGBANG_BALLOON_GUEST_CHECK_OK
-  write_vdb_marker BANGBANG_BALLOON_GUEST_CHECK_OK
+  features_path=$balloon_device/features
+  if [ ! -r "$features_path" ]; then
+    emit_line BANGBANG_BALLOON_GUEST_CHECK_FAIL_NO_FEATURES
+    write_vdb_marker BANGBANG_BALLOON_GUEST_CHECK_FAIL
+    return
+  fi
+
+  features=$(tr -d '\r\n' < "$features_path" 2>/dev/null || true)
+  case "$features" in
+    ?????1*)
+      ;;
+    *)
+      emit_line BANGBANG_BALLOON_GUEST_CHECK_FAIL_REPORTING_NOT_NEGOTIATED
+      write_vdb_marker BANGBANG_BALLOON_GUEST_CHECK_FAIL
+      return
+      ;;
+  esac
+
+  emit_line BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK
+  write_vdb_marker BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK
 }
 
 check_memory_hotplug_marker() {

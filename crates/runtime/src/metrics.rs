@@ -3628,6 +3628,84 @@ impl From<VirtioBalloonDiscardOutcome> for BalloonDiscardMetrics {
     }
 }
 
+/// Observable counters for virtio-balloon free-page reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BalloonFreePageReportMetrics {
+    count: u64,
+    requested_bytes: u64,
+    advised_bytes: u64,
+    skipped_bytes: u64,
+    failures: u64,
+}
+
+impl BalloonFreePageReportMetrics {
+    pub const fn new(
+        count: u64,
+        requested_bytes: u64,
+        advised_bytes: u64,
+        skipped_bytes: u64,
+        failures: u64,
+    ) -> Self {
+        Self {
+            count,
+            requested_bytes,
+            advised_bytes,
+            skipped_bytes,
+            failures,
+        }
+    }
+
+    pub const fn count(self) -> u64 {
+        self.count
+    }
+
+    pub const fn requested_bytes(self) -> u64 {
+        self.requested_bytes
+    }
+
+    pub const fn advised_bytes(self) -> u64 {
+        self.advised_bytes
+    }
+
+    pub const fn skipped_bytes(self) -> u64 {
+        self.skipped_bytes
+    }
+
+    pub const fn failures(self) -> u64 {
+        self.failures
+    }
+
+    const fn is_empty(self) -> bool {
+        self.count == 0
+            && self.requested_bytes == 0
+            && self.advised_bytes == 0
+            && self.skipped_bytes == 0
+            && self.failures == 0
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            count: self.count.saturating_add(other.count),
+            requested_bytes: self.requested_bytes.saturating_add(other.requested_bytes),
+            advised_bytes: self.advised_bytes.saturating_add(other.advised_bytes),
+            skipped_bytes: self.skipped_bytes.saturating_add(other.skipped_bytes),
+            failures: self.failures.saturating_add(other.failures),
+        }
+    }
+}
+
+impl From<VirtioBalloonDiscardOutcome> for BalloonFreePageReportMetrics {
+    fn from(outcome: VirtioBalloonDiscardOutcome) -> Self {
+        Self::new(
+            outcome.attempts(),
+            outcome.requested_bytes(),
+            outcome.advised_bytes(),
+            outcome.skipped_bytes(),
+            outcome.failures(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BalloonDeviceMetrics {
     activate_fails: u64,
@@ -3638,6 +3716,7 @@ pub struct BalloonDeviceMetrics {
     event_fails: u64,
     inflate_discard: BalloonDiscardMetrics,
     hinting_discard: BalloonDiscardMetrics,
+    free_page_report: BalloonFreePageReportMetrics,
 }
 
 impl BalloonDeviceMetrics {
@@ -3658,6 +3737,7 @@ impl BalloonDeviceMetrics {
             event_fails,
             inflate_discard: BalloonDiscardMetrics::new(0, 0, 0, 0),
             hinting_discard: BalloonDiscardMetrics::new(0, 0, 0, 0),
+            free_page_report: BalloonFreePageReportMetrics::new(0, 0, 0, 0, 0),
         }
     }
 
@@ -3671,6 +3751,14 @@ impl BalloonDeviceMetrics {
         self
     }
 
+    pub const fn with_free_page_report_metrics(
+        mut self,
+        free_page_report: BalloonFreePageReportMetrics,
+    ) -> Self {
+        self.free_page_report = free_page_report;
+        self
+    }
+
     pub const fn is_empty(self) -> bool {
         self.activate_fails == 0
             && self.inflate_count == 0
@@ -3680,6 +3768,7 @@ impl BalloonDeviceMetrics {
             && self.event_fails == 0
             && self.inflate_discard.is_empty()
             && self.hinting_discard.is_empty()
+            && self.free_page_report.is_empty()
     }
 
     pub const fn activate_fails(self) -> u64 {
@@ -3714,6 +3803,10 @@ impl BalloonDeviceMetrics {
         self.hinting_discard
     }
 
+    pub const fn free_page_report(self) -> BalloonFreePageReportMetrics {
+        self.free_page_report
+    }
+
     const fn merged_with(self, other: Self) -> Self {
         Self {
             activate_fails: self.activate_fails.saturating_add(other.activate_fails),
@@ -3728,6 +3821,7 @@ impl BalloonDeviceMetrics {
             event_fails: self.event_fails.saturating_add(other.event_fails),
             inflate_discard: self.inflate_discard.merged_with(other.inflate_discard),
             hinting_discard: self.hinting_discard.merged_with(other.hinting_discard),
+            free_page_report: self.free_page_report.merged_with(other.free_page_report),
         }
     }
 }
@@ -3750,6 +3844,9 @@ impl SharedBalloonDeviceMetrics {
         }
         if let Some(queue_dispatch) = dispatch.hinting_queue_dispatch() {
             self.record_hinting_discard(queue_dispatch.hinting_discard());
+        }
+        if let Some(queue_dispatch) = dispatch.reporting_queue_dispatch() {
+            self.record_free_page_report(queue_dispatch.reporting_discard());
         }
 
         let stats_updates = if dispatch.statistics_notifications() != 0 {
@@ -3802,6 +3899,19 @@ impl SharedBalloonDeviceMetrics {
                 self.inner.hinting_discard_failures.load(Ordering::Relaxed),
             ),
         )
+        .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(
+            self.inner.free_page_report_count.load(Ordering::Relaxed),
+            self.inner
+                .free_page_report_requested_bytes
+                .load(Ordering::Relaxed),
+            self.inner
+                .free_page_report_advised_bytes
+                .load(Ordering::Relaxed),
+            self.inner
+                .free_page_report_skipped_bytes
+                .load(Ordering::Relaxed),
+            self.inner.free_page_report_failures.load(Ordering::Relaxed),
+        ))
     }
 
     fn record_inflations(&self, count: u64) {
@@ -3841,6 +3951,33 @@ impl SharedBalloonDeviceMetrics {
             outcome,
         );
     }
+
+    fn record_free_page_report(&self, outcome: VirtioBalloonDiscardOutcome) {
+        if outcome.attempts() != 0 {
+            record_atomic_metric(&self.inner.free_page_report_count, outcome.attempts());
+        }
+        if outcome.requested_bytes() != 0 {
+            record_atomic_metric(
+                &self.inner.free_page_report_requested_bytes,
+                outcome.requested_bytes(),
+            );
+        }
+        if outcome.advised_bytes() != 0 {
+            record_atomic_metric(
+                &self.inner.free_page_report_advised_bytes,
+                outcome.advised_bytes(),
+            );
+        }
+        if outcome.skipped_bytes() != 0 {
+            record_atomic_metric(
+                &self.inner.free_page_report_skipped_bytes,
+                outcome.skipped_bytes(),
+            );
+        }
+        if outcome.failures() != 0 {
+            record_atomic_metric(&self.inner.free_page_report_failures, outcome.failures());
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3859,6 +3996,11 @@ struct SharedBalloonDeviceMetricsInner {
     hinting_discard_advised_bytes: AtomicU64,
     hinting_discard_skipped_bytes: AtomicU64,
     hinting_discard_failures: AtomicU64,
+    free_page_report_count: AtomicU64,
+    free_page_report_requested_bytes: AtomicU64,
+    free_page_report_advised_bytes: AtomicU64,
+    free_page_report_skipped_bytes: AtomicU64,
+    free_page_report_failures: AtomicU64,
 }
 
 fn record_balloon_discard_metrics(
@@ -5036,6 +5178,43 @@ impl MetricsSink {
                 ),
             );
             balloon.insert(
+                "free_page_report_count".to_string(),
+                serde_json::Value::Number(balloon_device_metrics.free_page_report().count().into()),
+            );
+            balloon.insert(
+                "free_page_report_requested_bytes".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics
+                        .free_page_report()
+                        .requested_bytes()
+                        .into(),
+                ),
+            );
+            balloon.insert(
+                "free_page_report_advised_bytes".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics
+                        .free_page_report()
+                        .advised_bytes()
+                        .into(),
+                ),
+            );
+            balloon.insert(
+                "free_page_report_skipped_bytes".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics
+                        .free_page_report()
+                        .skipped_bytes()
+                        .into(),
+                ),
+            );
+            balloon.insert(
+                "free_page_report_fails".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics.free_page_report().failures().into(),
+                ),
+            );
+            balloon.insert(
                 "stats_update_fails".to_string(),
                 serde_json::Value::Number(balloon_device_metrics.stats_update_fails().into()),
             );
@@ -5313,13 +5492,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BalloonDeviceMetrics, BalloonDiscardMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
-        BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
-        MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics,
-        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
-        PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        BalloonDeviceMetrics, BalloonDiscardMetrics, BalloonFreePageReportMetrics,
+        BlockDeviceMetrics, BlockDeviceMetricsByDrive, BootRunLoopMetricStatus,
+        EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
+        MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics, NetworkInterfaceMetrics,
+        NetworkInterfaceMetricsByInterface, PmemDeviceMetrics, PmemDeviceMetricsByDevice,
+        RtcDeviceMetrics, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMmdsMetrics,
+        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
         SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
         SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
@@ -6741,10 +6921,14 @@ mod tests {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics = MetricsDiagnostics::new().with_balloon_device_metrics(
-            BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6).with_discard_metrics(
-                BalloonDiscardMetrics::new(7, 8, 9, 10),
-                BalloonDiscardMetrics::new(11, 12, 13, 14),
-            ),
+            BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6)
+                .with_discard_metrics(
+                    BalloonDiscardMetrics::new(7, 8, 9, 10),
+                    BalloonDiscardMetrics::new(11, 12, 13, 14),
+                )
+                .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(
+                    15, 16, 17, 18, 19,
+                )),
         );
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
@@ -6752,7 +6936,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"balloon":{"activate_fails":1,"deflate_count":5,"event_fails":6,"hinting_discard_advised_bytes":12,"hinting_discard_attempts":11,"hinting_discard_fails":14,"hinting_discard_skipped_bytes":13,"inflate_count":2,"inflate_discard_advised_bytes":8,"inflate_discard_attempts":7,"inflate_discard_fails":10,"inflate_discard_skipped_bytes":9,"stats_update_fails":4,"stats_updates_count":3},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"balloon":{"activate_fails":1,"deflate_count":5,"event_fails":6,"free_page_report_advised_bytes":17,"free_page_report_count":15,"free_page_report_fails":19,"free_page_report_requested_bytes":16,"free_page_report_skipped_bytes":18,"hinting_discard_advised_bytes":12,"hinting_discard_attempts":11,"hinting_discard_fails":14,"hinting_discard_skipped_bytes":13,"inflate_count":2,"inflate_discard_advised_bytes":8,"inflate_discard_attempts":7,"inflate_discard_fails":10,"inflate_discard_skipped_bytes":9,"stats_update_fails":4,"stats_updates_count":3},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
@@ -6808,13 +6992,22 @@ mod tests {
             .with_discard_metrics(
                 BalloonDiscardMetrics::new(u64::MAX - 1, u64::MAX - 2, u64::MAX - 3, u64::MAX - 4),
                 BalloonDiscardMetrics::new(u64::MAX - 5, u64::MAX - 6, u64::MAX - 7, u64::MAX - 8),
-            ),
+            )
+            .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(
+                u64::MAX - 1,
+                u64::MAX - 2,
+                u64::MAX - 3,
+                u64::MAX - 4,
+                u64::MAX - 5,
+            )),
         );
         let additional = MetricsDiagnostics::new().with_balloon_device_metrics(
-            BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6).with_discard_metrics(
-                BalloonDiscardMetrics::new(2, 3, 4, 5),
-                BalloonDiscardMetrics::new(6, 7, 8, 9),
-            ),
+            BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6)
+                .with_discard_metrics(
+                    BalloonDiscardMetrics::new(2, 3, 4, 5),
+                    BalloonDiscardMetrics::new(6, 7, 8, 9),
+                )
+                .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(2, 3, 4, 5, 6)),
         );
 
         assert_eq!(
@@ -6832,6 +7025,13 @@ mod tests {
                     BalloonDiscardMetrics::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX,),
                     BalloonDiscardMetrics::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX,),
                 )
+                .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(
+                    u64::MAX,
+                    u64::MAX,
+                    u64::MAX,
+                    u64::MAX,
+                    u64::MAX,
+                ))
             )
         );
     }

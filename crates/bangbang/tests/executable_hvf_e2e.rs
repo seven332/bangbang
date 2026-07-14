@@ -33,7 +33,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_BOOT_OK_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BOOT_OK";
     const BOOT_TIMER_LOG_MARKER: &[u8] = b"Guest-boot-time =";
     const DIRECT_ROOTFS_BALLOON_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.balloon-check=1";
-    const DIRECT_ROOTFS_BALLOON_MARKER: &[u8] = b"BANGBANG_BALLOON_GUEST_CHECK_OK";
+    const DIRECT_ROOTFS_BALLOON_MARKER: &[u8] = b"BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_READY";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_GROWN_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_GROWN";
@@ -1888,6 +1888,7 @@ mod macos_arm64 {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let data_backing_path = test_dir.path().join("data.img");
+        let metrics_path = test_dir.path().join("metrics.out");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -1906,10 +1907,17 @@ mod macos_arm64 {
             "PUT /machine-config balloon direct rootfs",
         );
 
+        let metrics_body = format!(
+            r#"{{"metrics_path":{}}}"#,
+            json_string(path_text(&metrics_path))
+        );
+        let metrics_response = http_put_json(&socket_path, "/metrics", &metrics_body);
+        assert_no_content_response(&metrics_response, "PUT /metrics balloon direct rootfs");
+
         let balloon_response = http_put_json(
             &socket_path,
             "/balloon",
-            r#"{"amount_mib":8,"deflate_on_oom":false,"free_page_hinting":true}"#,
+            r#"{"amount_mib":8,"deflate_on_oom":false,"free_page_hinting":true,"free_page_reporting":true}"#,
         );
         assert_no_content_response(&balloon_response, "PUT /balloon direct rootfs");
 
@@ -1919,6 +1927,7 @@ mod macos_arm64 {
             r#""amount_mib":8"#,
             r#""deflate_on_oom":false"#,
             r#""free_page_hinting":true"#,
+            r#""free_page_reporting":true"#,
         ] {
             assert_response_contains(&configured_balloon, expected, "GET /balloon direct rootfs");
         }
@@ -1943,6 +1952,11 @@ mod macos_arm64 {
         assert_response_contains(
             &vm_config,
             r#""free_page_hinting":true"#,
+            "GET /vm/config after PUT /balloon",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""free_page_reporting":true"#,
             "GET /vm/config after PUT /balloon",
         );
 
@@ -2084,6 +2098,20 @@ mod macos_arm64 {
             let output = bangbang.force_stop_and_collect();
             panic!(
                 "direct rootfs guest did not observe virtio-balloon through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        if let Err(err) = wait_for_nonzero_balloon_free_page_report_count(
+            &socket_path,
+            &metrics_path,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let metrics = fs::read_to_string(&metrics_path)
+                .unwrap_or_else(|read_err| format!("<metrics unavailable: {read_err}>"));
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not execute virtio-balloon free-page reporting: {err}; metrics:\n{metrics}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -6481,6 +6509,46 @@ mod macos_arm64 {
 
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn wait_for_nonzero_balloon_free_page_report_count(
+        socket_path: &Path,
+        metrics_path: &Path,
+        timeout: Duration,
+    ) -> Result<u64, String> {
+        let started_at = Instant::now();
+
+        loop {
+            let response =
+                http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
+            if !response.starts_with("HTTP/1.1 204 No Content\r\n") {
+                return Err(format!(
+                    "FlushMetrics failed while waiting for reporting activity:\n{response}"
+                ));
+            }
+            let count = latest_balloon_free_page_report_count(metrics_path);
+            if let Some(count) = count.filter(|count| *count > 0) {
+                return Ok(count);
+            }
+            if started_at.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for balloon.free_page_report_count > 0; latest count={count:?}"
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn latest_balloon_free_page_report_count(path: &Path) -> Option<u64> {
+        let output = fs::read_to_string(path).ok()?;
+        output.lines().rev().find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("balloon")?
+                .get("free_page_report_count")?
+                .as_u64()
+        })
     }
 
     fn wait_for_http_response_fragment(

@@ -2979,25 +2979,16 @@ mod tests {
     }
 
     #[test]
-    fn put_balloon_rejects_free_page_reporting_without_mutating() {
+    fn put_balloon_accepts_free_page_reporting() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let input = balloon_input(32, false).with_free_page_reporting(true);
         controller
-            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
-            .expect("initial balloon should store");
+            .handle_action(VmmAction::PutBalloon(input))
+            .expect("free-page reporting should store");
 
-        let err = controller
-            .handle_action(VmmAction::PutBalloon(
-                balloon_input(32, false).with_free_page_reporting(true),
-            ))
-            .expect_err("free-page reporting should fail");
-
-        assert_eq!(
-            err,
-            VmmActionError::BalloonConfig(BalloonConfigError::UnsupportedFreePageReporting)
-        );
         assert_eq!(
             controller.balloon_config(),
-            Some(BalloonConfig::from(balloon_input(64, true)))
+            Some(BalloonConfig::from(input))
         );
     }
 

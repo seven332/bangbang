@@ -4500,7 +4500,7 @@ mod tests {
     #[test]
     fn config_file_accepts_balloon_section() {
         let actions = super::config_file_actions_from_str(
-            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"balloon":{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":false}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"balloon":{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":true}}"#,
         )
         .expect("balloon config section should parse");
 
@@ -4512,7 +4512,7 @@ mod tests {
                     bangbang_runtime::balloon::BalloonConfigInput::new(64, true)
                         .with_stats_polling_interval_s(60)
                         .with_free_page_hinting(true)
-                        .with_free_page_reporting(false)
+                        .with_free_page_reporting(true)
                 ),
             ]
         );
@@ -4994,7 +4994,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_rejects_balloon_free_page_reporting_before_starting() {
+    fn config_file_accepts_balloon_free_page_reporting_before_starting() {
         let config_path = unique_config_path("balloon-free-page-reporting");
         let config = r#"{
             "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
@@ -5008,25 +5008,18 @@ mod tests {
             TestInstanceStarter,
         );
 
-        let err = super::apply_startup_config_file(
-            &mut vmm,
-            Some(config_path.to_str().expect("UTF-8 path")),
-        )
-        .expect_err("free-page reporting should fail before start");
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("free-page reporting config should apply and start");
 
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
         assert_eq!(
-            err,
-            ProcessError::ConfigFile(super::ConfigFileError::Apply(
-                VmmActionError::BalloonConfig(
-                    bangbang_runtime::balloon::BalloonConfigError::UnsupportedFreePageReporting,
-                ),
+            vmm.handle_action(VmmAction::GetBalloon)
+                .expect("reporting balloon config should be retained"),
+            VmmData::BalloonConfiguration(bangbang_runtime::balloon::BalloonConfig::from(
+                bangbang_runtime::balloon::BalloonConfigInput::new(64, true)
+                    .with_free_page_reporting(true)
             ))
-        );
-        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
-        assert!(!vmm.has_started_session());
-        assert_eq!(
-            vmm.handle_action(VmmAction::GetBalloon),
-            Err(VmmActionError::BalloonUnsupported)
         );
 
         fs::remove_file(config_path).expect("fixture config should clean up");

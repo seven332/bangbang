@@ -744,11 +744,14 @@ checks that the guest selected `virtio_rng` as the current hardware RNG, reads
 from `/dev/hwrng`, and writes a host-observable marker only after a non-empty
 read succeeds.
 It also includes a direct-rootfs balloon scenario that configures `/balloon`,
-checks that the guest bound a virtio-balloon driver, exercises the minimal
-hinting start/stop command-state APIs, requires the public statistics response
-to reach nonzero `actual_pages`, and writes a host-observable marker after the
-driver path is visible. This proves signed guest inflation reaches the runtime
-discard owner; it does not impose a process-footprint threshold.
+enables free-page reporting, checks that the guest bound a virtio-balloon driver
+and negotiated reporting feature bit 5, exercises the minimal hinting start/stop
+command-state APIs, requires the public statistics response to reach nonzero
+`actual_pages`, and flushes public metrics until
+`balloon.free_page_report_count` is nonzero. The guest writes a host-observable
+marker only after driver binding and reporting negotiation are visible. This
+proves signed guest inflation and reporting reach the runtime discard owner; it
+does not impose a process-footprint threshold.
 Runtime `PATCH /balloon` target-size updates are covered by unit, API socket,
 and process-session tests that verify stored config updates, active config-space
 generation changes, and config interrupt signaling. Guest-reported statistics
@@ -759,6 +762,13 @@ timer-driven guest
 polling. Hinting queue guest-command acknowledgement, automatic host DONE
 acknowledgement, active/stale range selection, best-effort advice outcomes, and
 inflate/hint metrics are covered by runtime unit and MMIO handler tests.
+Reporting queue tests cover compact queue-index routing with hinting enabled,
+multi-descriptor chains, multiple available chains, writable-direction checks,
+empty and overflowing ranges, unmapped memory, injected platform failures,
+bad-then-valid best-effort progress, used-ring and later-available failures,
+discard-before-ack ordering, interrupt intent, and requested/advised/skipped/
+failure metric separation. Startup and HVF signal tests cover reporting queue
+notification routing and shared metrics recording.
 Guest-memory tests inject page sizes and zero/free failures to verify complete
 validation, per-region segmentation, inward alignment, 4-KiB-within-16-KiB
 neighbor safety, partial failures, byte accounting, repeats, and independent
@@ -918,9 +928,11 @@ reads bytes from `/dev/hwrng`, and writes
 `BANGBANG_ENTROPY_GUEST_READ_OK` only after the read returns non-empty data.
 When the boot args include `bangbang.balloon-check=1`, the same init script
 checks the virtio bus for a device bound to the `virtio_balloon` driver and
-writes `BANGBANG_BALLOON_GUEST_CHECK_OK` only after that driver binding is
-visible. The signed host test separately polls `/balloon/statistics` until
-`actual_pages` is nonzero before accepting the scenario.
+requires the device's negotiated feature bitmap to include free-page reporting
+bit 5 before writing `BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK`. The signed
+host test separately polls `/balloon/statistics` until `actual_pages` is nonzero
+and uses public `FlushMetrics` requests until
+`balloon.free_page_report_count` is nonzero before accepting the scenario.
 When the boot args include `bangbang.memory-hotplug-check=1`, the same init
 script checks the virtio bus for a device bound to `virtio_mem`, writes
 `BANGBANG_MEMORY_HOTPLUG_GUEST_READY`, follows `dmesg` for the runtime
