@@ -1,0 +1,3822 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "families": [
+    "api-contract",
+    "boot-and-lifecycle",
+    "cpu-and-machine",
+    "cross-capability",
+    "device-transport",
+    "isolation",
+    "machine-memory",
+    "memory-devices",
+    "network-and-mmds",
+    "observability",
+    "process",
+    "public-tools",
+    "remaining-devices",
+    "runtime-device-management",
+    "serial-and-time",
+    "snapshots",
+    "specifications",
+    "storage",
+    "vsock"
+  ],
+  "capabilities": [
+    {
+      "id": "api-operation:GET /",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation GET /.",
+      "source_refs": [
+        "api-operation:GET /"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:GET /balloon",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation GET /balloon.",
+      "source_refs": [
+        "api-operation:GET /balloon"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:GET /balloon/hinting/status",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation GET /balloon/hinting/status.",
+      "source_refs": [
+        "api-operation:GET /balloon/hinting/status"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:GET /balloon/statistics",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation GET /balloon/statistics.",
+      "source_refs": [
+        "api-operation:GET /balloon/statistics"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:GET /hotplug/memory",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation GET /hotplug/memory.",
+      "source_refs": [
+        "api-operation:GET /hotplug/memory"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:GET /machine-config",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation GET /machine-config.",
+      "source_refs": [
+        "api-operation:GET /machine-config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:GET /mmds",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation GET /mmds.",
+      "source_refs": [
+        "api-operation:GET /mmds"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:GET /version",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation GET /version.",
+      "source_refs": [
+        "api-operation:GET /version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:GET /vm/config",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation GET /vm/config.",
+      "source_refs": [
+        "api-operation:GET /vm/config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /balloon",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /balloon.",
+      "source_refs": [
+        "api-operation:PATCH /balloon"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /balloon/hinting/start",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /balloon/hinting/start.",
+      "source_refs": [
+        "api-operation:PATCH /balloon/hinting/start"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /balloon/hinting/stop",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /balloon/hinting/stop.",
+      "source_refs": [
+        "api-operation:PATCH /balloon/hinting/stop"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /balloon/statistics",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /balloon/statistics.",
+      "source_refs": [
+        "api-operation:PATCH /balloon/statistics"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /drives/{drive_id}",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /drives/{drive_id}.",
+      "source_refs": [
+        "api-operation:PATCH /drives/{drive_id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /hotplug/memory",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /hotplug/memory.",
+      "source_refs": [
+        "api-operation:PATCH /hotplug/memory"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /machine-config",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /machine-config.",
+      "source_refs": [
+        "api-operation:PATCH /machine-config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /mmds",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /mmds.",
+      "source_refs": [
+        "api-operation:PATCH /mmds"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /network-interfaces/{iface_id}",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /network-interfaces/{iface_id}.",
+      "source_refs": [
+        "api-operation:PATCH /network-interfaces/{iface_id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /pmem/{id}",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /pmem/{id}.",
+      "source_refs": [
+        "api-operation:PATCH /pmem/{id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PATCH /vm",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /vm.",
+      "source_refs": [
+        "api-operation:PATCH /vm"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /actions",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /actions.",
+      "source_refs": [
+        "api-operation:PUT /actions"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /balloon",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /balloon.",
+      "source_refs": [
+        "api-operation:PUT /balloon"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /boot-source",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /boot-source.",
+      "source_refs": [
+        "api-operation:PUT /boot-source"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /cpu-config",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /cpu-config.",
+      "source_refs": [
+        "api-operation:PUT /cpu-config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /drives/{drive_id}",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /drives/{drive_id}.",
+      "source_refs": [
+        "api-operation:PUT /drives/{drive_id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /entropy",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /entropy.",
+      "source_refs": [
+        "api-operation:PUT /entropy"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /hotplug/memory",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /hotplug/memory.",
+      "source_refs": [
+        "api-operation:PUT /hotplug/memory"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /logger",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /logger.",
+      "source_refs": [
+        "api-operation:PUT /logger"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /machine-config",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /machine-config.",
+      "source_refs": [
+        "api-operation:PUT /machine-config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /metrics",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /metrics.",
+      "source_refs": [
+        "api-operation:PUT /metrics"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /mmds",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /mmds.",
+      "source_refs": [
+        "api-operation:PUT /mmds"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /mmds/config",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /mmds/config.",
+      "source_refs": [
+        "api-operation:PUT /mmds/config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /network-interfaces/{iface_id}",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /network-interfaces/{iface_id}.",
+      "source_refs": [
+        "api-operation:PUT /network-interfaces/{iface_id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /pmem/{id}",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /pmem/{id}.",
+      "source_refs": [
+        "api-operation:PUT /pmem/{id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /serial",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /serial.",
+      "source_refs": [
+        "api-operation:PUT /serial"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /snapshot/create",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /snapshot/create.",
+      "source_refs": [
+        "api-operation:PUT /snapshot/create"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /snapshot/load",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /snapshot/load.",
+      "source_refs": [
+        "api-operation:PUT /snapshot/load"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-operation:PUT /vsock",
+      "family": "api-contract",
+      "summary": "Audit the observable Firecracker v1.16 API operation PUT /vsock.",
+      "source_refs": [
+        "api-operation:PUT /vsock"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /.",
+      "source_refs": [
+        "api-path:/"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/actions",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /actions.",
+      "source_refs": [
+        "api-path:/actions"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/balloon",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /balloon.",
+      "source_refs": [
+        "api-path:/balloon"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/balloon/hinting/start",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /balloon/hinting/start.",
+      "source_refs": [
+        "api-path:/balloon/hinting/start"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/balloon/hinting/status",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /balloon/hinting/status.",
+      "source_refs": [
+        "api-path:/balloon/hinting/status"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/balloon/hinting/stop",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /balloon/hinting/stop.",
+      "source_refs": [
+        "api-path:/balloon/hinting/stop"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/balloon/statistics",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /balloon/statistics.",
+      "source_refs": [
+        "api-path:/balloon/statistics"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/boot-source",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /boot-source.",
+      "source_refs": [
+        "api-path:/boot-source"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/cpu-config",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /cpu-config.",
+      "source_refs": [
+        "api-path:/cpu-config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/drives/{drive_id}",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /drives/{drive_id}.",
+      "source_refs": [
+        "api-path:/drives/{drive_id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/entropy",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /entropy.",
+      "source_refs": [
+        "api-path:/entropy"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/hotplug/memory",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /hotplug/memory.",
+      "source_refs": [
+        "api-path:/hotplug/memory"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/logger",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /logger.",
+      "source_refs": [
+        "api-path:/logger"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/machine-config",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /machine-config.",
+      "source_refs": [
+        "api-path:/machine-config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/metrics",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /metrics.",
+      "source_refs": [
+        "api-path:/metrics"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/mmds",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /mmds.",
+      "source_refs": [
+        "api-path:/mmds"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/mmds/config",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /mmds/config.",
+      "source_refs": [
+        "api-path:/mmds/config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/network-interfaces/{iface_id}",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /network-interfaces/{iface_id}.",
+      "source_refs": [
+        "api-path:/network-interfaces/{iface_id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/pmem/{id}",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /pmem/{id}.",
+      "source_refs": [
+        "api-path:/pmem/{id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/serial",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /serial.",
+      "source_refs": [
+        "api-path:/serial"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/snapshot/create",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /snapshot/create.",
+      "source_refs": [
+        "api-path:/snapshot/create"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/snapshot/load",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /snapshot/load.",
+      "source_refs": [
+        "api-path:/snapshot/load"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/version",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /version.",
+      "source_refs": [
+        "api-path:/version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/vm",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /vm.",
+      "source_refs": [
+        "api-path:/vm"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/vm/config",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /vm/config.",
+      "source_refs": [
+        "api-path:/vm/config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-path:/vsock",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API path /vsock.",
+      "source_refs": [
+        "api-path:/vsock"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:ArmRegisterModifier.addr",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property ArmRegisterModifier.addr.",
+      "source_refs": [
+        "api-property:ArmRegisterModifier.addr"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:ArmRegisterModifier.bitmap",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property ArmRegisterModifier.bitmap.",
+      "source_refs": [
+        "api-property:ArmRegisterModifier.bitmap"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Balloon.amount_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Balloon.amount_mib.",
+      "source_refs": [
+        "api-property:Balloon.amount_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Balloon.deflate_on_oom",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Balloon.deflate_on_oom.",
+      "source_refs": [
+        "api-property:Balloon.deflate_on_oom"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Balloon.free_page_hinting",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Balloon.free_page_hinting.",
+      "source_refs": [
+        "api-property:Balloon.free_page_hinting"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Balloon.free_page_reporting",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Balloon.free_page_reporting.",
+      "source_refs": [
+        "api-property:Balloon.free_page_reporting"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Balloon.stats_polling_interval_s",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Balloon.stats_polling_interval_s.",
+      "source_refs": [
+        "api-property:Balloon.stats_polling_interval_s"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonHintingStatus.guest_cmd",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonHintingStatus.guest_cmd.",
+      "source_refs": [
+        "api-property:BalloonHintingStatus.guest_cmd"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonHintingStatus.host_cmd",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonHintingStatus.host_cmd.",
+      "source_refs": [
+        "api-property:BalloonHintingStatus.host_cmd"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStartCmd.acknowledge_on_stop",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStartCmd.acknowledge_on_stop.",
+      "source_refs": [
+        "api-property:BalloonStartCmd.acknowledge_on_stop"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.actual_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.actual_mib.",
+      "source_refs": [
+        "api-property:BalloonStats.actual_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.actual_pages",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.actual_pages.",
+      "source_refs": [
+        "api-property:BalloonStats.actual_pages"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.alloc_stall",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.alloc_stall.",
+      "source_refs": [
+        "api-property:BalloonStats.alloc_stall"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.async_reclaim",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.async_reclaim.",
+      "source_refs": [
+        "api-property:BalloonStats.async_reclaim"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.async_scan",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.async_scan.",
+      "source_refs": [
+        "api-property:BalloonStats.async_scan"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.available_memory",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.available_memory.",
+      "source_refs": [
+        "api-property:BalloonStats.available_memory"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.direct_reclaim",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.direct_reclaim.",
+      "source_refs": [
+        "api-property:BalloonStats.direct_reclaim"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.direct_scan",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.direct_scan.",
+      "source_refs": [
+        "api-property:BalloonStats.direct_scan"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.disk_caches",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.disk_caches.",
+      "source_refs": [
+        "api-property:BalloonStats.disk_caches"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.free_memory",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.free_memory.",
+      "source_refs": [
+        "api-property:BalloonStats.free_memory"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.hugetlb_allocations",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.hugetlb_allocations.",
+      "source_refs": [
+        "api-property:BalloonStats.hugetlb_allocations"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.hugetlb_failures",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.hugetlb_failures.",
+      "source_refs": [
+        "api-property:BalloonStats.hugetlb_failures"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.major_faults",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.major_faults.",
+      "source_refs": [
+        "api-property:BalloonStats.major_faults"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.minor_faults",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.minor_faults.",
+      "source_refs": [
+        "api-property:BalloonStats.minor_faults"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.oom_kill",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.oom_kill.",
+      "source_refs": [
+        "api-property:BalloonStats.oom_kill"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.swap_in",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.swap_in.",
+      "source_refs": [
+        "api-property:BalloonStats.swap_in"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.swap_out",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.swap_out.",
+      "source_refs": [
+        "api-property:BalloonStats.swap_out"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.target_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.target_mib.",
+      "source_refs": [
+        "api-property:BalloonStats.target_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.target_pages",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.target_pages.",
+      "source_refs": [
+        "api-property:BalloonStats.target_pages"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStats.total_memory",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStats.total_memory.",
+      "source_refs": [
+        "api-property:BalloonStats.total_memory"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonStatsUpdate.stats_polling_interval_s",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonStatsUpdate.stats_polling_interval_s.",
+      "source_refs": [
+        "api-property:BalloonStatsUpdate.stats_polling_interval_s"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BalloonUpdate.amount_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BalloonUpdate.amount_mib.",
+      "source_refs": [
+        "api-property:BalloonUpdate.amount_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BootSource.boot_args",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BootSource.boot_args.",
+      "source_refs": [
+        "api-property:BootSource.boot_args"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BootSource.initrd_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BootSource.initrd_path.",
+      "source_refs": [
+        "api-property:BootSource.initrd_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:BootSource.kernel_image_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property BootSource.kernel_image_path.",
+      "source_refs": [
+        "api-property:BootSource.kernel_image_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuConfig.cpuid_modifiers",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuConfig.cpuid_modifiers.",
+      "source_refs": [
+        "api-property:CpuConfig.cpuid_modifiers"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuConfig.kvm_capabilities",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuConfig.kvm_capabilities.",
+      "source_refs": [
+        "api-property:CpuConfig.kvm_capabilities"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuConfig.msr_modifiers",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuConfig.msr_modifiers.",
+      "source_refs": [
+        "api-property:CpuConfig.msr_modifiers"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuConfig.reg_modifiers",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuConfig.reg_modifiers.",
+      "source_refs": [
+        "api-property:CpuConfig.reg_modifiers"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuConfig.vcpu_features",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuConfig.vcpu_features.",
+      "source_refs": [
+        "api-property:CpuConfig.vcpu_features"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuidLeafModifier.flags",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuidLeafModifier.flags.",
+      "source_refs": [
+        "api-property:CpuidLeafModifier.flags"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuidLeafModifier.leaf",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuidLeafModifier.leaf.",
+      "source_refs": [
+        "api-property:CpuidLeafModifier.leaf"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuidLeafModifier.modifiers",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuidLeafModifier.modifiers.",
+      "source_refs": [
+        "api-property:CpuidLeafModifier.modifiers"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuidLeafModifier.subleaf",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuidLeafModifier.subleaf.",
+      "source_refs": [
+        "api-property:CpuidLeafModifier.subleaf"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuidRegisterModifier.bitmap",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuidRegisterModifier.bitmap.",
+      "source_refs": [
+        "api-property:CpuidRegisterModifier.bitmap"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:CpuidRegisterModifier.register",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property CpuidRegisterModifier.register.",
+      "source_refs": [
+        "api-property:CpuidRegisterModifier.register"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Drive.cache_type",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Drive.cache_type.",
+      "source_refs": [
+        "api-property:Drive.cache_type"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Drive.drive_id",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Drive.drive_id.",
+      "source_refs": [
+        "api-property:Drive.drive_id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Drive.io_engine",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Drive.io_engine.",
+      "source_refs": [
+        "api-property:Drive.io_engine"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Drive.is_read_only",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Drive.is_read_only.",
+      "source_refs": [
+        "api-property:Drive.is_read_only"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Drive.is_root_device",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Drive.is_root_device.",
+      "source_refs": [
+        "api-property:Drive.is_root_device"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Drive.partuuid",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Drive.partuuid.",
+      "source_refs": [
+        "api-property:Drive.partuuid"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Drive.path_on_host",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Drive.path_on_host.",
+      "source_refs": [
+        "api-property:Drive.path_on_host"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Drive.rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Drive.rate_limiter.",
+      "source_refs": [
+        "api-property:Drive.rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Drive.socket",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Drive.socket.",
+      "source_refs": [
+        "api-property:Drive.socket"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:EntropyDevice.rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property EntropyDevice.rate_limiter.",
+      "source_refs": [
+        "api-property:EntropyDevice.rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Error.fault_message",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Error.fault_message.",
+      "source_refs": [
+        "api-property:Error.fault_message"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FirecrackerVersion.firecracker_version",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FirecrackerVersion.firecracker_version.",
+      "source_refs": [
+        "api-property:FirecrackerVersion.firecracker_version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.balloon",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.balloon.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.balloon"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.boot-source",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.boot-source.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.boot-source"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.cpu-config",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.cpu-config.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.cpu-config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.drives",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.drives.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.drives"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.entropy",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.entropy.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.entropy"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.logger",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.logger.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.logger"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.machine-config",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.machine-config.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.machine-config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.memory-hotplug",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.memory-hotplug.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.memory-hotplug"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.metrics",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.metrics.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.metrics"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.mmds-config",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.mmds-config.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.mmds-config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.network-interfaces",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.network-interfaces.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.network-interfaces"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.pmem",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.pmem.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.pmem"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.vsock",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.vsock.",
+      "source_refs": [
+        "api-property:FullVmConfiguration.vsock"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:InstanceActionInfo.action_type",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property InstanceActionInfo.action_type.",
+      "source_refs": [
+        "api-property:InstanceActionInfo.action_type"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:InstanceInfo.app_name",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property InstanceInfo.app_name.",
+      "source_refs": [
+        "api-property:InstanceInfo.app_name"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:InstanceInfo.id",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property InstanceInfo.id.",
+      "source_refs": [
+        "api-property:InstanceInfo.id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:InstanceInfo.state",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property InstanceInfo.state.",
+      "source_refs": [
+        "api-property:InstanceInfo.state"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:InstanceInfo.vmm_version",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property InstanceInfo.vmm_version.",
+      "source_refs": [
+        "api-property:InstanceInfo.vmm_version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Logger.level",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Logger.level.",
+      "source_refs": [
+        "api-property:Logger.level"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Logger.log_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Logger.log_path.",
+      "source_refs": [
+        "api-property:Logger.log_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Logger.module",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Logger.module.",
+      "source_refs": [
+        "api-property:Logger.module"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Logger.show_level",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Logger.show_level.",
+      "source_refs": [
+        "api-property:Logger.show_level"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Logger.show_log_origin",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Logger.show_log_origin.",
+      "source_refs": [
+        "api-property:Logger.show_log_origin"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MachineConfiguration.cpu_template",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.cpu_template.",
+      "source_refs": [
+        "api-property:MachineConfiguration.cpu_template"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MachineConfiguration.huge_pages",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.huge_pages.",
+      "source_refs": [
+        "api-property:MachineConfiguration.huge_pages"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MachineConfiguration.mem_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.mem_size_mib.",
+      "source_refs": [
+        "api-property:MachineConfiguration.mem_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MachineConfiguration.smt",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.smt.",
+      "source_refs": [
+        "api-property:MachineConfiguration.smt"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MachineConfiguration.track_dirty_pages",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.track_dirty_pages.",
+      "source_refs": [
+        "api-property:MachineConfiguration.track_dirty_pages"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MachineConfiguration.vcpu_count",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.vcpu_count.",
+      "source_refs": [
+        "api-property:MachineConfiguration.vcpu_count"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryBackend.backend_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryBackend.backend_path.",
+      "source_refs": [
+        "api-property:MemoryBackend.backend_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryBackend.backend_type",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryBackend.backend_type.",
+      "source_refs": [
+        "api-property:MemoryBackend.backend_type"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryHotplugConfig.block_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugConfig.block_size_mib.",
+      "source_refs": [
+        "api-property:MemoryHotplugConfig.block_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryHotplugConfig.slot_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugConfig.slot_size_mib.",
+      "source_refs": [
+        "api-property:MemoryHotplugConfig.slot_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryHotplugConfig.total_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugConfig.total_size_mib.",
+      "source_refs": [
+        "api-property:MemoryHotplugConfig.total_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryHotplugSizeUpdate.requested_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugSizeUpdate.requested_size_mib.",
+      "source_refs": [
+        "api-property:MemoryHotplugSizeUpdate.requested_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.block_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.block_size_mib.",
+      "source_refs": [
+        "api-property:MemoryHotplugStatus.block_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.plugged_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.plugged_size_mib.",
+      "source_refs": [
+        "api-property:MemoryHotplugStatus.plugged_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.requested_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.requested_size_mib.",
+      "source_refs": [
+        "api-property:MemoryHotplugStatus.requested_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.slot_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.slot_size_mib.",
+      "source_refs": [
+        "api-property:MemoryHotplugStatus.slot_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.total_size_mib",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.total_size_mib.",
+      "source_refs": [
+        "api-property:MemoryHotplugStatus.total_size_mib"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Metrics.metrics_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Metrics.metrics_path.",
+      "source_refs": [
+        "api-property:Metrics.metrics_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MmdsConfig.imds_compat",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MmdsConfig.imds_compat.",
+      "source_refs": [
+        "api-property:MmdsConfig.imds_compat"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MmdsConfig.ipv4_address",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MmdsConfig.ipv4_address.",
+      "source_refs": [
+        "api-property:MmdsConfig.ipv4_address"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MmdsConfig.network_interfaces",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MmdsConfig.network_interfaces.",
+      "source_refs": [
+        "api-property:MmdsConfig.network_interfaces"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MmdsConfig.version",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MmdsConfig.version.",
+      "source_refs": [
+        "api-property:MmdsConfig.version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MsrModifier.addr",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MsrModifier.addr.",
+      "source_refs": [
+        "api-property:MsrModifier.addr"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:MsrModifier.bitmap",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property MsrModifier.bitmap.",
+      "source_refs": [
+        "api-property:MsrModifier.bitmap"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:NetworkInterface.guest_mac",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.guest_mac.",
+      "source_refs": [
+        "api-property:NetworkInterface.guest_mac"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:NetworkInterface.host_dev_name",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.host_dev_name.",
+      "source_refs": [
+        "api-property:NetworkInterface.host_dev_name"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:NetworkInterface.iface_id",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.iface_id.",
+      "source_refs": [
+        "api-property:NetworkInterface.iface_id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:NetworkInterface.mtu",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.mtu.",
+      "source_refs": [
+        "api-property:NetworkInterface.mtu"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:NetworkInterface.rx_rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.rx_rate_limiter.",
+      "source_refs": [
+        "api-property:NetworkInterface.rx_rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:NetworkInterface.tx_rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.tx_rate_limiter.",
+      "source_refs": [
+        "api-property:NetworkInterface.tx_rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:NetworkOverride.host_dev_name",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property NetworkOverride.host_dev_name.",
+      "source_refs": [
+        "api-property:NetworkOverride.host_dev_name"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:NetworkOverride.iface_id",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property NetworkOverride.iface_id.",
+      "source_refs": [
+        "api-property:NetworkOverride.iface_id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:PartialDrive.drive_id",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property PartialDrive.drive_id.",
+      "source_refs": [
+        "api-property:PartialDrive.drive_id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:PartialDrive.path_on_host",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property PartialDrive.path_on_host.",
+      "source_refs": [
+        "api-property:PartialDrive.path_on_host"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:PartialDrive.rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property PartialDrive.rate_limiter.",
+      "source_refs": [
+        "api-property:PartialDrive.rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:PartialNetworkInterface.iface_id",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property PartialNetworkInterface.iface_id.",
+      "source_refs": [
+        "api-property:PartialNetworkInterface.iface_id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:PartialNetworkInterface.rx_rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property PartialNetworkInterface.rx_rate_limiter.",
+      "source_refs": [
+        "api-property:PartialNetworkInterface.rx_rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:PartialNetworkInterface.tx_rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property PartialNetworkInterface.tx_rate_limiter.",
+      "source_refs": [
+        "api-property:PartialNetworkInterface.tx_rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:PartialPmem.id",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property PartialPmem.id.",
+      "source_refs": [
+        "api-property:PartialPmem.id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:PartialPmem.rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property PartialPmem.rate_limiter.",
+      "source_refs": [
+        "api-property:PartialPmem.rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Pmem.id",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Pmem.id.",
+      "source_refs": [
+        "api-property:Pmem.id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Pmem.path_on_host",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Pmem.path_on_host.",
+      "source_refs": [
+        "api-property:Pmem.path_on_host"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Pmem.rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Pmem.rate_limiter.",
+      "source_refs": [
+        "api-property:Pmem.rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Pmem.read_only",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Pmem.read_only.",
+      "source_refs": [
+        "api-property:Pmem.read_only"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Pmem.root_device",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Pmem.root_device.",
+      "source_refs": [
+        "api-property:Pmem.root_device"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:RateLimiter.bandwidth",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property RateLimiter.bandwidth.",
+      "source_refs": [
+        "api-property:RateLimiter.bandwidth"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:RateLimiter.ops",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property RateLimiter.ops.",
+      "source_refs": [
+        "api-property:RateLimiter.ops"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SerialDevice.rate_limiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SerialDevice.rate_limiter.",
+      "source_refs": [
+        "api-property:SerialDevice.rate_limiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SerialDevice.serial_out_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SerialDevice.serial_out_path.",
+      "source_refs": [
+        "api-property:SerialDevice.serial_out_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotCreateParams.mem_file_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotCreateParams.mem_file_path.",
+      "source_refs": [
+        "api-property:SnapshotCreateParams.mem_file_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotCreateParams.snapshot_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotCreateParams.snapshot_path.",
+      "source_refs": [
+        "api-property:SnapshotCreateParams.snapshot_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotCreateParams.snapshot_type",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotCreateParams.snapshot_type.",
+      "source_refs": [
+        "api-property:SnapshotCreateParams.snapshot_type"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.clock_realtime",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.clock_realtime.",
+      "source_refs": [
+        "api-property:SnapshotLoadParams.clock_realtime"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.enable_diff_snapshots",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.enable_diff_snapshots.",
+      "source_refs": [
+        "api-property:SnapshotLoadParams.enable_diff_snapshots"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.mem_backend",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.mem_backend.",
+      "source_refs": [
+        "api-property:SnapshotLoadParams.mem_backend"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.mem_file_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.mem_file_path.",
+      "source_refs": [
+        "api-property:SnapshotLoadParams.mem_file_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.network_overrides",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.network_overrides.",
+      "source_refs": [
+        "api-property:SnapshotLoadParams.network_overrides"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.resume_vm",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.resume_vm.",
+      "source_refs": [
+        "api-property:SnapshotLoadParams.resume_vm"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.snapshot_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.snapshot_path.",
+      "source_refs": [
+        "api-property:SnapshotLoadParams.snapshot_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.track_dirty_pages",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.track_dirty_pages.",
+      "source_refs": [
+        "api-property:SnapshotLoadParams.track_dirty_pages"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.vsock_override",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.vsock_override.",
+      "source_refs": [
+        "api-property:SnapshotLoadParams.vsock_override"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:TokenBucket.one_time_burst",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property TokenBucket.one_time_burst.",
+      "source_refs": [
+        "api-property:TokenBucket.one_time_burst"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:TokenBucket.refill_time",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property TokenBucket.refill_time.",
+      "source_refs": [
+        "api-property:TokenBucket.refill_time"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:TokenBucket.size",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property TokenBucket.size.",
+      "source_refs": [
+        "api-property:TokenBucket.size"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:VcpuFeatures.bitmap",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property VcpuFeatures.bitmap.",
+      "source_refs": [
+        "api-property:VcpuFeatures.bitmap"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:VcpuFeatures.index",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property VcpuFeatures.index.",
+      "source_refs": [
+        "api-property:VcpuFeatures.index"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Vm.state",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Vm.state.",
+      "source_refs": [
+        "api-property:Vm.state"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Vsock.guest_cid",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Vsock.guest_cid.",
+      "source_refs": [
+        "api-property:Vsock.guest_cid"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Vsock.uds_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Vsock.uds_path.",
+      "source_refs": [
+        "api-property:Vsock.uds_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:Vsock.vsock_id",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property Vsock.vsock_id.",
+      "source_refs": [
+        "api-property:Vsock.vsock_id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-property:VsockOverride.uds_path",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API property VsockOverride.uds_path.",
+      "source_refs": [
+        "api-property:VsockOverride.uds_path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:ArmRegisterModifier",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema ArmRegisterModifier.",
+      "source_refs": [
+        "api-schema:ArmRegisterModifier"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:Balloon",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema Balloon.",
+      "source_refs": [
+        "api-schema:Balloon"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:BalloonHintingStatus",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema BalloonHintingStatus.",
+      "source_refs": [
+        "api-schema:BalloonHintingStatus"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:BalloonStartCmd",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema BalloonStartCmd.",
+      "source_refs": [
+        "api-schema:BalloonStartCmd"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:BalloonStats",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema BalloonStats.",
+      "source_refs": [
+        "api-schema:BalloonStats"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:BalloonStatsUpdate",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema BalloonStatsUpdate.",
+      "source_refs": [
+        "api-schema:BalloonStatsUpdate"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:BalloonUpdate",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema BalloonUpdate.",
+      "source_refs": [
+        "api-schema:BalloonUpdate"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:BootSource",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema BootSource.",
+      "source_refs": [
+        "api-schema:BootSource"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:CpuConfig",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema CpuConfig.",
+      "source_refs": [
+        "api-schema:CpuConfig"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:CpuTemplate",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema CpuTemplate.",
+      "source_refs": [
+        "api-schema:CpuTemplate"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:CpuidLeafModifier",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema CpuidLeafModifier.",
+      "source_refs": [
+        "api-schema:CpuidLeafModifier"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:CpuidRegisterModifier",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema CpuidRegisterModifier.",
+      "source_refs": [
+        "api-schema:CpuidRegisterModifier"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:Drive",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema Drive.",
+      "source_refs": [
+        "api-schema:Drive"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:EntropyDevice",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema EntropyDevice.",
+      "source_refs": [
+        "api-schema:EntropyDevice"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:Error",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema Error.",
+      "source_refs": [
+        "api-schema:Error"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:FirecrackerVersion",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema FirecrackerVersion.",
+      "source_refs": [
+        "api-schema:FirecrackerVersion"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:FullVmConfiguration",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema FullVmConfiguration.",
+      "source_refs": [
+        "api-schema:FullVmConfiguration"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:InstanceActionInfo",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema InstanceActionInfo.",
+      "source_refs": [
+        "api-schema:InstanceActionInfo"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:InstanceInfo",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema InstanceInfo.",
+      "source_refs": [
+        "api-schema:InstanceInfo"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:Logger",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema Logger.",
+      "source_refs": [
+        "api-schema:Logger"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:MachineConfiguration",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema MachineConfiguration.",
+      "source_refs": [
+        "api-schema:MachineConfiguration"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:MemoryBackend",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema MemoryBackend.",
+      "source_refs": [
+        "api-schema:MemoryBackend"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:MemoryHotplugConfig",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema MemoryHotplugConfig.",
+      "source_refs": [
+        "api-schema:MemoryHotplugConfig"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:MemoryHotplugSizeUpdate",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema MemoryHotplugSizeUpdate.",
+      "source_refs": [
+        "api-schema:MemoryHotplugSizeUpdate"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:MemoryHotplugStatus",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema MemoryHotplugStatus.",
+      "source_refs": [
+        "api-schema:MemoryHotplugStatus"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:Metrics",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema Metrics.",
+      "source_refs": [
+        "api-schema:Metrics"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:MmdsConfig",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema MmdsConfig.",
+      "source_refs": [
+        "api-schema:MmdsConfig"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:MmdsContentsObject",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema MmdsContentsObject.",
+      "source_refs": [
+        "api-schema:MmdsContentsObject"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:MsrModifier",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema MsrModifier.",
+      "source_refs": [
+        "api-schema:MsrModifier"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:NetworkInterface",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema NetworkInterface.",
+      "source_refs": [
+        "api-schema:NetworkInterface"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:NetworkOverride",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema NetworkOverride.",
+      "source_refs": [
+        "api-schema:NetworkOverride"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:PartialDrive",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema PartialDrive.",
+      "source_refs": [
+        "api-schema:PartialDrive"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:PartialNetworkInterface",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema PartialNetworkInterface.",
+      "source_refs": [
+        "api-schema:PartialNetworkInterface"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:PartialPmem",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema PartialPmem.",
+      "source_refs": [
+        "api-schema:PartialPmem"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:Pmem",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema Pmem.",
+      "source_refs": [
+        "api-schema:Pmem"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:RateLimiter",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema RateLimiter.",
+      "source_refs": [
+        "api-schema:RateLimiter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:SerialDevice",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema SerialDevice.",
+      "source_refs": [
+        "api-schema:SerialDevice"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:SnapshotCreateParams",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema SnapshotCreateParams.",
+      "source_refs": [
+        "api-schema:SnapshotCreateParams"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:SnapshotLoadParams",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema SnapshotLoadParams.",
+      "source_refs": [
+        "api-schema:SnapshotLoadParams"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:TokenBucket",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema TokenBucket.",
+      "source_refs": [
+        "api-schema:TokenBucket"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:VcpuFeatures",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema VcpuFeatures.",
+      "source_refs": [
+        "api-schema:VcpuFeatures"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:Vm",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema Vm.",
+      "source_refs": [
+        "api-schema:Vm"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:Vsock",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema Vsock.",
+      "source_refs": [
+        "api-schema:Vsock"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "api-schema:VsockOverride",
+      "family": "api-contract",
+      "summary": "Audit the Firecracker v1.16 API schema VsockOverride.",
+      "source_refs": [
+        "api-schema:VsockOverride"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:actions-api",
+      "family": "api-contract",
+      "summary": "Audit all applicable capability claims owned by the pinned actions-api source corpus.",
+      "source_refs": [
+        "corpus:actions-api"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:ballooning",
+      "family": "memory-devices",
+      "summary": "Audit all applicable capability claims owned by the pinned ballooning source corpus.",
+      "source_refs": [
+        "corpus:ballooning"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:block-caching",
+      "family": "storage",
+      "summary": "Audit all applicable capability claims owned by the pinned block-caching source corpus.",
+      "source_refs": [
+        "corpus:block-caching"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:block-io-engine",
+      "family": "storage",
+      "summary": "Audit all applicable capability claims owned by the pinned block-io-engine source corpus.",
+      "source_refs": [
+        "corpus:block-io-engine"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:block-vhost-user",
+      "family": "storage",
+      "summary": "Audit all applicable capability claims owned by the pinned block-vhost-user source corpus.",
+      "source_refs": [
+        "corpus:block-vhost-user"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:cpu-boot-protocol",
+      "family": "cpu-and-machine",
+      "summary": "Audit all applicable capability claims owned by the pinned cpu-boot-protocol source corpus.",
+      "source_refs": [
+        "corpus:cpu-boot-protocol"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:cpu-template-helper",
+      "family": "cpu-and-machine",
+      "summary": "Audit all applicable capability claims owned by the pinned cpu-template-helper source corpus.",
+      "source_refs": [
+        "corpus:cpu-template-helper"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:cpu-templates",
+      "family": "cpu-and-machine",
+      "summary": "Audit all applicable capability claims owned by the pinned cpu-templates source corpus.",
+      "source_refs": [
+        "corpus:cpu-templates"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:design",
+      "family": "process",
+      "summary": "Audit all applicable capability claims owned by the pinned design source corpus.",
+      "source_refs": [
+        "corpus:design"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:device-api",
+      "family": "device-transport",
+      "summary": "Audit all applicable capability claims owned by the pinned device-api source corpus.",
+      "source_refs": [
+        "corpus:device-api"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:device-hotplug",
+      "family": "runtime-device-management",
+      "summary": "Audit all applicable capability claims owned by the pinned device-hotplug source corpus.",
+      "source_refs": [
+        "corpus:device-hotplug"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:entropy",
+      "family": "remaining-devices",
+      "summary": "Audit all applicable capability claims owned by the pinned entropy source corpus.",
+      "source_refs": [
+        "corpus:entropy"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:formal-verification",
+      "family": "specifications",
+      "summary": "Audit all applicable capability claims owned by the pinned formal-verification source corpus.",
+      "source_refs": [
+        "corpus:formal-verification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:getting-started",
+      "family": "process",
+      "summary": "Audit all applicable capability claims owned by the pinned getting-started source corpus.",
+      "source_refs": [
+        "corpus:getting-started"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:hugepages",
+      "family": "machine-memory",
+      "summary": "Audit all applicable capability claims owned by the pinned hugepages source corpus.",
+      "source_refs": [
+        "corpus:hugepages"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:jailer",
+      "family": "isolation",
+      "summary": "Audit all applicable capability claims owned by the pinned jailer source corpus.",
+      "source_refs": [
+        "corpus:jailer"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:logger",
+      "family": "observability",
+      "summary": "Audit all applicable capability claims owned by the pinned logger source corpus.",
+      "source_refs": [
+        "corpus:logger"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:memory-hotplug",
+      "family": "memory-devices",
+      "summary": "Audit all applicable capability claims owned by the pinned memory-hotplug source corpus.",
+      "source_refs": [
+        "corpus:memory-hotplug"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:metrics",
+      "family": "observability",
+      "summary": "Audit all applicable capability claims owned by the pinned metrics source corpus.",
+      "source_refs": [
+        "corpus:metrics"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:mmds-design",
+      "family": "network-and-mmds",
+      "summary": "Audit all applicable capability claims owned by the pinned mmds-design source corpus.",
+      "source_refs": [
+        "corpus:mmds-design"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:mmds-user-guide",
+      "family": "network-and-mmds",
+      "summary": "Audit all applicable capability claims owned by the pinned mmds-user-guide source corpus.",
+      "source_refs": [
+        "corpus:mmds-user-guide"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:network-performance",
+      "family": "specifications",
+      "summary": "Audit all applicable capability claims owned by the pinned network-performance source corpus.",
+      "source_refs": [
+        "corpus:network-performance"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:network-setup",
+      "family": "network-and-mmds",
+      "summary": "Audit all applicable capability claims owned by the pinned network-setup source corpus.",
+      "source_refs": [
+        "corpus:network-setup"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:patch-block",
+      "family": "storage",
+      "summary": "Audit all applicable capability claims owned by the pinned patch-block source corpus.",
+      "source_refs": [
+        "corpus:patch-block"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:patch-network-interface",
+      "family": "network-and-mmds",
+      "summary": "Audit all applicable capability claims owned by the pinned patch-network-interface source corpus.",
+      "source_refs": [
+        "corpus:patch-network-interface"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:pmem",
+      "family": "storage",
+      "summary": "Audit all applicable capability claims owned by the pinned pmem source corpus.",
+      "source_refs": [
+        "corpus:pmem"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:production-host",
+      "family": "isolation",
+      "summary": "Audit all applicable capability claims owned by the pinned production-host source corpus.",
+      "source_refs": [
+        "corpus:production-host"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:release-changelog",
+      "family": "specifications",
+      "summary": "Audit all applicable capability claims owned by the pinned release-changelog source corpus.",
+      "source_refs": [
+        "corpus:release-changelog"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:rootfs-and-kernel",
+      "family": "boot-and-lifecycle",
+      "summary": "Audit all applicable capability claims owned by the pinned rootfs-and-kernel source corpus.",
+      "source_refs": [
+        "corpus:rootfs-and-kernel"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:seccomp",
+      "family": "isolation",
+      "summary": "Audit all applicable capability claims owned by the pinned seccomp source corpus.",
+      "source_refs": [
+        "corpus:seccomp"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:seccompiler",
+      "family": "isolation",
+      "summary": "Audit all applicable capability claims owned by the pinned seccompiler source corpus.",
+      "source_refs": [
+        "corpus:seccompiler"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:snapshot-editor",
+      "family": "snapshots",
+      "summary": "Audit all applicable capability claims owned by the pinned snapshot-editor source corpus.",
+      "source_refs": [
+        "corpus:snapshot-editor"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:snapshot-network-clones",
+      "family": "snapshots",
+      "summary": "Audit all applicable capability claims owned by the pinned snapshot-network-clones source corpus.",
+      "source_refs": [
+        "corpus:snapshot-network-clones"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:snapshot-page-faults",
+      "family": "snapshots",
+      "summary": "Audit all applicable capability claims owned by the pinned snapshot-page-faults source corpus.",
+      "source_refs": [
+        "corpus:snapshot-page-faults"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:snapshot-random-clones",
+      "family": "snapshots",
+      "summary": "Audit all applicable capability claims owned by the pinned snapshot-random-clones source corpus.",
+      "source_refs": [
+        "corpus:snapshot-random-clones"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:snapshot-support",
+      "family": "snapshots",
+      "summary": "Audit all applicable capability claims owned by the pinned snapshot-support source corpus.",
+      "source_refs": [
+        "corpus:snapshot-support"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:snapshot-versioning",
+      "family": "snapshots",
+      "summary": "Audit all applicable capability claims owned by the pinned snapshot-versioning source corpus.",
+      "source_refs": [
+        "corpus:snapshot-versioning"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:specification",
+      "family": "specifications",
+      "summary": "Audit all applicable capability claims owned by the pinned specification source corpus.",
+      "source_refs": [
+        "corpus:specification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:tracing",
+      "family": "observability",
+      "summary": "Audit all applicable capability claims owned by the pinned tracing source corpus.",
+      "source_refs": [
+        "corpus:tracing"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "corpus:vsock",
+      "family": "vsock",
+      "summary": "Audit all applicable capability claims owned by the pinned vsock source corpus.",
+      "source_refs": [
+        "corpus:vsock"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:api-sock",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --api-sock.",
+      "source_refs": [
+        "firecracker-argument:api-sock"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:boot-timer",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --boot-timer.",
+      "source_refs": [
+        "firecracker-argument:boot-timer"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:config-file",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --config-file.",
+      "source_refs": [
+        "firecracker-argument:config-file"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:describe-snapshot",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --describe-snapshot.",
+      "source_refs": [
+        "firecracker-argument:describe-snapshot"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:enable-pci",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --enable-pci.",
+      "source_refs": [
+        "firecracker-argument:enable-pci"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:http-api-max-payload-size",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --http-api-max-payload-size.",
+      "source_refs": [
+        "firecracker-argument:http-api-max-payload-size"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:id",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --id.",
+      "source_refs": [
+        "firecracker-argument:id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:level",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --level.",
+      "source_refs": [
+        "firecracker-argument:level"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:log-path",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --log-path.",
+      "source_refs": [
+        "firecracker-argument:log-path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:metadata",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --metadata.",
+      "source_refs": [
+        "firecracker-argument:metadata"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:metrics-path",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --metrics-path.",
+      "source_refs": [
+        "firecracker-argument:metrics-path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:mmds-size-limit",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --mmds-size-limit.",
+      "source_refs": [
+        "firecracker-argument:mmds-size-limit"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:module",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --module.",
+      "source_refs": [
+        "firecracker-argument:module"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:no-api",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --no-api.",
+      "source_refs": [
+        "firecracker-argument:no-api"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:no-seccomp",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --no-seccomp.",
+      "source_refs": [
+        "firecracker-argument:no-seccomp"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:parent-cpu-time-us",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --parent-cpu-time-us.",
+      "source_refs": [
+        "firecracker-argument:parent-cpu-time-us"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:seccomp-filter",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --seccomp-filter.",
+      "source_refs": [
+        "firecracker-argument:seccomp-filter"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:show-level",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --show-level.",
+      "source_refs": [
+        "firecracker-argument:show-level"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:show-log-origin",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --show-log-origin.",
+      "source_refs": [
+        "firecracker-argument:show-log-origin"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:snapshot-version",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --snapshot-version.",
+      "source_refs": [
+        "firecracker-argument:snapshot-version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:start-time-cpu-us",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --start-time-cpu-us.",
+      "source_refs": [
+        "firecracker-argument:start-time-cpu-us"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:start-time-us",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --start-time-us.",
+      "source_refs": [
+        "firecracker-argument:start-time-us"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "firecracker-argument:version",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 executable argument --version.",
+      "source_refs": [
+        "firecracker-argument:version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "non-swagger-route:DELETE /drives/{drive_id}",
+      "family": "storage",
+      "summary": "Audit the pinned non-Swagger runtime route DELETE /drives/{drive_id}.",
+      "source_refs": [
+        "non-swagger-route:DELETE /drives/{drive_id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "non-swagger-route:DELETE /network-interfaces/{iface_id}",
+      "family": "network-and-mmds",
+      "summary": "Audit the pinned non-Swagger runtime route DELETE /network-interfaces/{iface_id}.",
+      "source_refs": [
+        "non-swagger-route:DELETE /network-interfaces/{iface_id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "non-swagger-route:DELETE /pmem/{id}",
+      "family": "storage",
+      "summary": "Audit the pinned non-Swagger runtime route DELETE /pmem/{id}.",
+      "source_refs": [
+        "non-swagger-route:DELETE /pmem/{id}"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.boot:kernel-rootfs-fdt-and-cache",
+      "family": "boot-and-lifecycle",
+      "summary": "Audit kernel/initrd/rootfs loading, boot arguments, DeviceTree construction, boot cache behavior, and startup failure ordering.",
+      "source_refs": [
+        "corpus:cpu-boot-protocol",
+        "corpus:rootfs-and-kernel"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.cpu:configuration-templates-and-feature-state",
+      "family": "cpu-and-machine",
+      "summary": "Audit arm CPU configuration, templates, feature state, modifier behavior, and applicable helper operations.",
+      "source_refs": [
+        "corpus:cpu-template-helper",
+        "corpus:cpu-templates"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.cross-capability:state-errors-metrics-security-and-snapshots",
+      "family": "cross-capability",
+      "summary": "Audit interactions among lifecycle state, API errors, metrics/logging, security/resource ownership, devices, networking, and snapshots.",
+      "source_refs": [
+        "corpus:design",
+        "corpus:snapshot-support",
+        "corpus:specification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.device:entropy-queues-limits-metrics-and-state",
+      "family": "remaining-devices",
+      "summary": "Audit entropy configuration, guest queue behavior, host randomness, limiting, wakeups, metrics, cleanup, and snapshot state.",
+      "source_refs": [
+        "corpus:entropy"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.device:rtc-vmclock-vmgenid-and-pvtime",
+      "family": "serial-and-time",
+      "summary": "Audit RTC, VMClock, VMGenID, PVTime applicability, interrupts, mutable state, clone behavior, metrics, and restore ordering.",
+      "source_refs": [
+        "corpus:device-api",
+        "corpus:snapshot-random-clones"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.device:serial-stdin-stdout-rx-and-restore",
+      "family": "serial-and-time",
+      "summary": "Audit serial default stdout, configured output, stdin/RX, TX/RX queues, limiting, metrics, buffering, cleanup, and in-flight restore.",
+      "source_refs": [
+        "corpus:device-api",
+        "corpus:snapshot-support"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.hotplug:runtime-device-manager",
+      "family": "runtime-device-management",
+      "summary": "Audit failure-atomic runtime block, pmem, and network attach/remove with guest preconditions, rollback, metrics, and cleanup.",
+      "source_refs": [
+        "corpus:device-hotplug"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.isolation:host-resource-authority-and-brokerage",
+      "family": "isolation",
+      "summary": "Audit path/socket/file/vmnet authority, privilege/resource brokerage, descriptor transfer, sandbox grants, per-VM policy, and cleanup.",
+      "source_refs": [
+        "corpus:jailer",
+        "corpus:network-setup",
+        "corpus:production-host"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
+      "family": "isolation",
+      "summary": "Audit applicable jailer/seccomp security and resource outcomes plus safe macOS containment, packaging, entitlement, and rejection behavior.",
+      "source_refs": [
+        "corpus:jailer",
+        "corpus:production-host",
+        "corpus:seccomp",
+        "corpus:seccompiler"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
+      "family": "isolation",
+      "summary": "Audit multi-process ownership, concurrency, bounds, redaction, guest-controlled input, FFI, failure atomicity, and replaced-resource cleanup.",
+      "source_refs": [
+        "corpus:design",
+        "corpus:production-host"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.lifecycle:pause-resume-quiescence-and-failure",
+      "family": "boot-and-lifecycle",
+      "summary": "Audit pause/resume, snapshot-ready quiescence, auxiliary work ownership, state admission, and fine-grained failure behavior.",
+      "source_refs": [
+        "corpus:design",
+        "corpus:snapshot-support"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.lifecycle:smp-psci-and-vcpu-ownership",
+      "family": "boot-and-lifecycle",
+      "summary": "Audit multi-vCPU creation, owner-thread execution, PSCI power transitions, interrupts, timers, and terminal guest outcomes.",
+      "source_refs": [
+        "corpus:cpu-boot-protocol",
+        "corpus:specification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
+      "family": "memory-devices",
+      "summary": "Audit balloon inflate/deflate, deflate-on-OOM, statistics transitions, hinting/reporting, host reclaim, metrics, and snapshot state.",
+      "source_refs": [
+        "corpus:ballooning"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
+      "family": "memory-devices",
+      "summary": "Audit virtio-mem sizing, block lifecycle, guest/HVF mappings, public accounting/deletion, rollback, metrics, and snapshot state.",
+      "source_refs": [
+        "corpus:memory-hotplug"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.memory:machine-sizing-hugepages-and-dirty-tracking",
+      "family": "machine-memory",
+      "summary": "Audit machine memory sizing, huge-page policy, mapping/protection, dirty tracking, bounds, and failure atomicity.",
+      "source_refs": [
+        "corpus:hugepages",
+        "corpus:specification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.mmds:tcp-token-session-and-isolation",
+      "family": "network-and-mmds",
+      "summary": "Audit MMDS v1/v2 tokens, complete TCP/session behavior, reassembly/retransmission/timeouts, interface policy, isolation, and snapshots.",
+      "source_refs": [
+        "corpus:mmds-design",
+        "corpus:mmds-user-guide"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "family": "network-and-mmds",
+      "summary": "Audit virtio-net queues, vmnet properties/callbacks/batching, egress policy, limiting, metrics, connectivity, cleanup, PCI, and snapshot state.",
+      "source_refs": [
+        "corpus:network-performance",
+        "corpus:network-setup",
+        "corpus:patch-network-interface"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.observability:logger-delivery-filtering-loss-and-redaction",
+      "family": "observability",
+      "summary": "Audit logger configuration, records, filtering, rate limits, delivery/loss, panic/fatal behavior, redaction, isolation, and cleanup.",
+      "source_refs": [
+        "corpus:logger",
+        "corpus:tracing"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.observability:metrics-schema-producers-flush-and-lifecycle",
+      "family": "observability",
+      "summary": "Audit metrics schema and every request/action/device/failure producer, timing, periodic/explicit/terminal flush, loss, backpressure, and isolation.",
+      "source_refs": [
+        "corpus:metrics",
+        "corpus:specification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.process:cli-config-readiness-and-api-socket",
+      "family": "process",
+      "summary": "Audit CLI parsing, configuration-file/no-API startup, API socket ownership, readiness, and process startup ordering.",
+      "source_refs": [
+        "corpus:design",
+        "corpus:getting-started"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.process:instance-identity-and-version-output",
+      "family": "process",
+      "summary": "Audit instance identity validation plus help, version, snapshot-version, and snapshot-description output semantics.",
+      "source_refs": [
+        "corpus:getting-started",
+        "corpus:specification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.process:signals-exits-fd-and-cleanup",
+      "family": "process",
+      "summary": "Audit fatal and nonfatal signals, exit codes, descriptor-table behavior, terminal cleanup, and repeatable process ownership.",
+      "source_refs": [
+        "corpus:getting-started",
+        "corpus:specification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
+      "family": "snapshots",
+      "summary": "Audit Diff snapshots, dirty tracking, File and UFFD-equivalent memory backends, cancellation, bounds, and security.",
+      "source_refs": [
+        "corpus:snapshot-page-faults",
+        "corpus:snapshot-support"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.snapshot:editor-rebase-and-inspection",
+      "family": "snapshots",
+      "summary": "Audit snapshot editor, rebase, inspection, version reporting, failure behavior, and applicable architecture semantics.",
+      "source_refs": [
+        "corpus:snapshot-editor"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.snapshot:full-create-load-and-public-lifecycle",
+      "family": "snapshots",
+      "summary": "Audit Full snapshot create/load admission, quiescence, publication, validation, cleanup, resume, and guest continuation.",
+      "source_refs": [
+        "corpus:snapshot-support",
+        "corpus:snapshot-versioning"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
+      "family": "snapshots",
+      "summary": "Audit snapshot state and restore for multiple vCPUs, writable/multiple drives, optional devices, MMDS, interrupts, timers, and serial.",
+      "source_refs": [
+        "corpus:snapshot-support"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.snapshot:network-vsock-overrides-portability-and-clones",
+      "family": "snapshots",
+      "summary": "Audit network/vsock restore overrides, clone identity/time rules, artifact/host portability, versioning, and cross-process restore.",
+      "source_refs": [
+        "corpus:snapshot-network-clones",
+        "corpus:snapshot-random-clones",
+        "corpus:snapshot-versioning"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.specification:api-availability-stability-and-failure-information",
+      "family": "specifications",
+      "summary": "Audit applicable API availability, stability, request/failure information, startup, and operational specification outcomes.",
+      "source_refs": [
+        "corpus:formal-verification",
+        "corpus:specification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.specification:performance-resource-and-telemetry-outcomes",
+      "family": "specifications",
+      "summary": "Audit portable boot/overhead/CPU/network/storage/latency, resource-density, and telemetry-loss outcomes separately from AWS/Linux host promises.",
+      "source_refs": [
+        "corpus:network-performance",
+        "corpus:production-host",
+        "corpus:specification"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.storage:block-sync-async-vhost-and-limits",
+      "family": "storage",
+      "summary": "Audit virtio-block Sync/Async behavior, vhost-user, cache/flush/root semantics, limiting, metrics, cleanup, and snapshot state.",
+      "source_refs": [
+        "corpus:block-caching",
+        "corpus:block-io-engine",
+        "corpus:block-vhost-user",
+        "corpus:patch-block"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.storage:pmem-root-mapping-flush-and-state",
+      "family": "storage",
+      "summary": "Audit pmem root/direct mapping, persistence/flush, limiting, dirty policy, cleanup, PCI activation, and snapshot state.",
+      "source_refs": [
+        "corpus:pmem"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.tools:packaging-help-errors-and-applicable-operations",
+      "family": "public-tools",
+      "summary": "Audit packaging, help/version, input/output authority, errors, cleanup, and architecture applicability for all pinned public tools.",
+      "source_refs": [
+        "corpus:cpu-template-helper",
+        "corpus:jailer",
+        "corpus:seccompiler",
+        "corpus:snapshot-editor"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.transport:pci-msi-and-coexistence",
+      "family": "device-transport",
+      "summary": "Audit optional PCI host bridge, config/BAR layout, virtio-pci, MSI/MSI-X, limits, and MMIO coexistence.",
+      "source_refs": [
+        "corpus:device-api",
+        "corpus:device-hotplug"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.transport:virtio-mmio-activation",
+      "family": "device-transport",
+      "summary": "Audit virtio-MMIO discovery, feature negotiation, queues, interrupts, reset, limits, and device activation.",
+      "source_refs": [
+        "corpus:device-api"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.vsock:live-routing-credit-events-and-cleanup",
+      "family": "vsock",
+      "summary": "Audit live vsock routing, credit flow, events, deadlines, errors, metrics, resource authority, and cleanup.",
+      "source_refs": [
+        "corpus:vsock"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "semantic.vsock:snapshot-override-reset-and-rx-gating",
+      "family": "vsock",
+      "summary": "Audit vsock snapshot state, restore UDS override, TRANSPORT_RESET, post-restore RX gating, and port/state preservation.",
+      "source_refs": [
+        "corpus:snapshot-support",
+        "corpus:vsock"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/compare/curr",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/compare/curr.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/fingerprint/compare/curr"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/compare/filters",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/compare/filters.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/fingerprint/compare/filters"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/compare/prev",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/compare/prev.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/fingerprint/compare/prev"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/dump/config",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/dump/config.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/fingerprint/dump/config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/dump/output",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/dump/output.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/fingerprint/dump/output"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/dump/template",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/dump/template.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/fingerprint/dump/template"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/dump/config",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/dump/config.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/template/dump/config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/dump/output",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/dump/output.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/template/dump/output"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/dump/template",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/dump/template.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/template/dump/template"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/strip/paths",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/strip/paths.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/template/strip/paths"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/strip/suffix",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/strip/suffix.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/template/strip/suffix"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/verify/config",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/verify/config.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/template/verify/config"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/verify/template",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/verify/template.",
+      "source_refs": [
+        "tool-argument:cpu-template-helper/template/verify/template"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/cgroup",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/cgroup.",
+      "source_refs": [
+        "tool-argument:jailer/cgroup"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/cgroup-version",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/cgroup-version.",
+      "source_refs": [
+        "tool-argument:jailer/cgroup-version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/chroot-base-dir",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/chroot-base-dir.",
+      "source_refs": [
+        "tool-argument:jailer/chroot-base-dir"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/daemonize",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/daemonize.",
+      "source_refs": [
+        "tool-argument:jailer/daemonize"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/exec-file",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/exec-file.",
+      "source_refs": [
+        "tool-argument:jailer/exec-file"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/gid",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/gid.",
+      "source_refs": [
+        "tool-argument:jailer/gid"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/id",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/id.",
+      "source_refs": [
+        "tool-argument:jailer/id"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/netns",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/netns.",
+      "source_refs": [
+        "tool-argument:jailer/netns"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/new-pid-ns",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/new-pid-ns.",
+      "source_refs": [
+        "tool-argument:jailer/new-pid-ns"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/parent-cgroup",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/parent-cgroup.",
+      "source_refs": [
+        "tool-argument:jailer/parent-cgroup"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/resource-limit",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/resource-limit.",
+      "source_refs": [
+        "tool-argument:jailer/resource-limit"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/uid",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/uid.",
+      "source_refs": [
+        "tool-argument:jailer/uid"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:jailer/version",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument jailer/version.",
+      "source_refs": [
+        "tool-argument:jailer/version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:rebase-snap/base-file",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument rebase-snap/base-file.",
+      "source_refs": [
+        "tool-argument:rebase-snap/base-file"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:rebase-snap/diff-file",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument rebase-snap/diff-file.",
+      "source_refs": [
+        "tool-argument:rebase-snap/diff-file"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:seccompiler/basic",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/basic.",
+      "source_refs": [
+        "tool-argument:seccompiler/basic"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:seccompiler/input-file",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/input-file.",
+      "source_refs": [
+        "tool-argument:seccompiler/input-file"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:seccompiler/output-file",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/output-file.",
+      "source_refs": [
+        "tool-argument:seccompiler/output-file"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:seccompiler/split-output",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/split-output.",
+      "source_refs": [
+        "tool-argument:seccompiler/split-output"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:seccompiler/target-arch",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/target-arch.",
+      "source_refs": [
+        "tool-argument:seccompiler/target-arch"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-memory/rebase/diff-path",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-memory/rebase/diff-path.",
+      "source_refs": [
+        "tool-argument:snapshot-editor/edit-memory/rebase/diff-path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-memory/rebase/memory-path",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-memory/rebase/memory-path.",
+      "source_refs": [
+        "tool-argument:snapshot-editor/edit-memory/rebase/memory-path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/output-path",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-vmstate/remove-regs/output-path.",
+      "source_refs": [
+        "tool-argument:snapshot-editor/edit-vmstate/remove-regs/output-path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/regs",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-vmstate/remove-regs/regs.",
+      "source_refs": [
+        "tool-argument:snapshot-editor/edit-vmstate/remove-regs/regs"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/vmstate-path",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-vmstate/remove-regs/vmstate-path.",
+      "source_refs": [
+        "tool-argument:snapshot-editor/edit-vmstate/remove-regs/vmstate-path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/info-vmstate/vcpu-states/vmstate-path",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/info-vmstate/vcpu-states/vmstate-path.",
+      "source_refs": [
+        "tool-argument:snapshot-editor/info-vmstate/vcpu-states/vmstate-path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/info-vmstate/version/vmstate-path",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/info-vmstate/version/vmstate-path.",
+      "source_refs": [
+        "tool-argument:snapshot-editor/info-vmstate/version/vmstate-path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/info-vmstate/vm-state/vmstate-path",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/info-vmstate/vm-state/vmstate-path.",
+      "source_refs": [
+        "tool-argument:snapshot-editor/info-vmstate/vm-state/vmstate-path"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/fingerprint/compare",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/fingerprint/compare.",
+      "source_refs": [
+        "tool-operation:cpu-template-helper/fingerprint/compare"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/fingerprint/dump",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/fingerprint/dump.",
+      "source_refs": [
+        "tool-operation:cpu-template-helper/fingerprint/dump"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/template/dump",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/template/dump.",
+      "source_refs": [
+        "tool-operation:cpu-template-helper/template/dump"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/template/strip",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/template/strip.",
+      "source_refs": [
+        "tool-operation:cpu-template-helper/template/strip"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/template/verify",
+      "family": "cpu-and-machine",
+      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/template/verify.",
+      "source_refs": [
+        "tool-operation:cpu-template-helper/template/verify"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:firecracker/run",
+      "family": "process",
+      "summary": "Audit the Firecracker v1.16 public tool operation firecracker/run.",
+      "source_refs": [
+        "tool-operation:firecracker/run"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:jailer/run",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool operation jailer/run.",
+      "source_refs": [
+        "tool-operation:jailer/run"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:rebase-snap/rebase",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool operation rebase-snap/rebase.",
+      "source_refs": [
+        "tool-operation:rebase-snap/rebase"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:seccompiler/compile",
+      "family": "isolation",
+      "summary": "Audit the Firecracker v1.16 public tool operation seccompiler/compile.",
+      "source_refs": [
+        "tool-operation:seccompiler/compile"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/edit-memory/rebase",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/edit-memory/rebase.",
+      "source_refs": [
+        "tool-operation:snapshot-editor/edit-memory/rebase"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/edit-vmstate/remove-regs",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/edit-vmstate/remove-regs.",
+      "source_refs": [
+        "tool-operation:snapshot-editor/edit-vmstate/remove-regs"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/info-vmstate/vcpu-states",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/info-vmstate/vcpu-states.",
+      "source_refs": [
+        "tool-operation:snapshot-editor/info-vmstate/vcpu-states"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/info-vmstate/version",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/info-vmstate/version.",
+      "source_refs": [
+        "tool-operation:snapshot-editor/info-vmstate/version"
+      ],
+      "disposition": "audit-required"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/info-vmstate/vm-state",
+      "family": "snapshots",
+      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/info-vmstate/vm-state.",
+      "source_refs": [
+        "tool-operation:snapshot-editor/info-vmstate/vm-state"
+      ],
+      "disposition": "audit-required"
+    }
+  ]
+}

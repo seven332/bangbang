@@ -157,6 +157,25 @@ Behavior changes should update user-facing docs and compatibility docs in the
 same PR. Document security boundaries, host-platform differences, unsupported
 features, and validation policy when they are part of the changed surface.
 
+Every Firecracker-facing capability PR must also update all owned records in
+the checked
+[v1.16.0 capability inventory](../compat/firecracker/v1.16.0/README.md).
+Review the machine-owned source manifest separately from the human-owned
+overlay. Regeneration must not manufacture or overwrite a disposition, owner,
+evidence reference, delivery issue, or Challenge result. Require exact
+implementation and validation references for `implemented-and-verified`, a
+delivery issue for `missing-platform-feasible`, and the complete strict
+platform evidence plus current Challenge result for
+`proven-platform-impossible`. Keep unresolved behavior `audit-required` rather
+than inferring support from parser recognition, stable rejection, historical
+issue closure, or family-level prose.
+
+Run
+`cargo run -p bangbang-firecracker-capability-audit --locked -- validate`
+when the PR changes Firecracker-facing behavior or inventory data. Final parent
+certification additionally runs `validate --final`; ordinary feature PRs must
+not weaken that gate to make unresolved records pass.
+
 Avoid overstating scaffold behavior: if a PR adds constants, internal helpers,
 or planning docs without public API behavior, describe that narrower state
 explicitly.

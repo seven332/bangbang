@@ -47,6 +47,9 @@ jobs:
       - name: Check
         run: cargo check --workspace --all-targets --all-features --locked
 
+      - name: Validate Firecracker capability inventory
+        run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 

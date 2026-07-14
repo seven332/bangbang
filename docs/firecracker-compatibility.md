@@ -373,6 +373,31 @@ The concise support-status and test-layer summary is maintained in
 remains the detailed source for endpoint behavior, field policy, compatibility
 rationale, and platform limits.
 
+### Capability inventory authority
+
+The checked
+[Firecracker v1.16.0 capability inventory](../compat/firecracker/v1.16.0/README.md)
+is the structural scope authority for exhaustive compatibility work. Its
+machine-owned source manifest pins exact Swagger, executable CLI, non-Swagger
+route, public-tool, and source-corpus identities. Its separate human overlay
+owns dispositions and evidence so regeneration cannot manufacture support or
+erase an unresolved contract.
+
+This document remains the detailed behavioral explanation and an evidence
+target for inventory records. It is not, by itself, proof that every upstream
+identity has been audited. In particular, historical landing notes, family-level
+`implemented` language, parser recognition, stable unsupported behavior,
+`partial`, `deferred`, and product/profile limits must not be promoted to
+`implemented-and-verified` without record-specific implementation and
+validation evidence under the inventory rules.
+
+During #1348 delivery, `audit-required` and `missing-platform-feasible` remain
+visible nonterminal states. Final validation rejects both. A
+`proven-platform-impossible` record requires the exact upstream contract,
+authoritative platform evidence, alternatives, stable public behavior, focused
+tests, compatibility/security documentation, and a current Challenge result.
+The inventory foundation itself changes no runtime behavior.
+
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, `GET /hotplug/memory`, pre-boot

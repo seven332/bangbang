@@ -10,6 +10,7 @@ and test rules:
 
 - [Firecracker Compatibility Scope](docs/firecracker-compatibility.md)
 - [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md)
+- [Firecracker v1.16.0 Capability Inventory](compat/firecracker/v1.16.0/README.md)
 - [Snapshot Feasibility](docs/snapshot-feasibility.md)
 - [macOS Host Security Model](docs/security.md)
 - [Testing Guide](docs/testing.md)
@@ -34,6 +35,8 @@ crates/api        Firecracker-compatible API request and response surface
 crates/runtime    Backend-neutral VM model, memory, MMIO, boot, and device helpers
 crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
+tools/firecracker-capability-audit
+                  Checked Firecracker source/capability inventory validator
 ```
 
 On supported macOS Apple Silicon hosts, the public machine configuration accepts
@@ -479,7 +482,10 @@ curl --unix-socket /tmp/bangbang.socket \
 See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for
 the full endpoint matrix, implemented behavior, and deferred Firecracker
 features. See [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md)
-for the support status and validation layer summary.
+for the support status and validation layer summary. The
+[v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
+mechanically checked scope authority for exhaustive compatibility work; its
+initial `audit-required` entries do not make new runtime claims.
 
 ## Build And Test
 
@@ -487,6 +493,7 @@ Requires the latest stable Rust toolchain.
 
 ```sh
 cargo fmt --all -- --check
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 cargo test -p bangbang-hvf --lib --all-features --locked

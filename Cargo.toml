@@ -4,6 +4,7 @@ members = [
     "crates/hvf",
     "crates/runtime",
     "crates/bangbang",
+    "tools/firecracker-capability-audit",
 ]
 resolver = "3"
 

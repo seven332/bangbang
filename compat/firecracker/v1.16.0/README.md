@@ -1,0 +1,107 @@
+# Firecracker v1.16.0 capability inventory
+
+This directory is the structural scope authority for bangbang's Firecracker
+v1.16.0 compatibility work. The baseline is commit
+`d83d72b710361a10294480131377b1b00b163af8`.
+
+The inventory complements, rather than replaces, the detailed behavior in
+[`docs/firecracker-compatibility.md`](../../../docs/firecracker-compatibility.md)
+and the test-layer summary in
+[`docs/firecracker-validation-matrix.md`](../../../docs/firecracker-validation-matrix.md).
+Those documents explain behavior; this directory makes omissions and terminal
+claims mechanically visible.
+
+## File ownership
+
+- [`source-manifest.json`](source-manifest.json) is machine-owned. It records
+  the pinned upstream inputs and exact identities for 26 Swagger paths, 38
+  operations, 44 definitions, 152 properties, 23 configured Firecracker
+  arguments, three non-Swagger DELETE routes, 14 public-tool operations, 41
+  public-tool arguments, and 40 explicit non-Swagger source-corpus items.
+- [`capabilities.json`](capabilities.json) is human-owned. Every generated
+  identity has exactly one overlay, and additional `semantic.*` records cover
+  cross-leaf guest, lifecycle, snapshot, observability, isolation, and
+  specification behavior.
+
+Regeneration may produce a candidate `source-manifest.json`; it must never
+create or rewrite a capability disposition, owner, evidence reference,
+delivery issue, or Challenge result. A changed generated identity instead
+causes a missing or stale overlay validation failure for a reviewer to resolve.
+
+Stable source IDs use `<kind>:<upstream-key>`. Semantic IDs start with
+`semantic.`. IDs are scoped to this immutable v1.16.0 baseline. A later
+Firecracker baseline gets a separate directory and an explicitly reviewed
+delta.
+
+## Dispositions
+
+Each capability has exactly one disposition:
+
+- `audit-required` means the exact contract still needs review under the
+  strict parent rule. It is allowed while delivery is in progress and is never
+  a completion state.
+- `missing-platform-feasible` requires a concrete delivery issue. It is never
+  a completion state.
+- `implemented-and-verified` requires implementation and validation
+  references appropriate to the claim. Parser recognition or a stable
+  unsupported response is not implementation.
+- `proven-platform-impossible` requires the upstream contract, authoritative
+  platform evidence, alternatives with rejection reasons, stable behavior,
+  focused tests, compatibility and security documentation, and a current
+  Challenge result.
+
+The initial inventory is deliberately conservative. Existing prose or issue
+closure does not automatically promote a record from `audit-required`.
+
+## Commands
+
+Validate checked-in delivery state without an upstream checkout:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+```
+
+The final parent gate rejects `audit-required` and
+`missing-platform-feasible`:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --final
+```
+
+Compare the generated manifest with an explicit clean Firecracker checkout at
+the exact pinned commit:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- compare \
+  --firecracker /path/to/firecracker
+```
+
+Generate a candidate without overwriting either checked-in inventory file:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- regenerate \
+  --firecracker /path/to/firecracker \
+  --output codex-work/tmp/firecracker-v1.16-source-manifest.candidate.json
+```
+
+The comparison command requires a clean Git worktree whose `HEAD` is the exact
+pinned commit. It reads only declared regular files below that canonical root.
+The local checkout path is not stored in tracked data. Ordinary CI does not
+need a sibling checkout.
+
+## Contributor update rule
+
+Every pull request that changes a Firecracker-facing capability must update
+all owned overlay records in the same change. Add implementation and validation
+evidence only for the exact observable contract proved by that PR. Keep
+unreviewed behavior `audit-required`; use `missing-platform-feasible` only with
+a delivery issue; and use `proven-platform-impossible` only after the complete
+strict evidence and Challenge gate.
+
+Run the focused validator and the repository's normal checks before submission.
+The checked-in integration test also validates this inventory through the
+ordinary workspace test command. A corpus reference records audit ownership;
+it does not by itself prove that every semantic statement is implemented.
+
+This inventory foundation changes no VM or process runtime behavior and makes
+no new compatibility claim.

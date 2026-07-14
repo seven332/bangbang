@@ -1,0 +1,3322 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "generator_version": 1,
+  "inputs": [
+    {
+      "path": "CHANGELOG.md",
+      "git_blob": "d76cfc8a4601638f45fea032982faef8b9e30742",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "SPECIFICATION.md",
+      "git_blob": "67ede9964f8a2d314b9cad69fe8d5b773e01b1d8",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/api_requests/actions.md",
+      "git_blob": "c11f152e651c53f4a93b27a405bed9b9694c98c8",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/api_requests/block-caching.md",
+      "git_blob": "5f75f683a58ff08e36b8fca0255d374eabe39036",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/api_requests/block-io-engine.md",
+      "git_blob": "edc544bbfb632a18f3e05fa2fe8fb709526c3604",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/api_requests/block-vhost-user.md",
+      "git_blob": "04761705ac0764a657e9e52853a1ba92fa484b4c",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/api_requests/patch-block.md",
+      "git_blob": "58da2b0bca4c3c2bc857fb4a63b7086bc023ead7",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/api_requests/patch-network-interface.md",
+      "git_blob": "5e5796e479e0aa4bd85906e757bd40f6af6d04fe",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/ballooning.md",
+      "git_blob": "0928646f0a8f4fe41d278df180f4b7f88c4bd7ec",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/cpu_templates/boot-protocol.md",
+      "git_blob": "5e71428d1520175be23742502a0926593352bbf1",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/cpu_templates/cpu-template-helper.md",
+      "git_blob": "13898be9d6c9fd8de39c85737edf4a648d91e1ba",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/cpu_templates/cpu-templates.md",
+      "git_blob": "e62b2ad1e94cea2e15b1e4d925581f770f430d22",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/design.md",
+      "git_blob": "143fef76410e4f7e45b32d3986e0d78eedf5175a",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/device-api.md",
+      "git_blob": "f638cc889f32e0be32fd750a79e65f88cb5c65a1",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/device-hotplug.md",
+      "git_blob": "d15fb956f9846a7a6dd4e7db54f57d5f3b0a4734",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/entropy.md",
+      "git_blob": "c39158b472a84f9ac5a4c896c8c82f3aa1e7a5c5",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/formal-verification.md",
+      "git_blob": "6a0c2d07574257ee1bb17dc78dc7fde9a6996dcf",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/getting-started.md",
+      "git_blob": "63e70d007f33701c04c6e8864a2c0d6718eee1e3",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/hugepages.md",
+      "git_blob": "a1c1a7619533dcb7f41042e42da92b63ff3e2e5b",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/jailer.md",
+      "git_blob": "fa5e8b4ee769f64ee83a317dce5902ffd0029a1b",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/logger.md",
+      "git_blob": "4585c4f3f67800a9c355d1603269b7d45507ec8b",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/memory-hotplug.md",
+      "git_blob": "c9385c35de6d389e5bc8ec2addf74565e8905f5d",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/metrics.md",
+      "git_blob": "98047e19f55d0dfb8b20c6f3cfa634884bcabb0a",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/mmds/mmds-design.md",
+      "git_blob": "dc21ffc1a686aeee75e37c599509da497e5fb1d6",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/mmds/mmds-user-guide.md",
+      "git_blob": "115a7648407cef0a2d61d933d9face5c149a65b7",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/network-performance.md",
+      "git_blob": "0be0d8cdd8dec6041286f36d3b33b7d7f8f4f437",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/network-setup.md",
+      "git_blob": "c161b6661d4362a49d1978e0cafc5e7a6e5cebf6",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/pmem.md",
+      "git_blob": "7629d9c1433be8825ea6b19f9a2b88172a43764d",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/prod-host-setup.md",
+      "git_blob": "8939b56a965963d8df1c44c583dcd38361197347",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/rootfs-and-kernel-setup.md",
+      "git_blob": "ecffc58b720a6f6f76281493a4e6ed248c4c824a",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/seccomp.md",
+      "git_blob": "0611fd8d602a08deaa3e5174a4b32953427c9dc9",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/seccompiler.md",
+      "git_blob": "50f44097cece19d2538e054ee7e3b6ba457c7a55",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/snapshotting/handling-page-faults-on-snapshot-resume.md",
+      "git_blob": "a5da980124ed8ee46207fdfbc086219069569805",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/snapshotting/network-for-clones.md",
+      "git_blob": "63115418765c3495ad34c2491ae8c149dcb7a24a",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/snapshotting/random-for-clones.md",
+      "git_blob": "40589be02706b536778a36b433d65f286df6b392",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/snapshotting/snapshot-editor.md",
+      "git_blob": "2c5e801796b1c313fea0afd8247ef7ea89bc49d4",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/snapshotting/snapshot-support.md",
+      "git_blob": "048a49623f0d872814a5fae777018013bef3def8",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/snapshotting/versioning.md",
+      "git_blob": "9951dbcd09b5f9ce5963d32227e8eb42919e5ca5",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/tracing.md",
+      "git_blob": "dd9f284c5950cd82effb4cba1ae918fe49a0ddc9",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "docs/vsock.md",
+      "git_blob": "9f3852d4ff0d63d5b591b54ba5e092958a79aa9b",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "src/cpu-template-helper/src/main.rs",
+      "git_blob": "8adbc4f06d03a4adb32a829a91b9fa9c204a3b9b",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "git_blob": "2946b19706718653d9a0728c32571e39f7ce40d5",
+      "extractor": "parsed-delete-routes-v1"
+    },
+    {
+      "path": "src/firecracker/src/main.rs",
+      "git_blob": "39c989c87f622472e104a66ac864440c1c9b7b7a",
+      "extractor": "firecracker-cli-v1"
+    },
+    {
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "git_blob": "d169ed19488d10a8c55654777dba188020ca9c2d",
+      "extractor": "swagger-v1"
+    },
+    {
+      "path": "src/jailer/src/main.rs",
+      "git_blob": "4f87f2563c6f6ef47cecbb2829fe91bf27a6f603",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "src/rebase-snap/src/main.rs",
+      "git_blob": "783e20861976b422a277333df99e209e697ce6f5",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "src/seccompiler/src/bin.rs",
+      "git_blob": "533e7c95870e850675f018b5b929525d1bc26198",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "src/snapshot-editor/src/edit_memory.rs",
+      "git_blob": "eca61afa2ff96849e0201fe9f4a2803d5afd8715",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "src/snapshot-editor/src/edit_vmstate.rs",
+      "git_blob": "e538156814ab346dcf78fea38f6e1a7897e5a994",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "src/snapshot-editor/src/info.rs",
+      "git_blob": "97d06a3e5f9e3212164c3d73c3e5d33a19135560",
+      "extractor": "curated-source-v1"
+    }
+  ],
+  "counts": {
+    "swagger_paths": 26,
+    "swagger_operations": 38,
+    "swagger_definitions": 44,
+    "swagger_properties": 152,
+    "firecracker_arguments": 23,
+    "non_swagger_routes": 3,
+    "public_tool_operations": 14,
+    "public_tool_arguments": 41,
+    "corpus_items": 40
+  },
+  "items": [
+    {
+      "id": "api-operation:GET /",
+      "kind": "api-operation",
+      "key": "GET /",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths///GET;operationId=describeInstance",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:GET /balloon",
+      "kind": "api-operation",
+      "key": "GET /balloon",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/GET;operationId=describeBalloonConfig",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:GET /balloon/hinting/status",
+      "kind": "api-operation",
+      "key": "GET /balloon/hinting/status",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/hinting/status/GET;operationId=describeBalloonHinting",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:GET /balloon/statistics",
+      "kind": "api-operation",
+      "key": "GET /balloon/statistics",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/statistics/GET;operationId=describeBalloonStats",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:GET /hotplug/memory",
+      "kind": "api-operation",
+      "key": "GET /hotplug/memory",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//hotplug/memory/GET;operationId=getMemoryHotplug",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:GET /machine-config",
+      "kind": "api-operation",
+      "key": "GET /machine-config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//machine-config/GET;operationId=getMachineConfiguration",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:GET /mmds",
+      "kind": "api-operation",
+      "key": "GET /mmds",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//mmds/GET;operationId=getMmds",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:GET /version",
+      "kind": "api-operation",
+      "key": "GET /version",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//version/GET;operationId=getFirecrackerVersion",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:GET /vm/config",
+      "kind": "api-operation",
+      "key": "GET /vm/config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//vm/config/GET;operationId=getExportVmConfig",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /balloon",
+      "kind": "api-operation",
+      "key": "PATCH /balloon",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/PATCH;operationId=patchBalloon",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /balloon/hinting/start",
+      "kind": "api-operation",
+      "key": "PATCH /balloon/hinting/start",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/hinting/start/PATCH;operationId=startBalloonHinting",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /balloon/hinting/stop",
+      "kind": "api-operation",
+      "key": "PATCH /balloon/hinting/stop",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/hinting/stop/PATCH;operationId=stopBalloonHinting",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /balloon/statistics",
+      "kind": "api-operation",
+      "key": "PATCH /balloon/statistics",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/statistics/PATCH;operationId=patchBalloonStatsInterval",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /drives/{drive_id}",
+      "kind": "api-operation",
+      "key": "PATCH /drives/{drive_id}",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//drives/{drive_id}/PATCH;operationId=patchGuestDriveByID",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /hotplug/memory",
+      "kind": "api-operation",
+      "key": "PATCH /hotplug/memory",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//hotplug/memory/PATCH;operationId=patchMemoryHotplug",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /machine-config",
+      "kind": "api-operation",
+      "key": "PATCH /machine-config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//machine-config/PATCH;operationId=patchMachineConfiguration",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /mmds",
+      "kind": "api-operation",
+      "key": "PATCH /mmds",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//mmds/PATCH;operationId=patchMmds",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /network-interfaces/{iface_id}",
+      "kind": "api-operation",
+      "key": "PATCH /network-interfaces/{iface_id}",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//network-interfaces/{iface_id}/PATCH;operationId=patchGuestNetworkInterfaceByID",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /pmem/{id}",
+      "kind": "api-operation",
+      "key": "PATCH /pmem/{id}",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//pmem/{id}/PATCH;operationId=patchGuestPmemByID",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PATCH /vm",
+      "kind": "api-operation",
+      "key": "PATCH /vm",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//vm/PATCH;operationId=patchVm",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /actions",
+      "kind": "api-operation",
+      "key": "PUT /actions",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//actions/PUT;operationId=createSyncAction",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /balloon",
+      "kind": "api-operation",
+      "key": "PUT /balloon",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/PUT;operationId=putBalloon",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /boot-source",
+      "kind": "api-operation",
+      "key": "PUT /boot-source",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//boot-source/PUT;operationId=putGuestBootSource",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /cpu-config",
+      "kind": "api-operation",
+      "key": "PUT /cpu-config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//cpu-config/PUT;operationId=putCpuConfiguration",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /drives/{drive_id}",
+      "kind": "api-operation",
+      "key": "PUT /drives/{drive_id}",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//drives/{drive_id}/PUT;operationId=putGuestDriveByID",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /entropy",
+      "kind": "api-operation",
+      "key": "PUT /entropy",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//entropy/PUT;operationId=putEntropyDevice",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /hotplug/memory",
+      "kind": "api-operation",
+      "key": "PUT /hotplug/memory",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//hotplug/memory/PUT;operationId=putMemoryHotplug",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /logger",
+      "kind": "api-operation",
+      "key": "PUT /logger",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//logger/PUT;operationId=putLogger",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /machine-config",
+      "kind": "api-operation",
+      "key": "PUT /machine-config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//machine-config/PUT;operationId=putMachineConfiguration",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /metrics",
+      "kind": "api-operation",
+      "key": "PUT /metrics",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//metrics/PUT;operationId=putMetrics",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /mmds",
+      "kind": "api-operation",
+      "key": "PUT /mmds",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//mmds/PUT;operationId=putMmds",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /mmds/config",
+      "kind": "api-operation",
+      "key": "PUT /mmds/config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//mmds/config/PUT;operationId=putMmdsConfig",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /network-interfaces/{iface_id}",
+      "kind": "api-operation",
+      "key": "PUT /network-interfaces/{iface_id}",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//network-interfaces/{iface_id}/PUT;operationId=putGuestNetworkInterfaceByID",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /pmem/{id}",
+      "kind": "api-operation",
+      "key": "PUT /pmem/{id}",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//pmem/{id}/PUT;operationId=putGuestPmemByID",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /serial",
+      "kind": "api-operation",
+      "key": "PUT /serial",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//serial/PUT;operationId=putSerialDevice",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /snapshot/create",
+      "kind": "api-operation",
+      "key": "PUT /snapshot/create",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//snapshot/create/PUT;operationId=createSnapshot",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /snapshot/load",
+      "kind": "api-operation",
+      "key": "PUT /snapshot/load",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//snapshot/load/PUT;operationId=loadSnapshot",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-operation:PUT /vsock",
+      "kind": "api-operation",
+      "key": "PUT /vsock",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//vsock/PUT;operationId=putGuestVsock",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/",
+      "kind": "api-path",
+      "key": "/",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/actions",
+      "kind": "api-path",
+      "key": "/actions",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//actions",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/balloon",
+      "kind": "api-path",
+      "key": "/balloon",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/balloon/hinting/start",
+      "kind": "api-path",
+      "key": "/balloon/hinting/start",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/hinting/start",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/balloon/hinting/status",
+      "kind": "api-path",
+      "key": "/balloon/hinting/status",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/hinting/status",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/balloon/hinting/stop",
+      "kind": "api-path",
+      "key": "/balloon/hinting/stop",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/hinting/stop",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/balloon/statistics",
+      "kind": "api-path",
+      "key": "/balloon/statistics",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//balloon/statistics",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/boot-source",
+      "kind": "api-path",
+      "key": "/boot-source",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//boot-source",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/cpu-config",
+      "kind": "api-path",
+      "key": "/cpu-config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//cpu-config",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/drives/{drive_id}",
+      "kind": "api-path",
+      "key": "/drives/{drive_id}",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//drives/{drive_id}",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/entropy",
+      "kind": "api-path",
+      "key": "/entropy",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//entropy",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/hotplug/memory",
+      "kind": "api-path",
+      "key": "/hotplug/memory",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//hotplug/memory",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/logger",
+      "kind": "api-path",
+      "key": "/logger",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//logger",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/machine-config",
+      "kind": "api-path",
+      "key": "/machine-config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//machine-config",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/metrics",
+      "kind": "api-path",
+      "key": "/metrics",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//metrics",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/mmds",
+      "kind": "api-path",
+      "key": "/mmds",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//mmds",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/mmds/config",
+      "kind": "api-path",
+      "key": "/mmds/config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//mmds/config",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/network-interfaces/{iface_id}",
+      "kind": "api-path",
+      "key": "/network-interfaces/{iface_id}",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//network-interfaces/{iface_id}",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/pmem/{id}",
+      "kind": "api-path",
+      "key": "/pmem/{id}",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//pmem/{id}",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/serial",
+      "kind": "api-path",
+      "key": "/serial",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//serial",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/snapshot/create",
+      "kind": "api-path",
+      "key": "/snapshot/create",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//snapshot/create",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/snapshot/load",
+      "kind": "api-path",
+      "key": "/snapshot/load",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//snapshot/load",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/version",
+      "kind": "api-path",
+      "key": "/version",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//version",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/vm",
+      "kind": "api-path",
+      "key": "/vm",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//vm",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/vm/config",
+      "kind": "api-path",
+      "key": "/vm/config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//vm/config",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-path:/vsock",
+      "kind": "api-path",
+      "key": "/vsock",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/paths//vsock",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:ArmRegisterModifier.addr",
+      "kind": "api-property",
+      "key": "ArmRegisterModifier.addr",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/ArmRegisterModifier/properties/addr",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:ArmRegisterModifier.bitmap",
+      "kind": "api-property",
+      "key": "ArmRegisterModifier.bitmap",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/ArmRegisterModifier/properties/bitmap",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Balloon.amount_mib",
+      "kind": "api-property",
+      "key": "Balloon.amount_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Balloon/properties/amount_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Balloon.deflate_on_oom",
+      "kind": "api-property",
+      "key": "Balloon.deflate_on_oom",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Balloon/properties/deflate_on_oom",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Balloon.free_page_hinting",
+      "kind": "api-property",
+      "key": "Balloon.free_page_hinting",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Balloon/properties/free_page_hinting",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Balloon.free_page_reporting",
+      "kind": "api-property",
+      "key": "Balloon.free_page_reporting",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Balloon/properties/free_page_reporting",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Balloon.stats_polling_interval_s",
+      "kind": "api-property",
+      "key": "Balloon.stats_polling_interval_s",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Balloon/properties/stats_polling_interval_s",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonHintingStatus.guest_cmd",
+      "kind": "api-property",
+      "key": "BalloonHintingStatus.guest_cmd",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonHintingStatus/properties/guest_cmd",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonHintingStatus.host_cmd",
+      "kind": "api-property",
+      "key": "BalloonHintingStatus.host_cmd",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonHintingStatus/properties/host_cmd",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStartCmd.acknowledge_on_stop",
+      "kind": "api-property",
+      "key": "BalloonStartCmd.acknowledge_on_stop",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStartCmd/properties/acknowledge_on_stop",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.actual_mib",
+      "kind": "api-property",
+      "key": "BalloonStats.actual_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/actual_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.actual_pages",
+      "kind": "api-property",
+      "key": "BalloonStats.actual_pages",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/actual_pages",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.alloc_stall",
+      "kind": "api-property",
+      "key": "BalloonStats.alloc_stall",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/alloc_stall",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.async_reclaim",
+      "kind": "api-property",
+      "key": "BalloonStats.async_reclaim",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/async_reclaim",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.async_scan",
+      "kind": "api-property",
+      "key": "BalloonStats.async_scan",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/async_scan",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.available_memory",
+      "kind": "api-property",
+      "key": "BalloonStats.available_memory",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/available_memory",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.direct_reclaim",
+      "kind": "api-property",
+      "key": "BalloonStats.direct_reclaim",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/direct_reclaim",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.direct_scan",
+      "kind": "api-property",
+      "key": "BalloonStats.direct_scan",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/direct_scan",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.disk_caches",
+      "kind": "api-property",
+      "key": "BalloonStats.disk_caches",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/disk_caches",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.free_memory",
+      "kind": "api-property",
+      "key": "BalloonStats.free_memory",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/free_memory",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.hugetlb_allocations",
+      "kind": "api-property",
+      "key": "BalloonStats.hugetlb_allocations",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/hugetlb_allocations",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.hugetlb_failures",
+      "kind": "api-property",
+      "key": "BalloonStats.hugetlb_failures",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/hugetlb_failures",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.major_faults",
+      "kind": "api-property",
+      "key": "BalloonStats.major_faults",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/major_faults",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.minor_faults",
+      "kind": "api-property",
+      "key": "BalloonStats.minor_faults",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/minor_faults",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.oom_kill",
+      "kind": "api-property",
+      "key": "BalloonStats.oom_kill",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/oom_kill",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.swap_in",
+      "kind": "api-property",
+      "key": "BalloonStats.swap_in",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/swap_in",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.swap_out",
+      "kind": "api-property",
+      "key": "BalloonStats.swap_out",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/swap_out",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.target_mib",
+      "kind": "api-property",
+      "key": "BalloonStats.target_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/target_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.target_pages",
+      "kind": "api-property",
+      "key": "BalloonStats.target_pages",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/target_pages",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStats.total_memory",
+      "kind": "api-property",
+      "key": "BalloonStats.total_memory",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats/properties/total_memory",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonStatsUpdate.stats_polling_interval_s",
+      "kind": "api-property",
+      "key": "BalloonStatsUpdate.stats_polling_interval_s",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStatsUpdate/properties/stats_polling_interval_s",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BalloonUpdate.amount_mib",
+      "kind": "api-property",
+      "key": "BalloonUpdate.amount_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonUpdate/properties/amount_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BootSource.boot_args",
+      "kind": "api-property",
+      "key": "BootSource.boot_args",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BootSource/properties/boot_args",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BootSource.initrd_path",
+      "kind": "api-property",
+      "key": "BootSource.initrd_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BootSource/properties/initrd_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:BootSource.kernel_image_path",
+      "kind": "api-property",
+      "key": "BootSource.kernel_image_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BootSource/properties/kernel_image_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuConfig.cpuid_modifiers",
+      "kind": "api-property",
+      "key": "CpuConfig.cpuid_modifiers",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuConfig/properties/cpuid_modifiers",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuConfig.kvm_capabilities",
+      "kind": "api-property",
+      "key": "CpuConfig.kvm_capabilities",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuConfig/properties/kvm_capabilities",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuConfig.msr_modifiers",
+      "kind": "api-property",
+      "key": "CpuConfig.msr_modifiers",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuConfig/properties/msr_modifiers",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuConfig.reg_modifiers",
+      "kind": "api-property",
+      "key": "CpuConfig.reg_modifiers",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuConfig/properties/reg_modifiers",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuConfig.vcpu_features",
+      "kind": "api-property",
+      "key": "CpuConfig.vcpu_features",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuConfig/properties/vcpu_features",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuidLeafModifier.flags",
+      "kind": "api-property",
+      "key": "CpuidLeafModifier.flags",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuidLeafModifier/properties/flags",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuidLeafModifier.leaf",
+      "kind": "api-property",
+      "key": "CpuidLeafModifier.leaf",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuidLeafModifier/properties/leaf",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuidLeafModifier.modifiers",
+      "kind": "api-property",
+      "key": "CpuidLeafModifier.modifiers",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuidLeafModifier/properties/modifiers",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuidLeafModifier.subleaf",
+      "kind": "api-property",
+      "key": "CpuidLeafModifier.subleaf",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuidLeafModifier/properties/subleaf",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuidRegisterModifier.bitmap",
+      "kind": "api-property",
+      "key": "CpuidRegisterModifier.bitmap",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuidRegisterModifier/properties/bitmap",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:CpuidRegisterModifier.register",
+      "kind": "api-property",
+      "key": "CpuidRegisterModifier.register",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuidRegisterModifier/properties/register",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Drive.cache_type",
+      "kind": "api-property",
+      "key": "Drive.cache_type",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive/properties/cache_type",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Drive.drive_id",
+      "kind": "api-property",
+      "key": "Drive.drive_id",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive/properties/drive_id",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Drive.io_engine",
+      "kind": "api-property",
+      "key": "Drive.io_engine",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive/properties/io_engine",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Drive.is_read_only",
+      "kind": "api-property",
+      "key": "Drive.is_read_only",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive/properties/is_read_only",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Drive.is_root_device",
+      "kind": "api-property",
+      "key": "Drive.is_root_device",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive/properties/is_root_device",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Drive.partuuid",
+      "kind": "api-property",
+      "key": "Drive.partuuid",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive/properties/partuuid",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Drive.path_on_host",
+      "kind": "api-property",
+      "key": "Drive.path_on_host",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive/properties/path_on_host",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Drive.rate_limiter",
+      "kind": "api-property",
+      "key": "Drive.rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive/properties/rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Drive.socket",
+      "kind": "api-property",
+      "key": "Drive.socket",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive/properties/socket",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:EntropyDevice.rate_limiter",
+      "kind": "api-property",
+      "key": "EntropyDevice.rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/EntropyDevice/properties/rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Error.fault_message",
+      "kind": "api-property",
+      "key": "Error.fault_message",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Error/properties/fault_message",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FirecrackerVersion.firecracker_version",
+      "kind": "api-property",
+      "key": "FirecrackerVersion.firecracker_version",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FirecrackerVersion/properties/firecracker_version",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.balloon",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.balloon",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/balloon",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.boot-source",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.boot-source",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/boot-source",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.cpu-config",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.cpu-config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/cpu-config",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.drives",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.drives",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/drives",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.entropy",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.entropy",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/entropy",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.logger",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.logger",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/logger",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.machine-config",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.machine-config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/machine-config",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.memory-hotplug",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.memory-hotplug",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/memory-hotplug",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.metrics",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.metrics",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/metrics",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.mmds-config",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.mmds-config",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/mmds-config",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.network-interfaces",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.network-interfaces",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/network-interfaces",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.pmem",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.pmem",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/pmem",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:FullVmConfiguration.vsock",
+      "kind": "api-property",
+      "key": "FullVmConfiguration.vsock",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration/properties/vsock",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:InstanceActionInfo.action_type",
+      "kind": "api-property",
+      "key": "InstanceActionInfo.action_type",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/InstanceActionInfo/properties/action_type",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:InstanceInfo.app_name",
+      "kind": "api-property",
+      "key": "InstanceInfo.app_name",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/InstanceInfo/properties/app_name",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:InstanceInfo.id",
+      "kind": "api-property",
+      "key": "InstanceInfo.id",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/InstanceInfo/properties/id",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:InstanceInfo.state",
+      "kind": "api-property",
+      "key": "InstanceInfo.state",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/InstanceInfo/properties/state",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:InstanceInfo.vmm_version",
+      "kind": "api-property",
+      "key": "InstanceInfo.vmm_version",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/InstanceInfo/properties/vmm_version",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Logger.level",
+      "kind": "api-property",
+      "key": "Logger.level",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Logger/properties/level",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Logger.log_path",
+      "kind": "api-property",
+      "key": "Logger.log_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Logger/properties/log_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Logger.module",
+      "kind": "api-property",
+      "key": "Logger.module",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Logger/properties/module",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Logger.show_level",
+      "kind": "api-property",
+      "key": "Logger.show_level",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Logger/properties/show_level",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Logger.show_log_origin",
+      "kind": "api-property",
+      "key": "Logger.show_log_origin",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Logger/properties/show_log_origin",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MachineConfiguration.cpu_template",
+      "kind": "api-property",
+      "key": "MachineConfiguration.cpu_template",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MachineConfiguration/properties/cpu_template",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MachineConfiguration.huge_pages",
+      "kind": "api-property",
+      "key": "MachineConfiguration.huge_pages",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MachineConfiguration/properties/huge_pages",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MachineConfiguration.mem_size_mib",
+      "kind": "api-property",
+      "key": "MachineConfiguration.mem_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MachineConfiguration/properties/mem_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MachineConfiguration.smt",
+      "kind": "api-property",
+      "key": "MachineConfiguration.smt",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MachineConfiguration/properties/smt",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MachineConfiguration.track_dirty_pages",
+      "kind": "api-property",
+      "key": "MachineConfiguration.track_dirty_pages",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MachineConfiguration/properties/track_dirty_pages",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MachineConfiguration.vcpu_count",
+      "kind": "api-property",
+      "key": "MachineConfiguration.vcpu_count",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MachineConfiguration/properties/vcpu_count",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryBackend.backend_path",
+      "kind": "api-property",
+      "key": "MemoryBackend.backend_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryBackend/properties/backend_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryBackend.backend_type",
+      "kind": "api-property",
+      "key": "MemoryBackend.backend_type",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryBackend/properties/backend_type",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryHotplugConfig.block_size_mib",
+      "kind": "api-property",
+      "key": "MemoryHotplugConfig.block_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugConfig/properties/block_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryHotplugConfig.slot_size_mib",
+      "kind": "api-property",
+      "key": "MemoryHotplugConfig.slot_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugConfig/properties/slot_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryHotplugConfig.total_size_mib",
+      "kind": "api-property",
+      "key": "MemoryHotplugConfig.total_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugConfig/properties/total_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryHotplugSizeUpdate.requested_size_mib",
+      "kind": "api-property",
+      "key": "MemoryHotplugSizeUpdate.requested_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugSizeUpdate/properties/requested_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.block_size_mib",
+      "kind": "api-property",
+      "key": "MemoryHotplugStatus.block_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugStatus/properties/block_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.plugged_size_mib",
+      "kind": "api-property",
+      "key": "MemoryHotplugStatus.plugged_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugStatus/properties/plugged_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.requested_size_mib",
+      "kind": "api-property",
+      "key": "MemoryHotplugStatus.requested_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugStatus/properties/requested_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.slot_size_mib",
+      "kind": "api-property",
+      "key": "MemoryHotplugStatus.slot_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugStatus/properties/slot_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MemoryHotplugStatus.total_size_mib",
+      "kind": "api-property",
+      "key": "MemoryHotplugStatus.total_size_mib",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugStatus/properties/total_size_mib",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Metrics.metrics_path",
+      "kind": "api-property",
+      "key": "Metrics.metrics_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Metrics/properties/metrics_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MmdsConfig.imds_compat",
+      "kind": "api-property",
+      "key": "MmdsConfig.imds_compat",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MmdsConfig/properties/imds_compat",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MmdsConfig.ipv4_address",
+      "kind": "api-property",
+      "key": "MmdsConfig.ipv4_address",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MmdsConfig/properties/ipv4_address",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MmdsConfig.network_interfaces",
+      "kind": "api-property",
+      "key": "MmdsConfig.network_interfaces",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MmdsConfig/properties/network_interfaces",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MmdsConfig.version",
+      "kind": "api-property",
+      "key": "MmdsConfig.version",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MmdsConfig/properties/version",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MsrModifier.addr",
+      "kind": "api-property",
+      "key": "MsrModifier.addr",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MsrModifier/properties/addr",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:MsrModifier.bitmap",
+      "kind": "api-property",
+      "key": "MsrModifier.bitmap",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MsrModifier/properties/bitmap",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:NetworkInterface.guest_mac",
+      "kind": "api-property",
+      "key": "NetworkInterface.guest_mac",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkInterface/properties/guest_mac",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:NetworkInterface.host_dev_name",
+      "kind": "api-property",
+      "key": "NetworkInterface.host_dev_name",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkInterface/properties/host_dev_name",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:NetworkInterface.iface_id",
+      "kind": "api-property",
+      "key": "NetworkInterface.iface_id",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkInterface/properties/iface_id",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:NetworkInterface.mtu",
+      "kind": "api-property",
+      "key": "NetworkInterface.mtu",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkInterface/properties/mtu",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:NetworkInterface.rx_rate_limiter",
+      "kind": "api-property",
+      "key": "NetworkInterface.rx_rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkInterface/properties/rx_rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:NetworkInterface.tx_rate_limiter",
+      "kind": "api-property",
+      "key": "NetworkInterface.tx_rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkInterface/properties/tx_rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:NetworkOverride.host_dev_name",
+      "kind": "api-property",
+      "key": "NetworkOverride.host_dev_name",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkOverride/properties/host_dev_name",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:NetworkOverride.iface_id",
+      "kind": "api-property",
+      "key": "NetworkOverride.iface_id",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkOverride/properties/iface_id",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:PartialDrive.drive_id",
+      "kind": "api-property",
+      "key": "PartialDrive.drive_id",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialDrive/properties/drive_id",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:PartialDrive.path_on_host",
+      "kind": "api-property",
+      "key": "PartialDrive.path_on_host",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialDrive/properties/path_on_host",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:PartialDrive.rate_limiter",
+      "kind": "api-property",
+      "key": "PartialDrive.rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialDrive/properties/rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:PartialNetworkInterface.iface_id",
+      "kind": "api-property",
+      "key": "PartialNetworkInterface.iface_id",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialNetworkInterface/properties/iface_id",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:PartialNetworkInterface.rx_rate_limiter",
+      "kind": "api-property",
+      "key": "PartialNetworkInterface.rx_rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialNetworkInterface/properties/rx_rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:PartialNetworkInterface.tx_rate_limiter",
+      "kind": "api-property",
+      "key": "PartialNetworkInterface.tx_rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialNetworkInterface/properties/tx_rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:PartialPmem.id",
+      "kind": "api-property",
+      "key": "PartialPmem.id",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialPmem/properties/id",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:PartialPmem.rate_limiter",
+      "kind": "api-property",
+      "key": "PartialPmem.rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialPmem/properties/rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Pmem.id",
+      "kind": "api-property",
+      "key": "Pmem.id",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Pmem/properties/id",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Pmem.path_on_host",
+      "kind": "api-property",
+      "key": "Pmem.path_on_host",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Pmem/properties/path_on_host",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Pmem.rate_limiter",
+      "kind": "api-property",
+      "key": "Pmem.rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Pmem/properties/rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Pmem.read_only",
+      "kind": "api-property",
+      "key": "Pmem.read_only",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Pmem/properties/read_only",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Pmem.root_device",
+      "kind": "api-property",
+      "key": "Pmem.root_device",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Pmem/properties/root_device",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:RateLimiter.bandwidth",
+      "kind": "api-property",
+      "key": "RateLimiter.bandwidth",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/RateLimiter/properties/bandwidth",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:RateLimiter.ops",
+      "kind": "api-property",
+      "key": "RateLimiter.ops",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/RateLimiter/properties/ops",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SerialDevice.rate_limiter",
+      "kind": "api-property",
+      "key": "SerialDevice.rate_limiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SerialDevice/properties/rate_limiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SerialDevice.serial_out_path",
+      "kind": "api-property",
+      "key": "SerialDevice.serial_out_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SerialDevice/properties/serial_out_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotCreateParams.mem_file_path",
+      "kind": "api-property",
+      "key": "SnapshotCreateParams.mem_file_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotCreateParams/properties/mem_file_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotCreateParams.snapshot_path",
+      "kind": "api-property",
+      "key": "SnapshotCreateParams.snapshot_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotCreateParams/properties/snapshot_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotCreateParams.snapshot_type",
+      "kind": "api-property",
+      "key": "SnapshotCreateParams.snapshot_type",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotCreateParams/properties/snapshot_type",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.clock_realtime",
+      "kind": "api-property",
+      "key": "SnapshotLoadParams.clock_realtime",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams/properties/clock_realtime",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.enable_diff_snapshots",
+      "kind": "api-property",
+      "key": "SnapshotLoadParams.enable_diff_snapshots",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams/properties/enable_diff_snapshots",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.mem_backend",
+      "kind": "api-property",
+      "key": "SnapshotLoadParams.mem_backend",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams/properties/mem_backend",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.mem_file_path",
+      "kind": "api-property",
+      "key": "SnapshotLoadParams.mem_file_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams/properties/mem_file_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.network_overrides",
+      "kind": "api-property",
+      "key": "SnapshotLoadParams.network_overrides",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams/properties/network_overrides",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.resume_vm",
+      "kind": "api-property",
+      "key": "SnapshotLoadParams.resume_vm",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams/properties/resume_vm",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.snapshot_path",
+      "kind": "api-property",
+      "key": "SnapshotLoadParams.snapshot_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams/properties/snapshot_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.track_dirty_pages",
+      "kind": "api-property",
+      "key": "SnapshotLoadParams.track_dirty_pages",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams/properties/track_dirty_pages",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:SnapshotLoadParams.vsock_override",
+      "kind": "api-property",
+      "key": "SnapshotLoadParams.vsock_override",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams/properties/vsock_override",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:TokenBucket.one_time_burst",
+      "kind": "api-property",
+      "key": "TokenBucket.one_time_burst",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/TokenBucket/properties/one_time_burst",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:TokenBucket.refill_time",
+      "kind": "api-property",
+      "key": "TokenBucket.refill_time",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/TokenBucket/properties/refill_time",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:TokenBucket.size",
+      "kind": "api-property",
+      "key": "TokenBucket.size",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/TokenBucket/properties/size",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:VcpuFeatures.bitmap",
+      "kind": "api-property",
+      "key": "VcpuFeatures.bitmap",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/VcpuFeatures/properties/bitmap",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:VcpuFeatures.index",
+      "kind": "api-property",
+      "key": "VcpuFeatures.index",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/VcpuFeatures/properties/index",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Vm.state",
+      "kind": "api-property",
+      "key": "Vm.state",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Vm/properties/state",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Vsock.guest_cid",
+      "kind": "api-property",
+      "key": "Vsock.guest_cid",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Vsock/properties/guest_cid",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Vsock.uds_path",
+      "kind": "api-property",
+      "key": "Vsock.uds_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Vsock/properties/uds_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:Vsock.vsock_id",
+      "kind": "api-property",
+      "key": "Vsock.vsock_id",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Vsock/properties/vsock_id",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-property:VsockOverride.uds_path",
+      "kind": "api-property",
+      "key": "VsockOverride.uds_path",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/VsockOverride/properties/uds_path",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:ArmRegisterModifier",
+      "kind": "api-schema",
+      "key": "ArmRegisterModifier",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/ArmRegisterModifier",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:Balloon",
+      "kind": "api-schema",
+      "key": "Balloon",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Balloon",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:BalloonHintingStatus",
+      "kind": "api-schema",
+      "key": "BalloonHintingStatus",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonHintingStatus",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:BalloonStartCmd",
+      "kind": "api-schema",
+      "key": "BalloonStartCmd",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStartCmd",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:BalloonStats",
+      "kind": "api-schema",
+      "key": "BalloonStats",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStats",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:BalloonStatsUpdate",
+      "kind": "api-schema",
+      "key": "BalloonStatsUpdate",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonStatsUpdate",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:BalloonUpdate",
+      "kind": "api-schema",
+      "key": "BalloonUpdate",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BalloonUpdate",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:BootSource",
+      "kind": "api-schema",
+      "key": "BootSource",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/BootSource",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:CpuConfig",
+      "kind": "api-schema",
+      "key": "CpuConfig",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuConfig",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:CpuTemplate",
+      "kind": "api-schema",
+      "key": "CpuTemplate",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuTemplate",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:CpuidLeafModifier",
+      "kind": "api-schema",
+      "key": "CpuidLeafModifier",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuidLeafModifier",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:CpuidRegisterModifier",
+      "kind": "api-schema",
+      "key": "CpuidRegisterModifier",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/CpuidRegisterModifier",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:Drive",
+      "kind": "api-schema",
+      "key": "Drive",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Drive",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:EntropyDevice",
+      "kind": "api-schema",
+      "key": "EntropyDevice",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/EntropyDevice",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:Error",
+      "kind": "api-schema",
+      "key": "Error",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Error",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:FirecrackerVersion",
+      "kind": "api-schema",
+      "key": "FirecrackerVersion",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FirecrackerVersion",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:FullVmConfiguration",
+      "kind": "api-schema",
+      "key": "FullVmConfiguration",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/FullVmConfiguration",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:InstanceActionInfo",
+      "kind": "api-schema",
+      "key": "InstanceActionInfo",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/InstanceActionInfo",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:InstanceInfo",
+      "kind": "api-schema",
+      "key": "InstanceInfo",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/InstanceInfo",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:Logger",
+      "kind": "api-schema",
+      "key": "Logger",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Logger",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:MachineConfiguration",
+      "kind": "api-schema",
+      "key": "MachineConfiguration",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MachineConfiguration",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:MemoryBackend",
+      "kind": "api-schema",
+      "key": "MemoryBackend",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryBackend",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:MemoryHotplugConfig",
+      "kind": "api-schema",
+      "key": "MemoryHotplugConfig",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugConfig",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:MemoryHotplugSizeUpdate",
+      "kind": "api-schema",
+      "key": "MemoryHotplugSizeUpdate",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugSizeUpdate",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:MemoryHotplugStatus",
+      "kind": "api-schema",
+      "key": "MemoryHotplugStatus",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MemoryHotplugStatus",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:Metrics",
+      "kind": "api-schema",
+      "key": "Metrics",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Metrics",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:MmdsConfig",
+      "kind": "api-schema",
+      "key": "MmdsConfig",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MmdsConfig",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:MmdsContentsObject",
+      "kind": "api-schema",
+      "key": "MmdsContentsObject",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MmdsContentsObject",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:MsrModifier",
+      "kind": "api-schema",
+      "key": "MsrModifier",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/MsrModifier",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:NetworkInterface",
+      "kind": "api-schema",
+      "key": "NetworkInterface",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkInterface",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:NetworkOverride",
+      "kind": "api-schema",
+      "key": "NetworkOverride",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/NetworkOverride",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:PartialDrive",
+      "kind": "api-schema",
+      "key": "PartialDrive",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialDrive",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:PartialNetworkInterface",
+      "kind": "api-schema",
+      "key": "PartialNetworkInterface",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialNetworkInterface",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:PartialPmem",
+      "kind": "api-schema",
+      "key": "PartialPmem",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/PartialPmem",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:Pmem",
+      "kind": "api-schema",
+      "key": "Pmem",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Pmem",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:RateLimiter",
+      "kind": "api-schema",
+      "key": "RateLimiter",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/RateLimiter",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:SerialDevice",
+      "kind": "api-schema",
+      "key": "SerialDevice",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SerialDevice",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:SnapshotCreateParams",
+      "kind": "api-schema",
+      "key": "SnapshotCreateParams",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotCreateParams",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:SnapshotLoadParams",
+      "kind": "api-schema",
+      "key": "SnapshotLoadParams",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/SnapshotLoadParams",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:TokenBucket",
+      "kind": "api-schema",
+      "key": "TokenBucket",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/TokenBucket",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:VcpuFeatures",
+      "kind": "api-schema",
+      "key": "VcpuFeatures",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/VcpuFeatures",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:Vm",
+      "kind": "api-schema",
+      "key": "Vm",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Vm",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:Vsock",
+      "kind": "api-schema",
+      "key": "Vsock",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/Vsock",
+      "family": "api-contract"
+    },
+    {
+      "id": "api-schema:VsockOverride",
+      "kind": "api-schema",
+      "key": "VsockOverride",
+      "path": "src/firecracker/swagger/firecracker.yaml",
+      "anchor": "#/definitions/VsockOverride",
+      "family": "api-contract"
+    },
+    {
+      "id": "corpus:actions-api",
+      "kind": "corpus",
+      "key": "actions-api",
+      "path": "docs/api_requests/actions.md",
+      "anchor": "entire-file",
+      "family": "api-contract"
+    },
+    {
+      "id": "corpus:ballooning",
+      "kind": "corpus",
+      "key": "ballooning",
+      "path": "docs/ballooning.md",
+      "anchor": "entire-file",
+      "family": "memory-devices"
+    },
+    {
+      "id": "corpus:block-caching",
+      "kind": "corpus",
+      "key": "block-caching",
+      "path": "docs/api_requests/block-caching.md",
+      "anchor": "entire-file",
+      "family": "storage"
+    },
+    {
+      "id": "corpus:block-io-engine",
+      "kind": "corpus",
+      "key": "block-io-engine",
+      "path": "docs/api_requests/block-io-engine.md",
+      "anchor": "entire-file",
+      "family": "storage"
+    },
+    {
+      "id": "corpus:block-vhost-user",
+      "kind": "corpus",
+      "key": "block-vhost-user",
+      "path": "docs/api_requests/block-vhost-user.md",
+      "anchor": "entire-file",
+      "family": "storage"
+    },
+    {
+      "id": "corpus:cpu-boot-protocol",
+      "kind": "corpus",
+      "key": "cpu-boot-protocol",
+      "path": "docs/cpu_templates/boot-protocol.md",
+      "anchor": "entire-file",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "corpus:cpu-template-helper",
+      "kind": "corpus",
+      "key": "cpu-template-helper",
+      "path": "docs/cpu_templates/cpu-template-helper.md",
+      "anchor": "entire-file",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "corpus:cpu-templates",
+      "kind": "corpus",
+      "key": "cpu-templates",
+      "path": "docs/cpu_templates/cpu-templates.md",
+      "anchor": "entire-file",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "corpus:design",
+      "kind": "corpus",
+      "key": "design",
+      "path": "docs/design.md",
+      "anchor": "entire-file",
+      "family": "process"
+    },
+    {
+      "id": "corpus:device-api",
+      "kind": "corpus",
+      "key": "device-api",
+      "path": "docs/device-api.md",
+      "anchor": "entire-file",
+      "family": "device-transport"
+    },
+    {
+      "id": "corpus:device-hotplug",
+      "kind": "corpus",
+      "key": "device-hotplug",
+      "path": "docs/device-hotplug.md",
+      "anchor": "entire-file",
+      "family": "runtime-device-management"
+    },
+    {
+      "id": "corpus:entropy",
+      "kind": "corpus",
+      "key": "entropy",
+      "path": "docs/entropy.md",
+      "anchor": "entire-file",
+      "family": "remaining-devices"
+    },
+    {
+      "id": "corpus:formal-verification",
+      "kind": "corpus",
+      "key": "formal-verification",
+      "path": "docs/formal-verification.md",
+      "anchor": "entire-file",
+      "family": "specifications"
+    },
+    {
+      "id": "corpus:getting-started",
+      "kind": "corpus",
+      "key": "getting-started",
+      "path": "docs/getting-started.md",
+      "anchor": "entire-file",
+      "family": "process"
+    },
+    {
+      "id": "corpus:hugepages",
+      "kind": "corpus",
+      "key": "hugepages",
+      "path": "docs/hugepages.md",
+      "anchor": "entire-file",
+      "family": "machine-memory"
+    },
+    {
+      "id": "corpus:jailer",
+      "kind": "corpus",
+      "key": "jailer",
+      "path": "docs/jailer.md",
+      "anchor": "entire-file",
+      "family": "isolation"
+    },
+    {
+      "id": "corpus:logger",
+      "kind": "corpus",
+      "key": "logger",
+      "path": "docs/logger.md",
+      "anchor": "entire-file",
+      "family": "observability"
+    },
+    {
+      "id": "corpus:memory-hotplug",
+      "kind": "corpus",
+      "key": "memory-hotplug",
+      "path": "docs/memory-hotplug.md",
+      "anchor": "entire-file",
+      "family": "memory-devices"
+    },
+    {
+      "id": "corpus:metrics",
+      "kind": "corpus",
+      "key": "metrics",
+      "path": "docs/metrics.md",
+      "anchor": "entire-file",
+      "family": "observability"
+    },
+    {
+      "id": "corpus:mmds-design",
+      "kind": "corpus",
+      "key": "mmds-design",
+      "path": "docs/mmds/mmds-design.md",
+      "anchor": "entire-file",
+      "family": "network-and-mmds"
+    },
+    {
+      "id": "corpus:mmds-user-guide",
+      "kind": "corpus",
+      "key": "mmds-user-guide",
+      "path": "docs/mmds/mmds-user-guide.md",
+      "anchor": "entire-file",
+      "family": "network-and-mmds"
+    },
+    {
+      "id": "corpus:network-performance",
+      "kind": "corpus",
+      "key": "network-performance",
+      "path": "docs/network-performance.md",
+      "anchor": "entire-file",
+      "family": "specifications"
+    },
+    {
+      "id": "corpus:network-setup",
+      "kind": "corpus",
+      "key": "network-setup",
+      "path": "docs/network-setup.md",
+      "anchor": "entire-file",
+      "family": "network-and-mmds"
+    },
+    {
+      "id": "corpus:patch-block",
+      "kind": "corpus",
+      "key": "patch-block",
+      "path": "docs/api_requests/patch-block.md",
+      "anchor": "entire-file",
+      "family": "storage"
+    },
+    {
+      "id": "corpus:patch-network-interface",
+      "kind": "corpus",
+      "key": "patch-network-interface",
+      "path": "docs/api_requests/patch-network-interface.md",
+      "anchor": "entire-file",
+      "family": "network-and-mmds"
+    },
+    {
+      "id": "corpus:pmem",
+      "kind": "corpus",
+      "key": "pmem",
+      "path": "docs/pmem.md",
+      "anchor": "entire-file",
+      "family": "storage"
+    },
+    {
+      "id": "corpus:production-host",
+      "kind": "corpus",
+      "key": "production-host",
+      "path": "docs/prod-host-setup.md",
+      "anchor": "entire-file",
+      "family": "isolation"
+    },
+    {
+      "id": "corpus:release-changelog",
+      "kind": "corpus",
+      "key": "release-changelog",
+      "path": "CHANGELOG.md",
+      "anchor": "v1.16.0",
+      "family": "specifications"
+    },
+    {
+      "id": "corpus:rootfs-and-kernel",
+      "kind": "corpus",
+      "key": "rootfs-and-kernel",
+      "path": "docs/rootfs-and-kernel-setup.md",
+      "anchor": "entire-file",
+      "family": "boot-and-lifecycle"
+    },
+    {
+      "id": "corpus:seccomp",
+      "kind": "corpus",
+      "key": "seccomp",
+      "path": "docs/seccomp.md",
+      "anchor": "entire-file",
+      "family": "isolation"
+    },
+    {
+      "id": "corpus:seccompiler",
+      "kind": "corpus",
+      "key": "seccompiler",
+      "path": "docs/seccompiler.md",
+      "anchor": "entire-file",
+      "family": "isolation"
+    },
+    {
+      "id": "corpus:snapshot-editor",
+      "kind": "corpus",
+      "key": "snapshot-editor",
+      "path": "docs/snapshotting/snapshot-editor.md",
+      "anchor": "entire-file",
+      "family": "snapshots"
+    },
+    {
+      "id": "corpus:snapshot-network-clones",
+      "kind": "corpus",
+      "key": "snapshot-network-clones",
+      "path": "docs/snapshotting/network-for-clones.md",
+      "anchor": "entire-file",
+      "family": "snapshots"
+    },
+    {
+      "id": "corpus:snapshot-page-faults",
+      "kind": "corpus",
+      "key": "snapshot-page-faults",
+      "path": "docs/snapshotting/handling-page-faults-on-snapshot-resume.md",
+      "anchor": "entire-file",
+      "family": "snapshots"
+    },
+    {
+      "id": "corpus:snapshot-random-clones",
+      "kind": "corpus",
+      "key": "snapshot-random-clones",
+      "path": "docs/snapshotting/random-for-clones.md",
+      "anchor": "entire-file",
+      "family": "snapshots"
+    },
+    {
+      "id": "corpus:snapshot-support",
+      "kind": "corpus",
+      "key": "snapshot-support",
+      "path": "docs/snapshotting/snapshot-support.md",
+      "anchor": "entire-file",
+      "family": "snapshots"
+    },
+    {
+      "id": "corpus:snapshot-versioning",
+      "kind": "corpus",
+      "key": "snapshot-versioning",
+      "path": "docs/snapshotting/versioning.md",
+      "anchor": "entire-file",
+      "family": "snapshots"
+    },
+    {
+      "id": "corpus:specification",
+      "kind": "corpus",
+      "key": "specification",
+      "path": "SPECIFICATION.md",
+      "anchor": "entire-file",
+      "family": "specifications"
+    },
+    {
+      "id": "corpus:tracing",
+      "kind": "corpus",
+      "key": "tracing",
+      "path": "docs/tracing.md",
+      "anchor": "entire-file",
+      "family": "observability"
+    },
+    {
+      "id": "corpus:vsock",
+      "kind": "corpus",
+      "key": "vsock",
+      "path": "docs/vsock.md",
+      "anchor": "entire-file",
+      "family": "vsock"
+    },
+    {
+      "id": "firecracker-argument:api-sock",
+      "kind": "firecracker-argument",
+      "key": "api-sock",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(api-sock)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:boot-timer",
+      "kind": "firecracker-argument",
+      "key": "boot-timer",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(boot-timer)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:config-file",
+      "kind": "firecracker-argument",
+      "key": "config-file",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(config-file)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:describe-snapshot",
+      "kind": "firecracker-argument",
+      "key": "describe-snapshot",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(describe-snapshot)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:enable-pci",
+      "kind": "firecracker-argument",
+      "key": "enable-pci",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(enable-pci)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:http-api-max-payload-size",
+      "kind": "firecracker-argument",
+      "key": "http-api-max-payload-size",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(http-api-max-payload-size)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:id",
+      "kind": "firecracker-argument",
+      "key": "id",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(id)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:level",
+      "kind": "firecracker-argument",
+      "key": "level",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(level)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:log-path",
+      "kind": "firecracker-argument",
+      "key": "log-path",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(log-path)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:metadata",
+      "kind": "firecracker-argument",
+      "key": "metadata",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(metadata)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:metrics-path",
+      "kind": "firecracker-argument",
+      "key": "metrics-path",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(metrics-path)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:mmds-size-limit",
+      "kind": "firecracker-argument",
+      "key": "mmds-size-limit",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(mmds-size-limit)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:module",
+      "kind": "firecracker-argument",
+      "key": "module",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(module)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:no-api",
+      "kind": "firecracker-argument",
+      "key": "no-api",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(no-api)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:no-seccomp",
+      "kind": "firecracker-argument",
+      "key": "no-seccomp",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(no-seccomp)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:parent-cpu-time-us",
+      "kind": "firecracker-argument",
+      "key": "parent-cpu-time-us",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(parent-cpu-time-us)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:seccomp-filter",
+      "kind": "firecracker-argument",
+      "key": "seccomp-filter",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(seccomp-filter)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:show-level",
+      "kind": "firecracker-argument",
+      "key": "show-level",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(show-level)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:show-log-origin",
+      "kind": "firecracker-argument",
+      "key": "show-log-origin",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(show-log-origin)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:snapshot-version",
+      "kind": "firecracker-argument",
+      "key": "snapshot-version",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(snapshot-version)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:start-time-cpu-us",
+      "kind": "firecracker-argument",
+      "key": "start-time-cpu-us",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(start-time-cpu-us)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:start-time-us",
+      "kind": "firecracker-argument",
+      "key": "start-time-us",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(start-time-us)",
+      "family": "process"
+    },
+    {
+      "id": "firecracker-argument:version",
+      "kind": "firecracker-argument",
+      "key": "version",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "Argument::new(version)",
+      "family": "process"
+    },
+    {
+      "id": "non-swagger-route:DELETE /drives/{drive_id}",
+      "kind": "non-swagger-route",
+      "key": "DELETE /drives/{drive_id}",
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "anchor": "(Method::Delete, \"drives\", None)",
+      "family": "storage"
+    },
+    {
+      "id": "non-swagger-route:DELETE /network-interfaces/{iface_id}",
+      "kind": "non-swagger-route",
+      "key": "DELETE /network-interfaces/{iface_id}",
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "anchor": "(Method::Delete, \"network-interfaces\", None)",
+      "family": "network-and-mmds"
+    },
+    {
+      "id": "non-swagger-route:DELETE /pmem/{id}",
+      "kind": "non-swagger-route",
+      "key": "DELETE /pmem/{id}",
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "anchor": "(Method::Delete, \"pmem\", None)",
+      "family": "storage"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/compare/curr",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/fingerprint/compare/curr",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "FingerprintOperation::Compare.curr",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/compare/filters",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/fingerprint/compare/filters",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "FingerprintOperation::Compare.filters",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/compare/prev",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/fingerprint/compare/prev",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "FingerprintOperation::Compare.prev",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/dump/config",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/fingerprint/dump/config",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "FingerprintOperation::Dump.config",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/dump/output",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/fingerprint/dump/output",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "FingerprintOperation::Dump.output",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/fingerprint/dump/template",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/fingerprint/dump/template",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "FingerprintOperation::Dump.template",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/dump/config",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/template/dump/config",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Dump.config",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/dump/output",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/template/dump/output",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Dump.output",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/dump/template",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/template/dump/template",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Dump.template",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/strip/paths",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/template/strip/paths",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Strip.paths",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/strip/suffix",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/template/strip/suffix",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Strip.suffix",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/verify/config",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/template/verify/config",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Verify.config",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:cpu-template-helper/template/verify/template",
+      "kind": "tool-argument",
+      "key": "cpu-template-helper/template/verify/template",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Verify.template",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-argument:jailer/cgroup",
+      "kind": "tool-argument",
+      "key": "jailer/cgroup",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--cgroup",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/cgroup-version",
+      "kind": "tool-argument",
+      "key": "jailer/cgroup-version",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--cgroup-version",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/chroot-base-dir",
+      "kind": "tool-argument",
+      "key": "jailer/chroot-base-dir",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--chroot-base-dir",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/daemonize",
+      "kind": "tool-argument",
+      "key": "jailer/daemonize",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--daemonize",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/exec-file",
+      "kind": "tool-argument",
+      "key": "jailer/exec-file",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--exec-file",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/gid",
+      "kind": "tool-argument",
+      "key": "jailer/gid",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--gid",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/id",
+      "kind": "tool-argument",
+      "key": "jailer/id",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--id",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/netns",
+      "kind": "tool-argument",
+      "key": "jailer/netns",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--netns",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/new-pid-ns",
+      "kind": "tool-argument",
+      "key": "jailer/new-pid-ns",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--new-pid-ns",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/parent-cgroup",
+      "kind": "tool-argument",
+      "key": "jailer/parent-cgroup",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--parent-cgroup",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/resource-limit",
+      "kind": "tool-argument",
+      "key": "jailer/resource-limit",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--resource-limit",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/uid",
+      "kind": "tool-argument",
+      "key": "jailer/uid",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--uid",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:jailer/version",
+      "kind": "tool-argument",
+      "key": "jailer/version",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "--version",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:rebase-snap/base-file",
+      "kind": "tool-argument",
+      "key": "rebase-snap/base-file",
+      "path": "src/rebase-snap/src/main.rs",
+      "anchor": "--base-file",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-argument:rebase-snap/diff-file",
+      "kind": "tool-argument",
+      "key": "rebase-snap/diff-file",
+      "path": "src/rebase-snap/src/main.rs",
+      "anchor": "--diff-file",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-argument:seccompiler/basic",
+      "kind": "tool-argument",
+      "key": "seccompiler/basic",
+      "path": "src/seccompiler/src/bin.rs",
+      "anchor": "--basic",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:seccompiler/input-file",
+      "kind": "tool-argument",
+      "key": "seccompiler/input-file",
+      "path": "src/seccompiler/src/bin.rs",
+      "anchor": "--input-file",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:seccompiler/output-file",
+      "kind": "tool-argument",
+      "key": "seccompiler/output-file",
+      "path": "src/seccompiler/src/bin.rs",
+      "anchor": "--output-file",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:seccompiler/split-output",
+      "kind": "tool-argument",
+      "key": "seccompiler/split-output",
+      "path": "src/seccompiler/src/bin.rs",
+      "anchor": "--split-output",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:seccompiler/target-arch",
+      "kind": "tool-argument",
+      "key": "seccompiler/target-arch",
+      "path": "src/seccompiler/src/bin.rs",
+      "anchor": "--target-arch",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-memory/rebase/diff-path",
+      "kind": "tool-argument",
+      "key": "snapshot-editor/edit-memory/rebase/diff-path",
+      "path": "src/snapshot-editor/src/edit_memory.rs",
+      "anchor": "--diff-path",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-memory/rebase/memory-path",
+      "kind": "tool-argument",
+      "key": "snapshot-editor/edit-memory/rebase/memory-path",
+      "path": "src/snapshot-editor/src/edit_memory.rs",
+      "anchor": "--memory-path",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/output-path",
+      "kind": "tool-argument",
+      "key": "snapshot-editor/edit-vmstate/remove-regs/output-path",
+      "path": "src/snapshot-editor/src/edit_vmstate.rs",
+      "anchor": "--output-path",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/regs",
+      "kind": "tool-argument",
+      "key": "snapshot-editor/edit-vmstate/remove-regs/regs",
+      "path": "src/snapshot-editor/src/edit_vmstate.rs",
+      "anchor": "regs",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/vmstate-path",
+      "kind": "tool-argument",
+      "key": "snapshot-editor/edit-vmstate/remove-regs/vmstate-path",
+      "path": "src/snapshot-editor/src/edit_vmstate.rs",
+      "anchor": "--vmstate-path",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/info-vmstate/vcpu-states/vmstate-path",
+      "kind": "tool-argument",
+      "key": "snapshot-editor/info-vmstate/vcpu-states/vmstate-path",
+      "path": "src/snapshot-editor/src/info.rs",
+      "anchor": "VcpuStates.vmstate_path",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/info-vmstate/version/vmstate-path",
+      "kind": "tool-argument",
+      "key": "snapshot-editor/info-vmstate/version/vmstate-path",
+      "path": "src/snapshot-editor/src/info.rs",
+      "anchor": "Version.vmstate_path",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-argument:snapshot-editor/info-vmstate/vm-state/vmstate-path",
+      "kind": "tool-argument",
+      "key": "snapshot-editor/info-vmstate/vm-state/vmstate-path",
+      "path": "src/snapshot-editor/src/info.rs",
+      "anchor": "VmState.vmstate_path",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/fingerprint/compare",
+      "kind": "tool-operation",
+      "key": "cpu-template-helper/fingerprint/compare",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "FingerprintOperation::Compare",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/fingerprint/dump",
+      "kind": "tool-operation",
+      "key": "cpu-template-helper/fingerprint/dump",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "FingerprintOperation::Dump",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/template/dump",
+      "kind": "tool-operation",
+      "key": "cpu-template-helper/template/dump",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Dump",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/template/strip",
+      "kind": "tool-operation",
+      "key": "cpu-template-helper/template/strip",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Strip",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-operation:cpu-template-helper/template/verify",
+      "kind": "tool-operation",
+      "key": "cpu-template-helper/template/verify",
+      "path": "src/cpu-template-helper/src/main.rs",
+      "anchor": "TemplateOperation::Verify",
+      "family": "cpu-and-machine"
+    },
+    {
+      "id": "tool-operation:firecracker/run",
+      "kind": "tool-operation",
+      "key": "firecracker/run",
+      "path": "src/firecracker/src/main.rs",
+      "anchor": "build_arg_parser",
+      "family": "process"
+    },
+    {
+      "id": "tool-operation:jailer/run",
+      "kind": "tool-operation",
+      "key": "jailer/run",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "build_arg_parser",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-operation:rebase-snap/rebase",
+      "kind": "tool-operation",
+      "key": "rebase-snap/rebase",
+      "path": "src/rebase-snap/src/main.rs",
+      "anchor": "rebase",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-operation:seccompiler/compile",
+      "kind": "tool-operation",
+      "key": "seccompiler/compile",
+      "path": "src/seccompiler/src/bin.rs",
+      "anchor": "compile_bpf",
+      "family": "isolation"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/edit-memory/rebase",
+      "kind": "tool-operation",
+      "key": "snapshot-editor/edit-memory/rebase",
+      "path": "src/snapshot-editor/src/edit_memory.rs",
+      "anchor": "EditMemorySubCommand::Rebase",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/edit-vmstate/remove-regs",
+      "kind": "tool-operation",
+      "key": "snapshot-editor/edit-vmstate/remove-regs",
+      "path": "src/snapshot-editor/src/edit_vmstate.rs",
+      "anchor": "EditVmStateSubCommand::RemoveRegs",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/info-vmstate/vcpu-states",
+      "kind": "tool-operation",
+      "key": "snapshot-editor/info-vmstate/vcpu-states",
+      "path": "src/snapshot-editor/src/info.rs",
+      "anchor": "InfoVmStateSubCommand::VcpuStates",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/info-vmstate/version",
+      "kind": "tool-operation",
+      "key": "snapshot-editor/info-vmstate/version",
+      "path": "src/snapshot-editor/src/info.rs",
+      "anchor": "InfoVmStateSubCommand::Version",
+      "family": "snapshots"
+    },
+    {
+      "id": "tool-operation:snapshot-editor/info-vmstate/vm-state",
+      "kind": "tool-operation",
+      "key": "snapshot-editor/info-vmstate/vm-state",
+      "path": "src/snapshot-editor/src/info.rs",
+      "anchor": "InfoVmStateSubCommand::VmState",
+      "family": "snapshots"
+    }
+  ]
+}
