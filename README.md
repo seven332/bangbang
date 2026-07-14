@@ -35,6 +35,7 @@ crates/api        Firecracker-compatible API request and response surface
 crates/runtime    Backend-neutral VM model, memory, MMIO, boot, and device helpers
 crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
+crates/launcher   Production app bundle, nested-worker validation, and supervision
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
 ```
@@ -218,6 +219,53 @@ cargo run -p bangbang -- \
   --config-file /tmp/bangbang-vm.json \
   --no-api
 ```
+
+## Production macOS Bundle
+
+The direct `cargo run -p bangbang` path above is intentionally uncontained: it
+runs the VMM as the invoking user and relies on host filesystem permissions and
+per-resource validation. The production entry point instead has a fixed
+two-process topology:
+
+```text
+Bangbang.app                          dev.bangbang
+├── Contents/MacOS/bangbang           unsandboxed launcher
+└── Contents/Helpers/BangbangWorker.app
+    └── Contents/MacOS/bangbang-worker  App Sandbox + Hypervisor worker
+```
+
+Build and exclusively publish it to an absent destination named
+`Bangbang.app`:
+
+```sh
+scripts/build-production-bundle.sh --output /private/operator/Bangbang.app
+```
+
+Ad-hoc signing (`-`) is the local-validation default. A distribution build can
+supply one identity for both separately signed code objects:
+
+```sh
+scripts/build-production-bundle.sh \
+  --output /private/operator/Bangbang.app \
+  --signing-identity "Developer ID Application: Example (TEAMID)"
+```
+
+The worker is signed first with exactly App Sandbox and Hypervisor
+entitlements; the outer launcher is signed last without either entitlement.
+Both use Hardened Runtime. Before every launch, the outer executable validates
+the fixed bundle layout, nested signatures, identifiers, and required worker
+entitlements, then forwards all arguments and inherited standard streams to the
+embedded worker. It forwards `SIGINT` and `SIGTERM` and preserves the worker's
+ordinary exit status.
+
+Contained mode currently supports only app-container or sealed bundle
+resources. The public build wrapper does not embed guest files, and there is no
+security-scoped bookmark, external-file grant, descriptor broker, vmnet
+provisioning, authenticated launcher protocol, restart/crash-coupling policy,
+Developer ID possession proof, or notarization workflow yet. Static signature
+validation rejects modification at rest but is not atomic against a same-user
+concurrent replacement between validation and execution. See
+[macOS Host Security Model](docs/security.md) for the precise trust boundary.
 
 ## API Examples
 
@@ -498,6 +546,7 @@ cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 cargo test -p bangbang-hvf --lib --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo clippy -p bangbang-launcher --test production_bundle_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
 
@@ -518,6 +567,18 @@ HVF lifecycle suite with App Sandbox plus Hypervisor entitlements, and checks
 that the real executable accepts an app-container API socket while rejecting
 the default `/tmp` socket and outside configuration paths. It validates an
 Apple containment building block, not a production sandboxed distribution.
+
+Build and run the separately signed production launcher/worker boundary on its
+own:
+
+```sh
+scripts/run-integration-tests.sh --test production_bundle
+```
+
+This target verifies exact identifiers, entitlements, Hardened Runtime, strict
+nested signature validation, tamper rejection, container-only path denial and
+redaction, API readiness, graceful-signal forwarding, owned-socket cleanup, and
+a real sandboxed HVF guest through `SYSTEM_OFF`.
 
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
 validation work:

@@ -649,6 +649,7 @@ cargo clippy -p bangbang --test executable_hvf_e2e --all-features --locked --tar
 cargo clippy -p bangbang --test app_sandbox_process_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
+cargo clippy -p bangbang-launcher --test production_bundle_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
 
@@ -670,6 +671,7 @@ scripts/run-integration-tests.sh --test hvf_lifecycle
 scripts/run-integration-tests.sh --test guest_boot
 scripts/run-integration-tests.sh --test executable_hvf_e2e
 scripts/run-integration-tests.sh --test app_sandbox
+scripts/run-integration-tests.sh --test production_bundle
 ```
 
 The `app_sandbox` target is integration-only. It packages the existing
@@ -688,6 +690,39 @@ distribution, security-scoped bookmarks, and launcher/resource-broker
 protocols. A naked CLI binary is not a valid App Sandbox artifact; bundle
 identity is part of this test contract. `--allow-unsupported` still builds and
 signs both app bundles before runtime validation may be skipped.
+
+The `production_bundle` target exercises the shipped topology instead of the
+minimal App Sandbox fixtures. It performs a release build, creates one fixed
+outer app and separately signed nested worker, inspects both signatures, and
+compiles the disabled-by-default `production_bundle_e2e` target before an
+unsupported runner may skip execution. On supported Apple Silicon it proves:
+
+- exact launcher and worker identifiers, Hardened Runtime on both, no launcher
+  App Sandbox/Hypervisor authority, and exactly those two worker entitlements;
+- unchanged help/output and representative nonzero worker exit forwarding;
+- rejection before worker execution when a private bundle copy has a modified
+  or missing worker;
+- container-only API socket readiness plus path-redacted denial of an outside
+  config file;
+- `SIGINT` and `SIGTERM` forwarding with successful worker/launcher exit and
+  owned-socket cleanup; and
+- a sealed test-only kernel/initrd/config launching a real sandboxed HVF guest
+  through PSCI `SYSTEM_OFF` without an API socket.
+
+The runner's resource overlay is an internal signed-test input to the lower-
+level package tool. `scripts/build-production-bundle.sh` does not expose it or
+place guest resources in a normal product. Tests use readiness events and
+bounded deadlines rather than fixed sleeps.
+
+Build a local production bundle without running the integration suite:
+
+```sh
+scripts/build-production-bundle.sh --output /path/to/Bangbang.app
+```
+
+The destination must be absent and named `Bangbang.app`. The wrapper builds for
+`aarch64-apple-darwin`, uses ad-hoc signing by default, and accepts one optional
+signing identity for both independently signed code objects.
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two

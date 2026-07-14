@@ -362,6 +362,25 @@ claim. These named product and architecture boundaries, the sparse metrics
 schema, and the serial RX/stdout/native-v1 limits replace an open-ended “full
 logging and metrics” placeholder.
 
+The ordinary `bangbang` CLI remains the direct, uncontained process entry point.
+The separate production `Bangbang.app` entry point has a fixed unsandboxed
+launcher and one nested `dev.bangbang.worker` VMM. The worker is separately
+signed with exactly App Sandbox and Hypervisor entitlements, while the launcher
+has neither; both use Hardened Runtime. Assembly is private and no-clobber,
+inspects both code objects before exclusive publication, and runtime launch
+fails closed on wrong placement, symlinks, missing or modified code, signature,
+identifier, or required-entitlement failures.
+
+The launcher forwards worker arguments and inherited streams unchanged,
+forwards graceful `SIGINT`/`SIGTERM`, preserves ordinary worker status, and
+never signals after child reap. Signed Apple Silicon evidence covers strict
+nested validation, at-rest tamper rejection, outside-path denial/redaction,
+container API readiness and cleanup, both graceful signals, and a real
+sandboxed HVF guest ending through PSCI `SYSTEM_OFF`. This is macOS containment,
+not direct Linux jailer/seccomp equivalence. It does not yet provide external
+resource grants, vmnet provisioning, an authenticated session protocol, full
+crash coupling, launch constraints, Developer ID possession, or notarization.
+
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current
 socket, host-path, HVF entitlement, guest-data, and multi-process boundaries, and
@@ -2957,12 +2976,14 @@ macOS design work instead of direct implementation:
 
 The initial compatibility scope should document these differences without
 pretending they are solved. See [macOS Host Security Model](security.md) for the
-current host isolation boundary. The integration-only App Sandbox target proves
-that all signed HVF lifecycle tests run in an entitled app bundle, that a
-container API socket works and cleans up, and that the default `/tmp` socket plus
-an outside config file are denied with redacted errors. It does not turn the
-ordinary CLI into a sandboxed product or select a launcher, security-scoped
-bookmark, vmnet-provisioning, or resource-broker architecture.
+host isolation boundary. The lower-level `app_sandbox` target proves that the
+HVF lifecycle and process can execute inside App Sandbox. The separate
+`production_bundle` target proves the fixed launcher/nested-worker package,
+signature and entitlement split, tamper gate, container denial/redaction,
+signal/exit forwarding, socket cleanup, and real HVF guest lifecycle. The
+ordinary CLI remains uncontained, and security-scoped grants, authenticated
+resource brokerage, vmnet provisioning, Linux seccomp outcome classification,
+and deployment signing policy remain later #1351 work.
 
 ## Validation Expectations
 
@@ -2973,12 +2994,12 @@ surface:
 - golden tests for Firecracker-shaped API responses once the API exists
 - real HVF-backed integration tests on macOS Apple Silicon through
   `scripts/run-integration-tests.sh`, which signs the selected HVF test
-  binaries or executable e2e artifacts with the
-  `com.apple.security.hypervisor` entitlement before running them; the script
-  prepares the pinned Firecracker kernel plus generated tiny initrd for guest
-  boot and executable HVF e2e tests, and fails when the host cannot run HVF
-  tests unless CI explicitly uses `--allow-unsupported` after build/sign
-  validation
+  binaries, executable e2e artifacts, or fixed production bundle before running
+  them; the production worker receives App Sandbox plus Hypervisor entitlements
+  while its launcher receives neither. The script prepares the pinned
+  Firecracker kernel plus generated tiny initrd for guest boot, executable HVF
+  e2e, and production bundle tests, and fails when the host cannot run HVF tests
+  unless CI explicitly uses `--allow-unsupported` after build/sign validation
 
 Changes that alter support status or validation coverage should also update
 [Firecracker Validation Matrix](firecracker-validation-matrix.md).

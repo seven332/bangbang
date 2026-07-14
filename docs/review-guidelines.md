@@ -29,6 +29,7 @@ cargo clippy -p bangbang --test executable_hvf_e2e --all-features --locked --tar
 cargo clippy -p bangbang --test app_sandbox_process_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
+cargo clippy -p bangbang-launcher --test production_bundle_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
 
@@ -37,10 +38,11 @@ HVF-backed integration targets. These tests should not be skipped or ignored on
 hosts that support HVF. Hosted CI may use
 `scripts/run-integration-tests.sh --allow-unsupported` to validate build/sign
 behavior without executing HVF when the runner does not support it.
-Changes to signing, entitlements, host-resource policy, or macOS isolation must
-also retain the integration-only `app_sandbox` target in that wrapper. Review
-its claims as bundle/HVF/resource-boundary validation, not as a production
-sandboxed distribution or launcher.
+Changes to signing, entitlements, host-resource policy, the launcher, or macOS
+isolation must retain both `app_sandbox` and `production_bundle` targets in that
+wrapper. The former is the narrow containment-building-block gate. The latter
+must exercise the fixed production topology, separately inspect both code
+objects, reject modified nested code, and launch a real sandboxed HVF guest.
 
 Reviewers should confirm the PR body lists the checks that were run. If any
 command is intentionally skipped, the PR should explain why the skipped command
@@ -105,6 +107,13 @@ Unsafe code belongs behind small FFI wrappers. Every unsafe block must have a
 specific `SAFETY:` explanation, and the wrapper should translate platform errors
 into project errors without panics.
 
+For production bundle changes, review signing order, exact entitlements and
+identifiers, fixed executable placement, strict nested validation, same-volume
+exclusive publication, private staging cleanup, and error redaction. Existing
+destinations must never be replaced or merged. Static-code validation is an
+at-rest tamper gate; do not treat it as atomic protection from concurrent
+same-user replacement without a stronger launch-constraint design.
+
 ## Concurrency and Resource Management
 
 Review file descriptors, Unix sockets, temporary files, signal handlers, and VM
@@ -114,6 +123,11 @@ Cleanup must not delete resources that were replaced by another process.
 Look for races, deadlocks, missed wakeups, and transient error handling. Signal
 shutdown should not depend on unreachable state, arbitrary delays, or a socket
 path remaining available after startup.
+
+The production launcher owns one child. Review signal-versus-reap ordering so a
+PID is never signaled after the child has been reaped and could be reused;
+ordinary child exits must be preserved, while signal exits use the documented
+`128 + signal` mapping.
 
 ## Performance Review
 

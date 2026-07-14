@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-supported_tests=(hvf_lifecycle guest_boot executable_hvf_e2e app_sandbox)
+supported_tests=(hvf_lifecycle guest_boot executable_hvf_e2e app_sandbox production_bundle)
 
 usage() {
   cat <<'EOF'
@@ -15,7 +15,7 @@ Options:
   --allow-unsupported  Exit 0 instead of 1 when the host cannot execute HVF.
   --test NAME          Run one integration test target. Can be repeated.
                        Supported values: hvf_lifecycle, guest_boot,
-                       executable_hvf_e2e, app_sandbox.
+                       executable_hvf_e2e, app_sandbox, production_bundle.
   -h, --help           Show this help.
 
 Arguments after -- are passed to each signed Rust test binary or executable
@@ -228,6 +228,71 @@ build_app_sandbox_tests() {
     --no-run
 }
 
+build_production_bundle_tests() {
+  if [[ -z "$guest_kernel_path" || -z "$guest_initrd_path" ]]; then
+    echo "production bundle validation requires guest kernel and initrd fixtures" >&2
+    exit 1
+  fi
+
+  cargo build \
+    -p bangbang \
+    -p bangbang-launcher \
+    --bin bangbang \
+    --bin bangbang-launcher \
+    --release \
+    --all-features \
+    --locked \
+    --target "$target_triple"
+
+  cargo build \
+    -p bangbang-launcher \
+    --bin bangbang-bundle \
+    --release \
+    --locked
+
+  production_bundle_path="$tmp_dir/Bangbang.app"
+  production_resources="$tmp_dir/production-bundle-resources"
+  mkdir -p "$production_resources"
+  cp -p -- "$guest_kernel_path" "$production_resources/guest-kernel"
+  cp -p -- "$guest_initrd_path" "$production_resources/guest-initrd"
+
+  production_worker_resources="$production_bundle_path/Contents/Helpers/BangbangWorker.app/Contents/Resources"
+  python3 - \
+    "$production_worker_resources/guest-kernel" \
+    "$production_worker_resources/guest-initrd" \
+    "$production_resources/vm-config.json" <<'PY'
+import json
+import sys
+
+kernel_path, initrd_path, output_path = sys.argv[1:]
+config = {
+    "machine-config": {"vcpu_count": 1, "mem_size_mib": 256},
+    "boot-source": {
+        "kernel_image_path": kernel_path,
+        "initrd_path": initrd_path,
+        "boot_args": "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init",
+    },
+}
+with open(output_path, "w", encoding="utf-8") as output:
+    json.dump(config, output, separators=(",", ":"))
+PY
+
+  "$repo_root/target/release/bangbang-bundle" \
+    --launcher "$repo_root/target/$target_triple/release/bangbang-launcher" \
+    --worker "$repo_root/target/$target_triple/release/bangbang" \
+    --output "$production_bundle_path" \
+    --signing-identity - \
+    --test-worker-resources "$production_resources"
+
+  cargo test \
+    -p bangbang-launcher \
+    --test production_bundle_e2e \
+    --all-features \
+    --locked \
+    --target "$target_triple" \
+    --no-run
+}
+
 build_executable_hvf_e2e() {
   executable_hvf_e2e_bangbang="$tmp_dir/bangbang"
   scripts/build-signed-bangbang.sh --output "$executable_hvf_e2e_bangbang"
@@ -262,7 +327,9 @@ guest_kernel_path=""
 guest_initrd_path=""
 guest_rootfs_path=""
 guest_ext4_rootfs_path=""
-if contains guest_boot "${selected_tests[@]}" || contains executable_hvf_e2e "${selected_tests[@]}"; then
+if contains guest_boot "${selected_tests[@]}" \
+  || contains executable_hvf_e2e "${selected_tests[@]}" \
+  || contains production_bundle "${selected_tests[@]}"; then
   guest_kernel_path="$(scripts/fetch-firecracker-kernel.sh)"
   guest_initrd_path="$(scripts/build-guest-boot-initrd.py --check)"
 fi
@@ -278,11 +345,15 @@ signed_test_bins=()
 executable_hvf_e2e_bangbang=""
 app_sandbox_hvf_bin=""
 app_sandbox_bangbang_bin=""
+production_bundle_path=""
 
 for test_name in "${selected_tests[@]}"; do
   case "$test_name" in
     app_sandbox)
       build_app_sandbox_tests
+      ;;
+    production_bundle)
+      build_production_bundle_tests
       ;;
     executable_hvf_e2e)
       build_executable_hvf_e2e
@@ -374,6 +445,31 @@ if contains app_sandbox "${selected_tests[@]}"; then
       cargo test \
         -p bangbang \
         --test app_sandbox_process_e2e \
+        --all-features \
+        --locked \
+        --target "$target_triple" \
+        -- \
+        --test-threads=1 \
+        "${test_args[@]}"
+  fi
+fi
+
+if contains production_bundle "${selected_tests[@]}"; then
+  if [[ "${#test_args[@]}" -eq 0 ]]; then
+    BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
+      cargo test \
+        -p bangbang-launcher \
+        --test production_bundle_e2e \
+        --all-features \
+        --locked \
+        --target "$target_triple" \
+        -- \
+        --test-threads=1
+  else
+    BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
+      cargo test \
+        -p bangbang-launcher \
+        --test production_bundle_e2e \
         --all-features \
         --locked \
         --target "$target_triple" \

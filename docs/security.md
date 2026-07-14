@@ -6,19 +6,23 @@ Firecracker's full production isolation model on macOS.
 
 ## Security Boundary
 
-bangbang currently follows Firecracker's one-process-per-microVM model. One
+Direct mode follows Firecracker's one-VMM-process-per-microVM model. One
 `bangbang` process owns one API socket, one VMM controller, one HVF-backed
-startup path, and the host resources configured for that microVM.
+startup path, and the host resources configured for that microVM. Production
+bundle mode adds one outer supervisor process while retaining exactly one
+sandbox worker and one VMM ownership domain per invocation.
 
 Normal startup uses non-clobbering fd-table preallocation as a Firecracker-style
 performance guard. Failing to read the descriptor limit or duplicate a
 descriptor is non-fatal; failing to close a successfully duplicated descriptor is
 fatal. The setup does not overwrite inherited high-numbered descriptors.
 
-The current trusted boundary is the host user account and the local filesystem
-permissions around configured host paths. API clients, API request bodies,
-guest-provided MMIO data, guest memory, and configured host paths must be treated
-as untrusted input.
+Direct mode trusts the host user account and local filesystem permissions around
+configured paths. Production bundle mode additionally trusts its outer launcher,
+fixed metadata, and signed nested worker, while App Sandbox limits that worker
+to container or sealed resources. API clients, API request bodies,
+guest-provided MMIO data, guest memory, and configured host paths remain
+untrusted input in both modes.
 
 There is no authentication on the HTTP-over-Unix-socket API. bangbang restricts
 the published socket inode to owner-only permissions, and access control still
@@ -38,17 +42,18 @@ map to the current macOS/HVF scaffold:
 - privilege dropping after privileged resource preparation
 
 bangbang currently rejects Linux-specific Firecracker process options rather
-than silently accepting them. There is no production sandboxed distribution,
-resource broker, launcher process, or Firecracker-jailer replacement yet.
+than silently accepting them. The production bundle supplies a macOS App
+Sandbox launcher/worker boundary, but no external resource broker, exact
+seccomp/jailer outcome replacement, or complete distribution-signing policy yet.
 
 Apple App Sandbox is a supportable containment building block, not a direct
-jailer port. The signed integration runner packages real binaries as minimal app
-bundles with only App Sandbox and Hypervisor entitlements. The complete HVF
-lifecycle suite runs inside that boundary. Process tests prove that a socket in
-the app container is usable and cleaned on `SIGINT`, while the default `/tmp`
-socket and a config path outside the container are denied without path leakage.
-The shipped CLI remains an ordinary non-sandboxed executable; no production app
-bundle or resource policy is provided.
+jailer port. The lower-level signed target packages real binaries as minimal
+apps and proves the complete HVF lifecycle plus container allow/deny behavior.
+The production target separately proves the fixed outer app and nested worker,
+exact entitlement split, signature validation, signal supervision, owned socket
+cleanup, and a real sandboxed guest. The direct CLI remains an ordinary
+non-sandboxed executable; the production bundle's current resource policy is
+container or sealed resources only.
 
 ## Platform-Limit Taxonomy
 
@@ -79,9 +84,9 @@ changes Firecracker-facing behavior or security posture:
   when the public process boundary is affected.
 - Operator-owned policy: socket-directory permissions,
   host-path ownership, and current resource-sharing rules are deployment
-  assumptions until a launcher or resource broker exists. Document the
-  assumption and test that one `bangbang` process does not clean up resources it
-  no longer owns.
+  assumptions until the production launcher has an authenticated resource-
+  broker protocol. Document the assumption and test that one `bangbang` process
+  does not clean up resources it no longer owns.
 
 When a capability moves between these categories, update the compatibility docs,
 validation matrix, tests, and related issue links in the same PR.
@@ -95,10 +100,10 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Platform-limited unsupported | Reject matching Firecracker process options or document a concrete macOS replacement before accepting any no-op behavior. |
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
-| HVF entitlement and code signing | Implemented normal and App Sandbox validation paths | Keep real HVF tests in signed targets and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
+| HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
 | Network and vmnet | Implemented virtio-MMIO/MMDS-only subset; direct vmnet conditional | Keep supported `host_dev_name` forms, startup validation, MMDS-only behavior, entitlement requirements, and non-goals documented when network behavior changes. |
-| macOS App Sandbox | Signed feasibility and resource-denial boundary validated | Keep the integration app bundles minimal and do not claim that the ordinary CLI or a production distribution is sandboxed. |
-| Launcher or resource broker | Unimplemented product architecture | Keep host-path and shared-resource authority as operator responsibility unless a separately approved broker design is implemented. |
+| macOS App Sandbox | Production nested worker implemented for container/sealed resources | Keep the ordinary CLI explicitly uncontained and prove both package identity and real worker allow/deny behavior. |
+| Launcher and resource broker | Fixed pre-protocol launcher implemented; external resource broker missing | Keep host-path and shared-resource authority as operator responsibility until an authenticated, separately approved broker protocol is implemented. |
 
 ## Native Snapshot Composite and Device Boundary
 
@@ -193,20 +198,23 @@ namespace preflight.
 
 ## macOS Isolation Design Boundaries
 
-The current isolation boundary is one macOS process running as the invoking host
-user. bangbang does not yet split privilege between a launcher, broker, and VMM
-worker, and it does not install a sandbox profile. The host user account,
-filesystem permissions, API socket directory, and per-resource validation are
-therefore the only deployed host isolation controls.
+bangbang has two explicit execution modes. The direct CLI is one uncontained
+macOS process running as the invoking host user; its controls are the host user
+account, filesystem permissions, API socket directory, and per-resource
+validation. The production bundle has an unsandboxed outer launcher and one
+separately signed nested VMM worker constrained by App Sandbox. The launcher has
+no Hypervisor or App Sandbox entitlement and the worker has exactly both. This
+is a real deployed containment boundary, but it is not Firecracker's Linux
+jailer and does not yet authorize external resources.
 
 Use the following boundaries when designing or reviewing macOS isolation work:
 
 | Boundary or option | Current behavior | Future direction |
 | --- | --- | --- |
 | Operator-owned private directories | Required for API sockets, vsock sockets, observability sinks, and other configured paths that should not be shared. | A launcher or broker could create and own these directories before starting a VM process. |
-| HVF entitlement and code signing | Required to execute Hypervisor.framework code paths; signed integration wrappers cover the validation path. | A production launcher may control which executable receives the entitlement, but the entitlement itself is not guest containment. |
-| macOS App Sandbox | Integration-only app bundles run all signed HVF lifecycle tests and explicit process allow/deny checks. The ordinary CLI is not sandboxed. | A production bundle must define resource-specific container, bookmark, entitlement, and distribution policy before it is a claimed deployed boundary. |
-| Launcher or resource broker | Not implemented. | A future process could prepare privileged or shared host resources, pass owned descriptors to the VMM, and centralize cleanup policy. |
+| HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
+| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container or sealed bundle resources are the current contained-mode policy. | Security-scoped external grants and vmnet authorization require later explicit policy. |
+| Launcher or resource broker | The production launcher validates fixed nested code, starts one embedded worker, forwards arguments/signals, and preserves status. It does not open or transfer VM resources. | An authenticated protocol could grant owned descriptors/resources and centralize replacement-safe cleanup. |
 | Firecracker Linux jailer model | Platform-limited unsupported as a direct port. | Keep Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege-drop flags rejected or documented until macOS replacements exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
@@ -234,9 +242,67 @@ The test entitlements contain only `com.apple.security.app-sandbox` and
 `com.apple.security.hypervisor`. They do not grant vmnet, arbitrary files,
 full-disk access, or a private sandbox profile. Apple requires user-selected
 access or security-scoped URLs/bookmarks for many external files; a production
-sandboxed bangbang would therefore need a container-only resource policy or a
-separately designed launcher/broker that transfers authorized resources. This
-repository does not claim or ship either architecture.
+sandboxed VMM therefore needs either container/sealed resources or a separately
+designed launcher/broker that transfers authorized resources. The production
+bundle currently ships the first policy only; the public build wrapper embeds
+no guest resources, and no external grant or broker protocol is claimed.
+
+## Production Bundle and Signed Worker Boundary
+
+`scripts/build-production-bundle.sh` produces exactly one fixed topology:
+
+```text
+Bangbang.app                         identifier dev.bangbang
+└── Contents
+    ├── Info.plist
+    ├── MacOS/bangbang              outer launcher
+    └── Helpers/BangbangWorker.app  identifier dev.bangbang.worker
+        └── Contents
+            ├── Info.plist
+            └── MacOS/bangbang-worker
+```
+
+The package tool accepts already built regular launcher and worker files, an
+absent final `Bangbang.app`, and one signing identity. It assembles a private
+mode-0700 sibling staging tree, signs the worker first with exactly App Sandbox
+and Hypervisor entitlements, signs the outer app last without an entitlement
+file, and requires Hardened Runtime on both. It inspects plist identity and
+executable fields, signatures, entitlement separation, and strict recursive
+validity before a same-volume exclusive rename publishes the final bundle.
+Existing destinations are never replaced or merged. Failed assembly removes
+only the private unpublished staging tree; tool output, identities, paths, and
+worker data are omitted from product errors.
+
+At runtime the launcher derives the worker from its own exact bundle location;
+there is no environment, working-directory, or user-path override. It rejects
+symlinked, missing, nonregular, wrongly identified, or invalidly signed code,
+any outer entitlement, and any worker entitlement dictionary other than exactly
+App Sandbox and Hypervisor set to Boolean true before child output or readiness.
+Security.framework
+validates the outer and worker code requirements with strict, all-architecture,
+nested, and symlink-restriction checks, and reads each static signature to
+require Hardened Runtime. This detects package modification at rest. The
+compiled requirements do not anchor a certificate or Team ID, so
+they do not authenticate a wholly replaced and separately validly signed
+package. Validation is also not atomic against a same-user concurrent mutation
+between validation and execution; kernel launch constraints and a deployment
+minimum/team policy are deferred.
+
+The launcher passes the original argument bytes unchanged, inherits standard
+streams, owns one child, forwards graceful `SIGINT` and `SIGTERM`, and preserves
+ordinary exit codes. Its kqueue event loop processes pending signal events
+before reaping a child-exit batch and never signals after reap, preventing PID
+reuse from redirecting a late forward. An otherwise signaled child maps to
+`128 + signal`. There is no authenticated readiness/session protocol, external
+resource grant, descriptor transfer, restart policy, daemonization, parent-
+death kill, or complete two-way crash-coupling claim in this boundary.
+
+The outer launcher, fixed metadata, and signed nested code are trusted package
+components. API requests, guest data, device input, host path arguments, and
+HVF exits remain untrusted worker inputs. Container and sealed bundle resources
+are the only current contained resource authority. vmnet, snapshots, vsock
+paths, observability sinks, and arbitrary kernel/disk/config paths need later
+resource-specific grants before the production worker can safely use them.
 
 ## vmnet Host Policy Boundary
 
@@ -283,8 +349,8 @@ Configured RX/TX token buckets are implemented as device-local queue admission
 with retained work and session-owned retry wakeups. They are not packet
 filters, a host firewall, or a NAT policy, and current signed limiter evidence
 uses MMDS-only packet I/O rather than direct vmnet. The boundary still lacks
-packet filtering, production network isolation, a sandbox profile, a
-launcher/resource broker, runtime network hotplug, limiter-specific metrics,
+packet filtering, production network isolation, sandbox-worker vmnet authority
+and resource brokerage, runtime network hotplug, limiter-specific metrics,
 network snapshot state, and full Firecracker public packet-movement parity.
 
 ## API Socket Handling
@@ -893,6 +959,13 @@ features should add resource-specific redaction and file-type tests.
 Real Hypervisor.framework execution requires macOS support, Apple Silicon, and
 the `com.apple.security.hypervisor` entitlement on binaries that enter HVF.
 
+In the production bundle only `dev.bangbang.worker` receives that entitlement,
+paired with `com.apple.security.app-sandbox`; `dev.bangbang` receives neither.
+The two code objects are independently signed with one identity and Hardened
+Runtime, then recursively verified before publication and again through the
+launcher at execution. The default ad-hoc identity is local validation, not
+Developer ID or notarization evidence.
+
 The unsigned Rust test path runs only non-HVF unit tests. Real HVF integration
 tests must run through `scripts/run-integration-tests.sh`. This wrapper builds
 the selected HVF test binaries or executable e2e artifacts, creates a temporary
@@ -1228,14 +1301,22 @@ Use unique paths for:
 
 Each process owns its own VMM controller state and observability sinks. There is
 no global registry that prevents two processes from using the same host path.
-Path isolation is therefore an operator responsibility until a future launcher
-or resource broker exists.
+Path isolation is therefore an operator responsibility until the production
+launcher grows an authenticated resource-broker protocol.
+
+Each production launcher owns exactly one sandbox worker and does not share
+that child across invocations. The fixed process relationship prevents
+alternate worker selection, but it does not allocate unique external resources
+or coordinate them across launcher instances.
 
 ## Current Non-Goals
 
 The current scaffold does not implement:
 
-- a production macOS App Sandbox distribution or resource policy
+- external-resource grants or a complete production resource-broker policy for
+  the sandbox worker
+- Developer ID possession, notarization, kernel launch constraints, or an
+  authenticated launcher/worker session and complete crash-coupling policy
 - a Firecracker-jailer replacement
 - privilege dropping
 - host resource brokering
