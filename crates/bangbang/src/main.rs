@@ -1492,7 +1492,10 @@ impl Args {
     where
         I: IntoIterator<Item = OsString>,
     {
-        let args = args.into_iter().collect::<Vec<_>>();
+        let args = args
+            .into_iter()
+            .take_while(|arg| arg != "--")
+            .collect::<Vec<_>>();
 
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             return Ok(Self {
@@ -1518,7 +1521,10 @@ impl Args {
     where
         I: IntoIterator<Item = String>,
     {
-        let args = args.into_iter().collect::<Vec<_>>();
+        let args = args
+            .into_iter()
+            .take_while(|arg| arg != "--")
+            .collect::<Vec<_>>();
 
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             return Ok(Self {
@@ -1873,20 +1879,21 @@ fn help_text() -> String {
             "  bangbang [OPTIONS]\n\n",
             "Value-taking long options accept either --name value or --name=value.\n",
             "Value-less flags reject attached values.\n\n",
+            "A standalone -- ends option parsing; following tokens are ignored.\n\n",
             "Options:\n",
             "      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n",
             "      --boot-timer      Enable Firecracker-compatible guest boot-time logging\n",
             "      --config-file <PATH>\n",
             "                         Firecracker-shaped config file for API-enabled startup\n",
             "      --http-api-max-payload-size <BYTES>\n",
-            "                         Maximum HTTP API request body size [default: {}]\n",
+            "                         Maximum HTTP API request body size (non-negative) [default: {}]\n",
             "      --id <ID>          MicroVM unique identifier [default: {}]\n",
-            "                         Accepts 1-64 bytes, ASCII alphanumeric or '-'\n",
+            "                         Accepts 1-64 bytes, Unicode alphanumeric or '-'\n",
             "      --log-path <PATH>  Logger output file or FIFO path\n",
             "      --level <LEVEL>    Logger level: Off, Trace, Debug, Info, Warn, Warning, or Error\n",
             "      --metrics-path <PATH>  Metrics output file or FIFO path\n",
             "      --mmds-size-limit <BYTES>\n",
-            "                         MMDS data store size; defaults to HTTP API limit\n",
+            "                         Non-negative MMDS data store size; defaults to HTTP API limit\n",
             "      --metadata <PATH>  JSON metadata file used to initialize MMDS at startup\n",
             "      --module <MODULE>  Logger module prefix filter for minimal action logs\n",
             "      --no-api          Start from --config-file without publishing an API socket\n",
@@ -1974,7 +1981,7 @@ fn validate_api_sock(api_sock: &str) -> Result<(), String> {
 }
 
 fn parse_http_api_max_payload_size(value: &str) -> Result<usize, String> {
-    parse_positive_usize_arg(value, "http-api-max-payload-size")
+    parse_usize_arg(value, "http-api-max-payload-size")
 }
 
 fn validate_config_file_path(config_file: &str) -> Result<(), String> {
@@ -2004,7 +2011,7 @@ fn validate_startup_file_path(path: &str, name: &str) -> Result<(), String> {
 }
 
 fn parse_mmds_size_limit(value: &str) -> Result<usize, String> {
-    parse_positive_usize_arg(value, "mmds-size-limit")
+    parse_usize_arg(value, "mmds-size-limit")
 }
 
 fn parse_startup_time_us(value: &str, name: &str) -> Result<u64, String> {
@@ -2013,16 +2020,10 @@ fn parse_startup_time_us(value: &str, name: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid --{name}: value must be a non-negative integer"))
 }
 
-fn parse_positive_usize_arg(value: &str, name: &str) -> Result<usize, String> {
-    let parsed = value
+fn parse_usize_arg(value: &str, name: &str) -> Result<usize, String> {
+    value
         .parse::<usize>()
-        .map_err(|_| format!("invalid --{name}: value must be a positive integer"))?;
-
-    if parsed == 0 {
-        return Err(format!("invalid --{name}: value must be greater than 0"));
-    }
-
-    Ok(parsed)
+        .map_err(|_| format!("invalid --{name}: value must be a non-negative integer"))
 }
 
 fn validate_instance_id(id: &str) -> Result<(), String> {
@@ -2036,7 +2037,7 @@ fn validate_instance_id(id: &str) -> Result<(), String> {
     }
 
     for (position, ch) in id.chars().enumerate() {
-        if !(ch == '-' || ch.is_ascii_alphanumeric()) {
+        if !(ch == '-' || ch.is_alphanumeric()) {
             return Err(format!(
                 "invalid --id: invalid character {ch:?} at position {position}"
             ));
@@ -2996,6 +2997,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_os_separator_ignores_non_utf8_extra_args() {
+        let args = Args::parse_os([
+            OsString::from("--id"),
+            OsString::from("demo-1"),
+            OsString::from("--"),
+            OsString::from_vec(vec![0xff]),
+        ])
+        .expect("arguments after the separator should be ignored");
+
+        let Command::Run(config) = args.command else {
+            panic!("separator input should remain a run command");
+        };
+        assert_eq!(config.id, "demo-1");
+    }
+
+    #[test]
     fn rejects_non_utf8_process_arg() {
         let err =
             Args::parse_os([OsString::from_vec(vec![0xff])]).expect_err("non-utf8 arg should fail");
@@ -3040,6 +3057,10 @@ mod tests {
             help.contains("Value-taking long options accept either --name value or --name=value")
         );
         assert!(help.contains("Value-less flags reject attached values"));
+        assert!(help.contains("A standalone -- ends option parsing"));
+        assert!(help.contains("Unicode alphanumeric or '-'"));
+        assert!(help.contains("Maximum HTTP API request body size (non-negative)"));
+        assert!(help.contains("Non-negative MMDS data store size"));
         assert!(help.contains("GET /vm/config"));
         assert!(help.contains("--boot-timer"));
         assert!(help.contains("--config-file <PATH>"));
@@ -3126,6 +3147,22 @@ mod tests {
         let args = parse(&["-V"]).expect("short version arg should parse");
 
         assert_eq!(args.command, Command::Version);
+    }
+
+    #[test]
+    fn parse_separator_ignores_following_help_version_and_unknown_args() {
+        let config = parse_run(&[
+            "--id",
+            "demo-1",
+            "--",
+            "--help",
+            "--version",
+            "--unknown",
+            "positional",
+        ])
+        .expect("arguments after the separator should be ignored");
+
+        assert_eq!(config.id, "demo-1");
     }
 
     #[test]
@@ -3224,12 +3261,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_zero_and_max_http_api_payload_size_args() {
+        let zero = parse_run(&["--http-api-max-payload-size", "0"])
+            .expect("zero HTTP payload size should parse");
+        let maximum = usize::MAX.to_string();
+        let max = parse_run(&["--http-api-max-payload-size", &maximum])
+            .expect("maximum HTTP payload size should parse");
+
+        assert_eq!(zero.http_api_max_payload_size, 0);
+        assert_eq!(max.http_api_max_payload_size, usize::MAX);
+    }
+
+    #[test]
     fn parse_mmds_size_limit_arg() {
         let config =
             parse_run(&["--mmds-size-limit", "65536"]).expect("MMDS size limit should parse");
 
         assert_eq!(config.mmds_size_limit, Some(65_536));
         assert_eq!(config.effective_mmds_size_limit(), 65_536);
+    }
+
+    #[test]
+    fn parse_zero_and_max_mmds_size_limit_args() {
+        let zero =
+            parse_run(&["--mmds-size-limit", "0"]).expect("zero MMDS size limit should parse");
+        let maximum = usize::MAX.to_string();
+        let max = parse_run(&["--mmds-size-limit", &maximum])
+            .expect("maximum MMDS size limit should parse");
+
+        assert_eq!(zero.mmds_size_limit, Some(0));
+        assert_eq!(zero.effective_mmds_size_limit(), 0);
+        assert_eq!(max.mmds_size_limit, Some(usize::MAX));
+        assert_eq!(max.effective_mmds_size_limit(), usize::MAX);
     }
 
     #[test]
@@ -3762,20 +3825,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_http_api_max_payload_size() {
-        let err = parse(&["--http-api-max-payload-size", "0"])
-            .expect_err("zero payload size should fail");
-
-        assert_eq!(
-            err,
-            "invalid --http-api-max-payload-size: value must be greater than 0"
-        );
-
         let err = parse(&["--http-api-max-payload-size", "abc"])
             .expect_err("non-numeric payload size should fail");
 
         assert_eq!(
             err,
-            "invalid --http-api-max-payload-size: value must be a positive integer"
+            "invalid --http-api-max-payload-size: value must be a non-negative integer"
         );
 
         let err = parse(&[
@@ -3786,25 +3841,18 @@ mod tests {
 
         assert_eq!(
             err,
-            "invalid --http-api-max-payload-size: value must be a positive integer"
+            "invalid --http-api-max-payload-size: value must be a non-negative integer"
         );
     }
 
     #[test]
     fn rejects_invalid_mmds_size_limit() {
-        let err = parse(&["--mmds-size-limit", "0"]).expect_err("zero MMDS size should fail");
-
-        assert_eq!(
-            err,
-            "invalid --mmds-size-limit: value must be greater than 0"
-        );
-
         let err =
             parse(&["--mmds-size-limit", "abc"]).expect_err("non-numeric MMDS size should fail");
 
         assert_eq!(
             err,
-            "invalid --mmds-size-limit: value must be a positive integer"
+            "invalid --mmds-size-limit: value must be a non-negative integer"
         );
 
         let err = parse(&["--mmds-size-limit", "999999999999999999999999999999"])
@@ -3812,7 +3860,7 @@ mod tests {
 
         assert_eq!(
             err,
-            "invalid --mmds-size-limit: value must be a positive integer"
+            "invalid --mmds-size-limit: value must be a non-negative integer"
         );
     }
 
@@ -3995,16 +4043,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_id_with_non_ascii_alphanumeric() {
+    fn accepts_id_with_non_ascii_alphanumeric() {
         const NON_ASCII_ALPHANUMERIC: char = '\u{e9}';
 
         let id = format!("vm{NON_ASCII_ALPHANUMERIC}1");
-        let err = Args::parse(["--id".to_string(), id]).expect_err("non-ascii id should fail");
+        let args = Args::parse(["--id".to_string(), id.clone()])
+            .expect("Unicode alphanumeric id should parse");
 
-        assert_eq!(
-            err.to_string(),
-            format!("invalid --id: invalid character {NON_ASCII_ALPHANUMERIC:?} at position 2")
-        );
+        let Command::Run(config) = args.command else {
+            panic!("id input should remain a run command");
+        };
+        assert_eq!(config.id, id);
+    }
+
+    #[test]
+    fn accepts_multibyte_id_at_max_length_by_bytes() {
+        let id = "\u{e9}".repeat(MAX_INSTANCE_ID_LEN / 2);
+        let args =
+            Args::parse(["--id".to_string(), id.clone()]).expect("64-byte Unicode id should parse");
+
+        let Command::Run(config) = args.command else {
+            panic!("id input should remain a run command");
+        };
+        assert_eq!(config.id, id);
+    }
+
+    #[test]
+    fn rejects_id_with_unicode_punctuation_or_symbol() {
+        for (id, invalid, position) in [("vm·1", '·', 2), ("vm💥1", '💥', 2)] {
+            let err = Args::parse(["--id".to_string(), id.to_string()])
+                .expect_err("Unicode punctuation and symbols should fail");
+
+            assert_eq!(
+                err.to_string(),
+                format!("invalid --id: invalid character {invalid:?} at position {position}")
+            );
+        }
     }
 
     #[test]
@@ -4054,7 +4128,7 @@ mod tests {
 
         assert_eq!(
             err,
-            "invalid --http-api-max-payload-size: value must be a positive integer"
+            "invalid --http-api-max-payload-size: value must be a non-negative integer"
         );
     }
 

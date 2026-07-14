@@ -425,8 +425,13 @@ explicit boundaries rather than unqualified future “full” observability work
 
 ## Process Startup CLI
 
-The current `bangbang` executable parses only the first process-lifecycle
-arguments and starts the first API socket surface. It binds a Unix socket and
+The current `bangbang` executable has a checked Firecracker v1.16.0 process
+contract for all 23 configured argument names. Eighteen argument leaves have
+implemented and verified process-facing behavior; PCI, both seccomp flags, and
+both Firecracker snapshot-artifact commands remain explicit cross-family
+handoffs. The exact audit and evidence are recorded in
+[`compat/firecracker/v1.16.0/process-contract.md`](../compat/firecracker/v1.16.0/process-contract.md).
+The executable binds a Unix socket and
 serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,
 `GET /hotplug/memory`, pre-boot `PUT /machine-config`, pre-boot
 `PUT /boot-source` configuration storage, and pre-boot
@@ -450,8 +455,8 @@ management remains deferred.
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
 | `--api-sock <PATH>` | binds the API Unix socket | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
-| `--http-api-max-payload-size <BYTES>` | configures the maximum accepted HTTP API request body size | Defaults to Firecracker's `51200` byte limit. The configured value applies to the HTTP body declared by `Content-Length`; request-head bytes are bounded separately by bangbang's parser safety cap. Zero, malformed, and duplicate values are rejected during argument parsing. |
-| `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. |
+| `--http-api-max-payload-size <BYTES>` | configures the maximum accepted HTTP API request body size | Defaults to Firecracker's `51200` byte limit and accepts the complete non-negative `usize` domain. The configured value applies to the HTTP body declared by `Content-Length`; request-head bytes are bounded separately by bangbang's parser safety cap. A zero limit permits bodyless requests and returns `413 Payload Too Large` for every nonempty body. Malformed, overflowing, and duplicate values are rejected during argument parsing. |
+| `--id <ID>` | parsed, validated, and stored | Defaults to Firecracker's `anonymous-instance`. IDs use Firecracker's 1-to-64 UTF-8-byte bound and accept `-` or any Unicode alphanumeric character. The exact accepted value is returned through `GET /`; punctuation, symbols, empty values, and byte-overlong multibyte values fail before readiness. |
 | `--start-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, session-initial, explicit runtime, 60-second periodic, and normal-terminal metrics output includes `api_server.process_startup_time_us` as the sampled monotonic clock minus this value, saturating at zero for future timestamps. |
 | `--start-time-cpu-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, session-initial, explicit runtime, 60-second periodic, and normal-terminal metrics output includes `api_server.process_startup_time_cpu_us` as the sampled process CPU clock minus this value, saturating at zero for future timestamps before adding optional parent CPU time. |
 | `--parent-cpu-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When `--start-time-cpu-us` is also provided, every emitted store value adds this value into `api_server.process_startup_time_cpu_us`; it is not serialized separately. |
@@ -462,7 +467,7 @@ management remains deferred.
 | `--show-level` | enables level prefix for minimal logger events | Writes `level=Info` before minimal API request, action, and boot-timer log lines. |
 | `--show-log-origin` | enables origin field for implemented logger events | Writes `origin=<file>:<line>` before API request, action, and boot-timer log messages. |
 | `--boot-timer` | enables guest boot-time logging | Registers the Firecracker aarch64 pseudo-MMIO boot timer at `0x4000_0000`; a guest write of byte value `123` at offset `0` logs elapsed wall and process CPU time through the configured logger sink when level and module filters allow `Info` for `bangbang_runtime::boot_timer`. This is process observability state and is not exposed in `GET /vm/config`. |
-| `--mmds-size-limit <BYTES>` | configures the maximum serialized MMDS data-store size | When omitted, follows the effective HTTP API payload limit like Firecracker; with default HTTP settings this is `51200` bytes. Zero, malformed, and duplicate values are rejected during argument parsing. |
+| `--mmds-size-limit <BYTES>` | configures the maximum serialized MMDS data-store size | When omitted, follows the effective HTTP API payload limit like Firecracker; with default HTTP settings this is `51200` bytes. The complete non-negative `usize` domain is accepted. A zero limit permits startup and rejects every serialized JSON object through the MMDS data-store-limit response. Malformed, overflowing, and duplicate values fail during argument parsing. |
 | `--metadata <PATH>` | initializes MMDS data before API serving or no-api readiness | Reads a readable regular UTF-8 JSON metadata file up to 1 MiB and applies it through the same runtime validation and serialized data-store limit as `PUT /mmds`. Malformed files, non-object data, oversized files, duplicate object keys, empty paths, control-character paths, and missing-value inputs fail before readiness. |
 | `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. In API-enabled mode, the API socket is published only after successful startup. Malformed files, oversized files, duplicate object keys, unknown sections, unsupported sections, or invalid sections fail before socket publication or no-api readiness. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
@@ -534,14 +539,18 @@ not exist in the supported device subset remain absent rather than appearing as
 synthetic zero-filled fields. The startup timing stores match Firecracker's
 `ProcessTimeReporter` field names for the implemented process path.
 
-bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
-This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
-Unicode alphanumeric characters.
-
 Supported value-taking startup arguments accept both Firecracker-style
 `--arg value` and `--arg=value` forms. Value-less flags, such as `--no-api`,
 `--show-level`, `--show-log-origin`, and `--snapshot-version`, reject attached
 values.
+
+Like Firecracker's shared parser, the first standalone `--` ends option
+parsing. The Firecracker main process does not consume retained extra
+`String` arguments, so bangbang ignores following help/version spellings,
+unknown options, and positional values. Bangbang additionally splits
+`OsString` input before UTF-8 conversion, safely ignoring non-UTF-8 bytes after
+the separator; Firecracker collects `env::args()` before parsing, so this last
+behavior is a bangbang robustness extension rather than an upstream claim.
 
 `--config-file` currently accepts the supported Firecracker-shaped sections
 `machine-config`, `boot-source`, `drives`, `network-interfaces`,
