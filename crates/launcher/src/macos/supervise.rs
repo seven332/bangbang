@@ -240,44 +240,51 @@ fn wait_session_inner(
 
     let mut decoder = FrameDecoder::default();
     let mut cancellation_deadline: Option<Instant> = None;
-    let mut disconnect_deadline: Option<Instant> = None;
-    let mut child_exited;
+    let mut exit_deadline: Option<Instant> = None;
+    let mut session_closed = false;
     loop {
-        let deadline = match (cancellation_deadline, disconnect_deadline) {
+        let deadline = match (cancellation_deadline, exit_deadline) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
             (None, None) => None,
         };
-        let timeout =
-            deadline.and_then(|deadline: Instant| deadline.checked_duration_since(Instant::now()));
+        let timeout = timeout_until(deadline);
         let events = wait_events(kqueue.as_raw_fd(), timeout)?;
-        child_exited = false;
-        for queued in events {
-            if queued.filter == libc::EVFILT_PROC
+        let child_exited = events.iter().any(|queued| {
+            queued.filter == libc::EVFILT_PROC
                 && queued.ident == child_pid
                 && queued.fflags & libc::NOTE_EXIT != 0
-            {
-                child_exited = true;
-                continue;
-            }
-            if queued.filter == libc::EVFILT_READ && queued.ident == session_fd {
-                if disconnect_deadline.is_none()
-                    && drain_session(session, &mut decoder, lifecycle, namespace, terminal)?
-                {
-                    disconnect_deadline = Some(Instant::now() + DISCONNECT_GRACE);
+        });
+        // Protocol state and EOF take precedence over same-batch signals. This
+        // preserves an already-observed worker exit and avoids writing Cancel to
+        // a channel that the worker has just closed.
+        for queued in &events {
+            if !session_closed && queued.filter == libc::EVFILT_READ && queued.ident == session_fd {
+                session_closed =
+                    drain_session(session, &mut decoder, lifecycle, namespace, terminal)?;
+                if session_closed {
+                    exit_deadline.get_or_insert(Instant::now() + DISCONNECT_GRACE);
                     register_events(
                         kqueue.as_raw_fd(),
                         &[event(session_fd, libc::EVFILT_READ, libc::EV_DELETE, 0)],
                     )?;
                 }
-                continue;
             }
+        }
+        if terminal.is_some() {
+            exit_deadline.get_or_insert(Instant::now() + DISCONNECT_GRACE);
+        }
+
+        for queued in &events {
             for signal in &mut wakeups.signals {
                 let signal_fd = usize::try_from(signal.reader.as_raw_fd())
                     .map_err(|_| LauncherError::SignalSetup(io::ErrorKind::InvalidInput))?;
                 if queued.filter == libc::EVFILT_READ
                     && queued.ident == signal_fd
                     && signal.drain()?
+                    && !child_exited
+                    && !session_closed
+                    && terminal.is_none()
                     && !lifecycle.is_cancelled()
                 {
                     let signal = match signal.signal {
@@ -297,10 +304,12 @@ fn wait_session_inner(
         if child_exited {
             // Drain all bytes made readable with this exit before reaping, so
             // terminal state cannot lose a same-batch race.
-            let _ = drain_session(session, &mut decoder, lifecycle, namespace, terminal)?;
+            if !session_closed {
+                let _ = drain_session(session, &mut decoder, lifecycle, namespace, terminal)?;
+            }
             break;
         }
-        if disconnect_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if exit_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(LauncherError::SessionProtocol);
         }
         if cancellation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -312,6 +321,10 @@ fn wait_session_inner(
     }
 
     worker.wait()
+}
+
+fn timeout_until(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
 }
 
 fn drain_session(
@@ -535,5 +548,14 @@ mod tests {
         );
         let signaled = ExitStatus::from_raw(libc::SIGTERM);
         assert_eq!(public_exit_code(signaled), Some(128 + 15));
+    }
+
+    #[test]
+    fn expired_deadline_is_an_immediate_timeout() {
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test deadline should be representable");
+        assert_eq!(timeout_until(Some(deadline)), Some(Duration::ZERO));
+        assert_eq!(timeout_until(None), None);
     }
 }
