@@ -171,6 +171,82 @@ bangbang should follow Firecracker's process model: one `bangbang` process
 manages one microVM. Future API work should keep the control plane outside the
 guest execution fast path.
 
+## Firecracker v1.16.0 Remaining-Device Audit
+
+The remaining-device baseline is pinned to Firecracker
+[`v1.16.0`](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/CHANGELOG.md#L9-L116)
+at commit `d83d72b710361a10294480131377b1b00b163af8`. “Implemented” below means the
+documented macOS/HVF virtio-MMIO subset, not Linux/KVM mechanism or complete
+optional-device parity.
+
+| Firecracker delta | bangbang classification |
+| --- | --- |
+| [#5786 PCI hotplug/hot-unplug](https://github.com/firecracker-microvm/firecracker/pull/5786) for block, pmem, and net | Transport-limited. Firecracker requires optional PCI plus manual guest rescan/removal; bangbang keeps tested nonmutating runtime PUT/DELETE rejection on virtio-MMIO. |
+| [#5789 pmem rate limiting](https://github.com/firecracker-microvm/firecracker/pull/5789) | Implemented for the supported pmem subset. Like [Firecracker's queue](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/pmem/device.rs#L362-L452), a non-empty coalesced event charges one operation plus the exact backing length before flush; bangbang retains throttled work for a session-owned retry and supports atomic live limiter replacement. |
+| [#5906 64-byte aarch64 `rng-seed`](https://github.com/firecracker-microvm/firecracker/pull/5906) and [#5762 64-KiB virtio-rng cap](https://github.com/firecracker-microvm/firecracker/pull/5762) | Implemented. The pinned upstream source shows the [64-byte FDT property](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/fdt.rs#L275-L283) and [64-KiB queue bound](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/rng/device.rs#L31-L35). |
+| [#5760 VMGenID ACPI HID](https://github.com/firecracker-microvm/firecracker/pull/5760) | Not applicable to bangbang's aarch64 DeviceTree-only device. Its `microsoft,vmgenid` node matches the pinned [Firecracker DeviceTree shape](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/fdt.rs#L289-L299), and native-v1 load replaces the generation and notifies the guest. |
+| [#5793 cross-slot virtio-mem updates](https://github.com/firecracker-microvm/firecracker/pull/5793) | Implemented at bangbang's block-owned/HVF-mapping abstraction. Firecracker updates [every intersecting KVM slot](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/mem/device.rs#L502-L554); bangbang does not expose KVM slot identity and instead proves adjacent, partial, cross-conceptual-slot, and rollback behavior over exact dynamic mappings. |
+| [#5794 balloon statistics bound](https://github.com/firecracker-microvm/firecracker/pull/5794) and [#5884 hinting `204`](https://github.com/firecracker-microvm/firecracker/pull/5884) | Implemented. Statistics are bounded to the same [256-tag limit](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/balloon/device.rs#L48-L52); hinting routes return `204 No Content`. |
+| [#5818 virtio initialization/status sequencing](https://github.com/firecracker-microvm/firecracker/pull/5818) | The new PCI sequencing is transport-limited; existing virtio-MMIO ordered initialization and clear-bit rejection except reset are implemented and tested. |
+| [#5809 x86 KVM clock restore](https://github.com/firecracker-microvm/firecracker/pull/5809) | Platform/profile-limited. It is not the aarch64 startup VMClock contract; mutable VMClock restore/signaling remains outside native-v1. |
+
+Other v1.16.0 changelog entries are not silently absorbed into this device
+scope. [#5824 serial limiting](https://github.com/firecracker-microvm/firecracker/pull/5824)
+is covered by the implemented TX limiter, while
+[#5799 log callsite limiting](https://github.com/firecracker-microvm/firecracker/pull/5799)
+remains in the broader observability scope. Network MTU
+[#5828](https://github.com/firecracker-microvm/firecracker/pull/5828) and vsock
+`EVENT_IDX` [#5872](https://github.com/firecracker-microvm/firecracker/pull/5872)
+are implemented in their owning live subsets. Vsock restore changes
+[#5323](https://github.com/firecracker-microvm/firecracker/pull/5323) and
+[#5882](https://github.com/firecracker-microvm/firecracker/pull/5882) remain
+explicit native-v1 optional-device exclusions. UART restore
+[#5764](https://github.com/firecracker-microvm/firecracker/pull/5764) is covered
+only by bangbang's exact native-v1 UART profile, not Firecracker artifact
+compatibility. Aarch64 cache visibility
+[#5780](https://github.com/firecracker-microvm/firecracker/pull/5780) belongs to
+machine/CPU topology, and x86 KVM MSR coverage
+[#5738](https://github.com/firecracker-microvm/firecracker/pull/5738) is
+non-applicable to arm64 HVF. Linux host-kernel support is likewise a platform
+boundary rather than a macOS device claim.
+
+Bangbang completion evidence is equally exact. The merged implementation PRs
+are [#1334 virtio-mem](https://github.com/seven332/bangbang/pull/1334),
+[#1335 targeted pmem flush](https://github.com/seven332/bangbang/pull/1335),
+[#1336 pmem limiting](https://github.com/seven332/bangbang/pull/1336),
+[#1337 Darwin discard](https://github.com/seven332/bangbang/pull/1337), and
+[#1338 free-page reporting](https://github.com/seven332/bangbang/pull/1338).
+The pinned signed executable source contains the exact
+[balloon reporting](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L1887),
+[virtio-mem lifecycle](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2127),
+[PL031](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2369),
+[VMClock discovery](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2465),
+[entropy](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2695),
+[pmem limiter/flush](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2808),
+and [native-v1 VMGenID replacement](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L5385)
+cases. These are guest-visible gates; the validation matrix keeps broader
+focused backend coverage separate.
+
+Firecracker's aarch64
+[PL031 node has no interrupt property](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/fdt.rs#L443-L456),
+so bangbang's no-alarm PL031 is an implemented Firecracker aarch64 subset rather
+than a missing interrupt implementation. ARM PVTime remains platform-limited:
+Firecracker allocates and registers
+[one KVM-backed 64-byte region per vCPU](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/builder.rs#L558-L600),
+while an HVF execution-time observation alone is not that shared-page guest ABI.
+
+Balloon inflate, accepted hinting, and free-page reporting use whole-range
+validation, per-owner segmentation, inward host-page alignment, and Darwin
+zero-before-free advice. Pinned Apple XNU maps
+[`VM_BEHAVIOR_FREE` to `VM_SYNC_KILLPAGES`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/vm/vm_map.c#L16745-L16759),
+[stops at map holes](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/vm/vm_map.c#L21220-L21237),
+[rounds destructive work inward](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/vm/vm_map.c#L21331-L21349),
+and documents deactivation as clearing modified state and
+[forgetting page changes](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/vm/vm_object.c#L2620-L2652).
+This supports zero-safe best-effort reclaimability. It does not promise
+synchronous RSS or footprint reduction and does not use paired reusable-page
+accounting.
+
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current
 socket, host-path, HVF entitlement, guest-data, and multi-process boundaries, and
@@ -390,12 +466,16 @@ Startup attaches each prepared pmem device as a guest-visible virtio-mmio/FDT
 node whose MMIO config-space exposes the prepared `start` and `size` values.
 Configured bandwidth and operation buckets are reported through
 `GET /vm/config` and charged once per non-empty coalesced flush event before
-descriptor consumption. Throttled work retains its queue cursor and is retried
-by a dedicated session-owned HVF wakeup. Runtime `PATCH /pmem/{id}` accepts
-missing, `null`, empty, and all-null rate limiter objects as no-op updates and
-atomically replaces or clears present buckets on the exact active device before
-committing stored configuration. `PUT /pmem/{id}` rejects `root_device: true`
-until pmem root boot semantics are implemented.
+descriptor consumption. Flush selection is lazy after the first valid request
+and scoped to the notified device, so empty or malformed-only events do not
+synchronize a backing and peer pmem devices are not traversed. One event result
+is cached only for later valid descriptors on that device. Throttled work
+retains its queue cursor and is retried by a dedicated session-owned HVF wakeup.
+Runtime `PATCH /pmem/{id}` accepts missing, `null`, empty, and all-null rate
+limiter objects as no-op updates and atomically replaces or clears present
+buckets on the exact active device before committing stored configuration.
+`PUT /pmem/{id}` rejects `root_device: true` until pmem root boot semantics are
+implemented.
 The `memory-hotplug` section is parsed and stored like `PUT /hotplug/memory`.
 When present, `InstanceStart` attaches the current virtio-mem MMIO/FDT shell,
 with zero plugged, requested, and usable bytes. Runtime
@@ -405,9 +485,15 @@ config interrupt. The runtime virtio-mem handler can track plugged blocks,
 answer `STATE` requests as plugged, unplugged, or mixed, accept valid
 `PLUG`/`UNPLUG`/`UNPLUG_ALL` requests, and update virtio-mem config-space
 `plugged_size`. After startup, `GET /hotplug/memory` reports that active
-runtime plugged size when the handler can be queried. Accepted guest
-`PLUG`/`UNPLUG` requests use the HVF dynamic memory mapping path, while broader
-public guest-memory accounting and public hot-unplug semantics remain deferred.
+runtime plugged size when the handler can be queried. Accepted guest requests
+operate over complete validated block ranges and use exact block-owned HVF
+dynamic mappings that may be split or combined for unplug. Backend mutation
+precedes ACK publication, device state commits after guest-visible completion,
+and partial or late failures roll applied ranges back in reverse order. Signed
+executable coverage proves Linux and the public status surface complete a
+requested/plugged `0 -> 128 MiB -> 0` lifecycle. Runtime device deletion,
+broader public guest-memory accounting, and optional-device snapshot state
+remain deferred; bangbang does not claim Firecracker's KVM slot mechanism.
 The config-file path does not load MMDS data; use Firecracker's separate
 `--metadata <PATH>` startup argument for startup MMDS data.
 
@@ -543,9 +629,9 @@ compatibility targets.
 | `PATCH` | `/balloon/hinting/start` | partial; host command state and Darwin active-range discard implemented | Parses Firecracker-shaped free-page hinting start commands, including empty/default commands, rejects malformed or invalid bodies first, and then routes valid requests through the VMM state/action policy. Hinting start is post-boot-only, requires a configured balloon with `free_page_hinting: true`, preserves `acknowledge_on_stop` in backend-neutral device state, advances the host command id while skipping reserved values, updates active config space, raises a config interrupt, and returns `204 No Content`. Hinting queue command acknowledgements can update `guest_cmd`, accepted current-command ranges use best-effort Darwin discard, stale/inactive ranges remain ignored, and completed guest `STOP(0)`/`DONE(1)` commands can automatically acknowledge host `DONE(1)`. |
 | `PATCH` | `/balloon/hinting/stop` | partial; host command state and Darwin active-range discard implemented | Routes through the VMM state/action policy without parsing the request body, matching Firecracker's stop-command parser behavior. Hinting stop is post-boot-only, requires a configured balloon with `free_page_hinting: true`, writes the Firecracker done command into host-owned active device state and config space, raises a config interrupt, and returns `204 No Content`. Hinting queue command acknowledgements can update `guest_cmd`, accepted active-run ranges use best-effort Darwin discard before a stop takes effect, and completed guest `STOP(0)`/`DONE(1)` commands can automatically acknowledge host `DONE(1)`. |
 | `GET` | `/balloon/hinting/status` | partial; host and guest command status implemented | Routes through the VMM state/action policy. Hinting status is post-boot-only, requires a configured balloon with `free_page_hinting: true`, and returns Firecracker-shaped `host_cmd` and `guest_cmd` fields from active device state. Current status reports the latest start/stop host command and the latest 4-byte guest command observed on the hinting queue; `guest_cmd` remains `null` until the guest sends a command descriptor. Accepted active-run ranges are validated and discarded best effort on Darwin but are not exposed in this response. |
-| `PUT`, `PATCH` | `/pmem/{id}` | partial; pre-boot config storage, startup backing mapping, guest-visible MMIO/FDT attachment, HVF guest-memory registration, shadow writeback, guest-range config-space, rate-limited flush dispatch, and live limiter PATCH implemented | `PUT /pmem/{id}` stores Firecracker-shaped pmem configuration before boot, replaces prior config for the same ID, and appears in `GET /vm/config` under `pmem`. It rejects empty backing paths and `root_device: true` without opening host files during the request. `InstanceStart` opens each configured backing, validates it as a non-zero regular file, mmaps it to a 2 MiB-aligned host range, assigns a deterministic non-overlapping 2 MiB-aligned guest physical range after the aarch64 MMIO64 gap while skipping current guest RAM, creates the HVF VM with the framework-reported maximum IPA size, copies the prepared mapping into an HVF-compatible anonymous shadow, registers that shadow with HVF after DRAM using read-only or read/write non-executable permissions, copies writable shadows back to the backing file for guest queue-driven flush requests and after clean unmap, skips writeback after failed unmap cleanup, and attaches one virtio-mmio/FDT node per prepared pmem device. Runtime defines the backend-neutral virtio-pmem identity, one 256-entry queue, modern virtio feature bit, 2 MiB alignment constant, 16-byte config-space layout, and flush request completion/status handling; the attached MMIO config-space exposes the prepared `start`/`size` values. Empty or all-null limiter objects are treated as unconfigured. Configured per-device bandwidth and operation buckets are charged once per non-empty coalesced event before descriptor consumption, with pending work retried by a dedicated per-session HVF wakeup. `PATCH /pmem/{id}` remains post-boot-only, atomically replaces or clears present buckets on the exact active device, preserves stored and live state on failure, and leaves pmem root boot, dirty-range tracking, direct file-backed HVF mapping, and hot-unplug to dedicated device designs. |
+| `PUT`, `PATCH` | `/pmem/{id}` | implemented supported virtio-MMIO subset; root/direct mapping, PCI attach/delete, and snapshots excluded | `PUT /pmem/{id}` stores strict Firecracker-shaped pre-boot configuration without opening the host path, rejects `root_device: true`, and exposes accepted state through `GET /vm/config`. `InstanceStart` validates each nonzero regular backing, assigns a deterministic aligned guest range, creates and registers an HVF-compatible anonymous shadow, attaches one virtio-MMIO/FDT device, and preserves read-only versus writable cleanup policy. Flush is selected lazily for only the notified device after a valid request; empty or malformed-only events do not sync, peer devices are not traversed, and one event result is cached for later valid descriptors on that same device. Optional bandwidth/ops buckets charge one operation plus exact backing length before a non-empty coalesced event, retain a throttled cursor for a session-owned retry, and expose throttling/wakeup metrics. Post-boot `PATCH /pmem/{id}` atomically replaces or clears present live buckets before stored commit and preserves both states on failure. Signed coverage proves initial limiter, live partial replacement, guest read, and selected-backing flush. Pmem root boot, dirty tracking, direct file-backed HVF mapping, PCI attach/delete, and optional-device snapshots remain excluded. |
 | `PUT` | `/entropy` | supported target; configuration storage, entropy rate limiting, startup attachment, and signed executable guest read validation implemented | Stores one Firecracker-shaped virtio-rng entropy configuration before boot. Missing, `null`, empty, and all-null `rate_limiter` objects remain unconfigured; valid configured `bandwidth` and `ops` buckets are stored, echoed through `GET /vm/config`, and applied to the HVF virtio-rng queue path. Throttled descriptors remain pending and are retried on later dispatch opportunities without sleeping or busy-waiting; runtime dispatch reports the earliest backend-neutral retry delay for pending limiter-throttled descriptors, and active HVF entropy queues schedule a per-session retry wakeup from that delay. Oversized byte requests are allowed once a bandwidth bucket is full so a guest cannot be permanently throttled by a request larger than the bucket size. `InstanceStart` attaches the existing HVF virtio-rng MMIO/FDT device backed by the session-owned host OS randomness source. The signed executable HVF e2e target boots a direct-rootfs guest, checks that Linux selected `virtio_rng` as the current hardware RNG, reads non-empty data from `/dev/hwrng`, and writes a host-observable success marker. Post-start requests follow the pre-boot-only unsupported-state policy. Full Firecracker timerfd/eventfd shared event-source parity remains deferred; aggregate `entropy` runtime metrics cover implemented request, byte, host-randomness failure, event-failure, throttling, and limiter-event activity. |
-| `GET`, `PUT`, `PATCH` | `/hotplug/memory` | partial; pre-boot config storage, initial status, startup-visible virtio-mem shell, request-queue completion, plugged-block tracking, failure-aware mutation boundary, active status, and runtime requested-size update implemented | Parses Firecracker-shaped `PUT` and `PATCH` memory hotplug request bodies, rejects malformed or schema-invalid bodies first, and then routes valid requests through the VMM state/action policy. `PUT` is pre-boot-only, applies Firecracker-shaped block/slot/total size semantic validation, stores valid configs, replaces prior configs, and exposes the stored config through `GET /vm/config`. `GET /hotplug/memory` returns the stored config plus `plugged_size_mib: 0` before startup; after startup it queries the active virtio-mem handler and reports the current active `plugged_size_mib` plus the stored `requested_size_mib`. Without a stored config it returns the memory-hotplug-specific unsupported fault, and active query failures return a clear status fault instead of stale data. `PATCH` is post-boot-only, validates the requested size against configured total size and block alignment, updates the active virtio-mem requested-size config field, grows usable config-space size to a slot boundary when needed, increments config generation, and raises a config interrupt before committing the stored requested size. Startup can attach a guest-visible virtio-mem MMIO/FDT shell whose config space exposes the configured block size, a deterministic hotplug aperture, the configured total region size, and zero usable, plugged, and requested bytes. The backend-neutral queue path parses request and response descriptors, publishes used-ring entries, wires queue-interrupt intent through boot runtime/HVF, tracks plugged block ranges, returns plugged/unplugged/mixed `STATE` responses for valid usable ranges, accepts valid `PLUG`/`UNPLUG`/`UNPLUG_ALL` requests through a failure-aware mutation executor boundary, updates config-space `plugged_size`, and keeps invalid ranges, duplicate mutations, unsupported request types, descriptor parse failures, mutation executor failures, response write failures, used-ring failures, and rollback failures fail-closed. A signed executable e2e scenario covers a direct-rootfs guest binding `virtio_mem` and observing a runtime requested-size update. Broader public guest-memory accounting and public memory hot-unplug semantics need dedicated designs. |
+| `GET`, `PUT`, `PATCH` | `/hotplug/memory` | implemented supported virtio-MMIO subset; runtime device deletion and snapshots excluded | `PUT` validates and stores block/slot/total sizing before boot; `GET` returns stored pre-start status or exact active requested/plugged status; `PATCH` validates and signals requested-size changes after start. Startup attaches one virtio-mem MMIO/FDT device. Its queue validates request/response descriptors and complete block ranges, answers `STATE`, and applies `PLUG`, `UNPLUG`, and `UNPLUG_ALL` over exact block-owned guest/HVF mappings before ACK. Device state commits only after guest-visible completion; split/combined mappings and partial or late failures use reverse rollback and fail closed. Focused coverage crosses the conceptual slot boundary and adjacent mappings without claiming KVM slot identity. Signed direct-rootfs coverage proves Linux binding and public requested/plugged size `0 -> 128 MiB -> 0`. Runtime device deletion, broader public accounting, and optional-device snapshots remain deferred. |
 | `PATCH` | `/vm` | partial; topology-wide runtime pause/resume implemented | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state. After startup, `Paused` transitions a `Running` instance to `Paused` only after a topology-wide active-run wakeup barrier drains every online vCPU and the process-owned boot worker closes its next-run gate. `Resumed` transitions it back to `Running` only after the worker accepts resume. Repeated pause/resume requests fail as unsupported-state errors without mutating VM state. Signed dual-process evidence observes independent CPU0/CPU1 progress tokens, proves both stop while one process is paused as an isolated peer continues, and proves both resume without fixed sleeps. Complete HVF vCPU state capture and snapshot-ready paused ownership remain deferred. |
 | `PATCH` | `/drives/{drive_id}` | supported target; runtime backing refresh and rate-limiter update implemented | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Empty or all-null rate limiter objects are treated as unconfigured/no-op updates. Pre-boot requests fail as post-boot-only operations. Runtime requests for an existing active drive open replacement backing only when `path_on_host` is present, refresh the matching virtio-block MMIO handler, update the active per-device limiter when a configured limiter bucket is present, update stored configuration after handler success, and leave the old backing and stored config intact on failure. When a limiter throttles a block queue descriptor, runtime dispatch exposes a backend-neutral retry delay and active HVF block queues schedule a per-session retry wakeup without completing the descriptor. This implements the supported pending/retry/wakeup semantics without claiming Firecracker's exact Linux timerfd/eventfd event-source identity. |
 | `PATCH` | `/network-interfaces/{iface_id}` | runtime rate-limiter updates implemented | Returns unsupported-state before startup, validates the target interface after startup, and accepts omitted, `null`, empty, or all-null `rx_rate_limiter` and `tx_rate_limiter` objects as runtime no-ops. In `Running` or `Paused`, configured bandwidth and ops buckets update the matching live RX/TX limiter and stored config. Omitted inner buckets preserve both stored values and exact live budget, enabled buckets start with a fresh full budget at one update instant, and explicit disabled buckets clear only the selected bucket. Active-device mutation completes before stored config is committed, so lookup, worker-command, or handler failures leave stored state unchanged. Limiter updates do not change virtio queue state, pending-work flags, config generation, or interrupt status; later retained work is scheduled from the updated live state. Limiter-specific metrics, snapshots, and hotplug remain deferred. |
@@ -1638,10 +1724,12 @@ path. Internally, a prepared never-run boot session can generate a distinct
 nonzero VMGenID, write the complete guest buffer, commit retained metadata, and
 then assert the edge-rising SPI. Random/preflight/write failures send no edge;
 a signal failure is reported after commit and requires another replacement or
-session discard. Snapshot-schema persistence, public load orchestration,
-guest-observed restore notification, VMClock generation-counter updates and
-signaling, and VMClock restore semantics remain deferred to later
-snapshot/time-device work tracked by #543.
+session discard. Public native-v1 load uses that transaction after aggregate
+interrupt restore, and signed cross-process coverage proves the guest observes
+both saved 64-bit VMGenID halves change before continued execution. VMClock
+generation-counter updates, signaling, and mutable restore semantics remain
+outside the narrow native-v1 profile; optional-device snapshot profiles and
+broader time portability remain deferred.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
@@ -2413,7 +2501,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage; recognized unsupported for vhost-user-block `socket` configs | unsupported after start; `400` `fault_message` | Records validated pre-boot virtio-block config, including optional bandwidth/ops rate limiters. Startup preparation opens backing files, registers initial block MMIO devices, applies configured limiters in queue dispatch without sleeping, and wires session-owned HVF retry wakeups when a throttled descriptor remains pending. Firecracker-shaped socket-backed vhost-user-block configs are parsed and rejected with `drive socket is not supported` without mutating stored config. Firecracker v1.16.0 runtime PUT is developer-preview PCI hotplug requiring `--enable-pci` and guest rescan; bangbang uses MMIO, rejects that option, and rejects runtime PUT before opening or retaining the proposed backing. External vhost-user-block execution remains unsupported. |
 | `PUT /pmem/{id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records Firecracker-shaped pre-boot config and replaces prior config for the same ID without opening the host backing file during the request; empty or all-null limiter objects are unconfigured, valid bandwidth/ops buckets are stored and reported through `GET /vm/config`, and `root_device: true` is rejected without mutation. Startup opens and validates each backing as a non-zero regular file, maps and registers its guest range, attaches one virtio-mmio/FDT device, applies the limiter before coalesced flush dispatch, writes writable shadows back for guest queue-driven flush requests and after clean unmap, and retains the handles, mappings, and range metadata. Root-device semantics, dirty-range tracking, direct file-backed HVF mapping, and hot-unplug remain deferred. |
 | `PATCH /pmem/{id}` | recognized post-boot-only operation; `400` `fault_message` | runtime rate-limiter updates supported; `204` empty response on successful no-op, replacement, or clear | Parses Firecracker-shaped pmem rate-limiter updates, rejects malformed or mismatched bodies first, returns unsupported-state before startup, and validates the exact active pmem ID after startup. Omitted, `null`, empty, or all-null limiters are no-ops; present buckets replace, clear, or preserve individual live and stored buckets under shared update rules. Handler or owner-thread delivery failures do not commit stored configuration, and a replacement that unblocks pending work schedules an immediate bounded retry. |
-| `GET /hotplug/memory`, `PUT /hotplug/memory`, `PATCH /hotplug/memory` | `PUT` implemented for config storage; `GET` returns status after config; startup-visible virtio-mem shell, request-queue completion, plugged-block tracking, failure-aware HVF dynamic memory mutations, active status, and runtime requested-size update modeled; `PATCH` unsupported-state before start | `GET` returns pre-start stored status or active runtime status if configured; `PUT` unsupported after start; `PATCH` validates and commits requested-size updates after start | `PUT` stores a validated Firecracker-shaped pre-boot config and replaces the prior config without opening host resources. `GET` returns `total_size_mib`, `block_size_mib`, `slot_size_mib`, `plugged_size_mib: 0`, and the current `requested_size_mib` before startup; after startup it reports the active virtio-mem handler's current `plugged_size_mib` with the stored requested size. Without a stored config it returns the memory-hotplug-specific unsupported fault. `InstanceStart` can attach a guest-visible virtio-mem MMIO/FDT shell backed by the runtime handler foundation; the config space exposes the configured block and total region sizes with zero usable, plugged, and requested bytes. Runtime `PATCH` updates the active requested-size config field, grows usable config-space size to a slot boundary when needed, increments config generation, and raises a config interrupt before committing stored status. The runtime handler can parse and complete virtio-mem request descriptors, publish used-ring entries, raise queue interrupts through HVF, track plugged block ranges, return plugged/unplugged/mixed `STATE` responses, apply accepted `PLUG`/`UNPLUG`/`UNPLUG_ALL` requests through the active HVF dynamic guest-memory executor before ACK publication, roll back applied backend mutations on late completion failures when possible, and update config-space `plugged_size` only after mutation execution and guest-visible completion publication succeed. A signed executable e2e scenario covers a direct-rootfs guest binding `virtio_mem` and observing a runtime requested-size update. Broader public guest-memory accounting and public hot-unplug semantics remain deferred. |
+| `GET /hotplug/memory`, `PUT /hotplug/memory`, `PATCH /hotplug/memory` | `PUT` stores validated pre-boot config; `GET` reports configured or active status; `PATCH` is unsupported-state before start | Implemented supported runtime subset; post-start `GET` reports exact requested/plugged size and `PATCH` changes requested size | Startup attaches one virtio-mem MMIO/FDT device with the configured block and region shape. Active queue handling validates complete block ranges, applies exact block-owned HVF map/unmap work before ACK, supports split and combined unplug, commits device state only after guest-visible completion, and rolls partial or late failures back in reverse order. Signed Linux coverage proves the public lifecycle `0 -> 128 MiB -> 0`. Runtime device deletion, broader public guest-memory accounting, optional-device snapshots, and Firecracker KVM slot identity remain excluded. |
 | `PATCH /drives/{drive_id}` | recognized post-boot-only operation; `400` `fault_message` | supported target; `204` empty response on successful backing or rate-limiter update | Parses Firecracker-shaped update requests and routes valid bodies through `UpdateBlockDevice`. Empty or all-null limiter objects are treated as unconfigured/no-op updates. Runtime updates for existing active drives open replacement backing files only when `path_on_host` is present, update active per-device limiter buckets when configured limiter buckets are present, update stored drive configuration after handler success, and preserve previous state on failure. Active backing or limiter update attempts report aggregate plus per-drive block `update_count` or `update_fails` metrics; parser-level rejections, unsupported-state faults, unknown-drive validation failures, and pathless no-op updates are not reported as block update attempts. Throttled block dispatches expose a backend-neutral retry delay and active HVF block queues schedule a per-session retry wakeup. PATCH mutates an existing MMIO device only; the supported retry semantics do not claim Linux timerfd/eventfd implementation identity. |
 | `DELETE /drives/{drive_id}`, `DELETE /pmem/{id}`, `DELETE /network-interfaces/{iface_id}` | recognized bodyless hot-unplug; `400` `fault_message` | recognized bodyless hot-unplug; `400` `fault_message` | Bodyless requests route through one `HotUnplugDevice` VMM action. Pre-boot requests return the normal unsupported-state fault, and runtime requests return the matching device-specific unsupported fault without mutating stored configuration. Requests with a body fail first as malformed request shape before hot-unplug routing. Firecracker v1.16.0's developer-preview DELETE requires PCI transport and guest removal before host deletion; bangbang's current MMIO devices deliberately retain stable rejection semantics while optional cross-capability PCI architecture remains deferred. |
 | `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records up to 16 validated pre-boot configs without opening host networking resources, including initial Firecracker-shaped RX/TX bandwidth and ops limiters; missing, empty, all-null, and disabled-only limiters normalize to unconfigured. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the count before selecting packet I/O. If every configured interface is listed in MMDS config, startup validates supported `host_dev_name` syntax and uses process-local MMDS-only packet I/O without opening vmnet resources; otherwise it opens vmnet packet I/O for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names. Unsupported names fail before `Running`. Internal queue dispatch enforces independent directional budgets before side effects, retains throttled work for explicit retry, refunds only successful MMDS TX detours, exposes the earliest retry duration, and uses a per-session HVF wakeup to redispatch retained work on the owning thread. Runtime PATCH updates individual live limiter buckets for existing interfaces. Broader public/direct-vmnet packet movement, limiter-specific metrics, snapshots, and DELETE remain deferred. |
@@ -2577,15 +2665,17 @@ Their eventual support level should follow the endpoint matrix:
   PCI/vhost/KVM transports. Native-v1 snapshot UDS override, event-queue
   `TRANSPORT_RESET`, and post-restore RX gating remain the stable #543
   exclusions rather than live snapshot-compatibility claims
-- snapshots
+- snapshot behavior beyond the implemented narrow native-v1 profile, including
+  optional-device state, mutable VMClock restore/signaling, dirty tracking,
+  overrides, Firecracker artifact compatibility, and cross-host portability
 - full MMDS TCP routing, stream reassembly, and retransmission policy
 - full Firecracker balloon counters beyond the implemented discard metrics,
   paired reusable-page accounting, and balloon snapshot state
-- pmem root-device semantics, dirty-range
-  tracking, direct file-backed HVF mapping, and hot-unplug beyond startup
-  backing-file validation/mapping, guest-visible MMIO/FDT attachment, HVF
-  guest-memory registration, the internal guest-range config-space foundation,
-  and queue-driven flush writeback
+- pmem root-device semantics, dirty-range tracking, direct file-backed HVF
+  mapping, PCI attach/delete, and optional-device snapshots beyond targeted
+  notified-device flush, per-event bandwidth/ops limiting, retained retry,
+  runtime limiter replacement, guest-visible MMIO/FDT attachment, and signed
+  guest read/flush proof
 - full Firecracker active timerfd/eventfd rate-limiter wakeup parity beyond the
   current HVF block, entropy, network, and pmem retry schedulers, including shared
   event-source behavior
@@ -2593,7 +2683,9 @@ Their eventual support level should follow the endpoint matrix:
   producers beyond the implemented TX output path
 - full logger integration, and full Firecracker metrics counters beyond the
   currently implemented minimal metrics subset
-- memory hotplug
+- memory hotplug beyond the implemented block-granular virtio-MMIO lifecycle,
+  including runtime device deletion, broader public guest-memory accounting,
+  optional-device snapshot state, and Firecracker's KVM slot mechanism
 - complete HVF vCPU state capture/restore and snapshot-ready paused ownership
   beyond the current topology-wide supervisor plus block and
   entropy retry-scheduler barrier

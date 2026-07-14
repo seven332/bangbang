@@ -155,10 +155,22 @@ with deadlines and deterministic yields rather than fixed sleeps.
 
 For virtio-pmem changes, unit tests should cover MMIO registration, FDT
 metadata, config-space `start`/`size`, deterministic multi-device layout,
-queue parsing/completion, shadow writeback, and cleanup/error paths. Signed HVF
-coverage validates startup assembly and mapped pmem ownership through the
-lifecycle target; the signed `guest_boot` target should cover guest-side pmem
-discovery, backing reads, guest writes, and queue-driven flush behavior.
+queue parsing/completion, shadow writeback, and cleanup/error paths. Targeted
+flush tests must prove empty and malformed-only events do not synchronize,
+one valid request caches one selected-device result, peer backings are not
+traversed, one operation plus exact backing length is charged before flush,
+throttled cursors retry, and live limiter replacement is failure-atomic. Signed
+HVF coverage validates startup assembly and mapped pmem ownership through the
+lifecycle target; signed executable coverage should retain initial limiter,
+live PATCH, guest read/write, and selected-backing flush proof.
+
+For virtio-mem changes, focused tests should cover block-aligned validation,
+adjacent sequential plugs, partial multi-block unplug, split/combined exact
+mapping ownership, a request crossing the conceptual slot boundary, guest
+completion before state commit, and reverse rollback including injected
+rollback failure. Signed executable coverage should retain Linux driver binding
+and public requested/plugged status across `0 -> 128 MiB -> 0`; it must not
+substitute a requested-size-only observation for guest-completed plug/unplug.
 
 ## What To Cover
 
@@ -877,7 +889,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v33.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v35.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -935,11 +947,13 @@ and uses public `FlushMetrics` requests until
 `balloon.free_page_report_count` is nonzero before accepting the scenario.
 When the boot args include `bangbang.memory-hotplug-check=1`, the same init
 script checks the virtio bus for a device bound to `virtio_mem`, writes
-`BANGBANG_MEMORY_HOTPLUG_GUEST_READY`, follows `dmesg` for the runtime
-requested-size update, and writes `BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK`
-only after the guest observes that update. The host-side e2e waits for the
-ready marker, sends `PATCH /hotplug/memory`, verifies the public API requested
-size, and then waits for the guest success marker.
+`BANGBANG_MEMORY_HOTPLUG_GUEST_READY` after observing requested size zero,
+follows `dmesg` for the 128-MiB requested-size transition, writes
+`BANGBANG_MEMORY_HOTPLUG_GUEST_GROWN`, and writes
+`BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK` only after a final transition back to
+zero. The host-side e2e advances on those markers, sends the grow and shrink
+`PATCH /hotplug/memory` requests, and requires public requested and plugged
+sizes to complete `0 -> 128 MiB -> 0`.
 When the boot args include `bangbang.rtc-check=1`, the same init script checks
 that Linux exposes `/dev/rtc0` as a character device and finds PL031 RTC
 evidence in sysfs, procfs, or dmesg before writing
@@ -1009,7 +1023,7 @@ connection exchange through the signed executable, including sustained
 bidirectional streams and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, that RTC alarm
-interrupts, VMClock restore signaling, VMClock guest e2e observation,
+interrupts, mutable VMClock restore signaling or guest observation,
 or broader RTC-adjacent time/identity behavior is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 

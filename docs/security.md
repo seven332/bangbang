@@ -366,9 +366,15 @@ is resource-specific:
   coalesced flush event before the queue cursor advances. Throttled work stays
   pending behind a dedicated per-session wakeup, and runtime
   `PATCH /pmem/{id}` replaces the exact active device limiter before stored
-  configuration is committed. Diagnostics expose only counters and device IDs,
-  not bucket values or backing paths. Root-device boot semantics, direct
-  file-backed HVF mapping, dirty-range tracking, and hot-unplug remain deferred.
+  configuration is committed. Flush selection is lazy and scoped to the
+  notified device: empty or malformed-only events perform no backing sync, one
+  valid request caches only that device's event result, and peer pmem mappings
+  are not traversed. Diagnostics expose only counters and device IDs, not
+  bucket values or backing paths. An operator can deliberately configure the
+  same external file for multiple devices or processes; that alias is outside
+  bangbang's isolation guarantee and requires operator-owned access and
+  coordination. Root-device boot semantics, direct file-backed HVF mapping,
+  dirty-range tracking, and hot-unplug remain deferred.
 - `/entropy` accepts Firecracker-shaped bandwidth and ops rate-limiter buckets.
   The limiter is process-local runtime state, is applied before host entropy is
   read or guest memory is written, and must not sleep or busy-wait while budget
@@ -981,6 +987,21 @@ explicit. The current HVF runner emulates only the early-boot `OSDLR_EL1` and
 `OSLAR_EL1` OS lock RAZ/WI behavior needed by the pinned Firecracker kernel;
 unsupported trapped system registers fail closed instead of being treated as
 generic no-ops.
+
+The current virtio-mem device treats every guest request as untrusted dynamic
+memory ownership input. It validates block alignment, count, overflow, usable
+range, requested-size capacity, and prior block state before invoking the HVF
+owner. Plug work creates exact anonymous guest-memory regions and maps them into
+the active VM; unplug work can split or combine block-owned ranges while
+removing only complete owned mappings. Device block state and `plugged_size`
+commit only after backend mutation and guest-visible response publication both
+succeed. If a later subrange or used-ring publication fails, already-applied
+subranges roll back in reverse order; rollback failure is reported as a
+fail-closed error, not simulated success. Session shutdown retains reverse
+owner teardown, and no
+mapping is shared across VMs. Lowering requested size asks the guest to
+cooperate; it is not host-forced device deletion, snapshot admission, or a
+promise that untrusted guest progress will release memory.
 
 The current virtio-balloon foundation derives a startup-attached virtio-mmio/FDT
 shell from stored control-plane configuration. It exposes guest-visible
