@@ -114,6 +114,16 @@ destinations must never be replaced or merged. Static-code validation is an
 at-rest tamper gate; do not treat it as atomic protection from concurrent
 same-user replacement without a stronger launch-constraint design.
 
+For launcher-worker session changes, review both asymmetric authentication
+directions: the launcher must bind the unreaped PID to the expected dynamic
+signed worker before resume and again after child-attributed `Hello`; the worker
+can require only matching effective credentials, the inherited endpoint, and
+`LOCAL_PEERPID == getppid()` because App Sandbox denies its parent-code lookup.
+No public/VM/resource side effect may precede random-session `Start` and the
+independently validated `Prepared`/`Proceed` namespace gate. Keep v1 frames at
+4096 bytes or less, sequences exact, message/state variants closed, diagnostics
+redacted, and the all-zero identity exclusive to the initial greeting.
+
 ## Concurrency and Resource Management
 
 Review file descriptors, Unix sockets, temporary files, signal handlers, and VM
@@ -128,6 +138,18 @@ The production launcher owns one child. Review signal-versus-reap ordering so a
 PID is never signaled after the child has been reaped and could be reused;
 ordinary child exits must be preserved, while signal exits use the documented
 `128 + signal` mapping.
+
+The production session owns one empty locked runtime namespace. Review worker
+cleanup after launcher EOF, launcher cleanup after worker exit, and bounded
+both-killed recovery separately. Every removal must compare exact type, owner,
+mode, device/inode, emptiness, pathname identity, and lock state; missing,
+replaced, populated, ambiguous, live, or excess entries must be preserved.
+Later graceful signals must coalesce behind one cancellation and its bounded
+escalation, and concurrent launchers must never share session state or signal,
+reap, or clean each other's workers and namespaces. Absolute handshake
+deadlines must survive fragmented reads and `EINTR`; `Terminal` or EOF must also
+start a bounded owned-process exit grace rather than permitting an indefinite
+wait.
 
 ## Performance Review
 

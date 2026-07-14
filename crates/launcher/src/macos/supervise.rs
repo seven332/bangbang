@@ -1,14 +1,25 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::process::{Child, ExitStatus};
+use std::os::unix::process::ExitStatusExt;
+use std::process::ExitStatus;
 use std::ptr;
+use std::time::{Duration, Instant};
 
+use bangbang_session::macos::runtime::{LauncherNamespace, NamespaceIdentity};
+use bangbang_session::{
+    CancelSignal, Frame, FrameDecoder, LauncherLifecycle, Message, TerminalCategory, encode_frame,
+};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
 
+use super::spawn::OwnedWorker;
 use crate::LauncherError;
+
+const CANCELLATION_GRACE: Duration = Duration::from_secs(5);
+const SESSION_EXIT_GRACE: Duration = Duration::from_secs(5);
+const BOOTSTRAP_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct SignalWakeup {
@@ -82,13 +93,123 @@ impl SignalWakeups {
     }
 }
 
-pub(crate) fn wait_and_forward(
-    child: &mut Child,
+pub(crate) fn write_frame(stream: &mut UnixStream, frame: Frame) -> Result<(), LauncherError> {
+    let encoded = encode_frame(frame).map_err(|_| LauncherError::SessionProtocol)?;
+    stream
+        .write_all(&encoded)
+        .map_err(|_| LauncherError::SessionProtocol)
+}
+
+pub(crate) fn read_bootstrap_hello(
+    stream: &mut UnixStream,
+    lifecycle: &mut LauncherLifecycle,
+) -> Result<(), LauncherError> {
+    let deadline = Instant::now()
+        .checked_add(BOOTSTRAP_HELLO_TIMEOUT)
+        .ok_or(LauncherError::SessionProtocol)?;
+    let result = (|| {
+        let mut decoder = FrameDecoder::default();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(LauncherError::SessionProtocol)?;
+            if let Some(frame) = decoder
+                .next_frame()
+                .map_err(|_| LauncherError::SessionProtocol)?
+            {
+                if lifecycle
+                    .receive(frame)
+                    .map_err(|_| LauncherError::SessionProtocol)?
+                    != Message::Hello
+                    || decoder.finish().is_err()
+                {
+                    return Err(LauncherError::SessionProtocol);
+                }
+                return Ok(());
+            }
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| LauncherError::SessionSetup(error.kind()))?;
+            let length = match stream.read(&mut buffer) {
+                Ok(length) => length,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(LauncherError::SessionProtocol),
+            };
+            if length == 0 {
+                return Err(LauncherError::SessionProtocol);
+            }
+            decoder
+                .push(buffer.get(..length).ok_or(LauncherError::SessionProtocol)?)
+                .map_err(|_| LauncherError::SessionProtocol)?;
+        }
+    })();
+    let clear_result = stream
+        .set_read_timeout(None)
+        .map_err(|error| LauncherError::SessionSetup(error.kind()));
+    result.and(clear_result)
+}
+
+pub(crate) fn wait_session(
+    worker: &mut OwnedWorker,
+    session: &mut UnixStream,
+    mut lifecycle: LauncherLifecycle,
     mut wakeups: SignalWakeups,
 ) -> Result<ExitStatus, LauncherError> {
+    let session_id = lifecycle.session();
+    let mut namespace = None;
+    let mut terminal = None;
+    let result = wait_session_inner(
+        worker,
+        session,
+        &mut lifecycle,
+        &mut wakeups,
+        &mut namespace,
+        &mut terminal,
+    );
+    if result.is_err() {
+        let _ = session.shutdown(std::net::Shutdown::Both);
+        worker.terminate_and_reap();
+    }
+
+    let cleanup = if let Some(namespace) = namespace.as_mut() {
+        namespace.cleanup()
+    } else {
+        LauncherNamespace::recover_after_worker_exit(session_id)
+            .and_then(|recovered| recovered.map_or(Ok(()), |mut namespace| namespace.cleanup()))
+    }
+    .map_err(|_| LauncherError::RuntimeNamespace);
+
+    match result {
+        Ok(status) => {
+            cleanup?;
+            validate_terminal(status, terminal)?;
+            Ok(status)
+        }
+        Err(error) => {
+            let _ = cleanup;
+            Err(error)
+        }
+    }
+}
+
+fn wait_session_inner(
+    worker: &mut OwnedWorker,
+    session: &mut UnixStream,
+    lifecycle: &mut LauncherLifecycle,
+    wakeups: &mut SignalWakeups,
+    namespace: &mut Option<LauncherNamespace>,
+    terminal: &mut Option<(TerminalCategory, u8)>,
+) -> Result<ExitStatus, LauncherError> {
+    session
+        .set_nonblocking(true)
+        .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
     let kqueue = create_kqueue()?;
-    let child_pid = usize::try_from(child.id())
+    let child_pid = usize::try_from(worker.pid())
         .map_err(|_| LauncherError::WorkerWait(io::ErrorKind::InvalidInput))?;
+    let session_fd = usize::try_from(session.as_raw_fd())
+        .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
     let changes = [
         event(
             usize::try_from(wakeups.signals[0].reader.as_raw_fd())
@@ -105,6 +226,12 @@ pub(crate) fn wait_and_forward(
             0,
         ),
         event(
+            session_fd,
+            libc::EVFILT_READ,
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            0,
+        ),
+        event(
             child_pid,
             libc::EVFILT_PROC,
             libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
@@ -113,45 +240,184 @@ pub(crate) fn wait_and_forward(
     ];
     register_events(kqueue.as_raw_fd(), &changes)?;
 
-    let mut forwarding_error = None;
+    let mut decoder = FrameDecoder::default();
+    let mut cancellation_deadline: Option<Instant> = None;
+    let mut exit_deadline: Option<Instant> = None;
+    let mut session_closed = false;
     loop {
-        let events = wait_events(kqueue.as_raw_fd())?;
-        let mut child_exited = false;
-        for event in events {
-            if event.filter == libc::EVFILT_PROC
-                && event.ident == child_pid
-                && event.fflags & libc::NOTE_EXIT != 0
-            {
-                child_exited = true;
-                continue;
+        let deadline = match (cancellation_deadline, exit_deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
+        let timeout = timeout_until(deadline);
+        let events = wait_events(kqueue.as_raw_fd(), timeout)?;
+        let child_exited = events.iter().any(|queued| {
+            queued.filter == libc::EVFILT_PROC
+                && queued.ident == child_pid
+                && queued.fflags & libc::NOTE_EXIT != 0
+        });
+        // Protocol state and EOF take precedence over same-batch signals. This
+        // preserves an already-observed worker exit and avoids writing Cancel to
+        // a channel that the worker has just closed.
+        for queued in &events {
+            if !session_closed && queued.filter == libc::EVFILT_READ && queued.ident == session_fd {
+                session_closed =
+                    drain_session(session, &mut decoder, lifecycle, namespace, terminal)?;
+                if session_closed {
+                    exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
+                    register_events(
+                        kqueue.as_raw_fd(),
+                        &[event(session_fd, libc::EVFILT_READ, libc::EV_DELETE, 0)],
+                    )?;
+                }
             }
+        }
+        if terminal.is_some() {
+            exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
+        }
 
+        for queued in &events {
             for signal in &mut wakeups.signals {
                 let signal_fd = usize::try_from(signal.reader.as_raw_fd())
                     .map_err(|_| LauncherError::SignalSetup(io::ErrorKind::InvalidInput))?;
-                if event.filter == libc::EVFILT_READ
-                    && event.ident == signal_fd
+                if queued.filter == libc::EVFILT_READ
+                    && queued.ident == signal_fd
                     && signal.drain()?
-                    && let Err(kind) = forward_signal(child.id(), signal.signal)
+                    && !child_exited
+                    && !session_closed
+                    && terminal.is_none()
+                    && !lifecycle.is_cancelled()
                 {
-                    forwarding_error.get_or_insert(kind);
+                    let signal = match signal.signal {
+                        SIGINT => CancelSignal::Interrupt,
+                        SIGTERM => CancelSignal::Terminate,
+                        _ => return Err(LauncherError::SessionProtocol),
+                    };
+                    let frame = lifecycle
+                        .cancel(signal)
+                        .map_err(|_| LauncherError::SessionProtocol)?;
+                    write_frame(session, frame)?;
+                    cancellation_deadline = Some(Instant::now() + CANCELLATION_GRACE);
                 }
             }
         }
 
         if child_exited {
-            // The child is not reaped until every signal event in this batch
-            // has been processed. Therefore its PID cannot be reused by any
-            // process targeted above. No signal is sent after this wait.
-            let status = child
-                .wait()
-                .map_err(|err| LauncherError::WorkerWait(err.kind()))?;
-            if let Some(kind) = forwarding_error {
-                return Err(LauncherError::SignalForward(kind));
+            // Drain all bytes made readable with this exit before reaping, so
+            // terminal state cannot lose a same-batch race.
+            if !session_closed {
+                let _ = drain_session(session, &mut decoder, lifecycle, namespace, terminal)?;
             }
-            return Ok(status);
+            break;
+        }
+        if exit_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(LauncherError::SessionProtocol);
+        }
+        if cancellation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            worker
+                .signal(libc::SIGKILL)
+                .map_err(LauncherError::SignalForward)?;
+            cancellation_deadline = None;
         }
     }
+
+    worker.wait()
+}
+
+fn timeout_until(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+}
+
+fn drain_session(
+    session: &mut UnixStream,
+    decoder: &mut FrameDecoder,
+    lifecycle: &mut LauncherLifecycle,
+    namespace: &mut Option<LauncherNamespace>,
+    terminal: &mut Option<(TerminalCategory, u8)>,
+) -> Result<bool, LauncherError> {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match session.read(&mut buffer) {
+            Ok(0) => {
+                decoder
+                    .finish()
+                    .map_err(|_| LauncherError::SessionProtocol)?;
+                return Ok(true);
+            }
+            Ok(length) => {
+                decoder
+                    .push(buffer.get(..length).ok_or(LauncherError::SessionProtocol)?)
+                    .map_err(|_| LauncherError::SessionProtocol)?;
+                while let Some(frame) = decoder
+                    .next_frame()
+                    .map_err(|_| LauncherError::SessionProtocol)?
+                {
+                    let message = lifecycle
+                        .receive(frame)
+                        .map_err(|_| LauncherError::SessionProtocol)?;
+                    match message {
+                        Message::Prepared { device, inode } => {
+                            if namespace.is_some() {
+                                return Err(LauncherError::SessionProtocol);
+                            }
+                            let validated = LauncherNamespace::validate(
+                                lifecycle.session(),
+                                NamespaceIdentity { device, inode },
+                            )
+                            .map_err(|_| LauncherError::RuntimeNamespace)?;
+                            *namespace = Some(validated);
+                            if !lifecycle.is_cancelled() {
+                                let proceed = lifecycle
+                                    .proceed()
+                                    .map_err(|_| LauncherError::SessionProtocol)?;
+                                write_frame(session, proceed)?;
+                            }
+                        }
+                        Message::Starting | Message::Ready(_) => {}
+                        Message::Terminal {
+                            category,
+                            exit_code,
+                        } => {
+                            if terminal.replace((category, exit_code)).is_some() {
+                                return Err(LauncherError::SessionProtocol);
+                            }
+                        }
+                        Message::Hello | Message::Start | Message::Proceed | Message::Cancel(_) => {
+                            return Err(LauncherError::SessionProtocol);
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(LauncherError::SessionProtocol),
+        }
+    }
+}
+
+fn validate_terminal(
+    status: ExitStatus,
+    terminal: Option<(TerminalCategory, u8)>,
+) -> Result<(), LauncherError> {
+    let Some((_category, reported)) = terminal else {
+        return Ok(());
+    };
+    if public_exit_code(status) == Some(reported) {
+        Ok(())
+    } else {
+        Err(LauncherError::SessionProtocol)
+    }
+}
+
+fn public_exit_code(status: ExitStatus) -> Option<u8> {
+    if let Some(code) = status.code() {
+        return u8::try_from(code).ok();
+    }
+    status
+        .signal()
+        .and_then(|signal| 128_i32.checked_add(signal))
+        .and_then(|code| u8::try_from(code).ok())
 }
 
 fn create_kqueue() -> Result<OwnedFd, LauncherError> {
@@ -200,31 +466,46 @@ fn register_events(kqueue: RawFd, changes: &[libc::kevent]) -> Result<(), Launch
     }
 }
 
-fn wait_events(kqueue: RawFd) -> Result<Vec<libc::kevent>, LauncherError> {
+fn wait_events(
+    kqueue: RawFd,
+    timeout: Option<Duration>,
+) -> Result<Vec<libc::kevent>, LauncherError> {
+    let deadline = match timeout {
+        Some(timeout) => Some(
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or(LauncherError::WorkerWait(io::ErrorKind::InvalidInput))?,
+        ),
+        None => None,
+    };
     loop {
-        let mut events = [MaybeUninit::<libc::kevent>::uninit(); 3];
-        // SAFETY: `events` provides room for three `kevent` values. The kernel
-        // initializes exactly the positive number returned before they are read.
+        let mut events = [MaybeUninit::<libc::kevent>::uninit(); 4];
+        let timeout = deadline
+            .map(|deadline| duration_timespec(deadline.saturating_duration_since(Instant::now())));
+        let timeout_ptr = timeout
+            .as_ref()
+            .map_or(ptr::null(), |value| value as *const libc::timespec);
+        // SAFETY: `events` provides room for four values. The optional timespec
+        // remains live, and the kernel initializes exactly the positive count.
         let count = unsafe {
             libc::kevent(
                 kqueue,
                 ptr::null(),
                 0,
                 events.as_mut_ptr().cast(),
-                3,
-                ptr::null(),
+                4,
+                timeout_ptr,
             )
         };
-        if count > 0 {
+        if count >= 0 {
             let count = usize::try_from(count)
                 .map_err(|_| LauncherError::WorkerWait(io::ErrorKind::InvalidData))?;
             return Ok(events
                 .into_iter()
                 .take(count)
-                .map(|event| {
-                    // SAFETY: `kevent` initialized every event below the
-                    // returned count.
-                    unsafe { event.assume_init() }
+                .map(|queued| {
+                    // SAFETY: `kevent` initialized every event below `count`.
+                    unsafe { queued.assume_init() }
                 })
                 .collect());
         }
@@ -235,19 +516,10 @@ fn wait_events(kqueue: RawFd) -> Result<Vec<libc::kevent>, LauncherError> {
     }
 }
 
-fn forward_signal(child_id: u32, signal: i32) -> Result<(), io::ErrorKind> {
-    let pid = i32::try_from(child_id).map_err(|_| io::ErrorKind::InvalidInput)?;
-    // SAFETY: `pid` is the unreaped owned child and `signal` is SIGINT or
-    // SIGTERM. `kill` neither retains pointers nor transfers ownership.
-    let result = unsafe { libc::kill(pid, signal) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error.kind())
+fn duration_timespec(duration: Duration) -> libc::timespec {
+    libc::timespec {
+        tv_sec: libc::time_t::try_from(duration.as_secs()).unwrap_or(libc::time_t::MAX),
+        tv_nsec: libc::c_long::from(duration.subsec_nanos()),
     }
 }
 
@@ -256,26 +528,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_batch_defers_reaping_until_signal_events_are_processed() {
+    fn event_batch_defers_reaping_until_all_events_are_available() {
         let signal_event = event(7, libc::EVFILT_READ, 0, 0);
         let exit_event = event(42, libc::EVFILT_PROC, 0, libc::NOTE_EXIT);
         let events = [exit_event, signal_event];
-        let exit_index = events
-            .iter()
-            .position(|event| event.filter == libc::EVFILT_PROC)
-            .expect("exit event should exist");
-        let signal_index = events
-            .iter()
-            .position(|event| event.filter == libc::EVFILT_READ)
-            .expect("signal event should exist");
-        assert!(
-            exit_index < signal_index,
-            "test must exercise exit-first order"
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].filter, libc::EVFILT_PROC);
+        assert_eq!(events[1].filter, libc::EVFILT_READ);
+    }
+
+    #[test]
+    fn terminal_status_must_match_reaped_public_exit() {
+        let success = ExitStatus::from_raw(0);
+        assert_eq!(
+            validate_terminal(success, Some((TerminalCategory::Success, 0))),
+            Ok(())
         );
         assert_eq!(
-            events.len(),
-            2,
-            "the whole batch remains available before reaping"
+            validate_terminal(success, Some((TerminalCategory::ProcessFailure, 1))),
+            Err(LauncherError::SessionProtocol)
         );
+        let signaled = ExitStatus::from_raw(libc::SIGTERM);
+        assert_eq!(public_exit_code(signaled), Some(128 + 15));
+    }
+
+    #[test]
+    fn expired_deadline_is_an_immediate_timeout() {
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test deadline should be representable");
+        assert_eq!(timeout_until(Some(deadline)), Some(Duration::ZERO));
+        assert_eq!(timeout_until(None), None);
     }
 }

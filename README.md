@@ -36,6 +36,7 @@ crates/runtime    Backend-neutral VM model, memory, MMIO, boot, and device helpe
 crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
 crates/launcher   Production app bundle, nested-worker validation, and supervision
+crates/session    Private launcher-worker protocol and runtime namespace ownership
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
 ```
@@ -254,17 +255,44 @@ The worker is signed first with exactly App Sandbox and Hypervisor
 entitlements; the outer launcher is signed last without either entitlement.
 Both use Hardened Runtime. Before every launch, the outer executable validates
 the fixed bundle layout, nested signatures, identifiers, and required worker
-entitlements, then forwards all arguments and inherited standard streams to the
-embedded worker. It forwards `SIGINT` and `SIGTERM` and preserves the worker's
-ordinary exit status.
+entitlements. It then starts the fixed worker suspended with a default-close
+descriptor policy: only open standard streams and one private session endpoint
+survive. The launcher validates the live worker code before resuming it and
+again after the worker has used the endpoint and sent the bounded pre-session
+greeting.
+
+Each launch uses an unnamed Unix socketpair and a random 256-bit session
+identity. Protocol v1 has a 4-KiB frame limit, exact per-direction sequence
+numbers, closed message variants, and monotonic
+`prepared -> starting -> ready -> terminal` state. The launcher authenticates
+the live worker PID, effective credentials, signature, identity, and exact
+entitlements. The sandboxed worker verifies that the peer PID is its direct
+parent and that effective credentials match; App Sandbox prevents the worker
+from independently querying the launcher's code signature, so authentication is
+deliberately asymmetric.
+
+Before public argument or VM processing, the worker creates and locks a unique
+mode-0700 empty namespace in its App Sandbox container. The launcher derives
+that path independently and checks its exact name, owner, mode, device, inode,
+emptiness, and live lock before authorizing startup. Graceful signals become one
+session cancellation, readiness is reported only at the existing committed API
+or no-API seams, and structured terminal status must match the reaped public
+exit. Initial `Hello`, `Start`, and `Proceed` reads use absolute five-second
+deadlines; cancellation and post-`Terminal`/EOF process-exit waits use a
+five-second grace before owned-worker escalation. A surviving worker cleans
+after launcher EOF; a surviving launcher cleans after worker exit; a later
+worker performs bounded identity-checked recovery when both were killed.
+Concurrent sessions retain independent identities, processes, namespaces, and
+API sockets.
 
 Contained mode currently supports only app-container or sealed bundle
-resources. The public build wrapper does not embed guest files, and there is no
-security-scoped bookmark, external-file grant, descriptor broker, vmnet
-provisioning, authenticated launcher protocol, restart/crash-coupling policy,
-Developer ID possession proof, or notarization workflow yet. Static signature
-validation rejects modification at rest but is not atomic against a same-user
-concurrent replacement between validation and execution. See
+resources. The session namespace is empty and carries no grant material. The
+public build wrapper does not embed guest files, and there is no security-scoped
+bookmark, external-file grant/descriptor broker, vmnet provisioning, automatic
+restart policy, Developer ID possession proof, launch-constraint policy, or
+notarization workflow yet. Same-identifier workers share one App Sandbox
+container, so namespace locks and identity checks protect cooperative sessions
+and replacements but do not isolate a malicious same-bundle sibling. See
 [macOS Host Security Model](docs/security.md) for the precise trust boundary.
 
 ## API Examples
@@ -577,9 +605,11 @@ scripts/run-integration-tests.sh --test production_bundle
 ```
 
 This target verifies exact identifiers, entitlements, Hardened Runtime, strict
-nested signature validation, tamper rejection, container-only path denial and
-redaction, API readiness, graceful-signal forwarding, owned-socket cleanup, and
-a real sandboxed HVF guest through `SYSTEM_OFF`.
+static and live-worker validation, tamper rejection, the descriptor allowlist,
+malformed-bootstrap rejection, container-only path denial and redaction,
+structured API/no-API readiness and cancellation, worker-first/launcher-first/
+both-killed namespace cleanup, concurrent-session isolation, owned-socket
+cleanup, and a real sandboxed HVF guest through `SYSTEM_OFF`.
 
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
 validation work:

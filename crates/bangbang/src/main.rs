@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 mod api_server;
+mod contained_session;
 #[doc(hidden)]
 #[cfg(target_os = "macos")]
 pub mod host_network;
@@ -23,6 +24,7 @@ use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{RequestError, parse_request_with_limit};
 use bangbang_hvf::HvfBackend;
+use contained_session::ContainedSession;
 use periodic_metrics::{
     PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
 };
@@ -53,7 +55,19 @@ const FIRECRACKER_DEFAULT_NOFILE_LIMIT: RawFd = 2048;
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &["enable-pci", "no-seccomp", "seccomp-filter"];
 
 fn main() -> ExitCode {
-    match run() {
+    let mut contained = match ContainedSession::bootstrap() {
+        Ok(contained) => contained,
+        Err(err) => {
+            eprintln!("bangbang: {err}");
+            return ProcessExitCode::ProcessFailure.into_exit_code();
+        }
+    };
+    let result = run(&mut contained);
+    let (category, exit_code) = terminal_result(&result, contained.as_ref());
+    if let Some(session) = contained.as_mut() {
+        let _ = session.finish(category, exit_code);
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let exit_code = err.exit_code().into_exit_code();
@@ -63,8 +77,22 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), ProcessError> {
+fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
+    let mut contained_shutdown = if let Some(session) = contained.as_mut() {
+        let (reader, writer) = session
+            .take_wakeup_pair()
+            .map_err(|_| ProcessError::ContainedSession)?;
+        Some(ShutdownSignal::install_with_pair(reader, writer)?)
+    } else {
+        None
+    };
+    if contained_shutdown_requested(contained)? {
+        return Ok(());
+    }
     let args = parse_process_args(env::args_os().skip(1))?;
+    if contained_shutdown_requested(contained)? {
+        return Ok(());
+    }
 
     match args.command {
         Command::Help => {
@@ -87,6 +115,9 @@ fn run() -> Result<(), ProcessError> {
         Command::Run(config) => {
             let config = *config;
             preallocate_fdtable().map_err(ProcessError::FdTablePreallocation)?;
+            if contained_shutdown_requested(contained)? {
+                return Ok(());
+            }
             let effective_mmds_size_limit = config.effective_mmds_size_limit();
             let StartupConfig {
                 api_sock,
@@ -122,31 +153,105 @@ fn run() -> Result<(), ProcessError> {
             .with_process_metrics_diagnostics(process_metrics_diagnostics)
             .with_process_signal_metrics(signal_metrics.clone());
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
+            if contained_shutdown_requested(contained)? {
+                return Ok(());
+            }
             apply_startup_logger_config(&mut vmm, logger_config)?;
+            if contained_shutdown_requested(contained)? {
+                return Ok(());
+            }
             apply_startup_metadata(&mut vmm, metadata.as_deref())?;
+            if contained_shutdown_requested(contained)? {
+                return Ok(());
+            }
             let _fatal_signal_handlers = FatalSignalHandlers::install()?;
             let _sigpipe_signal_handler = SigpipeSignalHandler::install(signal_metrics)?;
-            apply_startup_config_file(&mut vmm, config_file.as_deref())?;
+            if apply_startup_config_file_with_cancel(&mut vmm, config_file.as_deref(), || {
+                contained_shutdown_requested(contained)
+            })? {
+                return finish_process_with_terminal_metrics(&mut vmm, Ok(()));
+            }
             let result = (|| {
-                let mut shutdown_signal = ShutdownSignal::install()?;
+                let mut shutdown_signal = match contained_shutdown.take() {
+                    Some(signal) => signal,
+                    None => ShutdownSignal::install()?,
+                };
+                if contained_shutdown_requested(contained)? {
+                    return Ok(());
+                }
                 if no_api {
+                    if let Some(session) = contained.as_mut() {
+                        session
+                            .send_ready(bangbang_session::Readiness::NoApi)
+                            .map_err(|_| ProcessError::ContainedSession)?;
+                    }
                     println!("status: VM running without API");
-                    return wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
+                    let result = wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
+                    return result.and_then(|()| contained_wakeup_result(contained));
                 }
 
                 let server =
                     ApiServer::bind_with_max_payload_size(&api_sock, http_api_max_payload_size)
                         .map_err(ProcessError::ApiServer)?;
+                if contained_shutdown_requested(contained)? {
+                    return Ok(());
+                }
+                if let Some(session) = contained.as_mut() {
+                    session
+                        .send_ready(bangbang_session::Readiness::Api)
+                        .map_err(|_| ProcessError::ContainedSession)?;
+                }
                 println!("status: API server listening");
                 let shutdown_wakeup = shutdown_signal.wakeup_reader();
                 server
                     .run_until(&mut vmm, shutdown_wakeup)
                     .map_err(ProcessError::ApiServer)
+                    .and_then(|()| contained_wakeup_result(contained))
             })();
 
             finish_process_with_terminal_metrics(&mut vmm, result)
         }
     }
+}
+
+fn terminal_result(
+    result: &Result<(), ProcessError>,
+    contained: Option<&ContainedSession>,
+) -> (bangbang_session::TerminalCategory, u8) {
+    match result {
+        Ok(()) if contained.is_some_and(ContainedSession::was_cancelled) => {
+            (bangbang_session::TerminalCategory::Cancelled, 0)
+        }
+        Ok(()) => (bangbang_session::TerminalCategory::Success, 0),
+        Err(error)
+            if matches!(
+                error.exit_code(),
+                ProcessExitCode::ArgumentParsing | ProcessExitCode::BadConfiguration
+            ) =>
+        {
+            (
+                bangbang_session::TerminalCategory::Configuration,
+                error.exit_code().value(),
+            )
+        }
+        Err(error) => (
+            bangbang_session::TerminalCategory::ProcessFailure,
+            error.exit_code().value(),
+        ),
+    }
+}
+
+fn contained_shutdown_requested(
+    contained: &Option<ContainedSession>,
+) -> Result<bool, ProcessError> {
+    contained
+        .as_ref()
+        .map_or(Ok(false), |session| session.shutdown_requested())
+        .map_err(|_| ProcessError::ContainedSession)
+}
+
+fn contained_wakeup_result(contained: &Option<ContainedSession>) -> Result<(), ProcessError> {
+    contained_shutdown_requested(contained).map(|_| ())
 }
 
 fn finish_process_with_terminal_metrics<S>(
@@ -256,6 +361,7 @@ fn handle_due_no_api_periodic_schedulers(
     Ok(handled)
 }
 
+#[cfg(test)]
 fn apply_startup_config_file<S>(
     vmm: &mut ProcessVmm<S>,
     config_file: Option<&str>,
@@ -263,23 +369,44 @@ fn apply_startup_config_file<S>(
 where
     S: vmm::InstanceStartExecutor,
 {
+    let cancelled = apply_startup_config_file_with_cancel(vmm, config_file, || Ok(false))?;
+    debug_assert!(!cancelled, "non-cancellable wrapper cannot cancel");
+    Ok(())
+}
+
+fn apply_startup_config_file_with_cancel<S, C>(
+    vmm: &mut ProcessVmm<S>,
+    config_file: Option<&str>,
+    mut cancelled: C,
+) -> Result<bool, ProcessError>
+where
+    S: vmm::InstanceStartExecutor,
+    C: FnMut() -> Result<bool, ProcessError>,
+{
     let Some(config_file) = config_file else {
-        return Ok(());
+        return Ok(false);
     };
     let actions = config_file_actions(config_file).map_err(ProcessError::ConfigFile)?;
 
     for action in actions {
+        if cancelled()? {
+            return Ok(true);
+        }
         vmm.handle_action(action)
             .map_err(ConfigFileError::Apply)
             .map_err(ProcessError::ConfigFile)?;
     }
 
+    if cancelled()? {
+        return Ok(true);
+    }
     let result = vmm.handle_action(VmmAction::InstanceStart);
     vmm.handle_initial_metrics_flush();
     result
         .map(|_| ())
         .map_err(ConfigFileError::Apply)
-        .map_err(ProcessError::ConfigFile)
+        .map_err(ProcessError::ConfigFile)?;
+    Ok(false)
 }
 
 fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
@@ -877,6 +1004,7 @@ enum ProcessError {
     ArgumentParsing(String),
     BadConfiguration(String),
     ConfigFile(ConfigFileError),
+    ContainedSession,
     FdTablePreallocation(FdTablePreallocationError),
     Metadata(MetadataFileError),
     PeriodicBalloonStatisticsUpdate(VmmActionError),
@@ -895,6 +1023,7 @@ impl ProcessError {
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
             Self::BadConfiguration(_) => ProcessExitCode::BadConfiguration,
             Self::ConfigFile(_) => ProcessExitCode::BadConfiguration,
+            Self::ContainedSession => ProcessExitCode::ProcessFailure,
             Self::FdTablePreallocation(_) => ProcessExitCode::ProcessFailure,
             Self::Metadata(_) => ProcessExitCode::BadConfiguration,
             Self::PeriodicBalloonStatisticsUpdate(_) => ProcessExitCode::ProcessFailure,
@@ -915,6 +1044,7 @@ impl fmt::Display for ProcessError {
             Self::ArgumentParsing(message) => f.write_str(message),
             Self::BadConfiguration(message) => f.write_str(message),
             Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
+            Self::ContainedSession => f.write_str("private launcher session failed"),
             Self::FdTablePreallocation(err) => {
                 write!(f, "file descriptor table preallocation failed: {err}")
             }
@@ -1164,6 +1294,13 @@ impl ShutdownSignal {
     fn install() -> Result<Self, ProcessError> {
         let (wakeup_reader, wakeup_writer) =
             UnixStream::pair().map_err(|err| ProcessError::SignalHandler(err.kind()))?;
+        Self::install_with_pair(wakeup_reader, wakeup_writer)
+    }
+
+    fn install_with_pair(
+        wakeup_reader: UnixStream,
+        wakeup_writer: UnixStream,
+    ) -> Result<Self, ProcessError> {
         let sigint = register_signal_wakeup(SIGINT, &wakeup_writer)?;
         let sigterm = match register_signal_wakeup(SIGTERM, &wakeup_writer) {
             Ok(sigterm) => sigterm,

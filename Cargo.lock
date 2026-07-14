@@ -9,6 +9,7 @@ dependencies = [
  "bangbang-api",
  "bangbang-hvf",
  "bangbang-runtime",
+ "bangbang-session",
  "block2",
  "crc64",
  "dispatch2",
@@ -51,6 +52,7 @@ dependencies = [
 name = "bangbang-launcher"
 version = "0.1.0"
 dependencies = [
+ "bangbang-session",
  "libc",
  "signal-hook",
 ]
@@ -65,6 +67,14 @@ dependencies = [
  "libc",
  "serde_json",
  "vm-fdt",
+]
+
+[[package]]
+name = "bangbang-session"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "libc",
 ]
 
 [[package]]

@@ -9,13 +9,16 @@ Firecracker's full production isolation model on macOS.
 Direct mode follows Firecracker's one-VMM-process-per-microVM model. One
 `bangbang` process owns one API socket, one VMM controller, one HVF-backed
 startup path, and the host resources configured for that microVM. Production
-bundle mode adds one outer supervisor process while retaining exactly one
-sandbox worker and one VMM ownership domain per invocation.
+bundle mode adds one outer supervisor and one authenticated private process
+session while retaining exactly one sandbox worker and one VMM ownership domain
+per invocation.
 
-Normal startup uses non-clobbering fd-table preallocation as a Firecracker-style
+Direct startup uses non-clobbering fd-table preallocation as a Firecracker-style
 performance guard. Failing to read the descriptor limit or duplicate a
-descriptor is non-fatal; failing to close a successfully duplicated descriptor is
-fatal. The setup does not overwrite inherited high-numbered descriptors.
+descriptor is non-fatal; failing to close a successfully duplicated descriptor
+is fatal. The setup does not overwrite inherited high-numbered descriptors.
+Production launch instead uses Darwin's default-close spawn mode and explicitly
+retains only open standard streams plus one fixed private session descriptor.
 
 Direct mode trusts the host user account and local filesystem permissions around
 configured paths. Production bundle mode additionally trusts its outer launcher,
@@ -43,14 +46,17 @@ map to the current macOS/HVF scaffold:
 
 bangbang currently rejects Linux-specific Firecracker process options rather
 than silently accepting them. The production bundle supplies a macOS App
-Sandbox launcher/worker boundary, but no external resource broker, exact
-seccomp/jailer outcome replacement, or complete distribution-signing policy yet.
+Sandbox launcher/worker boundary plus a bounded per-VM lifecycle session, but no
+external resource broker, exact seccomp/jailer outcome replacement, or complete
+distribution-signing policy yet.
 
 Apple App Sandbox is a supportable containment building block, not a direct
 jailer port. The lower-level signed target packages real binaries as minimal
 apps and proves the complete HVF lifecycle plus container allow/deny behavior.
 The production target separately proves the fixed outer app and nested worker,
-exact entitlement split, signature validation, signal supervision, owned socket
+exact entitlement split, static and dynamic code validation, descriptor closure,
+bounded protocol rejection, signal cancellation, both surviving-process cleanup
+directions, both-killed recovery, concurrent namespace isolation, owned socket
 cleanup, and a real sandboxed guest. The direct CLI remains an ordinary
 non-sandboxed executable; the production bundle's current resource policy is
 container or sealed resources only.
@@ -82,11 +88,11 @@ changes Firecracker-facing behavior or security posture:
   that intentionally return a Firecracker-shaped fault without mutating state
   are `recognized unsupported`. Add parser/state tests and process e2e coverage
   when the public process boundary is affected.
-- Operator-owned policy: socket-directory permissions,
-  host-path ownership, and current resource-sharing rules are deployment
-  assumptions until the production launcher has an authenticated resource-
-  broker protocol. Document the assumption and test that one `bangbang` process
-  does not clean up resources it no longer owns.
+- Operator-owned policy: socket-directory permissions, host-path ownership, and
+  current resource-sharing rules are deployment assumptions until the
+  production session carries separately approved, typed resource grants.
+  Document the assumption and test that one `bangbang` process does not clean
+  up resources it no longer owns.
 
 When a capability moves between these categories, update the compatibility docs,
 validation matrix, tests, and related issue links in the same PR.
@@ -103,7 +109,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
 | Network and vmnet | Implemented virtio-MMIO/MMDS-only subset; direct vmnet conditional | Keep supported `host_dev_name` forms, startup validation, MMDS-only behavior, entitlement requirements, and non-goals documented when network behavior changes. |
 | macOS App Sandbox | Production nested worker implemented for container/sealed resources | Keep the ordinary CLI explicitly uncontained and prove both package identity and real worker allow/deny behavior. |
-| Launcher and resource broker | Fixed pre-protocol launcher implemented; external resource broker missing | Keep host-path and shared-resource authority as operator responsibility until an authenticated, separately approved broker protocol is implemented. |
+| Launcher and resource broker | Authenticated lifecycle/session launcher implemented; external resource broker missing | Keep host-path and shared-resource authority as operator responsibility until separately approved typed grant and revocation messages are implemented. |
 
 ## Native Snapshot Composite and Device Boundary
 
@@ -214,7 +220,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | Operator-owned private directories | Required for API sockets, vsock sockets, observability sinks, and other configured paths that should not be shared. | A launcher or broker could create and own these directories before starting a VM process. |
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
 | macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container or sealed bundle resources are the current contained-mode policy. | Security-scoped external grants and vmnet authorization require later explicit policy. |
-| Launcher or resource broker | The production launcher validates fixed nested code, starts one embedded worker, forwards arguments/signals, and preserves status. It does not open or transfer VM resources. | An authenticated protocol could grant owned descriptors/resources and centralize replacement-safe cleanup. |
+| Launcher or resource broker | The production launcher validates fixed and live nested code, starts one default-close worker, authenticates a bounded lifecycle session, owns cancellation/status, and coordinates a private empty namespace. It does not open or transfer VM resources. | Extend the existing session only with separately reviewed typed grants, descriptor identity, revocation, and resource-specific cleanup. |
 | Firecracker Linux jailer model | Platform-limited unsupported as a direct port. | Keep Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege-drop flags rejected or documented until macOS replacements exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
@@ -274,35 +280,75 @@ only the private unpublished staging tree; tool output, identities, paths, and
 worker data are omitted from product errors.
 
 At runtime the launcher derives the worker from its own exact bundle location;
-there is no environment, working-directory, or user-path override. It rejects
-symlinked, missing, nonregular, wrongly identified, or invalidly signed code,
-any outer entitlement, and any worker entitlement dictionary other than exactly
-App Sandbox and Hypervisor set to Boolean true before child output or readiness.
-Security.framework
-validates the outer and worker code requirements with strict, all-architecture,
-nested, and symlink-restriction checks, and reads each static signature to
-require Hardened Runtime. This detects package modification at rest. The
-compiled requirements do not anchor a certificate or Team ID, so
-they do not authenticate a wholly replaced and separately validly signed
-package. Validation is also not atomic against a same-user concurrent mutation
-between validation and execution; kernel launch constraints and a deployment
-minimum/team policy are deferred.
+there is no working-directory or user-path override. It rejects symlinked,
+missing, nonregular, wrongly identified, or invalidly signed code, any outer
+entitlement, and any worker entitlement dictionary other than exactly App
+Sandbox and Hypervisor set to Boolean true. Security.framework validates the
+outer and worker static requirements with strict, all-architecture, nested, and
+symlink-restriction checks and requires Hardened Runtime. It also validates the
+spawned worker's dynamic code by PID while that process is suspended and again
+after the resumed bootstrap has used its session endpoint. The requirements do
+not anchor a certificate or Team ID, so they do not authenticate a wholly
+replaced and separately validly signed package; Developer ID/team policy and
+kernel launch constraints remain deployment work.
 
-The launcher passes the original argument bytes unchanged, inherits standard
-streams, owns one child, forwards graceful `SIGINT` and `SIGTERM`, and preserves
-ordinary exit codes. Its kqueue event loop processes pending signal events
-before reaping a child-exit batch and never signals after reap, preventing PID
-reuse from redirecting a late forward. An otherwise signaled child maps to
-`128 + signal`. There is no authenticated readiness/session protocol, external
-resource grant, descriptor transfer, restart policy, daemonization, parent-
-death kill, or complete two-way crash-coupling claim in this boundary.
+The launcher preserves original argument bytes and ordinary environment entries
+while replacing one private bootstrap marker. Direct Darwin `posix_spawn` uses
+`CLOEXEC_DEFAULT | START_SUSPENDED`; file actions retain each open standard
+stream and duplicate exactly one socketpair endpoint to the fixed internal
+descriptor. Unexpected inheritable descriptors are closed in the worker image.
+Before `Start`, worker code can only mark that descriptor close-on-exec, require
+peer effective UID/GID to match, require `LOCAL_PEERPID == getppid()`, send one
+no-payload `Hello` under the reserved all-zero identity, and block. The launcher
+then checks the child-attributed peer PID/credentials and live code again before
+sending a fresh random session identity. App Sandbox denies the worker's
+Security.framework lookup of its unsandboxed parent, so worker-to-launcher trust
+is deliberately limited to the inherited endpoint, direct-parent PID,
+credentials, exact sequences, and disconnect behavior; symmetric code-signing
+authentication is not claimed.
+
+Protocol v1 uses a fixed endian-stable header, 256-bit session identity, exact
+per-direction sequence, zero reserved fields, closed message kinds, fixed
+payload shapes, and a 4096-byte frame cap. Wrong magic/version/reserved fields,
+oversized or truncated input, unknown messages, replay/gap, cross-session data,
+wrong sender, and invalid state fail with one redacted category before public or
+VM work. `Hello`, `Start`, `Prepared`, `Proceed`, `Starting`, optional committed
+`Ready(Api|NoApi)`, at most one `Cancel(SIGINT|SIGTERM)`, and path-free
+`Terminal(category, exit_code)` form the complete v1 lifecycle. Structured exit
+values must match the reaped public status; abrupt death may omit `Terminal`.
+The initial `Hello`, `Start`, and `Proceed` reads each use an absolute
+five-second deadline, including across interrupted or fragmented reads.
+
+After `Start`, the worker creates and locks an empty mode-0700 directory named
+only from the random identity beneath its fixed App Sandbox container temp root.
+`Prepared` carries device/inode numbers, never a path. The launcher independently
+derives the root from the current user's home and fixed worker identifier, opens
+without following links, and checks exact name, type, effective owner, mode,
+device, inode, emptiness, and the worker-held lock before sending `Proceed`.
+The directory contains no socket, protocol data, argument, external grant, or
+resource. Same-identifier workers share the container, so the lock and identity
+checks preserve unrelated or replaced cooperative sessions but do not defend
+against a malicious same-bundle sibling with equivalent container authority.
+
+The launcher kqueue watches both graceful signals, the session stream, and the
+unreaped child. The first signal sends one bounded cancellation and starts a
+five-second grace deadline; later signals are coalesced, and expiry kills only
+the still-owned unreaped worker. A structured `Terminal` or session EOF starts
+the same bounded process-exit grace, so a peer cannot report completion or
+disconnect and then hold supervision indefinitely. Pending protocol bytes are
+drained before a same-batch child reap, ordinary status is preserved, and
+signaled status maps to `128 + signal`. Worker EOF cleanup handles
+launcher-first death; launcher identity-checked cleanup handles worker-first
+death; a later worker scans at most 128 names and removes only valid empty
+unlocked identity-stable residue after both were killed. There is no automatic
+restart or reconnect.
 
 The outer launcher, fixed metadata, and signed nested code are trusted package
 components. API requests, guest data, device input, host path arguments, and
 HVF exits remain untrusted worker inputs. Container and sealed bundle resources
 are the only current contained resource authority. vmnet, snapshots, vsock
 paths, observability sinks, and arbitrary kernel/disk/config paths need later
-resource-specific grants before the production worker can safely use them.
+typed resource grants before the production worker can safely use them.
 
 ## vmnet Host Policy Boundary
 
@@ -1302,12 +1348,13 @@ Use unique paths for:
 Each process owns its own VMM controller state and observability sinks. There is
 no global registry that prevents two processes from using the same host path.
 Path isolation is therefore an operator responsibility until the production
-launcher grows an authenticated resource-broker protocol.
+session grows typed resource grants and collision/revocation policy.
 
 Each production launcher owns exactly one sandbox worker and does not share
-that child across invocations. The fixed process relationship prevents
-alternate worker selection, but it does not allocate unique external resources
-or coordinate them across launcher instances.
+that child across invocations. Every invocation has a random protocol identity
+and locked private namespace, and signed tests prove that one crashed session
+does not terminate or clean a concurrent peer. This does not allocate unique
+external resources or coordinate caller-supplied paths across launchers.
 
 ## Current Non-Goals
 
@@ -1316,7 +1363,7 @@ The current scaffold does not implement:
 - external-resource grants or a complete production resource-broker policy for
   the sandbox worker
 - Developer ID possession, notarization, kernel launch constraints, or an
-  authenticated launcher/worker session and complete crash-coupling policy
+  automatic restart/reconnect policy
 - a Firecracker-jailer replacement
 - privilege dropping
 - host resource brokering

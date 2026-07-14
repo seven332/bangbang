@@ -700,20 +700,41 @@ unsupported runner may skip execution. On supported Apple Silicon it proves:
 
 - exact launcher and worker identifiers, Hardened Runtime on both, no launcher
   App Sandbox/Hypervisor authority, and exactly those two worker entitlements;
-- unchanged help/output and representative nonzero worker exit forwarding;
+- unchanged help/output and representative nonzero worker exit forwarding
+  through the structured lifecycle session;
 - rejection before worker execution when a private bundle copy has a modified
   or missing worker;
+- suspended and post-`Hello` live-worker validation, bounded malformed bootstrap
+  rejection before public readiness, and stable path/identity/frame redaction;
+- a default-close spawn allowlist that retains standard streams and the private
+  endpoint while making a deliberately inheritable unexpected fd unavailable;
 - container-only API socket readiness plus path-redacted denial of an outside
   config file;
-- `SIGINT` and `SIGTERM` forwarding with successful worker/launcher exit and
-  owned-socket cleanup; and
+- `SIGINT` and `SIGTERM` as one graceful session cancellation with successful
+  worker/launcher exit and owned-socket cleanup;
+- worker-first and launcher-first death cleanup, both-killed stale namespace
+  recovery, and preservation of the concurrent peer namespace;
+- two simultaneous API sessions remaining independent when one worker is
+  killed and the other is queried and then gracefully stopped; and
 - a sealed test-only kernel/initrd/config launching a real sandboxed HVF guest
-  through PSCI `SYSTEM_OFF` without an API socket.
+  after committed no-API readiness and ending through PSCI `SYSTEM_OFF`.
 
 The runner's resource overlay is an internal signed-test input to the lower-
 level package tool. `scripts/build-production-bundle.sh` does not expose it or
 place guest resources in a normal product. Tests use readiness events and
 bounded deadlines rather than fixed sleeps.
+
+Portable `bangbang-session` tests exhaustively split and coalesce every v1
+message frame and cover wrong magic/version/reserved data, exact frame/buffer
+limits, oversized input, EOF rejection, replay, sequence gaps, cross-session and
+wrong-role/state input, reserved identity use, monotonic API/early-command/
+cancellation state, and payload/identity-redacted formatting. Darwin unit tests
+cover kernel peer acceptance and PID rejection, exact namespace naming/root
+derivation, bounded independent directory iteration across repeated checks,
+stale empty-directory recovery, populated-entry preservation, and
+replacement-safe cleanup. These tests do not replace the signed target:
+default-close spawning, dynamic code identity, App Sandbox root resolution,
+crash order, and real HVF claims require the packaged execution above.
 
 Build a local production bundle without running the integration suite:
 

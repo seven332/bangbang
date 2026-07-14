@@ -4,6 +4,7 @@ members = [
     "crates/hvf",
     "crates/launcher",
     "crates/runtime",
+    "crates/session",
     "crates/bangbang",
     "tools/firecracker-capability-audit",
 ]
