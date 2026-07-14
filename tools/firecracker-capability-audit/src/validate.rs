@@ -582,10 +582,14 @@ fn validate_exclusion(
         &format!("{id} exclusion.challenge"),
         errors,
     );
-    if !matches!(&exclusion.challenge, Reference::Github { .. }) {
-        errors.push(format!(
+    match &exclusion.challenge {
+        Reference::Github { url } if !is_github_challenge_url(url) => errors.push(format!(
+            "platform exclusion challenge must link a GitHub issue Challenge comment: {id}"
+        )),
+        Reference::Github { .. } => {}
+        _ => errors.push(format!(
             "platform exclusion challenge must be a GitHub reference: {id}"
-        ));
+        )),
     }
 }
 
@@ -639,15 +643,17 @@ fn validate_reference(
             }
         }
         Reference::Github { url } => {
-            if !url.starts_with("https://github.com/") {
+            if !is_github_reference_url(url) {
                 errors.push(format!(
-                    "GitHub reference must use https://github.com/: {label}"
+                    "GitHub reference must name an HTTPS repository path: {label}"
                 ));
             }
         }
         Reference::Authoritative { url } => {
-            if !url.starts_with("https://") {
-                errors.push(format!("authoritative reference must use HTTPS: {label}"));
+            if !is_https_reference_url(url) {
+                errors.push(format!(
+                    "authoritative reference must name an HTTPS host: {label}"
+                ));
             }
         }
     }
@@ -677,9 +683,70 @@ fn is_semantic_id(value: &str) -> bool {
 }
 
 fn is_delivery_issue(value: &str) -> bool {
-    value.strip_prefix('#').is_some_and(|number| {
-        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-    }) || (value.starts_with("https://github.com/") && value.contains("/issues/"))
+    value.strip_prefix('#').is_some_and(is_positive_decimal) || is_github_issue_url(value)
+}
+
+fn is_github_reference_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    if rest.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return false;
+    }
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    let mut segments = path.split('/');
+    segments.next().is_some_and(|owner| !owner.is_empty())
+        && segments
+            .next()
+            .is_some_and(|repository| !repository.is_empty())
+}
+
+fn is_github_issue_url(url: &str) -> bool {
+    if !is_github_reference_url(url) {
+        return false;
+    }
+    let path = url
+        .strip_prefix("https://github.com/")
+        .unwrap_or_default()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let mut segments = path.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some(_), Some(_), Some("issues"), Some(number), None) if is_positive_decimal(number)
+    )
+}
+
+fn is_github_challenge_url(url: &str) -> bool {
+    is_github_issue_url(url)
+        && url
+            .split_once("#issuecomment-")
+            .is_some_and(|(_, comment)| is_positive_decimal(comment))
+}
+
+fn is_https_reference_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return false;
+    }
+    rest.split(['/', '?', '#'])
+        .next()
+        .is_some_and(|host| host.contains('.') && !host.starts_with('.') && !host.ends_with('.'))
+}
+
+fn is_positive_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.bytes().any(|byte| byte != b'0')
 }
 
 fn check_sorted_unique<'a>(
@@ -854,6 +921,35 @@ mod tests {
         let (manifest, inventory) = valid_fixture();
         validate(&manifest, &inventory, Path::new("."), AuditMode::Delivery)
             .expect("fixture should validate");
+    }
+
+    #[test]
+    fn validates_external_reference_and_issue_url_shapes() {
+        assert!(is_github_reference_url(
+            "https://github.com/seven332/bangbang"
+        ));
+        assert!(!is_github_reference_url("https://github.com/"));
+        assert!(!is_github_reference_url(
+            "https://github.com/seven332/bang bang"
+        ));
+        assert!(is_github_issue_url(
+            "https://github.com/seven332/bangbang/issues/1349"
+        ));
+        assert!(!is_github_issue_url(
+            "https://github.com/seven332/bangbang/pull/1350"
+        ));
+        assert!(is_github_challenge_url(
+            "https://github.com/seven332/bangbang/issues/1349#issuecomment-4971005774"
+        ));
+        assert!(!is_github_challenge_url(
+            "https://github.com/seven332/bangbang/issues/1349"
+        ));
+        assert!(is_https_reference_url(
+            "https://developer.apple.com/documentation/hypervisor"
+        ));
+        assert!(!is_https_reference_url("https://"));
+        assert!(is_delivery_issue("#1349"));
+        assert!(!is_delivery_issue("#0"));
     }
 
     #[test]

@@ -69,11 +69,34 @@ fn run_compare(args: &[String]) -> Result<String, AuditError> {
     let checked_in = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))?;
     let derived = derive_source_manifest(Path::new(&firecracker))?;
     if checked_in != derived {
+        let checked_json = String::from_utf8(source_manifest_json(&checked_in)?)
+            .map_err(|_| AuditError::new("checked source manifest JSON is not valid UTF-8"))?;
+        let derived_json = String::from_utf8(source_manifest_json(&derived)?)
+            .map_err(|_| AuditError::new("derived source manifest JSON is not valid UTF-8"))?;
         return Err(AuditError::new(format!(
-            "derived source manifest differs from {SOURCE_MANIFEST_PATH}; run regenerate to an explicit candidate path"
+            "derived source manifest differs from {SOURCE_MANIFEST_PATH}; run regenerate to an explicit candidate path\n{}",
+            canonical_line_diff(&checked_json, &derived_json)
         )));
     }
     Ok("checked-in source manifest matches the pinned Firecracker checkout".to_string())
+}
+
+fn canonical_line_diff(checked: &str, derived: &str) -> String {
+    let checked_lines: Vec<&str> = checked.lines().collect();
+    let derived_lines: Vec<&str> = derived.lines().collect();
+    let line_count = checked_lines.len().max(derived_lines.len());
+    let mut differences = Vec::new();
+    for index in 0..line_count {
+        let checked_line = checked_lines.get(index).copied();
+        let derived_line = derived_lines.get(index).copied();
+        if checked_line != derived_line {
+            differences.push(format!(
+                "line {}: checked={checked_line:?}; derived={derived_line:?}",
+                index + 1
+            ));
+        }
+    }
+    differences.join("\n")
 }
 
 fn run_regenerate(args: &[String]) -> Result<String, AuditError> {
@@ -262,6 +285,13 @@ mod tests {
         let error = required_option(&["--firecracker".to_string()], "--firecracker")
             .expect_err("missing value should fail");
         assert!(error.to_string().contains("requires a value"));
+    }
+
+    #[test]
+    fn canonical_diff_reports_changed_and_missing_lines() {
+        let diff = canonical_line_diff("one\ntwo\n", "one\nchanged\nthree\n");
+        assert!(diff.contains("line 2: checked=Some(\"two\"); derived=Some(\"changed\")"));
+        assert!(diff.contains("line 3: checked=None; derived=Some(\"three\")"));
     }
 
     #[test]
