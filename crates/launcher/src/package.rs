@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::layout::{APP_SANDBOX_ENTITLEMENT, HYPERVISOR_ENTITLEMENT};
 use crate::{
     LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME, OUTER_BUNDLE_NAME, PackageError,
-    WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
+    PackageOptions, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 
 const LAUNCHER_INFO_PLIST: &[u8] = include_bytes!("../../../packaging/macos/Bangbang-Info.plist");
@@ -25,21 +25,6 @@ const MAX_TEST_RESOURCE_ENTRIES: usize = 128;
 const MAX_TEST_RESOURCE_DEPTH: usize = 8;
 const MAX_TEST_RESOURCE_BYTES: u64 = 1024 * 1024 * 1024;
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
-
-/// Inputs for one immutable production bundle publication.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackageOptions {
-    /// Already-built production launcher executable.
-    pub launcher_binary: PathBuf,
-    /// Already-built direct VMM executable copied into the sandbox worker app.
-    pub worker_binary: PathBuf,
-    /// Final output, whose file name must be `Bangbang.app` and must not exist.
-    pub output_bundle: PathBuf,
-    /// One identity for both separately signed code objects; `-` selects ad-hoc signing.
-    pub signing_identity: OsString,
-    /// Hidden repository-integration resource tree copied before signing.
-    pub test_worker_resources: Option<PathBuf>,
-}
 
 /// Builds, inspects, and exclusively publishes one production app bundle.
 pub fn build_bundle(options: &PackageOptions) -> Result<PathBuf, PackageError> {
