@@ -69,20 +69,20 @@ fn run() -> Result<(), ProcessError> {
     match args.command {
         Command::Help => {
             print_help();
-            return Ok(());
+            Ok(())
         }
         Command::Version => {
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            Ok(())
         }
         Command::SnapshotVersion => {
             println!("v{NATIVE_V1_SNAPSHOT_VERSION}");
-            return Ok(());
+            Ok(())
         }
         Command::DescribeSnapshot(path) => {
             let metadata = describe_snapshot(path.as_str())?;
             println!("v{}", metadata.version());
-            return Ok(());
+            Ok(())
         }
         Command::Run(config) => {
             let config = *config;
@@ -127,25 +127,37 @@ fn run() -> Result<(), ProcessError> {
             let _fatal_signal_handlers = FatalSignalHandlers::install()?;
             let _sigpipe_signal_handler = SigpipeSignalHandler::install(signal_metrics)?;
             apply_startup_config_file(&mut vmm, config_file.as_deref())?;
-            let mut shutdown_signal = ShutdownSignal::install()?;
-            if no_api {
-                println!("status: VM running without API");
-                wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm)?;
-                return Ok(());
-            }
+            let result = (|| {
+                let mut shutdown_signal = ShutdownSignal::install()?;
+                if no_api {
+                    println!("status: VM running without API");
+                    return wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
+                }
 
-            let server =
-                ApiServer::bind_with_max_payload_size(&api_sock, http_api_max_payload_size)
-                    .map_err(ProcessError::ApiServer)?;
-            println!("status: API server listening");
-            let shutdown_wakeup = shutdown_signal.wakeup_reader();
-            server
-                .run_until(&mut vmm, shutdown_wakeup)
-                .map_err(ProcessError::ApiServer)?;
+                let server =
+                    ApiServer::bind_with_max_payload_size(&api_sock, http_api_max_payload_size)
+                        .map_err(ProcessError::ApiServer)?;
+                println!("status: API server listening");
+                let shutdown_wakeup = shutdown_signal.wakeup_reader();
+                server
+                    .run_until(&mut vmm, shutdown_wakeup)
+                    .map_err(ProcessError::ApiServer)
+            })();
+
+            finish_process_with_terminal_metrics(&mut vmm, result)
         }
     }
+}
 
-    Ok(())
+fn finish_process_with_terminal_metrics<S>(
+    vmm: &mut ProcessVmm<S>,
+    result: Result<(), ProcessError>,
+) -> Result<(), ProcessError>
+where
+    S: vmm::InstanceStartExecutor,
+{
+    vmm.handle_terminal_metrics_flush();
+    result
 }
 
 fn wait_for_no_api_shutdown(
@@ -155,7 +167,7 @@ fn wait_for_no_api_shutdown(
     wait_for_no_api_shutdown_with_periodic_metrics_scheduler(
         shutdown_signal,
         vmm,
-        PeriodicMetricsScheduler::new(Instant::now()),
+        PeriodicMetricsScheduler::new(),
     )
 }
 
@@ -185,7 +197,7 @@ fn wait_for_no_api_shutdown_with_periodic_schedulers(
 
     loop {
         let now = Instant::now();
-        let metrics_timeout = Some(metrics_scheduler.poll_timeout_ms(now));
+        let metrics_timeout = metrics_scheduler.poll_timeout_ms(now, vmm.metrics_session_epoch());
         let balloon_timeout =
             balloon_scheduler.poll_timeout_ms(now, vmm.balloon_statistics_update_interval());
         match wait_for_shutdown_or_process_exit(
@@ -235,10 +247,9 @@ fn handle_due_no_api_periodic_schedulers(
     }
 
     let now = Instant::now();
-    if metrics_scheduler.is_due(now) {
-        vmm.handle_periodic_metrics_flush()
-            .map_err(ProcessError::PeriodicMetricsFlush)?;
-        metrics_scheduler.schedule_next(Instant::now());
+    if metrics_scheduler.is_due(now, vmm.metrics_session_epoch()) {
+        vmm.handle_periodic_metrics_flush();
+        metrics_scheduler.schedule_next(Instant::now(), vmm.metrics_session_epoch());
         handled = true;
     }
 
@@ -258,19 +269,14 @@ where
     let actions = config_file_actions(config_file).map_err(ProcessError::ConfigFile)?;
 
     for action in actions {
-        let flush_startup_metrics = matches!(action, VmmAction::PutMetrics(_));
         vmm.handle_action(action)
             .map_err(ConfigFileError::Apply)
             .map_err(ProcessError::ConfigFile)?;
-        if flush_startup_metrics {
-            vmm.flush_startup_metrics()
-                .map(|_| ())
-                .map_err(ConfigFileError::Apply)
-                .map_err(ProcessError::ConfigFile)?;
-        }
     }
 
-    vmm.handle_action(VmmAction::InstanceStart)
+    let result = vmm.handle_action(VmmAction::InstanceStart);
+    vmm.handle_initial_metrics_flush();
+    result
         .map(|_| ())
         .map_err(ConfigFileError::Apply)
         .map_err(ProcessError::ConfigFile)
@@ -621,9 +627,6 @@ where
         vmm.handle_action(VmmAction::PutMetrics(metrics_config))
             .map(|_| ())
             .map_err(ProcessError::StartupConfiguration)?;
-        vmm.flush_startup_metrics()
-            .map(|_| ())
-            .map_err(ProcessError::StartupConfiguration)?;
     }
 
     Ok(())
@@ -877,7 +880,6 @@ enum ProcessError {
     FdTablePreallocation(FdTablePreallocationError),
     Metadata(MetadataFileError),
     PeriodicBalloonStatisticsUpdate(VmmActionError),
-    PeriodicMetricsFlush(VmmActionError),
     ProcessExitNotification(std::io::ErrorKind),
     ProcessSessionTerminal,
     SignalHandler(std::io::ErrorKind),
@@ -896,7 +898,6 @@ impl ProcessError {
             Self::FdTablePreallocation(_) => ProcessExitCode::ProcessFailure,
             Self::Metadata(_) => ProcessExitCode::BadConfiguration,
             Self::PeriodicBalloonStatisticsUpdate(_) => ProcessExitCode::ProcessFailure,
-            Self::PeriodicMetricsFlush(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessExitNotification(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessSessionTerminal => ProcessExitCode::ProcessFailure,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
@@ -923,9 +924,6 @@ impl fmt::Display for ProcessError {
                     f,
                     "failed to trigger periodic balloon statistics update: {err}"
                 )
-            }
-            Self::PeriodicMetricsFlush(err) => {
-                write!(f, "failed to flush periodic metrics: {err}")
             }
             Self::ProcessExitNotification(kind) => {
                 write!(f, "process exit notification failed: {kind:?}")
@@ -2079,13 +2077,14 @@ fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::ffi::{CString, OsString};
     use std::fs;
     use std::io::{ErrorKind, Read, Write};
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2095,7 +2094,10 @@ mod tests {
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
     use bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput;
-    use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics};
+    use bangbang_runtime::metrics::{
+        MetricsConfigError, MetricsConfigInput, MetricsDiagnostics, MetricsFlushError,
+        SharedSignalMetrics,
+    };
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::network::NetworkInterfaceConfigInput;
     use bangbang_runtime::pmem::{PmemConfigError, PmemConfigInput};
@@ -2300,6 +2302,14 @@ mod tests {
     }
 
     impl ProcessSessionDiagnostics for TestProcessExitSession {
+        fn pause(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn resume(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
         fn trigger_balloon_statistics_update(
             &mut self,
         ) -> Result<(), bangbang_runtime::balloon::BalloonUpdateError> {
@@ -2481,11 +2491,18 @@ mod tests {
             self.inner.record_load_snapshot_latency_us(duration_us);
         }
 
-        fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
-            let result = self.inner.handle_periodic_metrics_flush();
+        fn metrics_session_epoch(&self) -> Option<Instant> {
+            self.inner.metrics_session_epoch()
+        }
+
+        fn handle_initial_metrics_flush(&mut self) {
+            self.inner.handle_initial_metrics_flush();
+        }
+
+        fn handle_periodic_metrics_flush(&mut self) {
+            self.inner.handle_periodic_metrics_flush();
             self.process_exit_trigger
                 .trigger(ProcessSessionExitStatus::GuestRequestedStop);
-            result
         }
 
         fn balloon_statistics_update_interval(&self) -> Option<Duration> {
@@ -2543,6 +2560,73 @@ mod tests {
             "bangbang-main-test-{}-{nanos}-{name}.metrics",
             std::process::id()
         ))
+    }
+
+    #[derive(Debug)]
+    struct MetricsFifo {
+        path: PathBuf,
+        reader: fs::File,
+    }
+
+    impl MetricsFifo {
+        fn create(name: &str) -> Self {
+            let path = unique_metrics_path(name);
+            let c_path = CString::new(path.as_os_str().as_bytes())
+                .expect("metrics FIFO path should not contain NUL");
+            // SAFETY: `c_path` is a live NUL-terminated path owned by this test fixture.
+            let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+            assert_eq!(result, 0, "metrics FIFO should be created");
+            let reader = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .expect("metrics FIFO reader should open");
+
+            Self { path, reader }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn fill_to_capacity(&self) {
+            let mut writer = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path)
+                .expect("metrics FIFO filler should open");
+            let chunk = [b'x'; 4096];
+            let mut written = 0usize;
+            loop {
+                match writer.write(&chunk) {
+                    Ok(0) => panic!("metrics FIFO filler unexpectedly wrote zero bytes"),
+                    Ok(count) => written = written.saturating_add(count),
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("metrics FIFO filler should reach capacity: {err}"),
+                }
+            }
+            assert!(written > 0, "metrics FIFO should accept filler bytes");
+        }
+
+        fn drain_available(&mut self) -> Vec<u8> {
+            let mut output = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                match self.reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => output.extend_from_slice(&chunk[..count]),
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("metrics FIFO should drain: {err}"),
+                }
+            }
+            output
+        }
+    }
+
+    impl Drop for MetricsFifo {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 
     fn test_shutdown_signal() -> super::ShutdownSignal {
@@ -2610,7 +2694,6 @@ mod tests {
                 ErrorKind::BrokenPipe,
             )),
             ProcessError::PeriodicBalloonStatisticsUpdate(VmmActionError::BalloonUnsupported),
-            ProcessError::PeriodicMetricsFlush(VmmActionError::EntropyUnsupported),
             ProcessError::ProcessExitNotification(std::io::ErrorKind::BrokenPipe),
             ProcessError::ProcessSessionTerminal,
             ProcessError::SignalHandler(std::io::ErrorKind::Interrupted),
@@ -4131,7 +4214,96 @@ mod tests {
     }
 
     #[test]
+    fn terminal_metrics_drain_initial_preserve_server_error_and_do_not_duplicate() {
+        let metrics_path = unique_metrics_path("server-error-final");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+
+        let result = Err(ProcessError::ApiServer(ApiServerError::Accept(
+            ErrorKind::BrokenPipe,
+        )));
+        assert_eq!(
+            super::finish_process_with_terminal_metrics(&mut vmm, result),
+            Err(ProcessError::ApiServer(ApiServerError::Accept(
+                ErrorKind::BrokenPipe
+            )))
+        );
+        let expected =
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n";
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            expected
+        );
+
+        assert_eq!(
+            super::finish_process_with_terminal_metrics(&mut vmm, Ok(())),
+            Ok(())
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should remain readable"),
+            expected
+        );
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn terminal_metrics_sink_failure_preserves_result_and_consumes_final_attempt() {
+        let mut metrics_fifo = MetricsFifo::create("terminal-failure");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics_fifo.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        vmm.handle_initial_metrics_flush();
+        let _initial = metrics_fifo.drain_available();
+        metrics_fifo.fill_to_capacity();
+
+        let result = Err(ProcessError::ApiServer(ApiServerError::Accept(
+            ErrorKind::BrokenPipe,
+        )));
+        assert_eq!(
+            super::finish_process_with_terminal_metrics(&mut vmm, result),
+            Err(ProcessError::ApiServer(ApiServerError::Accept(
+                ErrorKind::BrokenPipe
+            )))
+        );
+        let _failed_final = metrics_fifo.drain_available();
+
+        assert_eq!(
+            super::finish_process_with_terminal_metrics(&mut vmm, Ok(())),
+            Ok(())
+        );
+        assert_eq!(metrics_fifo.drain_available(), Vec::<u8>::new());
+    }
+
+    #[test]
     fn no_api_wait_returns_after_guest_requested_stop_notification() {
+        let metrics_path = unique_metrics_path("guest-stop-final");
         let process_exit_signal = TestProcessExitSignal::new();
         let process_exit_trigger = process_exit_signal.clone();
         let mut vmm = ProcessVmm::with_starter(
@@ -4142,22 +4314,36 @@ mod tests {
                 signal: process_exit_signal,
             },
         );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
             "/tmp/vmlinux",
         )))
         .expect("boot source should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("instance should start");
+        vmm.handle_initial_metrics_flush();
         let mut shutdown_signal = test_shutdown_signal();
 
         process_exit_trigger.trigger(ProcessSessionExitStatus::GuestRequestedStop);
 
-        super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm)
-            .expect("guest-requested stop should stop no-api wait successfully");
+        let result = super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
+        assert_eq!(
+            super::finish_process_with_terminal_metrics(&mut vmm, result),
+            Ok(())
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]
     fn no_api_wait_fails_after_process_terminal_notification() {
+        let metrics_path = unique_metrics_path("guest-terminal-final");
         let process_exit_signal = TestProcessExitSignal::new();
         let process_exit_trigger = process_exit_signal.clone();
         let mut vmm = ProcessVmm::with_starter(
@@ -4168,20 +4354,31 @@ mod tests {
                 signal: process_exit_signal,
             },
         );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
             "/tmp/vmlinux",
         )))
         .expect("boot source should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("instance should start");
+        vmm.handle_initial_metrics_flush();
         let mut shutdown_signal = test_shutdown_signal();
 
         process_exit_trigger.trigger(ProcessSessionExitStatus::Terminal);
 
+        let result = super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
         assert_eq!(
-            super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm),
+            super::finish_process_with_terminal_metrics(&mut vmm, result),
             Err(super::ProcessError::ProcessSessionTerminal)
         );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]
@@ -4207,6 +4404,10 @@ mod tests {
         .expect("boot source should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("instance should start");
+        vmm.handle_initial_metrics_flush();
+        vmm.handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
         let mut vmm = ProcessExitAfterPeriodicFlush::new(vmm, process_exit_trigger);
         let mut shutdown_signal = test_shutdown_signal();
 
@@ -4220,9 +4421,119 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         fs::remove_file(metrics_path).expect("fixture metrics should clean up");
+    }
+
+    #[test]
+    fn no_api_periodic_metrics_failure_reschedules_and_retries_delta() {
+        let mut metrics_fifo = MetricsFifo::create("periodic-retry");
+        let signal_metrics = SharedSignalMetrics::default();
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        )
+        .with_process_signal_metrics(signal_metrics.clone());
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics_fifo.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        vmm.handle_initial_metrics_flush();
+        let initial = String::from_utf8(metrics_fifo.drain_available())
+            .expect("initial metrics should be UTF-8");
+        assert!(initial.contains(r#""metrics_flush_count":1"#));
+
+        metrics_fifo.fill_to_capacity();
+        signal_metrics.record_sigpipe();
+        let session_epoch = vmm
+            .metrics_session_epoch()
+            .expect("started session should have a metrics epoch");
+        let now = Instant::now();
+        let mut metrics_scheduler = super::PeriodicMetricsScheduler::due_now(now);
+        let mut balloon_scheduler = super::PeriodicBalloonStatisticsScheduler::new(now, None);
+
+        assert_eq!(
+            super::handle_due_no_api_periodic_schedulers(
+                &mut vmm,
+                &mut metrics_scheduler,
+                &mut balloon_scheduler,
+            ),
+            Ok(true)
+        );
+        assert!(matches!(
+            metrics_scheduler.poll_timeout_ms(Instant::now(), Some(session_epoch)),
+            Some(timeout_ms) if timeout_ms > 0
+        ));
+        let _failed_attempt = metrics_fifo.drain_available();
+
+        signal_metrics.record_sigpipe();
+        let now = Instant::now();
+        let mut retry_scheduler = super::PeriodicMetricsScheduler::due_now(now);
+        assert_eq!(
+            super::handle_due_no_api_periodic_schedulers(
+                &mut vmm,
+                &mut retry_scheduler,
+                &mut balloon_scheduler,
+            ),
+            Ok(true)
+        );
+        let retried = String::from_utf8(metrics_fifo.drain_available())
+            .expect("retried metrics should be UTF-8");
+        assert!(retried.contains(r#""missed_metrics_count":1"#));
+        assert!(retried.contains(r#""sigpipe":2"#));
+
+        metrics_fifo.fill_to_capacity();
+        let explicit_error = vmm
+            .handle_action(VmmAction::FlushMetrics)
+            .expect_err("explicit metrics flush should preserve sink errors");
+        assert!(matches!(
+            explicit_error,
+            VmmActionError::MetricsFlush(MetricsFlushError::Write(ErrorKind::WouldBlock))
+        ));
+        let _explicit_attempt = metrics_fifo.drain_available();
+    }
+
+    #[test]
+    fn initial_metrics_failure_preserves_session_and_consumes_initial_attempt() {
+        let mut metrics_fifo = MetricsFifo::create("initial-failure");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics_fifo.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        metrics_fifo.fill_to_capacity();
+
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start despite the full metrics sink");
+        vmm.handle_initial_metrics_flush();
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
+        let _failed_initial = metrics_fifo.drain_available();
+
+        vmm.handle_initial_metrics_flush();
+        assert_eq!(metrics_fifo.drain_available(), Vec::<u8>::new());
+        vmm.handle_periodic_metrics_flush();
+        let retried = String::from_utf8(metrics_fifo.drain_available())
+            .expect("periodic retry metrics should be UTF-8");
+        assert!(retried.contains(r#""missed_metrics_count":1"#));
     }
 
     #[test]
@@ -4260,7 +4571,7 @@ mod tests {
             super::wait_for_no_api_shutdown_with_periodic_schedulers(
                 &mut shutdown_signal,
                 &mut vmm,
-                super::PeriodicMetricsScheduler::new(now),
+                super::PeriodicMetricsScheduler::new(),
                 super::PeriodicBalloonStatisticsScheduler::due_now(now, Duration::from_secs(1)),
             ),
             Ok(())
@@ -5375,7 +5686,7 @@ mod tests {
     }
 
     #[test]
-    fn applies_startup_metrics_config_before_actions() {
+    fn startup_metrics_config_waits_for_started_session_before_initial_write() {
         let path = unique_metrics_path("flush");
         let mut vmm = ProcessVmm::with_starter(
             "demo-1",
@@ -5390,7 +5701,7 @@ mod tests {
         assert!(!vmm.has_started_session());
         assert_eq!(
             fs::read_to_string(&path).expect("startup metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+            ""
         );
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
             "/tmp/vmlinux",
@@ -5398,6 +5709,7 @@ mod tests {
         .expect("boot source should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("instance start should succeed");
+        vmm.handle_initial_metrics_flush();
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("flush metrics should succeed");
 
@@ -5410,7 +5722,7 @@ mod tests {
     }
 
     #[test]
-    fn applies_startup_metrics_config_with_startup_time_diagnostics() {
+    fn initial_metrics_write_includes_startup_time_diagnostics() {
         let path = unique_metrics_path("startup-time");
         let diagnostics = MetricsDiagnostics::new()
             .with_start_time_us(1000)
@@ -5431,6 +5743,19 @@ mod tests {
         assert!(!vmm.has_started_session());
         assert_eq!(
             fs::read_to_string(&path).expect("startup metrics output should be readable"),
+            ""
+        );
+
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance start should succeed");
+        vmm.handle_initial_metrics_flush();
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("initial metrics output should be readable"),
             "{\"api_server\":{\"process_startup_time_cpu_us\":5000,\"process_startup_time_us\":1000},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 

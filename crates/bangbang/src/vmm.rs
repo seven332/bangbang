@@ -1137,9 +1137,13 @@ pub(crate) trait VmmRequestHandler {
 
     fn record_load_snapshot_latency_us(&mut self, duration_us: u64);
 
-    fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
-        Ok(false)
+    fn metrics_session_epoch(&self) -> Option<Instant> {
+        None
     }
+
+    fn handle_initial_metrics_flush(&mut self) {}
+
+    fn handle_periodic_metrics_flush(&mut self) {}
 
     fn balloon_statistics_update_interval(&self) -> Option<Duration> {
         None
@@ -1170,6 +1174,9 @@ where
     controller: VmmController,
     starter: S,
     started_session: Option<S::Session>,
+    metrics_session_epoch: Option<Instant>,
+    initial_metrics_attempted: bool,
+    terminal_metrics_attempted: bool,
     process_metrics_diagnostics: MetricsDiagnostics,
     process_signal_metrics: Option<SharedSignalMetrics>,
     terminal_snapshot_load_failure: bool,
@@ -1233,6 +1240,9 @@ where
             ),
             starter,
             started_session: None,
+            metrics_session_epoch: None,
+            initial_metrics_attempted: false,
+            terminal_metrics_attempted: false,
             process_metrics_diagnostics: MetricsDiagnostics::default(),
             process_signal_metrics: None,
             terminal_snapshot_load_failure: false,
@@ -1252,9 +1262,12 @@ where
         self
     }
 
-    #[cfg(test)]
     pub(crate) const fn has_started_session(&self) -> bool {
         self.started_session.is_some()
+    }
+
+    pub(crate) const fn metrics_session_epoch(&self) -> Option<Instant> {
+        self.metrics_session_epoch
     }
 }
 
@@ -1293,7 +1306,8 @@ where
     }
 
     pub(crate) fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
-        match action {
+        let had_started_session = self.has_started_session();
+        let result = match action {
             VmmAction::InstanceStart => self.start_instance(),
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
@@ -1312,7 +1326,14 @@ where
             VmmAction::PatchBalloonHintingStop => self.stop_balloon_hinting(),
             VmmAction::FlushMetrics => self.flush_metrics(),
             action => self.controller.handle_action(action),
+        };
+
+        if !had_started_session && self.has_started_session() {
+            debug_assert!(self.metrics_session_epoch.is_none());
+            self.metrics_session_epoch.get_or_insert_with(Instant::now);
         }
+
+        result
     }
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
@@ -1729,18 +1750,34 @@ where
         })
     }
 
-    pub(crate) fn flush_startup_metrics(&mut self) -> Result<bool, VmmActionError> {
+    fn flush_automatic_metrics(&mut self) -> Result<bool, VmmActionError> {
         let diagnostics = self.metrics_diagnostics();
 
         self.controller
-            .flush_startup_metrics_with_diagnostics(&diagnostics)
+            .flush_automatic_metrics_with_diagnostics(&diagnostics)
     }
 
-    fn flush_periodic_metrics(&mut self) -> Result<bool, VmmActionError> {
-        let diagnostics = self.metrics_diagnostics();
+    pub(crate) fn handle_initial_metrics_flush(&mut self) {
+        if !self.has_started_session() || self.initial_metrics_attempted {
+            return;
+        }
 
-        self.controller
-            .flush_periodic_metrics_with_diagnostics(&diagnostics)
+        self.initial_metrics_attempted = true;
+        let _ = self.flush_automatic_metrics();
+    }
+
+    fn handle_periodic_metrics_flush(&mut self) {
+        let _ = self.flush_automatic_metrics();
+    }
+
+    pub(crate) fn handle_terminal_metrics_flush(&mut self) {
+        self.handle_initial_metrics_flush();
+        if !self.has_started_session() || self.terminal_metrics_attempted {
+            return;
+        }
+
+        self.terminal_metrics_attempted = true;
+        let _ = self.flush_automatic_metrics();
     }
 
     fn balloon_statistics_update_interval(&self) -> Option<Duration> {
@@ -1895,8 +1932,16 @@ where
         ProcessVmm::handle_put_action_request(self, action)
     }
 
-    fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
-        ProcessVmm::flush_periodic_metrics(self)
+    fn metrics_session_epoch(&self) -> Option<Instant> {
+        ProcessVmm::metrics_session_epoch(self)
+    }
+
+    fn handle_initial_metrics_flush(&mut self) {
+        ProcessVmm::handle_initial_metrics_flush(self);
+    }
+
+    fn handle_periodic_metrics_flush(&mut self) {
+        ProcessVmm::handle_periodic_metrics_flush(self);
     }
 
     fn balloon_statistics_update_interval(&self) -> Option<Duration> {
@@ -7296,15 +7341,23 @@ mod tests {
 
     #[test]
     fn public_native_v1_load_commits_one_paused_session() {
+        let metrics = TempFilePath::create("snapshot-load-paused-metrics");
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
         let calls = starter.calls();
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
 
         assert_eq!(
             vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
             Ok(VmmData::Empty)
         );
 
+        let session_epoch = vmm
+            .metrics_session_epoch()
+            .expect("committed paused load should record a metrics epoch");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(vmm.instance_info().state, InstanceState::Paused);
         let session = vmm
@@ -7314,6 +7367,12 @@ mod tests {
         assert_eq!(session.id, 77);
         assert_eq!(session.resume_count, 0);
         assert_eq!(vmm.drive_configs()[0].drive_id(), "root");
+        vmm.handle_initial_metrics_flush();
+        vmm.handle_initial_metrics_flush();
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
 
         assert_eq!(
             vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
@@ -7323,13 +7382,25 @@ mod tests {
             })
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.metrics_session_epoch(), Some(session_epoch));
+        vmm.handle_initial_metrics_flush();
+        vmm.handle_periodic_metrics_flush();
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
     }
 
     #[test]
     fn public_native_v1_load_resumes_only_after_paused_commit() {
+        let metrics = TempFilePath::create("snapshot-load-resumed-metrics");
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
         let calls = starter.calls();
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
 
         assert_eq!(
             vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(true))),
@@ -7338,6 +7409,7 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.metrics_session_epoch().is_some());
         assert_eq!(
             vmm.started_session
                 .as_ref()
@@ -7345,13 +7417,24 @@ mod tests {
                 .resume_count,
             1
         );
+        vmm.handle_initial_metrics_flush();
+        vmm.handle_initial_metrics_flush();
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
     }
 
     #[test]
     fn public_native_v1_resume_failure_returns_load_error_and_stays_paused() {
+        let metrics = TempFilePath::create("snapshot-load-resume-failure-metrics");
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::ResumeFailure);
         let calls = starter.calls();
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
 
         assert_eq!(
             vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(true))),
@@ -7362,6 +7445,7 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert!(vmm.metrics_session_epoch().is_some());
         assert_eq!(
             vmm.started_session
                 .as_ref()
@@ -7370,13 +7454,24 @@ mod tests {
             1
         );
         assert_eq!(vmm.process_exit_status(), ProcessSessionExitStatus::Running);
+        vmm.handle_initial_metrics_flush();
+        vmm.handle_initial_metrics_flush();
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
     }
 
     #[test]
     fn public_terminal_native_v1_load_error_latches_process() {
+        let metrics = TempFilePath::create("snapshot-load-precommit-failure-metrics");
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Terminal);
         let calls = starter.calls();
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
 
         assert_eq!(
             vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
@@ -7387,9 +7482,16 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
         assert!(!vmm.has_started_session());
+        assert_eq!(vmm.metrics_session_epoch(), None);
         assert_eq!(
             vmm.process_exit_status(),
             ProcessSessionExitStatus::Terminal
+        );
+        vmm.handle_initial_metrics_flush();
+        vmm.handle_terminal_metrics_flush();
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            ""
         );
     }
 
@@ -10792,6 +10894,7 @@ mod tests {
         assert_eq!(err, VmmActionError::MissingBootSource);
         assert_eq!(vmm.starter.calls, 0);
         assert!(!vmm.has_started_session());
+        assert_eq!(vmm.metrics_session_epoch(), None);
         assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
     }
 
@@ -10807,6 +10910,7 @@ mod tests {
         assert_eq!(vmm.instance_info().state, InstanceState::Running);
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(vmm.started_session, Some(FakeSession::new(7)));
+        assert!(vmm.metrics_session_epoch().is_some());
     }
 
     #[test]
@@ -12563,12 +12667,55 @@ mod tests {
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
 
-        assert_eq!(vmm.flush_periodic_metrics(), Ok(true));
+        vmm.handle_periodic_metrics_flush();
 
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"api_server\":{\"process_startup_time_us\":1000},\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(logger.path()).expect("logger output should read"),
+            "action=InstanceStart\n"
+        );
+    }
+
+    #[test]
+    fn automatic_initial_and_terminal_metrics_are_session_gated_and_idempotent() {
+        let metrics = TempFilePath::create("automatic-lifecycle-metrics");
+        let logger = TempFilePath::create("automatic-lifecycle-logger");
+        let mut vmm =
+            ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(18));
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(logger.path()),
+        ))
+        .expect("logger should configure");
+
+        vmm.handle_initial_metrics_flush();
+        vmm.handle_terminal_metrics_flush();
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("pre-start metrics output should read"),
+            ""
+        );
+
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_initial_metrics_flush();
+        vmm.handle_initial_metrics_flush();
+        vmm.handle_terminal_metrics_flush();
+        vmm.handle_terminal_metrics_flush();
+
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert_eq!(
             fs::read_to_string(logger.path()).expect("logger output should read"),
@@ -12679,6 +12826,7 @@ mod tests {
         assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
         assert_eq!(vmm.starter.calls, 1);
         assert!(!vmm.has_started_session());
+        assert_eq!(vmm.metrics_session_epoch(), None);
     }
 
     #[test]
@@ -12721,6 +12869,9 @@ mod tests {
         let mut vmm = configured_vmm(FakeStarter::success(9));
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("first startup should succeed");
+        let session_epoch = vmm
+            .metrics_session_epoch()
+            .expect("successful start should record a metrics epoch");
 
         let err = vmm
             .handle_action(VmmAction::InstanceStart)
@@ -12735,6 +12886,7 @@ mod tests {
         );
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(vmm.started_session, Some(FakeSession::new(9)));
+        assert_eq!(vmm.metrics_session_epoch(), Some(session_epoch));
     }
 
     #[cfg(target_os = "macos")]

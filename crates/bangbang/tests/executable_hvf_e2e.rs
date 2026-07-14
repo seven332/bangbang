@@ -5960,33 +5960,73 @@ mod macos_arm64 {
                 path.display()
             )
         });
+        let lines = output
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|err| {
+                    panic!("metrics output line should be valid JSON: {err}; line:\n{line}")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            2,
+            "session initial and explicit flush should emit two metrics lines; output:\n{output}"
+        );
+        let sum_section = |section: &str| {
+            let mut total = serde_json::Map::new();
+            for line in &lines {
+                let Some(fields) = line.get(section).and_then(serde_json::Value::as_object) else {
+                    continue;
+                };
+                for (field, value) in fields {
+                    let value = value.as_u64().unwrap_or_else(|| {
+                        panic!("metrics field {section}.{field} should be an integer: {value}")
+                    });
+                    let entry = total
+                        .entry(field.clone())
+                        .or_insert(serde_json::Value::Number(0_u64.into()));
+                    let current = entry.as_u64().unwrap_or_else(|| {
+                        panic!("summed metrics field {section}.{field} should be an integer")
+                    });
+                    *entry = serde_json::Value::Number(current.saturating_add(value).into());
+                }
+            }
+            (!total.is_empty()).then_some(serde_json::Value::Object(total))
+        };
 
         assert!(
             output.contains(r#""metrics_flush_count":1"#),
             "metrics output should include first flush count; output:\n{output}"
         );
         if let Some(expected_get_api_requests) = expected_get_api_requests {
-            let expected_get_metrics = format!(r#""get_api_requests":{expected_get_api_requests}"#);
-            assert!(
-                output.contains(&expected_get_metrics),
-                "metrics output should include expected GET API request counters; output:\n{output}"
+            let expected = serde_json::from_str(expected_get_api_requests)
+                .expect("expected GET API request metrics should be valid JSON");
+            assert_eq!(
+                sum_section("get_api_requests"),
+                Some(expected),
+                "metrics output should sum to expected GET API request counters; output:\n{output}"
             );
         }
-        let expected_put_metrics = format!(r#""put_api_requests":{expected_put_api_requests}"#);
-        assert!(
-            output.contains(&expected_put_metrics),
-            "metrics output should include expected PUT API request counters; output:\n{output}"
+        let expected = serde_json::from_str(expected_put_api_requests)
+            .expect("expected PUT API request metrics should be valid JSON");
+        assert_eq!(
+            sum_section("put_api_requests"),
+            Some(expected),
+            "metrics output should sum to expected PUT API request counters; output:\n{output}"
         );
         if let Some(expected_patch_api_requests) = expected_patch_api_requests {
-            let expected_patch_metrics =
-                format!(r#""patch_api_requests":{expected_patch_api_requests}"#);
-            assert!(
-                output.contains(&expected_patch_metrics),
-                "metrics output should include expected PATCH API request counters; output:\n{output}"
+            let expected = serde_json::from_str(expected_patch_api_requests)
+                .expect("expected PATCH API request metrics should be valid JSON");
+            assert_eq!(
+                sum_section("patch_api_requests"),
+                Some(expected),
+                "metrics output should sum to expected PATCH API request counters; output:\n{output}"
             );
         } else {
-            assert!(
-                !output.contains(r#""patch_api_requests":"#),
+            assert_eq!(
+                sum_section("patch_api_requests"),
+                None,
                 "metrics output should not include PATCH API request counters; output:\n{output}"
             );
         }

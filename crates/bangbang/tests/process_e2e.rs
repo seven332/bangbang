@@ -378,7 +378,7 @@ fn executable_accepts_boot_timer_flag() {
 }
 
 #[test]
-fn executable_startup_metrics_path_writes_initial_metrics() {
+fn executable_startup_metrics_path_stays_empty_before_session() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let metrics_path = test_dir.path().join("startup.metrics");
@@ -400,7 +400,7 @@ fn executable_startup_metrics_path_writes_initial_metrics() {
 
     assert_eq!(
         fs::read_to_string(&metrics_path).expect("startup metrics should be readable"),
-        "{\"api_server\":{\"process_startup_time_cpu_us\":3000,\"process_startup_time_us\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        ""
     );
 
     let instance_info = http_get(&socket_path, "/");
@@ -412,6 +412,11 @@ fn executable_startup_metrics_path_writes_initial_metrics() {
     );
 
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+    assert_eq!(
+        fs::read_to_string(&metrics_path).expect("terminal metrics output should be readable"),
+        "",
+        "a process without a retained session must not emit terminal metrics"
+    );
 }
 
 #[test]
@@ -3697,23 +3702,15 @@ fn concurrent_executables_keep_api_resources_isolated() {
         "first-user-data",
         "second bangbang",
     );
-    assert_startup_metrics_match(
-        &first_metrics_path,
-        &[
-            r#""process_startup_time_us":0"#,
-            r#""process_startup_time_cpu_us":1300"#,
-        ],
-        &[r#""process_startup_time_cpu_us":2300"#],
-        "first bangbang",
+    assert_eq!(
+        fs::read_to_string(&first_metrics_path)
+            .expect("first pre-session metrics output should be readable"),
+        ""
     );
-    assert_startup_metrics_match(
-        &second_metrics_path,
-        &[
-            r#""process_startup_time_us":0"#,
-            r#""process_startup_time_cpu_us":2300"#,
-        ],
-        &[r#""process_startup_time_cpu_us":1300"#],
-        "second bangbang",
+    assert_eq!(
+        fs::read_to_string(&second_metrics_path)
+            .expect("second pre-session metrics output should be readable"),
+        ""
     );
 
     assert_clean_shutdown(
@@ -4329,30 +4326,4 @@ fn assert_mmds_data_matches(
             && !response.contains(&format!(r#""user-data":"{unexpected_user_data}""#)),
         "{request_name} response should not contain another process MMDS data; response:\n{response}"
     );
-}
-
-fn assert_startup_metrics_match(
-    metrics_path: &std::path::Path,
-    expected_fragments: &[&str],
-    unexpected_fragments: &[&str],
-    process_name: &str,
-) {
-    let output = fs::read_to_string(metrics_path).unwrap_or_else(|err| {
-        panic!(
-            "{process_name} metrics output {} should be readable: {err}",
-            metrics_path.display()
-        )
-    });
-    for expected in expected_fragments {
-        assert!(
-            output.contains(expected),
-            "{process_name} metrics output should contain {expected:?}; output:\n{output}"
-        );
-    }
-    for unexpected in unexpected_fragments {
-        assert!(
-            !output.contains(unexpected),
-            "{process_name} metrics output should not contain another process value {unexpected:?}; output:\n{output}"
-        );
-    }
 }
