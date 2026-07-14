@@ -107,7 +107,6 @@ pub(crate) enum ApiServerError {
     Bind(std::io::ErrorKind),
     Connection(std::io::ErrorKind),
     PeriodicBalloonStatisticsUpdate(VmmActionError),
-    PeriodicMetricsFlush(VmmActionError),
     ProcessSessionTerminal,
     SocketMetadata(std::io::ErrorKind),
     SocketPermissions(std::io::ErrorKind),
@@ -128,9 +127,6 @@ impl std::fmt::Display for ApiServerError {
                     f,
                     "failed to trigger periodic balloon statistics update: {err}"
                 )
-            }
-            Self::PeriodicMetricsFlush(err) => {
-                write!(f, "failed to flush periodic metrics: {err}")
             }
             Self::ProcessSessionTerminal => {
                 f.write_str("process-owned boot run loop exited with failure")
@@ -196,7 +192,7 @@ impl ApiServer {
         self.run_until_with_periodic_metrics_scheduler(
             vmm,
             shutdown_wakeup,
-            PeriodicMetricsScheduler::new(Instant::now()),
+            PeriodicMetricsScheduler::new(),
         )
     }
 
@@ -233,7 +229,8 @@ impl ApiServer {
 
         loop {
             let now = Instant::now();
-            let metrics_timeout = Some(metrics_scheduler.poll_timeout_ms(now));
+            let metrics_timeout =
+                metrics_scheduler.poll_timeout_ms(now, vmm.metrics_session_epoch());
             let balloon_timeout =
                 balloon_scheduler.poll_timeout_ms(now, vmm.balloon_statistics_update_interval());
             match wait_for_listener_or_shutdown(
@@ -303,10 +300,9 @@ fn handle_due_periodic_schedulers(
     }
 
     let now = Instant::now();
-    if metrics_scheduler.is_due(now) {
-        vmm.handle_periodic_metrics_flush()
-            .map_err(ApiServerError::PeriodicMetricsFlush)?;
-        metrics_scheduler.schedule_next(Instant::now());
+    if metrics_scheduler.is_due(now, vmm.metrics_session_epoch()) {
+        vmm.handle_periodic_metrics_flush();
+        metrics_scheduler.schedule_next(Instant::now(), vmm.metrics_session_epoch());
         handled = true;
     }
 
@@ -632,7 +628,9 @@ fn handle_request_bytes_with_limit(
     match parse_request_with_limit(bytes, http_api_max_payload_size) {
         Ok(request) => {
             log_api_request(&request, vmm);
-            handle_api_request(request, vmm)
+            let response = handle_api_request(request, vmm);
+            vmm.handle_initial_metrics_flush();
+            response
         }
         Err(err) => {
             if err == RequestError::SendCtrlAltDelUnsupported {
@@ -2885,12 +2883,19 @@ mod tests {
             self.inner.record_load_snapshot_latency_us(duration_us);
         }
 
-        fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
-            let result = self.inner.handle_periodic_metrics_flush();
+        fn metrics_session_epoch(&self) -> Option<Instant> {
+            self.inner.metrics_session_epoch()
+        }
+
+        fn handle_initial_metrics_flush(&mut self) {
+            self.inner.handle_initial_metrics_flush();
+        }
+
+        fn handle_periodic_metrics_flush(&mut self) {
+            self.inner.handle_periodic_metrics_flush();
             self.shutdown_writer
                 .write_all(b"x")
                 .expect("periodic flush test should signal shutdown");
-            result
         }
 
         fn balloon_statistics_update_interval(&self) -> Option<Duration> {
@@ -2941,6 +2946,68 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+
+    fn assert_two_line_api_metrics_total(path: &Path, expected: &str) -> String {
+        let output = fs::read_to_string(path).expect("metrics output should be readable");
+        let lines = output
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .expect("metrics line should be valid JSON")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            2,
+            "session initial and explicit flush should emit two lines: {output}"
+        );
+
+        let mut total = serde_json::Map::new();
+        for line in lines {
+            for (section, value) in line
+                .as_object()
+                .expect("metrics line should be a JSON object")
+            {
+                if matches!(
+                    section.as_str(),
+                    "deprecated_api"
+                        | "get_api_requests"
+                        | "patch_api_requests"
+                        | "put_api_requests"
+                ) {
+                    let target = total
+                        .entry(section.clone())
+                        .or_insert_with(|| serde_json::json!({}));
+                    let target = target
+                        .as_object_mut()
+                        .expect("aggregated API metrics section should be an object");
+                    for (field, value) in value
+                        .as_object()
+                        .expect("API metrics section should be an object")
+                    {
+                        let increment = value
+                            .as_u64()
+                            .expect("API metric value should be an unsigned integer");
+                        let current = target
+                            .get(field)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        target.insert(
+                            field.clone(),
+                            serde_json::Value::from(current.saturating_add(increment)),
+                        );
+                    }
+                } else {
+                    total.insert(section.clone(), value.clone());
+                }
+            }
+        }
+
+        let expected = serde_json::from_str::<serde_json::Value>(expected.trim())
+            .expect("expected metrics should be valid JSON");
+        assert_eq!(serde_json::Value::Object(total), expected, "{output}");
+        output
     }
 
     #[test]
@@ -4789,9 +4856,9 @@ mod tests {
         let flush_response = put_action_over_socket(&mut vmm, "flush-configured", "FlushMetrics");
 
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -4837,9 +4904,9 @@ mod tests {
             put_action_over_socket(&mut vmm, "flush-after-failure", "FlushMetrics");
 
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":4,\"actions_fails\":1,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"put_api_requests\":{\"actions_count\":4,\"actions_fails\":1,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -4902,9 +4969,9 @@ mod tests {
         let flush_response = put_action_over_socket(&mut vmm, "g-f", "FlushMetrics");
 
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"get_api_requests\":{\"balloon_count\":0,\"hotplug_memory_count\":0,\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":1,\"vmm_version_count\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"get_api_requests\":{\"balloon_count\":0,\"hotplug_memory_count\":0,\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":1,\"vmm_version_count\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -4996,9 +5063,9 @@ mod tests {
         let flush_response = put_action_over_socket(&mut vmm, "bf", "FlushMetrics");
 
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"get_api_requests\":{\"balloon_count\":3,\"hotplug_memory_count\":0,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":4,\"balloon_fails\":4,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":2,\"balloon_fails\":2,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"get_api_requests\":{\"balloon_count\":3,\"hotplug_memory_count\":0,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":4,\"balloon_fails\":4,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":2,\"balloon_fails\":2,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -5099,9 +5166,9 @@ mod tests {
 
         let flush_response = put_action_over_socket(&mut vmm, "o-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":2,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":2,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":2,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":2,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -5186,9 +5253,9 @@ mod tests {
         let flush_response = put_action_over_socket(&mut vmm, "op-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":1,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":1,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":1,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":1,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
         assert!(!rejected_metrics_path.exists());
 
@@ -5557,9 +5624,9 @@ mod tests {
 
         let flush_response = put_action_over_socket(&mut vmm, "core-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":2,\"cpu_cfg_fails\":1,\"drive_count\":2,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":2,\"network_fails\":1,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":2,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":2,\"cpu_cfg_fails\":1,\"drive_count\":2,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":2,\"network_fails\":1,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":2,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
 
         assert!(!drive_path.exists());
@@ -5645,9 +5712,9 @@ mod tests {
 
         let flush_response = put_action_over_socket(&mut vmm, "mmds-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":1,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":4,\"mmds_fails\":2,\"network_count\":1,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":1,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":4,\"mmds_fails\":2,\"network_count\":1,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -5727,11 +5794,9 @@ mod tests {
 
         let flush_response = put_action_over_socket(&mut vmm, "pm-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        let metrics_output =
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable");
-        assert_eq!(
-            metrics_output,
-            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":3,\"pmem_fails\":2},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        let metrics_output = assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":3,\"pmem_fails\":2},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
         assert!(!metrics_output.contains("pmem0"));
         assert!(!metrics_output.contains("/private/tmp/pmem.img"));
@@ -5840,11 +5905,9 @@ mod tests {
 
         let flush_response = put_action_over_socket(&mut vmm, "mh-m-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        let metrics_output =
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable");
-        assert_eq!(
-            metrics_output,
-            "{\"get_api_requests\":{\"balloon_count\":0,\"hotplug_memory_count\":1,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":2,\"hotplug_memory_fails\":2,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":3,\"hotplug_memory_fails\":3,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        let metrics_output = assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"get_api_requests\":{\"balloon_count\":0,\"hotplug_memory_count\":1,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":2,\"hotplug_memory_fails\":2,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":3,\"hotplug_memory_fails\":3,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
         assert!(!metrics_output.contains("222222222"));
         assert!(!metrics_output.contains("333333333"));
@@ -6020,11 +6083,9 @@ mod tests {
 
         let flush_response = put_action_over_socket(&mut vmm, "deprecated-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        let metrics_output =
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable");
-        assert_eq!(
-            metrics_output,
-            "{\"deprecated_api\":{\"deprecated_http_api_calls\":5},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":3,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":1,\"mmds_fails\":1,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        let metrics_output = assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"deprecated_api\":{\"deprecated_http_api_calls\":5},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":3,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":1,\"mmds_fails\":1,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
         assert!(!metrics_output.contains("vsock-secret"));
         assert!(!metrics_output.contains("deprecated-vsock-secret"));
@@ -6209,9 +6270,9 @@ mod tests {
 
         let flush_response = put_action_over_socket(&mut vmm, "patch-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":1,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":4,\"network_fails\":4,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":1,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":4,\"network_fails\":4,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -6343,9 +6404,9 @@ mod tests {
             put_action_over_socket(&mut vmm, "flush-with-boot-loop", "FlushMetrics");
 
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &metrics_path,
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n",
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -6392,10 +6453,9 @@ mod tests {
         let flush_response = put_action_over_socket(&mut vmm, "met-flush", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
-        assert_eq!(
-            fs::read_to_string(&startup_metrics_path)
-                .expect("startup metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        assert_two_line_api_metrics_total(
+            &startup_metrics_path,
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
         assert!(!api_metrics_path.exists());
 
@@ -7074,11 +7134,20 @@ mod tests {
 
         let flush = put_action_over_socket(&mut resumed, "slf", "FlushMetrics");
         assert!(flush.starts_with("HTTP/1.1 204 No Content\r\n"));
-        let metrics = read_metrics_json(&metrics_path);
-        assert_metric(&metrics, "deprecated_api", "deprecated_http_api_calls", 1);
-        assert_latency_metric_present(&metrics, "load_snapshot");
         let raw_metrics =
             fs::read_to_string(&metrics_path).expect("metrics should remain readable");
+        let metrics_lines = raw_metrics
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("metrics line should be JSON"))
+            .collect::<Vec<serde_json::Value>>();
+        assert_eq!(metrics_lines.len(), 2);
+        assert_metric(
+            &metrics_lines[0],
+            "deprecated_api",
+            "deprecated_http_api_calls",
+            1,
+        );
+        assert_latency_metric_present(&metrics_lines[0], "load_snapshot");
         assert!(!raw_metrics.contains("private-resumed-state"));
         assert!(!raw_metrics.contains("private-resumed-memory"));
 
@@ -9927,23 +9996,37 @@ mod tests {
     }
 
     #[test]
-    fn run_until_periodic_metrics_timeout_flushes_after_start() {
+    fn run_until_periodic_metrics_timeout_flushes_restored_paused_session() {
         let path = unique_socket_path("periodic-metrics");
         let metrics_path = unique_socket_path("periodic-metrics-output").with_extension("metrics");
         let server = ApiServer::bind(&path).expect("server should bind");
         let (mut shutdown_reader, shutdown_writer) =
             UnixStream::pair().expect("shutdown stream pair should be created");
-        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::snapshot_success());
         vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
             &metrics_path,
         )))
         .expect("metrics should configure");
-        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
-            "/tmp/vmlinux",
-        )))
-        .expect("boot source should configure");
-        vmm.handle_action(VmmAction::InstanceStart)
-            .expect("instance should start");
+        let load_request = request_with_body(
+            "PUT",
+            "/snapshot/load",
+            r#"{"snapshot_path":"private-state","mem_backend":{"backend_path":"private-memory","backend_type":"File"}}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(load_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Paused
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path)
+                .expect("initial restored metrics output should be readable")
+                .lines()
+                .count(),
+            1
+        );
         let mut vmm = ShutdownAfterPeriodicFlush::new(vmm, &shutdown_writer);
 
         assert_eq!(
@@ -9955,10 +10038,14 @@ mod tests {
             Ok(())
         );
 
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let output = fs::read_to_string(&metrics_path).expect("metrics output should be readable");
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let metrics: serde_json::Value =
+                serde_json::from_str(line).expect("metrics line should be JSON");
+            assert_latency_metric_present(&metrics, "load_snapshot");
+        }
         fs::remove_file(metrics_path).expect("fixture should clean up");
         drop(server);
         assert!(!path.exists());
@@ -9970,13 +10057,16 @@ mod tests {
         let metrics_path =
             unique_socket_path("periodic-pre-start-output").with_extension("metrics");
         let server = ApiServer::bind(&path).expect("server should bind");
-        let (mut shutdown_reader, shutdown_writer) =
+        let (mut shutdown_reader, mut shutdown_writer) =
             UnixStream::pair().expect("shutdown stream pair should be created");
         let mut vmm = test_controller();
         vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
             &metrics_path,
         )))
         .expect("metrics should configure");
+        shutdown_writer
+            .write_all(b"x")
+            .expect("pre-start shutdown should wake the dormant scheduler");
         let mut vmm = ShutdownAfterPeriodicFlush::new(vmm, &shutdown_writer);
 
         assert_eq!(
@@ -10097,7 +10187,7 @@ mod tests {
             server.run_until_with_periodic_schedulers(
                 &mut vmm,
                 &mut shutdown_reader,
-                PeriodicMetricsScheduler::new(now),
+                PeriodicMetricsScheduler::new(),
                 PeriodicBalloonStatisticsScheduler::due_now(now, Duration::from_secs(1)),
             ),
             Ok(())

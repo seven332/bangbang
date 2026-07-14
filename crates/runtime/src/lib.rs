@@ -1654,20 +1654,11 @@ impl VmmController {
         Ok(VmmData::Empty)
     }
 
-    pub fn flush_startup_metrics_with_diagnostics(
+    pub fn flush_automatic_metrics_with_diagnostics(
         &mut self,
         diagnostics: &metrics::MetricsDiagnostics,
     ) -> Result<bool, VmmActionError> {
-        self.metrics_state
-            .flush_with_diagnostics(diagnostics)
-            .map_err(VmmActionError::MetricsFlush)
-    }
-
-    pub fn flush_periodic_metrics_with_diagnostics(
-        &mut self,
-        diagnostics: &metrics::MetricsDiagnostics,
-    ) -> Result<bool, VmmActionError> {
-        if self.instance_info.state != InstanceState::Running {
+        if self.instance_info.state == InstanceState::NotStarted {
             return Ok(false);
         }
 
@@ -4894,7 +4885,7 @@ mod tests {
 
         assert_eq!(controller.instance_info().state, InstanceState::Running);
         assert_eq!(
-            controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
         );
         assert_eq!(
@@ -4906,7 +4897,7 @@ mod tests {
     }
 
     #[test]
-    fn boot_timer_logger_write_failure_reports_missed_log_count_in_metrics() {
+    fn automatic_metrics_reports_preboot_boot_timer_logger_write_failure_after_start() {
         let metrics_path = unique_metrics_path("boot-timer-missed-log");
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
@@ -4918,8 +4909,9 @@ mod tests {
         let boot_timer_logger = controller.boot_timer_logger();
 
         assert!(!boot_timer_logger.log_boot_time(1_000, 200));
+        controller.instance_info.state = InstanceState::Running;
         assert_eq!(
-            controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
         );
         assert_eq!(
@@ -4931,7 +4923,7 @@ mod tests {
     }
 
     #[test]
-    fn api_request_logger_write_failure_reports_missed_log_count_in_metrics() {
+    fn automatic_metrics_reports_preboot_api_logger_write_failure_after_start() {
         let metrics_path = unique_metrics_path("api-request-missed-log");
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
@@ -4942,8 +4934,9 @@ mod tests {
         controller.logger_state.configure_test_writer(FailingWriter);
 
         assert!(!controller.log_api_request("Put", "/mmds"));
+        controller.instance_info.state = InstanceState::Running;
         assert_eq!(
-            controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
         );
         assert_eq!(
@@ -4974,13 +4967,15 @@ mod tests {
         let first_boot_timer_logger = first.boot_timer_logger();
 
         assert!(!first_boot_timer_logger.log_boot_time(1_000, 200));
+        first.instance_info.state = InstanceState::Running;
+        second.instance_info.state = InstanceState::Running;
 
         assert_eq!(
-            first.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            first.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
         );
         assert_eq!(
-            second.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            second.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
         );
         assert_eq!(
@@ -5247,7 +5242,7 @@ mod tests {
             Ok(VmmData::Empty)
         );
         assert_eq!(
-            controller.flush_periodic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
         );
         assert_eq!(
@@ -5311,7 +5306,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_metrics_before_start_writes_without_logger_action() {
+    fn automatic_metrics_before_start_does_not_write_or_log_action() {
         let metrics_path = unique_metrics_path("startup-preboot");
         let logger_path = unique_logger_path("startup-no-action");
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
@@ -5327,14 +5322,14 @@ mod tests {
             .expect("logger config should be stored");
 
         assert_eq!(
-            controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
-            Ok(true)
+            controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(false)
         );
 
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+            ""
         );
         assert_eq!(
             fs::read_to_string(&logger_path).expect("logger output should be readable"),
@@ -5353,7 +5348,7 @@ mod tests {
             .expect("metrics config should be stored");
 
         assert_eq!(
-            controller.flush_periodic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(false)
         );
 
@@ -5387,7 +5382,7 @@ mod tests {
             .expect("start commit should set running state");
 
         assert_eq!(
-            controller.flush_periodic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
         );
 
@@ -5404,7 +5399,7 @@ mod tests {
     }
 
     #[test]
-    fn periodic_metrics_while_paused_does_not_write() {
+    fn automatic_metrics_while_paused_writes() {
         let path = unique_metrics_path("periodic-paused");
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
@@ -5413,12 +5408,12 @@ mod tests {
         controller.instance_info.state = InstanceState::Paused;
 
         assert_eq!(
-            controller.flush_periodic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
-            Ok(false)
+            controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(true)
         );
         assert_eq!(
             fs::read_to_string(&path).expect("metrics output should be readable"),
-            ""
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("metrics fixture should clean up");

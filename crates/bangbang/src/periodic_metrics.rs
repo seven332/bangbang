@@ -4,37 +4,67 @@ pub(crate) const FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL: Duration = Duratio
 
 #[derive(Debug, Clone)]
 pub(crate) struct PeriodicMetricsScheduler {
-    deadline: PeriodicDeadline,
+    deadline: Option<PeriodicDeadline>,
 }
 
 impl PeriodicMetricsScheduler {
-    pub(crate) fn new(now: Instant) -> Self {
-        Self::with_period(now, FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL)
+    pub(crate) const fn new() -> Self {
+        Self { deadline: None }
     }
 
     #[cfg(test)]
     pub(crate) fn due_now(now: Instant) -> Self {
         Self {
-            deadline: PeriodicDeadline::due_now(now, FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL),
+            deadline: Some(PeriodicDeadline::due_now(
+                now,
+                FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL,
+            )),
         }
     }
 
+    #[cfg(test)]
     fn with_period(now: Instant, period: Duration) -> Self {
         Self {
-            deadline: PeriodicDeadline::new(now, period),
+            deadline: Some(PeriodicDeadline::new(now, period)),
         }
     }
 
-    pub(crate) fn poll_timeout_ms(&self, now: Instant) -> i32 {
-        self.deadline.poll_timeout_ms(now)
+    pub(crate) fn poll_timeout_ms(
+        &mut self,
+        now: Instant,
+        session_epoch: Option<Instant>,
+    ) -> Option<i32> {
+        self.sync_session_epoch(session_epoch);
+        self.deadline
+            .as_ref()
+            .map(|deadline| deadline.poll_timeout_ms(now))
     }
 
-    pub(crate) fn is_due(&self, now: Instant) -> bool {
-        self.deadline.is_due(now)
+    pub(crate) fn is_due(&mut self, now: Instant, session_epoch: Option<Instant>) -> bool {
+        self.sync_session_epoch(session_epoch);
+        self.deadline
+            .as_ref()
+            .is_some_and(|deadline| deadline.is_due(now))
     }
 
-    pub(crate) fn schedule_next(&mut self, now: Instant) {
-        self.deadline.schedule_next(now);
+    pub(crate) fn schedule_next(&mut self, now: Instant, session_epoch: Option<Instant>) {
+        self.sync_session_epoch(session_epoch);
+        if let Some(deadline) = self.deadline.as_mut() {
+            deadline.schedule_next(now);
+        }
+    }
+
+    fn sync_session_epoch(&mut self, session_epoch: Option<Instant>) {
+        match (self.deadline.as_mut(), session_epoch) {
+            (Some(_), Some(_)) | (None, None) => {}
+            (Some(_), None) => self.deadline = None,
+            (None, Some(epoch)) => {
+                self.deadline = Some(PeriodicDeadline::new(
+                    epoch,
+                    FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL,
+                ));
+            }
+        }
     }
 }
 
@@ -168,53 +198,99 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scheduler_uses_firecracker_interval_by_default() {
+    fn metrics_scheduler_is_dormant_without_session_epoch() {
         let now = Instant::now();
-        let scheduler = PeriodicMetricsScheduler::new(now);
+        let mut scheduler = PeriodicMetricsScheduler::new();
+
+        assert_eq!(scheduler.poll_timeout_ms(now, None), None);
+        assert!(!scheduler.is_due(now, None));
+    }
+
+    #[test]
+    fn metrics_scheduler_uses_firecracker_interval_from_session_epoch() {
+        let now = Instant::now();
+        let mut scheduler = PeriodicMetricsScheduler::new();
 
         assert_eq!(
-            scheduler.poll_timeout_ms(now),
-            FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL.as_millis() as i32
+            scheduler.poll_timeout_ms(now, Some(now)),
+            Some(FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL.as_millis() as i32)
+        );
+    }
+
+    #[test]
+    fn metrics_scheduler_preserves_elapsed_time_before_epoch_observation() {
+        let epoch = Instant::now();
+        let observed_at = epoch + Duration::from_secs(17);
+        let mut scheduler = PeriodicMetricsScheduler::new();
+
+        assert_eq!(
+            scheduler.poll_timeout_ms(observed_at, Some(epoch)),
+            Some(43_000)
+        );
+    }
+
+    #[test]
+    fn metrics_scheduler_reports_late_epoch_observation_due_immediately() {
+        let epoch = Instant::now();
+        let observed_at = epoch + FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL;
+        let mut scheduler = PeriodicMetricsScheduler::new();
+
+        assert_eq!(scheduler.poll_timeout_ms(observed_at, Some(epoch)), Some(0));
+        assert!(scheduler.is_due(observed_at, Some(epoch)));
+    }
+
+    #[test]
+    fn metrics_scheduler_does_not_reset_deadline_on_later_observation() {
+        let epoch = Instant::now();
+        let mut scheduler = PeriodicMetricsScheduler::new();
+        assert_eq!(
+            scheduler.poll_timeout_ms(epoch + Duration::from_secs(5), Some(epoch)),
+            Some(55_000)
+        );
+
+        assert_eq!(
+            scheduler.poll_timeout_ms(epoch + Duration::from_secs(11), Some(epoch)),
+            Some(49_000)
         );
     }
 
     #[test]
     fn scheduler_reports_due_deadline_without_waiting() {
         let now = Instant::now();
-        let scheduler = PeriodicMetricsScheduler::due_now(now);
+        let mut scheduler = PeriodicMetricsScheduler::due_now(now);
 
-        assert_eq!(scheduler.poll_timeout_ms(now), 0);
-        assert!(scheduler.is_due(now));
+        assert_eq!(scheduler.poll_timeout_ms(now, Some(now)), Some(0));
+        assert!(scheduler.is_due(now, Some(now)));
     }
 
     #[test]
     fn scheduler_rounds_submillisecond_timeout_up() {
         let now = Instant::now();
-        let scheduler = PeriodicMetricsScheduler::with_period(now, Duration::from_nanos(1));
+        let mut scheduler = PeriodicMetricsScheduler::with_period(now, Duration::from_nanos(1));
 
-        assert_eq!(scheduler.poll_timeout_ms(now), 1);
+        assert_eq!(scheduler.poll_timeout_ms(now, Some(now)), Some(1));
     }
 
     #[test]
     fn scheduler_rounds_partial_millisecond_timeout_up() {
         let now = Instant::now();
-        let scheduler = PeriodicMetricsScheduler::with_period(
+        let mut scheduler = PeriodicMetricsScheduler::with_period(
             now,
             Duration::from_millis(1) + Duration::from_nanos(1),
         );
 
-        assert_eq!(scheduler.poll_timeout_ms(now), 2);
+        assert_eq!(scheduler.poll_timeout_ms(now, Some(now)), Some(2));
     }
 
     #[test]
     fn scheduler_schedules_next_deadline_after_flush() {
         let now = Instant::now();
         let mut scheduler = PeriodicMetricsScheduler::due_now(now);
-        scheduler.schedule_next(now);
+        scheduler.schedule_next(now, Some(now));
 
         assert_eq!(
-            scheduler.poll_timeout_ms(now),
-            FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL.as_millis() as i32
+            scheduler.poll_timeout_ms(now, Some(now)),
+            Some(FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL.as_millis() as i32)
         );
     }
 
