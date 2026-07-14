@@ -5,8 +5,8 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::{
-    AuditError, Baseline, Counts, FIRECRACKER_COMMIT, FIRECRACKER_VERSION, Input, SCHEMA_VERSION,
-    SourceItem, SourceManifest,
+    AuditError, Baseline, Counts, FIRECRACKER_COMMIT, FIRECRACKER_TARGET, FIRECRACKER_VERSION,
+    GENERATOR_VERSION, Input, SCHEMA_VERSION, SourceItem, SourceManifest,
 };
 
 const SWAGGER_PATH: &str = "src/firecracker/swagger/firecracker.yaml";
@@ -677,9 +677,9 @@ pub fn derive_source_manifest(path: &Path) -> Result<SourceManifest, AuditError>
         baseline: Baseline {
             version: FIRECRACKER_VERSION.to_string(),
             commit: FIRECRACKER_COMMIT.to_string(),
-            target: "aarch64-macos-hvf".to_string(),
+            target: FIRECRACKER_TARGET.to_string(),
         },
-        generator_version: 1,
+        generator_version: GENERATOR_VERSION,
         inputs,
         counts,
         items,

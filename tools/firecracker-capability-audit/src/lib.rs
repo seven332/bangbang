@@ -18,8 +18,12 @@ use std::path::Path;
 pub const FIRECRACKER_VERSION: &str = "1.16.0";
 /// Exact Firecracker commit audited by this inventory.
 pub const FIRECRACKER_COMMIT: &str = "d83d72b710361a10294480131377b1b00b163af8";
+/// Compatibility target audited by this inventory.
+pub const FIRECRACKER_TARGET: &str = "aarch64-macos-hvf";
 /// Current checked-in inventory schema.
 pub const SCHEMA_VERSION: u32 = 1;
+/// Current generated source-manifest format.
+pub const GENERATOR_VERSION: u32 = 1;
 /// Repository-relative generated source manifest path.
 pub const SOURCE_MANIFEST_PATH: &str = "compat/firecracker/v1.16.0/source-manifest.json";
 /// Repository-relative human capability overlay path.

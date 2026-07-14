@@ -67,7 +67,7 @@ pub struct SourceManifest {
 }
 
 /// One implementation or validation evidence reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Reference {
     /// A repository-relative tracked file and optional stable symbol/heading anchor.

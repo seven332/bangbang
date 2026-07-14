@@ -4,8 +4,8 @@ use std::path::{Component, Path};
 
 use crate::{
     AuditMode, Baseline, Capability, CapabilityInventory, Counts, Disposition, FIRECRACKER_COMMIT,
-    FIRECRACKER_VERSION, Input, PlatformExclusion, Reference, SCHEMA_VERSION, SourceItem,
-    SourceManifest,
+    FIRECRACKER_TARGET, FIRECRACKER_VERSION, GENERATOR_VERSION, Input, PlatformExclusion,
+    Reference, SCHEMA_VERSION, SourceItem, SourceManifest,
 };
 
 const EXPECTED_SWAGGER_PATHS: usize = 26;
@@ -14,6 +14,26 @@ const EXPECTED_SWAGGER_DEFINITIONS: usize = 44;
 const EXPECTED_SWAGGER_PROPERTIES: usize = 152;
 const EXPECTED_FIRECRACKER_ARGUMENTS: usize = 23;
 const EXPECTED_NON_SWAGGER_ROUTES: usize = 3;
+const EXPECTED_PUBLIC_TOOL_OPERATIONS: usize = 14;
+const EXPECTED_PUBLIC_TOOL_ARGUMENTS: usize = 41;
+const EXPECTED_CORPUS_ITEMS: usize = 40;
+const SOURCE_KINDS: &[&str] = &[
+    "api-operation",
+    "api-path",
+    "api-property",
+    "api-schema",
+    "corpus",
+    "firecracker-argument",
+    "non-swagger-route",
+    "tool-argument",
+    "tool-operation",
+];
+const EXTRACTORS: &[&str] = &[
+    "curated-source-v1",
+    "firecracker-cli-v1",
+    "parsed-delete-routes-v1",
+    "swagger-v1",
+];
 
 /// Complete deterministic set of inventory validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,8 +103,11 @@ fn validate_baseline(
     }
     validate_expected_baseline("source manifest", &manifest.baseline, errors);
     validate_expected_baseline("capability inventory", &inventory.baseline, errors);
-    if manifest.generator_version == 0 {
-        errors.push("source manifest generator_version must be positive".to_string());
+    if manifest.generator_version != GENERATOR_VERSION {
+        errors.push(format!(
+            "source manifest generator_version must be {GENERATOR_VERSION}, found {}",
+            manifest.generator_version
+        ));
     }
 }
 
@@ -101,8 +124,11 @@ fn validate_expected_baseline(label: &str, baseline: &Baseline, errors: &mut Vec
             baseline.commit
         ));
     }
-    if baseline.target.trim().is_empty() {
-        errors.push(format!("{label} target must not be empty"));
+    if baseline.target != FIRECRACKER_TARGET {
+        errors.push(format!(
+            "{label} target must be {FIRECRACKER_TARGET}, found {}",
+            baseline.target
+        ));
     }
 }
 
@@ -126,8 +152,11 @@ fn validate_inputs(inputs: &[Input], errors: &mut Vec<String>) {
                 input.path
             ));
         }
-        if input.extractor.trim().is_empty() {
-            errors.push(format!("input extractor must not be empty: {}", input.path));
+        if !EXTRACTORS.contains(&input.extractor.as_str()) {
+            errors.push(format!(
+                "input extractor is not recognized: {} -> {}",
+                input.path, input.extractor
+            ));
         }
     }
 }
@@ -153,6 +182,12 @@ fn validate_source_items(manifest: &SourceManifest, errors: &mut Vec<String>) {
             errors.push(format!(
                 "source item kind/key must not be empty: {}",
                 item.id
+            ));
+        }
+        if !SOURCE_KINDS.contains(&item.kind.as_str()) {
+            errors.push(format!(
+                "source item kind is not recognized: {} -> {}",
+                item.id, item.kind
             ));
         }
         if item.family.trim().is_empty() {
@@ -239,6 +274,21 @@ fn validate_expected_counts(counts: &Counts, errors: &mut Vec<String>) {
             EXPECTED_NON_SWAGGER_ROUTES,
             counts.non_swagger_routes,
         ),
+        (
+            "public tool operations",
+            EXPECTED_PUBLIC_TOOL_OPERATIONS,
+            counts.public_tool_operations,
+        ),
+        (
+            "public tool arguments",
+            EXPECTED_PUBLIC_TOOL_ARGUMENTS,
+            counts.public_tool_arguments,
+        ),
+        (
+            "source corpus items",
+            EXPECTED_CORPUS_ITEMS,
+            counts.corpus_items,
+        ),
     ];
     for (label, wanted, actual) in expected {
         if actual != wanted {
@@ -246,15 +296,6 @@ fn validate_expected_counts(counts: &Counts, errors: &mut Vec<String>) {
                 "{label} must contain {wanted} identities, found {actual}"
             ));
         }
-    }
-    if counts.public_tool_operations == 0 {
-        errors.push("public tool operations must not be empty".to_string());
-    }
-    if counts.public_tool_arguments == 0 {
-        errors.push("public tool arguments must not be empty".to_string());
-    }
-    if counts.corpus_items == 0 {
-        errors.push("non-Swagger source corpus must not be empty".to_string());
     }
 }
 
@@ -323,13 +364,18 @@ fn validate_capabilities(
     }
 
     for capability in &inventory.capabilities {
-        if !source_by_id.contains_key(capability.id.as_str())
-            && !capability.id.starts_with("semantic.")
-        {
-            errors.push(format!(
-                "non-generated capability id must start with semantic.: {}",
-                capability.id
-            ));
+        if !source_by_id.contains_key(capability.id.as_str()) {
+            if !capability.id.starts_with("semantic.") {
+                errors.push(format!(
+                    "non-generated capability id must start with semantic.: {}",
+                    capability.id
+                ));
+            } else if !is_semantic_id(&capability.id) {
+                errors.push(format!(
+                    "semantic capability id is not canonical: {}",
+                    capability.id
+                ));
+            }
         }
         if !families.contains(capability.family.as_str()) {
             errors.push(format!(
@@ -448,6 +494,11 @@ fn validate_disposition(
             errors,
         );
     }
+    check_sorted_unique_references(
+        &capability.implementation,
+        &format!("{} implementation reference", capability.id),
+        errors,
+    );
     for (index, reference) in capability.validation.iter().enumerate() {
         validate_reference(
             reference,
@@ -456,6 +507,11 @@ fn validate_disposition(
             errors,
         );
     }
+    check_sorted_unique_references(
+        &capability.validation,
+        &format!("{} validation reference", capability.id),
+        errors,
+    );
 }
 
 fn forbid_delivery_and_exclusion(capability: &Capability, errors: &mut Vec<String>) {
@@ -491,6 +547,11 @@ fn validate_exclusion(
         if references.is_empty() {
             errors.push(format!("platform exclusion {name} must not be empty: {id}"));
         }
+        check_sorted_unique_references(
+            references,
+            &format!("{id} exclusion.{name} reference"),
+            errors,
+        );
         for (index, reference) in references.iter().enumerate() {
             validate_reference(
                 reference,
@@ -510,6 +571,11 @@ fn validate_exclusion(
             "platform exclusion alternatives must contain reviewed reasons: {id}"
         ));
     }
+    check_sorted_unique(
+        exclusion.alternatives.iter().map(String::as_str),
+        &format!("{id} exclusion alternative"),
+        errors,
+    );
     validate_reference(
         &exclusion.challenge,
         repository_root,
@@ -552,6 +618,24 @@ fn validate_reference(
             };
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 errors.push(format!("local reference must name a regular file: {label}"));
+                return;
+            }
+            let canonical_root = match repository_root.canonicalize() {
+                Ok(path) => path,
+                Err(_) => {
+                    errors.push(format!("repository root is not accessible: {label}"));
+                    return;
+                }
+            };
+            let canonical = match joined.canonicalize() {
+                Ok(path) => path,
+                Err(_) => {
+                    errors.push(format!("local reference path is not accessible: {label}"));
+                    return;
+                }
+            };
+            if !canonical.starts_with(&canonical_root) {
+                errors.push(format!("local reference path escapes repository: {label}"));
             }
         }
         Reference::Github { url } => {
@@ -585,6 +669,13 @@ fn is_slug(value: &str) -> bool {
         && !value.ends_with('-')
 }
 
+fn is_semantic_id(value: &str) -> bool {
+    value
+        .strip_prefix("semantic.")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(namespace, name)| is_slug(namespace) && is_slug(name))
+}
+
 fn is_delivery_issue(value: &str) -> bool {
     value.strip_prefix('#').is_some_and(|number| {
         !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
@@ -613,15 +704,59 @@ fn check_sorted_unique<'a>(
     }
 }
 
+fn check_sorted_unique_references(references: &[Reference], label: &str, errors: &mut Vec<String>) {
+    for pair in references.windows(2) {
+        let [previous, current] = pair else {
+            continue;
+        };
+        if previous == current {
+            errors.push(format!("duplicate {label}: {current:?}"));
+        } else if previous > current {
+            errors.push(format!(
+                "{label} values are not canonically sorted: {previous:?} > {current:?}"
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "bangbang-capability-validation-{}-{serial}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("temporary directory should be created");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn baseline() -> Baseline {
         Baseline {
             version: FIRECRACKER_VERSION.to_string(),
             commit: FIRECRACKER_COMMIT.to_string(),
-            target: "aarch64-macos-hvf".to_string(),
+            target: FIRECRACKER_TARGET.to_string(),
         }
     }
 
@@ -652,9 +787,24 @@ mod tests {
             3,
             "runtime-device-management",
         );
-        add_items(&mut items, "tool-operation", 1, "public-tools");
-        add_items(&mut items, "tool-argument", 1, "public-tools");
-        add_items(&mut items, "corpus", 1, "specifications");
+        add_items(
+            &mut items,
+            "tool-operation",
+            EXPECTED_PUBLIC_TOOL_OPERATIONS,
+            "public-tools",
+        );
+        add_items(
+            &mut items,
+            "tool-argument",
+            EXPECTED_PUBLIC_TOOL_ARGUMENTS,
+            "public-tools",
+        );
+        add_items(
+            &mut items,
+            "corpus",
+            EXPECTED_CORPUS_ITEMS,
+            "specifications",
+        );
         items.sort_by(|left, right| left.id.cmp(&right.id));
 
         let counts = computed_counts(&items);
@@ -675,11 +825,11 @@ mod tests {
         let manifest = SourceManifest {
             schema_version: SCHEMA_VERSION,
             baseline: baseline(),
-            generator_version: 1,
+            generator_version: GENERATOR_VERSION,
             inputs: vec![Input {
                 path: "upstream/source".to_string(),
                 git_blob: "0123456789012345678901234567890123456789".to_string(),
-                extractor: "fixture".to_string(),
+                extractor: "curated-source-v1".to_string(),
             }],
             counts,
             items,
@@ -852,6 +1002,114 @@ mod tests {
                 .messages()
                 .iter()
                 .any(|message| message.contains("version must be 1.16.0"))
+        );
+    }
+
+    #[test]
+    fn rejects_target_generator_kind_and_extractor_drift() {
+        let (mut manifest, inventory) = valid_fixture();
+        manifest.baseline.target = "x86_64-linux-kvm".to_string();
+        manifest.generator_version += 1;
+        manifest.inputs[0].extractor = "unknown-extractor".to_string();
+        let item = manifest
+            .items
+            .first_mut()
+            .expect("fixture should have a source item");
+        item.kind = "unknown-kind".to_string();
+        item.id = format!("unknown-kind:{}", item.key);
+
+        let errors = validate(&manifest, &inventory, Path::new("."), AuditMode::Delivery)
+            .expect_err("frozen manifest metadata should reject drift");
+        for expected in [
+            "target must be aarch64-macos-hvf",
+            "generator_version must be 1",
+            "input extractor is not recognized",
+            "source item kind is not recognized",
+        ] {
+            assert!(
+                errors
+                    .messages()
+                    .iter()
+                    .any(|message| message.contains(expected)),
+                "missing expected validation error: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_semantic_id() {
+        let (manifest, mut inventory) = valid_fixture();
+        let source_id = manifest.items[0].id.clone();
+        inventory.capabilities.push(Capability {
+            id: "semantic.Bad_Name:contract".to_string(),
+            family: "api-contract".to_string(),
+            summary: "Audit an invalid semantic identity.".to_string(),
+            source_refs: vec![source_id],
+            disposition: Disposition::AuditRequired,
+            implementation: Vec::new(),
+            validation: Vec::new(),
+            delivery_issue: None,
+            exclusion: None,
+        });
+        inventory
+            .capabilities
+            .sort_by(|left, right| left.id.cmp(&right.id));
+
+        let errors = validate(&manifest, &inventory, Path::new("."), AuditMode::Delivery)
+            .expect_err("noncanonical semantic identity should fail");
+        assert!(
+            errors
+                .messages()
+                .iter()
+                .any(|message| message.contains("semantic capability id is not canonical"))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_evidence_references() {
+        let (manifest, mut inventory) = valid_fixture();
+        let reference = Reference::Github {
+            url: "https://github.com/seven332/bangbang/issues/1349".to_string(),
+        };
+        inventory.capabilities[0].implementation = vec![reference.clone(), reference];
+
+        let errors = validate(&manifest, &inventory, Path::new("."), AuditMode::Delivery)
+            .expect_err("duplicate references should fail");
+        assert!(
+            errors
+                .messages()
+                .iter()
+                .any(|message| message.contains("duplicate") && message.contains("reference"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_local_reference_through_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDirectory::new();
+        let outside = TempDirectory::new();
+        std::fs::write(outside.path().join("evidence.md"), "outside\n")
+            .expect("outside evidence should be written");
+        symlink(outside.path(), root.path().join("linked"))
+            .expect("linked evidence directory should be created");
+
+        let (manifest, mut inventory) = valid_fixture();
+        inventory.capabilities[0]
+            .implementation
+            .push(Reference::Local {
+                path: "linked/evidence.md".to_string(),
+                anchor: None,
+            });
+
+        let errors = validate(&manifest, &inventory, root.path(), AuditMode::Delivery)
+            .expect_err("a parent symlink must not escape the repository");
+        assert!(
+            errors
+                .messages()
+                .iter()
+                .any(|message| message.contains("escapes repository"))
         );
     }
 
