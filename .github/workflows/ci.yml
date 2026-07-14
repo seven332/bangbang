@@ -26,7 +26,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --target aarch64-apple-darwin
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --target aarch64-apple-darwin,aarch64-unknown-linux-musl
           rustup default stable
 
       - name: Cache Rust dependencies
@@ -46,6 +46,9 @@ jobs:
 
       - name: Check
         run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Check unsupported launcher target
+        run: cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 
       - name: Validate Firecracker capability inventory
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate
@@ -68,8 +71,10 @@ jobs:
       - name: Run clippy on signed integration targets
         run: |
           cargo clippy -p bangbang --test executable_hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
+          cargo clippy -p bangbang --test app_sandbox_process_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
           cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings
           cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
+          cargo clippy -p bangbang-launcher --test production_bundle_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 
       - name: Build documentation
         env:

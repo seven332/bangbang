@@ -3300,35 +3300,38 @@
     {
       "id": "semantic.isolation:host-resource-authority-and-brokerage",
       "family": "isolation",
-      "summary": "Audit path/socket/file/vmnet authority, privilege/resource brokerage, descriptor transfer, sandbox grants, per-VM policy, and cleanup.",
+      "summary": "The production worker is limited to container or sealed resources; authenticated external path/socket/file/vmnet grants, descriptor brokerage, per-VM policy, and replacement-safe cleanup remain feasible under #1351.",
       "source_refs": [
         "corpus:jailer",
         "corpus:network-setup",
         "corpus:production-host"
       ],
-      "disposition": "audit-required"
+      "disposition": "missing-platform-feasible",
+      "delivery_issue": "https://github.com/seven332/bangbang/issues/1351"
     },
     {
       "id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
       "family": "isolation",
-      "summary": "Audit applicable jailer/seccomp security and resource outcomes plus safe macOS containment, packaging, entitlement, and rejection behavior.",
+      "summary": "A fixed separately signed App Sandbox plus Hypervisor worker boundary is delivered; remaining jailer/seccomp resource and deployment outcomes require explicit macOS equivalents under #1351.",
       "source_refs": [
         "corpus:jailer",
         "corpus:production-host",
         "corpus:seccomp",
         "corpus:seccompiler"
       ],
-      "disposition": "audit-required"
+      "disposition": "missing-platform-feasible",
+      "delivery_issue": "https://github.com/seven332/bangbang/issues/1351"
     },
     {
       "id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
       "family": "isolation",
-      "summary": "Audit multi-process ownership, concurrency, bounds, redaction, guest-controlled input, FFI, failure atomicity, and replaced-resource cleanup.",
+      "summary": "The fixed launcher owns one worker with bounded no-clobber package assembly, redacted errors, and PID-reuse-safe graceful signal supervision; authenticated sessions, both crash orders, external-resource races, and replacement-safe cleanup remain feasible under #1351.",
       "source_refs": [
         "corpus:design",
         "corpus:production-host"
       ],
-      "disposition": "audit-required"
+      "disposition": "missing-platform-feasible",
+      "delivery_issue": "https://github.com/seven332/bangbang/issues/1351"
     },
     {
       "id": "semantic.lifecycle:pause-resume-quiescence-and-failure",

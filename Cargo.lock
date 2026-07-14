@@ -48,6 +48,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bangbang-launcher"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "signal-hook",
+]
+
+[[package]]
 name = "bangbang-runtime"
 version = "0.1.0"
 dependencies = [

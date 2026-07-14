@@ -27,6 +27,10 @@ claims mechanically visible.
   records. It traces arity, defaults, relationships, observable behavior,
   cross-family ownership, implementation, and executable validation without
   expanding the machine-owned identity extractor.
+- [`isolation-contract.md`](isolation-contract.md) records the production
+  macOS bundle/worker boundary, its executable evidence, and the remaining
+  #1351 isolation/resource/seccomp outcomes without treating them as direct
+  Linux jailer parity.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -65,6 +69,15 @@ snapshot-containing identity/output semantic, the aggregate run operation, and
 both broad source corpora remain `audit-required`. The checked
 [`process-contract.md`](process-contract.md) records those nine handoffs; a
 partially implemented composite is not a terminal claim.
+
+The #1354 production-boundary audit moves exactly three composite isolation
+records to `missing-platform-feasible` with #1351 as their delivery owner. It
+does not terminally promote them: external resource authority, authenticated
+brokerage, vmnet policy, crash coupling, deployment identity, and exact
+jailer/seccomp outcome classification remain incomplete. The broad source
+corpus records remain `audit-required`. The checked
+[`isolation-contract.md`](isolation-contract.md) separates the delivered
+package/sandbox/supervisor subset from those handoffs.
 
 ## Commands
 

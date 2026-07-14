@@ -1,0 +1,108 @@
+use std::fmt;
+use std::io;
+
+/// Stable launcher failure categories that do not expose package paths or tool output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherError {
+    /// The running executable is not in the fixed production bundle layout.
+    InvalidBundleLayout,
+    /// The fixed bundle or embedded worker is missing or not a regular code object.
+    InvalidBundleEntry,
+    /// Static code-signature or requirement validation failed.
+    InvalidBundleSignature,
+    /// Graceful signal observation could not be installed.
+    SignalSetup(io::ErrorKind),
+    /// The embedded worker could not be started.
+    WorkerSpawn(io::ErrorKind),
+    /// Waiting for the embedded worker failed.
+    WorkerWait(io::ErrorKind),
+    /// A graceful signal could not be forwarded to the owned worker.
+    SignalForward(io::ErrorKind),
+    /// Production launching is unavailable on this target.
+    UnsupportedPlatform,
+}
+
+impl fmt::Display for LauncherError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBundleLayout => formatter.write_str("invalid production bundle layout"),
+            Self::InvalidBundleEntry => formatter.write_str("invalid production bundle entry"),
+            Self::InvalidBundleSignature => {
+                formatter.write_str("production bundle signature validation failed")
+            }
+            Self::SignalSetup(kind) => {
+                write!(
+                    formatter,
+                    "failed to install launcher signal handling: {kind:?}"
+                )
+            }
+            Self::WorkerSpawn(kind) => {
+                write!(formatter, "failed to start sandbox worker: {kind:?}")
+            }
+            Self::WorkerWait(kind) => {
+                write!(formatter, "failed to wait for sandbox worker: {kind:?}")
+            }
+            Self::SignalForward(kind) => {
+                write!(formatter, "failed to forward launcher signal: {kind:?}")
+            }
+            Self::UnsupportedPlatform => {
+                formatter.write_str("production bundle launching requires macOS")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LauncherError {}
+
+/// Stable production-package failure categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageError {
+    /// Package command input is invalid.
+    InvalidInput,
+    /// A package input or fixed metadata object is missing or has an unsafe type.
+    InvalidInputEntry,
+    /// The optional repository-test resource tree is invalid or too large.
+    InvalidTestResources,
+    /// A private staging operation failed.
+    Staging(io::ErrorKind),
+    /// A fixed platform signing or metadata tool failed.
+    ToolFailure(&'static str),
+    /// Inspection found an unexpected identity, entitlement, or runtime flag.
+    InspectionFailure,
+    /// The final bundle already exists.
+    OutputAlreadyExists,
+    /// Exclusive final publication failed.
+    Publication(io::ErrorKind),
+    /// Production packaging is unavailable on this target.
+    UnsupportedPlatform,
+}
+
+impl fmt::Display for PackageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput => formatter.write_str("invalid production bundle input"),
+            Self::InvalidInputEntry => formatter.write_str("invalid production bundle input entry"),
+            Self::InvalidTestResources => {
+                formatter.write_str("invalid production bundle test resources")
+            }
+            Self::Staging(kind) => {
+                write!(formatter, "failed to stage production bundle: {kind:?}")
+            }
+            Self::ToolFailure(tool) => {
+                write!(formatter, "production bundle {tool} failed")
+            }
+            Self::InspectionFailure => formatter.write_str("production bundle inspection failed"),
+            Self::OutputAlreadyExists => {
+                formatter.write_str("production bundle output already exists")
+            }
+            Self::Publication(kind) => {
+                write!(formatter, "failed to publish production bundle: {kind:?}")
+            }
+            Self::UnsupportedPlatform => {
+                formatter.write_str("production bundle packaging requires macOS")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PackageError {}

@@ -1,0 +1,25 @@
+[package]
+name = "bangbang-launcher"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = "0.2"
+signal-hook = "0.3"
+
+[[bin]]
+name = "bangbang-launcher"
+path = "src/main.rs"
+
+[[bin]]
+name = "bangbang-bundle"
+path = "src/bin/bangbang-bundle.rs"
+
+[[test]]
+name = "production_bundle_e2e"
+path = "tests/production_bundle_e2e.rs"
+test = false
+
+[lints]
+workspace = true

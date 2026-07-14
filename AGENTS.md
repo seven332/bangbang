@@ -8,6 +8,8 @@ This is a Rust workspace for `bangbang`, a macOS-oriented VMM scaffold intended 
 - `crates/api` -> package `bangbang-api`: Firecracker-compatible API endpoint names.
 - `crates/runtime` -> package `bangbang-runtime`: backend-neutral VM trait and error type.
 - `crates/hvf` -> package `bangbang-hvf`: Apple Hypervisor.framework backend skeleton.
+- `crates/launcher` -> package `bangbang-launcher`: production macOS bundle assembly,
+  static-code validation, and the outer worker supervisor.
 - `tools/firecracker-capability-audit` -> package
   `bangbang-firecracker-capability-audit`: checked v1.16.0 scope inventory validator.
 - `compat/firecracker/v1.16.0`: pinned machine source manifest and human capability overlays.
@@ -21,6 +23,7 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`: validate the
   checked delivery-time Firecracker inventory without a sibling checkout.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
+- `cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl`: verify unsupported targets compile to the launcher's explicit platform-error path.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.
 - `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: run lint checks with warnings treated as errors.
@@ -28,8 +31,12 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo clippy -p bangbang --test app_sandbox_process_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed App Sandbox process boundary target.
 - `cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed HVF lifecycle target.
 - `cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed guest boot target.
+- `cargo clippy -p bangbang-launcher --test production_bundle_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed production bundle target.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`: build documentation without dependency docs.
 - `scripts/run-integration-tests.sh`: sign and run HVF-backed integration tests on macOS Apple Silicon; use `--allow-unsupported` only for CI runners that cannot execute HVF.
+- `scripts/build-production-bundle.sh --output /path/to/Bangbang.app`: build,
+  separately sign, inspect, and exclusively publish the production launcher and
+  nested App Sandbox worker.
 - `cargo run -p bangbang`: run the current VMM process skeleton.
 
 Use these commands before opening or updating a pull request. For local or self-hosted HVF verification, run `scripts/run-integration-tests.sh` without `--allow-unsupported` so unsupported hosts fail instead of being ignored.
@@ -50,7 +57,7 @@ Unsafe code must stay isolated behind small FFI wrappers, with `SAFETY:` comment
 
 Use Rust’s built-in test framework with `#[test]`. Add focused unit tests for argument parsing, error formatting, and backend state transitions as those surfaces grow. Test names should describe behavior, such as `parse_help_arg` or `displays_hypervisor_error`.
 
-Real Hypervisor.framework integration tests must run through `scripts/run-integration-tests.sh` so binaries are signed and unsupported hosts are handled explicitly. HVF crate integration tests live in `crates/hvf/tests/`; executable-level HVF e2e tests may live under the owning executable crate as dedicated `test = false` Cargo targets. Do not run or add real HVF integration tests through the unsigned workspace test path.
+Real Hypervisor.framework integration tests must run through `scripts/run-integration-tests.sh` so binaries are signed and unsupported hosts are handled explicitly. HVF crate integration tests live in `crates/hvf/tests/`; executable-level HVF e2e tests may live under the owning executable crate as dedicated `test = false` Cargo targets. The production bundle target lives under `crates/launcher/tests/` and must be run through the same wrapper so the real nested signatures and App Sandbox boundary are exercised. Do not run or add real HVF integration tests through the unsigned workspace test path.
 
 ## Commit & Pull Request Guidelines
 
