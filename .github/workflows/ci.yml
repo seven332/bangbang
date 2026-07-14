@@ -26,7 +26,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --target aarch64-apple-darwin
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --target aarch64-apple-darwin,aarch64-unknown-linux-musl
           rustup default stable
 
       - name: Cache Rust dependencies
@@ -46,6 +46,9 @@ jobs:
 
       - name: Check
         run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Check unsupported launcher target
+        run: cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 
       - name: Validate Firecracker capability inventory
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate

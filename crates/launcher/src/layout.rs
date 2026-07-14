@@ -16,7 +16,9 @@ pub const WORKER_BUNDLE_NAME: &str = "BangbangWorker.app";
 pub const WORKER_BUNDLE_IDENTIFIER: &str = "dev.bangbang.worker";
 /// Stable nested worker executable name.
 pub const WORKER_EXECUTABLE_NAME: &str = "bangbang-worker";
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const APP_SANDBOX_ENTITLEMENT: &str = "com.apple.security.app-sandbox";
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const HYPERVISOR_ENTITLEMENT: &str = "com.apple.security.hypervisor";
 
 /// Fixed production bundle paths derived from the running launcher executable.

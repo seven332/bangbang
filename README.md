@@ -543,6 +543,7 @@ Requires the latest stable Rust toolchain.
 cargo fmt --all -- --check
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo check --workspace --all-targets --all-features --locked
+cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 cargo test -p bangbang-hvf --lib --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

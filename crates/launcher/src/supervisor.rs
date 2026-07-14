@@ -1,8 +1,12 @@
 use std::ffi::OsString;
+#[cfg(any(target_os = "macos", test))]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
-use crate::{BundleLayout, LauncherError};
+#[cfg(target_os = "macos")]
+use crate::BundleLayout;
+use crate::LauncherError;
 
 /// Final process result returned by the production launcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +52,7 @@ where
     }
 }
 
+#[cfg(target_os = "macos")]
 fn stop_and_reap_after_supervision_error(child: &mut std::process::Child) {
     if !matches!(child.try_wait(), Ok(Some(_))) {
         let _ = child.kill();
@@ -55,6 +60,7 @@ fn stop_and_reap_after_supervision_error(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn map_exit_status(status: std::process::ExitStatus) -> Result<LauncherExit, LauncherError> {
     if let Some(code) = status.code() {
         return u8::try_from(code)
@@ -74,6 +80,7 @@ fn map_exit_status(status: std::process::ExitStatus) -> Result<LauncherExit, Lau
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(target_os = "macos")]
     use std::process::Command;
 
     use super::*;
@@ -98,6 +105,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn supervision_failure_cleanup_terminates_and_reaps_owned_worker() {
         let mut child = Command::new("/bin/sleep")

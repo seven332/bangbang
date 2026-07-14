@@ -3,7 +3,9 @@ use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+#[cfg(target_os = "macos")]
+use std::process::Command;
+use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::layout::{APP_SANDBOX_ENTITLEMENT, HYPERVISOR_ENTITLEMENT};
@@ -58,8 +60,10 @@ trait ToolRunner {
 }
 
 #[derive(Debug)]
+#[cfg(target_os = "macos")]
 struct SystemTools;
 
+#[cfg(target_os = "macos")]
 impl ToolRunner for SystemTools {
     fn run(&self, program: &Path, args: &[OsString]) -> Result<Output, io::ErrorKind> {
         Command::new(program)
@@ -74,8 +78,10 @@ trait Publisher {
 }
 
 #[derive(Debug)]
+#[cfg(target_os = "macos")]
 struct SystemPublisher;
 
+#[cfg(target_os = "macos")]
 impl Publisher for SystemPublisher {
     fn publish(&self, source: &Path, destination: &Path) -> Result<(), io::ErrorKind> {
         crate::macos::publish::publish_exclusive(source, destination)

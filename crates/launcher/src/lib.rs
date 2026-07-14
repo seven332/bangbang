@@ -4,6 +4,10 @@ mod error;
 mod layout;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod package;
+#[cfg(not(any(target_os = "macos", test)))]
+#[path = "package_unsupported.rs"]
 mod package;
 mod supervisor;
 

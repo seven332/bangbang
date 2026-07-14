@@ -23,6 +23,7 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`: validate the
   checked delivery-time Firecracker inventory without a sibling checkout.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
+- `cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl`: verify unsupported targets compile to the launcher's explicit platform-error path.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.
 - `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: run lint checks with warnings treated as errors.
