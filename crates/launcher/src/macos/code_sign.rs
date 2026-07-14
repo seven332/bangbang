@@ -21,9 +21,6 @@ const SEC_CS_CHECK_NESTED_CODE: SecCsFlags = 1 << 3;
 const SEC_CS_STRICT_VALIDATE: SecCsFlags = 1 << 4;
 const SEC_CS_RESTRICT_SYMLINKS: SecCsFlags = 1 << 7;
 
-const OUTER_REQUIREMENT: &str = "identifier \"dev.bangbang\" and entitlement[\"com.apple.security.app-sandbox\"] absent and entitlement[\"com.apple.security.hypervisor\"] absent";
-const WORKER_REQUIREMENT: &str = "identifier \"dev.bangbang.worker\" and entitlement[\"com.apple.security.app-sandbox\"] exists and entitlement[\"com.apple.security.hypervisor\"] exists";
-
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFURLCreateFromFileSystemRepresentation(
@@ -95,7 +92,7 @@ impl Drop for CfOwned {
 }
 
 pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<(), LauncherError> {
-    let outer_requirement = requirement(OUTER_REQUIREMENT)?;
+    let outer_requirement = requirement(&outer_requirement_text())?;
     let outer = static_code(layout.outer_bundle(), true)?;
     check(
         &outer,
@@ -107,7 +104,7 @@ pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<(), LauncherError
     )?;
     validate_entitlements(&outer, EntitlementProfile::Outer)?;
 
-    let worker_requirement = requirement(WORKER_REQUIREMENT)?;
+    let worker_requirement = requirement(&worker_requirement_text())?;
     let worker = static_code(layout.worker_bundle(), true)?;
     check(
         &worker,
@@ -115,6 +112,24 @@ pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<(), LauncherError
         &worker_requirement,
     )?;
     validate_entitlements(&worker, EntitlementProfile::Worker)
+}
+
+fn outer_requirement_text() -> String {
+    format!(
+        "identifier \"{}\" and entitlement[\"{}\"] absent and entitlement[\"{}\"] absent",
+        crate::LAUNCHER_BUNDLE_IDENTIFIER,
+        crate::layout::APP_SANDBOX_ENTITLEMENT,
+        crate::layout::HYPERVISOR_ENTITLEMENT
+    )
+}
+
+fn worker_requirement_text() -> String {
+    format!(
+        "identifier \"{}\" and entitlement[\"{}\"] exists and entitlement[\"{}\"] exists",
+        crate::WORKER_BUNDLE_IDENTIFIER,
+        crate::layout::APP_SANDBOX_ENTITLEMENT,
+        crate::layout::HYPERVISOR_ENTITLEMENT
+    )
 }
 
 fn static_code(path: &Path, is_directory: bool) -> Result<CfOwned, LauncherError> {
@@ -302,17 +317,19 @@ mod tests {
 
     #[test]
     fn worker_requirement_uses_the_stable_identity_and_entitlements() {
-        assert!(WORKER_REQUIREMENT.contains(crate::WORKER_BUNDLE_IDENTIFIER));
-        assert!(WORKER_REQUIREMENT.contains(APP_SANDBOX_ENTITLEMENT));
-        assert!(WORKER_REQUIREMENT.contains(HYPERVISOR_ENTITLEMENT));
-        assert!(WORKER_REQUIREMENT.matches(" exists").count() == 2);
-        assert!(OUTER_REQUIREMENT.contains(crate::LAUNCHER_BUNDLE_IDENTIFIER));
-        assert!(OUTER_REQUIREMENT.matches(" absent").count() == 2);
+        let worker = worker_requirement_text();
+        let outer = outer_requirement_text();
+        assert!(worker.contains(crate::WORKER_BUNDLE_IDENTIFIER));
+        assert!(worker.contains(APP_SANDBOX_ENTITLEMENT));
+        assert!(worker.contains(HYPERVISOR_ENTITLEMENT));
+        assert!(worker.matches(" exists").count() == 2);
+        assert!(outer.contains(crate::LAUNCHER_BUNDLE_IDENTIFIER));
+        assert!(outer.matches(" absent").count() == 2);
     }
 
     #[test]
     fn static_requirements_compile() {
-        requirement(OUTER_REQUIREMENT).expect("outer requirement should compile");
-        requirement(WORKER_REQUIREMENT).expect("worker requirement should compile");
+        requirement(&outer_requirement_text()).expect("outer requirement should compile");
+        requirement(&worker_requirement_text()).expect("worker requirement should compile");
     }
 }
