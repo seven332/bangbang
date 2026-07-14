@@ -28,10 +28,10 @@ create or rewrite a capability disposition, owner, evidence reference,
 delivery issue, or Challenge result. A changed generated identity instead
 causes a missing or stale overlay validation failure for a reviewer to resolve.
 
-Stable source IDs use `<kind>:<upstream-key>`. Semantic IDs start with
-`semantic.`. IDs are scoped to this immutable v1.16.0 baseline. A later
-Firecracker baseline gets a separate directory and an explicitly reviewed
-delta.
+Stable source IDs use `<kind>:<upstream-key>`. Semantic IDs use the lowercase
+`semantic.<namespace>:<slug>` form. IDs are scoped to this immutable v1.16.0
+baseline. A later Firecracker baseline gets a separate directory and an
+explicitly reviewed delta.
 
 ## Dispositions
 
@@ -48,7 +48,7 @@ Each capability has exactly one disposition:
 - `proven-platform-impossible` requires the upstream contract, authoritative
   platform evidence, alternatives with rejection reasons, stable behavior,
   focused tests, compatibility and security documentation, and a current
-  Challenge result.
+  Challenge result linked as its GitHub issue comment.
 
 The initial inventory is deliberately conservative. Existing prose or issue
 closure does not automatically promote a record from `audit-required`.
@@ -96,7 +96,9 @@ all owned overlay records in the same change. Add implementation and validation
 evidence only for the exact observable contract proved by that PR. Keep
 unreviewed behavior `audit-required`; use `missing-platform-feasible` only with
 a delivery issue; and use `proven-platform-impossible` only after the complete
-strict evidence and Challenge gate.
+strict evidence and Challenge gate. Keep capability IDs, source references,
+evidence references, and exclusion alternatives in canonical sorted order and
+free of duplicates.
 
 Run the focused validator and the repository's normal checks before submission.
 The checked-in integration test also validates this inventory through the
