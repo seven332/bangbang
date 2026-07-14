@@ -982,7 +982,9 @@ mod macos_arm64 {
             );
         }
 
-        assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+        let output = bangbang.terminate();
+        assert_clean_shutdown(output, &socket_path, "bangbang");
+        assert_normal_terminal_metrics_output(&metrics_path);
         assert!(
             !uds_path.exists(),
             "bangbang shutdown should remove its owned vsock listener path"
@@ -1395,7 +1397,9 @@ mod macos_arm64 {
             );
         }
 
-        assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang config file");
+        let output = bangbang.terminate();
+        assert_clean_shutdown(output, &socket_path, "bangbang config file");
+        assert_normal_terminal_metrics_output(&metrics_path);
         assert!(
             !uds_path.exists(),
             "bangbang config-file shutdown should remove its owned vsock listener path"
@@ -6038,6 +6042,37 @@ mod macos_arm64 {
         assert!(
             !output.contains(r#""boot_run_loop_status":"failed""#),
             "metrics output should not report failed boot run-loop status; output:\n{output}"
+        );
+    }
+
+    fn assert_normal_terminal_metrics_output(path: &Path) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "terminal metrics output {} should be readable: {err}",
+                path.display()
+            )
+        });
+        let lines = output
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|err| {
+                    panic!("terminal metrics line should be valid JSON: {err}; line:\n{line}")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines.len(),
+            3,
+            "session initial, explicit, and normal-terminal attempts should emit three metrics lines; output:\n{output}"
+        );
+        assert_eq!(
+            lines
+                .last()
+                .and_then(|line| line.pointer("/vmm/metrics_flush_count"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "normal-terminal metrics line should carry the per-success flush marker; output:\n{output}"
         );
     }
 

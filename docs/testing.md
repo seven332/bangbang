@@ -729,7 +729,9 @@ files and include API/config-file coverage for configured serial output files.
 The API-request, API-enabled config-file, and no-api config-file scenarios
 verify vsock listener binding during startup and owned vsock listener cleanup
 on shutdown. The API-request and API-enabled config-file scenarios verify
-metrics and logger outputs after runtime `FlushMetrics`. The config-file guest
+one session-initial metrics line plus explicit runtime `FlushMetrics` and logger
+output before shutdown, then verify exactly one additional normal-terminal
+metrics line after clean process exit. The config-file guest
 stop scenarios boot the tiny initrd's `/poweroff-init` or `/reboot-init`, which
 invoke Linux reboot syscalls so the kernel issues PSCI `SYSTEM_OFF` or
 `SYSTEM_RESET`, and verify that API-enabled and no-api `bangbang` processes
@@ -743,7 +745,7 @@ second writable drive. A boot-timer scenario starts the signed executable with
 wrapper, and waits for `Guest-boot-time` in the configured logger output after
 that wrapper writes the Firecracker magic byte to the boot-timer MMIO address.
 This verifies the public process/API/config-file/HVF path, including public
-serial output redirection and minimal observability output. The executable HVF
+serial output redirection and implemented observability reachability. The executable HVF
 e2e target also includes direct-rootfs MMDS v1 and v2 token-flow scenarios that
 configure a `vmnet:shared` network interface, configure MMDS for that
 interface, fetch a deterministic MMDS value from the guest through
@@ -797,6 +799,57 @@ then verifies the guest-written pmem marker in the host backing file.
 Because every configured network interface is bound to MMDS in these scenarios,
 startup uses the process-local MMDS-only packet path and does not require
 external vmnet packet movement.
+
+### Observability Evidence Map
+
+Exact logger timing and failure semantics are normative in focused runtime
+tests, not wall-clock signed tests. Injected monotonic time covers the initial
+ten-record boot-timer burst, 500-ms refill, five-second budget, backwards time,
+saturating suppression count, clone sharing, independent logger states, and the
+single unrestricted recovery warning. Failing, contended, and poisoned sink
+tests prove `missed_log_count` and that API, action, startup, and guest boot
+timer MMIO outcomes do not change. API socket tests cover level/origin/module
+filters and verify that request bodies never reach logger output.
+
+Metrics transaction tests use injected outputs to cover every implemented
+increment family and persistent store, first/no-new/new-event lines, lower/new
+producer generations, keyed disappearance and reappearance, independent
+owners, sparse omission, saturation, and writes that accept bytes before
+returning an error. They prove that only a complete success advances the typed
+baseline and that ambiguous failures replay at least once with
+`missed_metrics_count`. `metrics_flush_count` is asserted as `1` per successful
+line rather than as a cumulative producer.
+
+Process-lifecycle tests cover configuration-origin-independent initial output,
+preboot scheduler dormancy, a session-epoch deadline, Running and Paused
+periodic output, due work that is not starved by ready API clients, periodic
+failure/rearm/recovery, explicit failure propagation, initial/final sink
+failure, guest stop, worker terminal error, ordinary server error, exact result
+preservation, idempotent finalization, and independent process ownership. The
+60-second rule is checked with injected `Instant` values and due schedulers;
+tests do not sleep for a production interval.
+
+Serial unit tests cover nullable output, the bounded 64-KiB internal buffer,
+nonblocking file/FIFO behavior, path redaction, TX register behavior, exact
+token-bucket refill/drop decisions, and saturating UART counters. Snapshot
+device tests prove that bangbang-native v1 accepts only default serial config,
+round-trips serial MMIO metadata and six mutable register bytes, and constructs
+a fresh empty output buffer with empty UART metrics. It does not preserve
+public output configuration, buffered/in-flight TX bytes, limiter state, or
+counters.
+
+Production reachability is intentionally narrower than those normative tests.
+The existing API-driven and config-file-driven signed executable scenarios each
+observe session-initial plus explicit output before shutdown and one additional
+normal-terminal line after exit. The signed boot-timer scenario proves a guest
+magic write reaches the configured logger; signed initrd/direct-rootfs serial
+scenarios prove public TX output and clear behavior; signed device cases cover
+representative block, pmem, network/MMDS, vsock, entropy, RTC, balloon, UART,
+signal, latency, and startup producers. Guest poweroff/reset cases separately
+prove API and no-api terminal process paths. The two-process MMDS case proves
+that one process's flush and teardown cannot rewrite its peer's metrics file.
+None of these signed cases claims exact limiter timing, a synchronous footprint
+threshold, production telemetry policy, or Firecracker snapshot artifacts.
 
 Hosted macOS CI may use:
 
