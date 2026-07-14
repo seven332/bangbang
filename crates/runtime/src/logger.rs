@@ -766,6 +766,10 @@ mod tests {
         fn advance_ms(&self, elapsed_ms: u64) {
             self.now_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
         }
+
+        fn set_ms(&self, now_ms: u64) {
+            self.now_ms.store(now_ms, Ordering::Relaxed);
+        }
     }
 
     impl LogRateLimiterClock for TestLogRateLimiterClock {
@@ -1473,6 +1477,69 @@ mod tests {
                 suppressed: u64::MAX
             }
         );
+    }
+
+    #[test]
+    fn boot_timer_rate_limit_matches_refill_recovery_and_backwards_time_contract() {
+        let clock = TestLogRateLimiterClock::default();
+        clock.set_ms(1_000);
+        let limiter = BootTimerLogRateLimiter::with_clock(Arc::new(clock.clone()));
+
+        for _ in 0..10 {
+            assert_eq!(
+                limiter.check(),
+                LogRateLimitDecision::Admitted { suppressed: 0 }
+            );
+        }
+        for _ in 0..3 {
+            assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
+        }
+
+        clock.advance_ms(499);
+        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
+        clock.advance_ms(1);
+        assert_eq!(
+            limiter.check(),
+            LogRateLimitDecision::Admitted { suppressed: 4 }
+        );
+
+        clock.advance_ms(5_000);
+        for _ in 0..10 {
+            assert_eq!(
+                limiter.check(),
+                LogRateLimitDecision::Admitted { suppressed: 0 }
+            );
+        }
+        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
+
+        clock.set_ms(6_000);
+        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
+        clock.set_ms(7_000);
+        assert_eq!(
+            limiter.check(),
+            LogRateLimitDecision::Admitted { suppressed: 2 }
+        );
+    }
+
+    #[test]
+    fn boot_timer_recovery_and_original_delivery_failures_are_counted_independently() {
+        let clock = TestLogRateLimiterClock::default();
+        let mut state = LoggerState {
+            boot_timer_rate_limiter: BootTimerLogRateLimiter::with_clock(Arc::new(clock.clone())),
+            ..LoggerState::default()
+        };
+        state.configure_test_writer(std::io::sink());
+
+        for _ in 0..10 {
+            assert!(state.log_boot_timer(1_000, 200));
+        }
+        assert!(!state.log_boot_timer(1_000, 200));
+        state.configure_test_writer(FailingWriter);
+        clock.advance_ms(500);
+
+        assert!(!state.log_boot_timer(2_000, 300));
+        assert_eq!(state.metrics.missed_log_count(), 2);
+        assert_eq!(state.metrics.rate_limited_log_count(), 1);
     }
 
     #[test]
