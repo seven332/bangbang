@@ -856,17 +856,23 @@ is resource-specific:
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink. The `--metrics-path` startup CLI flag uses the same
   sink and host-path error redaction rules before the API socket is served.
-  Runtime `FlushMetrics` and periodic runtime metrics flushes every 60 seconds
-  can append minimal host observability lines to this sink while the VM is
-  running.
+  Configuration writes nothing. A retained session makes one best-effort
+  initial attempt, Running and Paused sessions make 60-second best-effort
+  attempts, explicit runtime `FlushMetrics` returns a sink error, and normal
+  convergence makes one best-effort final attempt without replacing the
+  process result. Ordinary handle drop closes the sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
   present and keeps a per-process logger sink. Successfully parsed API requests
   can append method/path lines before dispatch, and successful `InstanceStart`
-  and `FlushMetrics` can append minimal action-event lines when the configured
+  and explicit `FlushMetrics` can append action-event lines when the configured
   level allows `Info` and the optional module prefix matches the event module.
   API request log lines intentionally omit request bodies, including MMDS
-  payloads. Logger startup CLI flags use the same sink and host-path error
-  redaction rules before the API socket is served.
+  payloads. These host records are unrestricted; guest boot-timer records use a
+  ten-per-five-second limiter and one unrestricted recovery warning. Sink lock,
+  write, or flush failure increments missed-delivery accounting but cannot
+  change the API, action, startup, or guest-MMIO result. Logger startup CLI
+  flags use the same sink and host-path error redaction rules before the API
+  socket is served.
 - `scripts/run-integration-tests.sh` creates temporary files for signed
   integration tests and removes them when the wrapper exits normally. Its
   generated guest initrd is cached under `.tmp/guest-artifacts` by default.
@@ -1065,7 +1071,8 @@ ranges reach the bounded discard owner.
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures
 `serial_out_path`, startup opens that host path with nonblocking output
-semantics and routes guest TX bytes there. A configured serial `rate_limiter`
+semantics and routes guest TX bytes there. The default is not stdout, and there
+is no public RX/stdin or streaming surface. A configured serial `rate_limiter`
 must remain nonblocking: exhausted guest TX bytes are dropped instead of
 sleeping the VM thread or propagating a host-output backpressure error. Metrics
 may report the number of rate-limited dropped bytes, but must not include the
@@ -1073,6 +1080,14 @@ dropped guest byte values. Treat serial output as untrusted guest data. Reviews
 for serial-output changes must preserve explicit host-observation behavior,
 bounded internal buffering where used, path redaction, limiter state scoped to
 one process output, and per-process ownership.
+
+Bangbang-native v1 accepts only default serial configuration and captures the
+serial MMIO metadata plus its six mutable register bytes. Restore constructs a
+fresh bounded internal buffer with empty UART metrics. A public output path,
+buffered or in-flight TX bytes, limiter configuration or budget, and UART
+counters are not snapshot state. This prevents a restore from silently
+reopening an old observability path or inheriting an old output budget and is
+not a Firecracker artifact-compatibility claim.
 
 Block devices can expose host file contents to the guest and can write to the
 backing file when configured read-write. Operators should use dedicated disk
@@ -1091,22 +1106,33 @@ busy-wait.
 
 Metrics and logger outputs are host observability state, not guest
 configuration, and are intentionally omitted from `GET /vm/config`. Current
-logger API request and action events are host VMM events only; they can expose
-API method/path metadata but not request bodies or guest serial output. Current
-explicit and periodic metrics lines can expose selected API request counters,
-startup timing fields, logger and serial counters, a terse boot run-loop status
-summary, and minimal device counters such as block
+logger API request and action events are unrestricted host VMM records; they can
+expose API method/path metadata but not request bodies or guest serial output.
+The guest-triggerable boot-timer callsite alone uses a bounded limiter and emits
+one unrestricted warning when delivery recovers. Logger filtering and sink
+failures never change the API, action, or guest outcome; rate-limited records
+and delivery failures are observable only through process-local counters.
+Current session-initial, periodic, explicit, and normal-terminal metrics lines
+can expose selected API request counters, startup timing fields, logger and
+serial counters, a terse boot run-loop status summary, and minimal device
+fields such as block
 queue/update/throttling activity, virtio-pmem queue activity, virtio-net packet
 counters, and virtio-vsock queue, packet, byte, and connection cleanup counters,
 plus virtio-rng request, byte, host-randomness failure, and event-failure
 counters, PL031 RTC invalid read/write and error counters, and balloon
 inflate/hint/report discard attempts, reporting-requested bytes, actual advised
-bytes, skipped-edge bytes, and failed attempts. Device metrics are counters only and must not expose Unix
-socket paths, guest payload bytes, host stream data, worker error strings, host
-paths or pointers, guest serial bytes, randomness bytes, host entropy-source
-details, guest descriptors, guest memory addresses, or unexpected guest data.
-Future full logging and metrics support must preserve those redaction
-boundaries.
+bytes, skipped-edge bytes, failed attempts, and block latency samples. Counters
+and accumulated durations are emitted as increments; startup timing, latest
+lifecycle latency, status, and block latency minima/maxima/sample counts are
+stores. The typed previous-success baseline advances only after the complete
+line is written, so failed or ambiguous writes retain data for an at-least-once
+retry. A lower generation emits a full current sample, and absent device
+families remain absent rather than being synthesized. None of these fields may
+expose Unix socket paths, guest payload bytes, host stream data, worker error
+strings, host paths or pointers, guest serial bytes, randomness bytes, host
+entropy-source details, guest descriptors, guest memory addresses, or
+unexpected guest data. Future observability changes must preserve these
+redaction, transaction, and failure-isolation boundaries.
 
 MMDS control-plane contents are process-local in-memory JSON state configured
 through the unauthenticated local API socket. Treat metadata as sensitive host
@@ -1305,8 +1331,10 @@ The current scaffold does not implement:
   hotplug, broader CID routing, or full event payload dispatch. Native-v1
   snapshot UDS override, event-queue `TRANSPORT_RESET`, and post-restore RX
   gating remain #543 exclusions.
-- complete production logging or metrics policy
-- public run-loop control or serial input, rate-limiting, and streaming policy
+- log rotation, syslog, journald, tracing, remote telemetry, or process-global
+  panic/fatal observability durability
+- public run-loop control or serial RX/stdin, default stdout, and streaming
+  policy
 
 These are future security design and implementation topics. PRs that add new
 host-facing resources should update this document and include resource-specific

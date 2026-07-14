@@ -162,8 +162,8 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
   `anonymous-instance`.
 - `--start-time-us <MICROS>`, `--start-time-cpu-us <MICROS>`, and
   `--parent-cpu-time-us <MICROS>` accept Firecracker launcher timing values for
-  configured minimal startup metrics output, explicit `FlushMetrics`, and
-  periodic runtime metrics flushes.
+  session-initial, explicit `FlushMetrics`, 60-second Running/Paused periodic,
+  and normal-terminal metrics output.
 - `--metrics-path <PATH>` configures the same per-process metrics sink as
   `PUT /metrics` before the API socket is served.
 - `--mmds-size-limit <BYTES>` sets the maximum serialized MMDS data-store size.
@@ -171,8 +171,8 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
   `51200` bytes.
 - `--log-path <PATH>`, `--level <LEVEL>`, `--module <MODULE>`,
   `--show-level`, and `--show-log-origin` configure the same per-process
-  logger state as `PUT /logger` before the API socket is served. Current
-  minimal logger events use module paths `bangbang_runtime::api_server`,
+  logger state as `PUT /logger` before the API socket is served. Implemented
+  logger events use module paths `bangbang_runtime::api_server`,
   `bangbang_runtime::vmm_action`, and `bangbang_runtime::boot_timer`.
 - `--no-api` requires `--config-file <PATH>`, starts from that configuration
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
@@ -348,12 +348,16 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"metrics_path":"/tmp/bangbang.metrics"}'
 ```
 
-Configured metrics output records an initial minimal JSON line when startup
-metrics are configured successfully. It also records explicit runtime
-`FlushMetrics` actions and periodic runtime metrics flushes every 60 seconds
-while the VM is running. After `InstanceStart`, the line also includes a
-`boot_run_loop_status` summary such as `running`, `exited`, or `failed` when a
-process-owned boot worker exists. When startup timing CLI values are provided,
+Configuring the sink does not write before a VM session exists. The first
+retained session causes one best-effort initial JSON line, regardless of
+whether CLI, config-file, or API configuration supplied the sink. The same
+process writes every 60 seconds in both `Running` and `Paused`, supports the
+explicit runtime `FlushMetrics` action, and makes one best-effort
+normal-terminal attempt while it still owns live diagnostics. Initial,
+periodic, and terminal sink failures never replace the action, loop, or process
+result; explicit `FlushMetrics` remains runtime-only and returns a configured
+sink failure to its caller. Lines can include a `boot_run_loop_status` store
+such as `running`, `paused`, `exited`, or `failed`. When startup timing CLI values are provided,
 the same metrics output includes Firecracker-style
 `api_server.process_startup_time_us` and
 `api_server.process_startup_time_cpu_us` elapsed values. `--start-time-us` is
@@ -400,15 +404,28 @@ and failed attempts. Reporting also exposes its requested byte total separately
 from advised bytes, so accepted guest descriptors never imply that the host
 reclaimed the complete range. Darwin discard is best effort and does not promise
 a synchronous process-footprint reduction.
+
+All implemented API, logger, signal, UART, and device counts, byte totals,
+failures, errors, limiter activity, and block-latency `sum_us` are interval
+increments. Startup timing, boot status, the latest lifecycle/snapshot action
+latencies, and block-latency `min_us`, `max_us`, and `sample_count` are stores.
+The typed baseline advances only after a complete successful write. A new or
+lower producer generation emits its full current value; new, disappeared, and
+reappearing keyed devices follow the same rule. Empty device families stay
+sparse rather than appearing as fake all-zero Firecracker objects. An ambiguous
+write error retains the old baseline, so a later success replays the interval
+at least once. Every successfully completed line includes bangbang's extension
+`vmm.metrics_flush_count: 1`.
+
 Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported
 deprecated machine `cpu_template`, MMDS V1 config, `vsock_id`, and snapshot-load
 field forms.
-After a metrics write failure, API request logger write failure, action logger
-write failure, or boot-timer logger write failure, later successful metrics
-output includes the minimal
-Firecracker-shaped `logger.missed_metrics_count` and `logger.missed_log_count`
-counters.
+After a metrics write failure, later successful output includes
+`logger.missed_metrics_count`; failed API request/action/boot-timer logger
+delivery appears in `logger.missed_log_count`; and denied boot-timer records
+appear in `logger.rate_limited_log_count`. These are interval counters under the
+same successful-baseline rule.
 
 Configure logger output before boot:
 
@@ -419,15 +436,36 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"log_path":"/tmp/bangbang.log","level":"Info","module":"bangbang_runtime","show_level":true,"show_log_origin":true}'
 ```
 
-Configured logger output records minimal successfully parsed API request
-method/path lines without request bodies, plus successful `InstanceStart` and
-`FlushMetrics` action events. `show_level` adds `level=Info`, and
+No logger sink is configured by default. A configured nonblocking file/FIFO
+sink records successfully parsed API request method/path lines without request
+bodies, plus successful `InstanceStart` and explicit `FlushMetrics` action
+events. These host records are unrestricted by the guest limiter. `show_level` adds `level=Info`, and
 `show_log_origin` adds the callsite as `origin=<file>:<line>`.
-`module` filters these minimal logger events by prefix against
+`module` filters these logger events by prefix against
 `bangbang_runtime::api_server`, `bangbang_runtime::vmm_action`, or
-`bangbang_runtime::boot_timer`. When `--boot-timer` is enabled, boot-time log
-events use the boot-timer module path.
-Full internal log routing remains deferred.
+`bangbang_runtime::boot_timer`.
+
+When `--boot-timer` is enabled, its guest-triggered callsite admits an initial
+burst of ten records, refills at one record per 500 ms across a five-second
+budget, counts every denied record, and emits one unrestricted warning before
+the next admitted boot-time record. Filtered or unconfigured records consume no
+budget. Sink contention, poisoning, write, or flush failure is best effort:
+`missed_log_count` changes, but the API, action, startup, or guest MMIO result
+does not. Bangbang does not claim process-global panic/fatal durability,
+rotation, syslog, journald, tracing, or remote telemetry.
+
+Serial output is independently configured before boot with `PUT /serial`.
+Omitting or clearing `serial_out_path` keeps TX in a bounded 64-KiB internal
+buffer instead of stdout; a configured file/FIFO is opened nonblocking with
+path-redacted errors. An optional token bucket drops exhausted bytes without
+sleeping or failing the guest write and reports the drop count in `uart`
+metrics. There is no public serial RX, stdin route, or streaming API. The
+bangbang-native v1 profile captures default serial MMIO metadata/registers but
+restores a fresh output buffer and does not capture a public path, buffered or
+in-flight bytes, limiter state, or UART counters.
+
+The exact field classes, failure semantics, and native-v1 boundary are in
+[Firecracker Compatibility Scope](docs/firecracker-compatibility.md#firecracker-v1160-observability-contract).
 
 Submit an `InstanceStart` action:
 
@@ -501,8 +539,8 @@ rules, guest boot artifact caching, and local verification expectations.
 - `0`: help or version completed successfully, the API server exited without
   error, or no-api mode handled `SIGINT`/`SIGTERM`.
 - `152`: startup configuration failed before the process entered runtime,
-  including config-file, metadata, startup logger, and startup metrics
-  configuration failures. This matches Firecracker's bad-configuration exit
+  including config-file, metadata, logger-sink, and metrics-sink configuration
+  failures. This matches Firecracker's bad-configuration exit
   code.
 - `153`: startup argument parsing failed before process configuration began.
   This matches Firecracker's argument-parsing exit code.

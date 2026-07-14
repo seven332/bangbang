@@ -79,16 +79,15 @@ serial/backend interrupt wiring beyond the internal boot block and network notif
 and retained serial capture paths,
 broader device-backed feature negotiation,
 device-backed runner-loop MMIO scheduling, complete device emulation,
-full Firecracker metrics counters, full logger integration beyond API request
-method/path, action, and boot-timer events,
+production log rotation/syslog/journald/tracing/remote telemetry, process-global
+panic/fatal observability durability,
 non-timer CPU-suspend wake and broader PSCI power management, or successful actions beyond owned `InstanceStart`
 startup with an internal boot run loop across bounded step windows and runtime
-`FlushMetrics` yet. Minimal startup metrics flushing writes the first metrics
-line when startup metrics are configured, and periodic metrics flushing uses the
-same runtime metrics sink every 60 seconds while the VM is running. Metrics
-flush failures increment the minimal Firecracker-shaped
-`logger.missed_metrics_count` counter, and logger API request, action, or
-boot-timer write failures increment `logger.missed_log_count`, for later successful metrics output. Public drive configuration is
+`FlushMetrics` yet. The implemented logger, interval metrics, serial, and
+native-v1 UART boundaries are defined in
+[Firecracker v1.16.0 Observability Contract](#firecracker-v1160-observability-contract):
+configuration alone is silent, automatic writes are session-owned and best
+effort, and explicit `FlushMetrics` remains fallible. Public drive configuration is
 recorded as pre-boot VM state and applied during startup preparation. Runtime
 `PATCH /drives/{drive_id}` can refresh the backing file of an existing active
 virtio-block device through the process-owned boot session, but public
@@ -247,6 +246,122 @@ This supports zero-safe best-effort reclaimability. It does not promise
 synchronous RSS or footprint reduction and does not use paired reusable-page
 accounting.
 
+## Firecracker v1.16.0 Observability Contract
+
+Bangbang implements a process-local logger, interval metrics writer, and TX-only
+serial output subset. Compatibility here describes observable records, trigger
+and failure behavior, stable field names, and ownership; it does not require
+Firecracker's Linux timerfd/eventfd plumbing, global metric/logger statics, or
+lock-free packed limiter representation.
+
+### Logger records and delivery
+
+Logger output is silent by default because no sink is configured. `PUT /logger`
+and the matching CLI flags can open one process-local file or FIFO with
+append/create and `O_NONBLOCK` semantics. Open errors and later diagnostics do
+not echo the configured path. Level, optional level/origin prefixes, and module
+prefix matching filter records before delivery.
+
+Successfully parsed API requests and successful `InstanceStart` and explicit
+`FlushMetrics` actions are unrestricted host records: they do not consume the
+guest-triggered limiter. Request records contain only method and path, never
+request bodies. The boot timer is the one bounded guest-triggered logger
+callsite. It admits an initial burst of ten records, refills the five-second
+budget at one token per 500 ms, increments
+`logger.rate_limited_log_count` for every denied record, and emits one
+unrestricted `Warn` recovery record before the next admitted boot-time record.
+Unconfigured or filtered records do not consume the limiter and are not missed
+deliveries.
+
+Sink locking never waits. Lock contention or poisoning and write or flush
+failure increment the saturating `logger.missed_log_count`; they never change
+an API response, action result, VM startup result, or guest boot-timer MMIO
+result. A rate-limited record is counted as rate-limited rather than missed.
+
+### Metrics field and transaction model
+
+Every implemented event total is an interval increment: deprecated, GET, PUT,
+PATCH, logger, signal, and UART counters; block, pmem, network, MMDS, vsock,
+entropy, RTC, and balloon counts, byte totals, failures, errors, and limiter
+activity; and block latency `sum_us`. This applies to aggregate and stable-key
+per-drive, per-pmem-device, and per-interface objects. `*_bytes` fields are
+bytes, `*_us` fields are microseconds, and count/failure/event fields count the
+named events.
+
+The stores repeated with their latest value are process startup wall/CPU
+elapsed time, `boot_run_loop_status`, the most recent successful lifecycle or
+admitted snapshot action latencies, and block latency `min_us`, `max_us`, and
+`sample_count`. Each completely written line also contains bangbang's
+non-upstream `vmm.metrics_flush_count: 1` marker for that successful line.
+
+The process keeps one typed previous-successful snapshot. A line is derived
+against that snapshot and the baseline advances only after the complete write
+succeeds. A monotonically increasing producer emits `current - previous`; a
+new or reset generation whose current value is lower emits its full current
+value. New keyed devices start from zero, disappeared devices are omitted, and
+reappearing or replaced same-ID producers follow the same reset rule. A failure
+increments `logger.missed_metrics_count` and retains the old baseline. Because
+a nonblocking writer can accept bytes before reporting an error, the next
+success deliberately replays the uncommitted interval with at-least-once rather
+than exactly-once semantics.
+
+The JSON schema stays sparse. Empty optional device families and empty keyed
+objects are omitted; bangbang does not synthesize a zero-filled Firecracker
+schema for absent or unimplemented devices. Omission is not a support claim.
+Issue #717 remains `NOT_PLANNED` because Firecracker exposes no
+`GET /vm/config` request metric field, so bangbang does not invent one. Issue
+#738 remains `NOT_PLANNED` because Firecracker's metrics write-failure path
+increments `missed_metrics_count`, not `logger.metrics_fails`; bangbang has no
+matching producer for the latter.
+
+### Metrics triggers and errors
+
+Configuring a metrics sink writes nothing before a VM session exists. The
+first retained session causes one best-effort initial attempt regardless of
+whether the sink came from CLI, config file, or API configuration. The
+periodic scheduler is dormant preboot, anchors its first deadline 60 seconds
+after session creation, runs in both `Running` and `Paused`, and schedules the
+next deadline after an unconfigured no-op, success, or failure. Automatic
+initial and periodic failures do not change the action, API loop, or process
+result.
+
+Explicit `FlushMetrics` is different: it is a runtime-only API action, is
+rejected before startup, records its API/action effects, and returns a sink
+failure to its caller. While the process still owns the retained session and
+live diagnostics, every normal API or no-api convergence path makes one
+best-effort terminal attempt and then returns the original success or error.
+This includes handled shutdown, guest terminal outcomes, worker terminal
+errors, and ordinary bind/wait/server errors; it does not add process-global
+panic-hook or fatal-signal durability.
+
+### Serial output and native-v1
+
+`PUT /serial` stores a nullable public output path and optional byte token
+bucket before boot. A configured file or FIFO is opened nonblocking with
+path-redacted errors. With no path, guest TX goes to one bounded 64-KiB internal
+capture buffer rather than stdout. There is no public serial RX, stdin route,
+or streaming API. An exhausted limiter drops bytes without sleeping or failing
+the guest write; the interval `uart` object reports implemented TX writes,
+missed writes, output errors, and rate-limiter dropped bytes. Read and flush
+fields remain zero because the TX-only implementation has no such producers.
+
+Bangbang-native v1 accepts only `SerialConfig::default()`. Its device state
+captures the serial MMIO metadata plus interrupt-enable, line-control,
+modem-control, scratch, and both divisor-latch register bytes. Restore creates
+a fresh bounded output buffer with empty UART metrics. Buffered or in-flight TX
+bytes, a public path, limiter configuration or budget, and UART counters are
+not captured. This exact local profile is not Firecracker snapshot-artifact
+compatibility.
+
+### Stable product boundaries
+
+The ordinary CLI has no production rotation, syslog, journald, tracing, remote
+telemetry, or resource-broker policy. Logger and metrics state remains
+process-owned rather than global, so there is no panic/fatal-signal durability
+claim. These named product and architecture boundaries, the sparse metrics
+schema, and the serial RX/stdout/native-v1 limits replace an open-ended “full
+logging and metrics” placeholder.
+
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current
 socket, host-path, HVF entitlement, guest-data, and multi-process boundaries, and
@@ -271,12 +386,17 @@ pre-boot `PUT /serial`, parsed `PUT /actions`, pre-boot
 `PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
 action/data boundary. Validation rejects malformed boot-source, memory-hotplug,
 drive update, VM state update, and actions requests before VMM state mutation.
-Successful `InstanceStart` startup, the `Running` transition, runtime `Paused`/`Running` transitions through `PATCH /vm`, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
-output and retained internal active, paused, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes, and fail the process on non-success terminal worker states. Startup CLI and config-file metrics paths write one initial minimal metrics line when the metrics sink is configured. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, `/actions` API request counters, selected deprecated HTTP API usage, top-level `latencies_us.pause_vm` and `latencies_us.resume_vm` values for the most recent successful runtime `PATCH /vm` pause/resume requests, Firecracker-shaped `latencies_us.full_create_snapshot`, `diff_create_snapshot`, and `load_snapshot` values for valid-lifecycle snapshot requests that succeed, reach a capability rejection, or fail during admitted execution, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger API request, action, or boot-timer write failure, Firecracker-shaped `signals.sigpipe` counts for handled non-terminating `SIGPIPE`, Firecracker-shaped `uart` metrics for implemented serial TX writes, output errors, missed writes, and rate-limiter drops, a minimal aggregate `block` object and non-empty per-drive `block_{drive_id}` objects for implemented virtio-block queue activity, read/write latency aggregates, backing update counters, and failures, a minimal aggregate `net` and non-empty per-interface `net_{iface_id}` objects for implemented virtio-net RX/TX queue activity, packet counts, byte counts, and failures, a minimal aggregate `vsock` object for implemented virtio-vsock RX/TX queue activity, packet counts, payload byte counts, connection add/remove cleanup counters, and classifiable queue/event failures, a minimal aggregate `entropy` object for implemented virtio-rng request, byte, host-randomness failure, and event-failure activity, a minimal `rtc` object for implemented PL031 invalid read/write and error counters, and a minimal `balloon` object when the active balloon device reports implemented queue activity or failures. API-enabled and no-api runtime loops also flush the same minimal metrics output every 60 seconds while the VM is running. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal parsed API request method/path lines, without request bodies, plus successful `InstanceStart` and `FlushMetrics` action-event output; full Firecracker run-loop control beyond the current single-worker pause/resume subset, public serial
-streaming, serial input and flush counter producers, broader Firecracker metrics
-counters, and full logger integration beyond API request method/path, action,
-and boot-timer events remain
-deferred.
+Successful `InstanceStart`, the `Running` transition, runtime
+`Paused`/`Running` transitions through `PATCH /vm`, and one internal boot
+run-loop worker are implemented with configured or bounded internal serial TX
+output and retained active, paused, terminal-outcome, or error status.
+Process-owned API-enabled and no-api runs exit successfully after guest PSCI
+`SYSTEM_OFF` or `SYSTEM_RESET` and fail on non-success terminal worker states.
+The logger, sparse interval metrics, initial/periodic/explicit/terminal trigger
+rules, serial limiter, and precise native-v1 UART profile are the implemented
+supported subset documented above. Public serial RX/streaming/default stdout,
+process-global panic/fatal durability, and production telemetry facilities are
+explicit boundaries rather than unqualified future “full” observability work.
 
 ## Process Startup CLI
 
@@ -307,15 +427,15 @@ management remains deferred.
 | `--api-sock <PATH>` | binds the API Unix socket | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
 | `--http-api-max-payload-size <BYTES>` | configures the maximum accepted HTTP API request body size | Defaults to Firecracker's `51200` byte limit. The configured value applies to the HTTP body declared by `Content-Length`; request-head bytes are bounded separately by bangbang's parser safety cap. Zero, malformed, and duplicate values are rejected during argument parsing. |
 | `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. |
-| `--start-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output include `api_server.process_startup_time_us` as the sampled monotonic clock minus this value, saturating at zero for future timestamps. |
-| `--start-time-cpu-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output include `api_server.process_startup_time_cpu_us` as the sampled process CPU clock minus this value, saturating at zero for future timestamps before adding optional parent CPU time. |
-| `--parent-cpu-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When `--start-time-cpu-us` is also provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output add this value into `api_server.process_startup_time_cpu_us`; it is not serialized separately. |
+| `--start-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, session-initial, explicit runtime, 60-second periodic, and normal-terminal metrics output includes `api_server.process_startup_time_us` as the sampled monotonic clock minus this value, saturating at zero for future timestamps. |
+| `--start-time-cpu-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, session-initial, explicit runtime, 60-second periodic, and normal-terminal metrics output includes `api_server.process_startup_time_cpu_us` as the sampled process CPU clock minus this value, saturating at zero for future timestamps before adding optional parent CPU time. |
+| `--parent-cpu-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When `--start-time-cpu-us` is also provided, every emitted store value adds this value into `api_server.process_startup_time_cpu_us`; it is not serialized separately. |
 | `--metrics-path <PATH>` | configures metrics output before API serving | Uses the same per-process metrics sink and redacted host-path error policy as `PUT /metrics`. A later duplicate `PUT /metrics` request fails without replacing this sink. |
 | `--log-path <PATH>` | configures logger output before API serving | Uses the same per-process logger sink and redacted host-path error policy as `PUT /logger`. |
 | `--level <LEVEL>` | configures logger level before API serving | Accepts the existing logger levels `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error`; invalid levels fail before readiness with the bad-configuration exit status. Minimal API request, action, and boot-timer logs are emitted only when the configured level allows `Info`. |
-| `--module <MODULE>` | filters minimal logger events | Matches the stored `PUT /logger` field and filters current minimal logger events with Firecracker-style module-path prefix matching. API request method/path lines use `bangbang_runtime::api_server`, action logs use `bangbang_runtime::vmm_action`, and boot-timer logs use `bangbang_runtime::boot_timer`; full internal log routing remains deferred. |
+| `--module <MODULE>` | filters implemented logger events | Matches the stored `PUT /logger` field and filters current logger events with Firecracker-style module-path prefix matching. API request method/path lines use `bangbang_runtime::api_server`, action logs use `bangbang_runtime::vmm_action`, and boot-timer logs use `bangbang_runtime::boot_timer`. |
 | `--show-level` | enables level prefix for minimal logger events | Writes `level=Info` before minimal API request, action, and boot-timer log lines. |
-| `--show-log-origin` | enables origin field for minimal logger events | Writes `origin=<file>:<line>` before minimal API request, action, and boot-timer log messages. Full Firecracker logger integration remains deferred. |
+| `--show-log-origin` | enables origin field for implemented logger events | Writes `origin=<file>:<line>` before API request, action, and boot-timer log messages. |
 | `--boot-timer` | enables guest boot-time logging | Registers the Firecracker aarch64 pseudo-MMIO boot timer at `0x4000_0000`; a guest write of byte value `123` at offset `0` logs elapsed wall and process CPU time through the configured logger sink when level and module filters allow `Info` for `bangbang_runtime::boot_timer`. This is process observability state and is not exposed in `GET /vm/config`. |
 | `--mmds-size-limit <BYTES>` | configures the maximum serialized MMDS data-store size | When omitted, follows the effective HTTP API payload limit like Firecracker; with default HTTP settings this is `51200` bytes. Zero, malformed, and duplicate values are rejected during argument parsing. |
 | `--metadata <PATH>` | initializes MMDS data before API serving or no-api readiness | Reads a readable regular UTF-8 JSON metadata file up to 1 MiB and applies it through the same runtime validation and serialized data-store limit as `PUT /mmds`. Malformed files, non-object data, oversized files, duplicate object keys, empty paths, control-character paths, and missing-value inputs fail before readiness. |
@@ -335,9 +455,9 @@ as help, version, and snapshot inspection skip this setup.
 
 Startup timing arguments are intentionally not exposed in `GET /vm/config` or
 logs because they are process observability data, not guest configuration. When
-metrics are configured, startup, explicit `FlushMetrics`, and periodic runtime
-metrics flushes write provided values under the minimal `vmm` metrics object;
-omitted timing arguments remain omitted. Parsed `GET /`, `GET /version`,
+metrics are configured, session-initial, explicit `FlushMetrics`, Running or
+Paused periodic, and normal-terminal lines write the sampled store values under
+`api_server`; omitted timing arguments remain omitted. Parsed `GET /`, `GET /version`,
 `GET /machine-config`, `GET /mmds`, `GET /balloon`,
 `GET /balloon/statistics`, `GET /balloon/hinting/status`, and
 `GET /hotplug/memory` API requests are counted under `get_api_requests`; parsed
@@ -384,11 +504,10 @@ zero-and-free-advised byte, skipped-edge byte, requested reporting byte, and
 failed-attempt fields;
 `signals.sigpipe` reports handled non-terminating `SIGPIPE`
 signals. HVF block and entropy limiter retry wakeups are wired for active
-queues. Hotplug/removal counters, vhost-user-block metrics, entropy
-rate-limiter metrics beyond the implemented subset, and full Firecracker block
-metric coverage remain deferred. The startup timing fields from Firecracker's
-`ProcessTimeReporter` are implemented; the broader full Firecracker metrics set
-remains deferred.
+queues. Hotplug/removal, vhost-user-block, and other producer classes that do
+not exist in the supported device subset remain absent rather than appearing as
+synthetic zero-filled fields. The startup timing stores match Firecracker's
+`ProcessTimeReporter` field names for the implemented process path.
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
 This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
@@ -521,7 +640,7 @@ The current executable uses a small process exit status contract:
 | `149` | The process intercepted `SIGBUS`. | Matches Firecracker's fatal signal exit code. |
 | `150` | The process intercepted `SIGSEGV`. | Matches Firecracker's fatal signal exit code. |
 | `151` | The process intercepted `SIGXFSZ`. | Matches Firecracker's fatal signal exit code. |
-| `152` | Startup configuration failed before the process entered runtime, including config-file, metadata, startup logger, and startup metrics configuration failures. | Matches Firecracker's `BadConfiguration` exit code for clearly startup configuration failures. |
+| `152` | Startup configuration failed before the process entered runtime, including config-file, metadata, logger-sink, and metrics-sink configuration failures. | Matches Firecracker's `BadConfiguration` exit code for clearly startup configuration failures. |
 | `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
 | `154` | The process intercepted `SIGXCPU`. | Matches Firecracker's fatal signal exit code. |
 | `156` | The process intercepted `SIGHUP`. | Matches Firecracker's fatal signal exit code. |
@@ -611,11 +730,11 @@ compatibility targets.
 | `PATCH` | `/machine-config` | supported target; implemented | Applies pre-boot partial updates to the stored machine configuration, preserving omitted fields and rejecting invalid updates without mutation. |
 | `PUT` | `/boot-source` | supported target; implemented | Stores guest kernel path, optional initrd path, and optional boot arguments before boot; host files are opened during startup preparation. |
 | `PUT` | `/drives/{drive_id}` | supported target; implemented | Stores initial virtio-block device configuration before boot, including optional bandwidth/ops rate limiters; backing files are opened during startup preparation. |
-| `PUT` | `/metrics` | supported target; minimal subset implemented | Stores process metrics output before boot, opens the configured file/FIFO path with nonblocking output semantics, and omits metrics from `GET /vm/config` because it is not guest configuration. Duplicate initialization returns a fault. Explicit runtime `FlushMetrics` and periodic runtime metrics flushes every 60 seconds while the VM is running can append minimal output with Firecracker-style `api_server` startup timing fields plus initial `GET /`, `GET /version`, `GET /machine-config`, `GET /mmds`, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, `/actions` API request counters, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger API request, action, or boot-timer write failure, Firecracker-shaped `signals.sigpipe` counts, Firecracker-shaped `uart` metrics for implemented serial TX writes, output errors, missed writes, and rate-limiter drops, top-level aggregate `block`, `net`, `vsock`, `entropy`, `rtc`, and `balloon` objects when active devices report implemented queue, byte, update, or failure activity, plus non-empty per-drive `block_{drive_id}` and per-interface `net_{iface_id}` objects. |
-| `PUT` | `/actions` | supported target; internal startup execution and minimal metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the process VMM owner. Successfully parsed requests can write one minimal API request method/path line before dispatch when logger output is configured and the level/module filters allow it. `InstanceStart` validates stored boot-source and state preflight, prepares an owned HVF boot session with the configured serial output path or the default internal serial MMIO console on success, starts a process-owned internal boot run-loop worker across bounded step windows, writes one minimal action log line when logger output is configured and the level/module filters allow it, and commits `Running` only after the worker handle is retained and any emitted action log write succeeds. `FlushMetrics` is rejected before startup and returns `204 No Content` after startup; configured metrics output receives one minimal JSON line with flush count, selected `get_api_requests`, `put_api_requests`, and `patch_api_requests` counters, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger API request, action, or boot-timer write failure, optional Firecracker-style `api_server` startup timing fields, optional boot-run-loop status, optional `signals.sigpipe`, optional aggregate and per-drive block device metrics, optional aggregate and per-interface network metrics, optional vsock, entropy, RTC, and balloon device metrics, configured logger output receives one minimal action log line when the level/module filters allow it, and unconfigured metrics/logger output is a no-op success. The aarch64 `SendCtrlAltDel` unsupported parser path still contributes to `put_api_requests.actions_count` but not `actions_fails`, matching Firecracker's parser-entry metric placement. Periodic metrics flushes are not `/actions` requests and do not write logger action lines. |
+| `PUT` | `/metrics` | implemented supported sparse subset | Opens one process-local file/FIFO sink before boot with nonblocking output and path-redacted errors; duplicate initialization fails without replacing it, and observability state is omitted from `GET /vm/config`. Configuration alone writes nothing. A retained session causes one best-effort initial line; 60-second output continues in Running and Paused; explicit runtime `FlushMetrics` is fallible; and normal process convergence makes one best-effort final attempt. Lines use the interval/store, successful-baseline, reset-aware, sparse-schema, and at-least-once retry contract above for all implemented API, logger, signal, UART, and device producers. |
+| `PUT` | `/actions` | supported target; internal startup execution and explicit metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` and routes them through the process VMM owner. Parsed request and successful action logger records are best effort and never gate the functional result. `InstanceStart` validates boot source and state, prepares an owned HVF session with configured or bounded internal serial TX, starts the worker, and commits `Running` after the worker handle is retained. `FlushMetrics` is rejected before startup; after startup it returns `204` for an unconfigured/successful sink or a metrics fault for a failed configured write, and it retains its API/action/logger effects. Automatic initial, periodic, and terminal writes do not route through `/actions` and create no action log. The aarch64 `SendCtrlAltDel` parser path contributes to `put_api_requests.actions_count` but not `actions_fails`, matching Firecracker's parser-entry placement. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. The unsupported request is counted under `put_api_requests.actions_count` without incrementing `actions_fails`. |
-| `PUT` | `/logger` | supported target; minimal subset implemented | Stores process logger configuration before boot, opens `log_path` with nonblocking output semantics when provided, accepts optional Firecracker-shaped level/show/module fields, and omits logger state from `GET /vm/config` because it is not guest configuration. Successfully parsed API requests append minimal method/path lines without request bodies when the configured level allows `Info` and the optional module prefix matches `bangbang_runtime::api_server`; successful `InstanceStart` and `FlushMetrics` append deterministic `action=...` lines when the module prefix matches `bangbang_runtime::vmm_action`. Full internal log routing remains deferred. |
-| `PUT` | `/serial` | supported target; output path and output rate limiter implemented | Stores Firecracker-shaped pre-boot serial output configuration with optional `serial_out_path` and optional token-bucket `rate_limiter`; `{}` and `"serial_out_path": null` clear the configured public output path. `InstanceStart` opens the configured file/FIFO path with nonblocking output semantics and routes guest TX serial MMIO bytes to it. When a valid limiter is configured, exhausted output bytes are dropped without blocking or sleeping; runtime metrics can report a Firecracker-shaped `uart` object with implemented TX write, output error, missed write, and dropped-byte counters. Serial input/stdin, read counters, flush counters, and public streaming remain deferred. |
+| `PUT` | `/logger` | implemented supported process-local subset | Stores pre-boot configuration, opens an optional nonblocking sink, applies level/show/module filters, and omits observability state from `GET /vm/config`. Parsed API method/path and successful `InstanceStart`/explicit `FlushMetrics` actions are unrestricted host records with no bodies. Boot-timer records use the bounded callsite and recovery contract above. Sink contention/poison/write/flush failure increments `missed_log_count` and never changes the request, action, or guest result. No sink is configured by default. |
+| `PUT` | `/serial` | implemented TX output and limiter subset | Stores an optional pre-boot public path and byte token bucket; `{}` or `"serial_out_path": null` clears the public path. Startup opens a configured file/FIFO nonblocking, otherwise it uses a bounded 64-KiB internal buffer rather than stdout. Exhausted bytes are dropped without blocking, sleeping, or failing the guest write, and implemented UART deltas report writes, errors, missed writes, and dropped bytes. Public RX/stdin/streaming and read/flush producers are absent. |
 | `PUT` | `/cpu-config` | supported target; empty/no-op plus platform classification implemented | Parses Firecracker aarch64 custom CPU template request bodies, including empty `{}`. Malformed JSON, unknown or duplicate fields, x86-only fields, invalid numeric strings, and invalid bitmap strings return the normal malformed-request fault. Empty `{}` and explicitly empty `kvm_capabilities`, `reg_modifiers`, and `vcpu_features` arrays succeed before startup as no-op configuration requests. Valid non-empty input is immediately reduced to one value-redacted category: KVM capabilities, KVM vCPU-init features, arm register modifiers, or mixed. Each category returns its stable arm64 HVF platform fault before mutation or VM construction; raw capability IDs, feature indices, register addresses, and bitmaps are not retained in the runtime action. All post-start requests retain unsupported-state precedence. No custom CPU template is stored or returned by `GET /vm/config`. Any future writable subset requires a separate Apple API, feature-view validation, atomicity, and snapshot policy challenge. |
 | `PUT` | `/network-interfaces/{iface_id}` | supported target; initial and runtime rate limiting implemented | Stores up to 16 initial virtio-net configurations before boot without opening host networking resources, including Firecracker-shaped RX/TX bandwidth and ops limiters. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the interface count before selecting packet I/O. If every configured interface is listed in MMDS config, startup validates supported `host_dev_name` syntax and uses process-local MMDS-only packet I/O without opening vmnet resources; otherwise it selects vmnet packet I/O only for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names, where the bridged interface suffix must be nonempty and contain no NUL bytes or ASCII control characters. Unsupported names fail startup before `Running` is committed. Internal network notification dispatch owns independent RX/TX budgets per device, atomically admits one op plus complete guest-visible frame bytes before queue side effects, retains throttled work for a later owner-thread retry, refunds a TX reservation only after a successful MMDS detour, and exposes the earliest retry duration to a per-session HVF wakeup scheduler. Runtime PATCH can replace or clear individual live limiter buckets without changing queue state. Broader public/direct-vmnet packet movement, limiter-specific metrics, snapshots, and DELETE remain deferred. |
 | `PUT` | `/vsock` | supported target; implemented supported live virtio-MMIO/Unix-socket subset | Repeated valid pre-boot requests atomically replace stored configuration without opening host resources; post-start PUT is stably rejected without mutation. Startup binds and inode-tracks the process-owned `uds_path`, attaches one guest-visible MMIO/FDT device with three 256-entry queues, and cleans up only its own socket. The live handler supports guest- and host-initiated streams, bounded handshakes and four-packet directional backlogs, 256 connections per direction, dynamic 64-KiB credit windows with wrapping counters, partial/full shutdown, two-second request/shutdown cleanup, reset/error handling, `EVENT_IDX`, no-op event notifications, and path/payload-redacted diagnostics. Signed Apple Silicon cases incrementally verify ≥1 MiB in each direction, both peers' write-half-close/EOF, terminal cleanup, and two-stream isolation. Indirect descriptors are a supported bangbang extension. PATCH, DELETE, runtime hotplug, broader CID routing, full event payloads, PCI/vhost/KVM, and general performance/artifact parity remain excluded. Native-v1 snapshot UDS override, event-queue `TRANSPORT_RESET`, and post-restore RX gating remain the stable #543 exclusions. |
@@ -742,9 +861,9 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /metrics` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /logger` | `log_path` | optional | Host path to the logger output file or FIFO. When present, the runtime opens it as per-process observability state and redacts path details from API-facing open errors. When omitted, the existing sink is left unchanged. |
 | `PUT /logger` | `level` | optional | Case-insensitive values `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error` are accepted. `Warning` is normalized to `Warn`. |
-| `PUT /logger` | `show_level` | optional | When true, minimal API request, action, and boot-timer log lines include a `level=Info` prefix. |
-| `PUT /logger` | `show_log_origin` | optional | When true, minimal API request, action, and boot-timer log lines include an `origin=<file>:<line>` field for the callsite. |
-| `PUT /logger` | `module` | optional | Filters minimal logger events with Firecracker-style module-path prefix matching. API request method/path lines use `bangbang_runtime::api_server`, action logs use `bangbang_runtime::vmm_action`, and boot-timer logs use `bangbang_runtime::boot_timer`; non-matching filters suppress those lines without failing the action. |
+| `PUT /logger` | `show_level` | optional | When true, implemented API request, action, and boot-timer log lines include a `level=Info` prefix. |
+| `PUT /logger` | `show_log_origin` | optional | When true, implemented API request, action, and boot-timer log lines include an `origin=<file>:<line>` field for the callsite. |
+| `PUT /logger` | `module` | optional | Filters implemented logger events with Firecracker-style module-path prefix matching. API request method/path lines use `bangbang_runtime::api_server`, action logs use `bangbang_runtime::vmm_action`, and boot-timer logs use `bangbang_runtime::boot_timer`; non-matching filters suppress those lines without failing the action. |
 | `PUT /logger` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /serial` | `serial_out_path` | optional | Host path to the serial output file or FIFO. The runtime stores it before boot, startup opens it as per-process observability output, and API-facing open errors redact path details. Omit the field or set it to `null` to clear the configured public output path. |
 | `PUT /serial` | `rate_limiter` | optional token bucket | Missing or `null` values are accepted. Firecracker-shaped token buckets with `size`, optional `one_time_burst`, and `refill_time` are stored before boot. At startup, `size=0`, `refill_time=0`, or overflowing millisecond-to-nanosecond refill intervals disable the limiter; otherwise the limiter starts full, applies the optional one-time burst, refills over time, and drops exhausted output bytes without blocking. |
@@ -757,8 +876,8 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /hotplug/memory` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /hotplug/memory` | `requested_size_mib` | required; runtime requested-size update implemented | Required Firecracker-shaped target hotpluggable-memory size. The parser accepts syntactically valid unsigned integer values, then runtime validation requires the value to be no larger than the configured total size and a multiple of the configured block size. Successful post-start requests update stored status and active virtio-mem config-space requested size; active plugged-block status is reported through `GET /hotplug/memory`, and accepted guest `PLUG`/`UNPLUG` requests apply HVF dynamic memory mutations. Broader public guest-memory accounting remains deferred. |
 | `PATCH /hotplug/memory` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with configured serial output or the default internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and allowed by level/module filters, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Full public run-loop control beyond the current pause/resume subset and public serial streaming remain deferred. |
-| `PUT /actions` | `action_type=FlushMetrics` | runtime-only; minimal execution implemented | Rejected before startup. After startup, returns `204 No Content`; if metrics output was configured, appends one minimal JSON line with `metrics_flush_count`, the current selected API request counters, `logger.missed_metrics_count` after a previous metrics write failure, and `logger.missed_log_count` after a previous logger API request, action, or boot-timer write failure; if logger output was configured and allowed by level/module filters, appends one minimal API request method/path line before dispatch and one minimal action line during the flush action. Periodic metrics flushes reuse the same metrics payload every 60 seconds while running, but are not `/actions` requests and do not write logger action lines. Full Firecracker counters and full logger integration remain deferred. |
+| `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot source and state, prepares an owned HVF session with configured serial TX or bounded internal capture, starts the worker, and commits `Running` after retaining its handle. Success returns `204`. The action logger record is best effort; its failure increments `missed_log_count` but cannot undo startup or replace the response. Preparation or worker-start failure returns a fault without committing the session. Public serial RX/streaming and run-loop control beyond the current pause/resume subset are absent. |
+| `PUT /actions` | `action_type=FlushMetrics` | runtime-only explicit execution implemented | Rejected before startup. After startup, an unconfigured sink is a `204` no-op; a successful configured sink appends one interval/store line and returns `204`; and a sink failure returns the metrics fault while retaining the previous-success baseline. The parsed request and successful action logger records are unrestricted and best effort. Automatic initial, 60-second Running/Paused periodic, and normal-terminal attempts use the same payload transaction but are not `/actions` requests and create no action logger record. |
 | `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. The request is still counted in `put_api_requests.actions_count` without an `actions_fails` increment. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 
@@ -789,8 +908,9 @@ limiters before publishing readiness. The signed
 executable HVF e2e target now validates the guest-visible path by booting the
 generated direct-rootfs image, checking that Linux selected `virtio_rng` as the
 current hardware RNG, and reading non-empty data from `/dev/hwrng` before
-writing a host-observable marker. Metrics, security docs, and real rate
-limiting remain deferred.
+writing a host-observable marker. Aggregate entropy metrics plus per-session
+limiter retry scheduling are implemented; Firecracker's shared Linux
+timerfd/eventfd event-source identity remains outside this supported subset.
 
 The API and VMM state path route valid snapshot requests through explicit
 actions. `PUT /snapshot/create` remains an unsupported state before startup and
@@ -864,71 +984,22 @@ only after that worker handle is retained.
 The process startup path and API/VMM state path implement the metrics field
 policy above as a pre-boot-only per-process output sink. Startup CLI can
 initialize the metrics sink before the API socket is served. Duplicate
-initialization fails without replacing the original sink. `FlushMetrics` is
-runtime-only: it fails before startup, succeeds without writing when the sink is
-unconfigured, and writes one minimal JSON line when `--metrics-path` or
-`PUT /metrics` configured an output path. Startup CLI and config-file metrics
-paths also write one initial minimal metrics line when the sink is configured.
-API-enabled and no-api runtime loops flush the same metrics line every 60
-seconds while the VM is running; those periodic flushes do not log `/actions`
-events. The line includes initial Firecracker-shaped GET API counters for
-`get_api_requests.instance_info_count`, `vmm_version_count`,
-`machine_cfg_count`, `mmds_count`, and `hotplug_memory_count`, plus selected
-`put_api_requests` counters for parsed core configuration PUTs, `PUT /mmds`,
-`PUT /mmds/config`, `PUT /metrics`, `PUT /logger`, `PUT /serial`,
-`PUT /hotplug/memory`, `PUT /pmem/{pmem_id}`, and `/actions` requests routed
-through VMM control, parser failures for those endpoints in the matching
-`put_api_requests` count/fail counters, plus selected
-`patch_api_requests` counters for parsed
-`PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`,
-`PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
-`PATCH /pmem/{pmem_id}` requests routed through VMM control and parser failures
-for those PATCH endpoints. bangbang also records
-`balloon_count` extension fields for parsed balloon GET, PUT, and PATCH routes,
-plus `balloon_fails` extension fields for parsed balloon PUT and PATCH
-failures and identifiable malformed balloon PUT/PATCH parser failures, because
-Firecracker does not expose matching request metrics. It also does not emit
-entropy request-counter fields; Firecracker does not define
-`put_api_requests.entropy_count` or `entropy_fails`. Entropy device runtime
-metrics use the Firecracker-shaped top-level `entropy` object for implemented
-virtio-rng request, byte, host-randomness failure, event-failure, throttling,
-and limiter-event activity. RTC device runtime metrics use the
-Firecracker-shaped top-level `rtc` object for implemented PL031 invalid
-read/write and error counters. Current virtio-net runtime
-metrics are limited to aggregate `net` and per-interface `net_{iface_id}`
-counters for implemented RX/TX queue events, packet counts, byte counts,
-malformed TX frames, dispatch failures, packet I/O provider failures, handler
-lookup failures, and signal failures; rate-limiter, vmnet/TAP-specific,
-activation, config-space, spoofed-MAC, and hotplug counters remain deferred
-until those producers exist.
-Process-local MMDS packet handling reports a top-level `mmds` object when
-guest MMDS data-plane metrics are non-empty. The implemented producers cover
-accepted guest MMDS ARP/TCP packets, accepted errors, unusual unsupported
-empty-control packets, V2 missing or invalid guest GET tokens, TCP receive
-count, response TX count/frame/byte/error activity, and connection
-create/destroy events. Full Firecracker MMDS TCP stack parity and malformed
-Ethernet producer coverage remain deferred.
-Parsed deprecated HTTP API usage is counted under
-`deprecated_api.deprecated_http_api_calls` for the supported deprecated fields
-above; malformed parser failures remain outside the deprecated counter.
-Successful runtime `PATCH /vm` pause and resume requests also record the most
-recent API-layer action duration as `latencies_us.pause_vm` and
-`latencies_us.resume_vm`; failed state transitions and malformed requests do
-not emit those success latency fields. Recognized snapshot create/load requests
-record Firecracker-shaped `latencies_us.full_create_snapshot`,
-`latencies_us.diff_create_snapshot`, or `latencies_us.load_snapshot` when a
-valid-lifecycle action succeeds, reaches a capability rejection, or fails
-during admitted execution. Malformed snapshot requests and snapshot
-state-policy failures do not emit snapshot latency fields.
-Device runtime counters, remaining API request counters, and parser-level
-malformed-request counters for endpoints without Firecracker-shaped request
-metric fields remain deferred. Full public run-loop control beyond pause/resume,
-guest boot output, public runner loop scheduling, full Firecracker metrics
-counters, and full logger integration beyond API request method/path, action,
-and boot-timer events remain
-deferred. Metrics write failures increment `logger.missed_metrics_count`;
-logger API request, action, and boot-timer write failures increment `logger.missed_log_count`; broader logger
-metrics remain deferred.
+initialization fails without replacing the original sink. Configuration alone
+writes nothing. After the first retained session, the process makes one
+best-effort initial attempt, arms a session-epoch-based 60-second scheduler for
+both Running and Paused, and makes one best-effort final attempt on normal
+convergence. Every periodic attempt rearms even when output is unconfigured or
+fails. None of these automatic paths creates an `/actions` record or changes
+the process result.
+
+Explicit `FlushMetrics` remains runtime-only and fallible. It fails before
+startup, succeeds without output when unconfigured, writes one transactional
+line on success, and returns a configured-sink error while retaining the last
+successful baseline. The detailed producer classes, increment/store mapping,
+sparse omission, generation replacement, and ambiguous at-least-once retry
+rules are defined in the observability contract above. API request fields that
+Firecracker does not define, absent device producers, and empty optional
+families remain absent rather than being fabricated for shape completeness.
 The process startup path and API/VMM state path implement the logger field
 policy above as pre-boot-only per-process observability configuration. Startup
 CLI flags can configure the initial logger before the API socket is served.
@@ -944,8 +1015,11 @@ after the guest writes the boot timer magic byte. `show_level` adds
 boot timer callsite as `origin=<file>:<line>`. `module` filters API request logs
 against `bangbang_runtime::api_server`, action logs against
 `bangbang_runtime::vmm_action`, and boot timer logs against
-`bangbang_runtime::boot_timer`. It is not wired into the full process logging
-backend yet.
+`bangbang_runtime::boot_timer`. Request and action records are unrestricted;
+boot-timer records use the ten-per-five-second limiter and recovery warning.
+Sink contention or failure increments `missed_log_count` and never changes the
+functional outcome. No global process logging, panic/fatal writer, rotation, or
+external telemetry backend is claimed.
 The API and VMM state path implement the `PUT /vsock` field policy above as a
 pre-boot-only guest configuration section. Valid requests replace the stored
 vsock config and return `204 No Content`; invalid requests fail without
@@ -2467,9 +2541,11 @@ HVF boot-session worker with the configured serial output path or the default
 internal serial MMIO capture buffer. It marks the instance `Running` only after
 the bounded internal worker handle is retained; `FlushMetrics` fails before
 startup, then succeeds after startup and writes one minimal JSON line only when
-metrics output was configured. The API-enabled and no-api runtime loops also
-write the same minimal metrics line every 60 seconds while the VM is running,
-without routing those periodic flushes through `/actions`.
+metrics output was configured. Configuration itself is silent; one
+best-effort initial attempt follows session retention, periodic output runs
+every 60 seconds in Running and Paused, and normal convergence makes one
+best-effort final attempt. These automatic paths do not route through
+`/actions`; explicit `FlushMetrics` remains caller-visible and fallible.
 
 ### Initial API State Model
 
@@ -2511,15 +2587,15 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /mmds` | implemented; `204` empty response on successful data storage | implemented only when the MMDS store already exists; otherwise `400` `fault_message` | Stores a JSON object in the process runtime using the effective MMDS data-store limit. Pre-start requests that parse successfully and reach the VMM action create the MMDS store before validating and storing data. Runtime requests require a pre-existing store, matching Firecracker's runtime MMDS handle check. Oversized data is rejected without replacing the previous value. |
 | `PATCH /mmds` | implemented after data initialization; `204` empty response | implemented after data initialization; `204` empty response | Applies RFC 7396 merge-patch semantics to the stored JSON object using the effective MMDS data-store limit. Pre-start requests that parse successfully and reach the VMM action create the MMDS store before applying the patch, but patching still requires initialized data. Runtime requests return the same MMDS not-initialized fault when the store is absent or the store exists without initialized data. Oversized patched results are rejected without mutating the previous value. |
 | `PUT /mmds/config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Stores control-plane MMDS config before startup after runtime validation rejects empty interface lists and validates that each listed interface ID already exists in the configured network interface set. A successful config request creates the process-local MMDS store even when no data has been initialized. At startup, the configured interfaces can enable the implemented guest-visible MMDS packet path; runtime MMDS config updates and public packet movement remain deferred. |
-| `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. Malformed parser failures for this endpoint increment the selected metrics request count/fail counters without replacing the configured sink. When configured, startup CLI/config-file metrics paths can write one initial metrics line, and runtime `FlushMetrics` plus periodic runtime flushes every 60 seconds while the VM is running append later minimal metrics lines. |
-| `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; malformed parser failures increment the selected logger request count/fail counters without mutating logger state; minimal API request method/path logging omits bodies and supports configured level, origin, and module-prefix fields alongside minimal successful action logging, but full log routing remains deferred. |
+| `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Process observability state, omitted from `GET /vm/config`. Duplicate initialization and identifiable malformed requests are counted without replacing the sink. Configuration writes nothing. A retained session triggers one best-effort initial line, 60-second periodic attempts run in Running and Paused, explicit `FlushMetrics` is fallible, and normal convergence makes one best-effort final attempt under the transaction/schema contract above. |
+| `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Process observability state, omitted from `GET /vm/config`. Repeated pre-boot requests update provided fields. Unrestricted API method/path and action records omit bodies; bounded boot-timer records use suppression recovery. Filters apply before delivery, and sink misses never change functional results. No sink is configured by default. |
 | `PUT /serial` | implemented; `204` empty response on successful pre-boot output configuration, rate-limiter configuration, or clear request | unsupported after start; `400` `fault_message` | Serial output is process observability state, not guest configuration. Valid `serial_out_path` values and token-bucket `rate_limiter` values are stored without opening host resources during the request; startup opens the path, wraps the configured or default output in the limiter when enabled, and routes guest TX serial bytes to it. Malformed parser failures increment the selected serial request count/fail counters without mutating previous serial output configuration; empty/control-character paths are rejected without mutating it. |
 | `PUT /entropy` | implemented; `204` empty response on successful configuration | unsupported after start; `400` `fault_message` | Stores virtio-rng configuration before startup, including valid configured `bandwidth` and `ops` rate-limiter buckets. `GET /vm/config` includes `"entropy": {}` for unconfigured limiters or an entropy `rate_limiter` object for configured buckets. `InstanceStart` attaches the existing HVF virtio-rng MMIO/FDT device backed by the session-owned host OS randomness source and enforces the configured limiter in queue dispatch. |
 | `PUT /balloon` | partial; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Stores Firecracker-shaped balloon configuration before startup, rejects targets larger than configured guest memory without mutating previous balloon config, accepts and preserves `free_page_reporting: true`, exposes it through `GET /balloon` and `GET /vm/config`, and can attach the current virtio-mmio/FDT shell during `InstanceStart`. Runtime `PATCH /balloon` can update the target size after startup when a balloon was configured, runtime `PATCH /balloon/statistics` can update nonzero statistics polling intervals without toggling statistics enabled state, `GET /balloon/statistics` can return required target and actual fields from stored target state plus internal inflated-page accounting and optional guest-reported fields from statistics queue reports, and hinting start/stop/status can update and report host-owned command state plus 4-byte guest command acknowledgements when `free_page_hinting` is enabled. Runtime-handler and HVF boot-loop dispatch performs best-effort inward-aligned Darwin zero/free advice for completed inflate, accepted current-command hint ranges, and validated device-writable reporting ranges before returning, while preserving queue/accounting boundaries and reporting distinct attempt/requested/advised/skipped/failure metrics. Reporting failures remain per-descriptor best effort; paired reusable-page accounting, snapshot state, and synchronous footprint claims remain deferred. |
 | `GET /balloon/hinting/status` | post-boot-only unsupported-state fault; `400` `fault_message` | partial; `200` JSON with `free_page_hinting: true`, otherwise `400` `fault_message` | Requires a configured balloon with free-page hinting enabled and returns the active host command and guest command state. Start/stop commands update `host_cmd`; a 4-byte hinting queue descriptor updates `guest_cmd`, which remains `null` until the guest sends one. Guest `STOP(0)` and unexpected guest `DONE(1)` descriptors complete the current hinting run and, when the active run was started with `acknowledge_on_stop=true`, update `host_cmd` to `DONE(1)` through the same config-space/config-interrupt path as explicit stop. Accepted current-command ranges are validated and discarded best effort on Darwin; stale/inactive ranges remain ignored. |
 | `PATCH /balloon/hinting/start`, `PATCH /balloon/hinting/stop` | post-boot-only unsupported-state fault; `400` `fault_message` | partial; `204` with `free_page_hinting: true`, otherwise `400` `fault_message` | Start advances the host command id, skips Firecracker reserved command values, updates active config space, raises a config interrupt, and preserves `acknowledge_on_stop` in host-owned state. Stop writes Firecracker's done command, updates active config space, and raises a config interrupt. Hinting queue command acknowledgements can update `guest_cmd`, completed guest `STOP(0)`/`DONE(1)` commands automatically write host `DONE(1)` when `acknowledge_on_stop` is enabled, and accepted active-run ranges use best-effort Darwin discard. |
-| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation/logger-output fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with configured serial output or default internal serial capture is retained and any emitted action logging succeeds. The worker keeps internal active, paused, terminal-outcome, or error status; guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` can terminate the owning process successfully. Full Firecracker run-loop control beyond the current pause/resume subset, error exit-code parity, and public serial streaming remain deferred. |
-| `PUT /actions` with `FlushMetrics` | VMM-routed; `400` unsupported-state `fault_message` | implemented; `204` empty response or `400` logger/metrics output fault | Firecracker treats this as runtime-only. bangbang writes one minimal JSON line when metrics output was configured, including selected API request counters, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger API request, action, or boot-timer write failure, `boot_run_loop_status` as `running`, `paused`, `exited`, or `failed` when a process-owned boot worker exists, optional aggregate and per-drive block device metrics including implemented backing update counters, optional aggregate and per-interface network metrics for implemented RX/TX packet movement and failures, optional top-level MMDS metrics for implemented guest packet detour and response queue activity, optional entropy device metrics for implemented virtio-rng request/byte/failure activity, optional RTC device metrics for implemented PL031 MMIO errors, and optional balloon device metrics, writes one minimal API request method/path line before dispatch plus one minimal action line when logger output is configured and allowed by level/module filters, and otherwise succeeds without writing. Periodic metrics flushes reuse the same metrics payload every 60 seconds while running, but are not `/actions` requests and do not write logger action lines. |
+| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` after retaining the worker with configured serial TX or bounded internal capture. API/action logger delivery is best effort and cannot replace the startup result. The worker retains active, paused, terminal-outcome, or error status; guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` can terminate the owner successfully. Public serial RX/streaming and run-loop control beyond pause/resume are absent. |
+| `PUT /actions` with `FlushMetrics` | VMM-routed; `400` unsupported-state `fault_message` | implemented; `204` empty response or `400` metrics output fault | Runtime-only explicit action. An unconfigured sink is a no-op; success writes one interval/store line; failure is returned while preserving the previous-success baseline. Parsed request and successful action logger records are best effort. Automatic initial, periodic, and terminal attempts share the payload transaction but create no `/actions` counter or action record. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. The request contributes to `put_api_requests.actions_count` but not `actions_fails`. |
 | Non-initial endpoints from the endpoint matrix | `400` `fault_message` until their capability exists | `400` `fault_message` until their capability exists | Covers planned later and deferred endpoints; a later capability PR may define more specific state behavior. |
 | Unknown endpoint or invalid method/path | `400` `fault_message` | `400` `fault_message` | Matches Firecracker's parser-level invalid path or method handling. Bodyless `PUT` and bodyless `PATCH` requests on unsupported paths or methods generally use Firecracker's method-level empty request faults without accepting the route; empty-body-compatible balloon hinting routes keep their route-specific behavior. |
@@ -2669,8 +2745,9 @@ Their eventual support level should follow the endpoint matrix:
   optional-device state, mutable VMClock restore/signaling, dirty tracking,
   overrides, Firecracker artifact compatibility, and cross-host portability
 - full MMDS TCP routing, stream reassembly, and retransmission policy
-- full Firecracker balloon counters beyond the implemented discard metrics,
-  paired reusable-page accounting, and balloon snapshot state
+- balloon producers outside the implemented queue/discard/reporting activity,
+  paired reusable-page accounting, and balloon snapshot state; absent producers
+  are not emitted as synthetic zero fields
 - pmem root-device semantics, dirty-range tracking, direct file-backed HVF
   mapping, PCI attach/delete, and optional-device snapshots beyond targeted
   notified-device flush, per-event bandwidth/ops limiting, retained retry,
@@ -2679,10 +2756,12 @@ Their eventual support level should follow the endpoint matrix:
 - full Firecracker active timerfd/eventfd rate-limiter wakeup parity beyond the
   current HVF block, entropy, network, and pmem retry schedulers, including shared
   event-source behavior
-- serial input, public serial streaming, and Firecracker serial counter
-  producers beyond the implemented TX output path
-- full logger integration, and full Firecracker metrics counters beyond the
-  currently implemented minimal metrics subset
+- serial input/stdin, default stdout, public streaming, and read/flush
+  producers beyond the implemented TX output path; native-v1 captures default
+  UART registers but not its output buffer, path, limiter state, or counters
+- process-global panic/fatal observability durability and production rotation,
+  syslog, journald, tracing, or remote telemetry; the implemented logger and
+  sparse interval metrics schema do not fabricate absent records or devices
 - memory hotplug beyond the implemented block-granular virtio-MMIO lifecycle,
   including runtime device deletion, broader public guest-memory accounting,
   optional-device snapshot state, and Firecracker's KVM slot mechanism
