@@ -6,11 +6,16 @@ use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::Instant;
 
 const BOOT_TIMER_LOG_MODULE: &str = "bangbang_runtime::boot_timer";
 const API_REQUEST_LOG_MODULE: &str = "bangbang_runtime::api_server";
 const MINIMAL_ACTION_LOG_MODULE: &str = "bangbang_runtime::vmm_action";
+const DEFAULT_LOG_RATE_LIMIT_BURST: u64 = 10;
+const DEFAULT_LOG_RATE_LIMIT_REFILL_MS: u64 = 5_000;
+const DEFAULT_LOG_RATE_LIMIT_PERIOD_MS: u64 =
+    DEFAULT_LOG_RATE_LIMIT_REFILL_MS / DEFAULT_LOG_RATE_LIMIT_BURST;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoggerLevel {
@@ -186,47 +191,143 @@ impl fmt::Display for LoggerConfigError {
 
 impl std::error::Error for LoggerConfigError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoggerWriteError {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoggerDeliveryError {
+    LockContended,
     LockPoisoned,
-    Write(std::io::ErrorKind),
+    Write,
 }
 
-impl fmt::Display for LoggerWriteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LockPoisoned => f.write_str("logger output lock was poisoned"),
-            Self::Write(kind) => write!(f, "failed to write logger output: {kind:?}"),
-        }
-    }
+#[derive(Debug, Default)]
+struct SharedLoggerMetricsInner {
+    missed_log_count: AtomicU64,
+    rate_limited_log_count: AtomicU64,
 }
-
-impl std::error::Error for LoggerWriteError {}
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct MissedLogCounter {
-    count: Arc<AtomicU64>,
+pub(crate) struct SharedLoggerMetrics {
+    inner: Arc<SharedLoggerMetricsInner>,
 }
 
-impl MissedLogCounter {
-    pub(crate) fn record(&self) {
-        let mut current = self.count.load(Ordering::Relaxed);
+impl SharedLoggerMetrics {
+    fn record_saturating(counter: &AtomicU64) {
+        let mut current = counter.load(Ordering::Relaxed);
         while current != u64::MAX {
             let next = current.saturating_add(1);
-            match self.count.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return,
                 Err(actual) => current = actual,
             }
         }
     }
 
-    pub(crate) fn count(&self) -> u64 {
-        self.count.load(Ordering::Relaxed)
+    pub(crate) fn record_missed_log(&self) {
+        Self::record_saturating(&self.inner.missed_log_count);
+    }
+
+    pub(crate) fn record_rate_limited_log(&self) {
+        Self::record_saturating(&self.inner.rate_limited_log_count);
+    }
+
+    pub(crate) fn missed_log_count(&self) -> u64 {
+        self.inner.missed_log_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn rate_limited_log_count(&self) -> u64 {
+        self.inner.rate_limited_log_count.load(Ordering::Relaxed)
+    }
+}
+
+trait LogRateLimiterClock: fmt::Debug + Send + Sync {
+    fn now_ms(&self) -> u64;
+}
+
+#[derive(Debug)]
+struct SystemLogRateLimiterClock {
+    epoch: Instant,
+}
+
+impl Default for SystemLogRateLimiterClock {
+    fn default() -> Self {
+        Self {
+            epoch: Instant::now(),
+        }
+    }
+}
+
+impl LogRateLimiterClock for SystemLogRateLimiterClock {
+    fn now_ms(&self) -> u64 {
+        let elapsed = self.epoch.elapsed();
+        elapsed
+            .as_secs()
+            .saturating_mul(1_000)
+            .saturating_add(u64::from(elapsed.subsec_millis()))
+    }
+}
+
+#[derive(Debug, Default)]
+struct LogRateLimiterState {
+    theoretical_arrival_time_ms: u64,
+    suppressed: u64,
+}
+
+#[derive(Debug)]
+struct LogRateLimiterInner {
+    clock: Arc<dyn LogRateLimiterClock>,
+    state: Mutex<LogRateLimiterState>,
+}
+
+#[derive(Debug, Clone)]
+struct BootTimerLogRateLimiter {
+    inner: Arc<LogRateLimiterInner>,
+}
+
+impl Default for BootTimerLogRateLimiter {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(SystemLogRateLimiterClock::default()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogRateLimitDecision {
+    Admitted { suppressed: u64 },
+    Denied,
+}
+
+impl BootTimerLogRateLimiter {
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: Arc::new(LogRateLimiterInner {
+                clock,
+                state: Mutex::new(LogRateLimiterState::default()),
+            }),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        let now_ms = self.inner.clock.now_ms();
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next_theoretical_arrival_time_ms = state
+            .theoretical_arrival_time_ms
+            .max(now_ms)
+            .saturating_add(DEFAULT_LOG_RATE_LIMIT_PERIOD_MS);
+
+        if next_theoretical_arrival_time_ms.saturating_sub(now_ms)
+            > DEFAULT_LOG_RATE_LIMIT_REFILL_MS
+        {
+            state.suppressed = state.suppressed.saturating_add(1);
+            return LogRateLimitDecision::Denied;
+        }
+
+        state.theoretical_arrival_time_ms = next_theoretical_arrival_time_ms;
+        let suppressed = state.suppressed;
+        state.suppressed = 0;
+        LogRateLimitDecision::Admitted { suppressed }
     }
 }
 
@@ -237,53 +338,62 @@ pub struct BootTimerLogger {
     show_level: bool,
     show_log_origin: bool,
     module: Option<String>,
-    missed_log_counter: Option<MissedLogCounter>,
+    metrics: SharedLoggerMetrics,
+    rate_limiter: BootTimerLogRateLimiter,
 }
 
 impl BootTimerLogger {
-    pub(crate) fn with_missed_log_counter(mut self, counter: MissedLogCounter) -> Self {
-        self.missed_log_counter = Some(counter);
-        self
-    }
-
-    fn record_missed_log(&self) {
-        if let Some(counter) = &self.missed_log_counter {
-            counter.record();
+    fn record_delivery(&self, result: Result<(), LoggerDeliveryError>) -> bool {
+        if result.is_err() {
+            self.metrics.record_missed_log();
+            return false;
         }
+        true
     }
 
     #[track_caller]
-    pub fn log_boot_time(
-        &self,
-        wall_time_us: u64,
-        cpu_time_us: u64,
-    ) -> Result<bool, LoggerWriteError> {
+    pub fn log_boot_time(&self, wall_time_us: u64, cpu_time_us: u64) -> bool {
         const BOOT_TIMER_LEVEL: LoggerLevel = LoggerLevel::Info;
 
         if !self.level.allows(BOOT_TIMER_LEVEL) {
-            return Ok(false);
+            return false;
         }
 
         if !module_filter_allows(self.module.as_deref(), BOOT_TIMER_LOG_MODULE) {
-            return Ok(false);
+            return false;
         }
 
         let Some(sink) = &self.sink else {
-            return Ok(false);
+            return false;
         };
 
-        if let Err(err) = sink.write_boot_timer(
+        let suppressed = match self.rate_limiter.check() {
+            LogRateLimitDecision::Admitted { suppressed } => suppressed,
+            LogRateLimitDecision::Denied => {
+                self.metrics.record_rate_limited_log();
+                return false;
+            }
+        };
+        let origin = Location::caller();
+
+        if suppressed != 0 {
+            self.record_delivery(sink.write_rate_limit_recovery(
+                self.show_level,
+                self.show_log_origin,
+                origin,
+                LoggerLevel::Warn,
+                suppressed,
+            ));
+        }
+
+        self.record_delivery(sink.write_boot_timer(
             self.show_level,
             self.show_log_origin,
-            Location::caller(),
+            origin,
             BOOT_TIMER_LEVEL,
             wall_time_us,
             cpu_time_us,
-        ) {
-            self.record_missed_log();
-            return Err(err);
-        }
-        Ok(true)
+        ))
     }
 }
 
@@ -294,6 +404,8 @@ pub struct LoggerState {
     show_level: bool,
     show_log_origin: bool,
     module: Option<String>,
+    metrics: SharedLoggerMetrics,
+    boot_timer_rate_limiter: BootTimerLogRateLimiter,
 }
 
 impl Default for LoggerState {
@@ -304,11 +416,28 @@ impl Default for LoggerState {
             show_level: false,
             show_log_origin: false,
             module: None,
+            metrics: SharedLoggerMetrics::default(),
+            boot_timer_rate_limiter: BootTimerLogRateLimiter::default(),
         }
     }
 }
 
 impl LoggerState {
+    pub(crate) fn with_shared_metrics(metrics: SharedLoggerMetrics) -> Self {
+        Self {
+            metrics,
+            ..Self::default()
+        }
+    }
+
+    fn record_delivery(&self, result: Result<(), LoggerDeliveryError>) -> bool {
+        if result.is_err() {
+            self.metrics.record_missed_log();
+            return false;
+        }
+        true
+    }
+
     pub fn configure(&mut self, input: LoggerConfigInput) -> Result<(), LoggerConfigError> {
         let config = input.validate()?;
         let sink = config.log_path().map(LoggerSink::open).transpose()?;
@@ -333,60 +462,54 @@ impl LoggerState {
     }
 
     #[track_caller]
-    pub(crate) fn log_action(&mut self, action: &str) -> Result<bool, LoggerWriteError> {
+    pub(crate) fn log_action(&self, action: &str) -> bool {
         const ACTION_LEVEL: LoggerLevel = LoggerLevel::Info;
 
         if !self.level.allows(ACTION_LEVEL) {
-            return Ok(false);
+            return false;
         }
 
         if !module_filter_allows(self.module.as_deref(), MINIMAL_ACTION_LOG_MODULE) {
-            return Ok(false);
+            return false;
         }
 
         let Some(sink) = &self.sink else {
-            return Ok(false);
+            return false;
         };
 
-        sink.write_action(
+        self.record_delivery(sink.write_action(
             self.show_level,
             self.show_log_origin,
             Location::caller(),
             ACTION_LEVEL,
             action,
-        )?;
-        Ok(true)
+        ))
     }
 
     #[track_caller]
-    pub fn log_api_request(
-        &mut self,
-        method: &str,
-        path: impl fmt::Display,
-    ) -> Result<bool, LoggerWriteError> {
+    pub fn log_api_request(&self, method: &str, path: impl fmt::Display) -> bool {
         const API_REQUEST_LEVEL: LoggerLevel = LoggerLevel::Info;
 
         if !self.level.allows(API_REQUEST_LEVEL) {
-            return Ok(false);
+            return false;
         }
 
         if !module_filter_allows(self.module.as_deref(), API_REQUEST_LOG_MODULE) {
-            return Ok(false);
+            return false;
         }
 
         let Some(sink) = &self.sink else {
-            return Ok(false);
+            return false;
         };
 
-        sink.write_api_request(
+        self.record_delivery(sink.write_api_request(
             self.show_level,
             self.show_log_origin,
             Location::caller(),
             API_REQUEST_LEVEL,
             method,
             path,
-        )?;
-        Ok(true)
+        ))
     }
 
     pub fn boot_timer_logger(&self) -> BootTimerLogger {
@@ -396,16 +519,13 @@ impl LoggerState {
             show_level: self.show_level,
             show_log_origin: self.show_log_origin,
             module: self.module.clone(),
-            missed_log_counter: None,
+            metrics: self.metrics.clone(),
+            rate_limiter: self.boot_timer_rate_limiter.clone(),
         }
     }
 
     #[track_caller]
-    pub fn log_boot_timer(
-        &mut self,
-        wall_time_us: u64,
-        cpu_time_us: u64,
-    ) -> Result<bool, LoggerWriteError> {
+    pub fn log_boot_timer(&self, wall_time_us: u64, cpu_time_us: u64) -> bool {
         self.boot_timer_logger()
             .log_boot_time(wall_time_us, cpu_time_us)
     }
@@ -474,7 +594,7 @@ impl LoggerSink {
         origin: &Location<'_>,
         level: LoggerLevel,
         action: &str,
-    ) -> Result<(), LoggerWriteError> {
+    ) -> Result<(), LoggerDeliveryError> {
         self.write_message(
             show_level,
             show_log_origin,
@@ -492,7 +612,7 @@ impl LoggerSink {
         level: LoggerLevel,
         method: &str,
         path: impl fmt::Display,
-    ) -> Result<(), LoggerWriteError> {
+    ) -> Result<(), LoggerDeliveryError> {
         self.write_message(
             show_level,
             show_log_origin,
@@ -510,7 +630,7 @@ impl LoggerSink {
         level: LoggerLevel,
         wall_time_us: u64,
         cpu_time_us: u64,
-    ) -> Result<(), LoggerWriteError> {
+    ) -> Result<(), LoggerDeliveryError> {
         let wall_time_ms = wall_time_us / 1_000;
         let cpu_time_ms = cpu_time_us / 1_000;
         self.write_message(
@@ -524,6 +644,23 @@ impl LoggerSink {
         )
     }
 
+    fn write_rate_limit_recovery(
+        &self,
+        show_level: bool,
+        show_log_origin: bool,
+        origin: &Location<'_>,
+        level: LoggerLevel,
+        suppressed: u64,
+    ) -> Result<(), LoggerDeliveryError> {
+        self.write_message(
+            show_level,
+            show_log_origin,
+            origin,
+            level,
+            format_args!("{suppressed} messages were suppressed due to rate limiting"),
+        )
+    }
+
     fn write_message(
         &self,
         show_level: bool,
@@ -531,11 +668,12 @@ impl LoggerSink {
         origin: &Location<'_>,
         level: LoggerLevel,
         message: fmt::Arguments<'_>,
-    ) -> Result<(), LoggerWriteError> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| LoggerWriteError::LockPoisoned)?;
+    ) -> Result<(), LoggerDeliveryError> {
+        let mut writer = match self.writer.try_lock() {
+            Ok(writer) => writer,
+            Err(TryLockError::WouldBlock) => return Err(LoggerDeliveryError::LockContended),
+            Err(TryLockError::Poisoned(_)) => return Err(LoggerDeliveryError::LockPoisoned),
+        };
 
         match (show_level, show_log_origin) {
             (true, true) => writeln!(
@@ -554,10 +692,8 @@ impl LoggerSink {
             ),
             (false, false) => writeln!(writer, "{message}"),
         }
-        .map_err(|err| LoggerWriteError::Write(err.kind()))?;
-        writer
-            .flush()
-            .map_err(|err| LoggerWriteError::Write(err.kind()))
+        .map_err(|_| LoggerDeliveryError::Write)?;
+        writer.flush().map_err(|_| LoggerDeliveryError::Write)
     }
 }
 
@@ -570,13 +706,15 @@ mod tests {
     use std::fs;
     use std::io::{Error, ErrorKind, Write};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        API_REQUEST_LOG_MODULE, BOOT_TIMER_LOG_MODULE, LoggerConfigError, LoggerConfigInput,
-        LoggerLevel, LoggerSink, LoggerState, LoggerWriteError, MINIMAL_ACTION_LOG_MODULE,
-        MissedLogCounter,
+        API_REQUEST_LOG_MODULE, BOOT_TIMER_LOG_MODULE, BootTimerLogRateLimiter,
+        LogRateLimitDecision, LogRateLimiterClock, LoggerConfigError, LoggerConfigInput,
+        LoggerLevel, LoggerState, MINIMAL_ACTION_LOG_MODULE, SharedLoggerMetrics,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -607,6 +745,36 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct FlushFailingWriter;
+
+    impl Write for FlushFailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(Error::from(ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TestLogRateLimiterClock {
+        now_ms: Arc<AtomicU64>,
+    }
+
+    impl TestLogRateLimiterClock {
+        fn advance_ms(&self, elapsed_ms: u64) {
+            self.now_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
+        }
+    }
+
+    impl LogRateLimiterClock for TestLogRateLimiterClock {
+        fn now_ms(&self) -> u64 {
+            self.now_ms.load(Ordering::Relaxed)
+        }
+    }
+
+    #[derive(Debug)]
     struct PanickingDisplay;
 
     impl std::fmt::Display for PanickingDisplay {
@@ -616,14 +784,24 @@ mod tests {
     }
 
     #[test]
-    fn missed_log_counter_saturates_at_u64_max() {
-        let counter = MissedLogCounter::default();
-        counter.count.store(u64::MAX - 1, Ordering::Relaxed);
+    fn shared_logger_metrics_saturate_at_u64_max() {
+        let metrics = SharedLoggerMetrics::default();
+        metrics
+            .inner
+            .missed_log_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        metrics
+            .inner
+            .rate_limited_log_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
 
-        counter.record();
-        assert_eq!(counter.count(), u64::MAX);
-        counter.record();
-        assert_eq!(counter.count(), u64::MAX);
+        metrics.record_missed_log();
+        metrics.record_missed_log();
+        metrics.record_rate_limited_log();
+        metrics.record_rate_limited_log();
+
+        assert_eq!(metrics.missed_log_count(), u64::MAX);
+        assert_eq!(metrics.rate_limited_log_count(), u64::MAX);
     }
 
     fn assert_action_output_with_origin(output: &str, level: Option<LoggerLevel>, action: &str) {
@@ -744,9 +922,9 @@ mod tests {
 
     #[test]
     fn log_action_without_configuration_is_noop() {
-        let mut state = LoggerState::default();
+        let state = LoggerState::default();
 
-        assert_eq!(state.log_action("InstanceStart"), Ok(false));
+        assert!(!state.log_action("InstanceStart"));
         assert!(!state.is_configured());
     }
 
@@ -758,8 +936,8 @@ mod tests {
             .configure(LoggerConfigInput::new().with_log_path(&path))
             .expect("logger should configure");
 
-        assert_eq!(state.log_action("InstanceStart"), Ok(true));
-        assert_eq!(state.log_action("FlushMetrics"), Ok(true));
+        assert!(state.log_action("InstanceStart"));
+        assert!(state.log_action("FlushMetrics"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(output, "action=InstanceStart\naction=FlushMetrics\n");
@@ -774,7 +952,7 @@ mod tests {
             .configure(LoggerConfigInput::new().with_log_path(&path))
             .expect("logger should configure");
 
-        assert_eq!(state.log_api_request("Put", "/mmds"), Ok(true));
+        assert!(state.log_api_request("Put", "/mmds"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(
@@ -796,7 +974,7 @@ mod tests {
             )
             .expect("logger should configure");
 
-        assert_eq!(state.log_api_request("Get", "/version"), Ok(false));
+        assert!(!state.log_api_request("Get", "/version"));
         assert_eq!(
             fs::read_to_string(&path).expect("logger output should be readable"),
             ""
@@ -805,7 +983,7 @@ mod tests {
         state
             .configure(LoggerConfigInput::new().with_level(LoggerLevel::Info))
             .expect("logger should update level");
-        assert_eq!(state.log_api_request("Get", "/version"), Ok(true));
+        assert!(state.log_api_request("Get", "/version"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(
@@ -827,12 +1005,12 @@ mod tests {
             )
             .expect("logger should configure");
 
-        assert_eq!(state.log_api_request("Get", "/version"), Ok(false));
+        assert!(!state.log_api_request("Get", "/version"));
 
         state
             .configure(LoggerConfigInput::new().with_module(API_REQUEST_LOG_MODULE))
             .expect("logger should update module filter");
-        assert_eq!(state.log_api_request("Get", "/version"), Ok(true));
+        assert!(state.log_api_request("Get", "/version"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(
@@ -847,7 +1025,7 @@ mod tests {
         let path = unique_logger_path("api-request-suppressed");
         let mut state = LoggerState::default();
 
-        assert_eq!(state.log_api_request("Get", PanickingDisplay), Ok(false));
+        assert!(!state.log_api_request("Get", PanickingDisplay));
 
         state
             .configure(
@@ -856,7 +1034,7 @@ mod tests {
                     .with_level(LoggerLevel::Warn),
             )
             .expect("logger should configure");
-        assert_eq!(state.log_api_request("Get", PanickingDisplay), Ok(false));
+        assert!(!state.log_api_request("Get", PanickingDisplay));
 
         state
             .configure(
@@ -865,7 +1043,7 @@ mod tests {
                     .with_module(MINIMAL_ACTION_LOG_MODULE),
             )
             .expect("logger should update filters");
-        assert_eq!(state.log_api_request("Get", PanickingDisplay), Ok(false));
+        assert!(!state.log_api_request("Get", PanickingDisplay));
 
         assert_eq!(
             fs::read_to_string(&path).expect("logger output should be readable"),
@@ -875,21 +1053,12 @@ mod tests {
     }
 
     #[test]
-    fn log_api_request_reports_write_errors_without_path_details() {
-        let mut state = LoggerState {
-            sink: Some(LoggerSink::from_writer(FailingWriter)),
-            level: LoggerLevel::Info,
-            show_level: false,
-            show_log_origin: false,
-            module: None,
-        };
+    fn log_api_request_records_write_failure_without_failing_caller() {
+        let mut state = LoggerState::default();
+        state.configure_test_writer(FailingWriter);
 
-        let err = state
-            .log_api_request("Patch", "/mmds")
-            .expect_err("failing writer should report logger write error");
-
-        assert_eq!(err, LoggerWriteError::Write(ErrorKind::BrokenPipe));
-        assert_eq!(err.to_string(), "failed to write logger output: BrokenPipe");
+        assert!(!state.log_api_request("Patch", "/mmds"));
+        assert_eq!(state.metrics.missed_log_count(), 1);
     }
 
     #[test]
@@ -900,7 +1069,7 @@ mod tests {
             .configure(LoggerConfigInput::new().with_log_path(&path))
             .expect("logger should configure");
 
-        assert_eq!(state.log_boot_timer(7_123, 1_456), Ok(true));
+        assert!(state.log_boot_timer(7_123, 1_456));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(
@@ -919,8 +1088,8 @@ mod tests {
             .expect("logger should configure");
         let boot_timer_logger = state.boot_timer_logger();
 
-        assert_eq!(state.log_action("InstanceStart"), Ok(true));
-        assert_eq!(boot_timer_logger.log_boot_time(1_000, 200), Ok(true));
+        assert!(state.log_action("InstanceStart"));
+        assert!(boot_timer_logger.log_boot_time(1_000, 200));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(
@@ -934,16 +1103,10 @@ mod tests {
     fn boot_timer_logger_records_missed_log_on_write_failure() {
         let mut state = LoggerState::default();
         state.configure_test_writer(FailingWriter);
-        let counter = MissedLogCounter::default();
-        let boot_timer_logger = state
-            .boot_timer_logger()
-            .with_missed_log_counter(counter.clone());
+        let boot_timer_logger = state.boot_timer_logger();
 
-        assert_eq!(
-            boot_timer_logger.log_boot_time(1_000, 200),
-            Err(LoggerWriteError::Write(ErrorKind::BrokenPipe))
-        );
-        assert_eq!(counter.count(), 1);
+        assert!(!boot_timer_logger.log_boot_time(1_000, 200));
+        assert_eq!(state.metrics.missed_log_count(), 1);
     }
 
     #[test]
@@ -953,25 +1116,17 @@ mod tests {
         state
             .configure(LoggerConfigInput::new().with_log_path(&path))
             .expect("logger should configure");
-        let counter = MissedLogCounter::default();
 
-        assert_eq!(
-            state
-                .boot_timer_logger()
-                .with_missed_log_counter(counter.clone())
-                .log_boot_time(1_000, 200),
-            Ok(true)
-        );
-        assert_eq!(counter.count(), 0);
+        assert!(state.boot_timer_logger().log_boot_time(1_000, 200));
+        assert_eq!(state.metrics.missed_log_count(), 0);
 
-        assert_eq!(
-            LoggerState::default()
+        let unconfigured_state = LoggerState::default();
+        assert!(
+            !unconfigured_state
                 .boot_timer_logger()
-                .with_missed_log_counter(counter.clone())
-                .log_boot_time(1_000, 200),
-            Ok(false)
+                .log_boot_time(1_000, 200)
         );
-        assert_eq!(counter.count(), 0);
+        assert_eq!(unconfigured_state.metrics.missed_log_count(), 0);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -983,13 +1138,11 @@ mod tests {
         state
             .configure(LoggerConfigInput::new().with_module(MINIMAL_ACTION_LOG_MODULE))
             .expect("logger should update module filter");
-        let counter = MissedLogCounter::default();
-        let boot_timer_logger = state
-            .boot_timer_logger()
-            .with_missed_log_counter(counter.clone());
+        let boot_timer_logger = state.boot_timer_logger();
 
-        assert_eq!(boot_timer_logger.log_boot_time(1_000, 200), Ok(false));
-        assert_eq!(counter.count(), 0);
+        assert!(!boot_timer_logger.log_boot_time(1_000, 200));
+        assert_eq!(state.metrics.missed_log_count(), 0);
+        assert_eq!(state.metrics.rate_limited_log_count(), 0);
     }
 
     #[test]
@@ -1004,7 +1157,7 @@ mod tests {
             )
             .expect("logger should configure");
 
-        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+        assert!(state.log_action("InstanceStart"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(output, "level=Info action=InstanceStart\n");
@@ -1023,7 +1176,7 @@ mod tests {
             )
             .expect("logger should configure");
 
-        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+        assert!(state.log_action("InstanceStart"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_action_output_with_origin(&output, None, "InstanceStart");
@@ -1043,7 +1196,7 @@ mod tests {
             )
             .expect("logger should configure");
 
-        assert_eq!(state.log_action("FlushMetrics"), Ok(true));
+        assert!(state.log_action("FlushMetrics"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_action_output_with_origin(&output, Some(LoggerLevel::Info), "FlushMetrics");
@@ -1062,7 +1215,7 @@ mod tests {
             )
             .expect("logger should configure");
 
-        assert_eq!(state.log_action("InstanceStart"), Ok(false));
+        assert!(!state.log_action("InstanceStart"));
         assert_eq!(
             fs::read_to_string(&path).expect("logger output should be readable"),
             ""
@@ -1071,7 +1224,7 @@ mod tests {
         state
             .configure(LoggerConfigInput::new().with_level(LoggerLevel::Debug))
             .expect("logger should update level without replacing sink");
-        assert_eq!(state.log_action("FlushMetrics"), Ok(true));
+        assert!(state.log_action("FlushMetrics"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(output, "action=FlushMetrics\n");
@@ -1090,17 +1243,17 @@ mod tests {
             )
             .expect("logger should configure");
 
-        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+        assert!(state.log_action("InstanceStart"));
 
         state
             .configure(LoggerConfigInput::new().with_module(MINIMAL_ACTION_LOG_MODULE))
             .expect("logger should update module filter");
-        assert_eq!(state.log_action("FlushMetrics"), Ok(true));
+        assert!(state.log_action("FlushMetrics"));
 
         state
             .configure(LoggerConfigInput::new().with_module("api_server"))
             .expect("logger should update module filter");
-        assert_eq!(state.log_action("Suppressed"), Ok(false));
+        assert!(!state.log_action("Suppressed"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(output, "action=InstanceStart\naction=FlushMetrics\n");
@@ -1119,12 +1272,12 @@ mod tests {
             )
             .expect("logger should configure");
 
-        assert_eq!(state.log_boot_timer(1, 1), Ok(false));
+        assert!(!state.log_boot_timer(1, 1));
 
         state
             .configure(LoggerConfigInput::new().with_module(BOOT_TIMER_LOG_MODULE))
             .expect("logger should update module filter");
-        assert_eq!(state.log_boot_timer(1, 1), Ok(true));
+        assert!(state.log_boot_timer(1, 1));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(
@@ -1146,7 +1299,7 @@ mod tests {
             )
             .expect("logger should configure");
 
-        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+        assert!(state.log_action("InstanceStart"));
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(output, "action=InstanceStart\n");
@@ -1154,21 +1307,186 @@ mod tests {
     }
 
     #[test]
-    fn log_action_reports_write_errors_without_path_details() {
+    fn log_action_records_write_failure_without_failing_caller() {
+        let mut state = LoggerState::default();
+        state.configure_test_writer(FailingWriter);
+
+        assert!(!state.log_action("InstanceStart"));
+        assert_eq!(state.metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn log_action_records_flush_failure_without_failing_caller() {
+        let mut state = LoggerState::default();
+        state.configure_test_writer(FlushFailingWriter);
+
+        assert!(!state.log_action("InstanceStart"));
+        assert_eq!(state.metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn log_action_drops_contended_sink_without_blocking() {
+        let mut state = LoggerState::default();
+        state.configure_test_writer(std::io::sink());
+        let sink = state.sink.as_ref().expect("sink should exist").clone();
+        let guard = sink.writer.lock().expect("sink lock should be available");
+
+        assert!(!state.log_action("InstanceStart"));
+        assert_eq!(state.metrics.missed_log_count(), 1);
+
+        drop(guard);
+    }
+
+    #[test]
+    fn log_action_drops_poisoned_sink_without_panicking() {
+        let mut state = LoggerState::default();
+        state.configure_test_writer(std::io::sink());
+        let writer = state
+            .sink
+            .as_ref()
+            .expect("sink should exist")
+            .writer
+            .clone();
+        let poison_result = thread::spawn(move || {
+            let _guard = writer.lock().expect("sink lock should be available");
+            panic!("poison logger sink for test");
+        })
+        .join();
+        assert!(poison_result.is_err());
+
+        assert!(!state.log_action("InstanceStart"));
+        assert_eq!(state.metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn boot_timer_rate_limit_allows_burst_then_reports_recovery() {
+        let path = unique_logger_path("boot-timer-rate-limit");
+        let clock = TestLogRateLimiterClock::default();
         let mut state = LoggerState {
-            sink: Some(LoggerSink::from_writer(FailingWriter)),
-            level: LoggerLevel::Info,
-            show_level: false,
-            show_log_origin: false,
-            module: None,
+            boot_timer_rate_limiter: BootTimerLogRateLimiter::with_clock(Arc::new(clock.clone())),
+            ..LoggerState::default()
+        };
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_show_level(true),
+            )
+            .expect("logger should configure");
+        let first_session_logger = state.boot_timer_logger();
+
+        for _ in 0..10 {
+            assert!(first_session_logger.log_boot_time(1_000, 200));
+        }
+
+        let reconstructed_session_logger = state.boot_timer_logger();
+        assert!(!reconstructed_session_logger.log_boot_time(1_000, 200));
+        assert_eq!(state.metrics.rate_limited_log_count(), 1);
+        assert_eq!(state.metrics.missed_log_count(), 0);
+
+        clock.advance_ms(500);
+        assert!(reconstructed_session_logger.log_boot_time(2_000, 300));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 12);
+        assert_eq!(
+            lines[10],
+            "level=Warn 1 messages were suppressed due to rate limiting"
+        );
+        assert_eq!(
+            lines[11],
+            "level=Info Guest-boot-time =   2000 us 2 ms,    300 CPU us 0 CPU ms"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn boot_timer_local_policy_does_not_consume_rate_limit_or_record_misses() {
+        let path = unique_logger_path("boot-timer-local-policy");
+        let clock = TestLogRateLimiterClock::default();
+        let mut state = LoggerState {
+            boot_timer_rate_limiter: BootTimerLogRateLimiter::with_clock(Arc::new(clock)),
+            ..LoggerState::default()
         };
 
-        let err = state
-            .log_action("InstanceStart")
-            .expect_err("failing writer should report logger write error");
+        for _ in 0..20 {
+            assert!(!state.log_boot_timer(1_000, 200));
+        }
 
-        assert_eq!(err, LoggerWriteError::Write(ErrorKind::BrokenPipe));
-        assert_eq!(err.to_string(), "failed to write logger output: BrokenPipe");
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_level(LoggerLevel::Warn),
+            )
+            .expect("logger should configure");
+        for _ in 0..20 {
+            assert!(!state.log_boot_timer(1_000, 200));
+        }
+
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_level(LoggerLevel::Info)
+                    .with_module(MINIMAL_ACTION_LOG_MODULE),
+            )
+            .expect("logger should update filters");
+        for _ in 0..20 {
+            assert!(!state.log_boot_timer(1_000, 200));
+        }
+
+        state
+            .configure(LoggerConfigInput::new().with_module(BOOT_TIMER_LOG_MODULE))
+            .expect("logger should update module filter");
+        for _ in 0..10 {
+            assert!(state.log_boot_timer(1_000, 200));
+        }
+        assert!(!state.log_boot_timer(1_000, 200));
+
+        assert_eq!(state.metrics.missed_log_count(), 0);
+        assert_eq!(state.metrics.rate_limited_log_count(), 1);
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn boot_timer_rate_limit_suppressed_count_saturates() {
+        let clock = TestLogRateLimiterClock::default();
+        let limiter = BootTimerLogRateLimiter::with_clock(Arc::new(clock.clone()));
+        {
+            let mut state = limiter
+                .inner
+                .state
+                .lock()
+                .expect("rate limiter lock should be available");
+            state.theoretical_arrival_time_ms = 5_000;
+            state.suppressed = u64::MAX - 1;
+        }
+
+        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
+        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
+        clock.advance_ms(500);
+        assert_eq!(
+            limiter.check(),
+            LogRateLimitDecision::Admitted {
+                suppressed: u64::MAX
+            }
+        );
+    }
+
+    #[test]
+    fn boot_timer_rate_limiters_are_independent_between_logger_states() {
+        let mut first = LoggerState::default();
+        first.configure_test_writer(std::io::sink());
+        let mut second = LoggerState::default();
+        second.configure_test_writer(std::io::sink());
+
+        for _ in 0..10 {
+            assert!(first.log_boot_timer(1_000, 200));
+        }
+        assert!(!first.log_boot_timer(1_000, 200));
+        assert!(second.log_boot_timer(1_000, 200));
     }
 
     #[test]

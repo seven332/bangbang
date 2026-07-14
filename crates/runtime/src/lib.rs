@@ -382,7 +382,6 @@ pub enum VmmActionError {
     DriveUpdateUnsupported,
     EntropyConfig(entropy::EntropyConfigError),
     LoggerConfig(logger::LoggerConfigError),
-    LoggerWrite(logger::LoggerWriteError),
     MachineConfig(machine::MachineConfigError),
     MetricsConfig(metrics::MetricsConfigError),
     MetricsFlush(metrics::MetricsFlushError),
@@ -438,7 +437,6 @@ impl fmt::Display for VmmActionError {
             Self::DriveUpdateUnsupported => f.write_str("Drive updates are not supported."),
             Self::EntropyConfig(err) => write!(f, "{err}"),
             Self::LoggerConfig(err) => write!(f, "{err}"),
-            Self::LoggerWrite(err) => write!(f, "{err}"),
             Self::MachineConfig(err) => write!(f, "{err}"),
             Self::MetricsConfig(err) => write!(f, "{err}"),
             Self::MetricsFlush(err) => write!(f, "{err}"),
@@ -483,7 +481,6 @@ impl std::error::Error for VmmActionError {
             Self::DriveUpdate(err) => Some(err),
             Self::EntropyConfig(err) => Some(err),
             Self::LoggerConfig(err) => Some(err),
-            Self::LoggerWrite(err) => Some(err),
             Self::MachineConfig(err) => Some(err),
             Self::MetricsConfig(err) => Some(err),
             Self::MetricsFlush(err) => Some(err),
@@ -556,6 +553,7 @@ impl VmmController {
         app_name: impl Into<String>,
         mmds_data_store_limit_bytes: usize,
     ) -> Self {
+        let shared_logger_metrics = logger::SharedLoggerMetrics::default();
         Self {
             instance_info: InstanceInfo::new(
                 instance_id,
@@ -574,8 +572,8 @@ impl VmmController {
             balloon_config: None,
             pmem_configs: pmem::PmemConfigs::new(),
             serial_config: serial::SerialConfig::default(),
-            logger_state: logger::LoggerState::default(),
-            metrics_state: metrics::MetricsState::default(),
+            logger_state: logger::LoggerState::with_shared_metrics(shared_logger_metrics.clone()),
+            metrics_state: metrics::MetricsState::with_shared_logger_metrics(shared_logger_metrics),
             mmds_state: mmds::MmdsStateHandle::new(mmds::MmdsState::new(
                 mmds_data_store_limit_bytes,
             )),
@@ -646,9 +644,7 @@ impl VmmController {
     }
 
     pub fn boot_timer_logger(&self) -> logger::BootTimerLogger {
-        self.logger_state
-            .boot_timer_logger()
-            .with_missed_log_counter(self.metrics_state.missed_log_counter())
+        self.logger_state.boot_timer_logger()
     }
 
     pub fn vm_config(&self) -> Result<VmConfiguration, mmds::MmdsStateLockError> {
@@ -877,7 +873,7 @@ impl VmmController {
     {
         self.preflight_instance_start()?;
         executor(self).map_err(VmmActionError::InstanceStart)?;
-        self.log_action(VmmAction::InstanceStart.name())?;
+        self.log_action(VmmAction::InstanceStart.name());
         self.instance_info.state = InstanceState::Running;
         Ok(VmmData::Empty)
     }
@@ -1017,25 +1013,13 @@ impl VmmController {
     }
 
     #[track_caller]
-    fn log_action(&mut self, action: &str) -> Result<(), VmmActionError> {
-        if let Err(err) = self.logger_state.log_action(action) {
-            self.metrics_state.record_missed_log();
-            return Err(VmmActionError::LoggerWrite(err));
-        }
-
-        Ok(())
+    fn log_action(&self, action: &str) -> bool {
+        self.logger_state.log_action(action)
     }
 
     #[track_caller]
-    pub fn log_api_request(
-        &mut self,
-        method: &str,
-        path: impl fmt::Display,
-    ) -> Result<bool, VmmActionError> {
-        self.logger_state
-            .log_api_request(method, path)
-            .inspect_err(|_| self.metrics_state.record_missed_log())
-            .map_err(VmmActionError::LoggerWrite)
+    pub fn log_api_request(&mut self, method: &str, path: impl fmt::Display) -> bool {
+        self.logger_state.log_api_request(method, path)
     }
 
     pub fn record_put_actions_request(&mut self) {
@@ -1666,7 +1650,7 @@ impl VmmController {
         self.metrics_state
             .flush_with_diagnostics(diagnostics)
             .map_err(VmmActionError::MetricsFlush)?;
-        self.log_action(VmmAction::FlushMetrics.name())?;
+        self.log_action(VmmAction::FlushMetrics.name());
         Ok(VmmData::Empty)
     }
 
@@ -1742,7 +1726,7 @@ mod tests {
         entropy::{
             EntropyConfig, EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
         },
-        logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerWriteError},
+        logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
         machine::{
             DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigError,
             MachineConfigInput, MachineConfigPatchInput,
@@ -4891,7 +4875,7 @@ mod tests {
     }
 
     #[test]
-    fn start_instance_logger_write_failure_reports_missed_log_count_in_metrics() {
+    fn start_instance_logger_write_failure_does_not_fail_startup() {
         let metrics_path = unique_metrics_path("start-missed-log");
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
@@ -4904,15 +4888,11 @@ mod tests {
             .expect("boot source config should be stored");
         controller.logger_state.configure_test_writer(FailingWriter);
 
-        let err = controller
+        controller
             .commit_instance_start()
-            .expect_err("logger write should fail startup commit");
+            .expect("logger write failure should not fail startup commit");
 
-        assert_eq!(
-            err,
-            VmmActionError::LoggerWrite(LoggerWriteError::Write(ErrorKind::BrokenPipe))
-        );
-        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
         assert_eq!(
             controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
@@ -4937,11 +4917,7 @@ mod tests {
         controller.logger_state.configure_test_writer(FailingWriter);
         let boot_timer_logger = controller.boot_timer_logger();
 
-        let err = boot_timer_logger
-            .log_boot_time(1_000, 200)
-            .expect_err("boot timer logger write should fail");
-
-        assert_eq!(err, LoggerWriteError::Write(ErrorKind::BrokenPipe));
+        assert!(!boot_timer_logger.log_boot_time(1_000, 200));
         assert_eq!(
             controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
@@ -4965,14 +4941,7 @@ mod tests {
             .expect("metrics config should be stored");
         controller.logger_state.configure_test_writer(FailingWriter);
 
-        let err = controller
-            .log_api_request("Put", "/mmds")
-            .expect_err("API request logger write should fail");
-
-        assert_eq!(
-            err,
-            VmmActionError::LoggerWrite(LoggerWriteError::Write(ErrorKind::BrokenPipe))
-        );
+        assert!(!controller.log_api_request("Put", "/mmds"));
         assert_eq!(
             controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
@@ -5004,10 +4973,7 @@ mod tests {
         first.logger_state.configure_test_writer(FailingWriter);
         let first_boot_timer_logger = first.boot_timer_logger();
 
-        assert_eq!(
-            first_boot_timer_logger.log_boot_time(1_000, 200),
-            Err(LoggerWriteError::Write(ErrorKind::BrokenPipe))
-        );
+        assert!(!first_boot_timer_logger.log_boot_time(1_000, 200));
 
         assert_eq!(
             first.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
@@ -5260,7 +5226,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_metrics_logger_write_failure_reports_missed_log_count_in_metrics() {
+    fn flush_metrics_logger_write_failure_does_not_fail_action() {
         let metrics_path = unique_metrics_path("flush-missed-log");
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
@@ -5276,13 +5242,9 @@ mod tests {
             .expect("start commit should set running state");
         controller.logger_state.configure_test_writer(FailingWriter);
 
-        let err = controller
-            .handle_action(VmmAction::FlushMetrics)
-            .expect_err("flush metrics action logger write should fail");
-
         assert_eq!(
-            err,
-            VmmActionError::LoggerWrite(LoggerWriteError::Write(ErrorKind::BrokenPipe))
+            controller.handle_action(VmmAction::FlushMetrics),
+            Ok(VmmData::Empty)
         );
         assert_eq!(
             controller.flush_periodic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
@@ -5708,15 +5670,6 @@ mod tests {
         );
         assert!(!controller.logger_state.is_configured());
         assert_eq!(controller.logger_state.level(), LoggerLevel::Info);
-    }
-
-    #[test]
-    fn logger_write_error_preserves_redacted_source() {
-        let err =
-            VmmActionError::LoggerWrite(LoggerWriteError::Write(std::io::ErrorKind::BrokenPipe));
-
-        assert_eq!(err.to_string(), "failed to write logger output: BrokenPipe");
-        assert!(err.source().is_some());
     }
 
     #[test]

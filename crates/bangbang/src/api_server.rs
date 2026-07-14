@@ -630,10 +630,10 @@ fn handle_request_bytes_with_limit(
     http_api_max_payload_size: usize,
 ) -> HttpResponse {
     match parse_request_with_limit(bytes, http_api_max_payload_size) {
-        Ok(request) => match log_api_request(&request, vmm) {
-            Ok(_) => handle_api_request(request, vmm),
-            Err(err) => handle_empty(Err(err)),
-        },
+        Ok(request) => {
+            log_api_request(&request, vmm);
+            handle_api_request(request, vmm)
+        }
         Err(err) => {
             if err == RequestError::SendCtrlAltDelUnsupported {
                 record_unsupported_put_action_request(bytes, vmm);
@@ -649,10 +649,7 @@ fn handle_request_bytes_with_limit(
     }
 }
 
-fn log_api_request(
-    request: &ApiRequest,
-    vmm: &mut impl VmmRequestHandler,
-) -> Result<bool, VmmActionError> {
+fn log_api_request(request: &ApiRequest, vmm: &mut impl VmmRequestHandler) -> bool {
     match request {
         ApiRequest::GetInstanceInfo => vmm.log_api_request("Get", "/"),
         ApiRequest::GetBalloon => vmm.log_api_request("Get", "/balloon"),
@@ -2200,7 +2197,7 @@ mod tests {
         VirtioBalloonStat,
     };
     use bangbang_runtime::block::DriveUpdateError;
-    use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
+    use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
@@ -2709,18 +2706,6 @@ mod tests {
         assert_eq!(body.get("swap_in"), None);
     }
 
-    #[test]
-    fn handle_empty_maps_logger_write_errors_to_fault() {
-        let response = handle_empty(Err(VmmActionError::LoggerWrite(LoggerWriteError::Write(
-            std::io::ErrorKind::BrokenPipe,
-        ))));
-
-        assert_eq!(
-            response.body(),
-            r#"{"fault_message":"failed to write logger output: BrokenPipe"}"#
-        );
-    }
-
     fn unique_socket_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2874,11 +2859,7 @@ mod tests {
         }
 
         #[track_caller]
-        fn log_api_request(
-            &mut self,
-            method: &str,
-            path: impl std::fmt::Display,
-        ) -> Result<bool, VmmActionError> {
+        fn log_api_request(&mut self, method: &str, path: impl std::fmt::Display) -> bool {
             self.inner.log_api_request(method, path)
         }
 

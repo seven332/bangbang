@@ -1125,11 +1125,7 @@ pub(crate) trait VmmRequestHandler {
     fn record_deprecated_api_call(&mut self);
 
     #[track_caller]
-    fn log_api_request(
-        &mut self,
-        method: &str,
-        path: impl fmt::Display,
-    ) -> Result<bool, VmmActionError>;
+    fn log_api_request(&mut self, method: &str, path: impl fmt::Display) -> bool;
 
     fn record_pause_vm_latency_us(&mut self, duration_us: u64);
 
@@ -1371,11 +1367,7 @@ where
     }
 
     #[track_caller]
-    fn log_api_request(
-        &mut self,
-        method: &str,
-        path: impl fmt::Display,
-    ) -> Result<bool, VmmActionError> {
+    fn log_api_request(&mut self, method: &str, path: impl fmt::Display) -> bool {
         self.controller.log_api_request(method, path)
     }
 
@@ -1943,11 +1935,7 @@ where
     }
 
     #[track_caller]
-    fn log_api_request(
-        &mut self,
-        method: &str,
-        path: impl fmt::Display,
-    ) -> Result<bool, VmmActionError> {
+    fn log_api_request(&mut self, method: &str, path: impl fmt::Display) -> bool {
         ProcessVmm::log_api_request(self, method, path)
     }
 
@@ -8306,7 +8294,6 @@ mod tests {
             | VmmActionError::DriveUpdate(_)
             | VmmActionError::DriveUpdateUnsupported
             | VmmActionError::LoggerConfig(_)
-            | VmmActionError::LoggerWrite(_)
             | VmmActionError::MachineConfig(_)
             | VmmActionError::MetricsConfig(_)
             | VmmActionError::MetricsFlush(_)
