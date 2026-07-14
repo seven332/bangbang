@@ -49,6 +49,35 @@ pub struct SerialOutputMetrics {
 }
 
 impl SerialOutputMetrics {
+    const fn incremental_delta(current: u64, previous: u64) -> u64 {
+        if current >= previous {
+            current - previous
+        } else {
+            current
+        }
+    }
+
+    pub(crate) const fn delta_since(self, previous: Self) -> Self {
+        Self {
+            error_count: Self::incremental_delta(self.error_count, previous.error_count),
+            flush_count: Self::incremental_delta(self.flush_count, previous.flush_count),
+            missed_read_count: Self::incremental_delta(
+                self.missed_read_count,
+                previous.missed_read_count,
+            ),
+            missed_write_count: Self::incremental_delta(
+                self.missed_write_count,
+                previous.missed_write_count,
+            ),
+            read_count: Self::incremental_delta(self.read_count, previous.read_count),
+            write_count: Self::incremental_delta(self.write_count, previous.write_count),
+            rate_limiter_dropped_bytes: Self::incremental_delta(
+                self.rate_limiter_dropped_bytes,
+                previous.rate_limiter_dropped_bytes,
+            ),
+        }
+    }
+
     const fn from_fields(
         error_count: u64,
         flush_count: u64,

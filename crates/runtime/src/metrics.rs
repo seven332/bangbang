@@ -31,6 +31,40 @@ use crate::vsock::{
     VirtioVsockRxQueueDispatch, VirtioVsockTxQueueDispatch,
 };
 
+const fn incremental_delta(current: u64, previous: u64) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        current
+    }
+}
+
+macro_rules! impl_incremental_delta {
+    ($metrics:ident { $($field:ident),+ $(,)? }) => {
+        impl $metrics {
+            const fn delta_since(self, previous: Self) -> Self {
+                Self {
+                    $(
+                        $field: incremental_delta(self.$field, previous.$field),
+                    )+
+                }
+            }
+        }
+    };
+}
+
+const fn block_latency_delta(
+    current: VirtioBlockLatencyAggregate,
+    previous: VirtioBlockLatencyAggregate,
+) -> VirtioBlockLatencyAggregate {
+    VirtioBlockLatencyAggregate::new(
+        current.min_us(),
+        current.max_us(),
+        incremental_delta(current.sum_us(), previous.sum_us()),
+        current.sample_count(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsConfigInput {
     metrics_path: PathBuf,
@@ -99,14 +133,41 @@ impl fmt::Display for MetricsFlushError {
 
 impl std::error::Error for MetricsFlushError {}
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MetricsSnapshot {
+    diagnostics: MetricsDiagnostics,
+    deprecated_api: DeprecatedApiMetrics,
+    get_api_requests: GetApiRequestMetrics,
+    latencies_us: LatencyMetrics,
+    logger_metrics: LoggerMetrics,
+    patch_api_requests: PatchApiRequestMetrics,
+    put_api_requests: PutApiRequestMetrics,
+}
+
+impl MetricsSnapshot {
+    fn delta_since(&self, previous: &Self) -> Self {
+        Self {
+            diagnostics: self.diagnostics.delta_since(&previous.diagnostics),
+            deprecated_api: self.deprecated_api.delta_since(previous.deprecated_api),
+            get_api_requests: self.get_api_requests.delta_since(previous.get_api_requests),
+            latencies_us: self.latencies_us,
+            logger_metrics: self.logger_metrics.delta_since(previous.logger_metrics),
+            patch_api_requests: self
+                .patch_api_requests
+                .delta_since(previous.patch_api_requests),
+            put_api_requests: self.put_api_requests.delta_since(previous.put_api_requests),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MetricsState {
     deprecated_api: DeprecatedApiMetrics,
     sink: Option<MetricsSink>,
-    flush_count: u64,
     get_api_requests: GetApiRequestMetrics,
     latencies_us: LatencyMetrics,
     logger_metrics: LoggerMetrics,
+    previous_successful: MetricsSnapshot,
     shared_logger_metrics: SharedLoggerMetrics,
     patch_api_requests: PatchApiRequestMetrics,
     put_api_requests: PutApiRequestMetrics,
@@ -355,13 +416,11 @@ impl MetricsState {
         &mut self,
         diagnostics: &MetricsDiagnostics,
     ) -> Result<bool, MetricsFlushError> {
-        let Some(sink) = &mut self.sink else {
+        if self.sink.is_none() {
             return Ok(false);
-        };
-        let next_flush_count = self.flush_count.saturating_add(1);
-        let snapshot = MinimalMetricsSnapshot {
-            flush_count: next_flush_count,
-            diagnostics,
+        }
+        let current = MetricsSnapshot {
+            diagnostics: diagnostics.clone(),
             deprecated_api: self.deprecated_api,
             get_api_requests: self.get_api_requests,
             latencies_us: self.latencies_us,
@@ -372,11 +431,17 @@ impl MetricsState {
             patch_api_requests: self.patch_api_requests,
             put_api_requests: self.put_api_requests,
         };
-        if let Err(err) = sink.write_minimal_metrics(snapshot) {
+        let emitted = current.delta_since(&self.previous_successful);
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(false);
+        };
+        if let Err(err) = sink.write_minimal_metrics(&emitted) {
+            // The sink can report an error after some bytes became visible. Retaining the prior
+            // successful baseline intentionally gives consumers at-least-once replay.
             self.logger_metrics.record_missed_metrics();
             return Err(err);
         }
-        self.flush_count = next_flush_count;
+        self.previous_successful = current;
 
         Ok(true)
     }
@@ -399,6 +464,10 @@ impl MetricsState {
 struct DeprecatedApiMetrics {
     deprecated_http_api_calls: u64,
 }
+
+impl_incremental_delta!(DeprecatedApiMetrics {
+    deprecated_http_api_calls,
+});
 
 impl DeprecatedApiMetrics {
     const fn is_empty(self) -> bool {
@@ -424,12 +493,27 @@ struct GetApiRequestMetrics {
     mmds_count: u64,
 }
 
+impl_incremental_delta!(GetApiRequestMetrics {
+    balloon_count,
+    hotplug_memory_count,
+    instance_info_count,
+    vmm_version_count,
+    machine_cfg_count,
+    mmds_count,
+});
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LoggerMetrics {
     missed_log_count: u64,
     missed_metrics_count: u64,
     rate_limited_log_count: u64,
 }
+
+impl_incremental_delta!(LoggerMetrics {
+    missed_log_count,
+    missed_metrics_count,
+    rate_limited_log_count,
+});
 
 impl LoggerMetrics {
     const fn is_empty(self) -> bool {
@@ -524,6 +608,8 @@ impl LatencyMetrics {
 pub struct SignalMetrics {
     sigpipe: u64,
 }
+
+impl_incremental_delta!(SignalMetrics { sigpipe });
 
 impl SignalMetrics {
     pub const fn new(sigpipe: u64) -> Self {
@@ -641,6 +727,23 @@ struct PatchApiRequestMetrics {
     pmem_count: u64,
     pmem_fails: u64,
 }
+
+impl_incremental_delta!(PatchApiRequestMetrics {
+    balloon_count,
+    balloon_fails,
+    drive_count,
+    drive_fails,
+    network_count,
+    network_fails,
+    machine_cfg_count,
+    machine_cfg_fails,
+    mmds_count,
+    mmds_fails,
+    hotplug_memory_count,
+    hotplug_memory_fails,
+    pmem_count,
+    pmem_fails,
+});
 
 impl PatchApiRequestMetrics {
     const fn is_empty(self) -> bool {
@@ -804,6 +907,37 @@ struct PutApiRequestMetrics {
     vsock_count: u64,
     vsock_fails: u64,
 }
+
+impl_incremental_delta!(PutApiRequestMetrics {
+    actions_count,
+    actions_fails,
+    balloon_count,
+    balloon_fails,
+    boot_source_count,
+    boot_source_fails,
+    cpu_cfg_count,
+    cpu_cfg_fails,
+    drive_count,
+    drive_fails,
+    logger_count,
+    logger_fails,
+    machine_cfg_count,
+    machine_cfg_fails,
+    metrics_count,
+    metrics_fails,
+    hotplug_memory_count,
+    hotplug_memory_fails,
+    mmds_count,
+    mmds_fails,
+    network_count,
+    network_fails,
+    pmem_count,
+    pmem_fails,
+    serial_count,
+    serial_fails,
+    vsock_count,
+    vsock_fails,
+});
 
 impl PutApiRequestMetrics {
     const fn is_empty(self) -> bool {
@@ -1082,6 +1216,38 @@ pub struct BlockDeviceMetrics {
 }
 
 impl BlockDeviceMetrics {
+    const fn delta_since(self, previous: Self) -> Self {
+        Self {
+            event_fails: incremental_delta(self.event_fails, previous.event_fails),
+            execute_fails: incremental_delta(self.execute_fails, previous.execute_fails),
+            invalid_reqs_count: incremental_delta(
+                self.invalid_reqs_count,
+                previous.invalid_reqs_count,
+            ),
+            flush_count: incremental_delta(self.flush_count, previous.flush_count),
+            queue_event_count: incremental_delta(
+                self.queue_event_count,
+                previous.queue_event_count,
+            ),
+            rate_limiter_event_count: incremental_delta(
+                self.rate_limiter_event_count,
+                previous.rate_limiter_event_count,
+            ),
+            rate_limiter_throttled_events: incremental_delta(
+                self.rate_limiter_throttled_events,
+                previous.rate_limiter_throttled_events,
+            ),
+            update_count: incremental_delta(self.update_count, previous.update_count),
+            update_fails: incremental_delta(self.update_fails, previous.update_fails),
+            read_bytes: incremental_delta(self.read_bytes, previous.read_bytes),
+            write_bytes: incremental_delta(self.write_bytes, previous.write_bytes),
+            read_count: incremental_delta(self.read_count, previous.read_count),
+            write_count: incremental_delta(self.write_count, previous.write_count),
+            read_agg: block_latency_delta(self.read_agg, previous.read_agg),
+            write_agg: block_latency_delta(self.write_agg, previous.write_agg),
+        }
+    }
+
     pub const fn is_empty(self) -> bool {
         self.event_fails == 0
             && self.execute_fails == 0
@@ -1309,6 +1475,21 @@ impl BlockDeviceMetricsByDrive {
         self.metrics
             .iter()
             .map(|(drive_id, metrics)| (drive_id.as_str(), *metrics))
+    }
+
+    fn delta_since(&self, previous: Option<&Self>) -> Self {
+        let metrics = self
+            .metrics
+            .iter()
+            .map(|(drive_id, current)| {
+                let previous = previous
+                    .and_then(|metrics| metrics.metrics.get(drive_id))
+                    .copied()
+                    .unwrap_or_default();
+                (drive_id.clone(), current.delta_since(previous))
+            })
+            .collect();
+        Self { metrics }
     }
 
     fn merged_with(mut self, other: Self) -> Self {
@@ -1649,6 +1830,15 @@ pub struct PmemDeviceMetrics {
     rate_limiter_event_count: u64,
 }
 
+impl_incremental_delta!(PmemDeviceMetrics {
+    activate_fails,
+    cfg_fails,
+    event_fails,
+    queue_event_count,
+    rate_limiter_throttled_events,
+    rate_limiter_event_count,
+});
+
 impl PmemDeviceMetrics {
     pub const fn is_empty(self) -> bool {
         self.activate_fails == 0
@@ -1776,6 +1966,21 @@ impl PmemDeviceMetricsByDevice {
         self.metrics
             .iter()
             .map(|(device_id, metrics)| (device_id.as_str(), *metrics))
+    }
+
+    fn delta_since(&self, previous: Option<&Self>) -> Self {
+        let metrics = self
+            .metrics
+            .iter()
+            .map(|(device_id, current)| {
+                let previous = previous
+                    .and_then(|metrics| metrics.metrics.get(device_id))
+                    .copied()
+                    .unwrap_or_default();
+                (device_id.clone(), current.delta_since(previous))
+            })
+            .collect();
+        Self { metrics }
     }
 
     fn merged_with(mut self, other: Self) -> Self {
@@ -1985,6 +2190,21 @@ pub struct NetworkInterfaceMetrics {
     tx_queue_event_count: u64,
 }
 
+impl_incremental_delta!(NetworkInterfaceMetrics {
+    event_fails,
+    rx_queue_event_count,
+    rx_bytes_count,
+    rx_packets_count,
+    rx_fails,
+    rx_count,
+    tx_bytes_count,
+    tx_malformed_frames,
+    tx_fails,
+    tx_count,
+    tx_packets_count,
+    tx_queue_event_count,
+});
+
 impl NetworkInterfaceMetrics {
     pub const fn is_empty(self) -> bool {
         self.event_fails == 0
@@ -2175,6 +2395,21 @@ impl NetworkInterfaceMetricsByInterface {
         self.metrics
             .iter()
             .map(|(iface_id, metrics)| (iface_id.as_str(), *metrics))
+    }
+
+    fn delta_since(&self, previous: Option<&Self>) -> Self {
+        let metrics = self
+            .metrics
+            .iter()
+            .map(|(iface_id, current)| {
+                let previous = previous
+                    .and_then(|metrics| metrics.metrics.get(iface_id))
+                    .copied()
+                    .unwrap_or_default();
+                (iface_id.clone(), current.delta_since(previous))
+            })
+            .collect();
+        Self { metrics }
     }
 
     fn merged_with(mut self, other: Self) -> Self {
@@ -2477,6 +2712,22 @@ pub struct MmdsMetrics {
     connections_destroyed: u64,
 }
 
+impl_incremental_delta!(MmdsMetrics {
+    rx_accepted,
+    rx_accepted_err,
+    rx_accepted_unusual,
+    rx_bad_eth,
+    rx_invalid_token,
+    rx_no_token,
+    rx_count,
+    tx_bytes,
+    tx_count,
+    tx_errors,
+    tx_frames,
+    connections_created,
+    connections_destroyed,
+});
+
 impl MmdsMetrics {
     pub const fn is_empty(self) -> bool {
         self.rx_accepted == 0
@@ -2747,6 +2998,29 @@ pub struct VsockDeviceMetrics {
     tx_write_fails: u64,
     rx_read_fails: u64,
 }
+
+impl_incremental_delta!(VsockDeviceMetrics {
+    activate_fails,
+    cfg_fails,
+    rx_queue_event_fails,
+    tx_queue_event_fails,
+    ev_queue_event_fails,
+    muxer_event_fails,
+    conn_event_fails,
+    rx_queue_event_count,
+    tx_queue_event_count,
+    rx_bytes_count,
+    tx_bytes_count,
+    rx_packets_count,
+    tx_packets_count,
+    conns_added,
+    conns_killed,
+    conns_removed,
+    killq_resync,
+    tx_flush_fails,
+    tx_write_fails,
+    rx_read_fails,
+});
 
 impl VsockDeviceMetrics {
     pub const fn is_empty(self) -> bool {
@@ -3269,6 +3543,16 @@ pub struct EntropyDeviceMetrics {
     rate_limiter_event_count: u64,
 }
 
+impl_incremental_delta!(EntropyDeviceMetrics {
+    activate_fails,
+    entropy_event_fails,
+    entropy_event_count,
+    entropy_bytes,
+    host_rng_fails,
+    entropy_rate_limiter_throttled,
+    rate_limiter_event_count,
+});
+
 impl EntropyDeviceMetrics {
     pub const fn is_empty(self) -> bool {
         self.activate_fails == 0
@@ -3488,6 +3772,12 @@ pub struct RtcDeviceMetrics {
     missed_write_count: u64,
 }
 
+impl_incremental_delta!(RtcDeviceMetrics {
+    error_count,
+    missed_read_count,
+    missed_write_count,
+});
+
 impl RtcDeviceMetrics {
     pub const fn new(error_count: u64, missed_read_count: u64, missed_write_count: u64) -> Self {
         Self {
@@ -3582,6 +3872,13 @@ pub struct BalloonDiscardMetrics {
     failures: u64,
 }
 
+impl_incremental_delta!(BalloonDiscardMetrics {
+    attempts,
+    advised_bytes,
+    skipped_bytes,
+    failures,
+});
+
 impl BalloonDiscardMetrics {
     pub const fn new(attempts: u64, advised_bytes: u64, skipped_bytes: u64, failures: u64) -> Self {
         Self {
@@ -3645,6 +3942,14 @@ pub struct BalloonFreePageReportMetrics {
     skipped_bytes: u64,
     failures: u64,
 }
+
+impl_incremental_delta!(BalloonFreePageReportMetrics {
+    count,
+    requested_bytes,
+    advised_bytes,
+    skipped_bytes,
+    failures,
+});
 
 impl BalloonFreePageReportMetrics {
     pub const fn new(
@@ -3728,6 +4033,26 @@ pub struct BalloonDeviceMetrics {
 }
 
 impl BalloonDeviceMetrics {
+    const fn delta_since(self, previous: Self) -> Self {
+        Self {
+            activate_fails: incremental_delta(self.activate_fails, previous.activate_fails),
+            inflate_count: incremental_delta(self.inflate_count, previous.inflate_count),
+            stats_updates_count: incremental_delta(
+                self.stats_updates_count,
+                previous.stats_updates_count,
+            ),
+            stats_update_fails: incremental_delta(
+                self.stats_update_fails,
+                previous.stats_update_fails,
+            ),
+            deflate_count: incremental_delta(self.deflate_count, previous.deflate_count),
+            event_fails: incremental_delta(self.event_fails, previous.event_fails),
+            inflate_discard: self.inflate_discard.delta_since(previous.inflate_discard),
+            hinting_discard: self.hinting_discard.delta_since(previous.hinting_discard),
+            free_page_report: self.free_page_report.delta_since(previous.free_page_report),
+        }
+    }
+
     pub const fn new(
         activate_fails: u64,
         inflate_count: u64,
@@ -4261,6 +4586,57 @@ impl MetricsDiagnostics {
         self
     }
 
+    fn delta_since(&self, previous: &Self) -> Self {
+        Self {
+            block_device_metrics: self.block_device_metrics.map(|current| {
+                current.delta_since(previous.block_device_metrics.unwrap_or_default())
+            }),
+            block_device_metrics_by_drive: self.block_device_metrics_by_drive.as_ref().map(
+                |current| current.delta_since(previous.block_device_metrics_by_drive.as_ref()),
+            ),
+            pmem_device_metrics: self.pmem_device_metrics.map(|current| {
+                current.delta_since(previous.pmem_device_metrics.unwrap_or_default())
+            }),
+            pmem_device_metrics_by_device: self.pmem_device_metrics_by_device.as_ref().map(
+                |current| current.delta_since(previous.pmem_device_metrics_by_device.as_ref()),
+            ),
+            network_interface_metrics: self.network_interface_metrics.map(|current| {
+                current.delta_since(previous.network_interface_metrics.unwrap_or_default())
+            }),
+            network_interface_metrics_by_interface: self
+                .network_interface_metrics_by_interface
+                .as_ref()
+                .map(|current| {
+                    current.delta_since(previous.network_interface_metrics_by_interface.as_ref())
+                }),
+            mmds_metrics: self
+                .mmds_metrics
+                .map(|current| current.delta_since(previous.mmds_metrics.unwrap_or_default())),
+            vsock_device_metrics: self.vsock_device_metrics.map(|current| {
+                current.delta_since(previous.vsock_device_metrics.unwrap_or_default())
+            }),
+            entropy_device_metrics: self.entropy_device_metrics.map(|current| {
+                current.delta_since(previous.entropy_device_metrics.unwrap_or_default())
+            }),
+            rtc_device_metrics: self.rtc_device_metrics.map(|current| {
+                current.delta_since(previous.rtc_device_metrics.unwrap_or_default())
+            }),
+            balloon_device_metrics: self.balloon_device_metrics.map(|current| {
+                current.delta_since(previous.balloon_device_metrics.unwrap_or_default())
+            }),
+            boot_run_loop_status: self.boot_run_loop_status,
+            start_time_us: self.start_time_us,
+            start_time_cpu_us: self.start_time_cpu_us,
+            parent_cpu_time_us: self.parent_cpu_time_us,
+            serial_output_metrics: self.serial_output_metrics.map(|current| {
+                current.delta_since(previous.serial_output_metrics.unwrap_or_default())
+            }),
+            signal_metrics: self
+                .signal_metrics
+                .map(|current| current.delta_since(previous.signal_metrics.unwrap_or_default())),
+        }
+    }
+
     pub fn merged_with(mut self, other: Self) -> Self {
         if let Some(metrics) = other.block_device_metrics {
             self.block_device_metrics = Some(match self.block_device_metrics {
@@ -4456,18 +4832,6 @@ trait MetricsOutput: fmt::Debug + Send {
 #[derive(Debug)]
 struct FileMetricsOutput {
     writer: LineWriter<File>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MinimalMetricsSnapshot<'a> {
-    flush_count: u64,
-    diagnostics: &'a MetricsDiagnostics,
-    deprecated_api: DeprecatedApiMetrics,
-    get_api_requests: GetApiRequestMetrics,
-    latencies_us: LatencyMetrics,
-    logger_metrics: LoggerMetrics,
-    patch_api_requests: PatchApiRequestMetrics,
-    put_api_requests: PutApiRequestMetrics,
 }
 
 impl MetricsOutput for FileMetricsOutput {
@@ -4956,10 +5320,9 @@ impl MetricsSink {
 
     fn write_minimal_metrics(
         &mut self,
-        snapshot: MinimalMetricsSnapshot<'_>,
+        snapshot: &MetricsSnapshot,
     ) -> Result<(), MetricsFlushError> {
-        let MinimalMetricsSnapshot {
-            flush_count,
+        let MetricsSnapshot {
             diagnostics,
             deprecated_api,
             get_api_requests,
@@ -4977,7 +5340,7 @@ impl MetricsSink {
         }
         vmm.insert(
             "metrics_flush_count".to_string(),
-            serde_json::Value::Number(flush_count.into()),
+            serde_json::Value::Number(1_u64.into()),
         );
 
         let mut root = serde_json::Map::new();
@@ -5288,7 +5651,7 @@ impl MetricsSink {
         if !latencies_us.is_empty() {
             root.insert(
                 "latencies_us".to_string(),
-                serde_json::Value::Object(latency_metrics_json_object(latencies_us)),
+                serde_json::Value::Object(latency_metrics_json_object(*latencies_us)),
             );
         }
         if let Some(serial_output_metrics) = diagnostics.serial_output_metrics()
@@ -5548,6 +5911,13 @@ mod tests {
                 .fail_next_write = true;
         }
 
+        fn accept_next_write_then_fail(&self) {
+            self.state
+                .lock()
+                .expect("test metrics output lock should not be poisoned")
+                .accept_next_write_then_fail = true;
+        }
+
         fn lines(&self) -> Vec<String> {
             self.state
                 .lock()
@@ -5559,6 +5929,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct TestMetricsOutputState {
+        accept_next_write_then_fail: bool,
         fail_next_write: bool,
         lines: Vec<String>,
     }
@@ -5575,6 +5946,10 @@ mod tests {
             }
 
             state.lines.push(line.to_string());
+            if state.accept_next_write_then_fail {
+                state.accept_next_write_then_fail = false;
+                return Err(MetricsFlushError::Write(ErrorKind::BrokenPipe));
+            }
             Ok(())
         }
     }
@@ -5676,6 +6051,114 @@ mod tests {
             .with_rate_limiter_event_count(7)
     }
 
+    fn serial_metrics_with_scale(scale: u64) -> SerialOutputMetrics {
+        SerialOutputMetrics::default()
+            .with_error_count(scale)
+            .with_flush_count(2 * scale)
+            .with_missed_read_count(3 * scale)
+            .with_missed_write_count(4 * scale)
+            .with_read_count(5 * scale)
+            .with_write_count(6 * scale)
+            .with_rate_limiter_dropped_bytes(7 * scale)
+    }
+
+    fn balloon_metrics_with_all_fields() -> BalloonDeviceMetrics {
+        BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6)
+            .with_discard_metrics(
+                BalloonDiscardMetrics::new(7, 8, 9, 10),
+                BalloonDiscardMetrics::new(11, 12, 13, 14),
+            )
+            .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(15, 16, 17, 18, 19))
+    }
+
+    fn diagnostics_with_all_fields() -> MetricsDiagnostics {
+        let block = block_metrics_with_all_fields();
+        let pmem = pmem_metrics_with_all_fields();
+        let network = network_metrics_with_all_fields();
+
+        MetricsDiagnostics::new()
+            .with_block_device_metrics(block)
+            .with_block_device_metrics_by_drive(
+                BlockDeviceMetricsByDrive::new().with_drive_metrics("rootfs", block),
+            )
+            .with_pmem_device_metrics(pmem)
+            .with_pmem_device_metrics_by_device(
+                PmemDeviceMetricsByDevice::new().with_device_metrics("pmem0", pmem),
+            )
+            .with_network_interface_metrics(network)
+            .with_network_interface_metrics_by_interface(
+                NetworkInterfaceMetricsByInterface::new().with_interface_metrics("eth0", network),
+            )
+            .with_mmds_metrics(mmds_metrics_with_all_fields())
+            .with_vsock_device_metrics(vsock_metrics_with_all_fields())
+            .with_entropy_device_metrics(entropy_metrics_with_all_fields())
+            .with_rtc_device_metrics(RtcDeviceMetrics::new(1, 2, 3))
+            .with_balloon_device_metrics(balloon_metrics_with_all_fields())
+            .with_boot_run_loop_status(BootRunLoopMetricStatus::Running)
+            .with_start_time_us(1_000)
+            .with_start_time_cpu_us(2_000)
+            .with_parent_cpu_time_us(3_000)
+            .with_serial_output_metrics(serial_metrics_with_scale(1))
+            .with_signal_metrics(SignalMetrics::new(8))
+    }
+
+    fn record_all_process_metrics(state: &mut MetricsState) {
+        state.record_deprecated_api_call();
+        state.record_pause_vm_latency_us(101);
+        state.record_resume_vm_latency_us(102);
+        state.record_full_create_snapshot_latency_us(103);
+        state.record_diff_create_snapshot_latency_us(104);
+        state.record_load_snapshot_latency_us(105);
+        state.record_put_actions_request();
+        state.record_put_actions_failure();
+        state.record_put_balloon_request();
+        state.record_put_balloon_failure();
+        state.record_put_boot_source_request();
+        state.record_put_boot_source_failure();
+        state.record_put_cpu_config_request();
+        state.record_put_cpu_config_failure();
+        state.record_put_drive_request();
+        state.record_put_drive_failure();
+        state.record_put_metrics_request();
+        state.record_put_metrics_failure();
+        state.record_put_logger_request();
+        state.record_put_logger_failure();
+        state.record_put_machine_config_request();
+        state.record_put_machine_config_failure();
+        state.record_put_mmds_request();
+        state.record_put_mmds_failure();
+        state.record_put_hotplug_memory_request();
+        state.record_put_hotplug_memory_failure();
+        state.record_put_pmem_request();
+        state.record_put_pmem_failure();
+        state.record_put_network_request();
+        state.record_put_network_failure();
+        state.record_put_serial_request();
+        state.record_put_serial_failure();
+        state.record_put_vsock_request();
+        state.record_put_vsock_failure();
+        state.record_patch_drive_request();
+        state.record_patch_drive_failure();
+        state.record_patch_balloon_request();
+        state.record_patch_balloon_failure();
+        state.record_patch_network_request();
+        state.record_patch_network_failure();
+        state.record_patch_machine_config_request();
+        state.record_patch_machine_config_failure();
+        state.record_patch_mmds_request();
+        state.record_patch_mmds_failure();
+        state.record_patch_hotplug_memory_request();
+        state.record_patch_hotplug_memory_failure();
+        state.record_patch_pmem_request();
+        state.record_patch_pmem_failure();
+        state.record_get_balloon_request();
+        state.record_get_instance_info_request();
+        state.record_get_vmm_version_request();
+        state.record_get_machine_config_request();
+        state.record_get_mmds_request();
+        state.record_get_hotplug_memory_request();
+    }
+
     #[test]
     fn validates_metrics_path() {
         let config = MetricsConfigInput::new("/tmp/metrics")
@@ -5696,9 +6179,20 @@ mod tests {
     #[test]
     fn flush_without_configuration_is_noop() {
         let mut state = MetricsState::default();
+        state.record_deprecated_api_call();
 
         assert_eq!(state.flush(), Ok(false));
         assert!(!state.is_configured());
+
+        let output = TestMetricsOutput::default();
+        state.sink = Some(super::MetricsSink::new(Box::new(output.clone())));
+        assert_eq!(state.flush(), Ok(true));
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
     }
 
     #[test]
@@ -5716,17 +6210,176 @@ mod tests {
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
             output,
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":2}}\n"
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");
     }
 
     #[test]
-    fn failed_flush_records_missed_metrics_without_incrementing_flush_count() {
+    fn repeated_flushes_emit_all_increment_fields_and_preserve_stores() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let shared_logger_metrics = SharedLoggerMetrics::default();
+        state.shared_logger_metrics = shared_logger_metrics.clone();
+        let first = diagnostics_with_all_fields();
+        let next = first
+            .clone()
+            .merged_with(first.clone())
+            .with_serial_output_metrics(serial_metrics_with_scale(2));
+
+        record_all_process_metrics(&mut state);
+        shared_logger_metrics.record_missed_log();
+        shared_logger_metrics.record_rate_limited_log();
+        assert_eq!(state.flush_with_diagnostics(&first), Ok(true));
+        assert_eq!(state.flush_with_diagnostics(&first), Ok(true));
+
+        record_all_process_metrics(&mut state);
+        shared_logger_metrics.record_missed_log();
+        shared_logger_metrics.record_rate_limited_log();
+        assert_eq!(state.flush_with_diagnostics(&next), Ok(true));
+
+        let lines = output.lines();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], lines[2]);
+
+        let unchanged: serde_json::Value =
+            serde_json::from_str(&lines[1]).expect("metrics line should be valid JSON");
+        let root = unchanged
+            .as_object()
+            .expect("metrics line root should be an object");
+        assert_eq!(root.len(), 5);
+        assert!(root.contains_key("api_server"));
+        assert!(root.contains_key("block"));
+        assert!(root.contains_key("block_rootfs"));
+        assert!(root.contains_key("latencies_us"));
+        assert!(root.contains_key("vmm"));
+        assert_eq!(unchanged["api_server"]["process_startup_time_us"], 1_000);
+        assert_eq!(
+            unchanged["api_server"]["process_startup_time_cpu_us"],
+            5_000
+        );
+        assert_eq!(unchanged["block"]["read_agg"]["min_us"], 12);
+        assert_eq!(unchanged["block"]["read_agg"]["max_us"], 30);
+        assert_eq!(unchanged["block"]["read_agg"]["sum_us"], 0);
+        assert_eq!(unchanged["block"]["write_agg"]["min_us"], 13);
+        assert_eq!(unchanged["block"]["write_agg"]["max_us"], 31);
+        assert_eq!(unchanged["block"]["write_agg"]["sum_us"], 0);
+        assert_eq!(unchanged["latencies_us"]["pause_vm"], 101);
+        assert_eq!(unchanged["latencies_us"]["resume_vm"], 102);
+        assert_eq!(unchanged["vmm"]["boot_run_loop_status"], "running");
+        assert_eq!(unchanged["vmm"]["metrics_flush_count"], 1);
+    }
+
+    #[test]
+    fn incremental_counters_handle_saturation_and_lower_generations() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+
+        state.deprecated_api.deprecated_http_api_calls = u64::MAX - 1;
+        assert_eq!(state.flush(), Ok(true));
+        state.deprecated_api.deprecated_http_api_calls = u64::MAX;
+        assert_eq!(state.flush(), Ok(true));
+        assert_eq!(state.flush(), Ok(true));
+        state.deprecated_api.deprecated_http_api_calls = 2;
+        assert_eq!(state.flush(), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                format!(
+                    r#"{{"deprecated_api":{{"deprecated_http_api_calls":{}}},"vmm":{{"metrics_flush_count":1}}}}"#,
+                    u64::MAX - 1
+                ),
+                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"vmm":{"metrics_flush_count":1}}"#.to_owned(),
+                r#"{"vmm":{"metrics_flush_count":1}}"#.to_owned(),
+                r#"{"deprecated_api":{"deprecated_http_api_calls":2},"vmm":{"metrics_flush_count":1}}"#.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn keyed_metrics_track_new_disappeared_reappearing_and_lower_generations() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let first = MetricsDiagnostics::new().with_block_device_metrics_by_drive(
+            BlockDeviceMetricsByDrive::new()
+                .with_drive_metrics("data", BlockDeviceMetrics::default().with_update_count(5))
+                .with_drive_metrics("gone", BlockDeviceMetrics::default().with_update_count(7)),
+        );
+        let second = MetricsDiagnostics::new().with_block_device_metrics_by_drive(
+            BlockDeviceMetricsByDrive::new()
+                .with_drive_metrics("data", BlockDeviceMetrics::default().with_update_count(8))
+                .with_drive_metrics("new", BlockDeviceMetrics::default().with_update_count(2)),
+        );
+        let third = MetricsDiagnostics::new().with_block_device_metrics_by_drive(
+            BlockDeviceMetricsByDrive::new()
+                .with_drive_metrics("data", BlockDeviceMetrics::default().with_update_count(1))
+                .with_drive_metrics("gone", BlockDeviceMetrics::default().with_update_count(4)),
+        );
+
+        assert_eq!(state.flush_with_diagnostics(&first), Ok(true));
+        assert_eq!(state.flush_with_diagnostics(&second), Ok(true));
+        assert_eq!(state.flush_with_diagnostics(&third), Ok(true));
+        assert_eq!(state.flush_with_diagnostics(&third), Ok(true));
+
+        let lines = output.lines();
+        let values: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("metrics line should be valid JSON"))
+            .collect();
+        assert_eq!(values[0]["block_data"]["update_count"], 5);
+        assert_eq!(values[0]["block_gone"]["update_count"], 7);
+        let data_position = lines[0]
+            .find("block_data")
+            .expect("data key should be serialized");
+        let gone_position = lines[0]
+            .find("block_gone")
+            .expect("gone key should be serialized");
+        assert!(data_position < gone_position);
+        assert_eq!(values[1]["block_data"]["update_count"], 3);
+        assert_eq!(values[1]["block_new"]["update_count"], 2);
+        assert!(values[1].get("block_gone").is_none());
+        assert_eq!(values[2]["block_data"]["update_count"], 1);
+        assert_eq!(values[2]["block_gone"]["update_count"], 4);
+        assert!(values[2].get("block_new").is_none());
+        assert_eq!(
+            values[3],
+            serde_json::json!({"vmm": {"metrics_flush_count": 1}})
+        );
+    }
+
+    #[test]
+    fn independent_metrics_states_do_not_consume_each_others_deltas() {
+        let first_output = TestMetricsOutput::default();
+        let second_output = TestMetricsOutput::default();
+        let shared_logger_metrics = SharedLoggerMetrics::default();
+        let mut first = MetricsState::with_test_output(first_output.clone());
+        let mut second = MetricsState::with_test_output(second_output.clone());
+        first.shared_logger_metrics = shared_logger_metrics.clone();
+        second.shared_logger_metrics = shared_logger_metrics.clone();
+
+        shared_logger_metrics.record_missed_log();
+        assert_eq!(first.flush(), Ok(true));
+        assert_eq!(second.flush(), Ok(true));
+        shared_logger_metrics.record_missed_log();
+        assert_eq!(first.flush(), Ok(true));
+        assert_eq!(second.flush(), Ok(true));
+
+        let expected = [
+            r#"{"logger":{"missed_log_count":1},"vmm":{"metrics_flush_count":1}}"#,
+            r#"{"logger":{"missed_log_count":1},"vmm":{"metrics_flush_count":1}}"#,
+        ];
+        assert_eq!(first_output.lines(), expected);
+        assert_eq!(second_output.lines(), expected);
+    }
+
+    #[test]
+    fn failed_first_flush_replays_counters_and_records_missed_metrics() {
         let output = TestMetricsOutput::default();
         output.fail_next_write();
         let mut state = MetricsState::with_test_output(output.clone());
+        state.record_deprecated_api_call();
 
         assert_eq!(
             state.flush(),
@@ -5736,7 +6389,9 @@ mod tests {
 
         assert_eq!(
             output.lines(),
-            [r#"{"logger":{"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#]
+            [
+                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"logger":{"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#
+            ]
         );
     }
 
@@ -5760,6 +6415,54 @@ mod tests {
         assert_eq!(
             output.lines(),
             [r#"{"logger":{"missed_metrics_count":2},"vmm":{"metrics_flush_count":1}}"#]
+        );
+    }
+
+    #[test]
+    fn failed_middle_flush_retains_the_previous_successful_baseline() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+
+        state.record_deprecated_api_call();
+        assert_eq!(state.flush(), Ok(true));
+        state.record_deprecated_api_call();
+        output.fail_next_write();
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        state.record_deprecated_api_call();
+        assert_eq!(state.flush(), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"vmm":{"metrics_flush_count":1}}"#,
+                r#"{"deprecated_api":{"deprecated_http_api_calls":2},"logger":{"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn ambiguous_accepted_failure_replays_at_least_once() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+
+        state.record_deprecated_api_call();
+        output.accept_next_write_then_fail();
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        state.record_deprecated_api_call();
+        assert_eq!(state.flush(), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"vmm":{"metrics_flush_count":1}}"#,
+                r#"{"deprecated_api":{"deprecated_http_api_calls":2},"logger":{"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#,
+            ]
         );
     }
 
