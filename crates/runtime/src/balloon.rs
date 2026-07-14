@@ -5,7 +5,8 @@ use std::fmt;
 
 use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
-    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryDiscardAdviser,
+    GuestMemoryDiscardOutcome, GuestMemoryError, GuestMemoryRange, SystemGuestMemoryDiscardAdviser,
 };
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
@@ -1350,6 +1351,16 @@ impl VirtioBalloonPfnRange {
     fn end_pfn_exclusive(self) -> u64 {
         u64::from(self.start_pfn) + u64::from(self.page_count)
     }
+
+    fn guest_memory_range(self) -> Result<Option<GuestMemoryRange>, GuestMemoryError> {
+        if self.page_count == 0 {
+            return Ok(None);
+        }
+
+        let start = u64::from(self.start_pfn) * VIRTIO_BALLOON_PAGE_SIZE;
+        let size = u64::from(self.page_count) * VIRTIO_BALLOON_PAGE_SIZE;
+        GuestMemoryRange::new(GuestAddress::new(start), size).map(Some)
+    }
 }
 
 impl fmt::Display for VirtioBalloonPfnRange {
@@ -1684,14 +1695,12 @@ fn validate_pfn_range_mapped(
     memory: &GuestMemory,
     pfn_range: VirtioBalloonPfnRange,
 ) -> Result<(), VirtioBalloonPfnRangeAccessError> {
-    if pfn_range.page_count() == 0 {
+    let Some(guest_range) = pfn_range
+        .guest_memory_range()
+        .map_err(|source| VirtioBalloonPfnRangeAccessError::GuestRange { pfn_range, source })?
+    else {
         return Ok(());
-    }
-
-    let start = u64::from(pfn_range.start_pfn()) * VIRTIO_BALLOON_PAGE_SIZE;
-    let size = u64::from(pfn_range.page_count()) * VIRTIO_BALLOON_PAGE_SIZE;
-    let guest_range = GuestMemoryRange::new(GuestAddress::new(start), size)
-        .map_err(|source| VirtioBalloonPfnRangeAccessError::GuestRange { pfn_range, source })?;
+    };
 
     memory.validate_mapped_range(guest_range).map_err(|source| {
         VirtioBalloonPfnRangeAccessError::GuestMemory {
@@ -2448,6 +2457,15 @@ impl VirtioBalloonQueue {
         &mut self,
         memory: &mut GuestMemory,
     ) -> Result<VirtioBalloonQueueDispatch, VirtioBalloonQueueDispatchError> {
+        let mut adviser = SystemGuestMemoryDiscardAdviser;
+        self.dispatch_inflate_with_adviser(memory, &mut adviser)
+    }
+
+    fn dispatch_inflate_with_adviser(
+        &mut self,
+        memory: &mut GuestMemory,
+        adviser: &mut impl GuestMemoryDiscardAdviser,
+    ) -> Result<VirtioBalloonQueueDispatch, VirtioBalloonQueueDispatchError> {
         let mut dispatch = VirtioBalloonQueueDispatch::default();
 
         while let Some(chain) = self
@@ -2497,7 +2515,8 @@ impl VirtioBalloonQueue {
                     descriptor_head,
                     source,
                 })?;
-            dispatch.record_inflate_descriptor(pfn_ranges.ranges(), publication);
+            let discard = discard_balloon_pfn_ranges(memory, pfn_ranges.ranges(), adviser);
+            dispatch.record_inflate_descriptor(pfn_ranges.ranges(), discard, publication);
         }
 
         Ok(dispatch)
@@ -2602,6 +2621,16 @@ impl VirtioBalloonQueue {
         memory: &mut GuestMemory,
         context: VirtioBalloonHintingDispatchContext,
     ) -> Result<VirtioBalloonQueueDispatch, VirtioBalloonQueueDispatchError> {
+        let mut adviser = SystemGuestMemoryDiscardAdviser;
+        self.dispatch_hinting_commands_with_adviser(memory, context, &mut adviser)
+    }
+
+    fn dispatch_hinting_commands_with_adviser(
+        &mut self,
+        memory: &mut GuestMemory,
+        context: VirtioBalloonHintingDispatchContext,
+        adviser: &mut impl GuestMemoryDiscardAdviser,
+    ) -> Result<VirtioBalloonQueueDispatch, VirtioBalloonQueueDispatchError> {
         let mut dispatch = VirtioBalloonQueueDispatch::default();
         let mut current_guest_cmd = context.guest_cmd();
 
@@ -2655,11 +2684,48 @@ impl VirtioBalloonQueue {
             if let Some(guest_cmd) = descriptor_dispatch.guest_cmd() {
                 current_guest_cmd = Some(guest_cmd);
             }
-            dispatch.record_hinting_descriptor(descriptor_dispatch, publication);
+            let discard = discard_balloon_guest_ranges(
+                memory,
+                descriptor_dispatch.hinting_page_ranges(),
+                adviser,
+            );
+            dispatch.record_hinting_descriptor(descriptor_dispatch, discard, publication);
         }
 
         Ok(dispatch)
     }
+}
+
+fn discard_balloon_pfn_ranges(
+    memory: &GuestMemory,
+    ranges: &[VirtioBalloonPfnRange],
+    adviser: &mut impl GuestMemoryDiscardAdviser,
+) -> VirtioBalloonDiscardOutcome {
+    let mut discard = VirtioBalloonDiscardOutcome::default();
+    for pfn_range in ranges.iter().copied() {
+        match pfn_range.guest_memory_range() {
+            Ok(Some(guest_range)) => discard.record_guest_memory_outcome(
+                memory.discard_range_with_adviser(guest_range, adviser),
+            ),
+            Ok(None) => {}
+            Err(_) => discard.record_failed_conversion(
+                u64::from(pfn_range.page_count()).saturating_mul(VIRTIO_BALLOON_PAGE_SIZE),
+            ),
+        }
+    }
+    discard
+}
+
+fn discard_balloon_guest_ranges(
+    memory: &GuestMemory,
+    ranges: &[GuestMemoryRange],
+    adviser: &mut impl GuestMemoryDiscardAdviser,
+) -> VirtioBalloonDiscardOutcome {
+    let mut discard = VirtioBalloonDiscardOutcome::default();
+    for range in ranges.iter().copied() {
+        discard.record_guest_memory_outcome(memory.discard_range_with_adviser(range, adviser));
+    }
+    discard
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2711,6 +2777,80 @@ impl VirtioBalloonHintingDispatchContext {
     }
 }
 
+/// Aggregates best-effort host-discard work for one balloon queue dispatch.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBalloonDiscardOutcome {
+    attempts: u64,
+    requested_bytes: u64,
+    advised_bytes: u64,
+    skipped_bytes: u64,
+    failed_bytes: u64,
+    failures: u64,
+}
+
+impl VirtioBalloonDiscardOutcome {
+    /// Returns the number of accepted guest ranges passed to discard.
+    pub const fn attempts(self) -> u64 {
+        self.attempts
+    }
+
+    /// Returns the total bytes requested by accepted guest ranges.
+    pub const fn requested_bytes(self) -> u64 {
+        self.requested_bytes
+    }
+
+    /// Returns bytes whose aligned host interiors completed zero and free advice.
+    pub const fn advised_bytes(self) -> u64 {
+        self.advised_bytes
+    }
+
+    /// Returns partial host-page edge bytes skipped by discard.
+    pub const fn skipped_bytes(self) -> u64 {
+        self.skipped_bytes
+    }
+
+    /// Returns bytes that did not complete zero and free advice.
+    pub const fn failed_bytes(self) -> u64 {
+        self.failed_bytes
+    }
+
+    /// Returns accepted guest-range attempts that had any discard failure.
+    pub const fn failures(self) -> u64 {
+        self.failures
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            attempts: self.attempts.saturating_add(other.attempts),
+            requested_bytes: self.requested_bytes.saturating_add(other.requested_bytes),
+            advised_bytes: self.advised_bytes.saturating_add(other.advised_bytes),
+            skipped_bytes: self.skipped_bytes.saturating_add(other.skipped_bytes),
+            failed_bytes: self.failed_bytes.saturating_add(other.failed_bytes),
+            failures: self.failures.saturating_add(other.failures),
+        }
+    }
+
+    fn record_guest_memory_outcome(&mut self, outcome: GuestMemoryDiscardOutcome) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.requested_bytes = self
+            .requested_bytes
+            .saturating_add(outcome.requested_bytes());
+        self.advised_bytes = self.advised_bytes.saturating_add(outcome.advised_bytes());
+        self.skipped_bytes = self.skipped_bytes.saturating_add(outcome.skipped_bytes());
+        self.failed_bytes = self.failed_bytes.saturating_add(outcome.failed_bytes());
+        if !outcome.is_complete() {
+            self.failures = self.failures.saturating_add(1);
+        }
+    }
+
+    fn record_failed_conversion(&mut self, requested_bytes: u64) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.requested_bytes = self.requested_bytes.saturating_add(requested_bytes);
+        self.failed_bytes = self.failed_bytes.saturating_add(requested_bytes);
+        self.failures = self.failures.saturating_add(1);
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct VirtioBalloonQueueDispatch {
     completed_descriptors: usize,
@@ -2722,6 +2862,8 @@ pub struct VirtioBalloonQueueDispatch {
     statistics_oversized_reports: usize,
     statistics_pending_descriptor_head: Option<u16>,
     hinting_page_ranges: Vec<GuestMemoryRange>,
+    inflate_discard: VirtioBalloonDiscardOutcome,
+    hinting_discard: VirtioBalloonDiscardOutcome,
     hinting_guest_cmd: Option<u32>,
     hinting_completed_run: bool,
 }
@@ -2763,6 +2905,14 @@ impl VirtioBalloonQueueDispatch {
         &self.hinting_page_ranges
     }
 
+    pub const fn inflate_discard(&self) -> VirtioBalloonDiscardOutcome {
+        self.inflate_discard
+    }
+
+    pub const fn hinting_discard(&self) -> VirtioBalloonDiscardOutcome {
+        self.hinting_discard
+    }
+
     pub const fn hinting_guest_cmd(&self) -> Option<u32> {
         self.hinting_guest_cmd
     }
@@ -2786,11 +2936,13 @@ impl VirtioBalloonQueueDispatch {
     fn record_inflate_descriptor(
         &mut self,
         ranges: &[VirtioBalloonPfnRange],
+        discard: VirtioBalloonDiscardOutcome,
         publication: VirtqueueUsedRingPublication,
     ) {
         self.completed_descriptors += 1;
         self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         self.inflated_page_ranges.extend_from_slice(ranges);
+        self.inflate_discard = self.inflate_discard.merged_with(discard);
     }
 
     fn record_deflate_descriptor(
@@ -2829,12 +2981,14 @@ impl VirtioBalloonQueueDispatch {
     fn record_hinting_descriptor(
         &mut self,
         mut descriptor_dispatch: VirtioBalloonHintingDescriptorDispatch,
+        discard: VirtioBalloonDiscardOutcome,
         publication: VirtqueueUsedRingPublication,
     ) {
         self.completed_descriptors += 1;
         self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         self.hinting_page_ranges
             .append(&mut descriptor_dispatch.hinting_page_ranges);
+        self.hinting_discard = self.hinting_discard.merged_with(discard);
         if let Some(guest_cmd) = descriptor_dispatch.guest_cmd {
             self.hinting_guest_cmd = Some(guest_cmd);
             self.hinting_completed_run = is_completed_balloon_hinting_guest_cmd(guest_cmd);
@@ -4678,12 +4832,16 @@ fn balloon_config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceC
 mod tests {
     use super::*;
 
+    use std::ffi::c_void;
+    use std::io;
+    use std::ptr::NonNull;
+
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{
-        GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
-        GuestMemoryRange,
+        GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryDiscardFailureKind,
+        GuestMemoryError, GuestMemoryLayout, GuestMemoryRange,
     };
-    use crate::metrics::{BalloonDeviceMetrics, SharedBalloonDeviceMetrics};
+    use crate::metrics::{BalloonDeviceMetrics, BalloonDiscardMetrics, SharedBalloonDeviceMetrics};
     use crate::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -4711,6 +4869,61 @@ mod tests {
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
     const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+
+    #[derive(Debug)]
+    struct TestBalloonDiscardAdviser {
+        page_size: u64,
+        zero_calls: usize,
+        free_calls: usize,
+        fail_zero: bool,
+        fail_free: bool,
+    }
+
+    impl TestBalloonDiscardAdviser {
+        const fn new(page_size: u64) -> Self {
+            Self {
+                page_size,
+                zero_calls: 0,
+                free_calls: 0,
+                fail_zero: false,
+                fail_free: false,
+            }
+        }
+
+        const fn with_zero_failure(mut self) -> Self {
+            self.fail_zero = true;
+            self
+        }
+
+        const fn with_free_failure(mut self) -> Self {
+            self.fail_free = true;
+            self
+        }
+    }
+
+    impl GuestMemoryDiscardAdviser for TestBalloonDiscardAdviser {
+        fn host_page_size(&mut self) -> Result<u64, GuestMemoryDiscardFailureKind> {
+            Ok(self.page_size)
+        }
+
+        fn zero(&mut self, _address: NonNull<c_void>, _size: usize) -> io::Result<()> {
+            self.zero_calls += 1;
+            if self.fail_zero {
+                Err(io::Error::other("injected balloon zero failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn free(&mut self, _address: NonNull<c_void>, _size: usize) -> io::Result<()> {
+            self.free_calls += 1;
+            if self.fail_free {
+                Err(io::Error::other("injected balloon free failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     fn balloon_config(
         amount_mib: u32,
@@ -6433,6 +6646,114 @@ mod tests {
     }
 
     #[test]
+    fn inflate_queue_dispatch_records_successful_discard_outcome() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[40, 41, 42, 43]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_inflate_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(&mut memory, inflate_available_ring(), &[0]);
+        let mut queue = inflate_queue();
+        let mut adviser = TestBalloonDiscardAdviser::new(VIRTIO_BALLOON_PAGE_SIZE);
+
+        let dispatch = queue
+            .dispatch_inflate_with_adviser(&mut memory, &mut adviser)
+            .expect("inflate descriptor should dispatch with injected advice");
+
+        assert_eq!(dispatch.completed_descriptors(), 1);
+        assert_eq!(
+            dispatch.inflate_discard(),
+            VirtioBalloonDiscardOutcome {
+                attempts: 1,
+                requested_bytes: VIRTIO_BALLOON_PAGE_SIZE * 4,
+                advised_bytes: VIRTIO_BALLOON_PAGE_SIZE * 4,
+                skipped_bytes: 0,
+                failed_bytes: 0,
+                failures: 0,
+            }
+        );
+        assert_eq!(adviser.zero_calls, 1);
+        assert_eq!(adviser.free_calls, 1);
+        assert_eq!(read_used_idx(&memory, inflate_used_ring()), 1);
+    }
+
+    #[test]
+    fn inflate_queue_discard_failure_preserves_completion_and_accounting() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[44]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_inflate_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(&mut memory, inflate_available_ring(), &[0]);
+        let mut queue = inflate_queue();
+        let mut adviser =
+            TestBalloonDiscardAdviser::new(VIRTIO_BALLOON_PAGE_SIZE).with_zero_failure();
+
+        let dispatch = queue
+            .dispatch_inflate_with_adviser(&mut memory, &mut adviser)
+            .expect("advice failure should not fail inflate dispatch");
+        let mut accounting = VirtioBalloonMemoryAccounting::new();
+        apply_balloon_queue_accounting(&mut accounting, VirtioBalloonQueueKind::Inflate, &dispatch)
+            .expect("completed inflate should still update accounting");
+
+        assert_eq!(dispatch.completed_descriptors(), 1);
+        assert_eq!(
+            dispatch.inflate_discard(),
+            VirtioBalloonDiscardOutcome {
+                attempts: 1,
+                requested_bytes: VIRTIO_BALLOON_PAGE_SIZE,
+                advised_bytes: 0,
+                skipped_bytes: 0,
+                failed_bytes: VIRTIO_BALLOON_PAGE_SIZE,
+                failures: 1,
+            }
+        );
+        assert_eq!(adviser.zero_calls, 1);
+        assert_eq!(adviser.free_calls, 0);
+        assert_eq!(accounting.inflated_page_count(), 1);
+        assert_eq!(read_used_idx(&memory, inflate_used_ring()), 1);
+    }
+
+    #[test]
+    fn inflate_queue_later_error_preserves_completed_discard_outcome() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[48]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_inflate_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(&mut memory, inflate_available_ring(), &[0, TEST_QUEUE_SIZE]);
+        let mut queue = inflate_queue();
+        let mut adviser = TestBalloonDiscardAdviser::new(VIRTIO_BALLOON_PAGE_SIZE);
+
+        let error = queue
+            .dispatch_inflate_with_adviser(&mut memory, &mut adviser)
+            .expect_err("invalid later head should retain completed discard");
+
+        assert_eq!(error.completed_dispatch().completed_descriptors(), 1);
+        assert_eq!(
+            error.completed_dispatch().inflate_discard(),
+            VirtioBalloonDiscardOutcome {
+                attempts: 1,
+                requested_bytes: VIRTIO_BALLOON_PAGE_SIZE,
+                advised_bytes: VIRTIO_BALLOON_PAGE_SIZE,
+                skipped_bytes: 0,
+                failed_bytes: 0,
+                failures: 0,
+            }
+        );
+        assert_eq!(read_used_idx(&memory, inflate_used_ring()), 1);
+    }
+
+    #[test]
     fn inflate_queue_dispatch_reads_split_descriptor_payload() {
         let mut memory = pfn_descriptor_memory();
         let bytes = pfn_payload_bytes(&[5, 6, 8]);
@@ -7430,6 +7751,70 @@ mod tests {
     }
 
     #[test]
+    fn hinting_queue_discard_failure_preserves_active_range_completion() {
+        let mut memory = pfn_descriptor_memory();
+        let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
+        let command = 17_u32;
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &command.to_le_bytes());
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            0,
+            TestDescriptor::readable(
+                TEST_PFN_DATA,
+                VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32,
+                Some(1),
+            ),
+        );
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            1,
+            TestDescriptor::readable(
+                TEST_PFN_DATA_SPLIT,
+                u32::try_from(VIRTIO_BALLOON_PAGE_SIZE).expect("page size should fit u32"),
+                None,
+            ),
+        );
+        write_available_heads(&mut memory, queue_available_ring(queue_index), &[0]);
+        let mut queue = hinting_queue(queue_index);
+        let mut adviser =
+            TestBalloonDiscardAdviser::new(VIRTIO_BALLOON_PAGE_SIZE).with_free_failure();
+
+        let dispatch = queue
+            .dispatch_hinting_commands_with_adviser(
+                &mut memory,
+                hinting_context(command, None),
+                &mut adviser,
+            )
+            .expect("advice failure should not fail active hint dispatch");
+
+        assert_eq!(dispatch.completed_descriptors(), 1);
+        assert_eq!(dispatch.hinting_guest_cmd(), Some(command));
+        assert_eq!(
+            dispatch.hinting_page_ranges(),
+            &[
+                GuestMemoryRange::new(TEST_PFN_DATA_SPLIT, VIRTIO_BALLOON_PAGE_SIZE)
+                    .expect("test range should be valid")
+            ]
+        );
+        assert_eq!(
+            dispatch.hinting_discard(),
+            VirtioBalloonDiscardOutcome {
+                attempts: 1,
+                requested_bytes: VIRTIO_BALLOON_PAGE_SIZE,
+                advised_bytes: 0,
+                skipped_bytes: 0,
+                failed_bytes: VIRTIO_BALLOON_PAGE_SIZE,
+                failures: 1,
+            }
+        );
+        assert_eq!(adviser.zero_calls, 1);
+        assert_eq!(adviser.free_calls, 1);
+        assert_eq!(read_used_idx(&memory, queue_used_ring(queue_index)), 1);
+    }
+
+    #[test]
     fn hinting_queue_dispatch_records_range_from_context_guest_command() {
         let mut memory = pfn_descriptor_memory();
         let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
@@ -7562,6 +7947,7 @@ mod tests {
         assert_eq!(dispatch.completed_descriptors(), 1);
         assert_eq!(dispatch.hinting_guest_cmd(), Some(command));
         assert!(dispatch.hinting_page_ranges().is_empty());
+        assert_eq!(dispatch.hinting_discard().attempts(), 0);
         assert_eq!(read_used_idx(&memory, queue_used_ring(queue_index)), 1);
     }
 
@@ -8816,6 +9202,55 @@ mod tests {
                     page_count: 1,
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn balloon_metrics_record_distinct_inflate_and_hinting_discard_outcomes() {
+        let dispatch = VirtioBalloonDeviceNotificationDispatch {
+            drained_notifications: vec![
+                VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+                VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            ],
+            inflate_notifications: 1,
+            deflate_notifications: 0,
+            statistics_notifications: 0,
+            hinting_notifications: 1,
+            inflate_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                inflate_discard: VirtioBalloonDiscardOutcome {
+                    attempts: 2,
+                    requested_bytes: 16_384,
+                    advised_bytes: 8192,
+                    skipped_bytes: 4096,
+                    failed_bytes: 4096,
+                    failures: 1,
+                },
+                ..Default::default()
+            }),
+            deflate_queue_dispatch: None,
+            statistics_queue_dispatch: None,
+            hinting_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                hinting_discard: VirtioBalloonDiscardOutcome {
+                    attempts: 3,
+                    requested_bytes: 24_576,
+                    advised_bytes: 16_384,
+                    skipped_bytes: 8192,
+                    failed_bytes: 0,
+                    failures: 0,
+                },
+                ..Default::default()
+            }),
+        };
+        let metrics = SharedBalloonDeviceMetrics::default();
+
+        metrics.record_notification_dispatch(&dispatch);
+
+        assert_eq!(
+            metrics.snapshot(),
+            BalloonDeviceMetrics::new(0, 1, 0, 0, 0, 0).with_discard_metrics(
+                BalloonDiscardMetrics::new(2, 8192, 4096, 1),
+                BalloonDiscardMetrics::new(3, 16_384, 8192, 0),
+            )
         );
     }
 

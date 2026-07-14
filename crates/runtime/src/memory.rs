@@ -156,6 +156,186 @@ impl GuestMemoryLayout {
     }
 }
 
+/// Classifies a guest-memory discard failure without exposing a host address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestMemoryDiscardFailureKind {
+    /// The requested guest range was not fully backed by owned memory regions.
+    RangeValidation,
+    /// The current target has no supported zero-safe discard implementation.
+    UnsupportedTarget,
+    /// The host page size was unavailable, invalid, or not representable.
+    InvalidHostPageSize,
+    /// A bounded host-address calculation could not be represented.
+    HostAddress,
+    /// Zeroing a host-page-aligned interior failed.
+    ZeroAdvice,
+    /// Marking a successfully zeroed interior as free failed.
+    FreeAdvice,
+}
+
+/// Redacted failure counts from one guest-memory discard attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuestMemoryDiscardFailures {
+    range_validation: u64,
+    unsupported_target: u64,
+    invalid_host_page_size: u64,
+    host_address: u64,
+    zero_advice: u64,
+    free_advice: u64,
+}
+
+impl GuestMemoryDiscardFailures {
+    /// Returns the number of failures in one class.
+    pub const fn count(self, kind: GuestMemoryDiscardFailureKind) -> u64 {
+        match kind {
+            GuestMemoryDiscardFailureKind::RangeValidation => self.range_validation,
+            GuestMemoryDiscardFailureKind::UnsupportedTarget => self.unsupported_target,
+            GuestMemoryDiscardFailureKind::InvalidHostPageSize => self.invalid_host_page_size,
+            GuestMemoryDiscardFailureKind::HostAddress => self.host_address,
+            GuestMemoryDiscardFailureKind::ZeroAdvice => self.zero_advice,
+            GuestMemoryDiscardFailureKind::FreeAdvice => self.free_advice,
+        }
+    }
+
+    /// Returns the total number of classified failures.
+    pub const fn total(self) -> u64 {
+        self.range_validation
+            .saturating_add(self.unsupported_target)
+            .saturating_add(self.invalid_host_page_size)
+            .saturating_add(self.host_address)
+            .saturating_add(self.zero_advice)
+            .saturating_add(self.free_advice)
+    }
+
+    const fn with_failure(mut self, kind: GuestMemoryDiscardFailureKind) -> Self {
+        match kind {
+            GuestMemoryDiscardFailureKind::RangeValidation => {
+                self.range_validation = self.range_validation.saturating_add(1);
+            }
+            GuestMemoryDiscardFailureKind::UnsupportedTarget => {
+                self.unsupported_target = self.unsupported_target.saturating_add(1);
+            }
+            GuestMemoryDiscardFailureKind::InvalidHostPageSize => {
+                self.invalid_host_page_size = self.invalid_host_page_size.saturating_add(1);
+            }
+            GuestMemoryDiscardFailureKind::HostAddress => {
+                self.host_address = self.host_address.saturating_add(1);
+            }
+            GuestMemoryDiscardFailureKind::ZeroAdvice => {
+                self.zero_advice = self.zero_advice.saturating_add(1);
+            }
+            GuestMemoryDiscardFailureKind::FreeAdvice => {
+                self.free_advice = self.free_advice.saturating_add(1);
+            }
+        }
+        self
+    }
+}
+
+impl fmt::Display for GuestMemoryDiscardFailures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "guest memory discard failures: range_validation={}, unsupported_target={}, invalid_host_page_size={}, host_address={}, zero_advice={}, free_advice={}",
+            self.range_validation,
+            self.unsupported_target,
+            self.invalid_host_page_size,
+            self.host_address,
+            self.zero_advice,
+            self.free_advice
+        )
+    }
+}
+
+/// Byte accounting and redacted failures from one guest-memory discard attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestMemoryDiscardOutcome {
+    requested_bytes: u64,
+    advised_bytes: u64,
+    skipped_bytes: u64,
+    failed_bytes: u64,
+    failures: GuestMemoryDiscardFailures,
+}
+
+impl GuestMemoryDiscardOutcome {
+    const fn new(requested_bytes: u64) -> Self {
+        Self {
+            requested_bytes,
+            advised_bytes: 0,
+            skipped_bytes: 0,
+            failed_bytes: 0,
+            failures: GuestMemoryDiscardFailures {
+                range_validation: 0,
+                unsupported_target: 0,
+                invalid_host_page_size: 0,
+                host_address: 0,
+                zero_advice: 0,
+                free_advice: 0,
+            },
+        }
+    }
+
+    /// Returns the number of bytes in the requested guest range.
+    pub const fn requested_bytes(self) -> u64 {
+        self.requested_bytes
+    }
+
+    /// Returns bytes whose aligned host interiors completed zero and free advice.
+    pub const fn advised_bytes(self) -> u64 {
+        self.advised_bytes
+    }
+
+    /// Returns requested edge bytes skipped to preserve neighboring host pages.
+    pub const fn skipped_bytes(self) -> u64 {
+        self.skipped_bytes
+    }
+
+    /// Returns bytes that could not complete the zero-and-free sequence.
+    pub const fn failed_bytes(self) -> u64 {
+        self.failed_bytes
+    }
+
+    /// Returns redacted, stage-classified failure counts.
+    pub const fn failures(self) -> GuestMemoryDiscardFailures {
+        self.failures
+    }
+
+    /// Returns whether the attempt completed without a classified failure.
+    pub const fn is_complete(self) -> bool {
+        self.failures.total() == 0
+    }
+
+    const fn fail_all(mut self, kind: GuestMemoryDiscardFailureKind) -> Self {
+        self.failed_bytes = self.requested_bytes;
+        self.failures = self.failures.with_failure(kind);
+        self
+    }
+
+    fn record_skipped(&mut self, bytes: u64) {
+        self.skipped_bytes = self.skipped_bytes.saturating_add(bytes);
+    }
+
+    fn record_advised(&mut self, bytes: u64) {
+        self.advised_bytes = self.advised_bytes.saturating_add(bytes);
+    }
+
+    fn record_failed(&mut self, bytes: u64, kind: GuestMemoryDiscardFailureKind) {
+        self.failed_bytes = self.failed_bytes.saturating_add(bytes);
+        self.failures = self.failures.with_failure(kind);
+    }
+}
+
+pub(crate) trait GuestMemoryDiscardAdviser {
+    fn host_page_size(&mut self) -> Result<u64, GuestMemoryDiscardFailureKind>;
+
+    fn zero(&mut self, address: NonNull<c_void>, size: usize) -> io::Result<()>;
+
+    fn free(&mut self, address: NonNull<c_void>, size: usize) -> io::Result<()>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SystemGuestMemoryDiscardAdviser;
+
 #[derive(Debug)]
 pub struct GuestMemory {
     regions: Vec<GuestMemoryRegion>,
@@ -276,6 +456,106 @@ impl GuestMemory {
             .iter()
             .map(|region| region.range().size())
             .sum::<u64>()
+    }
+
+    /// Makes the host-page-aligned interior of one mapped guest range zero-safe
+    /// and reclaimable when the current target supports that operation.
+    ///
+    /// The complete guest range is validated before host advice. Partial host
+    /// pages at each owned mapping edge are skipped, and failures are reported
+    /// without exposing host addresses or changing guest-memory ownership.
+    pub fn discard_range(&self, range: GuestMemoryRange) -> GuestMemoryDiscardOutcome {
+        let mut adviser = SystemGuestMemoryDiscardAdviser;
+        self.discard_range_with_adviser(range, &mut adviser)
+    }
+
+    pub(crate) fn discard_range_with_adviser(
+        &self,
+        range: GuestMemoryRange,
+        adviser: &mut impl GuestMemoryDiscardAdviser,
+    ) -> GuestMemoryDiscardOutcome {
+        let mut outcome = GuestMemoryDiscardOutcome::new(range.size());
+        if self.validate_mapped_range(range).is_err() {
+            return outcome.fail_all(GuestMemoryDiscardFailureKind::RangeValidation);
+        }
+
+        let page_size = match adviser.host_page_size() {
+            Ok(page_size) => page_size,
+            Err(kind) => return outcome.fail_all(kind),
+        };
+        let Ok(page_size) = usize::try_from(page_size) else {
+            return outcome.fail_all(GuestMemoryDiscardFailureKind::InvalidHostPageSize);
+        };
+        if page_size == 0 || !page_size.is_power_of_two() {
+            return outcome.fail_all(GuestMemoryDiscardFailureKind::InvalidHostPageSize);
+        }
+
+        for region in &self.regions {
+            let Some(segment) = discard_segment(region, range) else {
+                continue;
+            };
+            let Ok(segment_size) = usize::try_from(segment.size) else {
+                outcome.record_failed(segment.size, GuestMemoryDiscardFailureKind::HostAddress);
+                continue;
+            };
+            let Ok(offset) = usize::try_from(segment.offset) else {
+                outcome.record_failed(segment.size, GuestMemoryDiscardFailureKind::HostAddress);
+                continue;
+            };
+            if offset
+                .checked_add(segment_size)
+                .is_none_or(|end| end > region.host_size())
+            {
+                outcome.record_failed(segment.size, GuestMemoryDiscardFailureKind::HostAddress);
+                continue;
+            }
+
+            let mapping_start = region.host_address().as_ptr().cast::<u8>();
+            let segment_start = mapping_start.wrapping_add(offset);
+            let segment_start_address = segment_start.addr();
+            let Some(segment_end_address) = segment_start_address.checked_add(segment_size) else {
+                outcome.record_failed(segment.size, GuestMemoryDiscardFailureKind::HostAddress);
+                continue;
+            };
+            let Some(advice_start_address) = align_up_usize(segment_start_address, page_size)
+            else {
+                outcome.record_failed(segment.size, GuestMemoryDiscardFailureKind::HostAddress);
+                continue;
+            };
+            let advice_end_address = align_down_usize(segment_end_address, page_size);
+            if advice_start_address >= advice_end_address {
+                outcome.record_skipped(segment.size);
+                continue;
+            }
+
+            let advice_size = advice_end_address - advice_start_address;
+            let skipped_size = segment_size - advice_size;
+            outcome.record_skipped(u64::try_from(skipped_size).unwrap_or(u64::MAX));
+
+            let advice_address = segment_start
+                .with_addr(advice_start_address)
+                .cast::<c_void>();
+            let Some(advice_address) = NonNull::new(advice_address) else {
+                outcome.record_failed(
+                    u64::try_from(advice_size).unwrap_or(u64::MAX),
+                    GuestMemoryDiscardFailureKind::HostAddress,
+                );
+                continue;
+            };
+            let advice_size_u64 = u64::try_from(advice_size).unwrap_or(u64::MAX);
+            if adviser.zero(advice_address, advice_size).is_err() {
+                outcome.record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::ZeroAdvice);
+                continue;
+            }
+            if adviser.free(advice_address, advice_size).is_err() {
+                outcome.record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::FreeAdvice);
+                continue;
+            }
+
+            outcome.record_advised(advice_size_u64);
+        }
+
+        outcome
     }
 
     pub fn write_slice(
@@ -749,6 +1029,44 @@ struct GuestMemorySegment {
     size: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestMemoryDiscardSegment {
+    offset: u64,
+    size: u64,
+}
+
+fn discard_segment(
+    region: &GuestMemoryRegion,
+    requested: GuestMemoryRange,
+) -> Option<GuestMemoryDiscardSegment> {
+    let region_range = region.range();
+    let start = region_range
+        .start()
+        .raw_value()
+        .max(requested.start().raw_value());
+    let end = region_range
+        .end_exclusive()
+        .raw_value()
+        .min(requested.end_exclusive().raw_value());
+    if start >= end {
+        return None;
+    }
+
+    Some(GuestMemoryDiscardSegment {
+        offset: start - region_range.start().raw_value(),
+        size: end - start,
+    })
+}
+
+fn align_up_usize(value: usize, alignment: usize) -> Option<usize> {
+    let mask = alignment.checked_sub(1)?;
+    value.checked_add(mask).map(|rounded| rounded & !mask)
+}
+
+const fn align_down_usize(value: usize, alignment: usize) -> usize {
+    value & !(alignment - 1)
+}
+
 fn access_range(
     start: GuestAddress,
     size: usize,
@@ -860,12 +1178,18 @@ fn overlapping_ranges_error(first: GuestMemoryRange, second: GuestMemoryRange) -
     }
 }
 
-fn host_page_size() -> Result<u64, GuestMemoryAllocationError> {
+fn system_host_page_size() -> Option<u64> {
     // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and does not
     // require process-local invariants from Rust.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = u64::try_from(page_size).ok()?;
+
+    (page_size != 0 && page_size.is_power_of_two()).then_some(page_size)
+}
+
+fn host_page_size() -> Result<u64, GuestMemoryAllocationError> {
     let page_size =
-        u64::try_from(page_size).map_err(|_| GuestMemoryAllocationError::InvalidHostPageSize)?;
+        system_host_page_size().ok_or(GuestMemoryAllocationError::InvalidHostPageSize)?;
 
     validate_host_page_size(page_size)?;
     Ok(page_size)
@@ -876,6 +1200,77 @@ fn validate_host_page_size(page_size: u64) -> Result<(), GuestMemoryAllocationEr
         Err(GuestMemoryAllocationError::InvalidHostPageSize)
     } else {
         Ok(())
+    }
+}
+
+impl GuestMemoryDiscardAdviser for SystemGuestMemoryDiscardAdviser {
+    fn host_page_size(&mut self) -> Result<u64, GuestMemoryDiscardFailureKind> {
+        #[cfg(target_os = "macos")]
+        {
+            system_host_page_size().ok_or(GuestMemoryDiscardFailureKind::InvalidHostPageSize)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GuestMemoryDiscardFailureKind::UnsupportedTarget)
+        }
+    }
+
+    fn zero(&mut self, address: NonNull<c_void>, size: usize) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            madvise_zero(address, size)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (address, size);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "guest memory zero advice is unsupported on this target",
+            ))
+        }
+    }
+
+    fn free(&mut self, address: NonNull<c_void>, size: usize) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            madvise_free(address, size)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (address, size);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "guest memory free advice is unsupported on this target",
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn madvise_zero(address: NonNull<c_void>, size: usize) -> io::Result<()> {
+    // SAFETY: `GuestMemory::discard_range_with_adviser` derives `address` and
+    // `size` from the host-page-aligned interior of a validated live mapping.
+    let result = unsafe { libc::madvise(address.as_ptr(), size, libc::MADV_ZERO) };
+    checked_madvise_result(result)
+}
+
+#[cfg(target_os = "macos")]
+fn madvise_free(address: NonNull<c_void>, size: usize) -> io::Result<()> {
+    // SAFETY: `GuestMemory::discard_range_with_adviser` calls this only after
+    // zero advice succeeds for the same live, host-page-aligned mapping range.
+    let result = unsafe { libc::madvise(address.as_ptr(), size, libc::MADV_FREE) };
+    checked_madvise_result(result)
+}
+
+#[cfg(target_os = "macos")]
+fn checked_madvise_result(result: libc::c_int) -> io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -1005,15 +1400,18 @@ impl Drop for AnonymousMapping {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::ffi::c_void;
     use std::io;
+    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::{
-        AnonymousMapper, AnonymousMapping, GuestAddress, GuestMemory, GuestMemoryAccessError,
-        GuestMemoryAllocationError, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64,
-        host_page_size,
+        AnonymousMapper, AnonymousMapping, AnonymousMappingKind, GuestAddress, GuestMemory,
+        GuestMemoryAccessError, GuestMemoryAllocationError, GuestMemoryDiscardAdviser,
+        GuestMemoryDiscardFailureKind, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange,
+        GuestMemoryRegion, aarch64, host_page_size,
     };
 
     const PAGE_SIZE: u64 = 4096;
@@ -1036,6 +1434,501 @@ mod tests {
             .iter()
             .map(|region| region.range())
             .collect()
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestAdviceKind {
+        Zero,
+        Free,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TestAdviceCall {
+        kind: TestAdviceKind,
+        address: usize,
+        size: usize,
+    }
+
+    #[derive(Debug)]
+    struct TestDiscardAdviser {
+        page_size: Result<u64, GuestMemoryDiscardFailureKind>,
+        calls: Vec<TestAdviceCall>,
+        zero_calls: usize,
+        free_calls: usize,
+        failing_zero_calls: HashSet<usize>,
+        failing_free_calls: HashSet<usize>,
+    }
+
+    impl TestDiscardAdviser {
+        fn new(page_size: u64) -> Self {
+            Self {
+                page_size: Ok(page_size),
+                calls: Vec::new(),
+                zero_calls: 0,
+                free_calls: 0,
+                failing_zero_calls: HashSet::new(),
+                failing_free_calls: HashSet::new(),
+            }
+        }
+
+        fn unavailable(kind: GuestMemoryDiscardFailureKind) -> Self {
+            Self {
+                page_size: Err(kind),
+                calls: Vec::new(),
+                zero_calls: 0,
+                free_calls: 0,
+                failing_zero_calls: HashSet::new(),
+                failing_free_calls: HashSet::new(),
+            }
+        }
+
+        fn fail_zero_call(mut self, call: usize) -> Self {
+            self.failing_zero_calls.insert(call);
+            self
+        }
+
+        fn fail_free_call(mut self, call: usize) -> Self {
+            self.failing_free_calls.insert(call);
+            self
+        }
+    }
+
+    impl GuestMemoryDiscardAdviser for TestDiscardAdviser {
+        fn host_page_size(&mut self) -> Result<u64, GuestMemoryDiscardFailureKind> {
+            self.page_size
+        }
+
+        fn zero(&mut self, address: NonNull<c_void>, size: usize) -> io::Result<()> {
+            let call = self.zero_calls;
+            self.zero_calls += 1;
+            self.calls.push(TestAdviceCall {
+                kind: TestAdviceKind::Zero,
+                address: address.as_ptr().addr(),
+                size,
+            });
+            if self.failing_zero_calls.contains(&call) {
+                Err(io::Error::other("injected zero advice failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn free(&mut self, address: NonNull<c_void>, size: usize) -> io::Result<()> {
+            let call = self.free_calls;
+            self.free_calls += 1;
+            self.calls.push(TestAdviceCall {
+                kind: TestAdviceKind::Free,
+                address: address.as_ptr().addr(),
+                size,
+            });
+            if self.failing_free_calls.contains(&call) {
+                Err(io::Error::other("injected free advice failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn guest_memory_discard_validates_whole_range_before_advice() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![range(0, page_size), range(page_size * 2, page_size)]);
+        let requested = range(page_size / 2, page_size * 2);
+        let mut adviser = TestDiscardAdviser::new(page_size);
+
+        let outcome = memory.discard_range_with_adviser(requested, &mut adviser);
+
+        assert_eq!(outcome.requested_bytes(), page_size * 2);
+        assert_eq!(outcome.advised_bytes(), 0);
+        assert_eq!(outcome.skipped_bytes(), 0);
+        assert_eq!(outcome.failed_bytes(), page_size * 2);
+        assert_eq!(outcome.failures().total(), 1);
+        assert_eq!(
+            outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::RangeValidation),
+            1
+        );
+        assert!(adviser.calls.is_empty());
+    }
+
+    #[test]
+    fn guest_memory_discard_segments_adjacent_owned_regions() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![
+            range(0, page_size * 2),
+            range(page_size * 2, page_size * 2),
+        ]);
+        let first_address = memory
+            .regions()
+            .first()
+            .expect("first region should exist")
+            .host_address()
+            .as_ptr()
+            .addr();
+        let second_address = memory
+            .regions()
+            .get(1)
+            .expect("second region should exist")
+            .host_address()
+            .as_ptr()
+            .addr();
+        let page_size_usize = usize::try_from(page_size).expect("page size should fit usize");
+        let mut adviser = TestDiscardAdviser::new(page_size);
+
+        let outcome = memory.discard_range_with_adviser(range(0, page_size * 4), &mut adviser);
+
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.requested_bytes(), page_size * 4);
+        assert_eq!(outcome.advised_bytes(), page_size * 4);
+        assert_eq!(outcome.skipped_bytes(), 0);
+        assert_eq!(outcome.failed_bytes(), 0);
+        assert_eq!(
+            adviser.calls,
+            [
+                TestAdviceCall {
+                    kind: TestAdviceKind::Zero,
+                    address: first_address,
+                    size: page_size_usize * 2,
+                },
+                TestAdviceCall {
+                    kind: TestAdviceKind::Free,
+                    address: first_address,
+                    size: page_size_usize * 2,
+                },
+                TestAdviceCall {
+                    kind: TestAdviceKind::Zero,
+                    address: second_address,
+                    size: page_size_usize * 2,
+                },
+                TestAdviceCall {
+                    kind: TestAdviceKind::Free,
+                    address: second_address,
+                    size: page_size_usize * 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn guest_memory_discard_aligns_each_segment_inward() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![range(0, page_size * 4)]);
+        let host_address = memory
+            .regions()
+            .first()
+            .expect("region should exist")
+            .host_address()
+            .as_ptr()
+            .addr();
+        let page_size_usize = usize::try_from(page_size).expect("page size should fit usize");
+        let mut adviser = TestDiscardAdviser::new(page_size);
+
+        let outcome =
+            memory.discard_range_with_adviser(range(page_size / 2, page_size * 3), &mut adviser);
+
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.requested_bytes(), page_size * 3);
+        assert_eq!(outcome.advised_bytes(), page_size * 2);
+        assert_eq!(outcome.skipped_bytes(), page_size);
+        assert_eq!(outcome.failed_bytes(), 0);
+        assert_eq!(
+            adviser.calls,
+            [
+                TestAdviceCall {
+                    kind: TestAdviceKind::Zero,
+                    address: host_address + page_size_usize,
+                    size: page_size_usize * 2,
+                },
+                TestAdviceCall {
+                    kind: TestAdviceKind::Free,
+                    address: host_address + page_size_usize,
+                    size: page_size_usize * 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn guest_memory_discard_skips_four_kibibytes_inside_sixteen_kibibytes() {
+        const FOUR_KIB: u64 = 4096;
+        const SIXTEEN_KIB: u64 = 16 * 1024;
+
+        let host_page_size =
+            host_page_size().expect("host page size should be available for tests");
+        let memory_size = host_page_size.max(SIXTEEN_KIB);
+        let mut memory = allocate_memory(vec![range(0, memory_size)]);
+        let original = vec![0xa5; usize::try_from(memory_size).expect("size should fit usize")];
+        memory
+            .write_slice(&original, GuestAddress::new(0))
+            .expect("test pattern should write");
+        let mut adviser = TestDiscardAdviser::new(SIXTEEN_KIB);
+
+        let outcome = memory.discard_range_with_adviser(range(FOUR_KIB, FOUR_KIB), &mut adviser);
+
+        let mut observed = vec![0; original.len()];
+        memory
+            .read_slice(&mut observed, GuestAddress::new(0))
+            .expect("test pattern should read");
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.requested_bytes(), FOUR_KIB);
+        assert_eq!(outcome.advised_bytes(), 0);
+        assert_eq!(outcome.skipped_bytes(), FOUR_KIB);
+        assert_eq!(outcome.failed_bytes(), 0);
+        assert!(adviser.calls.is_empty());
+        assert_eq!(observed, original);
+    }
+
+    #[test]
+    fn guest_memory_discard_reports_partial_failures_and_continues() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![
+            range(0, page_size),
+            range(page_size, page_size),
+            range(page_size * 2, page_size),
+        ]);
+        let addresses = memory
+            .regions()
+            .iter()
+            .map(|region| region.host_address().as_ptr().addr())
+            .collect::<Vec<_>>();
+        let first_address = *addresses.first().expect("first address should exist");
+        let second_address = *addresses.get(1).expect("second address should exist");
+        let third_address = *addresses.get(2).expect("third address should exist");
+        let page_size_usize = usize::try_from(page_size).expect("page size should fit usize");
+        let mut adviser = TestDiscardAdviser::new(page_size)
+            .fail_zero_call(0)
+            .fail_free_call(0);
+
+        let outcome = memory.discard_range_with_adviser(range(0, page_size * 3), &mut adviser);
+
+        assert!(!outcome.is_complete());
+        assert_eq!(outcome.requested_bytes(), page_size * 3);
+        assert_eq!(outcome.advised_bytes(), page_size);
+        assert_eq!(outcome.skipped_bytes(), 0);
+        assert_eq!(outcome.failed_bytes(), page_size * 2);
+        assert_eq!(outcome.failures().total(), 2);
+        assert_eq!(
+            outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::ZeroAdvice),
+            1
+        );
+        assert_eq!(
+            outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::FreeAdvice),
+            1
+        );
+        assert_eq!(
+            adviser.calls,
+            [
+                TestAdviceCall {
+                    kind: TestAdviceKind::Zero,
+                    address: first_address,
+                    size: page_size_usize,
+                },
+                TestAdviceCall {
+                    kind: TestAdviceKind::Zero,
+                    address: second_address,
+                    size: page_size_usize,
+                },
+                TestAdviceCall {
+                    kind: TestAdviceKind::Free,
+                    address: second_address,
+                    size: page_size_usize,
+                },
+                TestAdviceCall {
+                    kind: TestAdviceKind::Zero,
+                    address: third_address,
+                    size: page_size_usize,
+                },
+                TestAdviceCall {
+                    kind: TestAdviceKind::Free,
+                    address: third_address,
+                    size: page_size_usize,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn guest_memory_discard_rejects_invalid_page_size_without_advice() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![range(0, page_size)]);
+        let mut adviser = TestDiscardAdviser::new(3);
+
+        let outcome = memory.discard_range_with_adviser(range(0, page_size), &mut adviser);
+
+        assert_eq!(outcome.advised_bytes(), 0);
+        assert_eq!(outcome.skipped_bytes(), 0);
+        assert_eq!(outcome.failed_bytes(), page_size);
+        assert_eq!(
+            outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::InvalidHostPageSize),
+            1
+        );
+        assert!(adviser.calls.is_empty());
+    }
+
+    #[test]
+    fn guest_memory_discard_reports_unsupported_target_after_validation() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![range(0, page_size)]);
+        let mut adviser =
+            TestDiscardAdviser::unavailable(GuestMemoryDiscardFailureKind::UnsupportedTarget);
+
+        let outcome = memory.discard_range_with_adviser(range(0, page_size), &mut adviser);
+
+        assert_eq!(outcome.requested_bytes(), page_size);
+        assert_eq!(outcome.advised_bytes(), 0);
+        assert_eq!(outcome.failed_bytes(), page_size);
+        assert_eq!(
+            outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::UnsupportedTarget),
+            1
+        );
+        assert!(adviser.calls.is_empty());
+
+        let unmapped = range(page_size, page_size);
+        let mut unavailable =
+            TestDiscardAdviser::unavailable(GuestMemoryDiscardFailureKind::UnsupportedTarget);
+        let unmapped_outcome = memory.discard_range_with_adviser(unmapped, &mut unavailable);
+        assert_eq!(
+            unmapped_outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::RangeValidation),
+            1
+        );
+        assert_eq!(
+            unmapped_outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::UnsupportedTarget),
+            0
+        );
+    }
+
+    #[test]
+    fn guest_memory_discard_redacts_host_address_failures() {
+        let page_size = usize::try_from(PAGE_SIZE).expect("test page size should fit usize");
+        let host_address_value = usize::MAX - (page_size / 2);
+        let host_address = NonNull::new(host_address_value as *mut c_void)
+            .expect("synthetic host address should be non-null");
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let memory = GuestMemory {
+            regions: vec![GuestMemoryRegion {
+                range: range(0, PAGE_SIZE),
+                mapping: AnonymousMapping {
+                    address: host_address,
+                    size: page_size,
+                    kind: AnonymousMappingKind::Test {
+                        drop_count: Arc::clone(&drop_count),
+                    },
+                },
+            }],
+        };
+        let mut adviser = TestDiscardAdviser::new(PAGE_SIZE);
+
+        let outcome = memory.discard_range_with_adviser(range(0, PAGE_SIZE), &mut adviser);
+
+        assert_eq!(outcome.failed_bytes(), PAGE_SIZE);
+        assert_eq!(
+            outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::HostAddress),
+            1
+        );
+        assert!(adviser.calls.is_empty());
+        let host_address_text = format!("{host_address_value:#x}");
+        let diagnostic = format!("{outcome:?}; {}", outcome.failures());
+        assert!(!diagnostic.contains(&host_address_text));
+
+        drop(memory);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn guest_memory_discard_keeps_independent_owners_isolated() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let first = allocate_memory(vec![range(0, page_size)]);
+        let second = allocate_memory(vec![range(0, page_size)]);
+        let mut first_adviser = TestDiscardAdviser::new(page_size);
+        let mut second_adviser = TestDiscardAdviser::new(page_size);
+
+        let first_outcome =
+            first.discard_range_with_adviser(range(0, page_size), &mut first_adviser);
+        let second_outcome =
+            second.discard_range_with_adviser(range(0, page_size), &mut second_adviser);
+
+        assert_eq!(first_outcome, second_outcome);
+        assert!(first_outcome.is_complete());
+        let first_call = first_adviser
+            .calls
+            .first()
+            .expect("first owner should issue zero advice");
+        let second_call = second_adviser
+            .calls
+            .first()
+            .expect("second owner should issue zero advice");
+        assert_ne!(first_call.address, second_call.address);
+    }
+
+    #[test]
+    fn guest_memory_discard_repeated_range_has_no_persistent_state() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![range(0, page_size)]);
+        let requested = range(0, page_size);
+        let mut adviser = TestDiscardAdviser::new(page_size);
+
+        let first = memory.discard_range_with_adviser(requested, &mut adviser);
+        let second = memory.discard_range_with_adviser(requested, &mut adviser);
+
+        assert_eq!(first, second);
+        assert!(first.is_complete());
+        assert_eq!(adviser.calls.len(), 4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn guest_memory_system_discard_reuses_zero_contents_on_darwin() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(0, page_size * 2)]);
+        let page_size_usize = usize::try_from(page_size).expect("page size should fit usize");
+        memory
+            .write_slice(&vec![0x5a; page_size_usize], GuestAddress::new(0))
+            .expect("nonzero page should write");
+
+        let outcome = memory.discard_range(range(0, page_size));
+
+        let mut observed = vec![0xff; page_size_usize];
+        memory
+            .read_slice(&mut observed, GuestAddress::new(0))
+            .expect("discarded page should read");
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.advised_bytes(), page_size);
+        assert_eq!(outcome.skipped_bytes(), 0);
+        assert_eq!(outcome.failed_bytes(), 0);
+        assert!(observed.iter().all(|byte| *byte == 0));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn guest_memory_system_discard_reports_unsupported_target() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![range(0, page_size)]);
+
+        let outcome = memory.discard_range(range(0, page_size));
+
+        assert_eq!(outcome.advised_bytes(), 0);
+        assert_eq!(outcome.failed_bytes(), page_size);
+        assert_eq!(
+            outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::UnsupportedTarget),
+            1
+        );
     }
 
     #[test]

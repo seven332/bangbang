@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::balloon::VirtioBalloonDeviceNotificationDispatch;
+use crate::balloon::{VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDiscardOutcome};
 use crate::block::{
     VirtioBlockDeviceNotificationDispatch, VirtioBlockLatencyAggregate, VirtioBlockQueueDispatch,
 };
@@ -3565,6 +3565,69 @@ struct SharedRtcDeviceMetricsInner {
     missed_write_count: AtomicU64,
 }
 
+/// Observable counters for one balloon host-discard source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BalloonDiscardMetrics {
+    attempts: u64,
+    advised_bytes: u64,
+    skipped_bytes: u64,
+    failures: u64,
+}
+
+impl BalloonDiscardMetrics {
+    pub const fn new(attempts: u64, advised_bytes: u64, skipped_bytes: u64, failures: u64) -> Self {
+        Self {
+            attempts,
+            advised_bytes,
+            skipped_bytes,
+            failures,
+        }
+    }
+
+    pub const fn attempts(self) -> u64 {
+        self.attempts
+    }
+
+    pub const fn advised_bytes(self) -> u64 {
+        self.advised_bytes
+    }
+
+    pub const fn skipped_bytes(self) -> u64 {
+        self.skipped_bytes
+    }
+
+    pub const fn failures(self) -> u64 {
+        self.failures
+    }
+
+    const fn is_empty(self) -> bool {
+        self.attempts == 0
+            && self.advised_bytes == 0
+            && self.skipped_bytes == 0
+            && self.failures == 0
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            attempts: self.attempts.saturating_add(other.attempts),
+            advised_bytes: self.advised_bytes.saturating_add(other.advised_bytes),
+            skipped_bytes: self.skipped_bytes.saturating_add(other.skipped_bytes),
+            failures: self.failures.saturating_add(other.failures),
+        }
+    }
+}
+
+impl From<VirtioBalloonDiscardOutcome> for BalloonDiscardMetrics {
+    fn from(outcome: VirtioBalloonDiscardOutcome) -> Self {
+        Self::new(
+            outcome.attempts(),
+            outcome.advised_bytes(),
+            outcome.skipped_bytes(),
+            outcome.failures(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BalloonDeviceMetrics {
     activate_fails: u64,
@@ -3573,6 +3636,8 @@ pub struct BalloonDeviceMetrics {
     stats_update_fails: u64,
     deflate_count: u64,
     event_fails: u64,
+    inflate_discard: BalloonDiscardMetrics,
+    hinting_discard: BalloonDiscardMetrics,
 }
 
 impl BalloonDeviceMetrics {
@@ -3591,7 +3656,19 @@ impl BalloonDeviceMetrics {
             stats_update_fails,
             deflate_count,
             event_fails,
+            inflate_discard: BalloonDiscardMetrics::new(0, 0, 0, 0),
+            hinting_discard: BalloonDiscardMetrics::new(0, 0, 0, 0),
         }
+    }
+
+    pub const fn with_discard_metrics(
+        mut self,
+        inflate_discard: BalloonDiscardMetrics,
+        hinting_discard: BalloonDiscardMetrics,
+    ) -> Self {
+        self.inflate_discard = inflate_discard;
+        self.hinting_discard = hinting_discard;
+        self
     }
 
     pub const fn is_empty(self) -> bool {
@@ -3601,6 +3678,8 @@ impl BalloonDeviceMetrics {
             && self.stats_update_fails == 0
             && self.deflate_count == 0
             && self.event_fails == 0
+            && self.inflate_discard.is_empty()
+            && self.hinting_discard.is_empty()
     }
 
     pub const fn activate_fails(self) -> u64 {
@@ -3627,6 +3706,14 @@ impl BalloonDeviceMetrics {
         self.event_fails
     }
 
+    pub const fn inflate_discard(self) -> BalloonDiscardMetrics {
+        self.inflate_discard
+    }
+
+    pub const fn hinting_discard(self) -> BalloonDiscardMetrics {
+        self.hinting_discard
+    }
+
     const fn merged_with(self, other: Self) -> Self {
         Self {
             activate_fails: self.activate_fails.saturating_add(other.activate_fails),
@@ -3639,6 +3726,8 @@ impl BalloonDeviceMetrics {
                 .saturating_add(other.stats_update_fails),
             deflate_count: self.deflate_count.saturating_add(other.deflate_count),
             event_fails: self.event_fails.saturating_add(other.event_fails),
+            inflate_discard: self.inflate_discard.merged_with(other.inflate_discard),
+            hinting_discard: self.hinting_discard.merged_with(other.hinting_discard),
         }
     }
 }
@@ -3656,6 +3745,12 @@ impl SharedBalloonDeviceMetrics {
     pub fn record_notification_dispatch(&self, dispatch: &VirtioBalloonDeviceNotificationDispatch) {
         self.record_inflations(usize_to_u64_saturating(dispatch.inflate_notifications()));
         self.record_deflations(usize_to_u64_saturating(dispatch.deflate_notifications()));
+        if let Some(queue_dispatch) = dispatch.inflate_queue_dispatch() {
+            self.record_inflate_discard(queue_dispatch.inflate_discard());
+        }
+        if let Some(queue_dispatch) = dispatch.hinting_queue_dispatch() {
+            self.record_hinting_discard(queue_dispatch.hinting_discard());
+        }
 
         let stats_updates = if dispatch.statistics_notifications() != 0 {
             dispatch.statistics_notifications()
@@ -3685,6 +3780,28 @@ impl SharedBalloonDeviceMetrics {
             self.inner.deflate_count.load(Ordering::Relaxed),
             self.inner.event_fails.load(Ordering::Relaxed),
         )
+        .with_discard_metrics(
+            BalloonDiscardMetrics::new(
+                self.inner.inflate_discard_attempts.load(Ordering::Relaxed),
+                self.inner
+                    .inflate_discard_advised_bytes
+                    .load(Ordering::Relaxed),
+                self.inner
+                    .inflate_discard_skipped_bytes
+                    .load(Ordering::Relaxed),
+                self.inner.inflate_discard_failures.load(Ordering::Relaxed),
+            ),
+            BalloonDiscardMetrics::new(
+                self.inner.hinting_discard_attempts.load(Ordering::Relaxed),
+                self.inner
+                    .hinting_discard_advised_bytes
+                    .load(Ordering::Relaxed),
+                self.inner
+                    .hinting_discard_skipped_bytes
+                    .load(Ordering::Relaxed),
+                self.inner.hinting_discard_failures.load(Ordering::Relaxed),
+            ),
+        )
     }
 
     fn record_inflations(&self, count: u64) {
@@ -3704,6 +3821,26 @@ impl SharedBalloonDeviceMetrics {
             record_atomic_metric(&self.inner.stats_updates_count, count);
         }
     }
+
+    fn record_inflate_discard(&self, outcome: VirtioBalloonDiscardOutcome) {
+        record_balloon_discard_metrics(
+            &self.inner.inflate_discard_attempts,
+            &self.inner.inflate_discard_advised_bytes,
+            &self.inner.inflate_discard_skipped_bytes,
+            &self.inner.inflate_discard_failures,
+            outcome,
+        );
+    }
+
+    fn record_hinting_discard(&self, outcome: VirtioBalloonDiscardOutcome) {
+        record_balloon_discard_metrics(
+            &self.inner.hinting_discard_attempts,
+            &self.inner.hinting_discard_advised_bytes,
+            &self.inner.hinting_discard_skipped_bytes,
+            &self.inner.hinting_discard_failures,
+            outcome,
+        );
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3714,6 +3851,35 @@ struct SharedBalloonDeviceMetricsInner {
     stats_update_fails: AtomicU64,
     deflate_count: AtomicU64,
     event_fails: AtomicU64,
+    inflate_discard_attempts: AtomicU64,
+    inflate_discard_advised_bytes: AtomicU64,
+    inflate_discard_skipped_bytes: AtomicU64,
+    inflate_discard_failures: AtomicU64,
+    hinting_discard_attempts: AtomicU64,
+    hinting_discard_advised_bytes: AtomicU64,
+    hinting_discard_skipped_bytes: AtomicU64,
+    hinting_discard_failures: AtomicU64,
+}
+
+fn record_balloon_discard_metrics(
+    attempts: &AtomicU64,
+    advised_bytes: &AtomicU64,
+    skipped_bytes: &AtomicU64,
+    failures: &AtomicU64,
+    outcome: VirtioBalloonDiscardOutcome,
+) {
+    if outcome.attempts() != 0 {
+        record_atomic_metric(attempts, outcome.attempts());
+    }
+    if outcome.advised_bytes() != 0 {
+        record_atomic_metric(advised_bytes, outcome.advised_bytes());
+    }
+    if outcome.skipped_bytes() != 0 {
+        record_atomic_metric(skipped_bytes, outcome.skipped_bytes());
+    }
+    if outcome.failures() != 0 {
+        record_atomic_metric(failures, outcome.failures());
+    }
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
@@ -4810,6 +4976,66 @@ impl MetricsSink {
                 serde_json::Value::Number(balloon_device_metrics.inflate_count().into()),
             );
             balloon.insert(
+                "inflate_discard_attempts".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics.inflate_discard().attempts().into(),
+                ),
+            );
+            balloon.insert(
+                "inflate_discard_advised_bytes".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics
+                        .inflate_discard()
+                        .advised_bytes()
+                        .into(),
+                ),
+            );
+            balloon.insert(
+                "inflate_discard_skipped_bytes".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics
+                        .inflate_discard()
+                        .skipped_bytes()
+                        .into(),
+                ),
+            );
+            balloon.insert(
+                "inflate_discard_fails".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics.inflate_discard().failures().into(),
+                ),
+            );
+            balloon.insert(
+                "hinting_discard_attempts".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics.hinting_discard().attempts().into(),
+                ),
+            );
+            balloon.insert(
+                "hinting_discard_advised_bytes".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics
+                        .hinting_discard()
+                        .advised_bytes()
+                        .into(),
+                ),
+            );
+            balloon.insert(
+                "hinting_discard_skipped_bytes".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics
+                        .hinting_discard()
+                        .skipped_bytes()
+                        .into(),
+                ),
+            );
+            balloon.insert(
+                "hinting_discard_fails".to_string(),
+                serde_json::Value::Number(
+                    balloon_device_metrics.hinting_discard().failures().into(),
+                ),
+            );
+            balloon.insert(
                 "stats_update_fails".to_string(),
                 serde_json::Value::Number(balloon_device_metrics.stats_update_fails().into()),
             );
@@ -5087,7 +5313,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
+        BalloonDeviceMetrics, BalloonDiscardMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
         MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
@@ -6514,15 +6740,19 @@ mod tests {
     fn writes_balloon_device_metrics_when_provided() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
-        let diagnostics = MetricsDiagnostics::new()
-            .with_balloon_device_metrics(BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6));
+        let diagnostics = MetricsDiagnostics::new().with_balloon_device_metrics(
+            BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6).with_discard_metrics(
+                BalloonDiscardMetrics::new(7, 8, 9, 10),
+                BalloonDiscardMetrics::new(11, 12, 13, 14),
+            ),
+        );
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         assert_eq!(
             output.lines(),
             [
-                r#"{"balloon":{"activate_fails":1,"deflate_count":5,"event_fails":6,"inflate_count":2,"stats_update_fails":4,"stats_updates_count":3},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"balloon":{"activate_fails":1,"deflate_count":5,"event_fails":6,"hinting_discard_advised_bytes":12,"hinting_discard_attempts":11,"hinting_discard_fails":14,"hinting_discard_skipped_bytes":13,"inflate_count":2,"inflate_discard_advised_bytes":8,"inflate_discard_attempts":7,"inflate_discard_fails":10,"inflate_discard_skipped_bytes":9,"stats_update_fails":4,"stats_updates_count":3},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
@@ -6566,28 +6796,43 @@ mod tests {
 
     #[test]
     fn balloon_diagnostics_merge_saturates() {
-        let base =
-            MetricsDiagnostics::new().with_balloon_device_metrics(BalloonDeviceMetrics::new(
+        let base = MetricsDiagnostics::new().with_balloon_device_metrics(
+            BalloonDeviceMetrics::new(
                 u64::MAX,
                 u64::MAX - 1,
                 u64::MAX - 2,
                 u64::MAX - 3,
                 u64::MAX - 4,
                 u64::MAX - 5,
-            ));
-        let additional = MetricsDiagnostics::new()
-            .with_balloon_device_metrics(BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6));
+            )
+            .with_discard_metrics(
+                BalloonDiscardMetrics::new(u64::MAX - 1, u64::MAX - 2, u64::MAX - 3, u64::MAX - 4),
+                BalloonDiscardMetrics::new(u64::MAX - 5, u64::MAX - 6, u64::MAX - 7, u64::MAX - 8),
+            ),
+        );
+        let additional = MetricsDiagnostics::new().with_balloon_device_metrics(
+            BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6).with_discard_metrics(
+                BalloonDiscardMetrics::new(2, 3, 4, 5),
+                BalloonDiscardMetrics::new(6, 7, 8, 9),
+            ),
+        );
 
         assert_eq!(
             base.merged_with(additional).balloon_device_metrics(),
-            Some(BalloonDeviceMetrics::new(
-                u64::MAX,
-                u64::MAX,
-                u64::MAX,
-                u64::MAX,
-                u64::MAX,
-                u64::MAX,
-            ))
+            Some(
+                BalloonDeviceMetrics::new(
+                    u64::MAX,
+                    u64::MAX,
+                    u64::MAX,
+                    u64::MAX,
+                    u64::MAX,
+                    u64::MAX,
+                )
+                .with_discard_metrics(
+                    BalloonDiscardMetrics::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX,),
+                    BalloonDiscardMetrics::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX,),
+                )
+            )
         );
     }
 
