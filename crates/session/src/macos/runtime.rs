@@ -416,7 +416,7 @@ fn validate_directory(fd: RawFd) -> Result<NamespaceIdentity, RuntimeError> {
     // SAFETY: Identity call has no pointer or ownership contract.
     let uid = unsafe { libc::geteuid() };
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || stat.st_mode & 0o777 != 0o700
+        || stat.st_mode & 0o7777 != 0o700
         || stat.st_uid != uid
     {
         return Err(RuntimeError::InvalidEntry);
@@ -624,6 +624,7 @@ fn cstring(value: &OsStr) -> Result<CString, std::ffi::NulError> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -681,6 +682,18 @@ mod tests {
         assert_eq!(
             launcher_runtime_root().expect("launcher root should derive"),
             home.join(WORKER_CONTAINER_SUFFIX).join(RUNTIME_ROOT_NAME)
+        );
+    }
+
+    #[test]
+    fn directory_validation_rejects_special_mode_bits() {
+        let root = TestRoot::new();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o1700))
+            .expect("test permissions should change");
+        let directory = open_directory(root.path()).expect("test root should open");
+        assert_eq!(
+            validate_directory(directory.as_raw_fd()),
+            Err(RuntimeError::InvalidEntry)
         );
     }
 
