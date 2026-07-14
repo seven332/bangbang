@@ -31,7 +31,13 @@ where
             .args(args)
             .spawn()
             .map_err(|err| LauncherError::WorkerSpawn(err.kind()))?;
-        let status = crate::macos::supervise::wait_and_forward(&mut child, wakeups)?;
+        let status = match crate::macos::supervise::wait_and_forward(&mut child, wakeups) {
+            Ok(status) => status,
+            Err(err) => {
+                stop_and_reap_after_supervision_error(&mut child);
+                return Err(err);
+            }
+        };
         map_exit_status(status)
     }
 
@@ -40,6 +46,13 @@ where
         let _ = args;
         Err(LauncherError::UnsupportedPlatform)
     }
+}
+
+fn stop_and_reap_after_supervision_error(child: &mut std::process::Child) {
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
 }
 
 fn map_exit_status(status: std::process::ExitStatus) -> Result<LauncherExit, LauncherError> {
@@ -61,6 +74,7 @@ fn map_exit_status(status: std::process::ExitStatus) -> Result<LauncherExit, Lau
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
 
     use super::*;
 
@@ -81,6 +95,24 @@ mod tests {
         assert_eq!(
             map_exit_status(status).expect("signal status should map"),
             LauncherExit(128 + u8::try_from(libc::SIGTERM).expect("signal should fit"))
+        );
+    }
+
+    #[test]
+    fn supervision_failure_cleanup_terminates_and_reaps_owned_worker() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("test worker should start");
+
+        stop_and_reap_after_supervision_error(&mut child);
+
+        assert!(
+            child
+                .try_wait()
+                .expect("cleaned worker status should remain available")
+                .is_some(),
+            "cleanup must reap the owned worker"
         );
     }
 }
