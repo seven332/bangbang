@@ -27,7 +27,7 @@ mod platform {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use bangbang_session::macos::runtime::WorkerNamespace;
     use bangbang_session::macos::{set_cloexec, verify_peer};
@@ -119,9 +119,6 @@ mod platform {
             let owned = unsafe { OwnedFd::from_raw_fd(SESSION_FD) };
             let mut stream = UnixStream::from(owned);
             stream
-                .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
-                .map_err(|_| ContainedSessionError)?;
-            stream
                 .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
                 .map_err(|_| ContainedSessionError)?;
             // SAFETY: `getppid` has no pointer or ownership contract.
@@ -132,7 +129,7 @@ mod platform {
             let mut lifecycle = WorkerLifecycle::new();
             let hello = lifecycle.hello().map_err(|_| ContainedSessionError)?;
             write_frame(&mut stream, hello)?;
-            let start = read_frame(&mut stream, &mut decoder)?;
+            let start = read_frame(&mut stream, &mut decoder, handshake_deadline()?)?;
             if lifecycle
                 .receive(start)
                 .map_err(|_| ContainedSessionError)?
@@ -148,7 +145,7 @@ mod platform {
                 .map_err(|_| ContainedSessionError)?;
             write_frame(&mut stream, prepared)?;
 
-            let next = read_frame(&mut stream, &mut decoder)?;
+            let next = read_frame(&mut stream, &mut decoder, handshake_deadline()?)?;
             let next = lifecycle.receive(next).map_err(|_| ContainedSessionError)?;
             let started = match next {
                 Message::Proceed => {
@@ -361,11 +358,19 @@ mod platform {
     fn read_frame(
         stream: &mut UnixStream,
         decoder: &mut FrameDecoder,
+        deadline: Instant,
     ) -> Result<Frame, ContainedSessionError> {
         loop {
             if let Some(frame) = decoder.next_frame().map_err(|_| ContainedSessionError)? {
                 return Ok(frame);
             }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(ContainedSessionError)?;
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|_| ContainedSessionError)?;
             let mut bytes = [0_u8; 4096];
             let length = stream.read(&mut bytes).map_err(|_| ContainedSessionError)?;
             if length == 0 {
@@ -375,6 +380,12 @@ mod platform {
                 .push(bytes.get(..length).ok_or(ContainedSessionError)?)
                 .map_err(|_| ContainedSessionError)?;
         }
+    }
+
+    fn handshake_deadline() -> Result<Instant, ContainedSessionError> {
+        Instant::now()
+            .checked_add(HANDSHAKE_TIMEOUT)
+            .ok_or(ContainedSessionError)
     }
 
     fn write_frame(stream: &mut UnixStream, frame: Frame) -> Result<(), ContainedSessionError> {

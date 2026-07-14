@@ -104,9 +104,9 @@ pub(crate) fn read_bootstrap_hello(
     stream: &mut UnixStream,
     lifecycle: &mut LauncherLifecycle,
 ) -> Result<(), LauncherError> {
-    stream
-        .set_read_timeout(Some(BOOTSTRAP_HELLO_TIMEOUT))
-        .map_err(|error| LauncherError::SessionSetup(error.kind()))?;
+    let deadline = Instant::now()
+        .checked_add(BOOTSTRAP_HELLO_TIMEOUT)
+        .ok_or(LauncherError::SessionProtocol)?;
     let result = (|| {
         let mut decoder = FrameDecoder::default();
         let mut buffer = [0_u8; 4096];
@@ -125,6 +125,13 @@ pub(crate) fn read_bootstrap_hello(
                 }
                 return Ok(());
             }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(LauncherError::SessionProtocol)?;
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| LauncherError::SessionSetup(error.kind()))?;
             let length = stream
                 .read(&mut buffer)
                 .map_err(|_| LauncherError::SessionProtocol)?;
@@ -448,9 +455,18 @@ fn wait_events(
     kqueue: RawFd,
     timeout: Option<Duration>,
 ) -> Result<Vec<libc::kevent>, LauncherError> {
+    let deadline = match timeout {
+        Some(timeout) => Some(
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or(LauncherError::WorkerWait(io::ErrorKind::InvalidInput))?,
+        ),
+        None => None,
+    };
     loop {
         let mut events = [MaybeUninit::<libc::kevent>::uninit(); 4];
-        let timeout = timeout.map(duration_timespec);
+        let timeout = deadline
+            .map(|deadline| duration_timespec(deadline.saturating_duration_since(Instant::now())));
         let timeout_ptr = timeout
             .as_ref()
             .map_or(ptr::null(), |value| value as *const libc::timespec);
