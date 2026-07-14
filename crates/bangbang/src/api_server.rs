@@ -7521,7 +7521,7 @@ mod tests {
             &request_with_body(
                 "PUT",
                 "/balloon",
-                r#"{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":false}"#,
+                r#"{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":true}"#,
             ),
         );
         assert!(put_response.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -7536,7 +7536,7 @@ mod tests {
         assert!(get_response.contains(r#""deflate_on_oom":true"#));
         assert!(get_response.contains(r#""stats_polling_interval_s":60"#));
         assert!(get_response.contains(r#""free_page_hinting":true"#));
-        assert!(get_response.contains(r#""free_page_reporting":false"#));
+        assert!(get_response.contains(r#""free_page_reporting":true"#));
 
         let oversized_put_response = request_over_socket(
             &mut vmm,
@@ -7559,30 +7559,7 @@ mod tests {
         );
         assert!(get_after_oversized_put_response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(get_after_oversized_put_response.contains(r#""amount_mib":64"#));
-
-        let reporting_put_response = request_over_socket(
-            &mut vmm,
-            "b-put-r",
-            &request_with_body(
-                "PUT",
-                "/balloon",
-                r#"{"amount_mib":32,"deflate_on_oom":false,"free_page_reporting":true}"#,
-            ),
-        );
-        assert!(reporting_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(
-            reporting_put_response
-                .contains(r#""fault_message":"balloon free_page_reporting is not supported""#)
-        );
-
-        let get_after_reporting_put_response = request_over_socket(
-            &mut vmm,
-            "b-get-pr",
-            "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
-        assert!(get_after_reporting_put_response.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(get_after_reporting_put_response.contains(r#""amount_mib":64"#));
-        assert!(get_after_reporting_put_response.contains(r#""free_page_reporting":false"#));
+        assert!(get_after_oversized_put_response.contains(r#""free_page_reporting":true"#));
 
         let vm_config_response = request_over_socket(
             &mut vmm,
@@ -7592,7 +7569,7 @@ mod tests {
         assert!(vm_config_response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(vm_config_response.contains(r#""balloon":"#));
         assert!(vm_config_response.contains(r#""amount_mib":64"#));
-        assert!(vm_config_response.contains(r#""free_page_reporting":false"#));
+        assert!(vm_config_response.contains(r#""free_page_reporting":true"#));
 
         let boot_response = request_over_socket(
             &mut vmm,
@@ -7629,7 +7606,7 @@ mod tests {
         assert!(get_updated_response.contains(r#""deflate_on_oom":true"#));
         assert!(get_updated_response.contains(r#""stats_polling_interval_s":60"#));
         assert!(get_updated_response.contains(r#""free_page_hinting":true"#));
-        assert!(get_updated_response.contains(r#""free_page_reporting":false"#));
+        assert!(get_updated_response.contains(r#""free_page_reporting":true"#));
 
         let stats_patch_response = request_over_socket(
             &mut vmm,

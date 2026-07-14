@@ -8176,7 +8176,8 @@ mod tests {
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::balloon::{
         BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
-        VIRTIO_BALLOON_INFLATE_QUEUE_INDEX, VirtioBalloonDeviceNotificationError,
+        VIRTIO_BALLOON_INFLATE_QUEUE_INDEX, VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+        VirtioBalloonDeviceNotificationError,
     };
     use bangbang_runtime::block::{
         BlockMmioLayout, DriveConfigInput, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
@@ -9292,6 +9293,10 @@ mod tests {
     const TEST_BALLOON_DEFLATE_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x807a_4000);
     const TEST_BALLOON_DEFLATE_USED_RING: GuestAddress = GuestAddress::new(0x807a_5000);
     const TEST_BALLOON_PFN_PAYLOAD: GuestAddress = GuestAddress::new(0x807a_6000);
+    const TEST_BALLOON_REPORTING_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x807a_7000);
+    const TEST_BALLOON_REPORTING_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x807a_8000);
+    const TEST_BALLOON_REPORTING_USED_RING: GuestAddress = GuestAddress::new(0x807a_9000);
+    const TEST_BALLOON_REPORTING_RANGE: GuestAddress = GuestAddress::new(0x807a_a000);
     const TEST_BALLOON_MAPPED_PFN: u32 = 0x80000;
     const TEST_VIRTIO_MEM_REQ_PLUG: u16 = 0;
     const TEST_VIRTIO_MEM_REQ_STATE: u16 = 3;
@@ -10744,6 +10749,29 @@ mod tests {
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
     }
 
+    fn boot_runtime_with_balloon_reporting()
+    -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
+        let kernel = temp_file("kernel-with-balloon-reporting", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        controller
+            .handle_action(VmmAction::PutBalloon(
+                BalloonConfigInput::new(TEST_MEMORY_MIB as u32, false)
+                    .with_free_page_reporting(true),
+            ))
+            .expect("reporting balloon config should be stored");
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                balloon_interrupt_line: Some(line(32)),
+                ..valid_boot_resource_config(&[])
+            },
+        )
+        .expect("boot resources should assemble with reporting balloon");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
     fn boot_runtime_with_entropy() -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
         let kernel = temp_file("kernel-with-entropy", &arm64_image());
         let controller = controller_with_kernel(kernel.path());
@@ -11718,6 +11746,39 @@ mod tests {
         );
     }
 
+    fn configure_boot_balloon_reporting_queues(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        configure_boot_balloon_queue(runtime, mmio_dispatcher, VIRTIO_BALLOON_INFLATE_QUEUE_INDEX);
+        configure_boot_balloon_queue(runtime, mmio_dispatcher, VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX);
+        configure_boot_balloon_queue(runtime, mmio_dispatcher, VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
     fn configure_boot_balloon_queue(
         runtime: &mut Arm64BootRuntimeResources,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -11910,6 +11971,11 @@ mod tests {
                 TEST_BALLOON_DEFLATE_AVAILABLE_RING,
                 TEST_BALLOON_DEFLATE_USED_RING,
             ),
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX => (
+                TEST_BALLOON_REPORTING_DESCRIPTOR_TABLE,
+                TEST_BALLOON_REPORTING_AVAILABLE_RING,
+                TEST_BALLOON_REPORTING_USED_RING,
+            ),
             other => panic!("unsupported test balloon queue index {other}"),
         }
     }
@@ -12072,6 +12138,16 @@ mod tests {
             TestDescriptor::readable(TEST_BALLOON_PFN_PAYLOAD, 4, None),
         );
         write_balloon_deflate_available_heads(memory, &[0]);
+    }
+
+    fn write_queued_balloon_reporting_request(memory: &mut GuestMemory) {
+        write_balloon_descriptor_at(
+            memory,
+            TEST_BALLOON_REPORTING_DESCRIPTOR_TABLE,
+            0,
+            TestDescriptor::writable(TEST_BALLOON_REPORTING_RANGE, 4096, None),
+        );
+        write_balloon_reporting_available_heads(memory, &[0]);
     }
 
     fn write_queued_memory_hotplug_request(
@@ -12604,6 +12680,38 @@ mod tests {
         );
     }
 
+    fn balloon_reporting_available_ring_idx_address() -> GuestAddress {
+        TEST_BALLOON_REPORTING_AVAILABLE_RING
+            .checked_add(TEST_AVAILABLE_RING_IDX_OFFSET)
+            .expect("balloon reporting available idx address should not overflow")
+    }
+
+    fn balloon_reporting_available_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_BALLOON_REPORTING_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("balloon reporting available entry address should not overflow")
+    }
+
+    fn write_balloon_reporting_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
+        for (ring_index, head) in heads.iter().copied().enumerate() {
+            write_guest_u16(
+                memory,
+                balloon_reporting_available_ring_entry_address(
+                    u16::try_from(ring_index).expect("test ring index should fit in u16"),
+                ),
+                head,
+            );
+        }
+        write_guest_u16(
+            memory,
+            balloon_reporting_available_ring_idx_address(),
+            u16::try_from(heads.len()).expect("test available length should fit in u16"),
+        );
+    }
+
     fn read_balloon_inflate_used_index(memory: &GuestMemory) -> u16 {
         read_guest_u16(
             memory,
@@ -12619,6 +12727,15 @@ mod tests {
             TEST_BALLOON_DEFLATE_USED_RING
                 .checked_add(2)
                 .expect("balloon deflate used idx address should not overflow"),
+        )
+    }
+
+    fn read_balloon_reporting_used_index(memory: &GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_BALLOON_REPORTING_USED_RING
+                .checked_add(2)
+                .expect("balloon reporting used idx address should not overflow"),
         )
     }
 
@@ -14510,6 +14627,63 @@ mod tests {
             DeviceInterruptKind::Queue.status().bits()
         );
         assert_eq!(read_balloon_inflate_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn balloon_notification_signal_dispatch_signals_reporting_descriptor_and_records_metrics() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_balloon_reporting();
+        configure_boot_balloon_reporting_queues(&mut runtime, &mut mmio_dispatcher);
+        write_queued_balloon_reporting_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+        );
+        let dispatches =
+            dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_balloon_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued reporting dispatch should collect");
+
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        let dispatch = device
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("reporting notification should dispatch");
+        assert_eq!(dispatch.reporting_notifications(), 1);
+        let reporting = dispatch
+            .reporting_queue_dispatch()
+            .expect("reporting queue dispatch should be present");
+        assert_eq!(reporting.completed_descriptors(), 1);
+        assert_eq!(reporting.reporting_discard().attempts(), 1);
+        assert_eq!(reporting.reporting_discard().requested_bytes(), 4096);
+        assert!(reporting.needs_queue_interrupt());
+        assert_eq!(read_balloon_reporting_used_index(&memory), 1);
+
+        let metrics = SharedBalloonDeviceMetrics::default();
+        super::record_balloon_dispatch_metrics(&metrics, &result, false);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.free_page_report().count(), 1);
+        assert_eq!(snapshot.free_page_report().requested_bytes(), 4096);
+        assert_eq!(
+            snapshot.free_page_report().advised_bytes(),
+            reporting.reporting_discard().advised_bytes()
+        );
+        assert_eq!(
+            snapshot.free_page_report().skipped_bytes(),
+            reporting.reporting_discard().skipped_bytes()
+        );
+        assert_eq!(
+            snapshot.free_page_report().failures(),
+            reporting.reporting_discard().failures()
+        );
     }
 
     #[test]

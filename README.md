@@ -381,11 +381,13 @@ top-level `uart` object with Firecracker-shaped serial counters for implemented
 TX writes, missed writes, output errors, and rate-limiter drops; a top-level
 `signals` object with `sigpipe` counts for handled non-terminating `SIGPIPE`;
 plus a top-level `balloon` object for implemented virtio-balloon activity and
-failures. Balloon metrics distinguish inflate and free-page-hint discard
-attempts, bytes whose Darwin host-page interiors completed zero/free advice,
-partial-edge bytes skipped to protect neighboring guest data, and failed
-attempts. Darwin discard is best effort and does not promise a synchronous
-process-footprint reduction.
+failures. Balloon metrics distinguish inflate, free-page-hint, and free-page-
+report discard attempts, bytes whose Darwin host-page interiors completed
+zero/free advice, partial-edge bytes skipped to protect neighboring guest data,
+and failed attempts. Reporting also exposes its requested byte total separately
+from advised bytes, so accepted guest descriptors never imply that the host
+reclaimed the complete range. Darwin discard is best effort and does not promise
+a synchronous process-footprint reduction.
 Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported
 deprecated machine `cpu_template`, MMDS V1 config, `vsock_id`, and snapshot-load

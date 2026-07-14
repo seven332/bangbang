@@ -4261,6 +4261,10 @@ mod tests {
     const TEST_BALLOON_STATS_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8068_0000);
     const TEST_BALLOON_STATS_USED_RING: GuestAddress = GuestAddress::new(0x8069_0000);
     const TEST_BALLOON_STATS_PAYLOAD: GuestAddress = GuestAddress::new(0x806a_0000);
+    const TEST_BALLOON_REPORTING_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x806b_0000);
+    const TEST_BALLOON_REPORTING_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x806c_0000);
+    const TEST_BALLOON_REPORTING_USED_RING: GuestAddress = GuestAddress::new(0x806d_0000);
+    const TEST_BALLOON_REPORTING_RANGE: GuestAddress = GuestAddress::new(0x806e_0000);
     const TEST_BALLOON_MAPPED_PFN: u32 = 0x80000;
     const TEST_QUEUE_DEVICE_STRIDE: u64 = 0x0010_0000;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
@@ -5595,6 +5599,60 @@ mod tests {
         );
     }
 
+    fn configure_boot_balloon_reporting_queues(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        configure_boot_balloon_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+            TEST_BALLOON_INFLATE_DESCRIPTOR_TABLE,
+            TEST_BALLOON_INFLATE_AVAILABLE_RING,
+            TEST_BALLOON_INFLATE_USED_RING,
+        );
+        configure_boot_balloon_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+            TEST_BALLOON_DEFLATE_DESCRIPTOR_TABLE,
+            TEST_BALLOON_DEFLATE_AVAILABLE_RING,
+            TEST_BALLOON_DEFLATE_USED_RING,
+        );
+        configure_boot_balloon_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            TEST_BALLOON_REPORTING_DESCRIPTOR_TABLE,
+            TEST_BALLOON_REPORTING_AVAILABLE_RING,
+            TEST_BALLOON_REPORTING_USED_RING,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
     fn notify_boot_balloon_queue(
         runtime: &mut super::Arm64BootRuntimeResources,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -5819,6 +5877,16 @@ mod tests {
         write_available_heads_at(memory, TEST_BALLOON_STATS_AVAILABLE_RING, &[0]);
     }
 
+    fn write_queued_balloon_reporting_request(memory: &mut crate::memory::GuestMemory) {
+        write_descriptor_at(
+            memory,
+            TEST_BALLOON_REPORTING_DESCRIPTOR_TABLE,
+            0,
+            TestDescriptor::writable(TEST_BALLOON_REPORTING_RANGE, 4096, None),
+        );
+        write_available_heads_at(memory, TEST_BALLOON_REPORTING_AVAILABLE_RING, &[0]);
+    }
+
     fn write_queued_memory_hotplug_request(
         memory: &mut crate::memory::GuestMemory,
         request_type: u16,
@@ -5967,6 +6035,15 @@ mod tests {
             TEST_BALLOON_STATS_USED_RING
                 .checked_add(2)
                 .expect("balloon statistics used idx address should not overflow"),
+        )
+    }
+
+    fn read_boot_balloon_reporting_used_index(memory: &crate::memory::GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_BALLOON_REPORTING_USED_RING
+                .checked_add(2)
+                .expect("balloon reporting used idx address should not overflow"),
         )
     }
 
@@ -8995,6 +9072,55 @@ mod tests {
         assert!(inflate.needs_queue_interrupt());
         assert!(dispatch.deflate_queue_dispatch().is_none());
         assert_eq!(read_boot_balloon_inflate_used_index(&memory), 1);
+        assert_eq!(
+            read_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn boot_runtime_balloon_notification_dispatch_executes_reporting_request() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_balloon_config(
+            "kernel-balloon-reporting-dispatch",
+            BalloonConfigInput::new(TEST_MEMORY_MIB as u32, false).with_free_page_reporting(true),
+        );
+        configure_boot_balloon_reporting_queues(&mut runtime, &mut mmio_dispatcher);
+        write_queued_balloon_reporting_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+        );
+
+        let dispatches = runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("balloon reporting dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let dispatch = dispatches.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("queued reporting notification should dispatch");
+        assert_eq!(
+            dispatch.drained_notifications(),
+            [VIRTIO_BALLOON_STATS_QUEUE_INDEX]
+        );
+        assert_eq!(dispatch.reporting_notifications(), 1);
+        assert_eq!(dispatch.inflate_notifications(), 0);
+        assert_eq!(dispatch.deflate_notifications(), 0);
+        let reporting = dispatch
+            .reporting_queue_dispatch()
+            .expect("reporting queue dispatch should be present");
+        assert_eq!(reporting.completed_descriptors(), 1);
+        assert_eq!(reporting.reporting_discard().attempts(), 1);
+        assert_eq!(reporting.reporting_discard().requested_bytes(), 4096);
+        assert!(reporting.needs_queue_interrupt());
+        assert_eq!(read_boot_balloon_reporting_used_index(&memory), 1);
         assert_eq!(
             read_boot_balloon_mmio_u32(
                 &mut runtime,

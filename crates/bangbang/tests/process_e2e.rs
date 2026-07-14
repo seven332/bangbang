@@ -1243,7 +1243,7 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
     let balloon_put_response = http_put_json(
         &socket_path,
         "/balloon",
-        r#"{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":false}"#,
+        r#"{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":true}"#,
     );
     assert_no_content_response(&balloon_put_response, "PUT /balloon");
 
@@ -1254,7 +1254,7 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         r#""deflate_on_oom":true"#,
         r#""stats_polling_interval_s":60"#,
         r#""free_page_hinting":true"#,
-        r#""free_page_reporting":false"#,
+        r#""free_page_reporting":true"#,
     ] {
         assert_response_contains(
             &configured_balloon_get_response,
@@ -1277,38 +1277,8 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
     );
     assert_response_contains(
         &balloon_vm_config,
-        r#""free_page_reporting":false"#,
+        r#""free_page_reporting":true"#,
         "GET /vm/config after PUT /balloon",
-    );
-
-    let balloon_reporting_response = http_put_json(
-        &socket_path,
-        "/balloon",
-        r#"{"amount_mib":32,"deflate_on_oom":false,"free_page_reporting":true}"#,
-    );
-    assert_bad_request_response(
-        &balloon_reporting_response,
-        "PUT /balloon free_page_reporting",
-    );
-    assert_response_contains(
-        &balloon_reporting_response,
-        r#"{"fault_message":"balloon free_page_reporting is not supported"}"#,
-        "PUT /balloon free_page_reporting",
-    );
-    let balloon_after_reporting = http_get(&socket_path, "/balloon");
-    assert_ok_response(
-        &balloon_after_reporting,
-        "GET /balloon after rejected free_page_reporting",
-    );
-    assert_response_contains(
-        &balloon_after_reporting,
-        r#""amount_mib":64"#,
-        "GET /balloon after rejected free_page_reporting",
-    );
-    assert_response_contains(
-        &balloon_after_reporting,
-        r#""free_page_reporting":false"#,
-        "GET /balloon after rejected free_page_reporting",
     );
 
     for (path, action) in [
@@ -1595,7 +1565,7 @@ fn executable_no_api_config_file_pmem_root_device_fails_before_socket() {
 }
 
 #[test]
-fn executable_config_file_balloon_free_page_reporting_fails_before_socket() {
+fn executable_config_file_accepts_balloon_free_page_reporting_before_instance_start() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let config_path = write_balloon_free_page_reporting_startup_config(&test_dir);
@@ -1607,7 +1577,7 @@ fn executable_config_file_balloon_free_page_reporting_fails_before_socket() {
         &["--config-file", path_text(&config_path)],
     );
 
-    assert_balloon_free_page_reporting_startup_failure(
+    assert_balloon_free_page_reporting_reaches_instance_start(
         &output,
         &socket_path,
         "config-file balloon free-page reporting startup",
@@ -1615,7 +1585,7 @@ fn executable_config_file_balloon_free_page_reporting_fails_before_socket() {
 }
 
 #[test]
-fn executable_no_api_config_file_balloon_free_page_reporting_fails_before_socket() {
+fn executable_no_api_config_file_accepts_balloon_free_page_reporting_before_instance_start() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let config_path = write_balloon_free_page_reporting_startup_config(&test_dir);
@@ -1627,7 +1597,7 @@ fn executable_no_api_config_file_balloon_free_page_reporting_fails_before_socket
         &["--config-file", path_text(&config_path), "--no-api"],
     );
 
-    assert_balloon_free_page_reporting_startup_failure(
+    assert_balloon_free_page_reporting_reaches_instance_start(
         &output,
         &socket_path,
         "no-api config-file balloon free-page reporting startup",
@@ -3846,12 +3816,16 @@ fn write_pmem_root_device_startup_config(
 
 fn write_balloon_free_page_reporting_startup_config(test_dir: &TestDir) -> std::path::PathBuf {
     let config_path = test_dir.path().join("vm-config.json");
+    let kernel_path = test_dir.path().join("missing-vmlinux");
+    let kernel_path_json = json_string(path_text(&kernel_path));
     fs::write(
         &config_path,
-        r#"{
-            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
-            "balloon":{"amount_mib":64,"deflate_on_oom":true,"free_page_reporting":true}
-        }"#,
+        format!(
+            r#"{{
+                "boot-source":{{"kernel_image_path":{kernel_path_json}}},
+                "balloon":{{"amount_mib":64,"deflate_on_oom":true,"free_page_reporting":true}}
+            }}"#
+        ),
     )
     .expect("config file should be written");
 
@@ -4184,14 +4158,14 @@ fn assert_pmem_root_device_startup_failure(
     );
 }
 
-fn assert_balloon_free_page_reporting_startup_failure(
+fn assert_balloon_free_page_reporting_reaches_instance_start(
     output: &support::CompletedProcess,
     socket_path: &std::path::Path,
     case_name: &str,
 ) {
     assert!(
         !output.status.success(),
-        "{case_name} should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        "{case_name} should reach InstanceStart; status: {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         output.stdout,
         output.stderr
@@ -4199,7 +4173,7 @@ fn assert_balloon_free_page_reporting_startup_failure(
     assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
-        "{case_name} should fail before API socket publication"
+        "{case_name} should fail InstanceStart before API socket publication"
     );
     assert!(
         !output.stdout.contains("status: API server listening"),
@@ -4213,9 +4187,16 @@ fn assert_balloon_free_page_reporting_startup_failure(
     );
     assert!(
         output.stderr.contains(
-            "bangbang: config-file error: failed to apply config-file action: balloon free_page_reporting is not supported"
+            "bangbang: config-file error: failed to apply config-file action: failed to start microVM: hypervisor error:"
         ),
-        "{case_name} stderr should describe balloon free-page reporting rejection; stderr:\n{}",
+        "{case_name} stderr should prove reporting was accepted before InstanceStart; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output
+            .stderr
+            .contains("free_page_reporting is not supported"),
+        "{case_name} must not reject supported reporting; stderr:\n{}",
         output.stderr
     );
 }
