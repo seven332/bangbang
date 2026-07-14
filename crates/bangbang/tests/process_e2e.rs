@@ -467,6 +467,121 @@ fn executable_accepts_boot_timer_flag() {
 }
 
 #[test]
+fn executable_applies_startup_logger_arguments() {
+    let test_dir = TestDir::new();
+    let instance_id = test_dir.instance_id();
+
+    let matching_socket_path = test_dir.path().join("matching-logger.socket");
+    let matching_logger_path = test_dir.path().join("matching-logger.out");
+    let matching_bangbang = BangbangProcess::start_with_extra_args(
+        &matching_socket_path,
+        &instance_id,
+        &[
+            "--log-path",
+            path_text(&matching_logger_path),
+            "--level",
+            "Info",
+            "--module",
+            "bangbang_runtime::api_server",
+            "--show-level",
+            "--show-log-origin",
+        ],
+    );
+
+    let version = http_get(&matching_socket_path, "/version");
+    assert_ok_response(&version, "GET /version with startup logger");
+    let matching_output = fs::read_to_string(&matching_logger_path)
+        .expect("startup logger output should be readable");
+    let matching_line = matching_output
+        .strip_suffix('\n')
+        .expect("startup logger output should end with one newline");
+    let matching_record = matching_line
+        .strip_prefix("level=Info origin=")
+        .expect("startup logger should include the configured level and origin");
+    let (origin, message) = matching_record
+        .split_once(' ')
+        .expect("startup logger origin should precede the message");
+    let (origin_file, origin_line) = origin
+        .rsplit_once(':')
+        .expect("startup logger origin should contain a file and line");
+    assert!(
+        !origin_file.is_empty(),
+        "logger origin file must not be empty"
+    );
+    assert!(
+        origin_line.parse::<u32>().is_ok(),
+        "logger origin line must be numeric: {origin_line}"
+    );
+    assert_eq!(
+        message,
+        "The API server received a Get request on \"/version\"."
+    );
+    assert_clean_shutdown(
+        matching_bangbang.terminate(),
+        &matching_socket_path,
+        "bangbang with matching startup logger",
+    );
+
+    let filtered_socket_path = test_dir.path().join("filtered-logger.socket");
+    let filtered_logger_path = test_dir.path().join("filtered-logger.out");
+    let filtered_bangbang = BangbangProcess::start_with_extra_args(
+        &filtered_socket_path,
+        &instance_id,
+        &[
+            "--log-path",
+            path_text(&filtered_logger_path),
+            "--level",
+            "Info",
+            "--module",
+            "bangbang_runtime::vmm_action",
+        ],
+    );
+
+    let version = http_get(&filtered_socket_path, "/version");
+    assert_ok_response(&version, "GET /version with filtered startup logger");
+    assert_eq!(
+        fs::read_to_string(&filtered_logger_path)
+            .expect("filtered startup logger output should be readable"),
+        "",
+        "the startup module filter should suppress nonmatching API request logs"
+    );
+    assert_clean_shutdown(
+        filtered_bangbang.terminate(),
+        &filtered_socket_path,
+        "bangbang with filtered startup logger",
+    );
+
+    let warning_socket_path = test_dir.path().join("warning-logger.socket");
+    let warning_logger_path = test_dir.path().join("warning-logger.out");
+    let warning_bangbang = BangbangProcess::start_with_extra_args(
+        &warning_socket_path,
+        &instance_id,
+        &[
+            "--log-path",
+            path_text(&warning_logger_path),
+            "--level",
+            "Warning",
+            "--module",
+            "bangbang_runtime::api_server",
+        ],
+    );
+
+    let version = http_get(&warning_socket_path, "/version");
+    assert_ok_response(&version, "GET /version with warning startup logger");
+    assert_eq!(
+        fs::read_to_string(&warning_logger_path)
+            .expect("warning startup logger output should be readable"),
+        "",
+        "the startup level should suppress informational API request logs"
+    );
+    assert_clean_shutdown(
+        warning_bangbang.terminate(),
+        &warning_socket_path,
+        "bangbang with warning startup logger",
+    );
+}
+
+#[test]
 fn executable_startup_metrics_path_stays_empty_before_session() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");

@@ -2769,7 +2769,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
-          "anchor": "boot timer guest validation"
+          "anchor": "signed_executable_boot_timer_guest_write_logs_boot_time"
         },
         {
           "kind": "local",
@@ -2797,12 +2797,12 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
-          "anchor": "config-file signed startup validation"
+          "anchor": "signed_executable_starts_from_config_file"
         },
         {
           "kind": "local",
           "path": "crates/bangbang/tests/process_e2e.rs",
-          "anchor": "config-file process validation"
+          "anchor": "executable_config_file_failure_does_not_publish_socket"
         }
       ]
     },
@@ -2866,7 +2866,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/process_e2e.rs",
-          "anchor": "Unicode instance identity and invalid input validation"
+          "anchor": "executable_returns_unicode_instance_identity_at_byte_limit and executable_rejects_invalid_unicode_instance_ids_before_socket_publication"
         }
       ]
     },
@@ -2889,7 +2889,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/process_e2e.rs",
-          "anchor": "executable_rejects_invalid_logger_level_as_bad_configuration"
+          "anchor": "executable_applies_startup_logger_arguments and executable_rejects_invalid_logger_level_as_bad_configuration"
         }
       ]
     },
@@ -2912,7 +2912,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/process_e2e.rs",
-          "anchor": "executable_configures_observability_without_vm_config"
+          "anchor": "executable_applies_startup_logger_arguments"
         }
       ]
     },
@@ -3004,7 +3004,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/process_e2e.rs",
-          "anchor": "process logger module filtering"
+          "anchor": "executable_applies_startup_logger_arguments"
         }
       ]
     },
@@ -3027,12 +3027,12 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
-          "anchor": "no-api signed guest outcome validation"
+          "anchor": "signed_executable_starts_no_api_from_config_file"
         },
         {
           "kind": "local",
           "path": "crates/bangbang/tests/process_e2e.rs",
-          "anchor": "no-api process validation"
+          "anchor": "executable_no_api_config_file_failure_does_not_publish_socket"
         }
       ]
     },
@@ -3096,7 +3096,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/process_e2e.rs",
-          "anchor": "process logger level presentation"
+          "anchor": "executable_applies_startup_logger_arguments"
         }
       ]
     },
@@ -3119,7 +3119,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/process_e2e.rs",
-          "anchor": "process logger origin presentation"
+          "anchor": "executable_applies_startup_logger_arguments"
         }
       ]
     },

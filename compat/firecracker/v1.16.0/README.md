@@ -120,5 +120,5 @@ The checked-in integration test also validates this inventory through the
 ordinary workspace test command. A corpus reference records audit ownership;
 it does not by itself prove that every semantic statement is implemented.
 
-This inventory foundation changes no VM or process runtime behavior and makes
-no new compatibility claim.
+The inventory is not evidence by itself. Every terminal compatibility claim
+depends on its referenced production behavior and validation.
