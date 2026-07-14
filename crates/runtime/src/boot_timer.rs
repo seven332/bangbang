@@ -3,7 +3,7 @@
 use std::fmt;
 use std::mem::MaybeUninit;
 
-use crate::logger::{BootTimerLogger, LoggerWriteError};
+use crate::logger::BootTimerLogger;
 use crate::memory::GuestAddress;
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError,
@@ -152,8 +152,7 @@ where
             .map_err(|source| BootTimerMmioError::Clock { source })?
             .elapsed_since(self.start);
         self.logger
-            .log_boot_time(elapsed.wall_time_us(), elapsed.cpu_time_us())
-            .map_err(|source| BootTimerMmioError::Logger { source })?;
+            .log_boot_time(elapsed.wall_time_us(), elapsed.cpu_time_us());
         Ok(())
     }
 }
@@ -192,9 +191,6 @@ pub enum BootTimerMmioError {
     Clock {
         source: BootTimerClockError,
     },
-    Logger {
-        source: LoggerWriteError,
-    },
 }
 
 impl fmt::Display for BootTimerMmioError {
@@ -225,9 +221,6 @@ impl fmt::Display for BootTimerMmioError {
                 write!(f, "failed to build boot timer MMIO read bytes: {source}")
             }
             Self::Clock { source } => write!(f, "failed to read boot timer clock: {source}"),
-            Self::Logger { source } => {
-                write!(f, "failed to write boot timer logger output: {source}")
-            }
         }
     }
 }
@@ -237,7 +230,6 @@ impl std::error::Error for BootTimerMmioError {
         match self {
             Self::BuildReadBytes { source } => Some(source),
             Self::Clock { source } => Some(source),
-            Self::Logger { source } => Some(source),
             Self::UnsupportedAccessSize { .. }
             | Self::UnsupportedWriteDataLength { .. }
             | Self::InvalidRegisterOffset { .. } => None,
@@ -391,6 +383,7 @@ fn timespec_time_us(time: libc::timespec) -> Result<u64, std::io::ErrorKind> {
 mod tests {
     use std::collections::VecDeque;
     use std::fs;
+    use std::io::{Error, ErrorKind, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -400,7 +393,7 @@ mod tests {
         BootTimerClock, BootTimerClockError, BootTimerMmioDevice, BootTimerMmioError,
         BootTimerMmioLayout, BootTimerTimestamp, register_boot_timer_mmio,
     };
-    use crate::logger::{LoggerConfigInput, LoggerState};
+    use crate::logger::{LoggerConfigInput, LoggerState, SharedLoggerMetrics};
     use crate::memory::GuestAddress;
     use crate::mmio::{
         MmioAccessBytes, MmioDispatchError, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
@@ -429,6 +422,19 @@ mod tests {
             self.timestamps
                 .pop_front()
                 .expect("test clock should have a timestamp")
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(Error::from(ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
@@ -505,6 +511,35 @@ mod tests {
             "Guest-boot-time =   7123 us 7 ms,   1456 CPU us 1 CPU ms\n"
         );
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn magic_write_succeeds_when_logger_delivery_fails() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut logger_state = LoggerState::with_shared_metrics(metrics.clone());
+        logger_state.configure_test_writer(FailingWriter);
+        let device = BootTimerMmioDevice::with_clock(
+            ScriptedClock::new(VecDeque::from([
+                Ok(BootTimerTimestamp::new(10_000, 1_000)),
+                Ok(BootTimerTimestamp::new(17_123, 2_456)),
+            ])),
+            logger_state.boot_timer_logger(),
+        )
+        .expect("boot timer should build");
+        let mut dispatcher = dispatcher_with_device(device);
+        let access = dispatcher
+            .lookup(GuestAddress::new(0x1000), 1)
+            .expect("boot timer access should resolve");
+        let operation = MmioOperation::write(access, bytes(&[BOOT_TIMER_MAGIC_VALUE]))
+            .expect("write operation should build");
+
+        assert_eq!(
+            dispatcher
+                .dispatch(operation)
+                .expect("logger failure should not fail MMIO write"),
+            MmioDispatchOutcome::Write
+        );
+        assert_eq!(metrics.missed_log_count(), 1);
     }
 
     #[test]

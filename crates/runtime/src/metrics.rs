@@ -14,7 +14,7 @@ use crate::block::{
 use crate::entropy::{
     VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError, VirtioRngQueueDispatch,
 };
-use crate::logger::MissedLogCounter;
+use crate::logger::SharedLoggerMetrics;
 use crate::network::{
     VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkDeviceNotificationDispatch,
     VirtioNetworkDeviceNotificationError, VirtioNetworkRxQueueDispatch,
@@ -107,12 +107,19 @@ pub struct MetricsState {
     get_api_requests: GetApiRequestMetrics,
     latencies_us: LatencyMetrics,
     logger_metrics: LoggerMetrics,
-    missed_log_counter: MissedLogCounter,
+    shared_logger_metrics: SharedLoggerMetrics,
     patch_api_requests: PatchApiRequestMetrics,
     put_api_requests: PutApiRequestMetrics,
 }
 
 impl MetricsState {
+    pub(crate) fn with_shared_logger_metrics(shared_logger_metrics: SharedLoggerMetrics) -> Self {
+        Self {
+            shared_logger_metrics,
+            ..Self::default()
+        }
+    }
+
     pub fn configure(&mut self, input: MetricsConfigInput) -> Result<(), MetricsConfigError> {
         if self.sink.is_some() {
             return Err(MetricsConfigError::AlreadyInitialized);
@@ -344,14 +351,6 @@ impl MetricsState {
         self.get_api_requests.record_hotplug_memory_request();
     }
 
-    pub(crate) fn record_missed_log(&self) {
-        self.missed_log_counter.record();
-    }
-
-    pub(crate) fn missed_log_counter(&self) -> MissedLogCounter {
-        self.missed_log_counter.clone()
-    }
-
     pub fn flush_with_diagnostics(
         &mut self,
         diagnostics: &MetricsDiagnostics,
@@ -366,9 +365,10 @@ impl MetricsState {
             deprecated_api: self.deprecated_api,
             get_api_requests: self.get_api_requests,
             latencies_us: self.latencies_us,
-            logger_metrics: self
-                .logger_metrics
-                .with_missed_log_count(self.missed_log_counter.count()),
+            logger_metrics: self.logger_metrics.with_log_counts(
+                self.shared_logger_metrics.missed_log_count(),
+                self.shared_logger_metrics.rate_limited_log_count(),
+            ),
             patch_api_requests: self.patch_api_requests,
             put_api_requests: self.put_api_requests,
         };
@@ -428,15 +428,19 @@ struct GetApiRequestMetrics {
 struct LoggerMetrics {
     missed_log_count: u64,
     missed_metrics_count: u64,
+    rate_limited_log_count: u64,
 }
 
 impl LoggerMetrics {
     const fn is_empty(self) -> bool {
-        self.missed_log_count == 0 && self.missed_metrics_count == 0
+        self.missed_log_count == 0
+            && self.missed_metrics_count == 0
+            && self.rate_limited_log_count == 0
     }
 
-    const fn with_missed_log_count(mut self, missed_log_count: u64) -> Self {
+    const fn with_log_counts(mut self, missed_log_count: u64, rate_limited_log_count: u64) -> Self {
         self.missed_log_count = missed_log_count;
+        self.rate_limited_log_count = rate_limited_log_count;
         self
     }
 
@@ -450,6 +454,10 @@ impl LoggerMetrics {
 
     const fn missed_metrics_count(self) -> u64 {
         self.missed_metrics_count
+    }
+
+    const fn rate_limited_log_count(self) -> u64 {
+        self.rate_limited_log_count
     }
 }
 
@@ -5269,6 +5277,12 @@ impl MetricsSink {
                     serde_json::Value::Number(logger_metrics.missed_metrics_count().into()),
                 );
             }
+            if logger_metrics.rate_limited_log_count() != 0 {
+                logger.insert(
+                    "rate_limited_log_count".to_string(),
+                    serde_json::Value::Number(logger_metrics.rate_limited_log_count().into()),
+                );
+            }
             root.insert("logger".to_string(), serde_json::Value::Object(logger));
         }
         if !latencies_us.is_empty() {
@@ -5504,6 +5518,7 @@ mod tests {
         SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
+    use crate::logger::SharedLoggerMetrics;
     use crate::serial::SerialOutputMetrics;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -5749,11 +5764,14 @@ mod tests {
     }
 
     #[test]
-    fn logger_metrics_include_log_and_metrics_miss_counts() {
+    fn logger_metrics_include_delivery_and_rate_limit_counts() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
+        let shared_logger_metrics = SharedLoggerMetrics::default();
+        state.shared_logger_metrics = shared_logger_metrics.clone();
 
-        state.record_missed_log();
+        shared_logger_metrics.record_missed_log();
+        shared_logger_metrics.record_rate_limited_log();
         output.fail_next_write();
         assert_eq!(
             state.flush(),
@@ -5764,7 +5782,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"logger":{"missed_log_count":1,"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"logger":{"missed_log_count":1,"missed_metrics_count":1,"rate_limited_log_count":1},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }

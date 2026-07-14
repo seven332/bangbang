@@ -2455,11 +2455,7 @@ mod tests {
         }
 
         #[track_caller]
-        fn log_api_request(
-            &mut self,
-            method: &str,
-            path: impl std::fmt::Display,
-        ) -> Result<bool, VmmActionError> {
+        fn log_api_request(&mut self, method: &str, path: impl std::fmt::Display) -> bool {
             self.inner.log_api_request(method, path)
         }
 
