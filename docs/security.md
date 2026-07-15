@@ -330,9 +330,10 @@ validation precedes a claim. A successful pre-boot same-ID `PUT` atomically
 replaces public configuration and the retained opened backing; an ordinary path
 removes retained private authority and preserves the historical deferred-open
 timing. Startup preflights every prepared/consumed entry before moving any file
-into the VM resource bundle, then matches provided backings by exact device ID.
-Once moved, a later startup failure leaves that device's grant consumed and a
-fresh same-ID `PUT` is required.
+into the VM resource bundle, then matches provided backings by exact device ID
+and rechecks that their logical read-only mode matches the immutable device
+configuration. Once moved, a later startup failure leaves that device's grant
+consumed and a fresh same-ID `PUT` is required.
 
 After start, only the existing path-changing block `PATCH` may claim another
 preauthorized drive grant. The replacement is validated and opened before the
@@ -549,11 +550,14 @@ understood and acceptable for the deployment.
 Host paths configured through the API are untrusted input. The current behavior
 is resource-specific:
 
-- `/boot-source` stores kernel and optional initrd paths during configuration.
-  Files are opened later during `InstanceStart` with read-only nonblocking
-  access. Startup rejects inaccessible, non-regular, or empty payload files,
-  and API-facing startup errors must not echo the configured path.
-- `/drives/{drive_id}` stores block backing paths during configuration. Backing
+- `/boot-source` stores kernel and optional initrd paths or contained grant tags
+  during configuration. Direct paths are opened later during `InstanceStart`
+  with read-only nonblocking access. In contained mode exact tags instead claim
+  matching read-only kernel/initrd descriptors during the successful `PUT` and
+  move those files into startup without reopening the tags. Both paths reject
+  inaccessible, non-regular, or empty payload files, and API-facing errors must
+  not echo the configured path or tag.
+- `/drives/{drive_id}` stores block backing paths during configuration. Direct
   files are opened later during `InstanceStart`. In contained mode an exact
   drive grant tag is claimed during a successful pre-boot `PUT` with access
   matching `is_read_only`, retained by drive ID, and handed to startup without

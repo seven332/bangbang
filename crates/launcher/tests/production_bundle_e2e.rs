@@ -66,6 +66,7 @@ const GUEST_DATA_REF: &str = "bangbang-grant:grant-guest-data-1362";
 const GUEST_REPLACEMENT_REF: &str = "bangbang-grant:grant-guest-replacement-1362";
 const GUEST_PMEM_REF: &str = "bangbang-grant:grant-guest-pmem-1362";
 const GUEST_READ_ONLY_DATA_REF: &str = "bangbang-grant:grant-guest-read-only-data-1362";
+const GUEST_MISSING_REF: &str = "bangbang-grant:grant-guest-missing-1362";
 const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
 const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
 const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
@@ -542,6 +543,24 @@ fn normal_bundle_adopts_delayed_block_and_pmem_grants_by_descriptor_identity() {
     assert!(unchanged.contains(prior_path));
     assert!(!unchanged.contains(GUEST_PMEM_REF));
 
+    let missing = serde_json::json!({
+        "drive_id": "data",
+        "path_on_host": GUEST_MISSING_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+    });
+    let missing_response = http_put(
+        &running.socket,
+        "/drives/data",
+        &serde_json::to_string(&missing).expect("missing drive should serialize"),
+    );
+    assert_device_private_grant_fault(&missing_response, &fixture);
+    assert!(!missing_response.contains(GUEST_MISSING_REF));
+    let unchanged = http_get(&running.socket, "/vm/config");
+    assert_http_status(&unchanged, 200, "GET /vm/config after missing grant");
+    assert!(unchanged.contains(prior_path));
+    assert!(!unchanged.contains(GUEST_MISSING_REF));
+
     let wrong_access = serde_json::json!({
         "drive_id": "data",
         "path_on_host": GUEST_ROOTFS_REF,
@@ -869,12 +888,14 @@ fn normal_bundle_enforces_read_only_drive_grant_against_guest_writes() {
     let fixture = GuestDeviceGrantFixture::new("read-only-block");
     let mut running = spawn_ready_device_grant_api_launcher(&bundle, &fixture, "read-only-block");
     fixture.replace_source_pathnames();
-    let serial_path = container_tmp_dir().join(format!(
+    let serial_file = TestFilePath::new(container_tmp_dir().join(format!(
         "bb-read-only-{:x}-{}.serial",
         std::process::id(),
         NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst)
-    ));
-    running.sensitive.push(path_text(&serial_path).to_owned());
+    )));
+    running
+        .sensitive
+        .push(path_text(serial_file.path()).to_owned());
 
     assert_http_status(
         &http_put(
@@ -932,7 +953,7 @@ fn normal_bundle_enforces_read_only_drive_grant_against_guest_writes() {
             context,
         );
     }
-    let serial = serde_json::json!({"serial_out_path": path_text(&serial_path)});
+    let serial = serde_json::json!({"serial_out_path": path_text(serial_file.path())});
     assert_http_status(
         &http_put(
             &running.socket,
@@ -952,7 +973,7 @@ fn normal_bundle_enforces_read_only_drive_grant_against_guest_writes() {
         "start read-only block guest",
     );
     wait_for_file_contains(
-        &serial_path,
+        serial_file.path(),
         READ_ONLY_BLOCK_FAILURE_MARKER,
         PROCESS_TIMEOUT,
     )
@@ -968,7 +989,6 @@ fn normal_bundle_enforces_read_only_drive_grant_against_guest_writes() {
     );
 
     stop_running_launcher(&mut running, "read-only block grant guest");
-    let _ = fs::remove_file(serial_path);
 }
 
 #[test]
@@ -2773,6 +2793,25 @@ fn path_text(path: &Path) -> &str {
 
 #[derive(Debug)]
 struct TestDir(PathBuf);
+
+#[derive(Debug)]
+struct TestFilePath(PathBuf);
+
+impl TestFilePath {
+    fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestFilePath {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
 
 impl TestDir {
     fn new(name: &str) -> Self {

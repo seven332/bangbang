@@ -3040,11 +3040,21 @@ impl std::error::Error for VirtioBlockRequestError {
     }
 }
 
-#[derive(Debug)]
 pub struct BlockFileBacking {
     file: File,
     len: u64,
     is_read_only: bool,
+}
+
+impl fmt::Debug for BlockFileBacking {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockFileBacking")
+            .field("file", &"<owned>")
+            .field("len", &self.len)
+            .field("is_read_only", &self.is_read_only)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3916,7 +3926,14 @@ impl PreparedBlockDevice {
         backing: Option<BlockFileBacking>,
     ) -> Result<Self, PreparedBlockDeviceError> {
         let backing = match backing {
-            Some(backing) => backing,
+            Some(backing) => {
+                if backing.is_read_only() != config.is_read_only() {
+                    return Err(PreparedBlockDeviceError::BackingModeMismatch {
+                        drive_id: config.drive_id().to_string(),
+                    });
+                }
+                backing
+            }
             None => BlockFileBacking::open(config).map_err(|source| {
                 PreparedBlockDeviceError::OpenBacking {
                     drive_id: config.drive_id().to_string(),
@@ -4035,6 +4052,9 @@ pub enum PreparedBlockDeviceError {
         drive_id: String,
         source: BlockFileBackingError,
     },
+    BackingModeMismatch {
+        drive_id: String,
+    },
     UnexpectedBacking,
 }
 
@@ -4046,6 +4066,12 @@ impl fmt::Display for PreparedBlockDeviceError {
             }
             Self::OpenBacking { drive_id, source } => {
                 write!(f, "failed to prepare block device {drive_id}: {source}")
+            }
+            Self::BackingModeMismatch { drive_id } => {
+                write!(
+                    f,
+                    "provided block backing mode does not match drive {drive_id}"
+                )
             }
             Self::UnexpectedBacking => {
                 f.write_str("provided block backing does not match a configured drive")
@@ -4059,7 +4085,7 @@ impl std::error::Error for PreparedBlockDeviceError {
         match self {
             Self::AllocateDevices { source } => Some(source),
             Self::OpenBacking { source, .. } => Some(source),
-            Self::UnexpectedBacking => None,
+            Self::BackingModeMismatch { .. } | Self::UnexpectedBacking => None,
         }
     }
 }
@@ -6520,6 +6546,9 @@ mod tests {
             PreparedBlockDeviceError::AllocateDevices { .. } => {
                 panic!("missing path should not fail allocation")
             }
+            PreparedBlockDeviceError::BackingModeMismatch { .. } => {
+                panic!("path-only preparation should not have a backing mode mismatch")
+            }
             PreparedBlockDeviceError::UnexpectedBacking => {
                 panic!("path-only preparation should not have a provided backing")
             }
@@ -6555,6 +6584,9 @@ mod tests {
             PreparedBlockDeviceError::AllocateDevices { .. } => {
                 panic!("directory should not fail allocation")
             }
+            PreparedBlockDeviceError::BackingModeMismatch { .. } => {
+                panic!("path-only preparation should not have a backing mode mismatch")
+            }
             PreparedBlockDeviceError::UnexpectedBacking => {
                 panic!("path-only preparation should not have a provided backing")
             }
@@ -6588,6 +6620,9 @@ mod tests {
             }
             PreparedBlockDeviceError::AllocateDevices { .. } => {
                 panic!("FIFO should not fail allocation")
+            }
+            PreparedBlockDeviceError::BackingModeMismatch { .. } => {
+                panic!("path-only preparation should not have a backing mode mismatch")
             }
             PreparedBlockDeviceError::UnexpectedBacking => {
                 panic!("path-only preparation should not have a provided backing")
@@ -10018,9 +10053,49 @@ mod tests {
         let prepared =
             PreparedBlockDevices::from_config_slice_with_backings(configs.as_slice(), backings)
                 .expect("provided backing should prepare without configured path");
+        let rendered = format!("{prepared:?}");
 
         assert_eq!(prepared.as_slice()[0].device().backing().len(), 8);
         assert!(!prepared.as_slice()[0].device().backing().is_read_only());
+        assert!(!missing.exists());
+        assert!(rendered.contains("<owned>"));
+        assert!(!rendered.contains(file.as_path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn rejects_provided_backing_with_mismatched_read_only_mode() {
+        let file = temp_file("provided-mode-mismatch.img", b"provided");
+        let missing = missing_path("provided-mode-mismatch-missing.img");
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new("data", "data", &missing, false).with_is_read_only(true))
+            .expect("read-only drive config should validate");
+        let provided = BlockFileBacking::from_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file.as_path())
+                .expect("provided backing should open"),
+            false,
+        )
+        .expect("provided backing should validate");
+        let mut backings = BTreeMap::new();
+        backings.insert("data".to_string(), provided);
+
+        let err =
+            PreparedBlockDevices::from_config_slice_with_backings(configs.as_slice(), backings)
+                .expect_err("mismatched provided backing mode should fail");
+
+        assert!(matches!(
+            err,
+            PreparedBlockDeviceError::BackingModeMismatch { ref drive_id }
+                if drive_id == "data"
+        ));
+        assert!(
+            !err.to_string()
+                .contains(file.as_path().to_string_lossy().as_ref())
+        );
+        assert!(!err.to_string().contains(missing.to_string_lossy().as_ref()));
         assert!(!missing.exists());
     }
 

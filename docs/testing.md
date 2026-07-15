@@ -737,11 +737,11 @@ may skip execution. On supported Apple Silicon it proves:
 - invalid-command-line, wrong-role, and missing boot requests preserving the
   prior public configuration; grant faults stay redacted and the otherwise
   valid pair remains unconsumed;
-- delayed block/pmem API claims with exact role/access and one-time behavior,
-  same-ID rollback, authorized config tags, source-path replacement after the
-  launcher opened every file, guest-visible writable block persistence, pmem
-  marker read and flush persistence, and path-free block/pmem limiter updates
-  retaining their backing ownership;
+- delayed block/pmem API claims with exact role/access, malformed/missing
+  rejection, and one-time behavior; same-ID rollback, authorized config tags,
+  source-path replacement after the launcher opened every file, guest-visible
+  writable block persistence, pmem marker read and flush persistence, and
+  path-free block/pmem limiter updates retaining their backing ownership;
 - read-only drive authority reaching a real guest as a failed write while the
   original opened backing remains unchanged; and
 - preauthorized after-start block replacement synchronized by the guest's

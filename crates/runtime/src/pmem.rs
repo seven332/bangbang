@@ -1713,11 +1713,21 @@ impl PmemConfigs {
     }
 }
 
-#[derive(Debug)]
 pub struct PmemFileBacking {
     file: File,
     len: u64,
     read_only: bool,
+}
+
+impl fmt::Debug for PmemFileBacking {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmemFileBacking")
+            .field("file", &"<owned>")
+            .field("len", &self.len)
+            .field("read_only", &self.read_only)
+            .finish()
+    }
 }
 
 impl PmemFileBacking {
@@ -2265,7 +2275,14 @@ impl PreparedPmemDevice {
         allocator: &mut PmemGuestRangeAllocator<'_>,
     ) -> Result<Self, PreparedPmemDeviceError> {
         let backing = match backing {
-            Some(backing) => backing,
+            Some(backing) => {
+                if backing.is_read_only() != config.read_only() {
+                    return Err(PreparedPmemDeviceError::BackingModeMismatch {
+                        pmem_id: config.id().to_string(),
+                    });
+                }
+                backing
+            }
             None => PmemFileBacking::open(config).map_err(|source| {
                 PreparedPmemDeviceError::OpenBacking {
                     pmem_id: config.id().to_string(),
@@ -2488,6 +2505,9 @@ pub enum PreparedPmemDeviceError {
         pmem_id: String,
         source: PmemGuestRangeAllocationError,
     },
+    BackingModeMismatch {
+        pmem_id: String,
+    },
     UnexpectedBacking,
 }
 
@@ -2509,6 +2529,12 @@ impl fmt::Display for PreparedPmemDeviceError {
                     "failed to allocate guest range for pmem device {pmem_id}: {source}"
                 )
             }
+            Self::BackingModeMismatch { pmem_id } => {
+                write!(
+                    f,
+                    "provided pmem backing mode does not match device {pmem_id}"
+                )
+            }
             Self::UnexpectedBacking => {
                 f.write_str("provided pmem backing does not match a configured device")
             }
@@ -2523,7 +2549,7 @@ impl std::error::Error for PreparedPmemDeviceError {
             Self::OpenBacking { source, .. } => Some(source),
             Self::MapBacking { source, .. } => Some(source),
             Self::AllocateGuestRange { source, .. } => Some(source),
-            Self::UnexpectedBacking => None,
+            Self::BackingModeMismatch { .. } | Self::UnexpectedBacking => None,
         }
     }
 }
@@ -5451,10 +5477,52 @@ mod tests {
             &configs, &layout, backings,
         )
         .expect("provided pmem backing should prepare without configured path");
+        let rendered = format!("{prepared:?}");
 
         assert_eq!(prepared.as_slice()[0].backing().len(), 13);
         assert!(!prepared.as_slice()[0].backing().is_read_only());
         assert_eq!(prepared.as_slice()[0].mapping().file_len(), 13);
+        assert!(!missing.exists());
+        assert!(rendered.contains("<owned>"));
+        assert!(!rendered.contains(source.as_path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn prepared_devices_reject_provided_backing_with_mismatched_read_only_mode() {
+        let source = temp_file("provided-pmem-mode-mismatch.img", b"provided");
+        let missing = missing_path("provided-pmem-mode-mismatch-missing.img");
+        let configs = [pmem_config(
+            PmemConfigInput::new("pmem0", missing.to_string_lossy().into_owned())
+                .with_read_only(true),
+        )];
+        let provided = PmemFileBacking::from_file(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(source.as_path())
+                .expect("provided pmem backing should open"),
+            false,
+        )
+        .expect("provided pmem backing should validate");
+        let mut backings = BTreeMap::new();
+        backings.insert("pmem0".to_string(), provided);
+        let layout = guest_layout(vec![guest_range(aarch64::DRAM_MEM_START, 8 * 1024 * 1024)]);
+
+        let err = PreparedPmemDevices::from_config_slice_with_layout_and_backings(
+            &configs, &layout, backings,
+        )
+        .expect_err("mismatched provided backing mode should fail");
+
+        assert!(matches!(
+            err,
+            PreparedPmemDeviceError::BackingModeMismatch { ref pmem_id }
+                if pmem_id == "pmem0"
+        ));
+        assert!(
+            !err.to_string()
+                .contains(source.as_path().to_string_lossy().as_ref())
+        );
+        assert!(!err.to_string().contains(missing.to_string_lossy().as_ref()));
         assert!(!missing.exists());
     }
 
