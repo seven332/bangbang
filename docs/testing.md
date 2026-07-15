@@ -704,6 +704,18 @@ may skip execution. On supported Apple Silicon it proves:
   App Sandbox/Hypervisor authority, and exactly those two worker entitlements;
 - unchanged help/output and representative nonzero worker exit forwarding
   through the structured lifecycle session;
+- exact early jailer help/version output and closed policy parsing, including
+  fixed executable/current credentials, ID/timing injection, duplicate and
+  forwarded-singleton rejection, last-value resource limits, and redacted
+  failure;
+- a marker-only worker exec environment, absent caller/loader/debug variables,
+  current credentials/session identity, descriptor-entered private cwd, exact
+  default/explicit limits, real `EMFILE` exhaustion, and kernel `SIGXFSZ` at the
+  configured file-size boundary;
+- daemon caller return only after API readiness, one exact supervisor PID line,
+  new-session `/dev/null` execution, two concurrent noninterchangeable
+  supervisors, post-ack signal cleanup, and pre-ack parent loss cancelling the
+  worker and namespace;
 - rejection before worker execution when a private bundle copy has a modified
   or missing worker;
 - suspended and post-`Hello` live-worker validation, bounded malformed bootstrap
@@ -719,7 +731,7 @@ may skip execution. On supported Apple Silicon it proves:
   namespace recovery, and preservation of the concurrent peer namespace;
 - two simultaneous API sessions remaining independent when one worker is
   killed and the other is queried and then gracefully stopped; and
-- mandatory lifecycle-v2 acknowledgment for even an empty batch; exact
+- mandatory lifecycle-v3 acknowledgment for even an empty batch; exact
   SCM_RIGHTS read-only/write-only enforcement; one-session directory bookmark
   scope and outside-parent denial; typed mismatch rollback; path/ID/content
   redaction; signal cancellation during an incomplete batch; one absolute grant
@@ -797,8 +809,9 @@ expose an overlay, and places no guest resources in a normal product. The
 all-features development binary is not a shippable bundle. Tests use readiness
 events and bounded deadlines rather than fixed sleeps.
 
-Portable `bangbang-session` tests exhaustively split and coalesce every v2
-message frame and cover wrong magic/version/reserved data, exact frame/buffer
+Portable `bangbang-session` tests exhaustively split and coalesce every v3
+message frame and cover the fixed reserved-zero redacted `WorkerPolicy`, wrong
+magic/version/reserved data, exact frame/buffer
 limits, oversized input, EOF rejection, replay, sequence gaps, cross-session and
 wrong-role/state input, reserved identity use, monotonic API/early-command/
 cancellation/grant state, and payload/identity-redacted formatting. Grant codec

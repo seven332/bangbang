@@ -73,7 +73,7 @@ partially implemented composite is not a terminal claim.
 The #1354 production-boundary audit moves exactly three composite isolation
 records to `missing-platform-feasible` with #1351 as their delivery owner. It
 does not terminally promote them: external resource authority, authenticated
-brokerage, vmnet policy, crash coupling, deployment identity, and exact
+brokerage, vmnet policy, crash coupling, deployment identity, and complete
 jailer/seccomp outcome classification remain incomplete. The broad source
 corpus records remain `audit-required`. The checked
 [`isolation-contract.md`](isolation-contract.md) separates the delivered
@@ -98,6 +98,20 @@ worker death without deleting a replacement. The unavoidable create-before-
 record window, simultaneous uncatchable launcher/worker death, broader native
 snapshot profiles, general brokerage/hard revocation, network policy, Linux
 outcome classification, and deployment identity remain outside this slice.
+
+The #1370 launch-control slice promotes exactly five jailer argument leaves:
+`id`, fixed embedded `exec-file`, repeatable `resource-limit`, `daemonize`, and
+the early `version` command. Lifecycle v3 authenticates a fixed redacted worker
+policy; the worker receives no ambient parent environment, installs exact
+`RLIMIT_FSIZE`/`RLIMIT_NOFILE`, and descriptor-enters its private namespace
+before `Prepared`. A same-code signed launcher re-exec supplies bounded
+Ready/PID acknowledgment and retained daemon supervision. Signed tests exercise
+real descriptor/file-size exhaustion, pre-ack parent loss, post-ack signals,
+and concurrent daemon isolation. The complete 417-record delivery inventory is
+therefore 26 `implemented-and-verified`, 388 `audit-required`, and three
+`missing-platform-feasible`. Arbitrary uid/gid, configurable chroot, cgroups,
+network/PID namespaces, seccomp, aggregate jailer operation/corpus, general
+brokerage, vmnet, and deployment identity remain nonterminal under #1351.
 
 ## Commands
 

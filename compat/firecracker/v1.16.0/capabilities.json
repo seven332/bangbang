@@ -3331,7 +3331,7 @@
     {
       "id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
       "family": "isolation",
-      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a default-close standard/lifecycle/grant/dormant-broker descriptor allowlist, authenticated lifecycle v2, mandatory atomic startup-grant acknowledgment, a locked private namespace with only strict post-gate ownership records, and exact contained consumption of granted startup config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket, and vsock-socket authority. Normal signed execution proves outside-container file descriptors and anchored directories work through launcher-preauthorized identities, native snapshot create/describe/restore reaches a real guest, recorded snapshot staging is recovered after worker death without deleting replacements, both real vsock initiation directions work through supplied listeners or the fixed launcher facet, helpers are reaped before exposure, and worker entitlements remain exactly App Sandbox plus Hypervisor. Remaining jailer limits, credentials, daemonization, seccomp, network, general brokerage/hard revocation, cross-filesystem socket publication, and deployment outcomes require explicit macOS equivalents under #1351.",
+      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a closed environment and default-close standard/lifecycle/grant/dormant-broker descriptor allowlist, authenticated lifecycle v3 launch policy, exact worker-only RLIMIT_FSIZE/RLIMIT_NOFILE, current-credential and session verification, a descriptor-entered locked private namespace with strict post-gate ownership records, and exact contained consumption of granted startup config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket, and vsock-socket authority. A signed same-code launcher re-exec provides detached readiness, PID, signal, supervision, and cleanup ownership without exposing an orphaned worker. Normal signed execution proves outside-container descriptors and anchored directories work through launcher-preauthorized identities, native snapshot create/describe/restore reaches a real guest, recorded snapshot staging is recovered after worker death without deleting replacements, both real vsock initiation directions work through supplied listeners or the fixed launcher facet, helpers are reaped before exposure, and worker entitlements remain exactly App Sandbox plus Hypervisor. Arbitrary uid/gid transition and configurable chroot ownership, cgroups, network/PID namespaces, seccomp, general brokerage/hard revocation, cross-filesystem socket publication, and deployment outcomes still require explicit macOS conclusions under #1351.",
       "source_refs": [
         "corpus:jailer",
         "corpus:production-host",
@@ -3797,20 +3797,58 @@
     {
       "id": "tool-argument:jailer/daemonize",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/daemonize.",
+      "summary": "Provide the Firecracker v1.16 jailer daemon outcome through a signed same-code SETSID re-exec, /dev/null standard streams, bounded Ready/PID acknowledgment, parent-loss cancellation, retained supervision, signals, and cleanup.",
       "source_refs": [
         "tool-argument:jailer/daemonize"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/daemon.rs",
+          "anchor": "launch_parent, child_bootstrap, and DaemonNotifier"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/supervise.rs",
+          "anchor": "wait_session_inner daemon handoff observation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed_daemon_handoff_waits_for_ready_and_keeps_concurrent_supervisors_isolated and signed_daemon_parent_loss_before_ack_cancels_worker_and_private_state"
+        }
+      ]
     },
     {
       "id": "tool-argument:jailer/exec-file",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/exec-file.",
+      "summary": "Bind the production jailer executable declaration to the exact embedded worker path and revalidate its fixed live code identity before execution.",
       "source_refs": [
         "tool-argument:jailer/exec-file"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "LaunchRequest::validate"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/code_sign.rs",
+          "anchor": "validate_worker_process"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "launcher_exposes_exact_jailer_help_version_and_policy_validation and launcher_rejects_modified_missing_or_wrongly_signed_worker_before_execution"
+        }
+      ]
     },
     {
       "id": "tool-argument:jailer/gid",
@@ -3824,11 +3862,30 @@
     {
       "id": "tool-argument:jailer/id",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/id.",
+      "summary": "Validate one bounded Unicode-alphanumeric-or-hyphen jailer instance ID and inject it once ahead of opaque worker arguments with timing fields owned by the launcher.",
       "source_refs": [
         "tool-argument:jailer/id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "parse_jailer and LaunchRequest::prepare"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "parses_exact_policy_and_injects_owned_arguments and rejects_missing_duplicate_unknown_and_forwarded_inputs"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits"
+        }
+      ]
     },
     {
       "id": "tool-argument:jailer/netns",
@@ -3860,11 +3917,35 @@
     {
       "id": "tool-argument:jailer/resource-limit",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/resource-limit.",
+      "summary": "Provide repeatable last-value fsize/no-file jailer policy with the upstream no-file default, authenticated worker-local exact soft/hard installation, inherited-hard-limit rejection, and kernel-enforced exhaustion.",
       "source_refs": [
         "tool-argument:jailer/resource-limit"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "install_worker_policy and install_resource_limit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "parse_jailer and LaunchRequest::prepare"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "exact_limit_never_raises_the_inherited_hard_limit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits"
+        }
+      ]
     },
     {
       "id": "tool-argument:jailer/uid",
@@ -3878,11 +3959,30 @@
     {
       "id": "tool-argument:jailer/version",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/version.",
+      "summary": "Provide the exact early jailer-version command through the versioned production launch-policy activation without validating or starting a bundle worker.",
       "source_refs": [
         "tool-argument:jailer/version"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "LaunchCommand::parse"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/supervisor.rs",
+          "anchor": "LaunchCommand::Version"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "launcher_exposes_exact_jailer_help_version_and_policy_validation"
+        }
+      ]
     },
     {
       "id": "tool-argument:rebase-snap/base-file",

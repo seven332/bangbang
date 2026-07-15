@@ -371,19 +371,26 @@ inspects both code objects before exclusive publication, and runtime launch
 fails closed on wrong placement, symlinks, missing or modified code, signature,
 identifier, or required-entitlement failures.
 
-The launcher forwards worker arguments and standard streams unchanged but uses
-Darwin's default-close spawn policy so only standard streams plus fixed
-lifecycle, startup-grant, and dormant socket-broker endpoints reach the worker.
+The launcher preserves ordinary worker argument bytes or accepts one exact
+outer `--bangbang-jailer-v1 ... --` policy before the existing grant envelope.
+That policy binds the fixed executable, current uid/gid, one validated ID,
+launcher-owned timing, repeatable last-value `fsize`/`no-file` values, and
+optional daemon mode. Darwin's default-close spawn policy supplies only a
+private marker environment, standard streams, and fixed lifecycle,
+startup-grant, and dormant socket-broker endpoints to the worker.
 It validates the suspended live worker, resumes only the
 private bootstrap, authenticates the child-attributed socket peer and live code,
 and then binds a random 256-bit identity to a versioned, 4-KiB-bounded protocol
-with exact sequences and closed lifecycle messages. Worker authentication of the
-launcher is intentionally asymmetric: it verifies matching effective
-credentials and direct-parent PID before and after bootstrap, while App Sandbox
-denies its independent Security.framework lookup of the parent.
+with exact sequences, closed lifecycle messages, and a fixed reserved-zero
+`Start(WorkerPolicy)`. Worker authentication of the launcher is intentionally
+asymmetric: it verifies matching real/effective credentials, process session,
+and direct-parent PID before policy application, while App Sandbox denies its
+independent Security.framework lookup of the parent. The worker installs and
+reads back exact soft/hard `RLIMIT_FSIZE` and `RLIMIT_NOFILE` without raising an
+inherited hard limit; production no-file defaults to 2048.
 
-The worker creates and locks one exact mode-0700 empty namespace in its
-container before `Prepared`; the launcher independently verifies name, owner,
+The worker creates, locks, and descriptor-enters one exact mode-0700 empty
+namespace in its container before `Prepared`; the launcher independently verifies name, owner,
 mode, device, inode, emptiness, and live lock before `Proceed`. After that gate,
 socket publication may add only fixed strict role/child/identity ownership
 records. `Starting`,
@@ -391,7 +398,8 @@ committed API/no-API `Ready`, one cancellation, and path-free `Terminal` state
 are monotonic and sequence-checked. A surviving side performs exact-inode
 cleanup, and a later worker performs bounded unlocked-empty recovery after both
 sides are killed. Signed Apple Silicon evidence covers malformed bootstrap and
-fd closure, worker-first/launcher-first/both-killed cases, concurrent-session
+closed environment/fd policy, exact limits plus real `EMFILE`/`SIGXFSZ`, private
+cwd, worker-first/launcher-first/both-killed cases, concurrent-session
 isolation, both graceful signals, container API service, exact external startup
 config/metadata/kernel/initrd grants, repeatable block/pmem grants, delayed
 atomic claims that retain opened identities after pathname replacement,
@@ -402,6 +410,14 @@ granted-vsock initiation directions, and real sandboxed HVF guests ending
 through PSCI `SYSTEM_OFF`. It also proves external native-v1 snapshot
 create/describe/state-memory-root restore and exact staging cleanup after worker
 death.
+
+`--daemonize` re-executes the same validated outer code with default-close
+`SETSID`, `/dev/null` standard streams, a marker-only environment, and one
+closed handoff fd. The re-executed launcher remains the worker supervisor. The
+original returns one PID only after worker readiness and exact acknowledgment;
+parent loss before acknowledgment cancels the unpublished session, while later
+SIGINT/SIGTERM to that PID follows normal reap and cleanup. Signed evidence also
+covers two simultaneous daemon supervisors and peer survival after one stops.
 
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
 session namespace itself grants no host resource. The bounded startup channel
@@ -416,10 +432,11 @@ publication, while guest-initiated vsock connections use one fixed port-only
 launcher facet with no guest bytes or outgoing-network entitlement. Snapshot
 describe/state/memory/root consumers adopt exact files; create retains
 repeatable output anchors with bounded children and strict crash-cleanup
-records. General dynamic post-Ready delivery, hard revocation, cross-filesystem socket
-publication, vmnet provisioning and policy, jailer limits/credentials, seccomp
-outcomes, launch constraints, Developer ID possession, automatic restart, and
-notarization remain later work.
+records. General dynamic post-Ready delivery, hard revocation, cross-filesystem
+socket publication, vmnet provisioning and policy, arbitrary uid/gid transition,
+configurable chroot, cgroups, network/PID namespaces, seccomp outcomes, launch
+constraints, Developer ID possession, automatic restart, and notarization
+remain later work.
 
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current
@@ -3036,7 +3053,9 @@ macOS design work instead of direct implementation:
   unmasking, runner-loop interrupt delivery beyond the current internal
   block/network/timer paths, and public device wiring still need
   macOS-specific backend work.
-- Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
+- Linux seccomp, jailer, cgroup, and namespace mechanisms do not directly
+  apply; the fixed-code/current-user/rlimit/daemon outcomes above are macOS
+  equivalents, not those Linux identities.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.
 
@@ -3046,7 +3065,9 @@ host isolation boundary. The lower-level `app_sandbox` target proves that the
 HVF lifecycle and process can execute inside App Sandbox. The separate
 `production_bundle` target proves the fixed launcher/nested-worker package,
 signature and entitlement split, tamper gate, container denial/redaction,
-signal/exit forwarding, mandatory lifecycle-v2 grant acknowledgment, typed
+signal/exit forwarding, mandatory lifecycle-v3 policy/grant acknowledgment,
+closed environment/descriptors, exact resource limits and private cwd, signed
+daemon readiness/ownership and parent-loss cancellation, typed
 SCM_RIGHTS file authority, one-session directory bookmark scope, atomic
 rollback, grant-bearing crash/concurrency behavior, socket cleanup, and real HVF
 guest lifecycle. The ordinary CLI remains uncontained. Contained startup config,
@@ -3068,9 +3089,11 @@ cleanup, and keep guest-initiated vsock connects on one fixed session-bound
 launcher port facet without guest payloads or an outgoing-network entitlement.
 Signed normal-bundle proof covers outside-container API clients, real guest- and
 host-initiated vsock traffic, no surviving helper, and unchanged entitlements.
-Snapshot path consumers, general dynamic brokerage, cross-filesystem socket
-publication, hard revocation, vmnet provisioning, Linux seccomp outcome
-classification, and deployment signing policy remain later #1351 work.
+Snapshot path consumers use exact state/memory/root and repeatable output grants.
+General dynamic brokerage, cross-filesystem socket publication, hard revocation,
+vmnet provisioning, arbitrary credential/chroot authority, remaining Linux
+jailer controls, seccomp outcome classification, and deployment signing policy
+remain later #1351 work.
 
 ## Validation Expectations
 

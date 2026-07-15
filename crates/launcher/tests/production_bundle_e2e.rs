@@ -27,13 +27,14 @@ use bangbang_launcher::{
 };
 use bangbang_session::{
     Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD,
-    SOCKET_BROKER_FD, SessionId, encode_frame,
+    SOCKET_BROKER_FD, SessionId, WorkerPolicy, encode_frame,
 };
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
 const GRANT_TEST_BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH";
 const GUEST_EXT4_ROOTFS_ENV: &str = "BANGBANG_GUEST_EXT4_ROOTFS_PATH";
 const GRANT_MANIFEST_OPTION: &str = "--bangbang-grant-manifest";
+const JAILER_OPTION: &str = "--bangbang-jailer-v1";
 const GRANT_PROBE_OPTION: &str = "--bangbang-internal-grant-probe-v1";
 const GRANT_PROBE_READY: &str = "status: grant integration probe ready";
 const GRANT_DELAY_OPTION: &str = "--bangbang-internal-grant-delay-v1";
@@ -213,6 +214,26 @@ fn run_launcher(bundle: &Path, args: &[&OsStr]) -> Output {
         .expect("production launcher should execute")
 }
 
+fn jailer_command(bundle: &Path, id: &str, limits: &[&str], daemonize: bool) -> Command {
+    // SAFETY: Credential getters have no pointer or ownership contract.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let mut command = Command::new(launcher(bundle));
+    command
+        .arg(JAILER_OPTION)
+        .args(["--id", id])
+        .arg("--exec-file")
+        .arg(worker_executable(bundle))
+        .args(["--uid", &uid.to_string(), "--gid", &gid.to_string()]);
+    for limit in limits {
+        command.args(["--resource-limit", limit]);
+    }
+    if daemonize {
+        command.arg("--daemonize");
+    }
+    command.arg("--");
+    command
+}
+
 #[test]
 fn production_bundle_has_exact_nested_signing_contract() {
     let bundle = production_bundle();
@@ -278,6 +299,273 @@ fn launcher_forwards_help_and_argument_parsing_exit() {
     let stderr = String::from_utf8_lossy(&bad.stderr);
     assert!(stderr.contains("--no-api requires --config-file"));
     assert!(!stderr.contains("launcher signal"));
+}
+
+#[test]
+fn launcher_exposes_exact_jailer_help_version_and_policy_validation() {
+    let bundle = production_bundle();
+    let help = run_launcher(&bundle, &[OsStr::new(JAILER_OPTION), OsStr::new("--help")]);
+    assert_output_success(&help, "jailer help");
+    assert!(String::from_utf8_lossy(&help.stdout).starts_with("Usage: bangbang-launcher"));
+
+    let version = run_launcher(
+        &bundle,
+        &[OsStr::new(JAILER_OPTION), OsStr::new("--version")],
+    );
+    assert_output_success(&version, "jailer version");
+    assert!(String::from_utf8_lossy(&version.stdout).starts_with("Jailer v"));
+
+    let assert_invalid = |mut command: Command, context: &str| {
+        let invalid = run_with_timeout(&mut command, PROCESS_TIMEOUT, context);
+        assert_eq!(invalid.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&invalid.stderr),
+            "bangbang launcher: invalid production launch policy\n"
+        );
+    };
+
+    let mut duplicate = jailer_command(&bundle, "invalid-policy", &[], false);
+    duplicate
+        .args(["--id", "forged-duplicate"])
+        .arg("--version");
+    assert_invalid(duplicate, "duplicate jailer policy");
+
+    // SAFETY: Credential getters have no pointer or ownership contract.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let policy_command = |executable: &Path, requested_uid: u32, requested_gid: u32| {
+        let mut command = Command::new(launcher(&bundle));
+        command
+            .arg(JAILER_OPTION)
+            .args(["--id", "fixed-policy"])
+            .arg("--exec-file")
+            .arg(executable)
+            .args([
+                "--uid",
+                &requested_uid.to_string(),
+                "--gid",
+                &requested_gid.to_string(),
+                "--",
+                "--version",
+            ]);
+        command
+    };
+    assert_invalid(
+        policy_command(Path::new("/usr/bin/false"), uid, gid),
+        "substituted jailer executable",
+    );
+    assert_invalid(
+        policy_command(&worker_executable(&bundle), uid.wrapping_add(1), gid),
+        "mismatched jailer credential",
+    );
+}
+
+#[test]
+fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits() {
+    let bundle = grant_test_bundle();
+    for (case, limits) in [
+        ("policy-default", Vec::<&str>::new()),
+        ("policy-explicit", vec!["no-file=1024", "fsize=4096"]),
+        (
+            "policy-last",
+            vec!["no-file=4096", "fsize=8192", "no-file=2048", "fsize=4096"],
+        ),
+    ] {
+        let fixture = GrantProbeFixture::new(case, false);
+        let mut command = jailer_command(&bundle, case, &limits, false);
+        command
+            .arg(GRANT_MANIFEST_OPTION)
+            .arg(&fixture.manifest)
+            .arg("--")
+            .arg(GRANT_PROBE_OPTION)
+            .arg(case)
+            .env("BANGBANG_POLICY_SECRET", "secret-must-not-reach-worker")
+            .env(
+                "BANGBANG_ORDINARY_AMBIENT",
+                "ordinary-must-not-reach-worker",
+            )
+            .env("DYLD_LIBRARY_PATH", "loader-must-not-reach-worker")
+            .env("RUST_LOG", "debug-must-not-reach-worker")
+            .env(SESSION_ENV_KEY, "forged-internal-marker");
+        let output = run_with_timeout(&mut command, PROCESS_TIMEOUT, "signed jailer policy probe");
+        assert_output_success(&output, "signed jailer policy probe");
+        assert_grant_output_redacted(&output, &fixture);
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for value in [
+            "secret-must-not-reach-worker",
+            "ordinary-must-not-reach-worker",
+            "loader-must-not-reach-worker",
+            "debug-must-not-reach-worker",
+            "forged-internal-marker",
+        ] {
+            assert!(!diagnostics.contains(value));
+        }
+        fixture.assert_completed();
+    }
+
+    let nofile_fixture = GrantProbeFixture::new("policy-nofile-exhaustion", false);
+    let mut nofile = jailer_command(
+        &bundle,
+        "policy-nofile-exhaustion",
+        &["no-file=1024"],
+        false,
+    );
+    nofile
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&nofile_fixture.manifest)
+        .arg("--")
+        .arg(GRANT_PROBE_OPTION)
+        .arg("policy-nofile-exhaustion");
+    let nofile = run_with_timeout(&mut nofile, PROCESS_TIMEOUT, "RLIMIT_NOFILE exhaustion");
+    assert_output_success(&nofile, "RLIMIT_NOFILE exhaustion");
+    assert_grant_output_redacted(&nofile, &nofile_fixture);
+    nofile_fixture.assert_completed();
+
+    let fsize_fixture = GrantProbeFixture::new("policy-fsize-exhaustion", false);
+    let mut fsize = jailer_command(
+        &bundle,
+        "policy-fsize-exhaustion",
+        &["no-file=1024", "fsize=4096"],
+        false,
+    );
+    fsize
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fsize_fixture.manifest)
+        .arg("--")
+        .arg(GRANT_PROBE_OPTION)
+        .arg("policy-fsize-exhaustion");
+    let fsize = run_with_timeout(&mut fsize, PROCESS_TIMEOUT, "RLIMIT_FSIZE exhaustion");
+    assert_eq!(
+        fsize.status.code(),
+        Some(128 + libc::SIGXFSZ),
+        "the kernel should terminate the worker at the exact file-size boundary"
+    );
+    assert_grant_output_redacted(&fsize, &fsize_fixture);
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn signed_daemon_handoff_waits_for_ready_and_keeps_concurrent_supervisors_isolated() {
+    let bundle = production_bundle();
+    initialize_worker_container(&bundle);
+    let start = |name: &str| {
+        let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let socket =
+            container_tmp_dir().join(format!("bbd-{:x}-{test_id:x}.sock", std::process::id()));
+        let mut command = jailer_command(&bundle, name, &[], true);
+        command.args(["--api-sock", path_text(&socket)]);
+        let output = run_with_timeout(&mut command, PROCESS_TIMEOUT, "daemon readiness handoff");
+        assert_output_success(&output, "daemon readiness handoff");
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).expect("daemon PID line should be UTF-8");
+        let mut lines = stdout.lines();
+        let pid = lines
+            .next()
+            .and_then(|line| line.strip_prefix("bangbang daemon pid: "))
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0)
+            .expect("daemon PID line should be exact");
+        assert!(
+            lines.next().is_none(),
+            "daemon output should contain one PID line"
+        );
+        assert!(
+            fs::symlink_metadata(&socket)
+                .expect("Ready must publish the API socket")
+                .file_type()
+                .is_socket(),
+            "Ready must follow API socket publication"
+        );
+        assert_http_status(&http_get(&socket, "/"), 200, "daemon API readiness");
+        (pid, socket)
+    };
+
+    let (first_pid, first_socket) = start("daemon-policy-alpha");
+    let (second_pid, second_socket) = start("daemon-policy-beta");
+    assert_ne!(first_pid, second_pid);
+
+    // SAFETY: The authenticated PID was returned by the handoff and has not
+    // been observed exiting or reused.
+    assert_eq!(unsafe { libc::kill(first_pid, libc::SIGTERM) }, 0);
+    assert!(wait_for_process_exit(first_pid, PROCESS_TIMEOUT));
+    assert!(!first_socket.exists());
+    assert_http_status(
+        &http_get(&second_socket, "/"),
+        200,
+        "concurrent daemon survives peer termination",
+    );
+
+    // SAFETY: The second authenticated supervisor is still live above.
+    assert_eq!(unsafe { libc::kill(second_pid, libc::SIGTERM) }, 0);
+    assert!(wait_for_process_exit(second_pid, PROCESS_TIMEOUT));
+    assert!(!second_socket.exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn signed_daemon_parent_loss_before_ack_cancels_worker_and_private_state() {
+    let bundle = grant_test_bundle();
+    initialize_worker_container(&bundle);
+    let baseline_sessions = session_entries();
+    let fixture = GrantProbeFixture::new("daemon-parent-loss", false);
+    let mut command = jailer_command(&bundle, "daemon-parent-loss", &[], true);
+    command
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .arg(GRANT_DELAY_OPTION);
+    let parent = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("daemon handoff parent should start");
+    let parent_pid = libc::pid_t::try_from(parent.id()).expect("parent PID should fit");
+    let daemon_pid = wait_for_only_child_pid(parent_pid, PROCESS_TIMEOUT, "daemon launcher");
+    assert!(
+        wait_for_new_session(&baseline_sessions, PROCESS_TIMEOUT),
+        "daemon worker should prepare its private namespace before the handoff"
+    );
+    let worker_pid = wait_for_only_child_pid(daemon_pid, PROCESS_TIMEOUT, "daemon worker");
+    let daemon_exit = ProcessExitWatch::new(daemon_pid);
+    let worker_exit = ProcessExitWatch::new(worker_pid);
+
+    // SAFETY: The unreaped original launcher still owns this exact PID. SIGKILL
+    // closes the only parent handoff endpoint without signaling the new session.
+    assert_eq!(unsafe { libc::kill(parent_pid, libc::SIGKILL) }, 0);
+    let output = parent
+        .wait_with_output()
+        .expect("killed handoff parent should be reaped");
+    assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+    assert!(
+        output.stdout.is_empty(),
+        "pre-ack launch must not publish a PID"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "pre-ack failure must remain private"
+    );
+
+    let worker_stopped = worker_exit.wait(PROCESS_TIMEOUT);
+    let daemon_stopped = daemon_exit.wait(PROCESS_TIMEOUT);
+    if !worker_stopped || !daemon_stopped {
+        // SAFETY: The daemon established a fresh session/process group and the
+        // test has not observed its exit, so this bounds a failed cleanup path.
+        let _ = unsafe { libc::kill(-daemon_pid, libc::SIGKILL) };
+    }
+    assert!(
+        worker_stopped,
+        "parent loss should cancel and reap the worker"
+    );
+    assert!(
+        daemon_stopped,
+        "parent loss should stop the daemon supervisor"
+    );
+    assert_eq!(session_entries(), baseline_sessions);
+    fixture.assert_unmodified();
 }
 
 #[test]
@@ -2103,9 +2391,32 @@ fn contained_worker_closes_unexpected_inherited_descriptor() {
     let fixture = TestDir::new("inherited-fd");
     let config = fixture.path().join("config.json");
     fs::write(&config, b"{}").expect("probe config should be written");
-    let file = fs::File::open(&config).expect("probe config should open");
-    // SAFETY: `file` remains live and the returned descriptor is independently owned.
-    let inherited = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+    let regular = fs::File::open(&config).expect("probe config should open");
+    let directory = fs::File::open(fixture.path()).expect("probe directory should open");
+    let (stream, _stream_peer) = UnixStream::pair().expect("probe stream pair should open");
+    let (datagram, _datagram_peer) = UnixDatagram::pair().expect("probe datagram pair should open");
+    let mut pipe = [-1; 2];
+    // SAFETY: `pipe` is writable storage for exactly two fresh descriptors.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    // SAFETY: Both successful pipe descriptors transfer ownership exactly once.
+    let pipe_reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    // SAFETY: This is the distinct second descriptor returned by the same call.
+    let _pipe_writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+
+    for (kind, descriptor) in [
+        ("regular file", regular.as_raw_fd()),
+        ("directory", directory.as_raw_fd()),
+        ("stream socket", stream.as_raw_fd()),
+        ("datagram socket", datagram.as_raw_fd()),
+        ("pipe", pipe_reader.as_raw_fd()),
+    ] {
+        assert_unexpected_descriptor_closed(&bundle, descriptor, kind);
+    }
+}
+
+fn assert_unexpected_descriptor_closed(bundle: &Path, source: libc::c_int, kind: &str) {
+    // SAFETY: `source` remains live and the returned descriptor is independently owned.
+    let inherited = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 200) };
     assert!(inherited >= 200, "high probe descriptor should duplicate");
     // SAFETY: `inherited` is the fresh descriptor above and ownership transfers once.
     let inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
@@ -2116,7 +2427,7 @@ fn contained_worker_closes_unexpected_inherited_descriptor() {
     assert_eq!(result, 0);
     let descriptor_path = format!("/dev/fd/{}", inherited.as_raw_fd());
     let output = run_launcher(
-        &bundle,
+        bundle,
         &[
             OsStr::new("--config-file"),
             OsStr::new(&descriptor_path),
@@ -2127,7 +2438,7 @@ fn contained_worker_closes_unexpected_inherited_descriptor() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("failed to read config file"),
-        "closed descriptor should fail at read: {stderr}"
+        "closed {kind} descriptor should fail at read: {stderr}"
     );
     assert!(
         !stderr.contains("missing required section"),
@@ -2153,6 +2464,7 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
     let broker_child_fd = broker_child_endpoint.as_raw_fd();
     let mut command = Command::new(worker_executable(&bundle));
     command
+        .env_clear()
         .env(SESSION_ENV_KEY, SESSION_ENV_VALUE)
         .process_group(0)
         .stdout(Stdio::piped())
@@ -2197,7 +2509,7 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
     let mut malformed = encode_frame(Frame {
         session: SessionId::from_bytes([7; 32]),
         sequence: 0,
-        message: Message::Start,
+        message: Message::Start(WorkerPolicy::new(501, 20, 2048, None, false)),
     })
     .expect("start frame should encode");
     malformed[4..6].copy_from_slice(&1_u16.to_be_bytes());
@@ -4329,11 +4641,50 @@ fn session_entries() -> Vec<PathBuf> {
     entries
 }
 
+fn wait_for_new_session(baseline: &[PathBuf], timeout: Duration) -> bool {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .expect("session deadline should fit");
+    loop {
+        if session_entries()
+            .iter()
+            .any(|entry| !baseline.contains(entry))
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn only_worker_pid(launcher: &Child) -> libc::pid_t {
     let parent = libc::pid_t::try_from(launcher.id()).expect("launcher PID should fit");
     let children = child_pids(parent);
     assert_eq!(children.len(), 1, "launcher should own exactly one worker");
     children[0]
+}
+
+fn wait_for_only_child_pid(parent: libc::pid_t, timeout: Duration, context: &str) -> libc::pid_t {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .expect("child PID deadline should fit");
+    loop {
+        let children = child_pids(parent);
+        if let [pid] = children.as_slice() {
+            return *pid;
+        }
+        assert!(
+            children.is_empty(),
+            "{context} should have at most one child: {children:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {context} child PID"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn child_pids(parent: libc::pid_t) -> Vec<libc::pid_t> {
@@ -4763,6 +5114,54 @@ fn wait_for_child_exit(child: &Child, timeout: Duration) -> bool {
             panic!("waiting for child exit failed: {error:?}");
         }
     }
+}
+
+fn wait_for_process_exit(pid: libc::pid_t, timeout: Duration) -> bool {
+    // SAFETY: `kqueue` returns a fresh descriptor on success.
+    let descriptor = unsafe { libc::kqueue() };
+    assert!(descriptor >= 0, "process-exit kqueue should be created");
+    // SAFETY: Ownership of the fresh descriptor transfers exactly once.
+    let queue = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let change = libc::kevent {
+        ident: usize::try_from(pid).expect("daemon PID should fit"),
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: `change` is one initialized registration and no output buffer is used.
+    let registered = unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &raw const change,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if registered < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return true;
+    }
+    assert_eq!(registered, 0, "daemon exit event should register");
+    let timeout = libc::timespec {
+        tv_sec: libc::time_t::try_from(timeout.as_secs()).expect("timeout seconds should fit"),
+        tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+    };
+    let mut event = MaybeUninit::<libc::kevent>::uninit();
+    // SAFETY: `event` has room for one result and `timeout` remains live.
+    let count = unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            std::ptr::null(),
+            0,
+            event.as_mut_ptr(),
+            1,
+            &raw const timeout,
+        )
+    };
+    count == 1
 }
 
 fn kill_child_group(child: &mut Child) {

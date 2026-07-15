@@ -399,6 +399,25 @@ impl WorkerNamespace {
         })
     }
 
+    /// Enters the locked namespace as the process working directory and rechecks it.
+    pub fn enter(&self) -> Result<(), RuntimeError> {
+        // SAFETY: `directory` is the retained, locked namespace anchor.
+        if unsafe { libc::fchdir(self.directory.as_raw_fd()) } != 0 {
+            return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
+        }
+        self.verify_current_directory()
+    }
+
+    /// Rechecks that the process working directory is the retained namespace.
+    pub fn verify_current_directory(&self) -> Result<(), RuntimeError> {
+        let current = open_directory(Path::new("."))?;
+        if validate_directory(current.as_raw_fd())? == self.identity {
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidEntry)
+        }
+    }
+
     /// Removes only the same empty namespace inode.
     pub fn cleanup(&mut self) -> Result<(), RuntimeError> {
         if self.cleaned {

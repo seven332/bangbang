@@ -18,10 +18,18 @@ pub enum LauncherError {
     SessionSetup(io::ErrorKind),
     /// The live worker did not match the fixed signed identity.
     InvalidWorkerIdentity,
+    /// A daemon handoff peer did not match the fixed outer-launcher identity.
+    InvalidDaemonIdentity,
     /// The bounded private launcher-worker protocol failed.
     SessionProtocol,
     /// The explicit external-resource manifest or launcher envelope is invalid.
     InvalidGrantInput,
+    /// The versioned production launch-control envelope is invalid.
+    InvalidLaunchPolicy,
+    /// The authenticated worker rejected or could not install its launch policy.
+    WorkerPolicy,
+    /// The private daemon ownership handoff failed.
+    DaemonHandoff,
     /// An approved host resource could not be prepared without weakening identity.
     GrantPreparation,
     /// The private startup grant transaction failed.
@@ -64,8 +72,14 @@ impl fmt::Display for LauncherError {
             Self::InvalidWorkerIdentity => {
                 formatter.write_str("sandbox worker identity validation failed")
             }
+            Self::InvalidDaemonIdentity => {
+                formatter.write_str("daemon launcher identity validation failed")
+            }
             Self::SessionProtocol => formatter.write_str("private worker session failed"),
             Self::InvalidGrantInput => formatter.write_str("invalid resource grant input"),
+            Self::InvalidLaunchPolicy => formatter.write_str("invalid production launch policy"),
+            Self::WorkerPolicy => formatter.write_str("sandbox worker launch policy failed"),
+            Self::DaemonHandoff => formatter.write_str("private daemon handoff failed"),
             Self::GrantPreparation => formatter.write_str("resource grant preparation failed"),
             Self::GrantProtocol => formatter.write_str("private resource grant failed"),
             Self::SocketBroker => formatter.write_str("private socket broker failed"),

@@ -25,40 +25,54 @@ where
 {
     #[cfg(target_os = "macos")]
     {
-        use std::os::fd::AsRawFd;
-
-        use bangbang_session::{LauncherLifecycle, SessionId};
-
-        let input = crate::grant_manifest::LaunchInput::parse(args.into_iter().collect())?;
+        let child_bootstrap = crate::macos::daemon::child_bootstrap()?;
+        let timing = child_bootstrap
+            .as_ref()
+            .map_or_else(crate::launch_policy::LaunchTiming::sample, |bootstrap| {
+                Ok(bootstrap.timing)
+            })?;
+        let command = crate::launch_policy::LaunchCommand::parse(args.into_iter().collect())?;
+        let request = match command {
+            crate::launch_policy::LaunchCommand::Help => {
+                print!("{}", crate::launch_policy::help());
+                return Ok(LauncherExit(0));
+            }
+            crate::launch_policy::LaunchCommand::Version => {
+                println!("Jailer v{}", env!("CARGO_PKG_VERSION"));
+                return Ok(LauncherExit(0));
+            }
+            crate::launch_policy::LaunchCommand::Run(request) => request,
+        };
         let executable = std::env::current_exe().map_err(|_| LauncherError::InvalidBundleLayout)?;
         let layout = BundleLayout::from_launcher_executable(&executable)?;
         crate::macos::code_sign::validate_bundle(&layout)?;
-        let (worker_args, grants) = input.prepare()?;
-        let wakeups = crate::macos::supervise::SignalWakeups::install()?;
-        let session_id = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
-        let mut lifecycle = LauncherLifecycle::new(session_id);
-        let mut spawned =
-            crate::macos::spawn::spawn_suspended(layout.worker_executable(), worker_args)?;
-        crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?;
-        spawned.worker.resume()?;
-        crate::macos::supervise::read_bootstrap_hello(&mut spawned.session, &mut lifecycle)?;
-        bangbang_session::macos::verify_peer(spawned.session.as_raw_fd(), spawned.worker.pid())
-            .map_err(|_| LauncherError::InvalidWorkerIdentity)?;
-        crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?;
-        let start = lifecycle
-            .start()
-            .map_err(|_| LauncherError::SessionProtocol)?;
-        crate::macos::supervise::write_frame(&mut spawned.session, start)?;
-        let status = crate::macos::supervise::wait_session(
-            &mut spawned.worker,
-            &mut spawned.session,
-            &mut spawned.grants,
-            &mut spawned.socket_broker,
-            lifecycle,
-            wakeups,
-            &grants,
-        )?;
-        map_exit_status(status)
+        if let Some(mut bootstrap) = child_bootstrap {
+            let result = (|| {
+                if !request.requests_daemonize()
+                    || bootstrap.notifier.check_parent()?
+                        != crate::macos::daemon::NotifierEvent::Pending
+                {
+                    return Err(LauncherError::DaemonHandoff);
+                }
+                let launch = request.prepare(layout.worker_executable(), timing, true)?;
+                if bootstrap.notifier.check_parent()?
+                    != crate::macos::daemon::NotifierEvent::Pending
+                {
+                    return Err(LauncherError::DaemonHandoff);
+                }
+                launch_prepared(&layout, launch, Some(&mut bootstrap.notifier))
+            })();
+            if let Err(error) = result {
+                bootstrap.notifier.notify_failure(error);
+            }
+            return result;
+        }
+        if request.requests_daemonize() {
+            crate::macos::daemon::launch_parent(&request, timing, &executable, &layout)?;
+            return Ok(LauncherExit(0));
+        }
+        let launch = request.prepare(layout.worker_executable(), timing, false)?;
+        launch_prepared(&layout, launch, None)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -66,6 +80,46 @@ where
         let _ = args;
         Err(LauncherError::UnsupportedPlatform)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn launch_prepared(
+    layout: &BundleLayout,
+    launch: crate::launch_policy::PreparedLaunch,
+    notifier: Option<&mut crate::macos::daemon::DaemonNotifier>,
+) -> Result<LauncherExit, LauncherError> {
+    use std::os::fd::AsRawFd;
+
+    use bangbang_session::{LauncherLifecycle, SessionId};
+
+    let wakeups = crate::macos::supervise::SignalWakeups::install()?;
+    let session_id = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
+    let mut lifecycle = LauncherLifecycle::new(session_id);
+    let mut spawned =
+        crate::macos::spawn::spawn_suspended(layout.worker_executable(), launch.worker_args)?;
+    crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?;
+    spawned.worker.resume()?;
+    crate::macos::supervise::read_bootstrap_hello(&mut spawned.session, &mut lifecycle)?;
+    bangbang_session::macos::verify_peer(spawned.session.as_raw_fd(), spawned.worker.pid())
+        .map_err(|_| LauncherError::InvalidWorkerIdentity)?;
+    crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?;
+    let start = lifecycle
+        .start(launch.worker_policy)
+        .map_err(|_| LauncherError::SessionProtocol)?;
+    crate::macos::supervise::write_frame(&mut spawned.session, start)?;
+    let status = crate::macos::supervise::wait_session(
+        &mut spawned.worker,
+        &mut spawned.session,
+        crate::macos::supervise::AuxiliaryChannels::new(
+            &mut spawned.grants,
+            &mut spawned.socket_broker,
+        ),
+        lifecycle,
+        wakeups,
+        &launch.grants,
+        notifier,
+    )?;
+    map_exit_status(status)
 }
 
 #[cfg(any(target_os = "macos", test))]

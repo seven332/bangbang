@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -36,14 +37,17 @@ pub(crate) fn hold_after_snapshot_staging_record() {
 }
 
 pub(crate) fn is_requested(args: &[OsString]) -> bool {
-    args.first().is_some_and(|argument| argument == OPTION)
+    probe_args(args)
+        .and_then(|args| args.first())
+        .is_some_and(|argument| argument == OPTION)
 }
 
 pub(crate) fn run(
     session: &mut ContainedSession,
     args: &[OsString],
 ) -> Result<(), ContainedSessionError> {
-    let probe = ProbeCase::parse(args)?;
+    let probe = ProbeCase::parse(probe_args(args).ok_or(ContainedSessionError)?)?;
+    session.verify_launch_policy(probe.expected_no_file, probe.expected_file_size, false)?;
     let authority = session.grant_authority().ok_or(ContainedSessionError)?;
 
     let read_id =
@@ -66,6 +70,15 @@ pub(crate) fn run(
             .take_scoped_directory(&directory_id, ResourceRole::ApiSocketDirectory)
             .map_err(|_| ContainedSessionError)
     })?;
+    if probe.exhausts_no_file() {
+        verify_no_file_enforcement(read.as_raw_fd(), probe.expected_no_file)?;
+    }
+    if probe.exhausts_file_size() {
+        trigger_file_size_enforcement(
+            write.as_raw_fd(),
+            probe.expected_file_size.ok_or(ContainedSessionError)?,
+        )?;
+    }
     let expected_read = format!("bangbang-grant-read-{}\n", probe.name);
     let mut actual_read = vec![0_u8; expected_read.len()];
     // SAFETY: The buffer is writable for its exact length and the registry owns
@@ -148,10 +161,55 @@ pub(crate) fn run(
     Ok(())
 }
 
+fn verify_no_file_enforcement(source: RawFd, limit: u64) -> Result<(), ContainedSessionError> {
+    let maximum = usize::try_from(limit).map_err(|_| ContainedSessionError)?;
+    let mut duplicates = Vec::with_capacity(maximum);
+    loop {
+        // SAFETY: `source` remains live for the synchronous duplication. Each
+        // successful result is a fresh close-on-exec descriptor.
+        let descriptor = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 0) };
+        if descriptor >= 0 {
+            // SAFETY: Ownership of the fresh descriptor transfers exactly once.
+            duplicates.push(unsafe { OwnedFd::from_raw_fd(descriptor) });
+            if duplicates.len() > maximum {
+                return Err(ContainedSessionError);
+            }
+            continue;
+        }
+        return if std::io::Error::last_os_error().raw_os_error() == Some(libc::EMFILE)
+            && !duplicates.is_empty()
+        {
+            Ok(())
+        } else {
+            Err(ContainedSessionError)
+        };
+    }
+}
+
+fn trigger_file_size_enforcement(
+    descriptor: RawFd,
+    limit: u64,
+) -> Result<(), ContainedSessionError> {
+    let length = libc::off_t::try_from(limit).map_err(|_| ContainedSessionError)?;
+    // SAFETY: The granted descriptor is writable and retained for both fixed
+    // synchronous operations. Extending exactly to the installed limit is
+    // valid; the following one-byte write must raise SIGXFSZ and cannot return.
+    if unsafe { libc::ftruncate(descriptor, length) } != 0 {
+        return Err(ContainedSessionError);
+    }
+    // SAFETY: The source byte remains live and `length` is the first forbidden
+    // offset under the exact RLIMIT_FSIZE policy. A return means enforcement
+    // failed or produced an unexpected recoverable result.
+    let _ = unsafe { libc::pwrite(descriptor, b"x".as_ptr().cast(), 1, length) };
+    Err(ContainedSessionError)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProbeCase {
     name: &'static str,
     hold: bool,
+    expected_no_file: u64,
+    expected_file_size: Option<u64>,
 }
 
 impl ProbeCase {
@@ -166,28 +224,92 @@ impl ProbeCase {
             Some("single") => Ok(Self {
                 name: "single",
                 hold: false,
+                expected_no_file: 2048,
+                expected_file_size: None,
             }),
             Some("alpha") => Ok(Self {
                 name: "alpha",
                 hold: false,
+                expected_no_file: 2048,
+                expected_file_size: None,
             }),
             Some("beta") => Ok(Self {
                 name: "beta",
                 hold: false,
+                expected_no_file: 2048,
+                expected_file_size: None,
             }),
             Some("hold") => Ok(Self {
                 name: "hold",
                 hold: true,
+                expected_no_file: 2048,
+                expected_file_size: None,
             }),
             Some("hold-alpha") => Ok(Self {
                 name: "alpha",
                 hold: true,
+                expected_no_file: 2048,
+                expected_file_size: None,
             }),
             Some("hold-beta") => Ok(Self {
                 name: "beta",
                 hold: true,
+                expected_no_file: 2048,
+                expected_file_size: None,
+            }),
+            Some("policy-default") => Ok(Self {
+                name: "policy-default",
+                hold: false,
+                expected_no_file: 2048,
+                expected_file_size: None,
+            }),
+            Some("policy-explicit") => Ok(Self {
+                name: "policy-explicit",
+                hold: false,
+                expected_no_file: 1024,
+                expected_file_size: Some(4096),
+            }),
+            Some("policy-last") => Ok(Self {
+                name: "policy-last",
+                hold: false,
+                expected_no_file: 2048,
+                expected_file_size: Some(4096),
+            }),
+            Some("policy-nofile-exhaustion") => Ok(Self {
+                name: "policy-nofile-exhaustion",
+                hold: false,
+                expected_no_file: 1024,
+                expected_file_size: None,
+            }),
+            Some("policy-fsize-exhaustion") => Ok(Self {
+                name: "policy-fsize-exhaustion",
+                hold: false,
+                expected_no_file: 1024,
+                expected_file_size: Some(4096),
             }),
             _ => Err(ContainedSessionError),
         }
     }
+
+    fn exhausts_no_file(self) -> bool {
+        self.name == "policy-nofile-exhaustion"
+    }
+
+    fn exhausts_file_size(self) -> bool {
+        self.name == "policy-fsize-exhaustion"
+    }
+}
+
+fn probe_args(args: &[OsString]) -> Option<&[OsString]> {
+    if args.first().is_some_and(|argument| argument == OPTION) {
+        return Some(args);
+    }
+    let [id, _, start, _, start_cpu, _, parent_cpu, _, rest @ ..] = args else {
+        return None;
+    };
+    (id == "--id"
+        && start == "--start-time-us"
+        && start_cpu == "--start-time-cpu-us"
+        && parent_cpu == "--parent-cpu-time-us")
+        .then_some(rest)
 }

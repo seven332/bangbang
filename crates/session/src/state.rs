@@ -89,7 +89,7 @@ impl LauncherLifecycle {
     }
 
     /// Creates the initial `Start` frame.
-    pub fn start(&mut self) -> Result<Frame, ProtocolError> {
+    pub fn start(&mut self, policy: crate::WorkerPolicy) -> Result<Frame, ProtocolError> {
         if self.session.is_pre_session()
             || self.outgoing_sequence != 0
             || self.state != LauncherState::ReadyToStart
@@ -97,7 +97,7 @@ impl LauncherLifecycle {
             return Err(ProtocolError::InvalidLifecycle);
         }
         self.state = LauncherState::AwaitPrepared;
-        self.outgoing(Message::Start)
+        self.outgoing(Message::Start(policy))
     }
 
     /// Creates `Proceed` after local namespace validation.
@@ -284,7 +284,7 @@ impl WorkerLifecycle {
         }
 
         match (self.state, frame.message) {
-            (WorkerState::AwaitStart, Message::Start) if !frame.session.is_pre_session() => {
+            (WorkerState::AwaitStart, Message::Start(_)) if !frame.session.is_pre_session() => {
                 self.session = Some(frame.session);
                 self.state = WorkerState::Preparing;
             }
@@ -415,7 +415,7 @@ impl Default for WorkerLifecycle {
 
 #[cfg(test)]
 mod tests {
-    use crate::{CancelSignal, TerminalCategory};
+    use crate::{CancelSignal, TerminalCategory, WorkerPolicy};
 
     use super::*;
 
@@ -423,11 +423,15 @@ mod tests {
         SessionId::from_bytes([byte; 32])
     }
 
+    const fn policy() -> WorkerPolicy {
+        WorkerPolicy::new(501, 20, 2048, None, false)
+    }
+
     fn exchange_start(launcher: &mut LauncherLifecycle, worker: &mut WorkerLifecycle) {
         let hello = worker.hello().expect("hello should be valid");
         assert_eq!(launcher.receive(hello), Ok(Message::Hello));
-        let start = launcher.start().expect("start should be valid");
-        assert_eq!(worker.receive(start), Ok(Message::Start));
+        let start = launcher.start(policy()).expect("start should be valid");
+        assert_eq!(worker.receive(start), Ok(Message::Start(policy())));
     }
 
     fn exchange_grants(launcher: &mut LauncherLifecycle, worker: &mut WorkerLifecycle) {
@@ -491,7 +495,7 @@ mod tests {
         launcher
             .receive(worker.hello().expect("hello should send"))
             .expect("hello should receive");
-        let start = launcher.start().expect("start should send");
+        let start = launcher.start(policy()).expect("start should send");
         worker.receive(start).expect("start should receive");
         assert_eq!(worker.receive(start), Err(ProtocolError::InvalidPeerState));
 
@@ -554,14 +558,17 @@ mod tests {
         launcher
             .receive(worker.hello().expect("hello should send"))
             .expect("hello should receive");
-        assert_eq!(launcher.start(), Err(ProtocolError::InvalidLifecycle));
+        assert_eq!(
+            launcher.start(policy()),
+            Err(ProtocolError::InvalidLifecycle)
+        );
 
         let mut worker = WorkerLifecycle::new();
         assert_eq!(
             worker.receive(Frame {
                 session: SessionId::pre_session(),
                 sequence: 0,
-                message: Message::Start,
+                message: Message::Start(policy()),
             }),
             Err(ProtocolError::InvalidLifecycle)
         );

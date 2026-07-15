@@ -2,14 +2,18 @@ use std::fmt;
 
 use crate::BatchId;
 
-/// Maximum encoded v2 frame size, including its fixed header.
+/// Maximum encoded v3 frame size, including its fixed header.
 pub const MAX_FRAME_BYTES: usize = 4096;
-/// Encoded v2 header size.
+/// Encoded v3 header size.
 pub const HEADER_BYTES: usize = 56;
 const MAX_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - HEADER_BYTES;
 const MAX_BUFFER_BYTES: usize = MAX_FRAME_BYTES * 2;
-const MAGIC: [u8; 4] = *b"BBS2";
-const VERSION: u16 = 2;
+const MAGIC: [u8; 4] = *b"BBS3";
+const VERSION: u16 = 3;
+const WORKER_POLICY_BYTES: usize = 32;
+const POLICY_FLAG_FILE_SIZE: u16 = 1 << 0;
+const POLICY_FLAG_DAEMONIZED: u16 = 1 << 1;
+const POLICY_FLAGS: u16 = POLICY_FLAG_FILE_SIZE | POLICY_FLAG_DAEMONIZED;
 
 /// Random identity bound to every frame in one process session.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,13 +125,79 @@ pub enum TerminalCategory {
     Unstructured,
 }
 
-/// Closed v2 lifecycle message set.
+/// Fixed production-worker launch policy authenticated by the private lifecycle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct WorkerPolicy {
+    uid: u32,
+    gid: u32,
+    no_file: u64,
+    file_size: Option<u64>,
+    daemonized: bool,
+}
+
+impl WorkerPolicy {
+    /// Constructs an exact worker launch policy.
+    #[must_use]
+    pub const fn new(
+        uid: u32,
+        gid: u32,
+        no_file: u64,
+        file_size: Option<u64>,
+        daemonized: bool,
+    ) -> Self {
+        Self {
+            uid,
+            gid,
+            no_file,
+            file_size,
+            daemonized,
+        }
+    }
+
+    /// Returns the required real and effective user identity.
+    #[must_use]
+    pub const fn uid(self) -> u32 {
+        self.uid
+    }
+
+    /// Returns the required real and effective group identity.
+    #[must_use]
+    pub const fn gid(self) -> u32 {
+        self.gid
+    }
+
+    /// Returns the exact worker `RLIMIT_NOFILE` soft and hard value.
+    #[must_use]
+    pub const fn no_file(self) -> u64 {
+        self.no_file
+    }
+
+    /// Returns the optional exact worker `RLIMIT_FSIZE` soft and hard value.
+    #[must_use]
+    pub const fn file_size(self) -> Option<u64> {
+        self.file_size
+    }
+
+    /// Returns whether the outer launcher detached into its daemon session.
+    #[must_use]
+    pub const fn is_daemonized(self) -> bool {
+        self.daemonized
+    }
+}
+
+impl fmt::Debug for WorkerPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WorkerPolicy(<redacted>)")
+    }
+}
+
+/// Closed v3 lifecycle message set.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Message {
     /// Proves that the resumed worker reached its no-authority bootstrap.
     Hello,
     /// Begins a freshly spawned worker session.
-    Start,
+    Start(WorkerPolicy),
     /// Authorizes startup after launcher namespace validation.
     Proceed,
     /// Requests graceful worker cancellation.
@@ -158,7 +228,7 @@ impl fmt::Debug for Message {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Hello => formatter.write_str("Hello"),
-            Self::Start => formatter.write_str("Start"),
+            Self::Start(_) => formatter.write_str("Start(<redacted>)"),
             Self::Proceed => formatter.write_str("Proceed"),
             Self::Cancel(_) => formatter.write_str("Cancel(<redacted>)"),
             Self::Prepared { .. } => {
@@ -181,7 +251,7 @@ impl Message {
     #[must_use]
     pub const fn sender(self) -> Role {
         match self {
-            Self::Start | Self::Proceed | Self::Cancel(_) => Role::Launcher,
+            Self::Start(_) | Self::Proceed | Self::Cancel(_) => Role::Launcher,
             Self::Hello
             | Self::Prepared { .. }
             | Self::GrantsAccepted { .. }
@@ -226,7 +296,7 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Encodes one bounded v2 frame.
+/// Encodes one bounded v3 frame.
 pub fn encode_frame(frame: Frame) -> Result<Vec<u8>, ProtocolError> {
     let (kind, payload) = encode_message(frame.message);
     let payload_len = u32::try_from(payload.len()).map_err(|_| ProtocolError::InvalidFrame)?;
@@ -249,7 +319,7 @@ pub fn encode_frame(frame: Frame) -> Result<Vec<u8>, ProtocolError> {
 fn encode_message(message: Message) -> (u16, Vec<u8>) {
     match message {
         Message::Hello => (8, Vec::new()),
-        Message::Start => (1, Vec::new()),
+        Message::Start(policy) => (1, encode_worker_policy(policy)),
         Message::Proceed => (2, Vec::new()),
         Message::Cancel(signal) => (
             3,
@@ -300,6 +370,25 @@ fn encode_message(message: Message) -> (u16, Vec<u8>) {
             ],
         ),
     }
+}
+
+fn encode_worker_policy(policy: WorkerPolicy) -> Vec<u8> {
+    let mut flags = 0_u16;
+    if policy.file_size.is_some() {
+        flags |= POLICY_FLAG_FILE_SIZE;
+    }
+    if policy.daemonized {
+        flags |= POLICY_FLAG_DAEMONIZED;
+    }
+    let mut payload = Vec::with_capacity(WORKER_POLICY_BYTES);
+    payload.extend_from_slice(&flags.to_be_bytes());
+    payload.extend_from_slice(&0_u16.to_be_bytes());
+    payload.extend_from_slice(&policy.uid.to_be_bytes());
+    payload.extend_from_slice(&policy.gid.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&policy.no_file.to_be_bytes());
+    payload.extend_from_slice(&policy.file_size.unwrap_or(0).to_be_bytes());
+    payload
 }
 
 /// Incremental bounded decoder for Unix stream transport.
@@ -397,7 +486,9 @@ fn decode_complete_frame(bytes: &[u8]) -> Result<Frame, ProtocolError> {
 fn decode_message(kind: u16, payload: &[u8]) -> Result<Message, ProtocolError> {
     match (kind, payload) {
         (8, []) => Ok(Message::Hello),
-        (1, []) => Ok(Message::Start),
+        (1, payload) if payload.len() == WORKER_POLICY_BYTES => {
+            Ok(Message::Start(decode_worker_policy(payload)?))
+        }
         (2, []) => Ok(Message::Proceed),
         (3, [1]) => Ok(Message::Cancel(CancelSignal::Interrupt)),
         (3, [2]) => Ok(Message::Cancel(CancelSignal::Terminate)),
@@ -439,6 +530,29 @@ fn decode_message(kind: u16, payload: &[u8]) -> Result<Message, ProtocolError> {
     }
 }
 
+fn decode_worker_policy(payload: &[u8]) -> Result<WorkerPolicy, ProtocolError> {
+    let flags = read_u16(payload, 0)?;
+    if flags & !POLICY_FLAGS != 0 || read_u16(payload, 2)? != 0 || read_u32(payload, 12)? != 0 {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    let encoded_file_size = read_u64(payload, 24)?;
+    let file_size = if flags & POLICY_FLAG_FILE_SIZE == 0 {
+        if encoded_file_size != 0 {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        None
+    } else {
+        Some(encoded_file_size)
+    };
+    Ok(WorkerPolicy::new(
+        read_u32(payload, 4)?,
+        read_u32(payload, 8)?,
+        read_u64(payload, 16)?,
+        file_size,
+        flags & POLICY_FLAG_DAEMONIZED != 0,
+    ))
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ProtocolError> {
     let value: [u8; 2] = bytes
         .get(offset..offset.saturating_add(2))
@@ -474,11 +588,15 @@ mod tests {
         SessionId::from_bytes([byte; 32])
     }
 
+    const fn policy() -> WorkerPolicy {
+        WorkerPolicy::new(501, 20, 2048, Some(4096), true)
+    }
+
     #[test]
     fn every_message_round_trips_across_every_split() {
         let messages = [
             Message::Hello,
-            Message::Start,
+            Message::Start(policy()),
             Message::Proceed,
             Message::Cancel(CancelSignal::Interrupt),
             Message::Cancel(CancelSignal::Terminate),
@@ -535,7 +653,7 @@ mod tests {
         let first = Frame {
             session: id(1),
             sequence: 0,
-            message: Message::Start,
+            message: Message::Start(policy()),
         };
         let second = Frame {
             session: id(1),
@@ -562,7 +680,7 @@ mod tests {
         let mut encoded = encode_frame(Frame {
             session: id(3),
             sequence: 0,
-            message: Message::Start,
+            message: Message::Start(policy()),
         })
         .expect("frame should encode");
         encoded[8..12].copy_from_slice(&(MAX_FRAME_BYTES as u32).to_be_bytes());
@@ -578,7 +696,7 @@ mod tests {
         let mut exact = encode_frame(Frame {
             session: id(4),
             sequence: 0,
-            message: Message::Start,
+            message: Message::Start(policy()),
         })
         .expect("frame should encode");
         exact[6..8].copy_from_slice(&99_u16.to_be_bytes());
@@ -610,7 +728,7 @@ mod tests {
         let frame = Frame {
             session: id(5),
             sequence: 0,
-            message: Message::Start,
+            message: Message::Start(policy()),
         };
         for (offset, bytes) in [
             (0, b"FAIL".to_vec()),
@@ -664,5 +782,33 @@ mod tests {
             format!("{terminal:?}"),
             "Terminal { category: <redacted>, exit_code: <redacted> }"
         );
+        let policy = WorkerPolicy::new(1_234_567_891, 1_234_567_893, 65_535, Some(8_192), true);
+        assert_eq!(format!("{policy:?}"), "WorkerPolicy(<redacted>)");
+        assert_eq!(format!("{:?}", Message::Start(policy)), "Start(<redacted>)");
+        let debug = format!("{policy:?} {:?}", Message::Start(policy));
+        for sensitive in ["1234567891", "1234567893", "65535", "8192"] {
+            assert!(!debug.contains(sensitive));
+        }
+    }
+
+    #[test]
+    fn worker_policy_rejects_unknown_flags_reserved_bytes_and_ambiguous_optional_values() {
+        let frame = Frame {
+            session: id(6),
+            sequence: 0,
+            message: Message::Start(WorkerPolicy::new(501, 20, 2048, None, false)),
+        };
+        for (offset, bytes) in [
+            (HEADER_BYTES, 4_u16.to_be_bytes().to_vec()),
+            (HEADER_BYTES + 2, 1_u16.to_be_bytes().to_vec()),
+            (HEADER_BYTES + 12, 1_u32.to_be_bytes().to_vec()),
+            (HEADER_BYTES + 24, 1_u64.to_be_bytes().to_vec()),
+        ] {
+            let mut encoded = encode_frame(frame).expect("policy should encode");
+            encoded[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            let mut decoder = FrameDecoder::default();
+            decoder.push(&encoded).expect("bounded frame should buffer");
+            assert_eq!(decoder.next_frame(), Err(ProtocolError::InvalidFrame));
+        }
     }
 }

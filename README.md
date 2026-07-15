@@ -268,25 +268,32 @@ the fixed bundle layout, nested signatures, identifiers, and required worker
 entitlements. It then starts the fixed worker suspended with a default-close
 descriptor policy: only open standard streams, one private lifecycle endpoint,
 one private startup-grant endpoint, and one dormant private socket-broker
-endpoint survive. The launcher validates the live worker code before resuming it and
+endpoint survive. The exec environment contains only the private lifecycle
+marker; ambient launcher variables, including loader/debug controls, are not
+forwarded. The launcher validates the live worker code before resuming it and
 again after the worker has used the endpoint and sent the bounded pre-session
 greeting.
 
 Each launch uses unnamed lifecycle stream, grant datagram, and socket-broker
-socketpairs plus a random 256-bit session identity. Lifecycle protocol v2 has a 4-KiB frame limit,
-exact per-direction sequence numbers, closed message variants, and monotonic
+socketpairs plus a random 256-bit session identity. Lifecycle protocol v3 has a
+4-KiB frame limit, exact per-direction sequence numbers, closed message
+variants, a fixed reserved-zero `Start(WorkerPolicy)` payload, and monotonic
 `prepared -> grants-accepted -> starting -> ready -> terminal` state. Even an
-empty grant batch must be atomically acknowledged before `Proceed`. The launcher authenticates
-the live worker PID, effective credentials, signature, identity, and exact
-entitlements. The sandboxed worker verifies that the peer PID is its direct
-parent and that effective credentials match; App Sandbox prevents the worker
-from independently querying the launcher's code signature, so authentication is
-deliberately asymmetric.
+empty grant batch must be atomically acknowledged before `Proceed`. The launcher
+authenticates the live worker PID, effective credentials, signature, identity,
+and exact entitlements. The sandboxed worker verifies that the peer PID is its
+direct parent, that real/effective credentials match the authenticated policy,
+and that both processes share the intended session. It then applies and reads
+back exact soft/hard `RLIMIT_FSIZE` and `RLIMIT_NOFILE` values without raising an
+inherited hard limit. App Sandbox prevents the worker from independently
+querying the launcher's code signature, so authentication is deliberately
+asymmetric.
 
 Before public argument or VM processing, the worker creates and locks a unique
-mode-0700 empty namespace in its App Sandbox container. The launcher derives
-that path independently and checks its exact name, owner, mode, device, inode,
-emptiness, and live lock before authorizing startup. Graceful signals become one
+mode-0700 empty namespace in its App Sandbox container and enters it through the
+retained directory descriptor. The launcher derives that path independently and
+checks its exact name, owner, mode, device, inode, emptiness, and live lock
+before authorizing startup. Graceful signals become one
 session cancellation, readiness is reported only at the existing committed API
 or no-API seams, and structured terminal status must match the reaped public
 exit. Initial `Hello`, `Start`, and `Proceed` reads use absolute five-second
@@ -295,9 +302,46 @@ five-second grace before owned-worker escalation. A surviving worker cleans
 after launcher EOF; a surviving launcher cleans after worker exit; a later
 worker performs bounded identity-checked recovery when both were killed.
 Concurrent sessions retain independent identities, processes, namespaces,
-grant registries, and API sockets.
+policies, grant registries, and API sockets.
 
-The launcher recognizes one optional envelope only in argv position one:
+The launcher recognizes this optional versioned launch-policy envelope only in
+argv position one:
+
+```text
+--bangbang-jailer-v1 \
+  --id ID \
+  --exec-file /exact/BangbangWorker.app/Contents/MacOS/bangbang-worker \
+  --uid CURRENT_UID --gid CURRENT_GID \
+  [--resource-limit fsize=U64] \
+  [--resource-limit no-file=U64] \
+  [--daemonize] -- \
+  [--bangbang-grant-manifest MANIFEST --] FIRECRACKER_ARGS...
+```
+
+Singletons, unknown options, malformed values, missing delimiters, a different
+executable or credential, and conflicting forwarded ID/timing arguments are
+rejected before spawn without echoing values. Repeated `fsize` and `no-file`
+entries use the last value; `no-file` defaults to 2048 for every production
+worker, including launches without this envelope. The launcher injects the
+validated ID and sampled timing once. `--bangbang-jailer-v1 --help` and
+`--version` are exact early commands.
+
+With `--daemonize`, the validated outer launcher performs a default-close,
+empty-environment re-exec of the same signed code as a new session leader with
+standard streams attached to `/dev/null`. That process remains the sole worker
+supervisor. The original command returns only after API/no-API readiness and a
+bounded PID acknowledgment, printing exactly `bangbang daemon pid: PID`.
+SIGINT or SIGTERM sent to that PID uses the normal graceful worker cancellation
+and cleanup path. Original-launcher loss before acknowledgment cancels the
+unpublished session; after acknowledgment the handoff endpoint is closed.
+
+This is the unprivileged macOS outcome for fixed executable/current-user
+identity, private working root, environment/descriptors, resource limits, and
+daemon ownership. It does not claim arbitrary uid/gid switching, configurable
+chroot ownership, cgroups, network/PID namespaces, or seccomp.
+
+After the launch-policy delimiter, the existing optional grant envelope remains
+position one in the worker argument sequence:
 
 ```text
 --bangbang-grant-manifest MANIFEST -- FIRECRACKER_ARGS...
@@ -745,6 +789,10 @@ scripts/run-integration-tests.sh --test production_bundle
 
 This target verifies exact identifiers, entitlements, Hardened Runtime, strict
 static and live-worker validation, tamper rejection, the descriptor allowlist,
+closed worker environment, lifecycle-v3 launch-policy authentication, exact and
+kernel-enforced resource limits, private-root entry, jailer help/version/parser
+rejection, foreground compatibility, daemon readiness/PID/stdio/session
+ownership, pre-ack parent-loss cancellation, concurrent daemon isolation,
 malformed-bootstrap rejection, container-only path denial and redaction,
 structured API/no-API readiness and cancellation, worker-first/launcher-first
 namespace cleanup, empty both-killed namespace recovery, concurrent-session
