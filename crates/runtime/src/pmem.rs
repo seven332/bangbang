@@ -1,6 +1,6 @@
 //! Backend-neutral pmem configuration model.
 
-use std::collections::TryReserveError;
+use std::collections::{BTreeMap, TryReserveError};
 use std::ffi::c_void;
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -1411,13 +1411,26 @@ const fn updated_pmem_token_bucket(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PmemConfigInput {
     id: String,
     path_on_host: String,
     root_device: bool,
     read_only: bool,
     rate_limiter: Option<PmemRateLimiterConfig>,
+}
+
+impl fmt::Debug for PmemConfigInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmemConfigInput")
+            .field("id", &self.id)
+            .field("path_on_host", &"<redacted>")
+            .field("root_device", &self.root_device)
+            .field("read_only", &self.read_only)
+            .field("rate_limiter", &self.rate_limiter)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1513,13 +1526,26 @@ impl PmemUpdateInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PmemConfig {
     id: String,
     path_on_host: String,
     root_device: bool,
     read_only: bool,
     rate_limiter: Option<PmemRateLimiterConfig>,
+}
+
+impl fmt::Debug for PmemConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmemConfig")
+            .field("id", &self.id)
+            .field("path_on_host", &"<redacted>")
+            .field("root_device", &self.root_device)
+            .field("read_only", &self.read_only)
+            .field("rate_limiter", &self.rate_limiter)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1687,16 +1713,31 @@ impl PmemConfigs {
     }
 }
 
-#[derive(Debug)]
 pub struct PmemFileBacking {
     file: File,
     len: u64,
     read_only: bool,
 }
 
+impl fmt::Debug for PmemFileBacking {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmemFileBacking")
+            .field("file", &"<owned>")
+            .field("len", &self.len)
+            .field("read_only", &self.read_only)
+            .finish()
+    }
+}
+
 impl PmemFileBacking {
     pub fn open(config: &PmemConfig) -> Result<Self, PmemFileBackingError> {
         let file = open_pmem_file(config.path_on_host(), config.read_only())?;
+        Self::from_file(file, config.read_only())
+    }
+
+    /// Adopts an already-opened pmem backing without resolving its configured path.
+    pub fn from_file(file: File, read_only: bool) -> Result<Self, PmemFileBackingError> {
         let metadata = file
             .metadata()
             .map_err(|source| PmemFileBackingError::ReadMetadata { source })?;
@@ -1712,7 +1753,7 @@ impl PmemFileBacking {
         Ok(Self {
             file,
             len: metadata.len(),
-            read_only: config.read_only(),
+            read_only,
         })
     }
 
@@ -2227,17 +2268,28 @@ pub struct PreparedPmemDevice {
 }
 
 impl PreparedPmemDevice {
-    fn from_config_with_mapper_and_allocator(
+    fn from_config_with_backing_mapper_and_allocator(
         config: &PmemConfig,
+        backing: Option<PmemFileBacking>,
         mapper: &mut impl PmemBackingMapper,
         allocator: &mut PmemGuestRangeAllocator<'_>,
     ) -> Result<Self, PreparedPmemDeviceError> {
-        let backing = PmemFileBacking::open(config).map_err(|source| {
-            PreparedPmemDeviceError::OpenBacking {
-                pmem_id: config.id().to_string(),
-                source,
+        let backing = match backing {
+            Some(backing) => {
+                if backing.is_read_only() != config.read_only() {
+                    return Err(PreparedPmemDeviceError::BackingModeMismatch {
+                        pmem_id: config.id().to_string(),
+                    });
+                }
+                backing
             }
-        })?;
+            None => PmemFileBacking::open(config).map_err(|source| {
+                PreparedPmemDeviceError::OpenBacking {
+                    pmem_id: config.id().to_string(),
+                    source,
+                }
+            })?,
+        };
         let mapping =
             mapper
                 .map(&backing)
@@ -2326,9 +2378,22 @@ impl PreparedPmemDevices {
         configs: &[PmemConfig],
         layout: &GuestMemoryLayout,
     ) -> Result<Self, PreparedPmemDeviceError> {
+        Self::from_config_slice_with_layout_and_backings(configs, layout, BTreeMap::new())
+    }
+
+    pub(crate) fn from_config_slice_with_layout_and_backings(
+        configs: &[PmemConfig],
+        layout: &GuestMemoryLayout,
+        backings: BTreeMap<String, PmemFileBacking>,
+    ) -> Result<Self, PreparedPmemDeviceError> {
         let mut mapper = SystemPmemBackingMapper;
         let mut allocator = PmemGuestRangeAllocator::for_layout(layout);
-        Self::from_config_slice_with_mapper_and_allocator(configs, &mut mapper, &mut allocator)
+        Self::from_config_slice_with_backings_mapper_and_allocator(
+            configs,
+            backings,
+            &mut mapper,
+            &mut allocator,
+        )
     }
 
     #[cfg(test)]
@@ -2346,21 +2411,47 @@ impl PreparedPmemDevices {
         Self::from_config_slice_with_mapper_and_allocator(configs, mapper, &mut allocator)
     }
 
+    #[cfg(test)]
     fn from_config_slice_with_mapper_and_allocator(
         configs: &[PmemConfig],
         mapper: &mut impl PmemBackingMapper,
         allocator: &mut PmemGuestRangeAllocator<'_>,
     ) -> Result<Self, PreparedPmemDeviceError> {
+        Self::from_config_slice_with_backings_mapper_and_allocator(
+            configs,
+            BTreeMap::new(),
+            mapper,
+            allocator,
+        )
+    }
+
+    fn from_config_slice_with_backings_mapper_and_allocator(
+        configs: &[PmemConfig],
+        mut backings: BTreeMap<String, PmemFileBacking>,
+        mapper: &mut impl PmemBackingMapper,
+        allocator: &mut PmemGuestRangeAllocator<'_>,
+    ) -> Result<Self, PreparedPmemDeviceError> {
+        if backings
+            .keys()
+            .any(|pmem_id| !configs.iter().any(|config| config.id() == pmem_id))
+        {
+            return Err(PreparedPmemDeviceError::UnexpectedBacking);
+        }
+
         let mut devices = Vec::new();
         devices
             .try_reserve_exact(configs.len())
             .map_err(|source| PreparedPmemDeviceError::AllocateDevices { source })?;
 
         for config in configs {
-            devices.push(PreparedPmemDevice::from_config_with_mapper_and_allocator(
-                config, mapper, allocator,
-            )?);
+            let backing = backings.remove(config.id());
+            devices.push(
+                PreparedPmemDevice::from_config_with_backing_mapper_and_allocator(
+                    config, backing, mapper, allocator,
+                )?,
+            );
         }
+        debug_assert!(backings.is_empty());
 
         Ok(Self { devices })
     }
@@ -2414,6 +2505,10 @@ pub enum PreparedPmemDeviceError {
         pmem_id: String,
         source: PmemGuestRangeAllocationError,
     },
+    BackingModeMismatch {
+        pmem_id: String,
+    },
+    UnexpectedBacking,
 }
 
 impl fmt::Display for PreparedPmemDeviceError {
@@ -2434,6 +2529,15 @@ impl fmt::Display for PreparedPmemDeviceError {
                     "failed to allocate guest range for pmem device {pmem_id}: {source}"
                 )
             }
+            Self::BackingModeMismatch { pmem_id } => {
+                write!(
+                    f,
+                    "provided pmem backing mode does not match device {pmem_id}"
+                )
+            }
+            Self::UnexpectedBacking => {
+                f.write_str("provided pmem backing does not match a configured device")
+            }
         }
     }
 }
@@ -2445,6 +2549,7 @@ impl std::error::Error for PreparedPmemDeviceError {
             Self::OpenBacking { source, .. } => Some(source),
             Self::MapBacking { source, .. } => Some(source),
             Self::AllocateGuestRange { source, .. } => Some(source),
+            Self::BackingModeMismatch { .. } | Self::UnexpectedBacking => None,
         }
     }
 }
@@ -3210,6 +3315,7 @@ fn config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigErr
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     use std::error::Error as _;
     use std::ffi::CString;
     use std::fs;
@@ -4940,6 +5046,46 @@ mod tests {
     }
 
     #[test]
+    fn file_backing_adopts_provided_regular_file() {
+        let file = temp_file("provided-pmem.img", b"pmem");
+        let provided_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.as_path())
+            .expect("provided pmem backing should open");
+        let backing = PmemFileBacking::from_file(provided_file, false)
+            .expect("provided pmem backing should validate");
+
+        assert_eq!(backing.len(), 4);
+        assert!(!backing.is_empty());
+        assert!(!backing.is_read_only());
+        assert_eq!(
+            backing
+                .file()
+                .metadata()
+                .expect("provided pmem backing should have metadata")
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn file_backing_rejects_provided_directory_and_zero_sized_file() {
+        let dir = temp_dir("provided-dir-pmem.img");
+        let provided_dir = fs::File::open(dir.as_path()).expect("provided directory should open");
+        let dir_err = PmemFileBacking::from_file(provided_dir, true)
+            .expect_err("provided directory should fail");
+
+        let file = temp_file("provided-empty-pmem.img", b"");
+        let provided_file = fs::File::open(file.as_path()).expect("provided file should open");
+        let file_err = PmemFileBacking::from_file(provided_file, true)
+            .expect_err("provided zero-sized file should fail");
+
+        assert!(matches!(dir_err, PmemFileBackingError::NonRegularFile));
+        assert!(matches!(file_err, PmemFileBackingError::ZeroSizedFile));
+    }
+
+    #[test]
     fn file_backing_rejects_missing_path_without_echoing_it() {
         let path = missing_path("secret-missing-pmem.img");
         let err = open_backing(&path, true).expect_err("missing pmem backing should fail");
@@ -5306,6 +5452,121 @@ mod tests {
                 VIRTIO_PMEM_ALIGNMENT,
             )
         );
+    }
+
+    #[test]
+    fn prepared_devices_adopt_provided_backing_without_opening_configured_path() {
+        let source = temp_file("provided-pmem-source.img", b"provided-pmem");
+        let missing = missing_path("provided-pmem-missing.img");
+        let configs = [pmem_config(PmemConfigInput::new(
+            "pmem0",
+            missing.to_string_lossy().into_owned(),
+        ))];
+        let provided_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(source.as_path())
+            .expect("provided pmem backing should open");
+        let provided = PmemFileBacking::from_file(provided_file, false)
+            .expect("provided pmem backing should validate");
+        let mut backings = BTreeMap::new();
+        backings.insert("pmem0".to_string(), provided);
+        let layout = guest_layout(vec![guest_range(aarch64::DRAM_MEM_START, 8 * 1024 * 1024)]);
+
+        let prepared = PreparedPmemDevices::from_config_slice_with_layout_and_backings(
+            &configs, &layout, backings,
+        )
+        .expect("provided pmem backing should prepare without configured path");
+        let rendered = format!("{prepared:?}");
+
+        assert_eq!(prepared.as_slice()[0].backing().len(), 13);
+        assert!(!prepared.as_slice()[0].backing().is_read_only());
+        assert_eq!(prepared.as_slice()[0].mapping().file_len(), 13);
+        assert!(!missing.exists());
+        assert!(rendered.contains("<owned>"));
+        assert!(!rendered.contains(source.as_path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn prepared_devices_reject_provided_backing_with_mismatched_read_only_mode() {
+        let source = temp_file("provided-pmem-mode-mismatch.img", b"provided");
+        let missing = missing_path("provided-pmem-mode-mismatch-missing.img");
+        let configs = [pmem_config(
+            PmemConfigInput::new("pmem0", missing.to_string_lossy().into_owned())
+                .with_read_only(true),
+        )];
+        let provided = PmemFileBacking::from_file(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(source.as_path())
+                .expect("provided pmem backing should open"),
+            false,
+        )
+        .expect("provided pmem backing should validate");
+        let mut backings = BTreeMap::new();
+        backings.insert("pmem0".to_string(), provided);
+        let layout = guest_layout(vec![guest_range(aarch64::DRAM_MEM_START, 8 * 1024 * 1024)]);
+
+        let err = PreparedPmemDevices::from_config_slice_with_layout_and_backings(
+            &configs, &layout, backings,
+        )
+        .expect_err("mismatched provided backing mode should fail");
+
+        assert!(matches!(
+            err,
+            PreparedPmemDeviceError::BackingModeMismatch { ref pmem_id }
+                if pmem_id == "pmem0"
+        ));
+        assert!(
+            !err.to_string()
+                .contains(source.as_path().to_string_lossy().as_ref())
+        );
+        assert!(!err.to_string().contains(missing.to_string_lossy().as_ref()));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn prepared_devices_reject_provided_backing_without_matching_config() {
+        let source = temp_file("provided-pmem-unexpected.img", b"provided");
+        let provided = PmemFileBacking::from_file(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(source.as_path())
+                .expect("provided pmem backing should open"),
+            false,
+        )
+        .expect("provided pmem backing should validate");
+        let mut backings = BTreeMap::new();
+        backings.insert("missing".to_string(), provided);
+        let layout = guest_layout(vec![guest_range(aarch64::DRAM_MEM_START, 8 * 1024 * 1024)]);
+
+        let err =
+            PreparedPmemDevices::from_config_slice_with_layout_and_backings(&[], &layout, backings)
+                .expect_err("unexpected pmem backing should fail");
+
+        assert!(matches!(err, PreparedPmemDeviceError::UnexpectedBacking));
+        assert_eq!(
+            err.to_string(),
+            "provided pmem backing does not match a configured device"
+        );
+    }
+
+    #[test]
+    fn pmem_debug_redacts_configured_paths_and_grant_references() {
+        let input =
+            PmemConfigInput::new("pmem0", "bangbang-grant:secret-pmem-grant").with_read_only(true);
+        let config = PmemConfig::try_from(input.clone()).expect("pmem should validate");
+
+        for rendered in [
+            format!("{input:?}"),
+            format!("{config:?}"),
+            format!("{:?}", crate::VmmAction::PutPmem(input)),
+        ] {
+            assert!(rendered.contains("<redacted>"));
+            assert!(!rendered.contains("secret-pmem"));
+        }
     }
 
     #[test]

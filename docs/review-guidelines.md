@@ -145,6 +145,15 @@ boot descriptors beside the public configuration, never reopen a tag, and
 separate authorized `GET /vm/config` output from redacted diagnostics. Review
 the cancellation/disconnect race against pending claims, descriptor lifetime on
 every error path, and the singleton retry rule after boot consumes a grant.
+For repeatable block/pmem grants, derive access from the validated immutable
+device mode, key retained ownership by configured device ID, preflight every
+consumed startup entry before moving any backing, and reject unexpected backing
+map entries. Review same-ID `PUT` replacement separately from after-start block
+`PATCH`: both commit public state only after the consumer transition, while a
+successfully claimed live replacement remains one-time even if the later swap
+fails. Path-free block and pmem limiter updates must retain ownership and claim
+nothing. Authorized configuration output may contain the submitted tag; all
+diagnostics and nested `Debug` output must remain value-redacted.
 
 ## Concurrency and Resource Management
 

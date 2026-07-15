@@ -1,6 +1,6 @@
 //! Internal assembly of boot resources from validated VM configuration.
 
-use std::collections::TryReserveError;
+use std::collections::{BTreeMap, TryReserveError};
 use std::fmt;
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
@@ -63,8 +63,8 @@ use crate::network::{
     VirtioNetworkTxPacketSink,
 };
 use crate::pmem::{
-    PmemMmioDeviceRegistration, PmemMmioLayout, PmemMmioRegistrationError, PmemUpdate,
-    PmemUpdateError, PreparedPmemDevice, PreparedPmemDeviceError, PreparedPmemDevices,
+    PmemFileBacking, PmemMmioDeviceRegistration, PmemMmioLayout, PmemMmioRegistrationError,
+    PmemUpdate, PmemUpdateError, PreparedPmemDevice, PreparedPmemDeviceError, PreparedPmemDevices,
     VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus,
     VirtioPmemMmioHandler,
 };
@@ -93,6 +93,69 @@ const ARM64_BOOT_VMCLOCK_ABI_SIZE: usize = 112;
 const ARM64_BOOT_VMCLOCK_MAGIC: u32 = 1_263_289_174;
 const ARM64_BOOT_VMCLOCK_VERSION: u16 = 1;
 const ARM64_BOOT_VMCLOCK_COUNTER_INVALID: u8 = 255;
+
+/// Move-only files supplied by an authority owner for one VM startup attempt.
+#[derive(Default)]
+pub struct VmStartupResources {
+    boot_files: BootSourceFiles,
+    block_backings: BTreeMap<String, BlockFileBacking>,
+    pmem_backings: BTreeMap<String, PmemFileBacking>,
+}
+
+impl fmt::Debug for VmStartupResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmStartupResources")
+            .field("boot_files", &self.boot_files)
+            .field(
+                "block_backings",
+                &(!self.block_backings.is_empty()).then_some("<owned>"),
+            )
+            .field(
+                "pmem_backings",
+                &(!self.pmem_backings.is_empty()).then_some("<owned>"),
+            )
+            .finish()
+    }
+}
+
+impl VmStartupResources {
+    /// Creates a one-attempt resource bundle from exact device-ID backing maps.
+    pub fn new(
+        boot_files: BootSourceFiles,
+        block_backings: BTreeMap<String, BlockFileBacking>,
+        pmem_backings: BTreeMap<String, PmemFileBacking>,
+    ) -> Self {
+        Self {
+            boot_files,
+            block_backings,
+            pmem_backings,
+        }
+    }
+
+    /// Creates a bundle containing only already-opened boot payloads.
+    pub fn with_boot_files(boot_files: BootSourceFiles) -> Self {
+        Self::new(boot_files, BTreeMap::new(), BTreeMap::new())
+    }
+
+    /// Returns whether every startup resource should use its configured path.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.boot_files.is_empty()
+            && self.block_backings.is_empty()
+            && self.pmem_backings.is_empty()
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        BootSourceFiles,
+        BTreeMap<String, BlockFileBacking>,
+        BTreeMap<String, PmemFileBacking>,
+    ) {
+        (self.boot_files, self.block_backings, self.pmem_backings)
+    }
+}
 const ARM64_BOOT_VMCLOCK_STATUS_UNKNOWN: u8 = 0;
 const ARM64_BOOT_VMCLOCK_FLAG_VM_GEN_COUNTER_PRESENT: u64 = 256;
 const ARM64_BOOT_VMCLOCK_FLAG_NOTIFICATION_PRESENT: u64 = 512;
@@ -3273,10 +3336,10 @@ impl Arm64BootResources {
         controller: &VmmController,
         config: Arm64BootResourceConfig<'_>,
     ) -> Result<Self, Arm64BootResourceError> {
-        Self::assemble_from_controller_with_boot_files(
+        Self::assemble_from_controller_with_startup_resources(
             controller,
             config,
-            BootSourceFiles::default(),
+            VmStartupResources::default(),
         )
     }
 
@@ -3286,6 +3349,20 @@ impl Arm64BootResources {
         config: Arm64BootResourceConfig<'_>,
         boot_files: BootSourceFiles,
     ) -> Result<Self, Arm64BootResourceError> {
+        Self::assemble_from_controller_with_startup_resources(
+            controller,
+            config,
+            VmStartupResources::with_boot_files(boot_files),
+        )
+    }
+
+    /// Assembles resources while consuming all already-opened startup files.
+    pub fn assemble_from_controller_with_startup_resources(
+        controller: &VmmController,
+        config: Arm64BootResourceConfig<'_>,
+        startup_resources: VmStartupResources,
+    ) -> Result<Self, Arm64BootResourceError> {
+        let (boot_files, block_backings, pmem_backings) = startup_resources.into_parts();
         let Arm64BootResourceConfig {
             vcpu_mpidrs,
             gic,
@@ -3346,13 +3423,18 @@ impl Arm64BootResources {
             .load_with_files(&layout, &mut memory, boot_files)
             .map_err(|source| Arm64BootResourceError::BootSourceLoad { source })?;
         append_root_drive_command_line(&mut loaded_boot_source, controller.drive_configs())?;
-        let prepared_pmems =
-            PreparedPmemDevices::from_config_slice_with_layout(controller.pmem_configs(), &layout)
-                .map_err(|source| Arm64BootResourceError::PreparePmemDevices { source })?;
+        let prepared_pmems = PreparedPmemDevices::from_config_slice_with_layout_and_backings(
+            controller.pmem_configs(),
+            &layout,
+            pmem_backings,
+        )
+        .map_err(|source| Arm64BootResourceError::PreparePmemDevices { source })?;
 
-        let prepared_blocks =
-            PreparedBlockDevices::from_config_slice(controller.drive_configs())
-                .map_err(|source| Arm64BootResourceError::PrepareBlockDevices { source })?;
+        let prepared_blocks = PreparedBlockDevices::from_config_slice_with_backings(
+            controller.drive_configs(),
+            block_backings,
+        )
+        .map_err(|source| Arm64BootResourceError::PrepareBlockDevices { source })?;
         let block_mmio = prepared_blocks
             .register_mmio(block_mmio_layout)
             .map_err(|source| Arm64BootResourceError::RegisterBlockMmio {

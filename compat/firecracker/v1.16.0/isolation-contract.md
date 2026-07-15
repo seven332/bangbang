@@ -161,10 +161,40 @@ hard-revocable. Operators may still use the direct uncontained executable for
 the broader existing host-path surface, but that mode is not evidence for the
 production containment records.
 
+Drive and pmem roles are repeatable, so their explicit grant ID is the only
+selection key; no role-based or device-name lookup exists. A contained
+pre-boot `PUT` first validates complete action, lifecycle, device ID, root and
+ordering rules, path shape, and limiter state. It then claims the exact
+`DriveBacking` or `PmemBacking` role with read-only/read-write access derived
+from the validated device configuration, constructs the device-specific
+backing from the transferred file, and atomically commits public configuration
+plus private per-ID ownership. Mismatch, malformed/missing/consumed references,
+backing validation, or candidate validation preserve the previous config and
+backing. A successful same-ID ordinary-path `PUT` deliberately drops prepared
+grant ownership and retains deferred path opening.
+
+Startup uses one move-only aggregate for boot files and exact-ID block/pmem
+backings. It preflights every private entry for prior consumption before moving
+anything, follows public device order rather than map order, and rejects
+provided IDs absent from configuration. Prepared entries become consumed when
+moved; a later VM-start failure therefore requires a fresh same-ID `PUT` for
+each affected device, while unrelated entries are not partially moved by an
+early preflight failure.
+
+After `Ready`, the immutable startup batch can still contain unused grants.
+Only the existing path-changing `PATCH /drives/{id}` consumes one: lifecycle
+and full updated-config validation precede the exact claim, the opened backing
+is passed to the active session, and public config commits only after the
+handler swap. If the later active transition fails, the prior active
+device/config remains but the claimed grant is one-time consumed. Path-free
+drive updates and pmem limiter `PATCH` claim nothing and retain the active
+backing; pmem has no live backing replacement. Authorized `GET /vm/config`
+responses may contain submitted tags. Faults, errors, logs, and nested debug
+output exclude tags, IDs, paths, descriptor identity, and contents.
+
 The following remain feasible work owned by #1351:
 
-- consumer adoption for block/pmem, API/vsock/observability, and snapshot
-  resources;
+- consumer adoption for API/vsock/observability and snapshot resources;
 - dynamic post-Ready delivery and any hard-revocation broker;
 - vmnet entitlement/provisioning and per-VM network policy;
 - automatic restart/reconnect and any long-lived broker/service policy;
@@ -205,15 +235,27 @@ execution proves:
 - worker-first and launcher-first namespace cleanup, both-killed bounded stale
   recovery, and two concurrent API sessions remaining independent when one
   worker dies;
-- both sealed and external-grant config/metadata/kernel/initrd inputs starting
-  real sandboxed HVF guests through no-API production launches and ending
-  successfully through PSCI `SYSTEM_OFF`;
+- both sealed and external-grant config/metadata/kernel/initrd inputs plus
+  repeatable read-only/read-write block and pmem inputs starting real sandboxed
+  HVF guests through no-API production launches and ending successfully through
+  PSCI `SYSTEM_OFF`;
 - delayed API-time atomic boot adoption retaining the opened file identities
   after pathname replacement and returning the authorized references from
-  `GET /vm/config`; and
+  `GET /vm/config`;
 - invalid-command-line, wrong-role, and missing boot requests preserving the
   prior public configuration, with redacted grant faults and no consumption of
-  the valid pair.
+  the valid pair;
+- delayed exact role/access device claims, wrong-role/wrong-access/malformed and
+  duplicate-use failure, same-ID rollback, authorized block/pmem tags, and
+  limiter-only updates that retain backing ownership;
+- source pathname replacement after launcher preparation followed by real guest
+  writable block I/O and pmem marker read/flush persistence only in the
+  launcher-opened objects;
+- a read-only transferred block backing rejecting a real guest write while its
+  opened file remains unchanged; and
+- preauthorized after-start block replacement synchronized by guest
+  virtio-mem ready/grow/shrink markers so later writes reach the already-opened
+  replacement object rather than the planted pathname.
 
 Readiness events and bounded deadlines replace fixed sleeps. Destructive cases
 operate on private copies, so later checks continue to use the canonical signed
@@ -230,8 +272,9 @@ work:
 - `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
 
 The delivered package/session/grant/fd/crash subset, including exact adoption by
-the four startup-input consumers, is real but does not complete any of those
-composite records because remaining consumers, dynamic-broker, network,
+the singleton startup inputs and repeatable block/pmem consumers, is real but
+does not complete any of those composite records because remaining consumers,
+dynamic-broker, network,
 Linux-outcome, and deployment work remains. The broad `jailer`, `seccomp`,
 `seccompiler`, and `production-host` corpus records remain `audit-required`.
 Neither this audit nor the executable evidence is direct Firecracker jailer

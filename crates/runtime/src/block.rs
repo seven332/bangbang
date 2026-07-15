@@ -1,6 +1,6 @@
 //! Backend-neutral block-device configuration model.
 
-use std::collections::TryReserveError;
+use std::collections::{BTreeMap, TryReserveError};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -59,7 +59,7 @@ pub const VIRTIO_BLOCK_STATUS_UNSUPPORTED: u8 = 2;
 pub type VirtioBlockMmioHandler =
     VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DriveConfigInput {
     path_drive_id: String,
     body_drive_id: String,
@@ -73,12 +73,48 @@ pub struct DriveConfigInput {
     socket: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DriveUpdateInput {
     path_drive_id: String,
     body_drive_id: String,
     path_on_host: Option<PathBuf>,
     rate_limiter: Option<DriveRateLimiterConfig>,
+}
+
+impl fmt::Debug for DriveConfigInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveConfigInput")
+            .field("path_drive_id", &self.path_drive_id)
+            .field("body_drive_id", &self.body_drive_id)
+            .field(
+                "path_on_host",
+                &self.path_on_host.as_ref().map(|_| "<redacted>"),
+            )
+            .field("is_root_device", &self.is_root_device)
+            .field("is_read_only", &self.is_read_only)
+            .field("partuuid", &self.partuuid)
+            .field("cache_type", &self.cache_type)
+            .field("io_engine", &self.io_engine)
+            .field("rate_limiter", &self.rate_limiter)
+            .field("socket", &self.socket.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl fmt::Debug for DriveUpdateInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveUpdateInput")
+            .field("path_drive_id", &self.path_drive_id)
+            .field("body_drive_id", &self.body_drive_id)
+            .field(
+                "path_on_host",
+                &self.path_on_host.as_ref().map(|_| "<redacted>"),
+            )
+            .field("rate_limiter", &self.rate_limiter)
+            .finish()
+    }
 }
 
 impl DriveUpdateInput {
@@ -132,11 +168,25 @@ impl DriveUpdateInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DriveUpdate {
     drive_id: String,
     path_on_host: Option<PathBuf>,
     rate_limiter: Option<DriveRateLimiterConfig>,
+}
+
+impl fmt::Debug for DriveUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveUpdate")
+            .field("drive_id", &self.drive_id)
+            .field(
+                "path_on_host",
+                &self.path_on_host.as_ref().map(|_| "<redacted>"),
+            )
+            .field("rate_limiter", &self.rate_limiter)
+            .finish()
+    }
 }
 
 impl DriveUpdate {
@@ -366,7 +416,7 @@ const fn updated_token_bucket(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DriveConfig {
     drive_id: String,
     path_on_host: PathBuf,
@@ -376,6 +426,22 @@ pub struct DriveConfig {
     cache_type: DriveCacheType,
     io_engine: DriveIoEngine,
     rate_limiter: Option<DriveRateLimiterConfig>,
+}
+
+impl fmt::Debug for DriveConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveConfig")
+            .field("drive_id", &self.drive_id)
+            .field("path_on_host", &"<redacted>")
+            .field("is_root_device", &self.is_root_device)
+            .field("is_read_only", &self.is_read_only)
+            .field("partuuid", &self.partuuid)
+            .field("cache_type", &self.cache_type)
+            .field("io_engine", &self.io_engine)
+            .field("rate_limiter", &self.rate_limiter)
+            .finish()
+    }
 }
 
 impl DriveConfig {
@@ -461,6 +527,16 @@ impl DriveConfigs {
     }
 
     pub fn insert(&mut self, input: DriveConfigInput) -> Result<(), DriveConfigError> {
+        let config = self.validate_insert(input)?;
+        self.commit_insert(config);
+        Ok(())
+    }
+
+    /// Validates an insertion without mutating the configured drive set.
+    pub fn validate_insert(
+        &self,
+        input: DriveConfigInput,
+    ) -> Result<DriveConfig, DriveConfigError> {
         let config = input.validate()?;
         if config.is_root_device()
             && self.configs.iter().any(|existing| {
@@ -470,6 +546,11 @@ impl DriveConfigs {
             return Err(DriveConfigError::RootDeviceAlreadyConfigured);
         }
 
+        Ok(config)
+    }
+
+    /// Commits a drive configuration that was checked by [`Self::validate_insert`].
+    pub fn commit_insert(&mut self, config: DriveConfig) {
         let is_root_device = config.is_root_device();
         if let Some(index) = self
             .configs
@@ -486,8 +567,6 @@ impl DriveConfigs {
         } else {
             self.configs.push(config);
         }
-
-        Ok(())
     }
 
     pub fn updated_config(&self, input: DriveUpdateInput) -> Result<DriveConfig, DriveUpdateError> {
@@ -2961,11 +3040,21 @@ impl std::error::Error for VirtioBlockRequestError {
     }
 }
 
-#[derive(Debug)]
 pub struct BlockFileBacking {
     file: File,
     len: u64,
     is_read_only: bool,
+}
+
+impl fmt::Debug for BlockFileBacking {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockFileBacking")
+            .field("file", &"<owned>")
+            .field("len", &self.len)
+            .field("is_read_only", &self.is_read_only)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3077,6 +3166,11 @@ impl std::error::Error for SnapshotBlockFileBackingError {}
 impl BlockFileBacking {
     pub fn open(config: &DriveConfig) -> Result<Self, BlockFileBackingError> {
         let file = open_block_file(config.path_on_host(), config.is_read_only())?;
+        Self::from_file(file, config.is_read_only())
+    }
+
+    /// Adopts an already-opened block backing without resolving its configured path.
+    pub fn from_file(file: File, is_read_only: bool) -> Result<Self, BlockFileBackingError> {
         let metadata = file
             .metadata()
             .map_err(|source| BlockFileBackingError::ReadMetadata { source })?;
@@ -3088,7 +3182,7 @@ impl BlockFileBacking {
         Ok(Self {
             file,
             len: metadata.len(),
-            is_read_only: config.is_read_only(),
+            is_read_only,
         })
     }
 
@@ -3827,13 +3921,26 @@ pub struct PreparedBlockDevice {
 }
 
 impl PreparedBlockDevice {
-    fn from_config(config: &DriveConfig) -> Result<Self, PreparedBlockDeviceError> {
-        let backing = BlockFileBacking::open(config).map_err(|source| {
-            PreparedBlockDeviceError::OpenBacking {
-                drive_id: config.drive_id().to_string(),
-                source,
+    fn from_config_with_backing(
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+    ) -> Result<Self, PreparedBlockDeviceError> {
+        let backing = match backing {
+            Some(backing) => {
+                if backing.is_read_only() != config.is_read_only() {
+                    return Err(PreparedBlockDeviceError::BackingModeMismatch {
+                        drive_id: config.drive_id().to_string(),
+                    });
+                }
+                backing
             }
-        })?;
+            None => BlockFileBacking::open(config).map_err(|source| {
+                PreparedBlockDeviceError::OpenBacking {
+                    drive_id: config.drive_id().to_string(),
+                    source,
+                }
+            })?,
+        };
         let config_space = VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
         let device_id = VirtioBlockDeviceId::from_bytes(config.drive_id().as_bytes());
         let mut device = VirtioBlockDevice::new(backing, device_id);
@@ -3882,14 +3989,32 @@ impl PreparedBlockDevices {
     pub(crate) fn from_config_slice(
         configs: &[DriveConfig],
     ) -> Result<Self, PreparedBlockDeviceError> {
+        Self::from_config_slice_with_backings(configs, BTreeMap::new())
+    }
+
+    pub(crate) fn from_config_slice_with_backings(
+        configs: &[DriveConfig],
+        mut backings: BTreeMap<String, BlockFileBacking>,
+    ) -> Result<Self, PreparedBlockDeviceError> {
+        if backings
+            .keys()
+            .any(|drive_id| !configs.iter().any(|config| config.drive_id() == drive_id))
+        {
+            return Err(PreparedBlockDeviceError::UnexpectedBacking);
+        }
+
         let mut devices = Vec::new();
         devices
             .try_reserve_exact(configs.len())
             .map_err(|source| PreparedBlockDeviceError::AllocateDevices { source })?;
 
         for config in configs {
-            devices.push(PreparedBlockDevice::from_config(config)?);
+            let backing = backings.remove(config.drive_id());
+            devices.push(PreparedBlockDevice::from_config_with_backing(
+                config, backing,
+            )?);
         }
+        debug_assert!(backings.is_empty());
 
         Ok(Self { devices })
     }
@@ -3927,6 +4052,10 @@ pub enum PreparedBlockDeviceError {
         drive_id: String,
         source: BlockFileBackingError,
     },
+    BackingModeMismatch {
+        drive_id: String,
+    },
+    UnexpectedBacking,
 }
 
 impl fmt::Display for PreparedBlockDeviceError {
@@ -3938,6 +4067,15 @@ impl fmt::Display for PreparedBlockDeviceError {
             Self::OpenBacking { drive_id, source } => {
                 write!(f, "failed to prepare block device {drive_id}: {source}")
             }
+            Self::BackingModeMismatch { drive_id } => {
+                write!(
+                    f,
+                    "provided block backing mode does not match drive {drive_id}"
+                )
+            }
+            Self::UnexpectedBacking => {
+                f.write_str("provided block backing does not match a configured drive")
+            }
         }
     }
 }
@@ -3947,6 +4085,7 @@ impl std::error::Error for PreparedBlockDeviceError {
         match self {
             Self::AllocateDevices { source } => Some(source),
             Self::OpenBacking { source, .. } => Some(source),
+            Self::BackingModeMismatch { .. } | Self::UnexpectedBacking => None,
         }
     }
 }
@@ -4672,6 +4811,7 @@ fn validate_drive_update_id(source: DriveIdSource, drive_id: &str) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::error::Error as _;
     use std::ffi::CString;
     use std::fs::{self, OpenOptions};
@@ -6406,6 +6546,12 @@ mod tests {
             PreparedBlockDeviceError::AllocateDevices { .. } => {
                 panic!("missing path should not fail allocation")
             }
+            PreparedBlockDeviceError::BackingModeMismatch { .. } => {
+                panic!("path-only preparation should not have a backing mode mismatch")
+            }
+            PreparedBlockDeviceError::UnexpectedBacking => {
+                panic!("path-only preparation should not have a provided backing")
+            }
         }
         assert!(err.source().is_some());
         assert!(!err.to_string().contains("secret-prepared-missing"));
@@ -6438,6 +6584,12 @@ mod tests {
             PreparedBlockDeviceError::AllocateDevices { .. } => {
                 panic!("directory should not fail allocation")
             }
+            PreparedBlockDeviceError::BackingModeMismatch { .. } => {
+                panic!("path-only preparation should not have a backing mode mismatch")
+            }
+            PreparedBlockDeviceError::UnexpectedBacking => {
+                panic!("path-only preparation should not have a provided backing")
+            }
         }
         assert!(!err.to_string().contains("secret-prepared-dir"));
     }
@@ -6468,6 +6620,12 @@ mod tests {
             }
             PreparedBlockDeviceError::AllocateDevices { .. } => {
                 panic!("FIFO should not fail allocation")
+            }
+            PreparedBlockDeviceError::BackingModeMismatch { .. } => {
+                panic!("path-only preparation should not have a backing mode mismatch")
+            }
+            PreparedBlockDeviceError::UnexpectedBacking => {
+                panic!("path-only preparation should not have a provided backing")
             }
         }
         assert!(!err.to_string().contains("secret-prepared-fifo"));
@@ -9818,6 +9976,183 @@ mod tests {
 
         assert_eq!(backing.len(), 6);
         assert!(backing.is_read_only());
+    }
+
+    #[test]
+    fn adopts_provided_backing_with_the_same_io_behavior() {
+        let file = temp_file("provided-rw.img", b"abcdef");
+        let provided_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.as_path())
+            .expect("provided backing should open");
+        let backing = BlockFileBacking::from_file(provided_file, false)
+            .expect("provided backing should validate");
+        let mut read_buffer = [0_u8; 3];
+
+        assert_eq!(backing.len(), 6);
+        assert!(!backing.is_read_only());
+        backing
+            .read_at(1, &mut read_buffer)
+            .expect("provided backing read should succeed");
+        backing
+            .write_at(2, b"XY")
+            .expect("provided backing write should succeed");
+        backing
+            .flush()
+            .expect("provided backing flush should succeed");
+
+        assert_eq!(&read_buffer, b"bcd");
+        assert_eq!(
+            fs::read(file.as_path()).expect("file should read"),
+            b"abXYef"
+        );
+    }
+
+    #[test]
+    fn provided_backing_enforces_read_only_policy_and_regular_file_validation() {
+        let file = temp_file("provided-ro.img", b"abcdef");
+        let provided_file = OpenOptions::new()
+            .read(true)
+            .open(file.as_path())
+            .expect("provided read-only backing should open");
+        let backing = BlockFileBacking::from_file(provided_file, true)
+            .expect("provided read-only backing should validate");
+
+        assert!(matches!(
+            backing.write_at(0, b"z"),
+            Err(BlockFileBackingError::ReadOnlyWrite)
+        ));
+
+        let dir = temp_dir("provided-dir.img");
+        let provided_dir = fs::File::open(dir.as_path()).expect("provided directory should open");
+        let err = BlockFileBacking::from_file(provided_dir, true)
+            .expect_err("provided directory should fail");
+
+        assert!(matches!(err, BlockFileBackingError::NonRegularFile));
+    }
+
+    #[test]
+    fn adopts_provided_backing_without_opening_configured_path() {
+        let file = temp_file("provided-source.img", b"provided");
+        let missing = missing_path("provided-missing.img");
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new("data", "data", &missing, false))
+            .expect("provided drive config should validate");
+        let provided_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.as_path())
+            .expect("provided backing should open");
+        let provided = BlockFileBacking::from_file(provided_file, false)
+            .expect("provided backing should validate");
+        let mut backings = BTreeMap::new();
+        backings.insert("data".to_string(), provided);
+
+        let prepared =
+            PreparedBlockDevices::from_config_slice_with_backings(configs.as_slice(), backings)
+                .expect("provided backing should prepare without configured path");
+        let rendered = format!("{prepared:?}");
+
+        assert_eq!(prepared.as_slice()[0].device().backing().len(), 8);
+        assert!(!prepared.as_slice()[0].device().backing().is_read_only());
+        assert!(!missing.exists());
+        assert!(rendered.contains("<owned>"));
+        assert!(!rendered.contains(file.as_path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn rejects_provided_backing_with_mismatched_read_only_mode() {
+        let file = temp_file("provided-mode-mismatch.img", b"provided");
+        let missing = missing_path("provided-mode-mismatch-missing.img");
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new("data", "data", &missing, false).with_is_read_only(true))
+            .expect("read-only drive config should validate");
+        let provided = BlockFileBacking::from_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file.as_path())
+                .expect("provided backing should open"),
+            false,
+        )
+        .expect("provided backing should validate");
+        let mut backings = BTreeMap::new();
+        backings.insert("data".to_string(), provided);
+
+        let err =
+            PreparedBlockDevices::from_config_slice_with_backings(configs.as_slice(), backings)
+                .expect_err("mismatched provided backing mode should fail");
+
+        assert!(matches!(
+            err,
+            PreparedBlockDeviceError::BackingModeMismatch { ref drive_id }
+                if drive_id == "data"
+        ));
+        assert!(
+            !err.to_string()
+                .contains(file.as_path().to_string_lossy().as_ref())
+        );
+        assert!(!err.to_string().contains(missing.to_string_lossy().as_ref()));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn rejects_provided_backing_without_matching_drive() {
+        let file = temp_file("provided-unexpected.img", b"provided");
+        let provided = BlockFileBacking::from_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file.as_path())
+                .expect("provided backing should open"),
+            false,
+        )
+        .expect("provided backing should validate");
+        let mut backings = BTreeMap::new();
+        backings.insert("missing".to_string(), provided);
+
+        let err = PreparedBlockDevices::from_config_slice_with_backings(&[], backings)
+            .expect_err("unexpected backing should fail");
+
+        assert!(matches!(err, PreparedBlockDeviceError::UnexpectedBacking));
+        assert_eq!(
+            err.to_string(),
+            "provided block backing does not match a configured drive"
+        );
+    }
+
+    #[test]
+    fn drive_debug_redacts_configured_paths_and_grant_references() {
+        let reference = "bangbang-grant:secret-drive-grant";
+        let input = DriveConfigInput::new("data", "data", reference, false);
+        let socket_input = DriveConfigInput::new("socket", "socket", reference, false)
+            .with_socket("/secret/socket");
+        let update_input = DriveUpdateInput::new(
+            "data",
+            "data",
+            Some(PathBuf::from("bangbang-grant:secret-drive-update")),
+        );
+        let config = input.clone().validate().expect("drive should validate");
+        let update = update_input
+            .clone()
+            .validate()
+            .expect("update should validate");
+
+        for rendered in [
+            format!("{input:?}"),
+            format!("{socket_input:?}"),
+            format!("{update_input:?}"),
+            format!("{config:?}"),
+            format!("{update:?}"),
+            format!("{:?}", crate::VmmAction::PutDrive(input)),
+        ] {
+            assert!(rendered.contains("<redacted>"));
+            assert!(!rendered.contains("secret-drive"));
+            assert!(!rendered.contains("/secret/socket"));
+        }
     }
 
     #[test]

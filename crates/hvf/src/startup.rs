@@ -59,8 +59,9 @@ use bangbang_runtime::startup::{
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig, Arm64BootVmGenIdDevice,
     Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
     Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
-    Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, memory_hotplug_status_for_device,
-    replace_arm64_boot_vmgenid, update_memory_hotplug_config_for_device,
+    Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, VmStartupResources,
+    memory_hotplug_status_for_device, replace_arm64_boot_vmgenid,
+    update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -2629,15 +2630,32 @@ impl OwnedHvfArm64BootSession {
         config: HvfArm64BootSessionConfig,
         boot_files: BootSourceFiles,
     ) -> Result<Self, HvfArm64BootSessionError> {
+        Self::new_with_startup_resources(
+            controller,
+            config,
+            VmStartupResources::with_boot_files(boot_files),
+        )
+    }
+
+    /// Constructs a session while consuming all already-opened startup files.
+    pub fn new_with_startup_resources(
+        controller: &VmmController,
+        config: HvfArm64BootSessionConfig,
+        startup_resources: VmStartupResources,
+    ) -> Result<Self, HvfArm64BootSessionError> {
         let mut backend = HvfBackend::new();
-        let prepared: PreparedHvfArm64BootSession<'static> =
-            match prepare_arm64_boot_session_parts(&mut backend, controller, config, boot_files) {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    let _ = <HvfBackend as VmBackend>::destroy_vm(&mut backend);
-                    return Err(err);
-                }
-            };
+        let prepared: PreparedHvfArm64BootSession<'static> = match prepare_arm64_boot_session_parts(
+            &mut backend,
+            controller,
+            config,
+            startup_resources,
+        ) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                let _ = <HvfBackend as VmBackend>::destroy_vm(&mut backend);
+                return Err(err);
+            }
+        };
 
         Ok(Self {
             runner: prepared.runner,
@@ -7780,7 +7798,7 @@ impl HvfBackend {
             self,
             controller,
             config,
-            BootSourceFiles::default(),
+            VmStartupResources::default(),
         ) {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -7831,7 +7849,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
     backend: &mut HvfBackend,
     controller: &VmmController,
     config: HvfArm64BootSessionConfig,
-    boot_files: BootSourceFiles,
+    startup_resources: VmStartupResources,
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
     <HvfBackend as VmBackend>::create_vm(backend)
         .map_err(|source| HvfArm64BootSessionError::CreateVm { source })?;
@@ -7875,7 +7893,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         .memory_hotplug_device
         .zip(interrupt_lines.memory_hotplug)
         .map(|(memory_hotplug, interrupt_line)| memory_hotplug.into_runtime(interrupt_line));
-    let resources = Arm64BootResources::assemble_from_controller_with_boot_files(
+    let resources = Arm64BootResources::assemble_from_controller_with_startup_resources(
         controller,
         Arm64BootResourceConfig {
             vcpu_mpidrs: &mpidrs,
@@ -7903,7 +7921,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
             memory_hotplug_device: runtime_memory_hotplug,
             entropy_device: runtime_entropy,
         },
-        boot_files,
+        startup_resources,
     )
     .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
     let boot_registers = HvfArm64BootRegisters {

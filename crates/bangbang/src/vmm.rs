@@ -1,4 +1,4 @@
-use std::collections::TryReserveError;
+use std::collections::{BTreeMap, TryReserveError};
 use std::fmt;
 use std::io::Read;
 use std::io::Seek;
@@ -62,7 +62,9 @@ use bangbang_runtime::network::{
     VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition,
     VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
-use bangbang_runtime::pmem::{PmemMmioLayout, PmemUpdate, PmemUpdateError, PmemUpdateInput};
+use bangbang_runtime::pmem::{
+    PmemConfigInput, PmemFileBacking, PmemMmioLayout, PmemUpdate, PmemUpdateError, PmemUpdateInput,
+};
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
     SerialConfig, SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
@@ -84,13 +86,15 @@ use bangbang_runtime::snapshot_memory::{
 use bangbang_runtime::startup::{
     Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
     Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootPmemDevice,
-    balloon_hinting_status_for_device, balloon_stats_for_device, start_balloon_hinting_for_device,
-    stop_balloon_hinting_for_device, update_balloon_config_for_device,
-    update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
+    VmStartupResources, balloon_hinting_status_for_device, balloon_stats_for_device,
+    start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
+    update_balloon_config_for_device, update_balloon_statistics_for_device,
+    update_block_device_for_devices_with_opened,
     update_network_interface_rate_limiters_for_devices, update_pmem_rate_limiter_for_devices,
 };
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
+use bangbang_session::{GrantAccess, ResourceRole};
 
 use crate::contained_session::GrantAuthority;
 use crate::host_network::virtio_vmnet::{
@@ -142,14 +146,14 @@ pub(crate) trait InstanceStartExecutor {
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError>;
 
-    fn start_with_boot_files(
+    fn start_with_startup_resources(
         &mut self,
         controller: &VmmController,
-        boot_files: BootSourceFiles,
+        startup_resources: VmStartupResources,
     ) -> Result<Self::Session, BackendError> {
-        if !boot_files.is_empty() {
+        if !startup_resources.is_empty() {
             return Err(BackendError::Unsupported(
-                "startup executor cannot consume provided boot files",
+                "startup executor cannot consume provided startup resources",
             ));
         }
         self.start(controller)
@@ -373,6 +377,22 @@ fn native_v1_snapshot_resume_action_error(error: VmmActionError) -> VmmActionErr
     VmmActionError::SnapshotLoad(source)
 }
 
+pub(crate) enum BlockBackingUpdate {
+    Unchanged,
+    ConfiguredPath,
+    Provided(BlockFileBacking),
+}
+
+impl fmt::Debug for BlockBackingUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unchanged => formatter.write_str("Unchanged"),
+            Self::ConfiguredPath => formatter.write_str("ConfiguredPath(<redacted>)"),
+            Self::Provided(_) => formatter.write_str("Provided(<owned>)"),
+        }
+    }
+}
+
 pub(crate) trait ProcessSessionDiagnostics {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         MetricsDiagnostics::default()
@@ -394,7 +414,7 @@ pub(crate) trait ProcessSessionDiagnostics {
     fn update_block_device(
         &mut self,
         _config: &DriveConfig,
-        _refresh_backing: bool,
+        _backing_update: BlockBackingUpdate,
         _rate_limiter_update: Option<DriveRateLimiterConfig>,
     ) -> Result<(), DriveUpdateError> {
         Err(DriveUpdateError::ActiveSessionUnavailable)
@@ -1187,6 +1207,28 @@ enum BootGrantState {
     Consumed,
 }
 
+enum BackingGrantState<T> {
+    Prepared(T),
+    Consumed,
+}
+
+impl<T> fmt::Debug for BackingGrantState<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Prepared(_) => formatter.write_str("Prepared(<owned>)"),
+            Self::Consumed => formatter.write_str("Consumed"),
+        }
+    }
+}
+
+const fn grant_access_for_read_only(read_only: bool) -> GrantAccess {
+    if read_only {
+        GrantAccess::ReadOnly
+    } else {
+        GrantAccess::ReadWrite
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ProcessVmm<S>
 where
@@ -1203,6 +1245,8 @@ where
     terminal_snapshot_load_failure: bool,
     grant_authority: Option<GrantAuthority>,
     boot_grant_state: BootGrantState,
+    drive_grant_states: BTreeMap<String, BackingGrantState<BlockFileBacking>>,
+    pmem_grant_states: BTreeMap<String, BackingGrantState<PmemFileBacking>>,
 }
 
 impl ProcessVmm<HvfInstanceStartExecutor> {
@@ -1271,6 +1315,8 @@ where
             terminal_snapshot_load_failure: false,
             grant_authority: None,
             boot_grant_state: BootGrantState::PathBased,
+            drive_grant_states: BTreeMap::new(),
+            pmem_grant_states: BTreeMap::new(),
         }
     }
 
@@ -1340,6 +1386,8 @@ where
         let result = match action {
             VmmAction::InstanceStart => self.start_instance(),
             VmmAction::PutBootSource(input) => self.put_boot_source(input),
+            VmmAction::PutDrive(input) => self.put_drive(input),
+            VmmAction::PutPmem(input) => self.put_pmem(input),
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
             VmmAction::CreateSnapshot(input) => self.create_snapshot(input),
@@ -1447,6 +1495,19 @@ where
 
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
         self.controller.preflight_instance_start()?;
+        if matches!(self.boot_grant_state, BootGrantState::Consumed)
+            || self
+                .drive_grant_states
+                .values()
+                .any(|state| matches!(state, BackingGrantState::Consumed))
+            || self
+                .pmem_grant_states
+                .values()
+                .any(|state| matches!(state, BackingGrantState::Consumed))
+        {
+            return Err(VmmActionError::ResourceGrant);
+        }
+
         let boot_files =
             match std::mem::replace(&mut self.boot_grant_state, BootGrantState::Consumed) {
                 BootGrantState::PathBased => {
@@ -1456,12 +1517,32 @@ where
                 BootGrantState::Prepared(files) => files,
                 BootGrantState::Consumed => return Err(VmmActionError::ResourceGrant),
             };
+        let mut block_backings = BTreeMap::new();
+        for (drive_id, state) in &mut self.drive_grant_states {
+            let backing = match std::mem::replace(state, BackingGrantState::Consumed) {
+                BackingGrantState::Prepared(backing) => backing,
+                BackingGrantState::Consumed => return Err(VmmActionError::ResourceGrant),
+            };
+            let previous = block_backings.insert(drive_id.clone(), backing);
+            debug_assert!(previous.is_none());
+        }
+        let mut pmem_backings = BTreeMap::new();
+        for (pmem_id, state) in &mut self.pmem_grant_states {
+            let backing = match std::mem::replace(state, BackingGrantState::Consumed) {
+                BackingGrantState::Prepared(backing) => backing,
+                BackingGrantState::Consumed => return Err(VmmActionError::ResourceGrant),
+            };
+            let previous = pmem_backings.insert(pmem_id.clone(), backing);
+            debug_assert!(previous.is_none());
+        }
+        let startup_resources = VmStartupResources::new(boot_files, block_backings, pmem_backings);
         let controller = &mut self.controller;
         let starter = &mut self.starter;
         let mut started_session = None;
 
         let result = controller.start_instance_with(|controller| {
-            started_session = Some(starter.start_with_boot_files(controller, boot_files)?);
+            started_session =
+                Some(starter.start_with_startup_resources(controller, startup_resources)?);
             Ok(())
         });
 
@@ -1495,6 +1576,66 @@ where
 
         self.controller.commit_boot_source_config(config);
         self.boot_grant_state = grant_state;
+        Ok(VmmData::Empty)
+    }
+
+    fn put_drive(&mut self, input: DriveConfigInput) -> Result<VmmData, VmmActionError> {
+        let config = self.controller.prepare_drive_config(input)?;
+        let backing = match &self.grant_authority {
+            Some(authority) => authority
+                .claim_file(
+                    config.path_on_host(),
+                    ResourceRole::DriveBacking,
+                    grant_access_for_read_only(config.is_read_only()),
+                )
+                .map_err(|_| VmmActionError::ResourceGrant)?
+                .map(|file| BlockFileBacking::from_file(file, config.is_read_only()))
+                .transpose()
+                .map_err(|_| VmmActionError::ResourceGrant)?,
+            None => None,
+        };
+        let drive_id = config.drive_id().to_string();
+
+        self.controller.commit_drive_config(config);
+        match backing {
+            Some(backing) => {
+                self.drive_grant_states
+                    .insert(drive_id, BackingGrantState::Prepared(backing));
+            }
+            None => {
+                self.drive_grant_states.remove(&drive_id);
+            }
+        }
+        Ok(VmmData::Empty)
+    }
+
+    fn put_pmem(&mut self, input: PmemConfigInput) -> Result<VmmData, VmmActionError> {
+        let config = self.controller.prepare_pmem_config(input)?;
+        let backing = match &self.grant_authority {
+            Some(authority) => authority
+                .claim_file(
+                    std::path::Path::new(config.path_on_host()),
+                    ResourceRole::PmemBacking,
+                    grant_access_for_read_only(config.read_only()),
+                )
+                .map_err(|_| VmmActionError::ResourceGrant)?
+                .map(|file| PmemFileBacking::from_file(file, config.read_only()))
+                .transpose()
+                .map_err(|_| VmmActionError::ResourceGrant)?,
+            None => None,
+        };
+        let pmem_id = config.id().to_string();
+
+        self.controller.commit_pmem_config(config);
+        match backing {
+            Some(backing) => {
+                self.pmem_grant_states
+                    .insert(pmem_id, BackingGrantState::Prepared(backing));
+            }
+            None => {
+                self.pmem_grant_states.remove(&pmem_id);
+            }
+        }
         Ok(VmmData::Empty)
     }
 
@@ -1563,8 +1704,30 @@ where
                 ));
             };
 
+            let backing_update = if refresh_backing {
+                match &self.grant_authority {
+                    Some(authority) => match authority
+                        .claim_file(
+                            updated_config.path_on_host(),
+                            ResourceRole::DriveBacking,
+                            grant_access_for_read_only(updated_config.is_read_only()),
+                        )
+                        .map_err(|_| VmmActionError::ResourceGrant)?
+                    {
+                        Some(file) => BlockBackingUpdate::Provided(
+                            BlockFileBacking::from_file(file, updated_config.is_read_only())
+                                .map_err(|_| VmmActionError::ResourceGrant)?,
+                        ),
+                        None => BlockBackingUpdate::ConfiguredPath,
+                    },
+                    None => BlockBackingUpdate::ConfiguredPath,
+                }
+            } else {
+                BlockBackingUpdate::Unchanged
+            };
+
             session
-                .update_block_device(&updated_config, refresh_backing, rate_limiter_update)
+                .update_block_device(&updated_config, backing_update, rate_limiter_update)
                 .map_err(VmmActionError::DriveUpdate)?;
         }
         self.controller.commit_drive_update(updated_config)?;
@@ -2156,13 +2319,13 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
-        self.start_with_boot_files(controller, BootSourceFiles::default())
+        self.start_with_startup_resources(controller, VmStartupResources::default())
     }
 
-    fn start_with_boot_files(
+    fn start_with_startup_resources(
         &mut self,
         controller: &VmmController,
-        boot_files: BootSourceFiles,
+        startup_resources: VmStartupResources,
     ) -> Result<Self::Session, BackendError> {
         let serial_output = self
             .serial_output_for_controller(controller)
@@ -2179,10 +2342,10 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                     "failed to build network packet I/O provider: {err}"
                 ))
             })?;
-        let session = OwnedHvfArm64BootSession::new_with_boot_files(
+        let session = OwnedHvfArm64BootSession::new_with_startup_resources(
             controller,
             boot_session_config,
-            boot_files,
+            startup_resources,
         )
         .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
         let session = ProcessHvfBootSession::new(session, packet_io, mmds_metrics);
@@ -5012,7 +5175,7 @@ where
     fn update_block_device(
         &mut self,
         config: &DriveConfig,
-        refresh_backing: bool,
+        backing_update: BlockBackingUpdate,
         rate_limiter_update: Option<DriveRateLimiterConfig>,
     ) -> Result<(), DriveUpdateError> {
         let drive_id = config.drive_id();
@@ -5028,16 +5191,18 @@ where
 
         // Keep host file open/stat work on the caller side; only the active
         // handler mutation runs on the boot run-loop worker.
-        let backing = if refresh_backing {
-            match BootRunLoopBlockDeviceUpdater::open_block_device_backing(config) {
-                Ok(backing) => Some(backing),
-                Err(err) => {
-                    self.record_block_device_update_failure(drive_id);
-                    return Err(err);
+        let backing = match backing_update {
+            BlockBackingUpdate::Unchanged => None,
+            BlockBackingUpdate::ConfiguredPath => {
+                match BootRunLoopBlockDeviceUpdater::open_block_device_backing(config) {
+                    Ok(backing) => Some(backing),
+                    Err(err) => {
+                        self.record_block_device_update_failure(drive_id);
+                        return Err(err);
+                    }
                 }
             }
-        } else {
-            None
+            BlockBackingUpdate::Provided(backing) => Some(backing),
         };
         let updater = updater.clone();
         let config = config.clone();
@@ -5321,7 +5486,7 @@ fn default_hvf_boot_session_config(serial_output: SharedSerialOutput) -> HvfArm6
 mod tests {
     use std::collections::VecDeque;
     use std::fmt;
-    use std::fs::{self, File, remove_file};
+    use std::fs::{self, File, OpenOptions, remove_file};
     use std::io::{Cursor, Seek, SeekFrom, Write};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
@@ -5335,8 +5500,9 @@ mod tests {
         BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
     };
     use bangbang_runtime::block::{
-        BlockMmioLayout, DriveConfig, DriveConfigInput, DriveConfigs, DriveRateLimiterConfig,
-        DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput, PreparedBlockDevices,
+        BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveConfigs,
+        DriveRateLimiterConfig, DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput,
+        PreparedBlockDevices,
     };
     use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
     use bangbang_runtime::cpu::{CpuConfigInput, CpuConfigTemplateCategory};
@@ -5371,8 +5537,9 @@ mod tests {
         NetworkRateLimiterConfig, NetworkTokenBucketConfig, PreparedNetworkDevices,
     };
     use bangbang_runtime::pmem::{
-        PmemConfig, PmemConfigInput, PmemConfigs, PmemMmioLayout, PmemRateLimiterConfig,
-        PmemTokenBucketConfig, PmemUpdate, PmemUpdateError, PmemUpdateInput, PreparedPmemDevices,
+        PmemConfig, PmemConfigInput, PmemConfigs, PmemFileBacking, PmemMmioLayout,
+        PmemRateLimiterConfig, PmemTokenBucketConfig, PmemUpdate, PmemUpdateError, PmemUpdateInput,
+        PreparedPmemDevices,
     };
     use bangbang_runtime::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialConfigInput, SerialOutput,
@@ -5394,6 +5561,7 @@ mod tests {
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootPmemDevice,
+        VmStartupResources,
     };
     use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
     use bangbang_runtime::vsock::VsockConfigInput;
@@ -5408,8 +5576,8 @@ mod tests {
     };
 
     use super::{
-        BootGrantState, BootRunLoopBlockDeviceUpdater, BootRunLoopCommandAdmission,
-        BootRunLoopCommandAdmissionState, BootRunLoopCommandError,
+        BackingGrantState, BlockBackingUpdate, BootGrantState, BootRunLoopBlockDeviceUpdater,
+        BootRunLoopCommandAdmission, BootRunLoopCommandAdmissionState, BootRunLoopCommandError,
         BootRunLoopCommandSubmissionError, BootRunLoopControl, BootRunLoopNetworkInterfaceUpdater,
         BootRunLoopPmemDeviceUpdater, BootRunLoopSession, BootRunLoopSupervisor,
         BootRunLoopWorkerStatus, DEFAULT_BALLOON_MMIO_BASE, DEFAULT_BALLOON_MMIO_REGION_ID,
@@ -5992,12 +6160,13 @@ mod tests {
         fn update_block_device(
             &mut self,
             config: &DriveConfig,
-            refresh_backing: bool,
+            backing_update: BlockBackingUpdate,
             rate_limiter_update: Option<DriveRateLimiterConfig>,
         ) -> Result<(), DriveUpdateError> {
             self.block_update_count += 1;
             self.last_block_update = Some(config.drive_id().to_string());
-            self.last_block_update_refresh_backing = Some(refresh_backing);
+            self.last_block_update_refresh_backing =
+                Some(!matches!(backing_update, BlockBackingUpdate::Unchanged));
             self.last_block_update_rate_limiter = Some(rate_limiter_update);
             match self.block_update_result.clone() {
                 Some(err) => Err(err),
@@ -6296,12 +6465,12 @@ mod tests {
             }
         }
 
-        fn start_with_boot_files(
+        fn start_with_startup_resources(
             &mut self,
             controller: &bangbang_runtime::VmmController,
-            boot_files: BootSourceFiles,
+            startup_resources: VmStartupResources,
         ) -> Result<Self::Session, BackendError> {
-            if !boot_files.is_empty() {
+            if !startup_resources.is_empty() {
                 self.provided_boot_file_calls += 1;
             }
             self.start(controller)
@@ -10412,7 +10581,11 @@ mod tests {
             43
         );
         supervisor
-            .update_block_device(&replacement_config, true, None)
+            .update_block_device(
+                &replacement_config,
+                BlockBackingUpdate::ConfiguredPath,
+                None,
+            )
             .expect("drive update should run on worker");
         let diagnostics = supervisor.metrics_diagnostics();
 
@@ -10487,8 +10660,13 @@ mod tests {
                 .recv()
                 .expect("blocking command should start on worker");
 
-            let drive_update =
-                scope.spawn(|| supervisor.update_block_device(&replacement_config, true, None));
+            let drive_update = scope.spawn(|| {
+                supervisor.update_block_device(
+                    &replacement_config,
+                    BlockBackingUpdate::ConfiguredPath,
+                    None,
+                )
+            });
             control.wait_for_request_wakeup_count(2);
             release_command_sender
                 .send(())
@@ -10545,7 +10723,11 @@ mod tests {
         );
 
         let error = supervisor
-            .update_block_device(&replacement_config, true, None)
+            .update_block_device(
+                &replacement_config,
+                BlockBackingUpdate::ConfiguredPath,
+                None,
+            )
             .expect_err("unknown active drive should fail");
 
         assert_eq!(
@@ -10594,7 +10776,11 @@ mod tests {
         );
 
         let error = supervisor
-            .update_block_device(&replacement_config, true, None)
+            .update_block_device(
+                &replacement_config,
+                BlockBackingUpdate::ConfiguredPath,
+                None,
+            )
             .expect_err("full queue should fail");
 
         assert_eq!(
@@ -10653,7 +10839,7 @@ mod tests {
         );
 
         let error = supervisor
-            .update_block_device(&missing_config, true, None)
+            .update_block_device(&missing_config, BlockBackingUpdate::ConfiguredPath, None)
             .expect_err("missing backing should fail before queueing command");
 
         assert!(matches!(
@@ -12960,6 +13146,225 @@ mod tests {
         assert_eq!(reconfigured, VmmActionError::InstanceStart(source));
         assert_eq!(vmm.starter.calls, 2);
         assert_eq!(vmm.starter.provided_boot_file_calls, 1);
+    }
+
+    #[test]
+    fn consumed_device_grants_require_independent_same_id_reconfiguration() {
+        let source = BackendError::InvalidState("provided device startup failed");
+        let drive_file = TempFilePath::create_with_bytes("provided-drive", &[0x11; 512]);
+        let pmem_file = TempFilePath::create_with_bytes("provided-pmem", &[0x22; 4096]);
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            FakeStarter::failure(source.clone()),
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("data", "data", "bangbang-grant:drive", false)
+                .with_is_read_only(true),
+        ))
+        .expect("tagged drive should configure in direct test mode");
+        vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            "bangbang-grant:pmem",
+        )))
+        .expect("tagged pmem should configure in direct test mode");
+        let drive_backing = BlockFileBacking::from_file(
+            File::open(drive_file.path()).expect("drive fixture should open"),
+            true,
+        )
+        .expect("drive backing should validate");
+        let pmem_backing = PmemFileBacking::from_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(pmem_file.path())
+                .expect("pmem fixture should open"),
+            false,
+        )
+        .expect("pmem backing should validate");
+        vmm.drive_grant_states.insert(
+            "data".to_string(),
+            BackingGrantState::Prepared(drive_backing),
+        );
+        vmm.pmem_grant_states.insert(
+            "pmem0".to_string(),
+            BackingGrantState::Prepared(pmem_backing),
+        );
+
+        let first = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("provided-device startup failure should propagate");
+        assert_eq!(first, VmmActionError::InstanceStart(source.clone()));
+        assert_eq!(vmm.starter.calls, 1);
+        assert_eq!(vmm.starter.provided_boot_file_calls, 1);
+        assert!(matches!(
+            vmm.drive_grant_states.get("data"),
+            Some(BackingGrantState::Consumed)
+        ));
+        assert!(matches!(
+            vmm.pmem_grant_states.get("pmem0"),
+            Some(BackingGrantState::Consumed)
+        ));
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::ResourceGrant)
+        );
+        assert_eq!(vmm.starter.calls, 1);
+
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "data",
+            "data",
+            "/tmp/reconfigured-drive",
+            false,
+        )))
+        .expect("ordinary drive replacement should reset only its state");
+        assert!(!vmm.drive_grant_states.contains_key("data"));
+        assert_eq!(
+            vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::ResourceGrant)
+        );
+        assert_eq!(vmm.starter.calls, 1);
+
+        vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            "/tmp/reconfigured-pmem",
+        )))
+        .expect("ordinary pmem replacement should reset its state");
+        assert!(!vmm.pmem_grant_states.contains_key("pmem0"));
+        assert_eq!(
+            vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::InstanceStart(source))
+        );
+        assert_eq!(vmm.starter.calls, 2);
+        assert_eq!(vmm.starter.provided_boot_file_calls, 1);
+    }
+
+    #[test]
+    fn consumed_device_preflight_does_not_move_other_prepared_backings() {
+        let source = BackendError::InvalidState("provided pmem startup failed");
+        let pmem_file = TempFilePath::create_with_bytes("preflight-pmem", &[0x33; 4096]);
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            FakeStarter::failure(source.clone()),
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "data",
+            "data",
+            "bangbang-grant:drive",
+            false,
+        )))
+        .expect("drive should configure");
+        vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            "bangbang-grant:pmem",
+        )))
+        .expect("pmem should configure");
+        let pmem_backing = PmemFileBacking::from_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(pmem_file.path())
+                .expect("pmem fixture should open"),
+            false,
+        )
+        .expect("pmem backing should validate");
+        vmm.drive_grant_states
+            .insert("data".to_string(), BackingGrantState::Consumed);
+        vmm.pmem_grant_states.insert(
+            "pmem0".to_string(),
+            BackingGrantState::Prepared(pmem_backing),
+        );
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::ResourceGrant)
+        );
+        assert_eq!(vmm.starter.calls, 0);
+        assert!(matches!(
+            vmm.pmem_grant_states.get("pmem0"),
+            Some(BackingGrantState::Prepared(_))
+        ));
+
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "data",
+            "data",
+            "/tmp/reconfigured-drive",
+            false,
+        )))
+        .expect("drive replacement should clear consumed state");
+        assert_eq!(
+            vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::InstanceStart(source))
+        );
+        assert_eq!(vmm.starter.calls, 1);
+        assert_eq!(vmm.starter.provided_boot_file_calls, 1);
+        assert!(matches!(
+            vmm.pmem_grant_states.get("pmem0"),
+            Some(BackingGrantState::Consumed)
+        ));
+    }
+
+    #[test]
+    fn rejected_same_id_put_preserves_prepared_backing_state() {
+        let drive_file = TempFilePath::create_with_bytes("rollback-drive", &[0x44; 512]);
+        let mut vmm =
+            ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(91));
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "data",
+            "data",
+            "bangbang-grant:drive",
+            false,
+        )))
+        .expect("tagged drive should configure");
+        let backing = BlockFileBacking::from_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(drive_file.path())
+                .expect("drive fixture should open"),
+            false,
+        )
+        .expect("drive backing should validate");
+        vmm.drive_grant_states
+            .insert("data".to_string(), BackingGrantState::Prepared(backing));
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                "data", "data", "", false,
+            ))),
+            Err(VmmActionError::DriveConfig(
+                bangbang_runtime::block::DriveConfigError::EmptyPathOnHost
+            ))
+        );
+        assert!(matches!(
+            vmm.drive_grant_states.get("data"),
+            Some(BackingGrantState::Prepared(_))
+        ));
+        assert_eq!(
+            vmm.drive_configs()[0].path_on_host(),
+            Path::new("bangbang-grant:drive")
+        );
+
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "data",
+            "data",
+            "/tmp/ordinary-drive",
+            false,
+        )))
+        .expect("valid ordinary replacement should commit");
+        assert!(!vmm.drive_grant_states.contains_key("data"));
     }
 
     #[test]

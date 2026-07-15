@@ -195,6 +195,15 @@ mod platform {
             reference: &Path,
             role: ResourceRole,
         ) -> Result<Option<File>, GrantClaimError> {
+            self.claim_file(reference, role, GrantAccess::ReadOnly)
+        }
+
+        pub(crate) fn claim_file(
+            &self,
+            reference: &Path,
+            role: ResourceRole,
+            access: GrantAccess,
+        ) -> Result<Option<File>, GrantClaimError> {
             let Some(id) = grant_reference_id(reference)? else {
                 return Ok(None);
             };
@@ -202,7 +211,7 @@ mod platform {
             let grant = registry
                 .as_mut()
                 .ok_or(GrantClaimError)?
-                .take_file(&id, role, GrantAccess::ReadOnly)
+                .take_file(&id, role, access)
                 .map_err(|_| GrantClaimError)?;
             Ok(Some(File::from(grant.into_owned_fd())))
         }
@@ -771,7 +780,7 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use std::fs::File;
+        use std::fs::OpenOptions;
         use std::io::Read as _;
         use std::mem::MaybeUninit;
         use std::os::fd::{AsRawFd, OwnedFd};
@@ -807,8 +816,17 @@ mod platform {
             }
         }
 
-        fn file_record(id: &str, role: ResourceRole, path: &Path) -> (GrantRecord, OwnedFd) {
-            let file = File::open(path).expect("grant fixture should open");
+        fn file_record(
+            id: &str,
+            role: ResourceRole,
+            access: GrantAccess,
+            path: &Path,
+        ) -> (GrantRecord, OwnedFd) {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(access == GrantAccess::ReadWrite)
+                .open(path)
+                .expect("grant fixture should open");
             let descriptor: OwnedFd = file.into();
             let mut stat = MaybeUninit::<libc::stat>::uninit();
             assert_eq!(
@@ -825,7 +843,7 @@ mod platform {
                 GrantRecord::Descriptor {
                     id: GrantId::parse(id).expect("grant ID should parse"),
                     role,
-                    access: GrantAccess::ReadOnly,
+                    access,
                     kind: GrantObjectKind::RegularFile,
                     identity: ObjectIdentity {
                         device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
@@ -847,8 +865,8 @@ mod platform {
                     batch,
                     0,
                     GrantRecord::Begin {
-                        grant_count: 3,
-                        record_count: 5,
+                        grant_count: 5,
+                        record_count: 7,
                         bookmark_bytes: 0,
                     },
                     None,
@@ -870,11 +888,26 @@ mod platform {
                     ResourceRole::StartupMetadata,
                     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
                 ),
+                (
+                    "drive-ro",
+                    ResourceRole::DriveBacking,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contained_session.rs"),
+                ),
+                (
+                    "drive-rw",
+                    ResourceRole::DriveBacking,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vmm.rs"),
+                ),
             ]
             .into_iter()
             .enumerate()
             {
-                let (record, descriptor) = file_record(id, role, &path);
+                let access = if id == "drive-rw" {
+                    GrantAccess::ReadWrite
+                } else {
+                    GrantAccess::ReadOnly
+                };
+                let (record, descriptor) = file_record(id, role, access, &path);
                 staged
                     .accept(received(
                         session,
@@ -889,10 +922,10 @@ mod platform {
                 .accept(received(
                     session,
                     batch,
-                    4,
+                    6,
                     GrantRecord::Commit {
-                        grant_count: 3,
-                        record_count: 5,
+                        grant_count: 5,
+                        record_count: 7,
                         bookmark_bytes: 0,
                     },
                     None,
@@ -964,6 +997,44 @@ mod platform {
                     )
                     .expect("ordinary path should not claim")
                     .is_none()
+            );
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:drive-rw"),
+                        ResourceRole::DriveBacking,
+                        GrantAccess::ReadOnly,
+                    )
+                    .is_err()
+            );
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:drive-rw"),
+                        ResourceRole::DriveBacking,
+                        GrantAccess::ReadWrite,
+                    )
+                    .expect("exact read-write drive claim should validate")
+                    .is_some()
+            );
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:drive-ro"),
+                        ResourceRole::PmemBacking,
+                        GrantAccess::ReadOnly,
+                    )
+                    .is_err()
+            );
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:drive-ro"),
+                        ResourceRole::DriveBacking,
+                        GrantAccess::ReadOnly,
+                    )
+                    .expect("wrong-role failure should preserve drive grant")
+                    .is_some()
             );
 
             let mut mixed_registry = file_registry();
@@ -1070,7 +1141,7 @@ mod platform {
     use std::path::Path;
 
     use bangbang_runtime::boot::BootSourceFiles;
-    use bangbang_session::ResourceRole;
+    use bangbang_session::{GrantAccess, ResourceRole};
 
     use super::{
         ContainedSessionError, GrantClaimError, Readiness, TerminalCategory, UnixStream,
@@ -1084,7 +1155,16 @@ mod platform {
         pub(crate) fn claim_read_only_file(
             &self,
             reference: &Path,
+            role: ResourceRole,
+        ) -> Result<Option<std::fs::File>, GrantClaimError> {
+            self.claim_file(reference, role, GrantAccess::ReadOnly)
+        }
+
+        pub(crate) fn claim_file(
+            &self,
+            reference: &Path,
             _role: ResourceRole,
+            _access: GrantAccess,
         ) -> Result<Option<std::fs::File>, GrantClaimError> {
             match grant_reference_id(reference)? {
                 Some(_) => Err(GrantClaimError),
