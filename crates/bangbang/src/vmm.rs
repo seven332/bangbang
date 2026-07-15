@@ -105,7 +105,7 @@ use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
 #[cfg(target_os = "macos")]
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
-use bangbang_session::{GrantAccess, ResourceRole};
+use bangbang_session::{GrantAccess, ResourceRole, VmnetAuthority};
 
 #[cfg(target_os = "macos")]
 use crate::anchored_socket::{AnchoredSocketGuard, bind as bind_anchored_socket};
@@ -125,7 +125,8 @@ use crate::host_network::virtio_vmnet::{
 };
 use crate::host_network::vmnet::{
     StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VmnetHostDeviceNameConfigError,
-    VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceStartError, VmnetPacketIoBackend,
+    VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceStartError, VmnetMode,
+    VmnetPacketIoBackend,
 };
 
 #[cfg(test)]
@@ -1315,6 +1316,16 @@ const fn grant_access_for_read_only(read_only: bool) -> GrantAccess {
     }
 }
 
+/// Process origin used to distinguish direct operator policy from contained authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ProcessVmnetAuthority {
+    /// Direct execution retains the existing process vmnet behavior.
+    #[default]
+    Direct,
+    /// Contained execution is bounded by authenticated launcher policy.
+    Contained(VmnetAuthority),
+}
+
 #[derive(Debug)]
 pub(crate) struct ProcessVmm<S>
 where
@@ -1329,6 +1340,7 @@ where
     process_metrics_diagnostics: MetricsDiagnostics,
     process_signal_metrics: Option<SharedSignalMetrics>,
     terminal_snapshot_load_failure: bool,
+    vmnet_authority: ProcessVmnetAuthority,
     grant_authority: Option<GrantAuthority>,
     boot_grant_state: BootGrantState,
     drive_grant_states: BTreeMap<String, BackingGrantState<BlockFileBacking>>,
@@ -1408,6 +1420,7 @@ where
             process_metrics_diagnostics: MetricsDiagnostics::default(),
             process_signal_metrics: None,
             terminal_snapshot_load_failure: false,
+            vmnet_authority: ProcessVmnetAuthority::Direct,
             grant_authority: None,
             boot_grant_state: BootGrantState::PathBased,
             drive_grant_states: BTreeMap::new(),
@@ -1439,6 +1452,11 @@ where
 
     pub(crate) fn with_grant_authority(mut self, authority: Option<GrantAuthority>) -> Self {
         self.grant_authority = authority;
+        self
+    }
+
+    pub(crate) const fn with_vmnet_authority(mut self, authority: ProcessVmnetAuthority) -> Self {
+        self.vmnet_authority = authority;
         self
     }
 
@@ -1616,6 +1634,8 @@ where
 
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
         self.controller.preflight_instance_start()?;
+        validate_process_vmnet_authority(&self.controller, self.vmnet_authority)
+            .map_err(process_vmnet_authority_action_error)?;
         #[cfg(target_os = "macos")]
         let vsock_grant_consumed = matches!(self.vsock_grant_state, VsockGrantState::Consumed);
         #[cfg(not(target_os = "macos"))]
@@ -3436,6 +3456,98 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
             Self::ProviderBuild { source } => Some(source),
         }
     }
+}
+
+#[derive(Debug)]
+enum ProcessVmnetAuthorityValidationError {
+    Provider(ProcessNetworkPacketIoProviderBuildError),
+    HostNetworkNotAuthorized,
+}
+
+fn process_vmnet_authority_action_error(
+    error: ProcessVmnetAuthorityValidationError,
+) -> VmmActionError {
+    match error {
+        ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized => {
+            VmmActionError::NetworkInterfaceConfig(
+                NetworkInterfaceConfigError::HostNetworkNotAuthorized,
+            )
+        }
+        ProcessVmnetAuthorityValidationError::Provider(error) => {
+            VmmActionError::InstanceStart(BackendError::Hypervisor(format!(
+                "failed to build network packet I/O provider: {error}"
+            )))
+        }
+    }
+}
+
+fn validate_process_vmnet_authority(
+    controller: &VmmController,
+    authority: ProcessVmnetAuthority,
+) -> Result<(), ProcessVmnetAuthorityValidationError> {
+    let ProcessVmnetAuthority::Contained(authority) = authority else {
+        return Ok(());
+    };
+    let configs = controller.network_interface_configs();
+    validate_network_interface_count(configs.len()).map_err(|source| {
+        ProcessVmnetAuthorityValidationError::Provider(
+            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source },
+        )
+    })?;
+    let mmds_config = controller.mmds_config().map_err(|source| {
+        ProcessVmnetAuthorityValidationError::Provider(
+            ProcessNetworkPacketIoProviderBuildError::MmdsState { source },
+        )
+    })?;
+    let all_mmds = !configs.is_empty()
+        && mmds_config.as_ref().is_some_and(|mmds| {
+            configs.iter().all(|config| {
+                mmds.network_interfaces()
+                    .iter()
+                    .any(|iface_id| iface_id == config.iface_id())
+            })
+        });
+
+    let contained_authority = match (all_mmds, configs.is_empty()) {
+        (true, _) | (_, true) => None,
+        (false, false) => Some(authority),
+    };
+    if let Some(authority) = contained_authority
+        && configs.len()
+            > usize::from(
+                authority
+                    .max_interfaces()
+                    .ok_or(ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized)?,
+            )
+    {
+        return Err(ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized);
+    }
+
+    for config in configs {
+        let vmnet =
+            VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(|source| {
+                ProcessVmnetAuthorityValidationError::Provider(
+                    ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
+                        iface_id: config.iface_id().to_string(),
+                        source,
+                    },
+                )
+            })?;
+        let Some(authority) = contained_authority else {
+            continue;
+        };
+        let allowed = match vmnet.mode() {
+            VmnetMode::Host => authority.allows_host(),
+            VmnetMode::Shared => authority.allows_shared(),
+            VmnetMode::Bridged => vmnet
+                .bridged_interface_name()
+                .is_some_and(|bridge| authority.allows_bridge(bridge)),
+        };
+        if !allowed {
+            return Err(ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized);
+        }
+    }
+    Ok(())
 }
 
 trait ProcessVmnetPacketIoBackendFactory {
@@ -6087,6 +6199,7 @@ mod tests {
     use bangbang_runtime::{
         BackendError, InstanceState, VmmAction, VmmActionError, VmmController, VmmData,
     };
+    use bangbang_session::VmnetAuthority;
 
     use crate::host_network::vmnet::{
         VmnetError, VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceDescriptor,
@@ -6114,7 +6227,7 @@ mod tests {
         NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
         NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
         ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
         ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
         SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
@@ -11720,6 +11833,182 @@ mod tests {
         assert!(!vmm.has_started_session());
         assert_eq!(vmm.metrics_session_epoch(), None);
         assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+    }
+
+    #[test]
+    fn contained_vmnet_denial_precedes_starter_and_grant_consumption() {
+        let mut vmm = configured_vmm(FakeStarter::success(70))
+            .with_vmnet_authority(ProcessVmnetAuthority::Contained(VmnetAuthority::denied()));
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("private_iface", "private_iface", "vmnet:shared"),
+        ))
+        .expect("preboot network configuration should remain order-neutral");
+        let file = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("prepared boot fixture should open");
+        vmm.boot_grant_state = BootGrantState::Prepared(BootSourceFiles::new(Some(file), None));
+
+        let error = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("denied authority should fail before startup");
+
+        assert_eq!(
+            error,
+            VmmActionError::NetworkInterfaceConfig(
+                NetworkInterfaceConfigError::HostNetworkNotAuthorized
+            )
+        );
+        assert_eq!(
+            error.to_string(),
+            "system host networking is not authorized"
+        );
+        assert!(!error.to_string().contains("private_iface"));
+        assert_eq!(vmm.starter.calls, 0);
+        assert_eq!(vmm.starter.provided_boot_file_calls, 0);
+        assert!(matches!(vmm.boot_grant_state, BootGrantState::Prepared(_)));
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+    }
+
+    #[test]
+    fn contained_vmnet_authority_matches_every_exact_mode_and_active_limit() {
+        let authority = VmnetAuthority::try_new(true, true, 3, &["en0"])
+            .expect("test authority should validate");
+        let mut vmm = configured_vmm(FakeStarter::success(71))
+            .with_vmnet_authority(ProcessVmnetAuthority::Contained(authority));
+        for (iface_id, host_dev_name) in [
+            ("eth0", "vmnet:host"),
+            ("eth1", "vmnet:shared"),
+            ("eth2", "vmnet:bridged:en0"),
+        ] {
+            vmm.handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(iface_id, iface_id, host_dev_name),
+            ))
+            .expect("allowed network config should store");
+        }
+
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("every exact admitted mode should start");
+
+        assert_eq!(vmm.starter.calls, 1);
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+    }
+
+    #[test]
+    fn contained_vmnet_authority_rejects_bridge_mismatch_and_over_limit() {
+        let bridge_authority = VmnetAuthority::try_new(false, false, 1, &["en0"])
+            .expect("test authority should validate");
+        let mut bridge_vmm = configured_vmm(FakeStarter::success(72))
+            .with_vmnet_authority(ProcessVmnetAuthority::Contained(bridge_authority));
+        bridge_vmm
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:bridged:en1"),
+            ))
+            .expect("network config should remain storable before final admission");
+        assert_eq!(
+            bridge_vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::NetworkInterfaceConfig(
+                NetworkInterfaceConfigError::HostNetworkNotAuthorized
+            ))
+        );
+        assert_eq!(bridge_vmm.starter.calls, 0);
+
+        let shared_authority =
+            VmnetAuthority::try_new(false, true, 1, &[]).expect("test authority should validate");
+        let mut count_vmm = configured_vmm(FakeStarter::success(73))
+            .with_vmnet_authority(ProcessVmnetAuthority::Contained(shared_authority));
+        for iface_id in ["eth0", "eth1"] {
+            count_vmm
+                .handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new(iface_id, iface_id, "vmnet:shared"),
+                ))
+                .expect("network config should store");
+        }
+        assert_eq!(
+            count_vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::NetworkInterfaceConfig(
+                NetworkInterfaceConfigError::HostNetworkNotAuthorized
+            ))
+        );
+        assert_eq!(count_vmm.starter.calls, 0);
+    }
+
+    #[test]
+    fn all_mmds_requires_no_vmnet_authority_but_still_validates_syntax() {
+        let mut vmm = configured_vmm(FakeStarter::success(74))
+            .with_vmnet_authority(ProcessVmnetAuthority::Contained(VmnetAuthority::denied()));
+        for iface_id in ["eth0", "eth1"] {
+            vmm.handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(iface_id, iface_id, "vmnet:shared"),
+            ))
+            .expect("network config should store");
+        }
+        vmm.handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+            "eth0".to_string(),
+            "eth1".to_string(),
+        ])))
+        .expect("all-MMDS config should store");
+
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("all-MMDS should consume no vmnet authority");
+        assert_eq!(vmm.starter.calls, 1);
+
+        let mut malformed = configured_vmm(FakeStarter::success(75))
+            .with_vmnet_authority(ProcessVmnetAuthority::Contained(VmnetAuthority::denied()));
+        malformed
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"),
+            ))
+            .expect("backend-neutral config should store before final parsing");
+        malformed
+            .handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+                "eth0".to_string(),
+            ])))
+            .expect("MMDS config should store");
+        let error = malformed
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("all-MMDS should still parse vmnet-shaped host names");
+        assert!(matches!(error, VmmActionError::InstanceStart(_)));
+        assert_eq!(malformed.starter.calls, 0);
+    }
+
+    #[test]
+    fn partial_mmds_authorizes_the_complete_vmnet_provider_set() {
+        let authority =
+            VmnetAuthority::try_new(true, false, 2, &[]).expect("test authority should validate");
+        let mut vmm = configured_vmm(FakeStarter::success(76))
+            .with_vmnet_authority(ProcessVmnetAuthority::Contained(authority));
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:host"),
+        ))
+        .expect("host config should store");
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:shared"),
+        ))
+        .expect("shared config should store");
+        vmm.handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+            "eth1".to_string(),
+        ])))
+        .expect("partial MMDS config should store");
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::NetworkInterfaceConfig(
+                NetworkInterfaceConfigError::HostNetworkNotAuthorized
+            ))
+        );
+        assert_eq!(vmm.starter.calls, 0);
+    }
+
+    #[test]
+    fn direct_vmnet_behavior_does_not_use_production_allowlist_grammar() {
+        let mut vmm = configured_vmm(FakeStarter::success(77));
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:bridged:桥"),
+        ))
+        .expect("direct network config should store");
+
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("direct mode should retain the broader backend grammar");
+        assert_eq!(vmm.starter.calls, 1);
     }
 
     #[test]

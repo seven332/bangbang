@@ -5,6 +5,21 @@ use std::ptr::{self, NonNull};
 
 use crate::{BundleLayout, LauncherError};
 
+/// Exact statically and dynamically validated worker entitlement profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerProfile {
+    /// App Sandbox plus Hypervisor.framework, with no vmnet entitlement.
+    Networkless,
+}
+
+impl WorkerProfile {
+    pub(crate) const fn admits(self, authority: bangbang_session::VmnetAuthority) -> bool {
+        match self {
+            Self::Networkless => authority.is_denied(),
+        }
+    }
+}
+
 type CfIndex = isize;
 type CfNumberType = CfIndex;
 type CfStringEncoding = u32;
@@ -128,7 +143,7 @@ impl Drop for CfOwned {
     }
 }
 
-pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<(), LauncherError> {
+pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<WorkerProfile, LauncherError> {
     let outer_requirement = requirement(&outer_requirement_text())?;
     let outer = static_code(layout.outer_bundle(), true)?;
     check(
@@ -148,16 +163,18 @@ pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<(), LauncherError
         SEC_CS_CHECK_ALL_ARCHITECTURES | SEC_CS_STRICT_VALIDATE | SEC_CS_RESTRICT_SYMLINKS,
         &worker_requirement,
     )?;
-    validate_entitlements(&worker, EntitlementProfile::Worker)
+    validate_entitlements(&worker, EntitlementProfile::Worker)?;
+    Ok(WorkerProfile::Networkless)
 }
 
-pub(crate) fn validate_worker_process(pid: libc::pid_t) -> Result<(), LauncherError> {
+pub(crate) fn validate_worker_process(pid: libc::pid_t) -> Result<WorkerProfile, LauncherError> {
     validate_process(
         pid,
         &worker_requirement_text(),
         EntitlementProfile::Worker,
         LauncherError::InvalidWorkerIdentity,
-    )
+    )?;
+    Ok(WorkerProfile::Networkless)
 }
 
 pub(crate) fn validate_launcher_process(pid: libc::pid_t) -> Result<(), LauncherError> {

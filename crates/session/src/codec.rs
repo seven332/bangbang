@@ -2,18 +2,30 @@ use std::fmt;
 
 use crate::BatchId;
 
-/// Maximum encoded v3 frame size, including its fixed header.
+/// Maximum encoded v4 frame size, including its fixed header.
 pub const MAX_FRAME_BYTES: usize = 4096;
-/// Encoded v3 header size.
+/// Encoded v4 header size.
 pub const HEADER_BYTES: usize = 56;
 const MAX_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - HEADER_BYTES;
 const MAX_BUFFER_BYTES: usize = MAX_FRAME_BYTES * 2;
-const MAGIC: [u8; 4] = *b"BBS3";
-const VERSION: u16 = 3;
-const WORKER_POLICY_BYTES: usize = 32;
+const MAGIC: [u8; 4] = *b"BBS4";
+const VERSION: u16 = 4;
+const CREDENTIAL_POLICY_BYTES: usize = 32;
+const VMNET_AUTHORITY_BYTES: usize = 64;
+const WORKER_POLICY_BYTES: usize = CREDENTIAL_POLICY_BYTES + VMNET_AUTHORITY_BYTES;
 const POLICY_FLAG_FILE_SIZE: u16 = 1 << 0;
 const POLICY_FLAG_DAEMONIZED: u16 = 1 << 1;
 const POLICY_FLAGS: u16 = POLICY_FLAG_FILE_SIZE | POLICY_FLAG_DAEMONIZED;
+const VMNET_FLAG_HOST: u8 = 1 << 0;
+const VMNET_FLAG_SHARED: u8 = 1 << 1;
+const VMNET_FLAGS: u8 = VMNET_FLAG_HOST | VMNET_FLAG_SHARED;
+
+/// Maximum number of active vmnet interfaces admitted for one worker.
+pub const MAX_VMNET_ACTIVE_INTERFACES: u8 = 4;
+/// Maximum number of exact bridged-interface names in one authority.
+pub const MAX_VMNET_BRIDGE_NAMES: usize = 4;
+/// Maximum byte length of one bridged-interface name in production policy.
+pub const MAX_VMNET_BRIDGE_NAME_BYTES: usize = 15;
 
 /// Random identity bound to every frame in one process session.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -125,6 +137,159 @@ pub enum TerminalCategory {
     Unstructured,
 }
 
+/// A malformed or internally inconsistent production vmnet authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmnetAuthorityError;
+
+impl fmt::Display for VmnetAuthorityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid private vmnet authority")
+    }
+}
+
+impl std::error::Error for VmnetAuthorityError {}
+
+/// Fixed, bounded production authority for system vmnet acquisition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VmnetAuthority {
+    allow_host: bool,
+    allow_shared: bool,
+    max_interfaces: u8,
+    bridge_count: u8,
+    bridges: [[u8; MAX_VMNET_BRIDGE_NAME_BYTES]; MAX_VMNET_BRIDGE_NAMES],
+}
+
+impl VmnetAuthority {
+    /// Returns the unique authority that admits no system vmnet interfaces.
+    #[must_use]
+    pub const fn denied() -> Self {
+        Self {
+            allow_host: false,
+            allow_shared: false,
+            max_interfaces: 0,
+            bridge_count: 0,
+            bridges: [[0; MAX_VMNET_BRIDGE_NAME_BYTES]; MAX_VMNET_BRIDGE_NAMES],
+        }
+    }
+
+    /// Constructs one nonempty, canonical production vmnet authority.
+    pub fn try_new(
+        allow_host: bool,
+        allow_shared: bool,
+        max_interfaces: u8,
+        bridges: &[&str],
+    ) -> Result<Self, VmnetAuthorityError> {
+        if !(1..=MAX_VMNET_ACTIVE_INTERFACES).contains(&max_interfaces)
+            || (!allow_host && !allow_shared && bridges.is_empty())
+            || bridges.len() > MAX_VMNET_BRIDGE_NAMES
+        {
+            return Err(VmnetAuthorityError);
+        }
+
+        let mut encoded_bridges = [[0_u8; MAX_VMNET_BRIDGE_NAME_BYTES]; MAX_VMNET_BRIDGE_NAMES];
+        for (index, bridge) in bridges.iter().enumerate() {
+            let bytes = bridge.as_bytes();
+            if bytes.is_empty()
+                || bytes.len() > MAX_VMNET_BRIDGE_NAME_BYTES
+                || !bytes.iter().copied().all(is_vmnet_bridge_name_byte)
+                || bridges
+                    .get(..index)
+                    .ok_or(VmnetAuthorityError)?
+                    .contains(bridge)
+            {
+                return Err(VmnetAuthorityError);
+            }
+            encoded_bridges
+                .get_mut(index)
+                .and_then(|encoded| encoded.get_mut(..bytes.len()))
+                .ok_or(VmnetAuthorityError)?
+                .copy_from_slice(bytes);
+        }
+
+        Ok(Self {
+            allow_host,
+            allow_shared,
+            max_interfaces,
+            bridge_count: u8::try_from(bridges.len()).map_err(|_| VmnetAuthorityError)?,
+            bridges: encoded_bridges,
+        })
+    }
+
+    /// Returns whether this authority admits no system vmnet acquisition.
+    #[must_use]
+    pub const fn is_denied(self) -> bool {
+        self.max_interfaces == 0
+    }
+
+    /// Returns whether host-mode vmnet is admitted.
+    #[must_use]
+    pub const fn allows_host(self) -> bool {
+        self.allow_host
+    }
+
+    /// Returns whether shared-mode vmnet is admitted.
+    #[must_use]
+    pub const fn allows_shared(self) -> bool {
+        self.allow_shared
+    }
+
+    /// Returns the admitted active-interface maximum, or `None` when denied.
+    #[must_use]
+    pub const fn max_interfaces(self) -> Option<u8> {
+        if self.is_denied() {
+            None
+        } else {
+            Some(self.max_interfaces)
+        }
+    }
+
+    /// Returns whether the exact bridged-interface name is admitted.
+    #[must_use]
+    pub fn allows_bridge(self, bridge: &str) -> bool {
+        let candidate = bridge.as_bytes();
+        self.bridges
+            .get(..usize::from(self.bridge_count))
+            .is_some_and(|bridges| {
+                bridges
+                    .iter()
+                    .any(|encoded| bridge_name_bytes(encoded) == candidate)
+            })
+    }
+
+    const fn flags(self) -> u8 {
+        (if self.allow_host { VMNET_FLAG_HOST } else { 0 })
+            | (if self.allow_shared {
+                VMNET_FLAG_SHARED
+            } else {
+                0
+            })
+    }
+}
+
+impl Default for VmnetAuthority {
+    fn default() -> Self {
+        Self::denied()
+    }
+}
+
+impl fmt::Debug for VmnetAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VmnetAuthority(<redacted>)")
+    }
+}
+
+const fn is_vmnet_bridge_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+fn bridge_name_bytes(encoded: &[u8; MAX_VMNET_BRIDGE_NAME_BYTES]) -> &[u8] {
+    let len = encoded
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(encoded.len());
+    encoded.get(..len).unwrap_or(&[])
+}
+
 /// Fixed production-worker launch policy authenticated by the private lifecycle.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WorkerPolicy {
@@ -133,6 +298,7 @@ pub struct WorkerPolicy {
     no_file: u64,
     file_size: Option<u64>,
     daemonized: bool,
+    vmnet_authority: VmnetAuthority,
 }
 
 impl WorkerPolicy {
@@ -151,7 +317,15 @@ impl WorkerPolicy {
             no_file,
             file_size,
             daemonized,
+            vmnet_authority: VmnetAuthority::denied(),
         }
+    }
+
+    /// Attaches the immutable production vmnet authority to this policy.
+    #[must_use]
+    pub const fn with_vmnet_authority(mut self, authority: VmnetAuthority) -> Self {
+        self.vmnet_authority = authority;
+        self
     }
 
     /// Returns the required real and effective user identity.
@@ -183,6 +357,12 @@ impl WorkerPolicy {
     pub const fn is_daemonized(self) -> bool {
         self.daemonized
     }
+
+    /// Returns the immutable production vmnet authority.
+    #[must_use]
+    pub const fn vmnet_authority(self) -> VmnetAuthority {
+        self.vmnet_authority
+    }
 }
 
 impl fmt::Debug for WorkerPolicy {
@@ -191,7 +371,7 @@ impl fmt::Debug for WorkerPolicy {
     }
 }
 
-/// Closed v3 lifecycle message set.
+/// Closed v4 lifecycle message set.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Message {
     /// Proves that the resumed worker reached its no-authority bootstrap.
@@ -296,7 +476,7 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Encodes one bounded v3 frame.
+/// Encodes one bounded v4 frame.
 pub fn encode_frame(frame: Frame) -> Result<Vec<u8>, ProtocolError> {
     let (kind, payload) = encode_message(frame.message);
     let payload_len = u32::try_from(payload.len()).map_err(|_| ProtocolError::InvalidFrame)?;
@@ -388,6 +568,15 @@ fn encode_worker_policy(policy: WorkerPolicy) -> Vec<u8> {
     payload.extend_from_slice(&0_u32.to_be_bytes());
     payload.extend_from_slice(&policy.no_file.to_be_bytes());
     payload.extend_from_slice(&policy.file_size.unwrap_or(0).to_be_bytes());
+    let authority = policy.vmnet_authority;
+    payload.push(authority.flags());
+    payload.push(authority.max_interfaces);
+    payload.push(authority.bridge_count);
+    payload.push(0);
+    for bridge in authority.bridges {
+        payload.extend_from_slice(&bridge);
+    }
+    debug_assert_eq!(payload.len(), WORKER_POLICY_BYTES);
     payload
 }
 
@@ -544,13 +733,85 @@ fn decode_worker_policy(payload: &[u8]) -> Result<WorkerPolicy, ProtocolError> {
     } else {
         Some(encoded_file_size)
     };
+    let vmnet_authority = decode_vmnet_authority(
+        payload
+            .get(CREDENTIAL_POLICY_BYTES..)
+            .ok_or(ProtocolError::InvalidFrame)?,
+    )?;
     Ok(WorkerPolicy::new(
         read_u32(payload, 4)?,
         read_u32(payload, 8)?,
         read_u64(payload, 16)?,
         file_size,
         flags & POLICY_FLAG_DAEMONIZED != 0,
-    ))
+    )
+    .with_vmnet_authority(vmnet_authority))
+}
+
+fn decode_vmnet_authority(payload: &[u8]) -> Result<VmnetAuthority, ProtocolError> {
+    if payload.len() != VMNET_AUTHORITY_BYTES {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    let [flags, max_interfaces, encoded_bridge_count, reserved]: [u8; 4] = payload
+        .get(..4)
+        .ok_or(ProtocolError::InvalidFrame)?
+        .try_into()
+        .map_err(|_| ProtocolError::InvalidFrame)?;
+    if flags & !VMNET_FLAGS != 0
+        || reserved != 0
+        || usize::from(encoded_bridge_count) > MAX_VMNET_BRIDGE_NAMES
+    {
+        return Err(ProtocolError::InvalidFrame);
+    }
+
+    let bridge_count = usize::from(encoded_bridge_count);
+    let mut bridges = [""; MAX_VMNET_BRIDGE_NAMES];
+    for (index, bridge) in bridges.iter_mut().enumerate() {
+        let offset = 4 + index * MAX_VMNET_BRIDGE_NAME_BYTES;
+        let slot = payload
+            .get(offset..offset + MAX_VMNET_BRIDGE_NAME_BYTES)
+            .ok_or(ProtocolError::InvalidFrame)?;
+        if index >= bridge_count {
+            if slot.iter().any(|byte| *byte != 0) {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            continue;
+        }
+
+        let len = slot
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(slot.len());
+        if len == 0
+            || slot
+                .get(len..)
+                .ok_or(ProtocolError::InvalidFrame)?
+                .iter()
+                .any(|byte| *byte != 0)
+        {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        *bridge = std::str::from_utf8(slot.get(..len).ok_or(ProtocolError::InvalidFrame)?)
+            .map_err(|_| ProtocolError::InvalidFrame)?;
+    }
+
+    let allow_host = flags & VMNET_FLAG_HOST != 0;
+    let allow_shared = flags & VMNET_FLAG_SHARED != 0;
+    if !allow_host && !allow_shared && bridge_count == 0 {
+        return (max_interfaces == 0)
+            .then_some(VmnetAuthority::denied())
+            .ok_or(ProtocolError::InvalidFrame);
+    }
+
+    VmnetAuthority::try_new(
+        allow_host,
+        allow_shared,
+        max_interfaces,
+        bridges
+            .get(..bridge_count)
+            .ok_or(ProtocolError::InvalidFrame)?,
+    )
+    .map_err(|_| ProtocolError::InvalidFrame)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ProtocolError> {
@@ -810,5 +1071,134 @@ mod tests {
             decoder.push(&encoded).expect("bounded frame should buffer");
             assert_eq!(decoder.next_frame(), Err(ProtocolError::InvalidFrame));
         }
+    }
+
+    #[test]
+    fn vmnet_authority_validates_exact_bounded_modes_and_names() {
+        let denied = VmnetAuthority::denied();
+        assert!(denied.is_denied());
+        assert_eq!(denied.max_interfaces(), None);
+        assert!(!denied.allows_host());
+        assert!(!denied.allows_shared());
+        assert!(!denied.allows_bridge("en0"));
+
+        let authority = VmnetAuthority::try_new(
+            true,
+            true,
+            4,
+            &["en0", "bridge_1", "a.b-c", "abcdefghijklmno"],
+        )
+        .expect("bounded policy should validate");
+        assert!(!authority.is_denied());
+        assert_eq!(authority.max_interfaces(), Some(4));
+        assert!(authority.allows_host());
+        assert!(authority.allows_shared());
+        for bridge in ["en0", "bridge_1", "a.b-c", "abcdefghijklmno"] {
+            assert!(authority.allows_bridge(bridge));
+        }
+        assert!(!authority.allows_bridge("EN0"));
+        assert!(!authority.allows_bridge("en"));
+
+        for (allow_host, allow_shared, maximum, bridges) in [
+            (false, false, 1, Vec::new()),
+            (true, false, 0, Vec::new()),
+            (false, true, 5, Vec::new()),
+            (false, false, 1, vec![""]),
+            (false, false, 1, vec!["en$0"]),
+            (false, false, 1, vec!["abcdefghijklmnop"]),
+            (false, false, 1, vec!["en0", "en0"]),
+            (false, false, 4, vec!["a", "b", "c", "d", "e"]),
+        ] {
+            assert_eq!(
+                VmnetAuthority::try_new(allow_host, allow_shared, maximum, &bridges),
+                Err(VmnetAuthorityError)
+            );
+        }
+    }
+
+    #[test]
+    fn vmnet_authority_round_trips_in_the_fixed_start_payload() {
+        let authority = VmnetAuthority::try_new(true, true, 3, &["en0", "bridge_1"])
+            .expect("authority should validate");
+        let policy =
+            WorkerPolicy::new(501, 20, 2048, Some(4096), true).with_vmnet_authority(authority);
+        let frame = Frame {
+            session: id(0x71),
+            sequence: 19,
+            message: Message::Start(policy),
+        };
+        let encoded = encode_frame(frame).expect("policy should encode");
+        assert_eq!(encoded.len(), HEADER_BYTES + WORKER_POLICY_BYTES);
+        assert_eq!(&encoded[..4], b"BBS4");
+        assert_eq!(&encoded[4..6], &4_u16.to_be_bytes());
+
+        let mut decoder = FrameDecoder::default();
+        decoder.push(&encoded).expect("frame should buffer");
+        assert_eq!(decoder.next_frame(), Ok(Some(frame)));
+        assert_eq!(policy.vmnet_authority(), authority);
+    }
+
+    #[test]
+    fn vmnet_authority_decode_rejects_every_noncanonical_shape() {
+        let denied_frame = Frame {
+            session: id(0x72),
+            sequence: 0,
+            message: Message::Start(WorkerPolicy::new(501, 20, 2048, None, false)),
+        };
+        let authority_offset = HEADER_BYTES + CREDENTIAL_POLICY_BYTES;
+        for (offset, value) in [
+            (authority_offset, 4),
+            (authority_offset + 1, 1),
+            (authority_offset + 2, 5),
+            (authority_offset + 3, 1),
+            (authority_offset + 4, b'e'),
+        ] {
+            let mut encoded = encode_frame(denied_frame).expect("policy should encode");
+            encoded[offset] = value;
+            let mut decoder = FrameDecoder::default();
+            decoder.push(&encoded).expect("bounded frame should buffer");
+            assert_eq!(decoder.next_frame(), Err(ProtocolError::InvalidFrame));
+        }
+
+        let authority = VmnetAuthority::try_new(false, false, 2, &["en0", "en1"])
+            .expect("authority should validate");
+        let frame = Frame {
+            session: id(0x73),
+            sequence: 0,
+            message: Message::Start(
+                WorkerPolicy::new(501, 20, 2048, None, false).with_vmnet_authority(authority),
+            ),
+        };
+        let mutations: [fn(&mut [u8], usize); 6] = [
+            |bytes, offset| bytes[offset + 1] = 0,
+            |bytes, offset| bytes[offset + 1] = 5,
+            |bytes, offset| bytes[offset + 4] = b'$',
+            |bytes, offset| bytes[offset + 4 + 4] = b'x',
+            |bytes, offset| {
+                let first = offset + 4;
+                let second = first + MAX_VMNET_BRIDGE_NAME_BYTES;
+                bytes.copy_within(first..first + 3, second);
+            },
+            |bytes, offset| bytes[offset + 2] = 0,
+        ];
+        for mutate in mutations {
+            let mut encoded = encode_frame(frame).expect("policy should encode");
+            mutate(&mut encoded, authority_offset);
+            let mut decoder = FrameDecoder::default();
+            decoder.push(&encoded).expect("bounded frame should buffer");
+            assert_eq!(decoder.next_frame(), Err(ProtocolError::InvalidFrame));
+        }
+    }
+
+    #[test]
+    fn vmnet_authority_debug_and_errors_do_not_reveal_policy_values() {
+        let authority = VmnetAuthority::try_new(false, false, 1, &["secret_bridge"])
+            .expect("authority should validate");
+        assert_eq!(format!("{authority:?}"), "VmnetAuthority(<redacted>)");
+        assert!(!format!("{authority:?}").contains("secret_bridge"));
+        assert_eq!(
+            VmnetAuthorityError.to_string(),
+            "invalid private vmnet authority"
+        );
     }
 }

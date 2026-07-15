@@ -75,7 +75,7 @@ revalidates live code, and only then sends a random session identity plus one
 fixed redacted `WorkerPolicy` in `Start`.
 
 [`bangbang-session`](../../../crates/session/src/lib.rs) defines the closed
-lifecycle-v3 binary contract. Frames have fixed magic/version/reserved fields, a 256-bit
+lifecycle-v4 binary contract. Frames have fixed magic/version/reserved fields, a 256-bit
 identity, exact per-direction sequence numbers, fixed payload shapes, and a
 4096-byte cap. Replay, sequence gaps, cross-session or wrong-role messages,
 malformed/unknown/oversized/truncated data, and invalid lifecycle transitions
@@ -92,6 +92,18 @@ its Security.framework lookup of the parent, so only the launcher code-validates
 its peer; this asymmetry is part of the contract.
 `Hello`, `Start`, the grant transaction, and `Proceed` have absolute five-second
 deadlines, and `Terminal` or EOF starts a five-second owned-process exit grace.
+
+The v4 `Start` payload also binds one canonical immutable `VmnetAuthority` to
+the same session, sender, sequence, fixed worker, and daemon reparse. It defaults
+to deny and can contain independent host/shared bits, at most four exact
+1–15-byte `[A-Za-z0-9._-]` bridge names, and a separate active maximum from 1
+through 4. Contained InstanceStart validates the complete non-MMDS-only network
+set after controller preflight and before any grant or backend is consumed;
+all-MMDS needs no vmnet authority. Direct mode remains outside this production
+policy. Static/live code validation currently exposes only the exact
+networkless App Sandbox plus Hypervisor profile, which rejects every positive
+authority before worker spawn/resume. No restricted vmnet entitlement or real
+production connectivity is claimed by this contract revision.
 
 Grant-channel v1 uses one complete AF_UNIX datagram per record with a 1024-byte
 application cap, independent random 128-bit BatchId, exact lifecycle SessionId

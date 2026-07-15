@@ -4,11 +4,20 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use bangbang_session::{GrantId, SnapshotOutputChild, SocketChild};
+use bangbang_session::{GrantId, SnapshotOutputChild, SocketChild, VmnetAuthority, WorkerPolicy};
 #[cfg(not(target_os = "macos"))]
 use bangbang_session::{Readiness, TerminalCategory};
 
 const GRANT_REFERENCE_PREFIX: &str = "bangbang-grant:";
+
+fn started_vmnet_authority(
+    policy: WorkerPolicy,
+    started: bool,
+) -> Result<VmnetAuthority, ContainedSessionError> {
+    started
+        .then(|| policy.vmnet_authority())
+        .ok_or(ContainedSessionError)
+}
 
 /// Stable private bootstrap failure that never includes identity or path data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,9 +103,11 @@ mod reference_tests {
     use std::path::{Path, PathBuf};
 
     use bangbang_session::{MAX_GRANT_ID_BYTES, MAX_SNAPSHOT_OUTPUT_CHILD_BYTES};
+    use bangbang_session::{VmnetAuthority, WorkerPolicy};
 
     use super::{
-        GrantClaimError, grant_reference_id, snapshot_output_reference, socket_directory_reference,
+        ContainedSessionError, GrantClaimError, grant_reference_id, snapshot_output_reference,
+        socket_directory_reference, started_vmnet_authority,
     };
 
     #[test]
@@ -221,6 +232,31 @@ mod reference_tests {
         let non_utf8 = PathBuf::from(OsString::from_vec(b"bangbang-grant:output/\xff".to_vec()));
         assert_eq!(snapshot_output_reference(&non_utf8), Err(GrantClaimError));
     }
+
+    #[test]
+    fn vmnet_authority_is_published_only_for_each_started_session() {
+        let first =
+            VmnetAuthority::try_new(true, false, 1, &[]).expect("first authority should validate");
+        let second =
+            VmnetAuthority::try_new(false, true, 2, &[]).expect("second authority should validate");
+        let first_policy =
+            WorkerPolicy::new(501, 20, 2048, None, false).with_vmnet_authority(first);
+        let second_policy =
+            WorkerPolicy::new(501, 20, 2048, None, false).with_vmnet_authority(second);
+
+        assert_eq!(
+            started_vmnet_authority(first_policy, false),
+            Err(ContainedSessionError),
+            "cancelled pre-Proceed bootstrap must not publish policy"
+        );
+        assert_eq!(started_vmnet_authority(first_policy, true), Ok(first));
+        assert_eq!(started_vmnet_authority(second_policy, true), Ok(second));
+        assert_ne!(
+            started_vmnet_authority(first_policy, true),
+            started_vmnet_authority(second_policy, true),
+            "concurrent sessions retain independent values"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -259,7 +295,8 @@ mod platform {
     use bangbang_session::{
         Frame, FrameDecoder, GRANT_FD, GrantAccess, GrantId, Message, ObjectIdentity, Readiness,
         ResourceRole, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId,
-        SnapshotOutputChild, TerminalCategory, WorkerLifecycle, WorkerPolicy, encode_frame,
+        SnapshotOutputChild, TerminalCategory, VmnetAuthority, WorkerLifecycle, WorkerPolicy,
+        encode_frame,
     };
 
     use super::{
@@ -1035,6 +1072,10 @@ mod platform {
             self.started.then(|| self.grants.clone())
         }
 
+        pub(crate) fn vmnet_authority(&self) -> Result<VmnetAuthority, ContainedSessionError> {
+            super::started_vmnet_authority(self.policy, self.started)
+        }
+
         pub(crate) fn directory_grant_authority(&self) -> Option<DirectoryGrantAuthority> {
             self.started.then(|| self.directory_grants.clone())
         }
@@ -1065,6 +1106,7 @@ mod platform {
             if self.policy.no_file() != no_file
                 || self.policy.file_size() != file_size
                 || self.policy.is_daemonized() != daemonized
+                || !self.policy.vmnet_authority().is_denied()
                 || [
                     "BANGBANG_POLICY_SECRET",
                     "BANGBANG_ORDINARY_AMBIENT",
@@ -2037,6 +2079,12 @@ mod platform {
 
         pub(crate) fn grant_authority(&self) -> Option<GrantAuthority> {
             None
+        }
+
+        pub(crate) fn vmnet_authority(
+            &self,
+        ) -> Result<bangbang_session::VmnetAuthority, ContainedSessionError> {
+            Err(ContainedSessionError)
         }
 
         pub(crate) fn directory_grant_authority(&self) -> Option<DirectoryGrantAuthority> {

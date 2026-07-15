@@ -357,6 +357,29 @@ fn launcher_exposes_exact_jailer_help_version_and_policy_validation() {
         policy_command(&worker_executable(&bundle), uid.wrapping_add(1), gid),
         "mismatched jailer credential",
     );
+
+    let mut vmnet = Command::new(launcher(&bundle));
+    vmnet
+        .arg(JAILER_OPTION)
+        .args(["--id", "networkless-profile"])
+        .arg("--exec-file")
+        .arg(worker_executable(&bundle))
+        .args([
+            "--uid",
+            &uid.to_string(),
+            "--gid",
+            &gid.to_string(),
+            "--vmnet-allow",
+            "shared",
+            "--vmnet-max-interfaces",
+            "1",
+            "--",
+            "--version",
+        ]);
+    assert_invalid(
+        vmnet,
+        "networkless signed profile with positive vmnet authority",
+    );
 }
 
 #[test]
