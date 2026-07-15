@@ -7771,6 +7771,27 @@ mod tests {
     }
 
     #[test]
+    fn serial_reconfiguration_then_clear_keeps_snapshot_load_non_fresh() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        vmm.handle_action(VmmAction::PutSerial(
+            SerialConfigInput::new().with_serial_out_path("/tmp/serial-output"),
+        ))
+        .expect("serial output should configure");
+        vmm.handle_action(VmmAction::PutSerial(SerialConfigInput::new()))
+            .expect("serial output should clear");
+
+        assert_eq!(vmm.serial_config(), &SerialConfig::default());
+        assert_eq!(
+            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn public_native_v1_load_resumes_only_after_paused_commit() {
         let metrics = TempFilePath::create("snapshot-load-resumed-metrics");
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);

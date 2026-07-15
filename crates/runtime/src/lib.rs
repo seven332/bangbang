@@ -994,6 +994,7 @@ impl VmmController {
     /// Commits a validated serial replacement without further fallible work.
     pub fn commit_serial_config(&mut self, config: serial::SerialConfig) {
         self.serial_config = config;
+        self.snapshot_load_history_fresh = false;
     }
 
     pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {
