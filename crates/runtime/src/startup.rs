@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, TryReserveError};
 use std::fmt;
+use std::fs::File;
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
@@ -680,6 +681,19 @@ pub fn prepare_snapshot_v1_device_profile(
     memory: &GuestMemory,
     now: Instant,
 ) -> Result<PreparedSnapshotV1DeviceProfile, PrepareSnapshotV1DeviceProfileError> {
+    prepare_snapshot_v1_device_profile_with_root_backing(state, memory, now, None)
+}
+
+/// Prepares the native-v1 device profile with an optional exact root backing.
+///
+/// When supplied, the already-opened backing is adopted without resolving the
+/// persisted path stored in the snapshot state.
+pub fn prepare_snapshot_v1_device_profile_with_root_backing(
+    state: &SnapshotV1DeviceState,
+    memory: &GuestMemory,
+    now: Instant,
+    root_backing: Option<File>,
+) -> Result<PreparedSnapshotV1DeviceProfile, PrepareSnapshotV1DeviceProfileError> {
     let root = state.root_block();
     let drive_config = snapshot_v1_drive_config(root)?;
     validate_mmio_metadata(
@@ -715,8 +729,11 @@ pub fn prepare_snapshot_v1_device_profile(
         return Err(PrepareSnapshotV1DeviceProfileError::InvalidRetry);
     }
 
-    let (backing, backing_identity) = BlockFileBacking::open_snapshot_read_only(root.path())
-        .map_err(|_| PrepareSnapshotV1DeviceProfileError::BlockBacking)?;
+    let (backing, backing_identity) = match root_backing {
+        Some(file) => BlockFileBacking::from_snapshot_read_only_file(file),
+        None => BlockFileBacking::open_snapshot_read_only(root.path()),
+    }
+    .map_err(|_| PrepareSnapshotV1DeviceProfileError::BlockBacking)?;
     if backing_identity != root.backing_identity() {
         return Err(PrepareSnapshotV1DeviceProfileError::BlockBackingMismatch);
     }

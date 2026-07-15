@@ -2809,11 +2809,30 @@
     {
       "id": "firecracker-argument:describe-snapshot",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --describe-snapshot.",
+      "summary": "Provide bounded early --describe-snapshot inspection for the supported bangbang-native v1 envelope, with explicit Firecracker-artifact incompatibility.",
       "source_refs": [
         "firecracker-argument:describe-snapshot"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "describe_snapshot_with_authority"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_reports_native_snapshot_versions_before_socket_publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:enable-pci",
@@ -3300,7 +3319,7 @@
     {
       "id": "semantic.isolation:host-resource-authority-and-brokerage",
       "family": "isolation",
-      "summary": "Lifecycle v2 gates Proceed on an atomic bounded startup batch with strict no-follow manifests, typed SCM_RIGHTS file descriptors, anchored one-session mutable-directory bookmarks, exact session/batch/sequence/identity/access validation, and one-time redacted registry ownership. Contained config, metadata, kernel, and initrd consumers adopt exact read-only descriptors; repeatable block/pmem consumers bind exact IDs/access, retain opened backings, and support preauthorized live block replacement; singleton logger/metrics/serial consumers adopt exact write-only files. API/vsock consumers adopt exact singleton directory anchors plus a bounded safe child, use a reaped default-close signed binder for same-filesystem exclusive publication, retain supplied listeners with identity-owned cleanup, and route contained guest-initiated vsock connects through one fixed session/anchor/child-bound launcher port facet returning only connected stream descriptors. Signed normal-bundle proof covers file consumers, outside-container API connectivity, both real granted-vsock initiation directions, unchanged exact entitlements, no steady-state helper, redaction, cleanup, and concurrent authority. Snapshots, general dynamic brokerage/hard revocation, cross-filesystem socket publication, vmnet authority, and remaining resource-specific mutation/cleanup remain feasible under #1351.",
+      "summary": "Lifecycle v2 gates Proceed on an atomic bounded startup batch with strict no-follow manifests, typed SCM_RIGHTS file descriptors, anchored one-session mutable-directory bookmarks, exact session/batch/sequence/identity/access validation, and one-time redacted registry ownership. Contained config, metadata, kernel, initrd, snapshot describe/state/memory, and persisted snapshot-root consumers adopt exact read-only descriptors; repeatable block/pmem consumers bind exact IDs/access, retain opened backings, and support preauthorized live block replacement; singleton logger/metrics/serial consumers adopt exact write-only files. Snapshot create retains repeatable output-directory anchors plus bounded children for no-clobber publication and exact crash cleanup. API/vsock consumers adopt exact singleton directory anchors plus a bounded safe child, use a reaped default-close signed binder for same-filesystem exclusive publication, retain supplied listeners with identity-owned cleanup, and route contained guest-initiated vsock connects through one fixed session/anchor/child-bound launcher port facet returning only connected stream descriptors. Signed normal-bundle proof covers file and snapshot consumers, outside-container API connectivity, both real granted-vsock initiation directions, unchanged exact entitlements, no steady-state helper, redaction, cleanup, and concurrent authority. General dynamic brokerage/hard revocation, cross-filesystem socket publication, vmnet authority, and remaining resource-specific mutation/cleanup remain feasible under #1351.",
       "source_refs": [
         "corpus:jailer",
         "corpus:network-setup",
@@ -3312,7 +3331,7 @@
     {
       "id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
       "family": "isolation",
-      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a default-close standard/lifecycle/grant/dormant-broker descriptor allowlist, authenticated lifecycle v2, mandatory atomic startup-grant acknowledgment, a locked private namespace with only strict post-gate socket ownership records, and exact contained consumption of granted startup config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, API-socket, and vsock-socket authority. Normal signed execution proves outside-container file descriptors and anchored sockets work through launcher-preauthorized identities, both real vsock initiation directions work through supplied listeners or the fixed launcher facet, helpers are reaped before exposure, and worker entitlements remain exactly App Sandbox plus Hypervisor. Remaining jailer limits, credentials, daemonization, seccomp, snapshot resources, network, general brokerage/hard revocation, cross-filesystem publication, and deployment outcomes require explicit macOS equivalents under #1351.",
+      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a default-close standard/lifecycle/grant/dormant-broker descriptor allowlist, authenticated lifecycle v2, mandatory atomic startup-grant acknowledgment, a locked private namespace with only strict post-gate ownership records, and exact contained consumption of granted startup config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket, and vsock-socket authority. Normal signed execution proves outside-container file descriptors and anchored directories work through launcher-preauthorized identities, native snapshot create/describe/restore reaches a real guest, recorded snapshot staging is recovered after worker death without deleting replacements, both real vsock initiation directions work through supplied listeners or the fixed launcher facet, helpers are reaped before exposure, and worker entitlements remain exactly App Sandbox plus Hypervisor. Remaining jailer limits, credentials, daemonization, seccomp, network, general brokerage/hard revocation, cross-filesystem socket publication, and deployment outcomes require explicit macOS equivalents under #1351.",
       "source_refs": [
         "corpus:jailer",
         "corpus:production-host",
@@ -3325,7 +3344,7 @@
     {
       "id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
       "family": "isolation",
-      "summary": "The fixed launcher owns one dynamically validated worker through exact-sequence lifecycle, grant, and dormant socket-broker channels with nonblocking signal/child observation, one absolute grant deadline, failure-atomic staging and typed claims, synchronized pending-authority invalidation, structured readiness/terminal state, replacement-safe namespaces, crash-order cleanup, bounded empty-namespace both-killed recovery, redaction, and signed noninterchangeable concurrent authority. Per-device block/pmem ownership provides validate-claim-commit rollback and active block swap; output ownership provides failure-atomic singleton sinks and signed same-GrantId session isolation. Socket ownership adds validation-before-claim, strict role/child/identity records, exclusive anchor-relative publication, no-API/dormant non-consumption, supplied listener lifetime, fixed peer/session/sequence/anchor/target broker state, and worker- or launcher-side identity-only cleanup while preserving replaced targets. General dynamic-resource races, simultaneous uncatchable-death stale external names and private records, hard revocation, and malicious same-container sibling isolation remain feasible under #1351.",
+      "summary": "The fixed launcher owns one dynamically validated worker through exact-sequence lifecycle, grant, and dormant socket-broker channels with nonblocking signal/child observation, one absolute grant deadline, failure-atomic staging and typed claims, synchronized pending-authority invalidation, structured readiness/terminal state, replacement-safe namespaces, crash-order cleanup, bounded empty-namespace both-killed recovery, redaction, and signed noninterchangeable concurrent authority. Per-device block/pmem ownership provides validate-claim-commit rollback and active block swap; output ownership provides failure-atomic singleton sinks and signed same-GrantId session isolation. Snapshot ownership adds non-consuming state preinspection followed by atomic state/memory/root adoption, retained shared-or-distinct output anchors, no-clobber anchor-relative publication, and strict per-artifact staging records that let a surviving launcher remove only an exact worker-owned inode while preserving replacements. Socket ownership adds validation-before-claim, strict role/child/identity records, exclusive anchor-relative publication, no-API/dormant non-consumption, supplied listener lifetime, fixed peer/session/sequence/anchor/target broker state, and worker- or launcher-side identity-only cleanup while preserving replaced targets. General dynamic-resource races, unavoidable snapshot create-before-record and simultaneous uncatchable-death residue, hard revocation, and malicious same-container sibling isolation remain feasible under #1351.",
       "source_refs": [
         "corpus:design",
         "corpus:production-host"

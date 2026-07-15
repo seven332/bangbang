@@ -4,7 +4,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use bangbang_session::{GrantId, SocketChild};
+use bangbang_session::{GrantId, SnapshotOutputChild, SocketChild};
 #[cfg(not(target_os = "macos"))]
 use bangbang_session::{Readiness, TerminalCategory};
 
@@ -34,7 +34,7 @@ impl fmt::Display for GrantClaimError {
 
 impl std::error::Error for GrantClaimError {}
 
-fn grant_reference_id(reference: &Path) -> Result<Option<GrantId>, GrantClaimError> {
+pub(crate) fn grant_reference_id(reference: &Path) -> Result<Option<GrantId>, GrantClaimError> {
     let reference = reference.as_os_str().as_bytes();
     let Some(id) = reference.strip_prefix(GRANT_REFERENCE_PREFIX.as_bytes()) else {
         return Ok(None);
@@ -64,15 +64,40 @@ fn socket_directory_reference(
     )))
 }
 
+fn snapshot_output_reference(
+    reference: &Path,
+) -> Result<Option<(GrantId, SnapshotOutputChild)>, GrantClaimError> {
+    let reference = reference.as_os_str().as_bytes();
+    let Some(value) = reference.strip_prefix(GRANT_REFERENCE_PREFIX.as_bytes()) else {
+        return Ok(None);
+    };
+    let Some(separator) = value.iter().position(|byte| *byte == b'/') else {
+        return Err(GrantClaimError);
+    };
+    let (id, child) = value.split_at(separator);
+    let child = child.get(1..).ok_or(GrantClaimError)?;
+    if child.contains(&b'/') {
+        return Err(GrantClaimError);
+    }
+    let id = std::str::from_utf8(id).map_err(|_| GrantClaimError)?;
+    let child = std::str::from_utf8(child).map_err(|_| GrantClaimError)?;
+    Ok(Some((
+        GrantId::parse(id).map_err(|_| GrantClaimError)?,
+        SnapshotOutputChild::parse(child).map_err(|_| GrantClaimError)?,
+    )))
+}
+
 #[cfg(test)]
 mod reference_tests {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
 
-    use bangbang_session::MAX_GRANT_ID_BYTES;
+    use bangbang_session::{MAX_GRANT_ID_BYTES, MAX_SNAPSHOT_OUTPUT_CHILD_BYTES};
 
-    use super::{GrantClaimError, grant_reference_id, socket_directory_reference};
+    use super::{
+        GrantClaimError, grant_reference_id, snapshot_output_reference, socket_directory_reference,
+    };
 
     #[test]
     fn grant_references_use_one_exact_case_sensitive_bounded_grammar() {
@@ -151,11 +176,57 @@ mod reference_tests {
         let non_utf8 = PathBuf::from(OsString::from_vec(b"bangbang-grant:api/\xff".to_vec()));
         assert_eq!(socket_directory_reference(&non_utf8), Err(GrantClaimError));
     }
+
+    #[test]
+    fn snapshot_outputs_bind_one_exact_id_and_utf8_child() {
+        for child_value in ["state.snap", "memory image", "雪", r"back\\slash"] {
+            let reference = format!("bangbang-grant:output/{child_value}");
+            let (id, child) = snapshot_output_reference(Path::new(&reference))
+                .expect("reference should classify")
+                .expect("reference should be explicit");
+            assert_eq!(id.as_bytes(), b"output");
+            assert_eq!(child.as_bytes(), child_value.as_bytes());
+            assert!(!format!("{id:?} {child:?}").contains(child_value));
+        }
+
+        for ordinary in ["ordinary/snapshot", "Bangbang-grant:output/state"] {
+            assert!(
+                snapshot_output_reference(Path::new(ordinary))
+                    .expect("ordinary path should classify")
+                    .is_none()
+            );
+        }
+        for malformed in [
+            "bangbang-grant:output",
+            "bangbang-grant:/state",
+            "bangbang-grant:output/",
+            "bangbang-grant:output/.",
+            "bangbang-grant:output/..",
+            "bangbang-grant:output/nested/state",
+            "bangbang-grant:output/nul\0name",
+        ] {
+            assert_eq!(
+                snapshot_output_reference(Path::new(malformed)),
+                Err(GrantClaimError)
+            );
+        }
+        let overlong = format!(
+            "bangbang-grant:output/{}",
+            "a".repeat(MAX_SNAPSHOT_OUTPUT_CHILD_BYTES + 1)
+        );
+        assert_eq!(
+            snapshot_output_reference(Path::new(&overlong)),
+            Err(GrantClaimError)
+        );
+        let non_utf8 = PathBuf::from(OsString::from_vec(b"bangbang-grant:output/\xff".to_vec()));
+        assert_eq!(snapshot_output_reference(&non_utf8), Err(GrantClaimError));
+    }
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
     use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
     use std::env;
     use std::ffi::OsStr;
     use std::fs::File;
@@ -170,22 +241,29 @@ mod platform {
     use std::time::{Duration, Instant};
 
     use bangbang_runtime::boot::BootSourceFiles;
+    use bangbang_runtime::snapshot_artifact::{
+        SnapshotArtifactKind, SnapshotArtifactOutput, SnapshotStagingOwnership,
+        SnapshotStagingTracker, SnapshotStagingTrackingError,
+    };
     use bangbang_session::macos::grant_registry::{
         CommittedGrantBatch, DirectoryGrantRegistry, FileGrantRegistry, GrantRegistry,
         GrantedDirectory, StagedGrantBatch,
     };
     use bangbang_session::macos::grant_transport::receive_grant;
-    use bangbang_session::macos::runtime::{WorkerNamespace, WorkerSocketNamespace};
+    use bangbang_session::macos::runtime::{
+        SnapshotStagingKind, SnapshotStagingName, SnapshotStagingOwnershipRecord, WorkerNamespace,
+        WorkerSocketNamespace,
+    };
     use bangbang_session::macos::{set_cloexec, verify_peer, verify_peer_pid};
     use bangbang_session::{
-        Frame, FrameDecoder, GRANT_FD, GrantAccess, Message, Readiness, ResourceRole,
-        SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId,
-        TerminalCategory, WorkerLifecycle, encode_frame,
+        Frame, FrameDecoder, GRANT_FD, GrantAccess, GrantId, Message, ObjectIdentity, Readiness,
+        ResourceRole, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId,
+        SnapshotOutputChild, TerminalCategory, WorkerLifecycle, encode_frame,
     };
 
     use super::{
         ContainedSessionError, GrantClaimError, SocketChild, grant_reference_id,
-        socket_directory_reference,
+        snapshot_output_reference, socket_directory_reference,
     };
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -324,6 +402,42 @@ mod platform {
             Ok(BootSourceFiles::new(kernel, initrd))
         }
 
+        pub(crate) fn duplicate_exact_files(
+            &self,
+            requests: &[(GrantId, ResourceRole, GrantAccess)],
+        ) -> Result<Vec<File>, GrantClaimError> {
+            let registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            registry
+                .as_ref()
+                .ok_or(GrantClaimError)?
+                .duplicate_files(requests)
+                .map_err(|_| GrantClaimError)
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|file| File::from(file.into_owned_fd()))
+                        .collect()
+                })
+        }
+
+        pub(crate) fn take_exact_files(
+            &self,
+            requests: &[(GrantId, ResourceRole, GrantAccess)],
+        ) -> Result<Vec<File>, GrantClaimError> {
+            let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            registry
+                .as_mut()
+                .ok_or(GrantClaimError)?
+                .take_files(requests)
+                .map_err(|_| GrantClaimError)
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|file| File::from(file.into_owned_fd()))
+                        .collect()
+                })
+        }
+
         #[cfg(feature = "grant-integration-probe")]
         pub(crate) fn with_registry<T>(
             &self,
@@ -348,6 +462,124 @@ mod platform {
         pub(crate) child: SocketChild,
     }
 
+    /// One retained snapshot-output directory paired with one validated child.
+    #[derive(Clone)]
+    pub(crate) struct ClaimedSnapshotOutput {
+        directory: Rc<GrantedDirectory>,
+        child: SnapshotOutputChild,
+    }
+
+    /// Durable bridge from runtime staging events into the private session namespace.
+    pub(crate) struct SnapshotStagingRecordTracker {
+        namespace: WorkerSocketNamespace,
+    }
+
+    impl SnapshotStagingRecordTracker {
+        pub(crate) const fn new(namespace: WorkerSocketNamespace) -> Self {
+            Self { namespace }
+        }
+
+        fn record_for(
+            ownership: &SnapshotStagingOwnership,
+        ) -> Result<SnapshotStagingOwnershipRecord, SnapshotStagingTrackingError> {
+            let kind = match ownership.artifact() {
+                SnapshotArtifactKind::State => SnapshotStagingKind::State,
+                SnapshotArtifactKind::Memory => SnapshotStagingKind::Memory,
+            };
+            let component = std::str::from_utf8(ownership.component())
+                .map_err(|_| SnapshotStagingTrackingError)?;
+            let name = SnapshotStagingName::parse(kind, component)
+                .map_err(|_| SnapshotStagingTrackingError)?;
+            let directory = ownership.directory_identity();
+            let file = ownership.file_identity();
+            Ok(SnapshotStagingOwnershipRecord::new(
+                kind,
+                ObjectIdentity {
+                    device: directory.device(),
+                    inode: directory.inode(),
+                },
+                name,
+                ObjectIdentity {
+                    device: file.device(),
+                    inode: file.inode(),
+                },
+            ))
+        }
+    }
+
+    impl std::fmt::Debug for SnapshotStagingRecordTracker {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("SnapshotStagingRecordTracker")
+                .field("namespace", &"<owned>")
+                .finish()
+        }
+    }
+
+    impl SnapshotStagingTracker for SnapshotStagingRecordTracker {
+        fn record(
+            &self,
+            ownership: &SnapshotStagingOwnership,
+        ) -> Result<(), SnapshotStagingTrackingError> {
+            let record = Self::record_for(ownership)?;
+            self.namespace
+                .write_snapshot_staging_record(&record)
+                .map_err(|_| SnapshotStagingTrackingError)?;
+            #[cfg(feature = "grant-integration-probe")]
+            crate::grant_integration_probe::hold_after_snapshot_staging_record();
+            Ok(())
+        }
+
+        fn clear(
+            &self,
+            ownership: &SnapshotStagingOwnership,
+        ) -> Result<(), SnapshotStagingTrackingError> {
+            let record = Self::record_for(ownership)?;
+            self.namespace
+                .clear_snapshot_staging_record(&record)
+                .map_err(|_| SnapshotStagingTrackingError)
+        }
+    }
+
+    impl std::fmt::Debug for ClaimedSnapshotOutput {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ClaimedSnapshotOutput")
+                .field("directory", &"<retained>")
+                .field("child", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl ClaimedSnapshotOutput {
+        pub(crate) fn artifact_output(
+            &self,
+            tracker: Arc<dyn SnapshotStagingTracker>,
+        ) -> Result<SnapshotArtifactOutput, GrantClaimError> {
+            // SAFETY: the retained directory anchor remains live for fcntl;
+            // success returns an independently owned close-on-exec descriptor.
+            let descriptor =
+                unsafe { libc::fcntl(self.directory.anchor_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            if descriptor < 0 {
+                return Err(GrantClaimError);
+            }
+            // SAFETY: descriptor is the fresh duplicate returned above.
+            let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+            Ok(SnapshotArtifactOutput::anchored_tracked(
+                File::from(descriptor),
+                self.child.as_bytes().to_vec(),
+                tracker,
+            ))
+        }
+    }
+
+    /// Failure-atomic contained claims for a state/memory output pair.
+    #[derive(Debug, Default)]
+    pub(crate) struct ClaimedSnapshotOutputs {
+        pub(crate) state: Option<ClaimedSnapshotOutput>,
+        pub(crate) memory: Option<ClaimedSnapshotOutput>,
+    }
+
     impl std::fmt::Debug for ClaimedSocketDirectory {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -362,6 +594,7 @@ mod platform {
     #[derive(Clone)]
     pub(crate) struct DirectoryGrantAuthority {
         registry: Rc<RefCell<Option<DirectoryGrantRegistry>>>,
+        retained_snapshot: Rc<RefCell<HashMap<GrantId, Rc<GrantedDirectory>>>>,
     }
 
     impl std::fmt::Debug for DirectoryGrantAuthority {
@@ -377,6 +610,7 @@ mod platform {
         fn new(registry: DirectoryGrantRegistry) -> Self {
             Self {
                 registry: Rc::new(RefCell::new(Some(registry))),
+                retained_snapshot: Rc::new(RefCell::new(HashMap::new())),
             }
         }
 
@@ -399,6 +633,81 @@ mod platform {
             Ok(Some(ClaimedSocketDirectory { directory, child }))
         }
 
+        pub(crate) fn claim_snapshot_outputs(
+            &self,
+            state_reference: &Path,
+            memory_reference: &Path,
+        ) -> Result<ClaimedSnapshotOutputs, GrantClaimError> {
+            let state = snapshot_output_reference(state_reference)?;
+            let memory = snapshot_output_reference(memory_reference)?;
+            if matches!(
+                (&state, &memory),
+                (Some((state_id, state_child)), Some((memory_id, memory_child)))
+                    if state_id == memory_id && state_child == memory_child
+            ) {
+                return Err(GrantClaimError);
+            }
+
+            let mut distinct = HashSet::with_capacity(2);
+            let mut requested = Vec::with_capacity(2);
+            for (id, _) in [&state, &memory].into_iter().flatten() {
+                if distinct.insert(id.clone()) {
+                    requested.push(id.clone());
+                }
+            }
+            if requested.is_empty() {
+                return Ok(ClaimedSnapshotOutputs::default());
+            }
+
+            let mut retained = self
+                .retained_snapshot
+                .try_borrow_mut()
+                .map_err(|_| GrantClaimError)?;
+            let missing = requested
+                .iter()
+                .filter(|id| !retained.contains_key(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                retained
+                    .try_reserve(missing.len())
+                    .map_err(|_| GrantClaimError)?;
+                let requests = missing
+                    .iter()
+                    .cloned()
+                    .map(|id| (id, ResourceRole::SnapshotOutputDirectory))
+                    .collect::<Vec<_>>();
+                let directories = self
+                    .registry
+                    .try_borrow_mut()
+                    .map_err(|_| GrantClaimError)?
+                    .as_mut()
+                    .ok_or(GrantClaimError)?
+                    .take_scoped_directories(&requests)
+                    .map_err(|_| GrantClaimError)?;
+                for (id, directory) in missing.into_iter().zip(directories) {
+                    let previous = retained.insert(id, Rc::new(directory));
+                    debug_assert!(previous.is_none());
+                }
+            }
+
+            let claim = |reference: Option<(GrantId, SnapshotOutputChild)>| {
+                reference
+                    .map(|(id, child)| {
+                        retained
+                            .get(&id)
+                            .cloned()
+                            .map(|directory| ClaimedSnapshotOutput { directory, child })
+                            .ok_or(GrantClaimError)
+                    })
+                    .transpose()
+            };
+            Ok(ClaimedSnapshotOutputs {
+                state: claim(state)?,
+                memory: claim(memory)?,
+            })
+        }
+
         #[cfg(feature = "grant-integration-probe")]
         fn with_registry<T>(
             &self,
@@ -414,6 +723,9 @@ mod platform {
         fn invalidate(&self) {
             if let Ok(mut registry) = self.registry.try_borrow_mut() {
                 registry.take();
+            }
+            if let Ok(mut retained) = self.retained_snapshot.try_borrow_mut() {
+                retained.clear();
             }
         }
     }
@@ -1562,4 +1874,6 @@ pub(crate) use platform::{
     ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
 };
 #[cfg(target_os = "macos")]
-pub(crate) use platform::{SocketBrokerAuthority, SocketBrokerEndpoint};
+pub(crate) use platform::{
+    SnapshotStagingRecordTracker, SocketBrokerAuthority, SocketBrokerEndpoint,
+};

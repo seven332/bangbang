@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -96,6 +96,17 @@ impl GrantRegistry {
         take_files(&mut self.files, requests)
     }
 
+    /// Duplicates an ordered set of exact file descriptors without adopting them.
+    ///
+    /// Every request is validated before any descriptor is duplicated. The
+    /// original registry remains unchanged on success and failure.
+    pub fn duplicate_files(
+        &self,
+        requests: &[(GrantId, ResourceRole, GrantAccess)],
+    ) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+        duplicate_files(&self.files, requests)
+    }
+
     /// Moves all regular-file grants into a sendable one-time registry.
     pub fn take_file_registry(&mut self) -> FileGrantRegistry {
         FileGrantRegistry {
@@ -117,6 +128,14 @@ impl GrantRegistry {
         role: ResourceRole,
     ) -> Result<GrantedDirectory, GrantRegistryError> {
         take_scoped_directory(&mut self.directories, id, role)
+    }
+
+    /// Atomically adopts an ordered set of exact active directory scopes.
+    pub fn take_scoped_directories(
+        &mut self,
+        requests: &[(GrantId, ResourceRole)],
+    ) -> Result<Vec<GrantedDirectory>, GrantRegistryError> {
+        take_scoped_directories(&mut self.directories, requests)
     }
 }
 
@@ -165,6 +184,14 @@ impl FileGrantRegistry {
     ) -> Result<Vec<GrantedFile>, GrantRegistryError> {
         take_files(&mut self.entries, requests)
     }
+
+    /// Duplicates an ordered set of exact file descriptors without adopting them.
+    pub fn duplicate_files(
+        &self,
+        requests: &[(GrantId, ResourceRole, GrantAccess)],
+    ) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+        duplicate_files(&self.entries, requests)
+    }
 }
 
 /// One-time owner-thread registry containing active directory scopes.
@@ -203,6 +230,14 @@ impl DirectoryGrantRegistry {
     ) -> Result<GrantedDirectory, GrantRegistryError> {
         take_scoped_directory(&mut self.entries, id, role)
     }
+
+    /// Atomically adopts an ordered set of exact active directory scopes.
+    pub fn take_scoped_directories(
+        &mut self,
+        requests: &[(GrantId, ResourceRole)],
+    ) -> Result<Vec<GrantedDirectory>, GrantRegistryError> {
+        take_scoped_directories(&mut self.entries, requests)
+    }
 }
 
 fn take_scoped_directory(
@@ -219,6 +254,42 @@ fn take_scoped_directory(
         return Err(GrantRegistryError);
     }
     entries.remove(id).ok_or(GrantRegistryError)
+}
+
+fn take_scoped_directories(
+    entries: &mut HashMap<GrantId, GrantedDirectory>,
+    requests: &[(GrantId, ResourceRole)],
+) -> Result<Vec<GrantedDirectory>, GrantRegistryError> {
+    let mut ids = HashSet::with_capacity(requests.len());
+    for (id, role) in requests {
+        if !ids.insert(id)
+            || !matches!(
+                entries.get(id),
+                Some(directory)
+                    if directory.role == *role
+                        && directory.access == GrantAccess::CreateChildren
+            )
+        {
+            return Err(GrantRegistryError);
+        }
+    }
+
+    let mut directories = Vec::new();
+    directories
+        .try_reserve_exact(requests.len())
+        .map_err(|_| GrantRegistryError)?;
+    for (id, _) in requests {
+        let Some(directory) = entries.remove(id) else {
+            for (restored_id, restored_directory) in requests.iter().zip(directories.drain(..)).map(
+                |((restored_id, _), restored_directory)| (restored_id.clone(), restored_directory),
+            ) {
+                entries.insert(restored_id, restored_directory);
+            }
+            return Err(GrantRegistryError);
+        };
+        directories.push(directory);
+    }
+    Ok(directories)
 }
 
 fn take_file(
@@ -269,6 +340,47 @@ fn take_files(
             return Err(GrantRegistryError);
         };
         files.push(file);
+    }
+    Ok(files)
+}
+
+fn duplicate_files(
+    entries: &HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess)],
+) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+    let mut ids = HashSet::with_capacity(requests.len());
+    for (id, role, access) in requests {
+        if !ids.insert(id)
+            || !matches!(
+                entries.get(id),
+                Some(file) if file.role == *role && file.access == *access
+            )
+        {
+            return Err(GrantRegistryError);
+        }
+    }
+
+    let mut files = Vec::new();
+    files
+        .try_reserve_exact(requests.len())
+        .map_err(|_| GrantRegistryError)?;
+    for (id, _, _) in requests {
+        let file = entries.get(id).ok_or(GrantRegistryError)?;
+        // SAFETY: the source descriptor remains live for fcntl; success returns
+        // an independently owned close-on-exec descriptor.
+        let descriptor =
+            unsafe { libc::fcntl(file.descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if descriptor < 0 {
+            return Err(GrantRegistryError);
+        }
+        // SAFETY: descriptor is the fresh duplicate returned above.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        files.push(GrantedFile {
+            role: file.role,
+            access: file.access,
+            identity: file.identity,
+            descriptor,
+        });
     }
     Ok(files)
 }
@@ -1134,6 +1246,30 @@ mod tests {
         assert!(files.take_files(&duplicate).is_err());
         assert_eq!(files.len(), 2);
 
+        let inspected = files
+            .duplicate_files(&[
+                (
+                    kernel_id.clone(),
+                    ResourceRole::KernelImage,
+                    GrantAccess::ReadOnly,
+                ),
+                (
+                    initrd_id.clone(),
+                    ResourceRole::InitrdImage,
+                    GrantAccess::ReadOnly,
+                ),
+            ])
+            .expect("matching files should duplicate without adoption");
+        assert_eq!(inspected.len(), 2);
+        assert_eq!(files.len(), 2);
+        assert_ne!(inspected[0].as_raw_fd(), kernel.as_raw_fd());
+        assert_ne!(inspected[1].as_raw_fd(), initrd.as_raw_fd());
+        drop(inspected);
+
+        assert!(files.duplicate_files(&wrong_second).is_err());
+        assert!(files.duplicate_files(&duplicate).is_err());
+        assert_eq!(files.len(), 2);
+
         let adopted = files
             .take_files(&[
                 (
@@ -1162,6 +1298,79 @@ mod tests {
                 .take_file(&initrd_id, ResourceRole::InitrdImage, GrantAccess::ReadOnly,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn directory_registry_batch_adoption_is_failure_atomic() {
+        let base = std::env::temp_dir().join(format!(
+            "bangbang-grant-registry-pair-{}",
+            std::process::id()
+        ));
+        let state_path = base.join("state");
+        let memory_path = base.join("memory");
+        fs::create_dir_all(&state_path).expect("state directory should create");
+        fs::create_dir_all(&memory_path).expect("memory directory should create");
+
+        let make_directory = |path: &Path| {
+            let bookmark =
+                create_implicit_bookmark(path, true).expect("directory bookmark should create");
+            let scope = ScopedBookmark::resolve(&bookmark).expect("bookmark should resolve");
+            let anchor_file = File::open(path).expect("directory anchor should open");
+            let anchor = duplicate(&anchor_file);
+            let stat = descriptor_stat(anchor.as_raw_fd()).expect("directory stat should read");
+            GrantedDirectory {
+                role: ResourceRole::SnapshotOutputDirectory,
+                access: GrantAccess::CreateChildren,
+                identity: ObjectIdentity {
+                    device: normalized_device(stat.st_dev),
+                    inode: stat.st_ino,
+                },
+                anchor,
+                scope,
+            }
+        };
+
+        let state_id = GrantId::parse("snapshot-state-output").expect("state ID should parse");
+        let memory_id = GrantId::parse("snapshot-memory-output").expect("memory ID should parse");
+        let mut directories = DirectoryGrantRegistry {
+            entries: HashMap::from([
+                (state_id.clone(), make_directory(&state_path)),
+                (memory_id.clone(), make_directory(&memory_path)),
+            ]),
+        };
+
+        assert!(
+            directories
+                .take_scoped_directories(&[
+                    (state_id.clone(), ResourceRole::SnapshotOutputDirectory),
+                    (memory_id.clone(), ResourceRole::ApiSocketDirectory),
+                ])
+                .is_err()
+        );
+        assert_eq!(directories.len(), 2);
+        assert!(
+            directories
+                .take_scoped_directories(&[
+                    (state_id.clone(), ResourceRole::SnapshotOutputDirectory),
+                    (state_id.clone(), ResourceRole::SnapshotOutputDirectory),
+                ])
+                .is_err()
+        );
+        assert_eq!(directories.len(), 2);
+
+        let adopted = directories
+            .take_scoped_directories(&[
+                (memory_id, ResourceRole::SnapshotOutputDirectory),
+                (state_id, ResourceRole::SnapshotOutputDirectory),
+            ])
+            .expect("matching directories should adopt atomically");
+        assert_eq!(adopted.len(), 2);
+        assert!(directories.is_empty());
+        drop(adopted);
+
+        fs::remove_dir(memory_path).expect("memory directory should clean up");
+        fs::remove_dir(state_path).expect("state directory should clean up");
+        fs::remove_dir(base).expect("base directory should clean up");
     }
 
     #[test]

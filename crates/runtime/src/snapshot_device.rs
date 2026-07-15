@@ -408,9 +408,6 @@ pub fn capture_snapshot_v1_device_state(
         return Err(SnapshotV1DeviceCaptureError::InvalidRetry);
     }
 
-    let (path_backing, path_identity) =
-        BlockFileBacking::open_snapshot_read_only(config.path_on_host())
-            .map_err(|_| SnapshotV1DeviceCaptureError::BlockBacking)?;
     let live_device = input.block_handler.activation_handler();
     let live_backing = live_device.backing();
     if !live_backing.is_read_only() {
@@ -419,10 +416,14 @@ pub fn capture_snapshot_v1_device_state(
     let live_identity = live_backing
         .snapshot_identity()
         .map_err(|_| SnapshotV1DeviceCaptureError::BlockBacking)?;
-    if path_identity != live_identity || path_backing.len() != live_backing.len() {
-        return Err(SnapshotV1DeviceCaptureError::BlockBackingMismatch);
+    if !live_backing.uses_supplied_file() {
+        let (path_backing, path_identity) =
+            BlockFileBacking::open_snapshot_read_only(config.path_on_host())
+                .map_err(|_| SnapshotV1DeviceCaptureError::BlockBacking)?;
+        if path_identity != live_identity || path_backing.len() != live_backing.len() {
+            return Err(SnapshotV1DeviceCaptureError::BlockBackingMismatch);
+        }
     }
-    drop(path_backing);
 
     let expected_config_space =
         VirtioBlockConfigSpace::from_backing(live_backing, config.cache_type());
@@ -1473,7 +1474,7 @@ impl<'a> DeviceStateReader<'a> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::fs::{self, OpenOptions};
+    use std::fs::{self, File, OpenOptions};
     use std::io::Write as _;
     use std::os::unix::ffi::OsStringExt as _;
     use std::path::{Path, PathBuf};
@@ -1495,7 +1496,7 @@ mod tests {
     use crate::serial::SerialMmioState;
     use crate::startup::{
         PrepareSnapshotV1DeviceProfileError, install_snapshot_v1_runtime,
-        prepare_snapshot_v1_device_profile,
+        prepare_snapshot_v1_device_profile, prepare_snapshot_v1_device_profile_with_root_backing,
     };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -1933,6 +1934,68 @@ mod tests {
                 .expect("fresh serial output should read"),
             Vec::<u8>::new()
         );
+    }
+
+    #[test]
+    fn preparation_adopts_exact_supplied_backing_without_reopening_persisted_selector() {
+        let file = TempFile::new(&[0x5a; 512]);
+        let supplied = File::open(file.path()).expect("supplied backing should open");
+        let moved = file.path().with_extension("opened");
+        fs::rename(file.path(), &moved).expect("opened backing should move");
+        fs::write(file.path(), [0x7b; 512]).expect("replacement path should create");
+        let (_, identity) = BlockFileBacking::from_snapshot_read_only_file(
+            supplied
+                .try_clone()
+                .expect("supplied backing should duplicate"),
+        )
+        .expect("supplied backing should identify after move");
+        let mut state = fixture_with_path(PathBuf::from("bangbang-grant:root"), identity);
+        let vmclock_base = aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE - 4096;
+        let vmgenid_base = vmclock_base - 16;
+        state.vmgenid = platform(vmgenid_base, 16, 34);
+        state.vmclock = platform(vmclock_base, 4096, 35);
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(
+                GuestAddress::new(aarch64::SYSTEM_MEM_START),
+                aarch64::SYSTEM_MEM_SIZE,
+            )
+            .expect("test memory range should be valid"),
+        ])
+        .expect("test memory layout should be valid");
+        let mut memory = GuestMemory::allocate(&layout).expect("test memory should allocate");
+        memory
+            .write_slice(&[0x6b; 16], state.vmgenid().range().start())
+            .expect("source generation should write");
+
+        let prepared = prepare_snapshot_v1_device_profile_with_root_backing(
+            &state,
+            &memory,
+            Instant::now(),
+            Some(supplied),
+        )
+        .expect("exact supplied backing should prepare without selector lookup");
+
+        assert_eq!(
+            prepared.drive_config().path_on_host(),
+            Path::new("bangbang-grant:root")
+        );
+        assert!(
+            prepared
+                .block_handler()
+                .activation_handler()
+                .backing()
+                .uses_supplied_file()
+        );
+        assert_eq!(
+            prepared
+                .block_handler()
+                .activation_handler()
+                .backing()
+                .snapshot_identity()
+                .expect("prepared backing identity should read"),
+            identity
+        );
+        fs::remove_file(moved).expect("moved backing fixture should clean up");
     }
 
     #[test]

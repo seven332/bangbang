@@ -19,12 +19,25 @@ const MAX_RECOVERY_ENTRIES: usize = 128;
 const SOCKET_RECORD_BYTES: usize = 96;
 const SOCKET_RECORD_MAGIC: [u8; 4] = *b"BBS1";
 const SOCKET_RECORD_VERSION: u16 = 1;
+const SNAPSHOT_RECORD_BYTES: usize = 128;
+const SNAPSHOT_RECORD_MAGIC: [u8; 4] = *b"BBT1";
+const SNAPSHOT_RECORD_VERSION: u16 = 1;
+const SNAPSHOT_STATE_STAGING_PREFIX: &str = ".bangbang-snapshot-state-";
+const SNAPSHOT_MEMORY_STAGING_PREFIX: &str = ".bangbang-snapshot-memory-";
+const SNAPSHOT_STAGING_RANDOM_HEX_BYTES: usize = 32;
 
 fn socket_record_name(role: ResourceRole) -> Result<&'static CStr, RuntimeError> {
     match role {
         ResourceRole::ApiSocketDirectory => Ok(c".api-socket-owner"),
         ResourceRole::VsockSocketDirectory => Ok(c".vsock-socket-owner"),
         _ => Err(RuntimeError::InvalidEntry),
+    }
+}
+
+fn snapshot_record_name(kind: SnapshotStagingKind) -> &'static CStr {
+    match kind {
+        SnapshotStagingKind::State => c".snapshot-state-owner",
+        SnapshotStagingKind::Memory => c".snapshot-memory-owner",
     }
 }
 
@@ -90,6 +103,134 @@ impl SocketOwnershipRecord {
     }
 }
 
+/// One of the two independently staged native snapshot artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotStagingKind {
+    /// State commit-marker artifact.
+    State,
+    /// Guest-memory artifact.
+    Memory,
+}
+
+impl SnapshotStagingKind {
+    const fn protocol_byte(self) -> u8 {
+        match self {
+            Self::State => 1,
+            Self::Memory => 2,
+        }
+    }
+
+    fn from_protocol_byte(value: u8) -> Result<Self, RuntimeError> {
+        match value {
+            1 => Ok(Self::State),
+            2 => Ok(Self::Memory),
+            _ => Err(RuntimeError::InvalidEntry),
+        }
+    }
+
+    const fn staging_prefix(self) -> &'static str {
+        match self {
+            Self::State => SNAPSHOT_STATE_STAGING_PREFIX,
+            Self::Memory => SNAPSHOT_MEMORY_STAGING_PREFIX,
+        }
+    }
+}
+
+/// Strict random staging component retained only as private cleanup evidence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotStagingName(String);
+
+impl SnapshotStagingName {
+    /// Validates the exact artifact-specific prefix and lowercase random hex.
+    pub fn parse(kind: SnapshotStagingKind, value: &str) -> Result<Self, RuntimeError> {
+        let suffix = value
+            .strip_prefix(kind.staging_prefix())
+            .ok_or(RuntimeError::InvalidEntry)?;
+        if suffix.len() != SNAPSHOT_STAGING_RANDOM_HEX_BYTES
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(RuntimeError::InvalidEntry);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the exact private component bytes for anchored cleanup.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for SnapshotStagingName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SnapshotStagingName(<redacted>)")
+    }
+}
+
+/// Fixed cleanup evidence for one granted external snapshot staging inode.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotStagingOwnershipRecord {
+    kind: SnapshotStagingKind,
+    directory_identity: ObjectIdentity,
+    name: SnapshotStagingName,
+    file_identity: ObjectIdentity,
+}
+
+impl SnapshotStagingOwnershipRecord {
+    /// Creates one exact, fully validated ownership record.
+    pub fn new(
+        kind: SnapshotStagingKind,
+        directory_identity: ObjectIdentity,
+        name: SnapshotStagingName,
+        file_identity: ObjectIdentity,
+    ) -> Self {
+        Self {
+            kind,
+            directory_identity,
+            name,
+            file_identity,
+        }
+    }
+
+    /// Returns the state or memory artifact kind.
+    #[must_use]
+    pub const fn kind(&self) -> SnapshotStagingKind {
+        self.kind
+    }
+
+    /// Returns the exact granted-directory identity.
+    #[must_use]
+    pub const fn directory_identity(&self) -> ObjectIdentity {
+        self.directory_identity
+    }
+
+    /// Returns the strict private staging component.
+    #[must_use]
+    pub const fn name(&self) -> &SnapshotStagingName {
+        &self.name
+    }
+
+    /// Returns the exact staging-file identity.
+    #[must_use]
+    pub const fn file_identity(&self) -> ObjectIdentity {
+        self.file_identity
+    }
+}
+
+impl fmt::Debug for SnapshotStagingOwnershipRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotStagingOwnershipRecord")
+            .field("kind", &self.kind)
+            .field("directory_identity", &"<redacted>")
+            .field("name", &"<redacted>")
+            .field("file_identity", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Worker-side duplicate of the locked private namespace directory.
 pub struct WorkerSocketNamespace {
     directory: OwnedFd,
@@ -135,6 +276,22 @@ impl WorkerSocketNamespace {
     /// Removes only the exact current ownership record.
     pub fn clear_socket_record(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
         clear_socket_record(self.anchor_fd(), record)
+    }
+
+    /// Durably writes one fixed snapshot staging-ownership record.
+    pub fn write_snapshot_staging_record(
+        &self,
+        record: &SnapshotStagingOwnershipRecord,
+    ) -> Result<(), RuntimeError> {
+        write_snapshot_record(self.anchor_fd(), record)
+    }
+
+    /// Removes only the exact current snapshot staging-ownership record.
+    pub fn clear_snapshot_staging_record(
+        &self,
+        record: &SnapshotStagingOwnershipRecord,
+    ) -> Result<(), RuntimeError> {
+        clear_snapshot_record(self.anchor_fd(), record)
     }
 }
 
@@ -358,7 +515,7 @@ impl LauncherNamespace {
         if !try_lock_exclusive(directory.as_raw_fd())? {
             return Err(RuntimeError::InvalidEntry);
         }
-        if !directory_contains_only_socket_records(directory.as_raw_fd())? {
+        if !directory_contains_only_ownership_records(directory.as_raw_fd())? {
             return Err(RuntimeError::InvalidEntry);
         }
         Ok(Some(Self {
@@ -414,6 +571,27 @@ impl LauncherNamespace {
     /// Removes only an exact validated socket ownership record.
     pub fn clear_socket_record(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
         clear_socket_record(self.directory.as_raw_fd(), record)
+    }
+
+    /// Reads the at-most-two strict snapshot staging records after worker exit.
+    pub fn snapshot_staging_records(
+        &self,
+    ) -> Result<Vec<SnapshotStagingOwnershipRecord>, RuntimeError> {
+        let mut records = Vec::with_capacity(2);
+        for kind in [SnapshotStagingKind::State, SnapshotStagingKind::Memory] {
+            if let Some(record) = read_snapshot_record(self.directory.as_raw_fd(), kind)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Removes only an exact validated snapshot staging record.
+    pub fn clear_snapshot_staging_record(
+        &self,
+        record: &SnapshotStagingOwnershipRecord,
+    ) -> Result<(), RuntimeError> {
+        clear_snapshot_record(self.directory.as_raw_fd(), record)
     }
 }
 
@@ -625,6 +803,73 @@ fn decode_socket_record(
     )
 }
 
+fn encode_snapshot_record(record: &SnapshotStagingOwnershipRecord) -> [u8; SNAPSHOT_RECORD_BYTES] {
+    let mut bytes = [0_u8; SNAPSHOT_RECORD_BYTES];
+    bytes[0..4].copy_from_slice(&SNAPSHOT_RECORD_MAGIC);
+    bytes[4..6].copy_from_slice(&SNAPSHOT_RECORD_VERSION.to_be_bytes());
+    bytes[6] = record.kind.protocol_byte();
+    bytes[7] = u8::try_from(record.name.as_bytes().len()).unwrap_or(0);
+    bytes[8..16].copy_from_slice(&record.directory_identity.device.to_be_bytes());
+    bytes[16..24].copy_from_slice(&record.directory_identity.inode.to_be_bytes());
+    bytes[24..32].copy_from_slice(&record.file_identity.device.to_be_bytes());
+    bytes[32..40].copy_from_slice(&record.file_identity.inode.to_be_bytes());
+    let name_end = 40 + record.name.as_bytes().len();
+    if let Some(target) = bytes.get_mut(40..name_end) {
+        target.copy_from_slice(record.name.as_bytes());
+    }
+    bytes
+}
+
+fn decode_snapshot_record(
+    expected_kind: SnapshotStagingKind,
+    bytes: &[u8; SNAPSHOT_RECORD_BYTES],
+) -> Result<SnapshotStagingOwnershipRecord, RuntimeError> {
+    if bytes.get(0..4) != Some(SNAPSHOT_RECORD_MAGIC.as_slice())
+        || bytes.get(4..6) != Some(SNAPSHOT_RECORD_VERSION.to_be_bytes().as_slice())
+        || SnapshotStagingKind::from_protocol_byte(
+            bytes.get(6).copied().ok_or(RuntimeError::InvalidEntry)?,
+        )? != expected_kind
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    let name_length = usize::from(*bytes.get(7).ok_or(RuntimeError::InvalidEntry)?);
+    let name_end = 40_usize
+        .checked_add(name_length)
+        .filter(|end| *end <= SNAPSHOT_RECORD_BYTES)
+        .ok_or(RuntimeError::InvalidEntry)?;
+    if bytes
+        .get(name_end..)
+        .ok_or(RuntimeError::InvalidEntry)?
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    let name = std::str::from_utf8(bytes.get(40..name_end).ok_or(RuntimeError::InvalidEntry)?)
+        .map_err(|_| RuntimeError::InvalidEntry)?;
+    let read_u64 = |range: std::ops::Range<usize>| -> Result<u64, RuntimeError> {
+        Ok(u64::from_be_bytes(
+            bytes
+                .get(range)
+                .ok_or(RuntimeError::InvalidEntry)?
+                .try_into()
+                .map_err(|_| RuntimeError::InvalidEntry)?,
+        ))
+    };
+    Ok(SnapshotStagingOwnershipRecord::new(
+        expected_kind,
+        ObjectIdentity {
+            device: read_u64(8..16)?,
+            inode: read_u64(16..24)?,
+        },
+        SnapshotStagingName::parse(expected_kind, name)?,
+        ObjectIdentity {
+            device: read_u64(24..32)?,
+            inode: read_u64(32..40)?,
+        },
+    ))
+}
+
 fn write_socket_record(
     directory: RawFd,
     record: &SocketOwnershipRecord,
@@ -715,6 +960,104 @@ fn clear_socket_record(
         if error.kind() != io::ErrorKind::NotFound {
             return Err(RuntimeError::Filesystem(error.kind()));
         }
+    }
+    Ok(())
+}
+
+fn write_snapshot_record(
+    directory: RawFd,
+    record: &SnapshotStagingOwnershipRecord,
+) -> Result<(), RuntimeError> {
+    let name = snapshot_record_name(record.kind);
+    // SAFETY: the namespace descriptor and fixed record name remain live.
+    let fd = unsafe {
+        libc::openat(
+            directory,
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    let mut file = File::from(owned_fd(fd)?);
+    let bytes = encode_snapshot_record(record);
+    let result = file.write_all(&bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        // SAFETY: the fixed record name is relative to the live namespace.
+        let _ = unsafe { libc::unlinkat(directory, name.as_ptr(), 0) };
+        return Err(RuntimeError::Filesystem(error.kind()));
+    }
+    // SAFETY: fsync has no pointer contract and the directory remains live.
+    if unsafe { libc::fsync(directory) } != 0 {
+        // SAFETY: same fixed record cleanup after failed durability.
+        let _ = unsafe { libc::unlinkat(directory, name.as_ptr(), 0) };
+        return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
+    }
+    Ok(())
+}
+
+fn read_snapshot_record(
+    directory: RawFd,
+    kind: SnapshotStagingKind,
+) -> Result<Option<SnapshotStagingOwnershipRecord>, RuntimeError> {
+    let name = snapshot_record_name(kind);
+    // SAFETY: the namespace descriptor and fixed record name remain live.
+    let fd = unsafe {
+        libc::openat(
+            directory,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(RuntimeError::Filesystem(error.kind()))
+        };
+    }
+    let mut file = File::from(owned_fd(fd)?);
+    let metadata = file
+        .metadata()
+        .map_err(|error| RuntimeError::Filesystem(error.kind()))?;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: identity lookup has no pointer or ownership contract.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.uid() != uid
+        || metadata.nlink() != 1
+        || metadata.len() != u64::try_from(SNAPSHOT_RECORD_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    let mut bytes = [0_u8; SNAPSHOT_RECORD_BYTES];
+    file.read_exact(&mut bytes)
+        .map_err(|error| RuntimeError::Filesystem(error.kind()))?;
+    decode_snapshot_record(kind, &bytes).map(Some)
+}
+
+fn clear_snapshot_record(
+    directory: RawFd,
+    expected: &SnapshotStagingOwnershipRecord,
+) -> Result<(), RuntimeError> {
+    match read_snapshot_record(directory, expected.kind)? {
+        None => return Ok(()),
+        Some(actual) if actual == *expected => {}
+        Some(_) => return Err(RuntimeError::InvalidEntry),
+    }
+    let name = snapshot_record_name(expected.kind);
+    // SAFETY: the namespace descriptor and fixed record name remain live.
+    if unsafe { libc::unlinkat(directory, name.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(RuntimeError::Filesystem(error.kind()));
+        }
+    }
+    // SAFETY: fsync durably orders record removal in the private namespace.
+    if unsafe { libc::fsync(directory) } != 0 {
+        return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
     }
     Ok(())
 }
@@ -895,8 +1238,8 @@ fn directory_is_empty(fd: RawFd) -> Result<bool, RuntimeError> {
     Ok(directory_entries(fd, 1)?.is_empty())
 }
 
-fn directory_contains_only_socket_records(fd: RawFd) -> Result<bool, RuntimeError> {
-    let mut expected = Vec::with_capacity(2);
+fn directory_contains_only_ownership_records(fd: RawFd) -> Result<bool, RuntimeError> {
+    let mut expected = Vec::with_capacity(4);
     for role in [
         ResourceRole::ApiSocketDirectory,
         ResourceRole::VsockSocketDirectory,
@@ -905,7 +1248,12 @@ fn directory_contains_only_socket_records(fd: RawFd) -> Result<bool, RuntimeErro
             expected.push(socket_record_name(role)?.to_bytes());
         }
     }
-    let entries = directory_entries(fd, 3)?;
+    for kind in [SnapshotStagingKind::State, SnapshotStagingKind::Memory] {
+        if read_snapshot_record(fd, kind)?.is_some() {
+            expected.push(snapshot_record_name(kind).to_bytes());
+        }
+    }
+    let entries = directory_entries(fd, 5)?;
     Ok(entries.len() == expected.len()
         && entries.iter().all(|entry| {
             expected
@@ -1163,6 +1511,107 @@ mod tests {
         );
         clear_socket_record(directory.as_raw_fd(), &vsock).expect("vsock record should clear");
         assert!(directory_is_empty(directory.as_raw_fd()).expect("directory should inspect"));
+    }
+
+    #[test]
+    fn snapshot_staging_records_round_trip_redacted_and_clear_exactly() {
+        let root = TestRoot::new();
+        let directory = open_directory(root.path()).expect("test root should open");
+        let state_name = SnapshotStagingName::parse(
+            SnapshotStagingKind::State,
+            ".bangbang-snapshot-state-0123456789abcdef0123456789abcdef",
+        )
+        .expect("state staging name should parse");
+        let memory_name = SnapshotStagingName::parse(
+            SnapshotStagingKind::Memory,
+            ".bangbang-snapshot-memory-fedcba9876543210fedcba9876543210",
+        )
+        .expect("memory staging name should parse");
+        let state = SnapshotStagingOwnershipRecord::new(
+            SnapshotStagingKind::State,
+            ObjectIdentity {
+                device: 61,
+                inode: 67,
+            },
+            state_name,
+            ObjectIdentity {
+                device: 71,
+                inode: 73,
+            },
+        );
+        let memory = SnapshotStagingOwnershipRecord::new(
+            SnapshotStagingKind::Memory,
+            ObjectIdentity {
+                device: 79,
+                inode: 83,
+            },
+            memory_name,
+            ObjectIdentity {
+                device: 89,
+                inode: 97,
+            },
+        );
+
+        write_snapshot_record(directory.as_raw_fd(), &state).expect("state record should write");
+        write_snapshot_record(directory.as_raw_fd(), &memory).expect("memory record should write");
+        assert_eq!(
+            read_snapshot_record(directory.as_raw_fd(), SnapshotStagingKind::State)
+                .expect("state record should read"),
+            Some(state.clone())
+        );
+        assert_eq!(
+            read_snapshot_record(directory.as_raw_fd(), SnapshotStagingKind::Memory)
+                .expect("memory record should read"),
+            Some(memory.clone())
+        );
+        assert!(
+            directory_contains_only_ownership_records(directory.as_raw_fd())
+                .expect("known records should validate")
+        );
+        let debug = format!("{state:?} {memory:?}");
+        assert!(!debug.contains("012345") && !debug.contains("fedcba"));
+        assert!(!debug.contains("61") && !debug.contains("97"));
+
+        clear_snapshot_record(directory.as_raw_fd(), &state).expect("state record should clear");
+        assert!(
+            read_snapshot_record(directory.as_raw_fd(), SnapshotStagingKind::State)
+                .expect("state absence should read")
+                .is_none()
+        );
+        assert!(
+            read_snapshot_record(directory.as_raw_fd(), SnapshotStagingKind::Memory)
+                .expect("memory record should remain")
+                .is_some()
+        );
+        clear_snapshot_record(directory.as_raw_fd(), &memory).expect("memory record should clear");
+        assert!(directory_is_empty(directory.as_raw_fd()).expect("directory should inspect"));
+    }
+
+    #[test]
+    fn snapshot_staging_names_reject_wrong_kind_case_length_and_components() {
+        for (kind, value) in [
+            (
+                SnapshotStagingKind::State,
+                ".bangbang-snapshot-memory-0123456789abcdef0123456789abcdef",
+            ),
+            (
+                SnapshotStagingKind::State,
+                ".bangbang-snapshot-state-0123456789abcdef",
+            ),
+            (
+                SnapshotStagingKind::Memory,
+                ".bangbang-snapshot-memory-ABCDEF0123456789abcdef0123456789",
+            ),
+            (
+                SnapshotStagingKind::Memory,
+                ".bangbang-snapshot-memory-0123456789abcdef0123456789abcdeg",
+            ),
+        ] {
+            assert_eq!(
+                SnapshotStagingName::parse(kind, value),
+                Err(RuntimeError::InvalidEntry)
+            );
+        }
     }
 
     #[test]

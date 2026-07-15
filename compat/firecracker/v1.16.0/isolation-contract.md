@@ -212,6 +212,39 @@ creation/FIFO behavior and logger/metrics-versus-serial open timing. Pending,
 replaced, active, cancelled, and terminal files close by ordinary cooperative
 ownership; no hard revocation is claimed.
 
+Snapshot describe/state/memory inputs use the same exact file-reference grammar
+with distinct singleton read-only roles. Early description duplicates and
+inspects only the granted regular file. Load duplicates state only for bounded
+decode, discovers any persisted grant-tagged root selector, then atomically
+takes every tagged state, memory, and read-only `DriveBacking` input. The
+prepared state, anonymous memory, and supplied root file complete restore
+without reopening a submitted or persisted tag. Direct and mixed ordinary
+members retain pathname adapters. Snapshot input grants are one-time after the
+atomic take; wrong, missing, duplicate, or mismatched authority consumes none.
+
+Snapshot outputs use `bangbang-grant:<GrantId>/<SnapshotOutputChild>`, where
+the child is one 1–255 byte UTF-8 component with no NUL or `/` and is not `.` or
+`..`. `SnapshotOutputDirectory` is repeatable across distinct grants and one
+retained grant may serve distinct state/memory children and later create
+requests. Complete request/profile validation precedes adoption. Publication
+creates staging and final files relative to retained anchors, preserves
+exclusive memory-first/state-last commit and typed orphan/durability behavior,
+and never reopens the bookmark-resolved path. App Sandbox scope still depends
+on the authorized directory remaining reachable at its granted pathname;
+moving that directory after scope activation can make descriptor-relative
+writes fail.
+
+For each granted staging inode, the worker durably writes one strict private
+record containing only artifact kind, exact directory identity, the bounded
+random component, and exact file identity. Normal publication or conclusive
+worker cleanup clears it. After worker exit, the launcher matches the record to
+its retained exact output anchor and unlinks only a current-user regular `0600`,
+single-link device/inode match; missing or replaced entries are preserved before
+the record and namespace are cleared. A hard death between file creation and
+recording, or simultaneous uncatchable launcher/worker death, can still leave
+residue. Darwin offers no identity-conditional unlink primitive that closes
+those windows.
+
 API and vsock sockets use the distinct exact contained reference
 `bangbang-grant:<GrantId>/<SocketChild>`. The child is one 1–64 byte ASCII
 `[A-Za-z0-9._-]` component other than `.` or `..`; malformed, traversal,
@@ -258,7 +291,6 @@ empty session namespaces.
 
 The following remain feasible work owned by #1351:
 
-- consumer adoption for snapshot resources;
 - general dynamic post-Ready delivery and any hard-revocation broker;
 - cross-filesystem socket publication;
 - vmnet entitlement/provisioning and per-VM network policy;
@@ -342,7 +374,14 @@ execution proves:
   followed by identity-owned API/vsock socket and namespace cleanup; and
 - launcher-first and worker-first abrupt death after granted API pathname
   replacement, with both surviving cleanup owners preserving the replacement
-  while clearing only the matching strict record and session namespace.
+  while clearing only the matching strict record and session namespace;
+- external granted native-v1 create into separate directories, retained-anchor
+  reuse for a second pair, same-GrantId concurrent-session isolation, bounded
+  early description, and two fresh descriptor-bound state/memory/root restores
+  with explicit and automatic resume through guest `SYSTEM_OFF`; and
+- worker-first death after a durably recorded snapshot staging inode, with the
+  launcher removing the exact inode or preserving a same-name replacement while
+  clearing the private record and session namespace.
 
 Readiness events and bounded deadlines replace fixed sleeps. Destructive cases
 operate on private copies, so later checks continue to use the canonical signed
@@ -360,9 +399,10 @@ work:
 
 The delivered package/session/grant/fd/crash subset, including exact adoption by
 the singleton startup inputs/outputs, repeatable block/pmem consumers, and
-singleton API/vsock directories plus the fixed port-only vsock facet, is real
-but does not complete any of those composite records because snapshot
-consumers, general dynamic brokerage/hard revocation, network,
+singleton API/vsock directories plus the fixed port-only vsock facet, and
+snapshot describe/state/memory/root/output consumers with exact crash cleanup,
+is real but does not complete any of those composite records because general
+dynamic brokerage/hard revocation, network,
 Linux-outcome, and deployment work remains. The broad `jailer`, `seccomp`,
 `seccompiler`, and `production-host` corpus records remain `audit-required`.
 Neither this audit nor the executable evidence is direct Firecracker jailer

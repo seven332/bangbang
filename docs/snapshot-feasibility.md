@@ -50,8 +50,24 @@ path.
 - `--snapshot-version` prints `v1.0.0`. `--describe-snapshot <PATH>` opens a
   bounded regular file with the same nonblocking, path-redacted startup-file
   policy, fully validates the native envelope and CRC, and prints its embedded
-  version. Both commands exit before fd-table setup, API socket publication,
-  signal setup, or HVF startup.
+  version. In contained mode an exact `SnapshotDescribeInput`/`ReadOnly` grant
+  supplies that already-opened file; direct mode keeps pathname opening. Both
+  commands exit before fd-table setup, API socket publication, signal setup, or
+  HVF startup.
+- Contained create accepts
+  `bangbang-grant:<GrantId>/<SnapshotOutputChild>` for either output. The child
+  is one 1–255 byte UTF-8 component with no NUL or `/` and is not `.` or `..`.
+  A repeatable `SnapshotOutputDirectory` grant may be shared by distinct
+  children, paired with a second grant, mixed with one ordinary destination,
+  and retained for later create attempts. Staging and final publication remain
+  relative to the granted anchors and never reopen their resolved paths.
+- Contained load accepts exact `bangbang-grant:<GrantId>` state and memory
+  selectors. It duplicates state for bounded decode without consuming the
+  registry, discovers any persisted grant-tagged read-only root backing, then
+  atomically takes all tagged `SnapshotStateInput`, `SnapshotMemoryInput`, and
+  `DriveBacking` files. Final memory/device/HVF preparation reuses decoded state
+  and supplied descriptors. Direct and mixed ordinary members keep pathname
+  adapters; no reserved reference falls back to ambient opening.
 - The runtime can encode a bounded state-embeddable GPA manifest, stream a full
   memory image from exact `GuestMemory` regions, and load a validated image into
   newly allocated anonymous memory through already-open seekable handles. A
@@ -65,6 +81,11 @@ path.
   explicit and automatic resume. Guest shutdown is reachable only after it
   observes VMGenID replacement, so clean exit also proves continuation from the
   captured execution point.
+- Signed production-bundle coverage repeats that continuity with external
+  granted kernel/root/metrics, separate state/memory output directories,
+  granted early description, two fresh state/memory/root grant loads, explicit
+  and automatic resume, collision preservation, and worker-first exact staging
+  cleanup versus same-name replacement preservation.
 
 ## Native V1 State Envelope
 
@@ -181,8 +202,9 @@ remainder of the outer 16 MiB payload budget after its exact binding. Unknown
 kinds, nonzero flags, a nonzero kind-1 state length, empty or oversized kind-2
 state, nested binding failures, truncation, and trailing bytes fail closed.
 
-On macOS, the internal publisher opens each destination directory once and
-performs subsequent namespace operations relative to that retained descriptor.
+On macOS, the internal publisher either opens each direct destination directory
+once or accepts an already-opened contained output anchor, then performs every
+namespace operation relative to that retained descriptor.
 It rejects exact directory/component aliases and pre-existing regular files,
 directories, FIFOs, sockets, and symlinks. Each artifact is prepared under an
 unreported 128-bit-random private name created with `O_EXCL`, `O_NOFOLLOW`, and
@@ -219,8 +241,9 @@ automatic cleanup targets. After state rename, a failed final directory sync
 returns a committed-but-durability-uncertain outcome, not an ordinary error;
 the visible pair must not be retried under the same names.
 
-Loading opens and validates state first. Only a valid commit record permits the
-regular, nonblocking, no-follow memory open and anonymous memory allocation.
+Loading opens and validates state first, or decodes an exact duplicate of a
+contained state grant. Only a valid commit record permits the regular,
+nonblocking, no-follow memory open or supplied-memory load and anonymous memory allocation.
 The exact image identity, length, GPA layout, CRC, final position, and EOF must
 all match before memory is returned. No VM or HVF state is constructed or
 mutated.
@@ -234,7 +257,14 @@ mutation rights can still race staging checks or replace final names later.
 CRC and image identity are mismatch/corruption detection, not authentication.
 Case- or normalization-equivalent absent names can also escape exact alias
 preflight; the exclusive state rename then fails safely and may leave a memory
-orphan.
+orphan. For granted outputs, strict per-artifact ownership records let the
+launcher use its retained exact anchor after worker reap and unlink only a
+current-user regular `0600`, single-link device/inode match; missing or replaced
+entries are preserved. A worker hard death before its record is durable, or
+simultaneous uncatchable worker/launcher death, can still leave staging residue.
+App Sandbox also ties security-scoped authorization to the granted directory's
+pathname: moving that directory after scope activation can deny later
+descriptor-relative writes even though the anchor remains open.
 
 ### Native-HVF Composite Payload
 
@@ -1194,7 +1224,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Runner pending-interrupt capture and restore (first bidirectional interrupt subset implemented) | #1174 adds typed IRQ/FIQ owner-thread get/set commands and one failure-atomic IRQ-then-FIQ capture. #1248 adds ordered owner-thread restore of that complete value through a dedicated value-free failure with the exact failed type and completed prefix. The two writes are nontransactional, so callers must retry the complete value or discard the vCPU before execution. CPU pending levels and validated GIC PPI mutations share generalized interrupt-operation admission but remain distinct state models. Both boot-session forms expose capture and restore, but the snapshot lease invokes neither. HVF clears both levels after a run, so automatic pre-run reassertion, the separately captured opaque GIC blob and EL1 ICC value, routing, delivery/EOI, persistence, schema, orchestration, and multi-vCPU association remain deferred. | Exact IRQ-then-FIQ read/write order; both read and write failures; typed value-free partial-write context; complete retry; bidirectional conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed IRQ-only restore/recapture twice after a FIQ-only mutation, followed by explicit clear, without a guest run or GIC/delivery claims. |
 | Runner opaque GIC device-state capture and restore (second bidirectional interrupt subset implemented) | #1178 adds a redacted immutable byte value and owner-loop capture for Hypervisor.framework's stable, versioned GIC device blob, with fallible allocation and retained-object cleanup. #1255 adds an independently loaded setter and command-owned pre-first-run apply of the complete value. Both operations share generalized interrupt admission; restore checks the sticky run lifetime atomically, preserves exact HVF failure provenance, and clones no bytes into diagnostics. Both boot-session forms expose capture and apply without involving the snapshot lease. EL1 ICC state is separate; parsing, persistence, compatibility preflight, cross-step lease, schema, orchestration, and multi-vCPU stopping remain deferred. | Capture create/size/data/release order and cleanup; restore exact pointer/`usize` length, empty/no-call and backend failure; sticky run gate; every forward/reverse conflict; abandonment, channels, queued destruction, unwind, panic, shutdown; redacted debug; and signed non-empty same-VM capture/reapply before run without parsing, comparison, logging, or guest execution. |
 | Runner EL1 GIC ICC register capture and restore (third bidirectional interrupt subset implemented) | #1180 adds a typed immutable ten-register value and owner-thread capture for PMR, BPR0, AP0R0, AP1R0, RPR, BPR1, CTLR, SRE, IGRPEN0, and IGRPEN1. #1258 adds a pre-first-run owner command that independently preloads getter and setter capabilities, writes the nine architecturally mutable fields in capture order, and validates the derived read-only RPR at its original position. A typed value-free error distinguishes write from derived-value validation and reports the exact register and completed write prefix. The operation is nontransactional, so callers must retry the complete value or discard the vCPU before execution. It shares generalized interrupt admission and complements, but is not embedded in, the opaque GIC blob; callers apply that compatible blob first without receiving a cross-step lease. Both boot-session forms expose capture and restore without involving the snapshot lease. `ICC_SRE_EL2`, ICH/ICV, destination validation, host-update preflight, persistence, composite orchestration, and multi-vCPU association remain deferred. | Exact SDK ids and ten-position read/write-or-validate order; every capture read failure, every mutable write failure, RPR read failure and mismatch; typed value-free partial-write context; complete retry; sticky never-run gate; bidirectional conflicts, abandonment, channels, queued destruction, unwind, panic, shutdown, and both boot-session delegates; signed guest-written PMR/BPR/SRE/group-enable capture plus same-idle-vCPU opaque-blob/ICC capture, ordered restore, and two exact recaptures without guest execution or value logging. |
-| Native-v1 baseline device profile (internal state and preflight implemented) | #1268 adds an exact standalone `BANGDEV\0` v1 profile capped at 16 KiB for one read-only root virtio-block device, complete healthy virtio-mmio registers, one queue and active cursors, guest-visible interrupt status, frozen limiter/retry time, UART registers with fresh-default output, and canonical VMGenID/VMClock metadata without reusable generation bytes. Capture joins process-owned drive/serial configuration with one quiesced worker observation; load preflight validates mapped non-overlapping rings and cursors, reopens the root regular file read-only/no-follow with exact descriptor stat identity, and builds drop-safe block/serial resources off-side. #1270 nests this exact value in the composite bundle, and #1272 installs it without boot writes and performs post-GIC VMGenID replacement. | Deterministic codec/header/EOF/bounds/redaction; transport no-partial-restore; queue mapping/cursor/retry; injected-time limiter and scheduler tests; real-file identity/no-follow and fresh-serial preflight; no-boot-write installation; runtime/HVF ownership; signed distinct-destination continuity. |
+| Native-v1 baseline device profile (internal state and preflight implemented) | #1268 adds an exact standalone `BANGDEV\0` v1 profile capped at 16 KiB for one read-only root virtio-block device, complete healthy virtio-mmio registers, one queue and active cursors, guest-visible interrupt status, frozen limiter/retry time, UART registers with fresh-default output, and canonical VMGenID/VMClock metadata without reusable generation bytes. Capture joins process-owned drive/serial configuration with one quiesced worker observation; a supplied grant backing is identified from its live descriptor without reopening its persisted tag. Load preflight validates mapped non-overlapping rings and cursors, either reopens the direct root read-only/no-follow or adopts the contained persisted read-only `DriveBacking`, requires exact device/inode/length/mode/mtime/ctime identity, and builds drop-safe block/serial resources off-side. #1270 nests this exact value in the composite bundle, #1272 installs it without boot writes and performs post-GIC VMGenID replacement, and #1368 supplies atomic contained state/memory/root preparation. | Deterministic codec/header/EOF/bounds/redaction; transport no-partial-restore; queue mapping/cursor/retry; injected-time limiter and scheduler tests; real-file identity/no-follow and supplied-file origin; fresh-serial preflight; no-boot-write installation; runtime/HVF ownership; signed direct and contained distinct-destination continuity. |
 | EL2 GIC CPU registers and remaining emulated-device state | Inventory `ICC_SRE_EL2` plus ICH/ICV ownership and add stable state models for optional MMIO devices outside the native-v1 baseline. | Per-device round-trip unit tests and signed HVF EL2 CPU-interface/device-state coverage if nested virtualization is enabled. |
 | Full guest-memory image I/O (internal primitives implemented) | #1263 defines the native-v1 fixed memory header and state-authoritative GPA binding, preserves exact discontiguous/dynamic region boundaries and canonical absolute offsets, streams full bytes through a fallible 1 MiB buffer with CRC-64/Jones, and anonymously loads only after seek-observed length, pair identity, trailer, binding checksum, and EOF validation. #1270 adds cooperative stage/chunk cancellation and holds immutable capture ownership through this copy; public success remains deferred. | Golden header/binding/CRC bytes; exact maximum metadata; multi-region and chunk-boundary round trips; malformed layout/length/identity/integrity; short/interrupted/failing I/O and seek races; cancellation before fixed stages and successive chunks; allocation/access failure and partial-owner drop; full process and signed capture coverage. |
 | No-clobber artifact commit boundary (internal primitive implemented) | #1264 adds the fixed memory-only commit record, directory-fd-anchored macOS staging, exclusive memory-first/state-last publication with file and directory barriers, typed orphan and committed-uncertain outcomes, and the inverse state-first committed-pair loader. #1270 preserves kind 1 exactly and adds bounded kind 2 for binding plus opaque complete state. #1274 adds a generic typed producer over a pathless staging writer, enforced writer-close proof, and fixed-size record/output matching while preserving kind 1. Destination directories are trusted; published finals are never cleanup targets; no public VMM/API path invokes the publisher. | Exact codec bytes and malformed inputs for both kinds; callback ordering/skip/panic/error/retention/forget and retry; output mismatch; same/cross-directory success; all final file types and aliases; ordered failure injection; late collisions; observed staging replacement; cleanup failure; corruption; redaction; and coordinated multiprocess contention. |
