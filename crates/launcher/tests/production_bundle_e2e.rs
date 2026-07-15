@@ -318,6 +318,11 @@ fn launcher_exposes_exact_jailer_help_version_and_policy_validation() {
     let assert_invalid = |mut command: Command, context: &str| {
         let invalid = run_with_timeout(&mut command, PROCESS_TIMEOUT, context);
         assert_eq!(invalid.status.code(), Some(1));
+        assert!(
+            invalid.stdout.is_empty(),
+            "invalid policy must not execute the worker; {context} stdout:\n{}",
+            String::from_utf8_lossy(&invalid.stdout)
+        );
         assert_eq!(
             String::from_utf8_lossy(&invalid.stderr),
             "bangbang launcher: invalid production launch policy\n"
