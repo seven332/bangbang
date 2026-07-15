@@ -1067,9 +1067,11 @@ mod platform {
                 || self.policy.is_daemonized() != daemonized
                 || [
                     "BANGBANG_POLICY_SECRET",
+                    "BANGBANG_ORDINARY_AMBIENT",
                     "DYLD_INSERT_LIBRARIES",
                     "DYLD_LIBRARY_PATH",
                     "RUST_LOG",
+                    SESSION_ENV_KEY,
                 ]
                 .into_iter()
                 .any(|name| env::var_os(name).is_some())

@@ -315,13 +315,47 @@ fn launcher_exposes_exact_jailer_help_version_and_policy_validation() {
     assert_output_success(&version, "jailer version");
     assert!(String::from_utf8_lossy(&version.stdout).starts_with("Jailer v"));
 
-    let mut invalid = jailer_command(&bundle, "invalid-policy", &[], false);
-    invalid.args(["--id", "forged-duplicate"]).arg("--version");
-    let invalid = run_with_timeout(&mut invalid, PROCESS_TIMEOUT, "invalid jailer policy");
-    assert_eq!(invalid.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8_lossy(&invalid.stderr),
-        "bangbang launcher: invalid production launch policy\n"
+    let assert_invalid = |mut command: Command, context: &str| {
+        let invalid = run_with_timeout(&mut command, PROCESS_TIMEOUT, context);
+        assert_eq!(invalid.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&invalid.stderr),
+            "bangbang launcher: invalid production launch policy\n"
+        );
+    };
+
+    let mut duplicate = jailer_command(&bundle, "invalid-policy", &[], false);
+    duplicate
+        .args(["--id", "forged-duplicate"])
+        .arg("--version");
+    assert_invalid(duplicate, "duplicate jailer policy");
+
+    // SAFETY: Credential getters have no pointer or ownership contract.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let policy_command = |executable: &Path, requested_uid: u32, requested_gid: u32| {
+        let mut command = Command::new(launcher(&bundle));
+        command
+            .arg(JAILER_OPTION)
+            .args(["--id", "fixed-policy"])
+            .arg("--exec-file")
+            .arg(executable)
+            .args([
+                "--uid",
+                &requested_uid.to_string(),
+                "--gid",
+                &requested_gid.to_string(),
+                "--",
+                "--version",
+            ]);
+        command
+    };
+    assert_invalid(
+        policy_command(Path::new("/usr/bin/false"), uid, gid),
+        "substituted jailer executable",
+    );
+    assert_invalid(
+        policy_command(&worker_executable(&bundle), uid.wrapping_add(1), gid),
+        "mismatched jailer credential",
     );
 }
 
@@ -344,11 +378,31 @@ fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits
             .arg("--")
             .arg(GRANT_PROBE_OPTION)
             .arg(case)
-            .env("BANGBANG_POLICY_SECRET", "must-not-reach-worker");
+            .env("BANGBANG_POLICY_SECRET", "secret-must-not-reach-worker")
+            .env(
+                "BANGBANG_ORDINARY_AMBIENT",
+                "ordinary-must-not-reach-worker",
+            )
+            .env("DYLD_LIBRARY_PATH", "loader-must-not-reach-worker")
+            .env("RUST_LOG", "debug-must-not-reach-worker")
+            .env(SESSION_ENV_KEY, "forged-internal-marker");
         let output = run_with_timeout(&mut command, PROCESS_TIMEOUT, "signed jailer policy probe");
         assert_output_success(&output, "signed jailer policy probe");
         assert_grant_output_redacted(&output, &fixture);
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("must-not-reach-worker"));
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for value in [
+            "secret-must-not-reach-worker",
+            "ordinary-must-not-reach-worker",
+            "loader-must-not-reach-worker",
+            "debug-must-not-reach-worker",
+            "forged-internal-marker",
+        ] {
+            assert!(!diagnostics.contains(value));
+        }
         fixture.assert_completed();
     }
 
@@ -2337,9 +2391,32 @@ fn contained_worker_closes_unexpected_inherited_descriptor() {
     let fixture = TestDir::new("inherited-fd");
     let config = fixture.path().join("config.json");
     fs::write(&config, b"{}").expect("probe config should be written");
-    let file = fs::File::open(&config).expect("probe config should open");
-    // SAFETY: `file` remains live and the returned descriptor is independently owned.
-    let inherited = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+    let regular = fs::File::open(&config).expect("probe config should open");
+    let directory = fs::File::open(fixture.path()).expect("probe directory should open");
+    let (stream, _stream_peer) = UnixStream::pair().expect("probe stream pair should open");
+    let (datagram, _datagram_peer) = UnixDatagram::pair().expect("probe datagram pair should open");
+    let mut pipe = [-1; 2];
+    // SAFETY: `pipe` is writable storage for exactly two fresh descriptors.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    // SAFETY: Both successful pipe descriptors transfer ownership exactly once.
+    let pipe_reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    // SAFETY: This is the distinct second descriptor returned by the same call.
+    let _pipe_writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+
+    for (kind, descriptor) in [
+        ("regular file", regular.as_raw_fd()),
+        ("directory", directory.as_raw_fd()),
+        ("stream socket", stream.as_raw_fd()),
+        ("datagram socket", datagram.as_raw_fd()),
+        ("pipe", pipe_reader.as_raw_fd()),
+    ] {
+        assert_unexpected_descriptor_closed(&bundle, descriptor, kind);
+    }
+}
+
+fn assert_unexpected_descriptor_closed(bundle: &Path, source: libc::c_int, kind: &str) {
+    // SAFETY: `source` remains live and the returned descriptor is independently owned.
+    let inherited = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 200) };
     assert!(inherited >= 200, "high probe descriptor should duplicate");
     // SAFETY: `inherited` is the fresh descriptor above and ownership transfers once.
     let inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
@@ -2350,7 +2427,7 @@ fn contained_worker_closes_unexpected_inherited_descriptor() {
     assert_eq!(result, 0);
     let descriptor_path = format!("/dev/fd/{}", inherited.as_raw_fd());
     let output = run_launcher(
-        &bundle,
+        bundle,
         &[
             OsStr::new("--config-file"),
             OsStr::new(&descriptor_path),
@@ -2361,7 +2438,7 @@ fn contained_worker_closes_unexpected_inherited_descriptor() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("failed to read config file"),
-        "closed descriptor should fail at read: {stderr}"
+        "closed {kind} descriptor should fail at read: {stderr}"
     );
     assert!(
         !stderr.contains("missing required section"),

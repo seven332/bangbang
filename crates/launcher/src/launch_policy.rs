@@ -441,6 +441,13 @@ mod tests {
         ]
     }
 
+    fn assert_invalid(args: Vec<OsString>) {
+        assert!(matches!(
+            LaunchCommand::parse(args),
+            Err(LauncherError::InvalidLaunchPolicy)
+        ));
+    }
+
     #[test]
     fn parses_exact_policy_and_injects_owned_arguments() {
         let worker = Path::new("/fixed/BangbangWorker");
@@ -520,11 +527,176 @@ mod tests {
                 value
             },
         ] {
+            assert_invalid(mutation);
+        }
+    }
+
+    #[test]
+    fn enforces_id_byte_boundaries_and_policy_text_encoding() {
+        let worker = Path::new("/fixed/worker");
+        for id in ["a".repeat(64), "界".repeat(21)] {
+            let mut args = base(worker);
+            args[2] = id.into();
             assert!(matches!(
-                LaunchCommand::parse(mutation),
-                Err(LauncherError::InvalidLaunchPolicy)
+                LaunchCommand::parse(args),
+                Ok(LaunchCommand::Run(_))
             ));
         }
+
+        for id in [
+            String::new(),
+            "a".repeat(65),
+            "界".repeat(22),
+            "bad_id".into(),
+        ] {
+            let mut args = base(worker);
+            args[2] = id.into();
+            assert_invalid(args);
+        }
+
+        let mut non_utf8_id = base(worker);
+        non_utf8_id[2] = OsString::from_vec(vec![0xff]);
+        assert_invalid(non_utf8_id);
+
+        let mut non_utf8_executable = base(worker);
+        non_utf8_executable[4] = OsString::from_vec(vec![b'/', 0xff]);
+        assert_invalid(non_utf8_executable);
+    }
+
+    #[test]
+    fn rejects_malformed_numbers_limits_flags_and_delimiters() {
+        let worker = Path::new("/fixed/worker");
+        let mut cases = Vec::new();
+
+        let mut missing_delimiter = base(worker);
+        missing_delimiter.pop();
+        cases.push(missing_delimiter);
+
+        let mut relative_executable = base(worker);
+        relative_executable[4] = "relative/worker".into();
+        cases.push(relative_executable);
+
+        for (index, value) in [(6, "4294967296"), (8, "not-a-number")] {
+            let mut args = base(worker);
+            args[index] = value.into();
+            cases.push(args);
+        }
+
+        for value in [
+            "fsize",
+            "=1",
+            "fsize=",
+            "fsize=1=2",
+            "unknown=1",
+            "no-file=18446744073709551616",
+        ] {
+            let mut args = base(worker);
+            args.splice(
+                args.len() - 1..args.len() - 1,
+                [OsString::from(RESOURCE_LIMIT_OPTION), OsString::from(value)],
+            );
+            cases.push(args);
+        }
+
+        let mut duplicate_daemon = base(worker);
+        duplicate_daemon.splice(
+            duplicate_daemon.len() - 1..duplicate_daemon.len() - 1,
+            [
+                OsString::from(DAEMONIZE_OPTION),
+                OsString::from(DAEMONIZE_OPTION),
+            ],
+        );
+        cases.push(duplicate_daemon);
+
+        for args in cases {
+            assert_invalid(args);
+        }
+    }
+
+    #[test]
+    fn validation_binds_fixed_executable_current_credentials_and_daemon_state() {
+        let worker = Path::new("/fixed/worker");
+        let LaunchCommand::Run(request) =
+            LaunchCommand::parse(base(worker)).expect("policy should parse")
+        else {
+            panic!("run command expected");
+        };
+        assert_eq!(request.validate(worker, false), Ok(()));
+        assert_eq!(
+            request.validate(Path::new("/fixed/other-worker"), false),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+        assert_eq!(
+            request.validate(worker, true),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+
+        let (uid, gid) = current_credentials().expect("credentials should be ordinary");
+        for (index, value) in [(6, uid.wrapping_add(1)), (8, gid.wrapping_add(1))] {
+            let mut args = base(worker);
+            args[index] = value.to_string().into();
+            let LaunchCommand::Run(request) =
+                LaunchCommand::parse(args).expect("mismatched policy should parse")
+            else {
+                panic!("run command expected");
+            };
+            assert_eq!(
+                request.validate(worker, false),
+                Err(LauncherError::InvalidLaunchPolicy)
+            );
+        }
+
+        let mut daemon_args = base(worker);
+        daemon_args.insert(daemon_args.len() - 1, DAEMONIZE_OPTION.into());
+        let LaunchCommand::Run(daemon_request) =
+            LaunchCommand::parse(daemon_args).expect("daemon policy should parse")
+        else {
+            panic!("run command expected");
+        };
+        assert_eq!(daemon_request.validate(worker, true), Ok(()));
+        assert_eq!(
+            daemon_request.validate(worker, false),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+    }
+
+    #[test]
+    fn rejects_forwarded_singletons_before_worker_delimiter_only() {
+        let worker = Path::new("/fixed/worker");
+        for option in FORWARDED_SINGLETONS {
+            let mut separate = base(worker);
+            separate.extend([OsString::from(option), OsString::from("forged")]);
+            assert_invalid(separate);
+
+            let mut attached = base(worker);
+            attached.push(format!("{option}=forged").into());
+            assert_invalid(attached);
+        }
+
+        let opaque = OsString::from_vec(vec![0xff, 0xfe]);
+        let mut args = base(worker);
+        args.extend([
+            OsString::from(DELIMITER),
+            OsString::from(ID_OPTION),
+            opaque.clone(),
+        ]);
+        let LaunchCommand::Run(request) =
+            LaunchCommand::parse(args).expect("post-delimiter values should stay opaque")
+        else {
+            panic!("run command expected");
+        };
+        let prepared = request
+            .prepare(
+                worker,
+                LaunchTiming::sample().expect("timing should sample"),
+                false,
+            )
+            .expect("opaque worker tail should prepare");
+        assert_eq!(
+            prepared.worker_args.get(prepared.worker_args.len() - 2),
+            Some(&OsString::from(ID_OPTION))
+        );
+        assert_eq!(prepared.worker_args.last(), Some(&opaque));
     }
 
     #[test]
