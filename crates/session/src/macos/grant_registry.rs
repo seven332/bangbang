@@ -12,7 +12,7 @@ use crate::macos::bookmark::{BookmarkError, ScopedBookmark};
 use crate::macos::grant_transport::ReceivedGrant;
 use crate::{
     BatchId, GrantAccess, GrantId, GrantObjectKind, GrantRecord, MAX_BATCH_BOOKMARK_BYTES,
-    MAX_GRANT_RECORDS, MAX_GRANTS, ObjectIdentity, ResourceRole, SessionId,
+    MAX_BOOKMARK_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS, ObjectIdentity, ResourceRole, SessionId,
 };
 
 /// Redacted staging or adoption failure.
@@ -361,7 +361,9 @@ impl StagedGrantBatch {
                 if !role.is_scoped_directory()
                     || access != GrantAccess::CreateChildren
                     || bookmark_bytes == 0
+                    || bookmark_bytes > MAX_BOOKMARK_BYTES
                     || fragment_count == 0
+                    || fragment_count > MAX_GRANT_RECORDS
                 {
                     return Err(GrantRegistryError);
                 }
@@ -740,6 +742,67 @@ mod tests {
             .expect("commit should return registry");
         assert!(committed.registry.is_empty());
         assert_eq!(committed.final_sequence, 1);
+    }
+
+    #[test]
+    fn receiver_revalidates_scoped_directory_limits_without_codec_assumptions() {
+        let directory = std::env::temp_dir().join(format!(
+            "bangbang-grant-registry-limits-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir(&directory);
+        let directory = fs::canonicalize(directory).expect("directory should canonicalize");
+        let anchor_file = File::open(&directory).expect("directory anchor should open");
+        let stat = descriptor_stat(anchor_file.as_raw_fd()).expect("anchor stat should read");
+        let identity = ObjectIdentity {
+            device: normalized_device(stat.st_dev),
+            inode: stat.st_ino,
+        };
+        let session = SessionId::from_bytes([21; 32]);
+        let batch = BatchId::from_bytes([22; 16]);
+
+        for (bookmark_bytes, fragment_count) in
+            [(MAX_BOOKMARK_BYTES + 1, 1), (1, MAX_GRANT_RECORDS + 1)]
+        {
+            let mut staged = StagedGrantBatch::new(session);
+            staged
+                .accept(receive(
+                    session,
+                    batch,
+                    0,
+                    GrantRecord::Begin {
+                        grant_count: 1,
+                        record_count: 3,
+                        bookmark_bytes,
+                    },
+                    None,
+                ))
+                .expect("begin should stage");
+            let anchor = duplicate(&anchor_file);
+            let anchor_fd = anchor.as_raw_fd();
+            assert!(
+                staged
+                    .accept(receive(
+                        session,
+                        batch,
+                        1,
+                        GrantRecord::ScopedDirectory {
+                            id: GrantId::parse("api-directory").expect("ID should parse"),
+                            role: ResourceRole::ApiSocketDirectory,
+                            access: GrantAccess::CreateChildren,
+                            identity,
+                            bookmark_bytes,
+                            fragment_count,
+                        },
+                        Some(anchor),
+                    ))
+                    .is_err()
+            );
+            // SAFETY: Rejection must drop the directly constructed received fd.
+            assert_eq!(unsafe { libc::fcntl(anchor_fd, libc::F_GETFD) }, -1);
+        }
+
+        fs::remove_dir(directory).expect("directory fixture should clean up");
     }
 
     #[test]
