@@ -709,8 +709,8 @@ may skip execution. On supported Apple Silicon it proves:
 - suspended and post-`Hello` live-worker validation, bounded malformed bootstrap
   rejection before public readiness, and stable path/identity/frame redaction;
 - a default-close spawn allowlist that retains standard streams plus only the
-  private lifecycle and grant endpoints while making a deliberately inheritable
-  unexpected fd unavailable;
+  private lifecycle, grant, and dormant socket-broker endpoints while making a
+  deliberately inheritable unexpected fd unavailable;
 - container-only API socket readiness plus path-redacted denial of an outside
   config file;
 - `SIGINT` and `SIGTERM` as one graceful session cancellation with successful
@@ -758,7 +758,22 @@ may skip execution. On supported Apple Silicon it proves:
 - two simultaneous workers reuse the same three GrantIds in independent
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
-  planted replacement paths remain unchanged.
+  planted replacement paths remain unchanged;
+- exact socket-directory references publishing an owner-only API listener into
+  an outside-container granted directory, serving a real client only after
+  readiness, and reaping the short-lived signed binder before exposure;
+- delayed API `PUT /vsock` retaining the directory claim until startup,
+  publishing the supplied main listener, and leaving only launcher plus worker
+  in steady state with the worker's exact entitlements unchanged;
+- a real guest initiating connections to two distinct host ports through the
+  dormant-then-fixed launcher facet, with only port requests and connected fds
+  crossing the private protocol; and
+- a real host initiating through the supplied granted main listener and
+  completing deterministic 1-MiB transfers in both directions plus both peers'
+  write-half-close/EOF sequence before identity-owned socket cleanup; and
+- launcher-first and worker-first abrupt death after replacing the granted API
+  pathname, proving both surviving cleanup owners preserve the replacement,
+  clear only the matching private record, and remove the session namespace.
 
 The production target receives the same generated direct-boot ext4 fixture as
 the signed executable target, but supplies it only as an external drive grant;
@@ -774,13 +789,18 @@ message frame and cover wrong magic/version/reserved data, exact frame/buffer
 limits, oversized input, EOF rejection, replay, sequence gaps, cross-session and
 wrong-role/state input, reserved identity use, monotonic API/early-command/
 cancellation/grant state, and payload/identity-redacted formatting. Grant codec
-tests cover every closed record, limit and descriptor declaration. Darwin unit
+tests cover every closed record, limit and descriptor declaration. Socket
+broker codec tests cover every closed kind, exact fixed frame/reserved fields,
+session/sequence/child/port/status encoding, descriptor declarations,
+truncation, malformed ancillary data, and value-redacted formatting. Darwin unit
 tests cover SCM_RIGHTS and FD_CLOEXEC, payload/control truncation, malformed
 ancillary cleanup, exact descriptor access/type/identity, sequence/session/batch
 poisoning and rollback, fragmented bookmark scope, kernel peer acceptance and
 PID rejection, exact namespace naming/root derivation, bounded independent
 directory iteration across repeated checks, stale empty-directory recovery,
-populated-entry preservation, and replacement-safe cleanup. These tests do not
+populated-entry preservation, strict socket ownership records, anchored
+exclusive publication/rollback, binder framing/descriptor validation, broker
+state and relative-target validation, and replacement-safe cleanup. These tests do not
 replace the signed target:
 default-close spawning, dynamic code identity, App Sandbox root resolution,
 crash order, and real HVF claims require the packaged execution above.
@@ -1279,6 +1299,15 @@ hotplug, and broader CID routing are not supported. Native-v1 snapshot UDS
 override, event-queue `TRANSPORT_RESET`, and post-restore RX gating remain the
 precise #543 exclusions. The signed transfer is a compatibility/progress gate,
 not a general performance, Firecracker artifact, or snapshot-parity claim.
+
+The production-bundle socket-directory cases exercise the same guest protocol
+through contained host authority. Host initiation enters through the supplied
+granted main listener. Guest initiation keeps queue, credit, routing, and
+shutdown state in the worker but asks the already authenticated launcher only
+for one relative `<SocketChild>_<port>` connection at a time; the launcher never
+receives payload bytes. API-only and direct-path cases keep that broker dormant.
+These tests prove the narrow fixed facet, not general dynamic brokerage,
+outbound-network entitlement, cross-filesystem publication, or hard revocation.
 
 For Network/MMDS specifically, this evidence validates the supported
 virtio-MMIO/MMDS-only subset: guest-visible MTU, MMDS v1 and v2 through API and

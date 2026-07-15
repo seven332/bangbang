@@ -1,12 +1,12 @@
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-use crate::SessionId;
+use crate::{ObjectIdentity, ResourceRole, SessionId, SocketChild};
 
 const WORKER_CONTAINER_SUFFIX: &str = "Library/Containers/dev.bangbang.worker/Data/tmp";
 const RUNTIME_ROOT_NAME: &str = "bangbang-sessions-v1";
@@ -16,6 +16,127 @@ const MAX_CONFSTR_BYTES: usize = 4096;
 const MAX_PASSWD_BUFFER_BYTES: usize = 64 * 1024;
 const DEFAULT_PASSWD_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_RECOVERY_ENTRIES: usize = 128;
+const SOCKET_RECORD_BYTES: usize = 96;
+const SOCKET_RECORD_MAGIC: [u8; 4] = *b"BBS1";
+const SOCKET_RECORD_VERSION: u16 = 1;
+
+fn socket_record_name(role: ResourceRole) -> Result<&'static CStr, RuntimeError> {
+    match role {
+        ResourceRole::ApiSocketDirectory => Ok(c".api-socket-owner"),
+        ResourceRole::VsockSocketDirectory => Ok(c".vsock-socket-owner"),
+        _ => Err(RuntimeError::InvalidEntry),
+    }
+}
+
+/// Returns the fixed private staging name for one socket-directory role.
+pub fn socket_staging_name(role: ResourceRole) -> Result<&'static CStr, RuntimeError> {
+    match role {
+        ResourceRole::ApiSocketDirectory => Ok(c".api-socket.pending"),
+        ResourceRole::VsockSocketDirectory => Ok(c".vsock-socket.pending"),
+        _ => Err(RuntimeError::InvalidEntry),
+    }
+}
+
+/// Fixed cleanup evidence shared by the worker and its owning launcher.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SocketOwnershipRecord {
+    role: ResourceRole,
+    child: SocketChild,
+    identity: ObjectIdentity,
+}
+
+impl fmt::Debug for SocketOwnershipRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SocketOwnershipRecord")
+            .field("role", &self.role)
+            .field("child", &"<redacted>")
+            .field("identity", &"<redacted>")
+            .finish()
+    }
+}
+
+impl SocketOwnershipRecord {
+    /// Creates exact cleanup evidence for one published socket.
+    pub fn new(
+        role: ResourceRole,
+        child: SocketChild,
+        identity: ObjectIdentity,
+    ) -> Result<Self, RuntimeError> {
+        socket_record_name(role)?;
+        Ok(Self {
+            role,
+            child,
+            identity,
+        })
+    }
+
+    /// Returns the exact singleton directory role.
+    #[must_use]
+    pub const fn role(&self) -> ResourceRole {
+        self.role
+    }
+
+    /// Returns the redacted safe child value.
+    #[must_use]
+    pub const fn child(&self) -> &SocketChild {
+        &self.child
+    }
+
+    /// Returns the socket identity captured before publication.
+    #[must_use]
+    pub const fn identity(&self) -> ObjectIdentity {
+        self.identity
+    }
+}
+
+/// Worker-side duplicate of the locked private namespace directory.
+pub struct WorkerSocketNamespace {
+    directory: OwnedFd,
+    identity: NamespaceIdentity,
+}
+
+impl fmt::Debug for WorkerSocketNamespace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkerSocketNamespace")
+            .field("directory", &"<owned>")
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
+impl WorkerSocketNamespace {
+    /// Duplicates the validated namespace anchor with close-on-exec ownership.
+    pub fn try_clone(&self) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            directory: duplicate_fd(self.directory.as_raw_fd())?,
+            identity: self.identity,
+        })
+    }
+
+    /// Returns the validated namespace anchor without transferring ownership.
+    #[must_use]
+    pub fn anchor_fd(&self) -> RawFd {
+        self.directory.as_raw_fd()
+    }
+
+    /// Returns the validated namespace identity.
+    #[must_use]
+    pub const fn identity(&self) -> NamespaceIdentity {
+        self.identity
+    }
+
+    /// Exclusively writes one fixed ownership record before publication.
+    pub fn write_socket_record(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
+        write_socket_record(self.anchor_fd(), record)
+    }
+
+    /// Removes only the exact current ownership record.
+    pub fn clear_socket_record(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
+        clear_socket_record(self.anchor_fd(), record)
+    }
+}
 
 /// Device/inode proof sent in the bounded bootstrap protocol.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,6 +234,14 @@ impl WorkerNamespace {
         self.identity
     }
 
+    /// Duplicates the locked namespace anchor for socket staging and records.
+    pub fn socket_namespace(&self) -> Result<WorkerSocketNamespace, RuntimeError> {
+        Ok(WorkerSocketNamespace {
+            directory: duplicate_fd(self.directory.as_raw_fd())?,
+            identity: self.identity,
+        })
+    }
+
     /// Removes only the same empty namespace inode.
     pub fn cleanup(&mut self) -> Result<(), RuntimeError> {
         if self.cleaned {
@@ -206,11 +335,11 @@ impl LauncherNamespace {
         })
     }
 
-    /// Recovers the exact empty namespace after the owned worker is reaped.
+    /// Recovers the exact namespace after the owned worker is reaped.
     ///
     /// This covers failures before `Prepared` was decoded. A missing root or
-    /// session name is ordinary; live, replaced, populated, or invalid entries
-    /// remain fail-closed.
+    /// session name is ordinary; live, replaced, unrelated, or invalid entries
+    /// remain fail-closed. Strict socket records remain for launcher cleanup.
     pub fn recover_after_worker_exit(session: SessionId) -> Result<Option<Self>, RuntimeError> {
         let root_path = launcher_runtime_root()?;
         let root = match open_directory(&root_path) {
@@ -226,9 +355,10 @@ impl LauncherNamespace {
             Err(error) => return Err(error),
         };
         let identity = validate_directory(directory.as_raw_fd())?;
-        if !directory_is_empty(directory.as_raw_fd())?
-            || !try_lock_exclusive(directory.as_raw_fd())?
-        {
+        if !try_lock_exclusive(directory.as_raw_fd())? {
+            return Err(RuntimeError::InvalidEntry);
+        }
+        if !directory_contains_only_socket_records(directory.as_raw_fd())? {
             return Err(RuntimeError::InvalidEntry);
         }
         Ok(Some(Self {
@@ -260,6 +390,25 @@ impl LauncherNamespace {
         )?;
         self.cleaned = true;
         Ok(())
+    }
+
+    /// Reads the at-most-two strict socket ownership records after worker exit.
+    pub fn socket_ownership_records(&self) -> Result<Vec<SocketOwnershipRecord>, RuntimeError> {
+        let mut records = Vec::with_capacity(2);
+        for role in [
+            ResourceRole::ApiSocketDirectory,
+            ResourceRole::VsockSocketDirectory,
+        ] {
+            if let Some(record) = read_socket_record(self.directory.as_raw_fd(), role)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Removes only an exact validated socket ownership record.
+    pub fn clear_socket_record(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
+        clear_socket_record(self.directory.as_raw_fd(), record)
     }
 }
 
@@ -405,6 +554,166 @@ fn owned_fd(fd: RawFd) -> Result<OwnedFd, RuntimeError> {
     }
 }
 
+fn duplicate_fd(fd: RawFd) -> Result<OwnedFd, RuntimeError> {
+    // SAFETY: `fd` remains live for `fcntl`; success returns a fresh owned descriptor.
+    owned_fd(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })
+}
+
+fn encode_socket_record(record: &SocketOwnershipRecord) -> [u8; SOCKET_RECORD_BYTES] {
+    let mut bytes = [0_u8; SOCKET_RECORD_BYTES];
+    bytes[0..4].copy_from_slice(&SOCKET_RECORD_MAGIC);
+    bytes[4..6].copy_from_slice(&SOCKET_RECORD_VERSION.to_be_bytes());
+    bytes[6] = record.role as u8;
+    bytes[7] = u8::try_from(record.child.as_bytes().len()).unwrap_or(0);
+    bytes[8..16].copy_from_slice(&record.identity.device.to_be_bytes());
+    bytes[16..24].copy_from_slice(&record.identity.inode.to_be_bytes());
+    let child_end = 24 + record.child.as_bytes().len();
+    if let Some(target) = bytes.get_mut(24..child_end) {
+        target.copy_from_slice(record.child.as_bytes());
+    }
+    bytes
+}
+
+fn decode_socket_record(
+    expected_role: ResourceRole,
+    bytes: &[u8; SOCKET_RECORD_BYTES],
+) -> Result<SocketOwnershipRecord, RuntimeError> {
+    if bytes.get(0..4) != Some(SOCKET_RECORD_MAGIC.as_slice())
+        || bytes.get(4..6) != Some(SOCKET_RECORD_VERSION.to_be_bytes().as_slice())
+        || bytes.get(6).copied() != Some(expected_role as u8)
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    let child_length = usize::from(*bytes.get(7).ok_or(RuntimeError::InvalidEntry)?);
+    let child_end = 24_usize
+        .checked_add(child_length)
+        .filter(|end| *end <= 88)
+        .ok_or(RuntimeError::InvalidEntry)?;
+    if bytes
+        .get(child_end..)
+        .ok_or(RuntimeError::InvalidEntry)?
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    let child = std::str::from_utf8(bytes.get(24..child_end).ok_or(RuntimeError::InvalidEntry)?)
+        .map_err(|_| RuntimeError::InvalidEntry)?;
+    let device = u64::from_be_bytes(
+        bytes
+            .get(8..16)
+            .ok_or(RuntimeError::InvalidEntry)?
+            .try_into()
+            .map_err(|_| RuntimeError::InvalidEntry)?,
+    );
+    let inode = u64::from_be_bytes(
+        bytes
+            .get(16..24)
+            .ok_or(RuntimeError::InvalidEntry)?
+            .try_into()
+            .map_err(|_| RuntimeError::InvalidEntry)?,
+    );
+    SocketOwnershipRecord::new(
+        expected_role,
+        SocketChild::parse(child).map_err(|_| RuntimeError::InvalidEntry)?,
+        ObjectIdentity { device, inode },
+    )
+}
+
+fn write_socket_record(
+    directory: RawFd,
+    record: &SocketOwnershipRecord,
+) -> Result<(), RuntimeError> {
+    let name = socket_record_name(record.role)?;
+    // SAFETY: `directory` and `name` are live; success returns a fresh record fd.
+    let fd = unsafe {
+        libc::openat(
+            directory,
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    let mut file = File::from(owned_fd(fd)?);
+    let bytes = encode_socket_record(record);
+    let result = file.write_all(&bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        // SAFETY: The fixed name is NUL-terminated and relative to the live namespace.
+        let _ = unsafe { libc::unlinkat(directory, name.as_ptr(), 0) };
+        return Err(RuntimeError::Filesystem(error.kind()));
+    }
+    // SAFETY: `directory` is live and fsync has no pointer contract.
+    if unsafe { libc::fsync(directory) } != 0 {
+        // SAFETY: Same fixed private record cleanup after failed durability.
+        let _ = unsafe { libc::unlinkat(directory, name.as_ptr(), 0) };
+        return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
+    }
+    Ok(())
+}
+
+fn read_socket_record(
+    directory: RawFd,
+    role: ResourceRole,
+) -> Result<Option<SocketOwnershipRecord>, RuntimeError> {
+    let name = socket_record_name(role)?;
+    // SAFETY: `directory` and `name` are live; success returns a fresh record fd.
+    let fd = unsafe {
+        libc::openat(
+            directory,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(RuntimeError::Filesystem(error.kind()))
+        };
+    }
+    let mut file = File::from(owned_fd(fd)?);
+    let metadata = file
+        .metadata()
+        .map_err(|error| RuntimeError::Filesystem(error.kind()))?;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: Identity call has no pointer or ownership contract.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.uid() != uid
+        || metadata.nlink() != 1
+        || metadata.len() != u64::try_from(SOCKET_RECORD_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    let mut bytes = [0_u8; SOCKET_RECORD_BYTES];
+    file.read_exact(&mut bytes)
+        .map_err(|error| RuntimeError::Filesystem(error.kind()))?;
+    decode_socket_record(role, &bytes).map(Some)
+}
+
+fn clear_socket_record(
+    directory: RawFd,
+    expected: &SocketOwnershipRecord,
+) -> Result<(), RuntimeError> {
+    match read_socket_record(directory, expected.role)? {
+        None => return Ok(()),
+        Some(actual) if actual == *expected => {}
+        Some(_) => return Err(RuntimeError::InvalidEntry),
+    }
+    let name = socket_record_name(expected.role)?;
+    // SAFETY: `directory` and the fixed record name remain live for unlinkat.
+    if unsafe { libc::unlinkat(directory, name.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(RuntimeError::Filesystem(error.kind()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_directory(fd: RawFd) -> Result<NamespaceIdentity, RuntimeError> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` is writable for one result and `fd` remains owned by caller.
@@ -456,9 +765,10 @@ fn recover_stale_entries(root: RawFd) -> Result<(), RuntimeError> {
         let Ok(identity) = validate_directory(directory.as_raw_fd()) else {
             continue;
         };
-        if !try_lock_exclusive(directory.as_raw_fd())?
-            || !directory_is_empty(directory.as_raw_fd())?
-        {
+        if !try_lock_exclusive(directory.as_raw_fd())? {
+            continue;
+        }
+        if !directory_is_empty(directory.as_raw_fd())? {
             continue;
         }
         let _ = cleanup_exact(root, directory.as_raw_fd(), &name, identity);
@@ -527,6 +837,25 @@ fn directory_entries(fd: RawFd, limit: usize) -> Result<Vec<OsString>, RuntimeEr
 
 fn directory_is_empty(fd: RawFd) -> Result<bool, RuntimeError> {
     Ok(directory_entries(fd, 1)?.is_empty())
+}
+
+fn directory_contains_only_socket_records(fd: RawFd) -> Result<bool, RuntimeError> {
+    let mut expected = Vec::with_capacity(2);
+    for role in [
+        ResourceRole::ApiSocketDirectory,
+        ResourceRole::VsockSocketDirectory,
+    ] {
+        if read_socket_record(fd, role)?.is_some() {
+            expected.push(socket_record_name(role)?.to_bytes());
+        }
+    }
+    let entries = directory_entries(fd, 3)?;
+    Ok(entries.len() == expected.len()
+        && entries.iter().all(|entry| {
+            expected
+                .iter()
+                .any(|expected| entry.as_os_str().as_bytes() == *expected)
+        }))
 }
 
 fn cleanup_exact(
@@ -724,6 +1053,109 @@ mod tests {
             !directory_is_empty(directory.as_raw_fd()).expect("second check should succeed"),
             "a repeated check must observe entries created after the first scan"
         );
+    }
+
+    #[test]
+    fn socket_records_round_trip_redacted_and_clear_exactly() {
+        let root = TestRoot::new();
+        let directory = open_directory(root.path()).expect("test root should open");
+        let api = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            SocketChild::parse("api.sock").expect("child should parse"),
+            ObjectIdentity {
+                device: 41,
+                inode: 43,
+            },
+        )
+        .expect("record should construct");
+        let vsock = SocketOwnershipRecord::new(
+            ResourceRole::VsockSocketDirectory,
+            SocketChild::parse("vsock.sock").expect("child should parse"),
+            ObjectIdentity {
+                device: 47,
+                inode: 53,
+            },
+        )
+        .expect("record should construct");
+
+        write_socket_record(directory.as_raw_fd(), &api).expect("API record should write");
+        write_socket_record(directory.as_raw_fd(), &vsock).expect("vsock record should write");
+        assert_eq!(
+            read_socket_record(directory.as_raw_fd(), ResourceRole::ApiSocketDirectory)
+                .expect("API record should read"),
+            Some(api.clone())
+        );
+        assert_eq!(
+            read_socket_record(directory.as_raw_fd(), ResourceRole::VsockSocketDirectory)
+                .expect("vsock record should read"),
+            Some(vsock.clone())
+        );
+        let debug = format!("{api:?} {vsock:?}");
+        assert!(!debug.contains("api.sock") && !debug.contains("vsock.sock"));
+
+        clear_socket_record(directory.as_raw_fd(), &api).expect("API record should clear");
+        assert!(
+            read_socket_record(directory.as_raw_fd(), ResourceRole::ApiSocketDirectory)
+                .expect("API absence should read")
+                .is_none()
+        );
+        assert!(
+            read_socket_record(directory.as_raw_fd(), ResourceRole::VsockSocketDirectory)
+                .expect("vsock record should remain")
+                .is_some()
+        );
+        clear_socket_record(directory.as_raw_fd(), &vsock).expect("vsock record should clear");
+        assert!(directory_is_empty(directory.as_raw_fd()).expect("directory should inspect"));
+    }
+
+    #[test]
+    fn socket_records_reject_corruption_and_wrong_expected_identity() {
+        let root = TestRoot::new();
+        let directory = open_directory(root.path()).expect("test root should open");
+        let record = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            SocketChild::parse("api.sock").expect("child should parse"),
+            ObjectIdentity {
+                device: 59,
+                inode: 61,
+            },
+        )
+        .expect("record should construct");
+        write_socket_record(directory.as_raw_fd(), &record).expect("record should write");
+        let wrong = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            SocketChild::parse("other.sock").expect("child should parse"),
+            record.identity(),
+        )
+        .expect("wrong record should construct");
+        assert_eq!(
+            clear_socket_record(directory.as_raw_fd(), &wrong),
+            Err(RuntimeError::InvalidEntry)
+        );
+        clear_socket_record(directory.as_raw_fd(), &record).expect("record should clear");
+
+        let name =
+            socket_record_name(ResourceRole::ApiSocketDirectory).expect("record name should exist");
+        // SAFETY: The directory and fixed name are live; the test owns the fresh file.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        let mut file = File::from(owned_fd(fd).expect("corrupt file should open"));
+        file.write_all(&[0_u8; SOCKET_RECORD_BYTES])
+            .expect("corrupt bytes should write");
+        drop(file);
+        assert_eq!(
+            read_socket_record(directory.as_raw_fd(), ResourceRole::ApiSocketDirectory),
+            Err(RuntimeError::InvalidEntry)
+        );
+        // SAFETY: The fixed corrupt test file is owned by this fixture.
+        let unlink_result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        assert_eq!(unlink_result, 0);
     }
 
     #[test]

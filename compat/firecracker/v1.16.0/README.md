@@ -79,6 +79,15 @@ corpus records remain `audit-required`. The checked
 [`isolation-contract.md`](isolation-contract.md) separates the delivered
 package/sandbox/supervisor subset from those handoffs.
 
+The #1365 socket-directory slice adopts the API and vsock directory roles with
+an exact safe-child grammar, same-filesystem anchored exclusive publication,
+strict ownership records, supplied listeners, and one fixed session-bound
+launcher facet for guest-initiated vsock port connections. It adds no worker
+entitlement or steady-state helper and does not terminally promote the three
+composites: snapshot authority, general dynamic brokerage and hard revocation,
+vmnet policy, Linux outcome classification, and deployment identity still
+remain under #1351.
+
 ## Commands
 
 Validate checked-in delivery state without an upstream checkout:

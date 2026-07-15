@@ -237,6 +237,23 @@ pub(crate) struct PreparedGrantBatch {
     records: Vec<PreparedRecord>,
 }
 
+/// Borrowed exact anchor metadata for one singleton socket-directory grant.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SocketDirectoryAnchor {
+    descriptor: RawFd,
+    identity: ObjectIdentity,
+}
+
+impl SocketDirectoryAnchor {
+    pub(crate) const fn descriptor(self) -> RawFd {
+        self.descriptor
+    }
+
+    pub(crate) const fn identity(self) -> ObjectIdentity {
+        self.identity
+    }
+}
+
 impl std::fmt::Debug for PreparedGrantBatch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -379,6 +396,37 @@ impl PreparedGrantBatch {
                 descriptor: record.descriptor.as_ref().map(AsRawFd::as_raw_fd),
             })
             .collect()
+    }
+
+    /// Borrows the exact retained anchor for one singleton socket-directory role.
+    pub(crate) fn socket_directory_anchor(
+        &self,
+        role: ResourceRole,
+    ) -> Option<SocketDirectoryAnchor> {
+        if !matches!(
+            role,
+            ResourceRole::ApiSocketDirectory | ResourceRole::VsockSocketDirectory
+        ) {
+            return None;
+        }
+        self.records
+            .iter()
+            .find_map(|prepared| match &prepared.record {
+                GrantRecord::ScopedDirectory {
+                    role: record_role,
+                    access: GrantAccess::CreateChildren,
+                    identity,
+                    ..
+                } if *record_role == role => prepared
+                    .descriptor
+                    .as_ref()
+                    .map(AsRawFd::as_raw_fd)
+                    .map(|descriptor| SocketDirectoryAnchor {
+                        descriptor,
+                        identity: *identity,
+                    }),
+                _ => None,
+            })
     }
 }
 

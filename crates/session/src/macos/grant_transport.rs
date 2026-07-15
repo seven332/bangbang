@@ -63,6 +63,30 @@ pub fn send_grant(
 /// Receives and validates one exact grant datagram.
 pub fn receive_grant(socket: &UnixDatagram) -> Result<ReceivedGrant, GrantTransportError> {
     let mut payload = [0_u8; MAX_GRANT_DATAGRAM_BYTES];
+    let (payload_len, descriptors) = receive_raw(socket, &mut payload)?;
+    let frame = decode_grant_frame(
+        payload
+            .get(..payload_len)
+            .ok_or(GrantTransportError::Invalid)?,
+    )?;
+    if usize::from(frame.descriptor_count) != descriptors.len() {
+        return Err(GrantTransportError::Invalid);
+    }
+    let mut descriptors = descriptors.into_iter();
+    let descriptor = descriptors.next();
+    if descriptors.next().is_some() {
+        return Err(GrantTransportError::Invalid);
+    }
+    Ok(ReceivedGrant { frame, descriptor })
+}
+
+pub(super) fn receive_raw(
+    socket: &UnixDatagram,
+    payload: &mut [u8],
+) -> Result<(usize, Vec<OwnedFd>), GrantTransportError> {
+    if payload.is_empty() || payload.len() > MAX_GRANT_DATAGRAM_BYTES {
+        return Err(GrantTransportError::Invalid);
+    }
     let mut control = [0_u32; CONTROL_WORDS];
     let mut iovec = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
@@ -109,23 +133,10 @@ pub fn receive_grant(socket: &UnixDatagram) -> Result<ReceivedGrant, GrantTransp
     {
         return Err(GrantTransportError::Invalid);
     }
-    let frame = decode_grant_frame(
-        payload
-            .get(..payload_len)
-            .ok_or(GrantTransportError::Invalid)?,
-    )?;
-    if usize::from(frame.descriptor_count) != descriptors.len() {
-        return Err(GrantTransportError::Invalid);
-    }
-    let mut descriptors = descriptors.into_iter();
-    let descriptor = descriptors.next();
-    if descriptors.next().is_some() {
-        return Err(GrantTransportError::Invalid);
-    }
-    Ok(ReceivedGrant { frame, descriptor })
+    Ok((payload_len, descriptors))
 }
 
-fn send_raw(
+pub(super) fn send_raw(
     socket: RawFd,
     payload: &[u8],
     descriptors: &[RawFd],

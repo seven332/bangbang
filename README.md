@@ -257,12 +257,13 @@ Both use Hardened Runtime. Before every launch, the outer executable validates
 the fixed bundle layout, nested signatures, identifiers, and required worker
 entitlements. It then starts the fixed worker suspended with a default-close
 descriptor policy: only open standard streams, one private lifecycle endpoint,
-and one private startup-grant endpoint survive. The launcher validates the live worker code before resuming it and
+one private startup-grant endpoint, and one dormant private socket-broker
+endpoint survive. The launcher validates the live worker code before resuming it and
 again after the worker has used the endpoint and sent the bounded pre-session
 greeting.
 
-Each launch uses unnamed lifecycle stream and grant datagram socketpairs plus a
-random 256-bit session identity. Lifecycle protocol v2 has a 4-KiB frame limit,
+Each launch uses unnamed lifecycle stream, grant datagram, and socket-broker
+socketpairs plus a random 256-bit session identity. Lifecycle protocol v2 has a 4-KiB frame limit,
 exact per-direction sequence numbers, closed message variants, and monotonic
 `prepared -> grants-accepted -> starting -> ready -> terminal` state. Even an
 empty grant batch must be atomically acknowledged before `Proceed`. The launcher authenticates
@@ -351,11 +352,41 @@ after a startup attempt consumes it. Clearing or replacing serial before start
 drops the prepared output. Direct paths retain their existing create, FIFO-like,
 and open-timing behavior.
 
-API/vsock directories, snapshot consumers, dynamic
-post-Ready brokerage, vmnet provisioning, automatic restart policy, Developer
-ID possession proof, launch-constraint policy, and notarization workflow
-remain. The session
-namespace stays empty and stores no path, descriptor, bookmark, or grant bytes.
+API and vsock directory consumers instead require the exact case-sensitive
+reference `bangbang-grant:<GrantId>/<SocketChild>`. `SocketChild` is one 1–64
+byte ASCII `[A-Za-z0-9._-]` component other than `.` or `..`; direct mode still
+treats identical bytes as an ordinary path. The owner thread claims the exact
+singleton directory role, retains its scope and anchor, and runs a short-lived
+default-close instance of the signed worker that binds one fixed private
+staging name. The worker receives the listener descriptor, records only its
+role, safe child, and socket identity in its private namespace, and publishes
+the socket exclusively to the requested child with fd-relative
+`renameatx_np(RENAME_EXCL)`. Publication requires the namespace and granted
+directory to share a filesystem. The binder is reaped before API readiness or
+VM-start success; shutdown removes only an identity-matching socket. A
+simultaneous uncatchable launcher and worker death can leave a stale external
+socket name.
+
+The granted API listener is served directly and becomes ready only after
+publication. `--no-api` claims no API directory. A granted vsock keeps the
+published main listener plus directory authority through its VM lifetime.
+Host-initiated traffic uses that supplied listener. Guest-initiated connections
+activate the otherwise dormant per-session launcher broker once, then send only
+monotonic `u32` host ports. The launcher is fixed to the retained vsock anchor
+and safe child, connects only to relative `<SocketChild>_<port>` targets after
+identity checks, and returns one validated connected stream descriptor. It
+receives no guest payload, grant ID, path, bookmark, or general resource
+selector. API-only, no-API, and direct-path sessions leave the broker dormant;
+the worker still has exactly App Sandbox and Hypervisor entitlements and steady
+state remains one launcher plus one worker.
+
+Snapshot consumers, general dynamic post-Ready brokerage, hard revocation,
+cross-filesystem socket publication, vmnet provisioning, automatic restart
+policy, Developer ID possession proof, launch-constraint policy, and
+notarization workflow remain. The session namespace must be empty at the
+`Prepared` gate; after authorization it may hold at most the two fixed socket
+ownership records containing role, safe child, and socket identity, never a
+path, descriptor, bookmark, grant ID, payload, or session byte.
 Same-identifier workers share one App Sandbox
 container, so namespace locks and identity checks protect cooperative sessions
 and replacements but do not isolate a malicious same-bundle sibling. See
@@ -686,7 +717,14 @@ read-only guest-write rejection, writable block persistence, pmem read/flush,
 guest console output through the transferred serial descriptor, terminal
 metrics, concurrent output-session isolation, preauthorized live block
 replacement, limiter-only backing retention, redacted failure atomicity, and
-real sandboxed HVF guests through `SYSTEM_OFF`.
+real sandboxed HVF guests through `SYSTEM_OFF`. It also proves an
+outside-container client can use a granted API socket, and that a real guest
+can complete deterministic bidirectional and half-close/EOF vsock traffic in
+both initiation directions through the supplied granted listener and fixed
+launcher broker, without changing the exact entitlements or leaving a helper
+in steady state. Abrupt launcher-first and worker-first cases replace the
+granted API pathname before death and prove both surviving cleanup owners
+preserve the replacement while clearing the matching private namespace record.
 
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
 validation work:

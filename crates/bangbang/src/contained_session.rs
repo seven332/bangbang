@@ -1,9 +1,10 @@
 use std::fmt;
+use std::os::unix::ffi::OsStrExt;
 #[cfg(not(target_os = "macos"))]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use bangbang_session::GrantId;
+use bangbang_session::{GrantId, SocketChild};
 #[cfg(not(target_os = "macos"))]
 use bangbang_session::{Readiness, TerminalCategory};
 
@@ -34,13 +35,33 @@ impl fmt::Display for GrantClaimError {
 impl std::error::Error for GrantClaimError {}
 
 fn grant_reference_id(reference: &Path) -> Result<Option<GrantId>, GrantClaimError> {
-    let Some(reference) = reference.to_str() else {
+    let reference = reference.as_os_str().as_bytes();
+    let Some(id) = reference.strip_prefix(GRANT_REFERENCE_PREFIX.as_bytes()) else {
         return Ok(None);
     };
-    let Some(id) = reference.strip_prefix(GRANT_REFERENCE_PREFIX) else {
-        return Ok(None);
-    };
+    let id = std::str::from_utf8(id).map_err(|_| GrantClaimError)?;
     GrantId::parse(id).map(Some).map_err(|_| GrantClaimError)
+}
+
+fn socket_directory_reference(
+    reference: &Path,
+) -> Result<Option<(GrantId, SocketChild)>, GrantClaimError> {
+    let reference = reference.as_os_str().as_bytes();
+    let Some(value) = reference.strip_prefix(GRANT_REFERENCE_PREFIX.as_bytes()) else {
+        return Ok(None);
+    };
+    let mut components = value.split(|byte| *byte == b'/');
+    let id = components.next().ok_or(GrantClaimError)?;
+    let child = components.next().ok_or(GrantClaimError)?;
+    if components.next().is_some() {
+        return Err(GrantClaimError);
+    }
+    let id = std::str::from_utf8(id).map_err(|_| GrantClaimError)?;
+    let child = std::str::from_utf8(child).map_err(|_| GrantClaimError)?;
+    Ok(Some((
+        GrantId::parse(id).map_err(|_| GrantClaimError)?,
+        SocketChild::parse(child).map_err(|_| GrantClaimError)?,
+    )))
 }
 
 #[cfg(test)]
@@ -49,7 +70,7 @@ mod reference_tests {
 
     use bangbang_session::MAX_GRANT_ID_BYTES;
 
-    use super::{GrantClaimError, grant_reference_id};
+    use super::{GrantClaimError, grant_reference_id, socket_directory_reference};
 
     #[test]
     fn grant_references_use_one_exact_case_sensitive_bounded_grammar() {
@@ -93,10 +114,44 @@ mod reference_tests {
         assert_eq!(GrantClaimError.to_string(), "private resource grant failed");
         assert!(!format!("{id:?} {GrantClaimError:?}").contains(&maximum));
     }
+
+    #[test]
+    fn directory_references_bind_one_exact_id_and_child() {
+        let (id, child) =
+            socket_directory_reference(Path::new("bangbang-grant:api-directory/api.sock"))
+                .expect("reference should classify")
+                .expect("reference should be explicit");
+        assert_eq!(id.as_bytes(), b"api-directory");
+        assert_eq!(child.as_bytes(), b"api.sock");
+
+        for ordinary in ["ordinary/socket", "Bangbang-grant:api/socket"] {
+            assert!(
+                socket_directory_reference(Path::new(ordinary))
+                    .expect("ordinary path should classify")
+                    .is_none()
+            );
+        }
+        for malformed in [
+            "bangbang-grant:api",
+            "bangbang-grant:/socket",
+            "bangbang-grant:api/",
+            "bangbang-grant:api/.",
+            "bangbang-grant:api/../socket",
+            "bangbang-grant:api/nested/socket",
+            "bangbang-grant:api/with space",
+            "bangbang-grant:api/雪",
+        ] {
+            assert_eq!(
+                socket_directory_reference(Path::new(malformed)),
+                Err(GrantClaimError)
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
+    use std::cell::RefCell;
     use std::env;
     use std::ffi::OsStr;
     use std::fs::File;
@@ -104,6 +159,7 @@ mod platform {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::path::Path;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
@@ -111,18 +167,22 @@ mod platform {
 
     use bangbang_runtime::boot::BootSourceFiles;
     use bangbang_session::macos::grant_registry::{
-        CommittedGrantBatch, FileGrantRegistry, GrantRegistry, StagedGrantBatch,
+        CommittedGrantBatch, DirectoryGrantRegistry, FileGrantRegistry, GrantRegistry,
+        GrantedDirectory, StagedGrantBatch,
     };
     use bangbang_session::macos::grant_transport::receive_grant;
-    use bangbang_session::macos::runtime::WorkerNamespace;
+    use bangbang_session::macos::runtime::{WorkerNamespace, WorkerSocketNamespace};
     use bangbang_session::macos::{set_cloexec, verify_peer, verify_peer_pid};
     use bangbang_session::{
         Frame, FrameDecoder, GRANT_FD, GrantAccess, Message, Readiness, ResourceRole,
-        SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, TerminalCategory, WorkerLifecycle,
-        encode_frame,
+        SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId,
+        TerminalCategory, WorkerLifecycle, encode_frame,
     };
 
-    use super::{ContainedSessionError, GrantClaimError, grant_reference_id};
+    use super::{
+        ContainedSessionError, GrantClaimError, SocketChild, grant_reference_id,
+        socket_directory_reference,
+    };
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     #[cfg(feature = "grant-integration-probe")]
@@ -278,6 +338,141 @@ mod platform {
         }
     }
 
+    /// One exact contained socket-directory claim.
+    pub(crate) struct ClaimedSocketDirectory {
+        pub(crate) directory: GrantedDirectory,
+        pub(crate) child: SocketChild,
+    }
+
+    impl std::fmt::Debug for ClaimedSocketDirectory {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ClaimedSocketDirectory")
+                .field("directory", &"<owned>")
+                .field("child", &"<redacted>")
+                .finish()
+        }
+    }
+
+    /// Main-thread authority for active directory scopes.
+    #[derive(Clone)]
+    pub(crate) struct DirectoryGrantAuthority {
+        registry: Rc<RefCell<Option<DirectoryGrantRegistry>>>,
+    }
+
+    impl std::fmt::Debug for DirectoryGrantAuthority {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("DirectoryGrantAuthority")
+                .field("registry", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl DirectoryGrantAuthority {
+        fn new(registry: DirectoryGrantRegistry) -> Self {
+            Self {
+                registry: Rc::new(RefCell::new(Some(registry))),
+            }
+        }
+
+        pub(crate) fn claim_socket_directory(
+            &self,
+            reference: &Path,
+            role: ResourceRole,
+        ) -> Result<Option<ClaimedSocketDirectory>, GrantClaimError> {
+            let Some((id, child)) = socket_directory_reference(reference)? else {
+                return Ok(None);
+            };
+            let directory = self
+                .registry
+                .try_borrow_mut()
+                .map_err(|_| GrantClaimError)?
+                .as_mut()
+                .ok_or(GrantClaimError)?
+                .take_scoped_directory(&id, role)
+                .map_err(|_| GrantClaimError)?;
+            Ok(Some(ClaimedSocketDirectory { directory, child }))
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        fn with_registry<T>(
+            &self,
+            consumer: impl FnOnce(&mut DirectoryGrantRegistry) -> Result<T, ContainedSessionError>,
+        ) -> Result<T, ContainedSessionError> {
+            let mut registry = self
+                .registry
+                .try_borrow_mut()
+                .map_err(|_| ContainedSessionError)?;
+            consumer(registry.as_mut().ok_or(ContainedSessionError)?)
+        }
+
+        fn invalidate(&self) {
+            if let Ok(mut registry) = self.registry.try_borrow_mut() {
+                registry.take();
+            }
+        }
+    }
+
+    /// Move-only authenticated launcher broker endpoint.
+    pub(crate) struct SocketBrokerEndpoint {
+        pub(crate) socket: UnixDatagram,
+        pub(crate) session: SessionId,
+        pub(crate) launcher_pid: libc::pid_t,
+    }
+
+    impl std::fmt::Debug for SocketBrokerEndpoint {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("SocketBrokerEndpoint")
+                .field("socket", &"<owned>")
+                .field("session", &"<redacted>")
+                .field("launcher_pid", &"<redacted>")
+                .finish()
+        }
+    }
+
+    /// Owner-thread one-time authority for the private launcher broker endpoint.
+    #[derive(Clone)]
+    pub(crate) struct SocketBrokerAuthority {
+        endpoint: Rc<RefCell<Option<SocketBrokerEndpoint>>>,
+    }
+
+    impl std::fmt::Debug for SocketBrokerAuthority {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("SocketBrokerAuthority")
+                .field("endpoint", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl SocketBrokerAuthority {
+        fn new(socket: UnixDatagram, session: SessionId, launcher_pid: libc::pid_t) -> Self {
+            Self {
+                endpoint: Rc::new(RefCell::new(Some(SocketBrokerEndpoint {
+                    socket,
+                    session,
+                    launcher_pid,
+                }))),
+            }
+        }
+
+        pub(crate) fn take_endpoint(&self) -> Result<SocketBrokerEndpoint, GrantClaimError> {
+            self.endpoint
+                .try_borrow_mut()
+                .map_err(|_| GrantClaimError)?
+                .take()
+                .ok_or(GrantClaimError)
+        }
+
+        fn invalidate(&self) {
+            if let Ok(mut endpoint) = self.endpoint.try_borrow_mut() {
+                endpoint.take();
+            }
+        }
+    }
+
     pub(crate) struct ContainedSession {
         stream: UnixStream,
         lifecycle: Arc<Mutex<WorkerLifecycle>>,
@@ -287,7 +482,9 @@ mod platform {
         wakeup_writer: Option<UnixStream>,
         reader: Option<JoinHandle<()>>,
         grants: GrantAuthority,
-        directory_grants: Option<GrantRegistry>,
+        directory_grants: DirectoryGrantAuthority,
+        socket_broker: SocketBrokerAuthority,
+        socket_namespace: WorkerSocketNamespace,
         started: bool,
         closed: bool,
     }
@@ -317,6 +514,7 @@ mod platform {
             }
             set_cloexec(SESSION_FD).map_err(|_| ContainedSessionError)?;
             set_cloexec(GRANT_FD).map_err(|_| ContainedSessionError)?;
+            set_cloexec(SOCKET_BROKER_FD).map_err(|_| ContainedSessionError)?;
             // SAFETY: The validated private bootstrap contract transfers the
             // fixed descriptor exactly once into this process object.
             let owned = unsafe { OwnedFd::from_raw_fd(SESSION_FD) };
@@ -325,6 +523,9 @@ mod platform {
             // grant descriptor 4 exactly once into this process object.
             let grant_owned = unsafe { OwnedFd::from_raw_fd(GRANT_FD) };
             let grant_socket = UnixDatagram::from(grant_owned);
+            // SAFETY: The private bootstrap contract transfers fixed broker fd 5 once.
+            let broker_owned = unsafe { OwnedFd::from_raw_fd(SOCKET_BROKER_FD) };
+            let broker_socket = UnixDatagram::from(broker_owned);
             stream
                 .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
                 .map_err(|_| ContainedSessionError)?;
@@ -332,6 +533,8 @@ mod platform {
             let parent = unsafe { libc::getppid() };
             verify_peer(stream.as_raw_fd(), parent).map_err(|_| ContainedSessionError)?;
             verify_peer_pid(grant_socket.as_raw_fd(), parent).map_err(|_| ContainedSessionError)?;
+            verify_peer_pid(broker_socket.as_raw_fd(), parent)
+                .map_err(|_| ContainedSessionError)?;
 
             let mut decoder = FrameDecoder::default();
             let mut lifecycle = WorkerLifecycle::new();
@@ -348,6 +551,9 @@ mod platform {
             let session = lifecycle.session().ok_or(ContainedSessionError)?;
             let namespace = WorkerNamespace::create(session).map_err(|_| ContainedSessionError)?;
             let identity = namespace.identity();
+            let socket_namespace = namespace
+                .socket_namespace()
+                .map_err(|_| ContainedSessionError)?;
             let prepared = lifecycle
                 .prepared(identity.device, identity.inode)
                 .map_err(|_| ContainedSessionError)?;
@@ -422,6 +628,8 @@ mod platform {
             };
             let control = Arc::new(SharedControl::new(initial_state));
             let file_grants = GrantAuthority::new(grants.take_file_registry());
+            let directory_grants = DirectoryGrantAuthority::new(grants.take_directory_registry());
+            let socket_broker = SocketBrokerAuthority::new(broker_socket, session, parent);
             let lifecycle = Arc::new(Mutex::new(lifecycle));
             let namespace = Arc::new(Mutex::new(Some(namespace)));
             let (wakeup_reader, mut wakeup_writer) =
@@ -455,7 +663,9 @@ mod platform {
                 wakeup_writer: Some(wakeup_writer),
                 reader,
                 grants: file_grants,
-                directory_grants: Some(grants),
+                directory_grants,
+                socket_broker,
+                socket_namespace,
                 started,
                 closed: false,
             }))
@@ -488,16 +698,32 @@ mod platform {
             self.started.then(|| self.grants.clone())
         }
 
+        pub(crate) fn directory_grant_authority(&self) -> Option<DirectoryGrantAuthority> {
+            self.started.then(|| self.directory_grants.clone())
+        }
+
+        pub(crate) fn socket_broker_authority(&self) -> Option<SocketBrokerAuthority> {
+            self.started.then(|| self.socket_broker.clone())
+        }
+
+        pub(crate) fn socket_namespace(
+            &self,
+        ) -> Result<Option<WorkerSocketNamespace>, ContainedSessionError> {
+            if !self.started {
+                return Ok(None);
+            }
+            self.socket_namespace
+                .try_clone()
+                .map(Some)
+                .map_err(|_| ContainedSessionError)
+        }
+
         #[cfg(feature = "grant-integration-probe")]
         pub(crate) fn with_directory_grants<T>(
             &mut self,
-            consumer: impl FnOnce(&mut GrantRegistry) -> Result<T, ContainedSessionError>,
+            consumer: impl FnOnce(&mut DirectoryGrantRegistry) -> Result<T, ContainedSessionError>,
         ) -> Result<T, ContainedSessionError> {
-            consumer(
-                self.directory_grants
-                    .as_mut()
-                    .ok_or(ContainedSessionError)?,
-            )
+            self.directory_grants.with_registry(consumer)
         }
 
         pub(crate) fn send_ready(
@@ -546,7 +772,8 @@ mod platform {
             self.closed = true;
             self.control.closing.store(true, Ordering::Release);
             self.grants.invalidate();
-            self.directory_grants.take();
+            self.directory_grants.invalidate();
+            self.socket_broker.invalidate();
             let _ = self.stream.shutdown(std::net::Shutdown::Both);
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
@@ -1216,11 +1443,17 @@ mod platform {
 
     use super::{
         ContainedSessionError, GrantClaimError, Readiness, TerminalCategory, UnixStream,
-        grant_reference_id,
+        grant_reference_id, socket_directory_reference,
     };
 
     #[derive(Debug, Clone)]
     pub(crate) struct GrantAuthority;
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct DirectoryGrantAuthority;
+
+    #[derive(Debug)]
+    pub(crate) struct ClaimedSocketDirectory;
 
     impl GrantAuthority {
         pub(crate) fn claim_read_only_file(
@@ -1261,6 +1494,19 @@ mod platform {
         }
     }
 
+    impl DirectoryGrantAuthority {
+        pub(crate) fn claim_socket_directory(
+            &self,
+            reference: &Path,
+            _role: ResourceRole,
+        ) -> Result<Option<ClaimedSocketDirectory>, GrantClaimError> {
+            match socket_directory_reference(reference)? {
+                Some(_) => Err(GrantClaimError),
+                None => Ok(None),
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub(crate) struct ContainedSession;
 
@@ -1287,6 +1533,10 @@ mod platform {
             None
         }
 
+        pub(crate) fn directory_grant_authority(&self) -> Option<DirectoryGrantAuthority> {
+            None
+        }
+
         pub(crate) fn send_ready(
             &mut self,
             _readiness: Readiness,
@@ -1304,4 +1554,8 @@ mod platform {
     }
 }
 
-pub(crate) use platform::{ContainedSession, GrantAuthority};
+pub(crate) use platform::{
+    ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
+};
+#[cfg(target_os = "macos")]
+pub(crate) use platform::{SocketBrokerAuthority, SocketBrokerEndpoint};

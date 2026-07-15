@@ -103,21 +103,20 @@ impl GrantRegistry {
         }
     }
 
+    /// Moves all active directory scopes into an owner-thread registry.
+    pub fn take_directory_registry(&mut self) -> DirectoryGrantRegistry {
+        DirectoryGrantRegistry {
+            entries: std::mem::take(&mut self.directories),
+        }
+    }
+
     /// Adopts one exact active directory scope once.
     pub fn take_scoped_directory(
         &mut self,
         id: &GrantId,
         role: ResourceRole,
     ) -> Result<GrantedDirectory, GrantRegistryError> {
-        let matches = matches!(
-            self.directories.get(id),
-            Some(directory)
-                if directory.role == role && directory.access == GrantAccess::CreateChildren
-        );
-        if !matches {
-            return Err(GrantRegistryError);
-        }
-        self.directories.remove(id).ok_or(GrantRegistryError)
+        take_scoped_directory(&mut self.directories, id, role)
     }
 }
 
@@ -166,6 +165,60 @@ impl FileGrantRegistry {
     ) -> Result<Vec<GrantedFile>, GrantRegistryError> {
         take_files(&mut self.entries, requests)
     }
+}
+
+/// One-time owner-thread registry containing active directory scopes.
+#[derive(Default)]
+pub struct DirectoryGrantRegistry {
+    entries: HashMap<GrantId, GrantedDirectory>,
+}
+
+impl fmt::Debug for DirectoryGrantRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirectoryGrantRegistry")
+            .field("entries", &"<redacted>")
+            .finish()
+    }
+}
+
+impl DirectoryGrantRegistry {
+    /// Returns the number of unadopted directory grants.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether no unadopted directory authority remains.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Adopts one exact active directory scope once.
+    pub fn take_scoped_directory(
+        &mut self,
+        id: &GrantId,
+        role: ResourceRole,
+    ) -> Result<GrantedDirectory, GrantRegistryError> {
+        take_scoped_directory(&mut self.entries, id, role)
+    }
+}
+
+fn take_scoped_directory(
+    entries: &mut HashMap<GrantId, GrantedDirectory>,
+    id: &GrantId,
+    role: ResourceRole,
+) -> Result<GrantedDirectory, GrantRegistryError> {
+    let matches = matches!(
+        entries.get(id),
+        Some(directory)
+            if directory.role == role && directory.access == GrantAccess::CreateChildren
+    );
+    if !matches {
+        return Err(GrantRegistryError);
+    }
+    entries.remove(id).ok_or(GrantRegistryError)
 }
 
 fn take_file(

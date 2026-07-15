@@ -87,6 +87,8 @@ use bangbang_runtime::{
     VmmAction, VmmActionError, VmmData,
 };
 
+#[cfg(target_os = "macos")]
+use crate::anchored_socket::{AnchoredSocketError, BoundAnchoredSocket};
 use crate::periodic_metrics::{
     PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
 };
@@ -104,6 +106,8 @@ static NEXT_TEMP_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ApiServerError {
     Accept(std::io::ErrorKind),
+    #[cfg(target_os = "macos")]
+    Anchored(AnchoredSocketError),
     Bind(std::io::ErrorKind),
     Connection(std::io::ErrorKind),
     PeriodicBalloonStatisticsUpdate(VmmActionError),
@@ -120,6 +124,8 @@ impl std::fmt::Display for ApiServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Accept(kind) => write!(f, "failed to accept API connection: {kind:?}"),
+            #[cfg(target_os = "macos")]
+            Self::Anchored(err) => write!(f, "failed to bind contained API socket: {err}"),
             Self::Bind(kind) => write!(f, "failed to bind API socket: {kind:?}"),
             Self::Connection(kind) => write!(f, "API connection I/O failed: {kind:?}"),
             Self::PeriodicBalloonStatisticsUpdate(err) => {
@@ -151,7 +157,7 @@ impl std::error::Error for ApiServerError {}
 pub(crate) struct ApiServer {
     listener: UnixListener,
     http_api_max_payload_size: usize,
-    _socket_guard: SocketGuard,
+    _socket_guard: Option<SocketGuard>,
 }
 
 impl ApiServer {
@@ -180,8 +186,24 @@ impl ApiServer {
         Ok(Self {
             listener,
             http_api_max_payload_size,
-            _socket_guard: socket_guard,
+            _socket_guard: Some(socket_guard),
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn from_anchored(
+        socket: BoundAnchoredSocket,
+        http_api_max_payload_size: usize,
+    ) -> (Self, crate::anchored_socket::AnchoredSocketGuard) {
+        let (listener, guard) = socket.into_parts();
+        (
+            Self {
+                listener,
+                http_api_max_payload_size,
+                _socket_guard: None,
+            },
+            guard,
+        )
     }
 
     pub(crate) fn run_until(
@@ -10219,14 +10241,10 @@ mod tests {
         .expect("boot source should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("instance should start");
-        let handle = thread::spawn(move || server.run_until(&mut vmm, &mut shutdown_reader));
-
         process_exit_trigger.trigger(ProcessSessionExitStatus::GuestRequestedStop);
 
-        assert_eq!(
-            handle.join().expect("server thread should not panic"),
-            Ok(())
-        );
+        assert_eq!(server.run_until(&mut vmm, &mut shutdown_reader), Ok(()));
+        drop(server);
         assert!(!path.exists());
     }
 
@@ -10247,14 +10265,13 @@ mod tests {
         .expect("boot source should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("instance should start");
-        let handle = thread::spawn(move || server.run_until(&mut vmm, &mut shutdown_reader));
-
         process_exit_trigger.trigger(ProcessSessionExitStatus::Terminal);
 
         assert_eq!(
-            handle.join().expect("server thread should not panic"),
+            server.run_until(&mut vmm, &mut shutdown_reader),
             Err(ApiServerError::ProcessSessionTerminal)
         );
+        drop(server);
         assert!(!path.exists());
     }
 

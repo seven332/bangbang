@@ -997,6 +997,26 @@ impl VmmController {
         self.snapshot_load_history_fresh = false;
     }
 
+    /// Validates a vsock replacement without mutating controller state.
+    pub fn prepare_vsock_config(
+        &self,
+        input: vsock::VsockConfigInput,
+    ) -> Result<vsock::VsockConfig, VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutVsock",
+                state: self.instance_info.state,
+            });
+        }
+        input.validate().map_err(VmmActionError::VsockConfig)
+    }
+
+    /// Commits a validated vsock replacement without further fallible work.
+    pub fn commit_vsock_config(&mut self, config: vsock::VsockConfig) {
+        self.vsock_config = Some(config);
+        self.snapshot_load_history_fresh = false;
+    }
+
     pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {
         if self.instance_info.state != InstanceState::NotStarted {
             return Err(VmmActionError::UnsupportedState {
@@ -1726,16 +1746,8 @@ impl VmmController {
                 Ok(VmmData::Empty)
             }
             VmmAction::PutVsock(config) => {
-                if self.instance_info.state != InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
-                let config = config.validate().map_err(VmmActionError::VsockConfig)?;
-                self.vsock_config = Some(config);
-
+                let config = self.prepare_vsock_config(config)?;
+                self.commit_vsock_config(config);
                 Ok(VmmData::Empty)
             }
         }

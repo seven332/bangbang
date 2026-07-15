@@ -79,9 +79,10 @@ use crate::snapshot_device::{
     capture_snapshot_v1_device_state, validate_mmio_metadata, validate_platform_metadata,
 };
 use crate::vsock::{
-    PreparedVsockDevice, PreparedVsockDeviceError, VirtioVsockDeviceNotificationDispatch,
-    VirtioVsockDeviceNotificationError, VirtioVsockMmioHandler, VsockMmioDeviceRegistration,
-    VsockMmioLayout, VsockMmioRegistrationError,
+    PreparedVsockDevice, PreparedVsockDeviceError, SuppliedVsockListener,
+    VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError,
+    VirtioVsockMmioHandler, VsockMmioDeviceRegistration, VsockMmioLayout,
+    VsockMmioRegistrationError,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -101,6 +102,7 @@ pub struct VmStartupResources {
     block_backings: BTreeMap<String, BlockFileBacking>,
     pmem_backings: BTreeMap<String, PmemFileBacking>,
     serial_output: Option<SerialOutputFile>,
+    supplied_vsock_listener: Option<SuppliedVsockListener>,
 }
 
 impl fmt::Debug for VmStartupResources {
@@ -120,6 +122,10 @@ impl fmt::Debug for VmStartupResources {
                 "serial_output",
                 &self.serial_output.as_ref().map(|_| "<owned>"),
             )
+            .field(
+                "supplied_vsock_listener",
+                &self.supplied_vsock_listener.as_ref().map(|_| "<owned>"),
+            )
             .finish()
     }
 }
@@ -136,6 +142,7 @@ impl VmStartupResources {
             block_backings,
             pmem_backings,
             serial_output: None,
+            supplied_vsock_listener: None,
         }
     }
 
@@ -156,6 +163,13 @@ impl VmStartupResources {
         self.serial_output.take()
     }
 
+    /// Adds an already-bound vsock listener for this startup attempt.
+    #[must_use]
+    pub fn with_supplied_vsock_listener(mut self, listener: SuppliedVsockListener) -> Self {
+        self.supplied_vsock_listener = Some(listener);
+        self
+    }
+
     /// Returns whether every startup resource should use its configured path.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -163,6 +177,7 @@ impl VmStartupResources {
             && self.block_backings.is_empty()
             && self.pmem_backings.is_empty()
             && self.serial_output.is_none()
+            && self.supplied_vsock_listener.is_none()
     }
 
     fn into_parts(
@@ -171,9 +186,15 @@ impl VmStartupResources {
         BootSourceFiles,
         BTreeMap<String, BlockFileBacking>,
         BTreeMap<String, PmemFileBacking>,
+        Option<SuppliedVsockListener>,
     ) {
         debug_assert!(self.serial_output.is_none());
-        (self.boot_files, self.block_backings, self.pmem_backings)
+        (
+            self.boot_files,
+            self.block_backings,
+            self.pmem_backings,
+            self.supplied_vsock_listener,
+        )
     }
 }
 const ARM64_BOOT_VMCLOCK_STATUS_UNKNOWN: u8 = 0;
@@ -341,6 +362,7 @@ pub enum Arm64BootVsockWakeupFdsError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootVsockWakeup {
     host_read_fds: Vec<RawFd>,
+    host_write_fds: Vec<RawFd>,
     deadline: Option<Instant>,
 }
 
@@ -348,13 +370,19 @@ impl Arm64BootVsockWakeup {
     pub const fn empty() -> Self {
         Self {
             host_read_fds: Vec::new(),
+            host_write_fds: Vec::new(),
             deadline: None,
         }
     }
 
-    fn new(host_read_fds: Vec<RawFd>, deadline: Option<Instant>) -> Self {
+    fn new(
+        host_read_fds: Vec<RawFd>,
+        host_write_fds: Vec<RawFd>,
+        deadline: Option<Instant>,
+    ) -> Self {
         Self {
             host_read_fds,
+            host_write_fds,
             deadline,
         }
     }
@@ -363,12 +391,16 @@ impl Arm64BootVsockWakeup {
         &self.host_read_fds
     }
 
+    pub fn host_write_fds(&self) -> &[RawFd] {
+        &self.host_write_fds
+    }
+
     pub const fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
-    pub fn into_parts(self) -> (Vec<RawFd>, Option<Instant>) {
-        (self.host_read_fds, self.deadline)
+    pub fn into_parts(self) -> (Vec<RawFd>, Vec<RawFd>, Option<Instant>) {
+        (self.host_read_fds, self.host_write_fds, self.deadline)
     }
 }
 
@@ -2334,7 +2366,9 @@ impl Arm64BootRuntimeResources {
         handler
             .activation_handler()
             .host_wakeup()
-            .map(|(fds, deadline)| Arm64BootVsockWakeup::new(fds, deadline))
+            .map(|(read_fds, write_fds, deadline)| {
+                Arm64BootVsockWakeup::new(read_fds, write_fds, deadline)
+            })
             .map_err(|source| Arm64BootVsockWakeupFdsError::ResultAllocation { source })
     }
 
@@ -3033,6 +3067,10 @@ pub enum Arm64BootResourceError {
         devices: usize,
         lines: usize,
     },
+    VsockStartupResourceCount {
+        configured: bool,
+        supplied: bool,
+    },
     BalloonInterruptLineCount {
         devices: usize,
         lines: usize,
@@ -3179,6 +3217,13 @@ impl fmt::Display for Arm64BootResourceError {
                 f,
                 "vsock MMIO device count {devices} does not match interrupt line count {lines}"
             ),
+            Self::VsockStartupResourceCount {
+                configured,
+                supplied,
+            } => write!(
+                f,
+                "vsock configuration presence {configured} does not match supplied listener presence {supplied}"
+            ),
             Self::BalloonInterruptLineCount { devices, lines } => write!(
                 f,
                 "balloon MMIO device count {devices} does not match interrupt line count {lines}"
@@ -3263,6 +3308,7 @@ impl std::error::Error for Arm64BootResourceError {
             | Self::PmemInterruptLineCount { .. }
             | Self::NetworkInterruptLineCount { .. }
             | Self::VsockInterruptLineCount { .. }
+            | Self::VsockStartupResourceCount { .. }
             | Self::BalloonInterruptLineCount { .. }
             | Self::MemoryHotplugInterruptLineCount { .. } => None,
         }
@@ -3382,7 +3428,8 @@ impl Arm64BootResources {
         config: Arm64BootResourceConfig<'_>,
         startup_resources: VmStartupResources,
     ) -> Result<Self, Arm64BootResourceError> {
-        let (boot_files, block_backings, pmem_backings) = startup_resources.into_parts();
+        let (boot_files, block_backings, pmem_backings, supplied_vsock_listener) =
+            startup_resources.into_parts();
         let Arm64BootResourceConfig {
             vcpu_mpidrs,
             gic,
@@ -3490,8 +3537,39 @@ impl Arm64BootResources {
             .try_reserve_exact(network_fdt_devices.len())
             .map_err(|source| Arm64BootResourceError::NetworkDeviceMetadataAllocation { source })?;
         fdt_devices.extend(network_fdt_devices);
-        let vsock_device = match (controller.vsock_config(), vsock_interrupt_line) {
-            (Some(config), Some(interrupt_line)) => {
+        if supplied_vsock_listener.is_some() != controller.vsock_config().is_some()
+            && supplied_vsock_listener.is_some()
+        {
+            return Err(Arm64BootResourceError::VsockStartupResourceCount {
+                configured: controller.vsock_config().is_some(),
+                supplied: true,
+            });
+        }
+        let vsock_device = match (
+            controller.vsock_config(),
+            vsock_interrupt_line,
+            supplied_vsock_listener,
+        ) {
+            (Some(config), Some(interrupt_line), Some(listener)) => {
+                let prepared_vsock =
+                    PreparedVsockDevice::from_config_with_supplied_host_socket(config, listener)
+                        .map_err(|source| Arm64BootResourceError::PrepareVsockDevice { source })?;
+                let vsock_mmio = prepared_vsock
+                    .register_mmio_with_dispatcher(vsock_mmio_layout, mmio_dispatcher)
+                    .map_err(|source| Arm64BootResourceError::RegisterVsockMmio {
+                        source: Box::new(source),
+                    })?;
+                let (dispatcher, registration) = vsock_mmio.into_parts();
+                mmio_dispatcher = dispatcher;
+                let (device, fdt_device) =
+                    arm64_boot_vsock_device_metadata(registration, interrupt_line);
+                fdt_devices.try_reserve_exact(1).map_err(|source| {
+                    Arm64BootResourceError::VsockDeviceMetadataAllocation { source }
+                })?;
+                fdt_devices.push(fdt_device);
+                Some(device)
+            }
+            (Some(config), Some(interrupt_line), None) => {
                 let prepared_vsock = PreparedVsockDevice::from_config_with_host_socket(config)
                     .map_err(|source| Arm64BootResourceError::PrepareVsockDevice { source })?;
                 let vsock_mmio = prepared_vsock
@@ -3509,12 +3587,18 @@ impl Arm64BootResources {
                 fdt_devices.push(fdt_device);
                 Some(device)
             }
-            (None, None) => None,
-            (Some(_), None) | (None, Some(_)) => {
+            (None, None, None) => None,
+            (Some(_), None, _) | (None, Some(_), _) => {
                 return Err(vsock_interrupt_line_count_error(
                     controller.vsock_config().is_some(),
                     vsock_interrupt_line.is_some(),
                 ));
+            }
+            (None, None, Some(_)) => {
+                return Err(Arm64BootResourceError::VsockStartupResourceCount {
+                    configured: false,
+                    supplied: true,
+                });
             }
         };
         let balloon_device = match (controller.balloon_config(), balloon_interrupt_line) {
@@ -4230,7 +4314,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -4321,11 +4405,12 @@ mod tests {
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
     };
     use crate::vsock::{
-        VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_HOST_CID,
-        VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE, VIRTIO_VSOCK_PACKET_HEADER_SIZE,
-        VIRTIO_VSOCK_PACKET_TYPE_STREAM, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
-        VSOCK_HOST_LOCAL_PORT_BASE, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
-        VsockConfigInput, VsockHostSocketOwnerError, VsockMmioLayout,
+        SuppliedVsockListener, VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
+        VIRTIO_VSOCK_HOST_CID, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE,
+        VIRTIO_VSOCK_PACKET_HEADER_SIZE, VIRTIO_VSOCK_PACKET_TYPE_STREAM,
+        VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX, VSOCK_HOST_LOCAL_PORT_BASE,
+        VirtioVsockMmioHandler, VirtioVsockPacketHeader, VsockConfigInput,
+        VsockHostSocketOwnerError, VsockMmioLayout,
     };
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -8236,6 +8321,47 @@ mod tests {
     }
 
     #[test]
+    fn configured_vsock_uses_supplied_listener_without_reopening_configured_reference() {
+        let kernel = temp_file("kernel-vsock-supplied-listener", &arm64_image());
+        let socket_path = PathBuf::from("/tmp").join(format!(
+            "bbvs-{}-{}",
+            std::process::id(),
+            NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = UnixListener::bind(&socket_path).expect("supplied listener should bind");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(
+            &mut controller,
+            44,
+            Path::new("bangbang-grant:vsock-directory/vsock.sock"),
+        );
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
+            ..valid_config(&[])
+        };
+        let startup_resources = VmStartupResources::default()
+            .with_supplied_vsock_listener(SuppliedVsockListener::new(listener));
+
+        let resources = Arm64BootResources::assemble_from_controller_with_startup_resources(
+            &controller,
+            config,
+            startup_resources,
+        )
+        .expect("supplied listener should assemble without reference lookup");
+        let _client = UnixStream::connect(&socket_path).expect("supplied socket should connect");
+        assert!(resources.vsock_device.is_some());
+
+        drop(resources);
+        assert!(socket_path.exists());
+        fs::remove_file(socket_path).expect("fixture socket should clean up");
+    }
+
+    #[test]
     fn extra_vsock_interrupt_line_without_config_fails() {
         let kernel = temp_file("kernel-vsock-extra-line", &arm64_image());
         let controller = controller_with_kernel(kernel.path());
@@ -8260,6 +8386,33 @@ mod tests {
             }
         ));
         assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn supplied_vsock_listener_without_configuration_fails_closed() {
+        let kernel = temp_file("kernel-vsock-extra-listener", &arm64_image());
+        let socket_path = missing_path("vsock-extra-listener.sock");
+        let listener = UnixListener::bind(&socket_path).expect("supplied listener should bind");
+        let controller = controller_with_kernel(kernel.path());
+        let startup_resources = VmStartupResources::default()
+            .with_supplied_vsock_listener(SuppliedVsockListener::new(listener));
+
+        let err = Arm64BootResources::assemble_from_controller_with_startup_resources(
+            &controller,
+            valid_config(&[]),
+            startup_resources,
+        )
+        .expect_err("extra supplied listener should fail");
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::VsockStartupResourceCount {
+                configured: false,
+                supplied: true
+            }
+        ));
+        assert!(std::error::Error::source(&err).is_none());
+        assert!(socket_path.exists());
+        fs::remove_file(socket_path).expect("fixture socket should clean up");
     }
 
     #[test]

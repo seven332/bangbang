@@ -53,6 +53,7 @@ where
             &mut spawned.worker,
             &mut spawned.session,
             &mut spawned.grants,
+            &mut spawned.socket_broker,
             lifecycle,
             wakeups,
             &grants,

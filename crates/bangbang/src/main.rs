@@ -10,6 +10,8 @@ use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
+mod anchored_socket;
 mod api_server;
 mod contained_session;
 #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
@@ -22,6 +24,8 @@ mod periodic_metrics;
 mod test_support;
 mod vmm;
 
+#[cfg(target_os = "macos")]
+use anchored_socket::bind as bind_anchored_socket;
 use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{RequestError, parse_request_with_limit};
@@ -58,6 +62,14 @@ const FIRECRACKER_DEFAULT_NOFILE_LIMIT: RawFd = 2048;
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &["enable-pci", "no-seccomp", "seccomp-filter"];
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if anchored_socket::is_binder_invocation() {
+        return if anchored_socket::run_binder() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     let mut contained = match ContainedSession::bootstrap() {
         Ok(contained) => contained,
         Err(err) => {
@@ -127,6 +139,21 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             let grant_authority = contained
                 .as_ref()
                 .and_then(ContainedSession::grant_authority);
+            #[cfg(target_os = "macos")]
+            let directory_grant_authority = contained
+                .as_ref()
+                .and_then(ContainedSession::directory_grant_authority);
+            #[cfg(target_os = "macos")]
+            let socket_broker_authority = contained
+                .as_ref()
+                .and_then(ContainedSession::socket_broker_authority);
+            #[cfg(target_os = "macos")]
+            let socket_namespace = contained
+                .as_ref()
+                .map(ContainedSession::socket_namespace)
+                .transpose()
+                .map_err(|_| ProcessError::ContainedSession)?
+                .flatten();
             preallocate_fdtable().map_err(ProcessError::FdTablePreallocation)?;
             if contained_shutdown_requested(contained)? {
                 return Ok(());
@@ -156,7 +183,7 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             );
 
             let signal_metrics = SharedSignalMetrics::default();
-            let mut vmm = ProcessVmm::new(
+            let vmm = ProcessVmm::new(
                 id,
                 env!("CARGO_PKG_VERSION"),
                 APP_NAME,
@@ -166,6 +193,14 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             .with_process_metrics_diagnostics(process_metrics_diagnostics)
             .with_process_signal_metrics(signal_metrics.clone())
             .with_grant_authority(grant_authority.clone());
+            #[cfg(target_os = "macos")]
+            let mut vmm = vmm.with_socket_grant_authority(
+                directory_grant_authority.clone(),
+                socket_broker_authority,
+                socket_namespace,
+            );
+            #[cfg(not(target_os = "macos"))]
+            let mut vmm = vmm;
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
             if contained_shutdown_requested(contained)? {
                 return Ok(());
@@ -211,6 +246,52 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
                     return result.and_then(|()| contained_wakeup_result(contained));
                 }
 
+                #[cfg(target_os = "macos")]
+                let (_anchored_api_guard, server) = {
+                    let claim = contained
+                        .as_ref()
+                        .and_then(ContainedSession::directory_grant_authority)
+                        .map(|authority| {
+                            authority.claim_socket_directory(
+                                std::path::Path::new(&api_sock),
+                                ResourceRole::ApiSocketDirectory,
+                            )
+                        })
+                        .transpose()
+                        .map_err(|_| ProcessError::ContainedSession)?
+                        .flatten();
+                    match claim {
+                        Some(claim) => {
+                            let namespace = contained
+                                .as_ref()
+                                .ok_or(ProcessError::ContainedSession)?
+                                .socket_namespace()
+                                .map_err(|_| ProcessError::ContainedSession)?
+                                .ok_or(ProcessError::ContainedSession)?;
+                            let socket = bind_anchored_socket(
+                                namespace,
+                                claim,
+                                ResourceRole::ApiSocketDirectory,
+                                None,
+                            )
+                            .map_err(|error| {
+                                ProcessError::ApiServer(ApiServerError::Anchored(error))
+                            })?;
+                            let (server, guard) =
+                                ApiServer::from_anchored(socket, http_api_max_payload_size);
+                            (Some(guard), server)
+                        }
+                        None => (
+                            None,
+                            ApiServer::bind_with_max_payload_size(
+                                &api_sock,
+                                http_api_max_payload_size,
+                            )
+                            .map_err(ProcessError::ApiServer)?,
+                        ),
+                    }
+                };
+                #[cfg(not(target_os = "macos"))]
                 let server =
                     ApiServer::bind_with_max_payload_size(&api_sock, http_api_max_payload_size)
                         .map_err(ProcessError::ApiServer)?;
