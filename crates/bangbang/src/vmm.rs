@@ -12929,6 +12929,9 @@ mod tests {
             "bangbang-grant:kernel",
         )))
         .expect("tagged boot source should store in direct test mode");
+        let debug = format!("{vmm:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("bangbang-grant:kernel"));
         let file = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("provided boot fixture should open");
         vmm.boot_grant_state = BootGrantState::Prepared(BootSourceFiles::new(Some(file), None));

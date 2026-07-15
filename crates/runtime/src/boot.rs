@@ -22,11 +22,25 @@ const ARM64_LEGACY_TEXT_OFFSET: u64 = 0x80000;
 const ARM64_BASE_ALIGNMENT: u64 = 0x20_0000;
 const INIT_ARGS_SEPARATOR: &str = " -- ";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BootSource {
     kernel_image_path: PathBuf,
     initrd_path: Option<PathBuf>,
     boot_args: Option<String>,
+}
+
+impl fmt::Debug for BootSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootSource")
+            .field("kernel_image_path", &"<redacted>")
+            .field(
+                "initrd_path",
+                &self.initrd_path.as_ref().map(|_| "<redacted>"),
+            )
+            .field("boot_args", &self.boot_args)
+            .finish()
+    }
 }
 
 impl BootSource {
@@ -190,11 +204,25 @@ impl fmt::Display for BootPayloadKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BootSourceConfigInput {
     kernel_image_path: PathBuf,
     initrd_path: Option<PathBuf>,
     boot_args: Option<String>,
+}
+
+impl fmt::Debug for BootSourceConfigInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootSourceConfigInput")
+            .field("kernel_image_path", &"<redacted>")
+            .field(
+                "initrd_path",
+                &self.initrd_path.as_ref().map(|_| "<redacted>"),
+            )
+            .field("boot_args", &self.boot_args)
+            .finish()
+    }
 }
 
 impl BootSourceConfigInput {
@@ -221,11 +249,25 @@ impl BootSourceConfigInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BootSourceConfig {
     kernel_image_path: PathBuf,
     initrd_path: Option<PathBuf>,
     boot_args: Option<String>,
+}
+
+impl fmt::Debug for BootSourceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootSourceConfig")
+            .field("kernel_image_path", &"<redacted>")
+            .field(
+                "initrd_path",
+                &self.initrd_path.as_ref().map(|_| "<redacted>"),
+            )
+            .field("boot_args", &self.boot_args)
+            .finish()
+    }
 }
 
 impl BootSourceConfig {
@@ -1548,6 +1590,33 @@ mod tests {
             "BootSourceFiles { kernel: Some(\"<owned>\"), initrd: None }"
         );
         assert!(!debug.contains(kernel_file.as_path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn boot_source_debug_redacts_paths_across_input_config_and_runtime_source() {
+        let private_kernel = "bangbang-grant:private-kernel";
+        let private_initrd = "bangbang-grant:private-initrd";
+        let input = BootSourceConfigInput::new(private_kernel)
+            .with_initrd_path(private_initrd)
+            .with_boot_args("console=hvc0");
+        let config = input
+            .clone()
+            .validate()
+            .expect("private boot config should validate");
+        let source = BootSource::new(private_kernel)
+            .with_initrd_path(private_initrd)
+            .with_boot_args("console=hvc0");
+
+        for debug in [
+            format!("{input:?}"),
+            format!("{config:?}"),
+            format!("{source:?}"),
+        ] {
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains(private_kernel));
+            assert!(!debug.contains(private_initrd));
+            assert!(debug.contains("console=hvc0"));
+        }
     }
 
     #[test]
