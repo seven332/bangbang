@@ -4371,6 +4371,8 @@ pub enum NetworkInterfaceConfigError {
     InvalidMtu {
         mtu: u16,
     },
+    /// Contained process policy does not admit system host networking.
+    HostNetworkNotAuthorized,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4427,6 +4429,9 @@ impl fmt::Display for NetworkInterfaceConfigError {
                     f,
                     "network mtu {mtu} is out of range [{VIRTIO_NET_MIN_MTU}, {VIRTIO_NET_MAX_MTU}]"
                 )
+            }
+            Self::HostNetworkNotAuthorized => {
+                f.write_str("system host networking is not authorized")
             }
         }
     }
@@ -6308,6 +6313,10 @@ mod tests {
         let err = NetworkInterfaceConfigError::EmptyHostDeviceName;
 
         assert_eq!(err.to_string(), "network host_dev_name must not be empty");
+        assert!(std::error::Error::source(&err).is_none());
+
+        let err = NetworkInterfaceConfigError::HostNetworkNotAuthorized;
+        assert_eq!(err.to_string(), "system host networking is not authorized");
         assert!(std::error::Error::source(&err).is_none());
     }
 

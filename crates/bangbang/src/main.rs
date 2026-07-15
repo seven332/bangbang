@@ -39,7 +39,7 @@ use signal_hook::consts::signal::SIGTERM;
 use signal_hook::consts::signal::{SIGBUS, SIGHUP, SIGILL, SIGINT, SIGPIPE, SIGSEGV, SIGSYS};
 use signal_hook::consts::signal::{SIGXCPU, SIGXFSZ};
 use signal_hook::{SigId, low_level};
-use vmm::{ProcessSessionExitDecision, ProcessVmm, VmmRequestHandler};
+use vmm::{ProcessSessionExitDecision, ProcessVmm, ProcessVmnetAuthority, VmmRequestHandler};
 
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics, SharedSignalMetrics};
@@ -144,6 +144,14 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
         }
         Command::Run(config) => {
             let config = *config;
+            let vmnet_authority = match contained.as_ref() {
+                Some(session) => ProcessVmnetAuthority::Contained(
+                    session
+                        .vmnet_authority()
+                        .map_err(|_| ProcessError::ContainedSession)?,
+                ),
+                None => ProcessVmnetAuthority::Direct,
+            };
             let grant_authority = contained
                 .as_ref()
                 .and_then(ContainedSession::grant_authority);
@@ -200,7 +208,8 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             .with_boot_timer_enabled(boot_timer)
             .with_process_metrics_diagnostics(process_metrics_diagnostics)
             .with_process_signal_metrics(signal_metrics.clone())
-            .with_grant_authority(grant_authority.clone());
+            .with_grant_authority(grant_authority.clone())
+            .with_vmnet_authority(vmnet_authority);
             #[cfg(target_os = "macos")]
             let mut vmm = vmm.with_socket_grant_authority(
                 directory_grant_authority.clone(),

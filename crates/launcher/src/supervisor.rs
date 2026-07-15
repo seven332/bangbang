@@ -45,7 +45,7 @@ where
         };
         let executable = std::env::current_exe().map_err(|_| LauncherError::InvalidBundleLayout)?;
         let layout = BundleLayout::from_launcher_executable(&executable)?;
-        crate::macos::code_sign::validate_bundle(&layout)?;
+        let worker_profile = crate::macos::code_sign::validate_bundle(&layout)?;
         if let Some(mut bootstrap) = child_bootstrap {
             let result = (|| {
                 if !request.requests_daemonize()
@@ -54,7 +54,8 @@ where
                 {
                     return Err(LauncherError::DaemonHandoff);
                 }
-                let launch = request.prepare(layout.worker_executable(), timing, true)?;
+                let launch =
+                    request.prepare(layout.worker_executable(), timing, true, worker_profile)?;
                 if bootstrap.notifier.check_parent()?
                     != crate::macos::daemon::NotifierEvent::Pending
                 {
@@ -71,7 +72,7 @@ where
             crate::macos::daemon::launch_parent(&request, timing, &executable, &layout)?;
             return Ok(LauncherExit(0));
         }
-        let launch = request.prepare(layout.worker_executable(), timing, false)?;
+        let launch = request.prepare(layout.worker_executable(), timing, false, worker_profile)?;
         launch_prepared(&layout, launch, None)
     }
 
@@ -97,12 +98,20 @@ fn launch_prepared(
     let mut lifecycle = LauncherLifecycle::new(session_id);
     let mut spawned =
         crate::macos::spawn::spawn_suspended(layout.worker_executable(), launch.worker_args)?;
-    crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?;
+    if crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?
+        != launch.worker_profile
+    {
+        return Err(LauncherError::InvalidWorkerIdentity);
+    }
     spawned.worker.resume()?;
     crate::macos::supervise::read_bootstrap_hello(&mut spawned.session, &mut lifecycle)?;
     bangbang_session::macos::verify_peer(spawned.session.as_raw_fd(), spawned.worker.pid())
         .map_err(|_| LauncherError::InvalidWorkerIdentity)?;
-    crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?;
+    if crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?
+        != launch.worker_profile
+    {
+        return Err(LauncherError::InvalidWorkerIdentity);
+    }
     let start = lifecycle
         .start(launch.worker_policy)
         .map_err(|_| LauncherError::SessionProtocol)?;

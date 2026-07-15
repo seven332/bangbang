@@ -3065,7 +3065,7 @@ host isolation boundary. The lower-level `app_sandbox` target proves that the
 HVF lifecycle and process can execute inside App Sandbox. The separate
 `production_bundle` target proves the fixed launcher/nested-worker package,
 signature and entitlement split, tamper gate, container denial/redaction,
-signal/exit forwarding, mandatory lifecycle-v3 policy/grant acknowledgment,
+signal/exit forwarding, mandatory lifecycle-v4 policy/grant acknowledgment,
 closed environment/descriptors, exact resource limits and private cwd, signed
 daemon readiness/ownership and parent-loss cancellation, typed
 SCM_RIGHTS file authority, one-session directory bookmark scope, atomic
@@ -3091,7 +3091,15 @@ Signed normal-bundle proof covers outside-container API clients, real guest- and
 host-initiated vsock traffic, no surviving helper, and unchanged entitlements.
 Snapshot path consumers use exact state/memory/root and repeatable output grants.
 General dynamic brokerage, cross-filesystem socket publication, hard revocation,
-vmnet provisioning, arbitrary credential/chroot authority, remaining Linux
+and vmnet provisioning remain incomplete. Lifecycle v4 now carries a canonical
+bounded host/shared/exact-bridge allowlist plus a separate 1-through-4 active
+limit, retains it immutably in contained workers, and applies it to the complete
+non-MMDS-only interface set before any startup resource or vmnet backend is
+acquired. Direct mode is unchanged and all-MMDS requires no vmnet authority.
+The shipping App Sandbox plus Hypervisor worker is still an exact networkless
+profile and rejects every positive authority before spawn/resume; no restricted
+Apple vmnet entitlement or real contained connectivity is claimed. Arbitrary
+credential/chroot authority, remaining Linux
 jailer controls, seccomp outcome classification, and deployment signing policy
 remain later #1351 work.
 

@@ -275,9 +275,9 @@ again after the worker has used the endpoint and sent the bounded pre-session
 greeting.
 
 Each launch uses unnamed lifecycle stream, grant datagram, and socket-broker
-socketpairs plus a random 256-bit session identity. Lifecycle protocol v3 has a
+socketpairs plus a random 256-bit session identity. Lifecycle protocol v4 has a
 4-KiB frame limit, exact per-direction sequence numbers, closed message
-variants, a fixed reserved-zero `Start(WorkerPolicy)` payload, and monotonic
+variants, a fixed 96-byte reserved-zero `Start(WorkerPolicy)` payload, and monotonic
 `prepared -> grants-accepted -> starting -> ready -> terminal` state. Even an
 empty grant batch must be atomically acknowledged before `Proceed`. The launcher
 authenticates the live worker PID, effective credentials, signature, identity,
@@ -288,6 +288,16 @@ back exact soft/hard `RLIMIT_FSIZE` and `RLIMIT_NOFILE` values without raising a
 inherited hard limit. App Sandbox prevents the worker from independently
 querying the launcher's code signature, so authentication is deliberately
 asymmetric.
+
+`Start` also carries one immutable, redacted `VmnetAuthority`. Its canonical
+default denies system vmnet; a nonempty value can independently allow host and
+shared modes, up to four exact 15-byte ASCII bridge names, and a separate active
+interface maximum from 1 through 4. The authority is bound to the same random
+session, sender role, sequence, fixed worker identity, and daemon handoff as the
+credential/limit policy. The shipping two-entitlement worker is classified as
+the closed `Networkless` profile, so every nonempty vmnet policy is rejected
+before worker spawn or resume. No current production bundle adds either Apple
+vmnet entitlement or claims external connectivity.
 
 Before public argument or VM processing, the worker creates and locks a unique
 mode-0700 empty namespace in its App Sandbox container and enters it through the
@@ -314,6 +324,8 @@ argv position one:
   --uid CURRENT_UID --gid CURRENT_GID \
   [--resource-limit fsize=U64] \
   [--resource-limit no-file=U64] \
+  [--vmnet-allow host|shared|bridged:INTERFACE]... \
+  [--vmnet-max-interfaces 1..=4] \
   [--daemonize] -- \
   [--bangbang-grant-manifest MANIFEST --] FIRECRACKER_ARGS...
 ```
@@ -325,6 +337,16 @@ entries use the last value; `no-file` defaults to 2048 for every production
 worker, including launches without this envelope. The launcher injects the
 validated ID and sampled timing once. `--bangbang-jailer-v1 --help` and
 `--version` are exact early commands.
+
+`--vmnet-allow` is repeatable but exact host/shared or bridge duplicates are
+invalid. A nonempty allowlist requires exactly one
+`--vmnet-max-interfaces`; the maximum without an allowlist is also invalid.
+Bridge names use `[A-Za-z0-9._-]`, are 1 through 15 bytes, and match guest
+configuration exactly. Ordinary post-`--` worker argv, files, environment, and
+descriptors cannot create or mutate this authority. Configuration remains
+order-neutral: all-MMDS final configurations require no vmnet authority, while
+any partial-MMDS configuration authorizes the complete configured interface set
+at final InstanceStart before resources or a backend are acquired.
 
 With `--daemonize`, the validated outer launcher performs a default-close,
 empty-environment re-exec of the same signed code as a new session leader with
@@ -465,7 +487,7 @@ the worker still has exactly App Sandbox and Hypervisor entitlements and steady
 state remains one launcher plus one worker.
 
 General dynamic post-Ready brokerage, hard revocation, cross-filesystem socket
-publication, vmnet provisioning, broader snapshot profiles, automatic restart
+publication, an approved static vmnet profile and provisioning, broader snapshot profiles, automatic restart
 policy, Developer ID possession proof, launch-constraint policy, and
 notarization workflow remain. The session namespace must be empty at the
 `Prepared` gate. Authorized construction may transiently add one fixed
@@ -578,6 +600,11 @@ routing/NAT, resource, and distribution policy. See the
 [compatibility scope](docs/firecracker-compatibility.md#internal-network-interface-configuration),
 [vmnet security boundary](docs/security.md#vmnet-host-policy-boundary), and
 [testing guide](docs/testing.md) for the exact supported subset and exclusions.
+Contained startup additionally enforces the authenticated lifecycle-v4 mode,
+bridge-name, and active-count authority before backend construction. The current
+networkless production profile rejects every nonempty authority before worker
+spawn, so this enforcement is preparation for a later approved signed profile,
+not a production-connectivity claim.
 
 Record a pre-boot vsock configuration:
 
@@ -789,7 +816,8 @@ scripts/run-integration-tests.sh --test production_bundle
 
 This target verifies exact identifiers, entitlements, Hardened Runtime, strict
 static and live-worker validation, tamper rejection, the descriptor allowlist,
-closed worker environment, lifecycle-v3 launch-policy authentication, exact and
+closed worker environment, lifecycle-v4 launch-policy authentication, canonical
+default-denied vmnet policy and networkless-profile rejection, exact and
 kernel-enforced resource limits, private-root entry, jailer help/version/parser
 rejection, foreground compatibility, daemon readiness/PID/stdio/session
 ownership, pre-ack parent-loss cancellation, concurrent daemon isolation,

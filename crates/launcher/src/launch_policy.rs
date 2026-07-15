@@ -2,7 +2,9 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use bangbang_session::WorkerPolicy;
+use bangbang_session::{
+    MAX_VMNET_ACTIVE_INTERFACES, MAX_VMNET_BRIDGE_NAMES, VmnetAuthority, WorkerPolicy,
+};
 
 use crate::LauncherError;
 use crate::grant_manifest::{LaunchInput, PreparedGrantBatch};
@@ -16,6 +18,8 @@ const UID_OPTION: &str = "--uid";
 const GID_OPTION: &str = "--gid";
 const RESOURCE_LIMIT_OPTION: &str = "--resource-limit";
 const DAEMONIZE_OPTION: &str = "--daemonize";
+const VMNET_ALLOW_OPTION: &str = "--vmnet-allow";
+const VMNET_MAX_INTERFACES_OPTION: &str = "--vmnet-max-interfaces";
 const FORWARDED_SINGLETONS: [&str; 4] = [
     "--id",
     "--start-time-us",
@@ -43,7 +47,7 @@ impl std::fmt::Debug for LaunchCommand {
 pub(crate) struct LaunchRequest {
     raw_args: Vec<OsString>,
     grants: LaunchInput,
-    jailer: Option<JailerOptions>,
+    jailer: Option<Box<JailerOptions>>,
 }
 
 impl std::fmt::Debug for LaunchRequest {
@@ -60,6 +64,7 @@ struct JailerOptions {
     no_file: u64,
     file_size: Option<u64>,
     daemonize: bool,
+    vmnet_authority: VmnetAuthority,
 }
 
 impl std::fmt::Debug for JailerOptions {
@@ -72,6 +77,7 @@ pub(crate) struct PreparedLaunch {
     pub(crate) worker_args: Vec<OsString>,
     pub(crate) grants: PreparedGrantBatch,
     pub(crate) worker_policy: WorkerPolicy,
+    pub(crate) worker_profile: crate::macos::code_sign::WorkerProfile,
 }
 
 impl std::fmt::Debug for PreparedLaunch {
@@ -192,8 +198,16 @@ impl LaunchRequest {
         worker_executable: &Path,
         timing: LaunchTiming,
         daemonized: bool,
+        worker_profile: crate::macos::code_sign::WorkerProfile,
     ) -> Result<PreparedLaunch, LauncherError> {
         self.validate(worker_executable, daemonized)?;
+        let vmnet_authority = self
+            .jailer
+            .as_ref()
+            .map_or_else(VmnetAuthority::denied, |jailer| jailer.vmnet_authority);
+        if !worker_profile.admits(vmnet_authority) {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
         let (mut worker_args, grants) = self.grants.prepare()?;
         let (uid, gid) = current_credentials()?;
         let (no_file, file_size) = if let Some(jailer) = self.jailer {
@@ -216,13 +230,15 @@ impl LaunchRequest {
         Ok(PreparedLaunch {
             worker_args,
             grants,
-            worker_policy: WorkerPolicy::new(uid, gid, no_file, file_size, daemonized),
+            worker_policy: WorkerPolicy::new(uid, gid, no_file, file_size, daemonized)
+                .with_vmnet_authority(vmnet_authority),
+            worker_profile,
         })
     }
 }
 
 pub(crate) const fn help() -> &'static str {
-    "Usage: bangbang-launcher --bangbang-jailer-v1 --id ID --exec-file PATH --uid UID --gid GID [--resource-limit fsize=U64] [--resource-limit no-file=U64] [--daemonize] -- [WORKER OPTIONS]\n"
+    "Usage: bangbang-launcher --bangbang-jailer-v1 --id ID --exec-file PATH --uid UID --gid GID [--resource-limit fsize=U64] [--resource-limit no-file=U64] [--vmnet-allow host|shared|bridged:INTERFACE ... --vmnet-max-interfaces 1..=4] [--daemonize] -- [WORKER OPTIONS]\n"
 }
 
 fn parse_jailer(args: Vec<OsString>) -> Result<LaunchCommand, LauncherError> {
@@ -234,6 +250,10 @@ fn parse_jailer(args: Vec<OsString>) -> Result<LaunchCommand, LauncherError> {
     let mut no_file = DEFAULT_NO_FILE;
     let mut file_size = None;
     let mut daemonize = false;
+    let mut allow_vmnet_host = false;
+    let mut allow_vmnet_shared = false;
+    let mut allowed_vmnet_bridges = Vec::new();
+    let mut vmnet_max_interfaces = None;
     let mut index = 1;
     while index < args.len() {
         let argument = policy_text(args.get(index).ok_or(LauncherError::InvalidLaunchPolicy)?)?;
@@ -300,6 +320,38 @@ fn parse_jailer(args: Vec<OsString>) -> Result<LaunchCommand, LauncherError> {
                 }
             }
             DAEMONIZE_OPTION if !daemonize => daemonize = true,
+            VMNET_ALLOW_OPTION => {
+                let value = next_policy_value(&args, &mut index)?;
+                match value {
+                    "host" if !allow_vmnet_host => allow_vmnet_host = true,
+                    "shared" if !allow_vmnet_shared => allow_vmnet_shared = true,
+                    "host" | "shared" => return Err(LauncherError::InvalidLaunchPolicy),
+                    value => {
+                        let bridge = value
+                            .strip_prefix("bridged:")
+                            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+                        if allowed_vmnet_bridges.len() >= MAX_VMNET_BRIDGE_NAMES
+                            || allowed_vmnet_bridges
+                                .iter()
+                                .any(|allowed| allowed == bridge)
+                            || VmnetAuthority::try_new(false, false, 1, &[bridge]).is_err()
+                        {
+                            return Err(LauncherError::InvalidLaunchPolicy);
+                        }
+                        allowed_vmnet_bridges.push(bridge.to_owned());
+                    }
+                }
+            }
+            VMNET_MAX_INTERFACES_OPTION => {
+                if vmnet_max_interfaces.is_some() {
+                    return Err(LauncherError::InvalidLaunchPolicy);
+                }
+                vmnet_max_interfaces = Some(
+                    next_policy_value(&args, &mut index)?
+                        .parse::<u8>()
+                        .map_err(|_| LauncherError::InvalidLaunchPolicy)?,
+                );
+            }
             _ => return Err(LauncherError::InvalidLaunchPolicy),
         }
         index += 1;
@@ -316,6 +368,22 @@ fn parse_jailer(args: Vec<OsString>) -> Result<LaunchCommand, LauncherError> {
         .to_vec();
     let grants = LaunchInput::parse(worker_envelope)?;
     reject_forwarded_singletons(&grants.worker_args)?;
+    let any_vmnet_allow =
+        allow_vmnet_host || allow_vmnet_shared || !allowed_vmnet_bridges.is_empty();
+    let vmnet_authority = match (any_vmnet_allow, vmnet_max_interfaces) {
+        (false, None) => VmnetAuthority::denied(),
+        (true, Some(maximum)) if maximum <= MAX_VMNET_ACTIVE_INTERFACES => {
+            let bridges = allowed_vmnet_bridges
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            VmnetAuthority::try_new(allow_vmnet_host, allow_vmnet_shared, maximum, &bridges)
+                .map_err(|_| LauncherError::InvalidLaunchPolicy)?
+        }
+        (false, Some(_)) | (true, None) | (true, Some(_)) => {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+    };
     let jailer = JailerOptions {
         id: id.ok_or(LauncherError::InvalidLaunchPolicy)?,
         exec_file: exec_file.ok_or(LauncherError::InvalidLaunchPolicy)?,
@@ -324,11 +392,12 @@ fn parse_jailer(args: Vec<OsString>) -> Result<LaunchCommand, LauncherError> {
         no_file,
         file_size,
         daemonize,
+        vmnet_authority,
     };
     Ok(LaunchCommand::Run(LaunchRequest {
         raw_args,
         grants,
-        jailer: Some(jailer),
+        jailer: Some(Box::new(jailer)),
     }))
 }
 
@@ -425,6 +494,10 @@ mod tests {
 
     use super::*;
 
+    const fn networkless_profile() -> crate::macos::code_sign::WorkerProfile {
+        crate::macos::code_sign::WorkerProfile::Networkless
+    }
+
     fn base(worker: &Path) -> Vec<OsString> {
         let (uid, gid) = current_credentials().expect("test credentials should be ordinary");
         vec![
@@ -473,6 +546,7 @@ mod tests {
                 worker,
                 LaunchTiming::sample().expect("timing should sample"),
                 false,
+                networkless_profile(),
             )
             .expect("policy should prepare");
         assert_eq!(prepared.worker_policy.no_file(), 2048);
@@ -499,10 +573,194 @@ mod tests {
                 Path::new("/fixed/worker"),
                 LaunchTiming::sample().expect("timing"),
                 false,
+                networkless_profile(),
             )
             .expect("legacy should prepare");
         assert_eq!(prepared.worker_args, vec![opaque]);
         assert_eq!(prepared.worker_policy.no_file(), DEFAULT_NO_FILE);
+        assert!(prepared.worker_policy.vmnet_authority().is_denied());
+    }
+
+    #[test]
+    fn ordinary_worker_arguments_cannot_enable_vmnet_authority() {
+        let worker_args = vec![
+            OsString::from(VMNET_ALLOW_OPTION),
+            OsString::from("shared"),
+            OsString::from(VMNET_MAX_INTERFACES_OPTION),
+            OsString::from("1"),
+        ];
+        let LaunchCommand::Run(request) =
+            LaunchCommand::parse(worker_args.clone()).expect("ordinary arguments should parse")
+        else {
+            panic!("run command expected");
+        };
+        let prepared = request
+            .prepare(
+                Path::new("/fixed/worker"),
+                LaunchTiming::sample().expect("timing"),
+                false,
+                networkless_profile(),
+            )
+            .expect("ordinary launch should prepare");
+
+        assert_eq!(prepared.worker_args, worker_args);
+        assert!(prepared.worker_policy.vmnet_authority().is_denied());
+    }
+
+    #[test]
+    fn parses_exact_vmnet_authority_and_preserves_daemon_reparse_bytes() {
+        let worker = Path::new("/fixed/BangbangWorker");
+        let mut args = base(worker);
+        args.splice(
+            args.len() - 1..args.len() - 1,
+            [
+                OsString::from(VMNET_ALLOW_OPTION),
+                OsString::from("host"),
+                OsString::from(VMNET_ALLOW_OPTION),
+                OsString::from("shared"),
+                OsString::from(VMNET_ALLOW_OPTION),
+                OsString::from("bridged:en0"),
+                OsString::from(VMNET_ALLOW_OPTION),
+                OsString::from("bridged:bridge_1"),
+                OsString::from(VMNET_MAX_INTERFACES_OPTION),
+                OsString::from("4"),
+                OsString::from(DAEMONIZE_OPTION),
+            ],
+        );
+        let LaunchCommand::Run(request) =
+            LaunchCommand::parse(args.clone()).expect("vmnet policy should parse")
+        else {
+            panic!("run command expected");
+        };
+        let authority = request
+            .jailer
+            .as_ref()
+            .expect("jailer policy should exist")
+            .vmnet_authority;
+        assert!(authority.allows_host());
+        assert!(authority.allows_shared());
+        assert!(authority.allows_bridge("en0"));
+        assert!(authority.allows_bridge("bridge_1"));
+        assert_eq!(authority.max_interfaces(), Some(4));
+        assert_eq!(request.raw_args(), args);
+
+        let LaunchCommand::Run(reparsed) =
+            LaunchCommand::parse(request.raw_args().to_vec()).expect("daemon bytes should reparse")
+        else {
+            panic!("run command expected");
+        };
+        assert_eq!(
+            reparsed
+                .jailer
+                .as_ref()
+                .expect("reparsed jailer policy should exist")
+                .vmnet_authority,
+            authority
+        );
+        assert!(matches!(
+            reparsed.prepare(
+                worker,
+                LaunchTiming::sample().expect("timing should sample"),
+                true,
+                networkless_profile(),
+            ),
+            Err(LauncherError::InvalidLaunchPolicy)
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_duplicate_and_unrelated_vmnet_options() {
+        let worker = Path::new("/fixed/worker");
+        let cases: &[&[&str]] = &[
+            &[VMNET_ALLOW_OPTION, "host"],
+            &[VMNET_MAX_INTERFACES_OPTION, "1"],
+            &[
+                VMNET_ALLOW_OPTION,
+                "host",
+                VMNET_ALLOW_OPTION,
+                "host",
+                VMNET_MAX_INTERFACES_OPTION,
+                "1",
+            ],
+            &[
+                VMNET_ALLOW_OPTION,
+                "shared",
+                VMNET_ALLOW_OPTION,
+                "shared",
+                VMNET_MAX_INTERFACES_OPTION,
+                "1",
+            ],
+            &[
+                VMNET_ALLOW_OPTION,
+                "bridged:en0",
+                VMNET_ALLOW_OPTION,
+                "bridged:en0",
+                VMNET_MAX_INTERFACES_OPTION,
+                "1",
+            ],
+            &[
+                VMNET_ALLOW_OPTION,
+                "host",
+                VMNET_MAX_INTERFACES_OPTION,
+                "1",
+                VMNET_MAX_INTERFACES_OPTION,
+                "2",
+            ],
+            &[VMNET_ALLOW_OPTION, "host", VMNET_MAX_INTERFACES_OPTION, "0"],
+            &[VMNET_ALLOW_OPTION, "host", VMNET_MAX_INTERFACES_OPTION, "5"],
+            &[
+                VMNET_ALLOW_OPTION,
+                "host",
+                VMNET_MAX_INTERFACES_OPTION,
+                "not-a-number",
+            ],
+            &[
+                VMNET_ALLOW_OPTION,
+                "bridged:",
+                VMNET_MAX_INTERFACES_OPTION,
+                "1",
+            ],
+            &[
+                VMNET_ALLOW_OPTION,
+                "bridged:en$0",
+                VMNET_MAX_INTERFACES_OPTION,
+                "1",
+            ],
+            &[
+                VMNET_ALLOW_OPTION,
+                "bridged:abcdefghijklmnop",
+                VMNET_MAX_INTERFACES_OPTION,
+                "1",
+            ],
+            &[
+                VMNET_ALLOW_OPTION,
+                "bridged:a",
+                VMNET_ALLOW_OPTION,
+                "bridged:b",
+                VMNET_ALLOW_OPTION,
+                "bridged:c",
+                VMNET_ALLOW_OPTION,
+                "bridged:d",
+                VMNET_ALLOW_OPTION,
+                "bridged:e",
+                VMNET_MAX_INTERFACES_OPTION,
+                "4",
+            ],
+            &[
+                VMNET_ALLOW_OPTION,
+                "unknown",
+                VMNET_MAX_INTERFACES_OPTION,
+                "1",
+            ],
+        ];
+        for values in cases {
+            let mut args = base(worker);
+            args.splice(
+                args.len() - 1..args.len() - 1,
+                values.iter().copied().map(OsString::from),
+            );
+            assert_invalid(args);
+        }
     }
 
     #[test]
@@ -690,6 +948,7 @@ mod tests {
                 worker,
                 LaunchTiming::sample().expect("timing should sample"),
                 false,
+                networkless_profile(),
             )
             .expect("opaque worker tail should prepare");
         assert_eq!(

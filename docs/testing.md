@@ -706,8 +706,10 @@ may skip execution. On supported Apple Silicon it proves:
   through the structured lifecycle session;
 - exact early jailer help/version output and closed policy parsing, including
   fixed executable/current credentials, ID/timing injection, duplicate and
-  forwarded-singleton rejection, last-value resource limits, and redacted
-  failure;
+  forwarded-singleton rejection, last-value resource limits, canonical
+  default-denied vmnet grammar, and redacted failure;
+- rejection of every positive host/shared/bridge/count vmnet authority by the
+  current exact two-entitlement networkless profile before worker execution;
 - a marker-only worker exec environment, absent caller/loader/debug variables,
   current credentials/session identity, descriptor-entered private cwd, exact
   default/explicit limits, real `EMFILE` exhaustion, and kernel `SIGXFSZ` at the
@@ -731,7 +733,7 @@ may skip execution. On supported Apple Silicon it proves:
   namespace recovery, and preservation of the concurrent peer namespace;
 - two simultaneous API sessions remaining independent when one worker is
   killed and the other is queried and then gracefully stopped; and
-- mandatory lifecycle-v3 acknowledgment for even an empty batch; exact
+- mandatory lifecycle-v4 acknowledgment for even an empty batch; exact
   SCM_RIGHTS read-only/write-only enforcement; one-session directory bookmark
   scope and outside-parent denial; typed mismatch rollback; path/ID/content
   redaction; signal cancellation during an incomplete batch; one absolute grant

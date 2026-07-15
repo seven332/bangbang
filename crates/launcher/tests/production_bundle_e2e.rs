@@ -318,6 +318,11 @@ fn launcher_exposes_exact_jailer_help_version_and_policy_validation() {
     let assert_invalid = |mut command: Command, context: &str| {
         let invalid = run_with_timeout(&mut command, PROCESS_TIMEOUT, context);
         assert_eq!(invalid.status.code(), Some(1));
+        assert!(
+            invalid.stdout.is_empty(),
+            "invalid policy must not execute the worker; {context} stdout:\n{}",
+            String::from_utf8_lossy(&invalid.stdout)
+        );
         assert_eq!(
             String::from_utf8_lossy(&invalid.stderr),
             "bangbang launcher: invalid production launch policy\n"
@@ -356,6 +361,29 @@ fn launcher_exposes_exact_jailer_help_version_and_policy_validation() {
     assert_invalid(
         policy_command(&worker_executable(&bundle), uid.wrapping_add(1), gid),
         "mismatched jailer credential",
+    );
+
+    let mut vmnet = Command::new(launcher(&bundle));
+    vmnet
+        .arg(JAILER_OPTION)
+        .args(["--id", "networkless-profile"])
+        .arg("--exec-file")
+        .arg(worker_executable(&bundle))
+        .args([
+            "--uid",
+            &uid.to_string(),
+            "--gid",
+            &gid.to_string(),
+            "--vmnet-allow",
+            "shared",
+            "--vmnet-max-interfaces",
+            "1",
+            "--",
+            "--version",
+        ]);
+    assert_invalid(
+        vmnet,
+        "networkless signed profile with positive vmnet authority",
     );
 }
 

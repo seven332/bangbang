@@ -121,7 +121,7 @@ can require matching real/effective credentials, session identity, the inherited
 endpoint, and `LOCAL_PEERPID == getppid()` because App Sandbox denies its
 parent-code lookup.
 No public/VM/resource side effect may precede random-session `Start` and the
-independently validated `Prepared`/grant-ack/`Proceed` gates. Keep lifecycle v3
+independently validated `Prepared`/grant-ack/`Proceed` gates. Keep lifecycle v4
 frames at 4096 bytes or less, sequences exact, message/state variants closed,
 diagnostics redacted, and the all-zero identity exclusive to the initial
 greeting. Even an empty grant batch must be acknowledged before `Proceed`.
@@ -131,8 +131,13 @@ activation and the mandatory policy delimiter, fixed executable/current
 credential binding, singleton and forwarded-timing conflict rejection,
 last-value `fsize`/`no-file` behavior, the 2048 no-file default, and unchanged
 nested grant/worker bytes. `Start(WorkerPolicy)` must remain fixed-size,
-reserved-zero, authenticated, and value-redacted. The worker must install and
-read back exact soft/hard limits without raising an inherited hard bound, then
+reserved-zero, authenticated, and value-redacted. Vmnet changes must preserve
+canonical default denial, exact bounded mode/bridge/count grammar, immutable
+contained retention, all-MMDS no-authority behavior, and the final pre-resource
+admission gate. A positive policy may be admitted only by an exactly validated
+matching worker profile; the networkless profile must fail before worker
+spawn/resume. The worker must install and read back exact soft/hard limits
+without raising an inherited hard bound, then
 descriptor-enter and recheck the locked private namespace before `Prepared`.
 The exec environment remains a closed marker-only input; platform-created
 runtime variables are not caller authority and must not justify forwarding

@@ -125,9 +125,9 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
-| Network and vmnet | Implemented virtio-MMIO/MMDS-only subset; direct vmnet conditional | Keep supported `host_dev_name` forms, startup validation, MMDS-only behavior, entitlement requirements, and non-goals documented when network behavior changes. |
+| Network and vmnet | Implemented virtio-MMIO/MMDS-only subset; direct vmnet conditional; contained lifecycle-v4 authority enforced but the shipping profile is networkless | Keep supported `host_dev_name` forms, exact mode/bridge/count admission, startup validation, MMDS-only behavior, entitlement/profile requirements, and non-goals documented when network behavior changes. |
 | macOS App Sandbox | Production nested worker implemented for container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, API-socket, and vsock-socket resources | Keep the ordinary CLI explicitly uncontained and prove package identity plus real ungranted denial and granted operation behavior without adding ambient network authority. |
-| Launcher and resource broker | Authenticated lifecycle v3 policy, closed exec environment and descriptor set, bounded atomic startup grants, signed daemon handoff, adopted file and socket-directory consumers, and one fixed session-bound vsock connection facet implemented; general dynamic brokerage missing | Require exact policy/role/access/anchor/identity checks, one-time registry adoption, closed session/sequence/rights framing, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
+| Launcher and resource broker | Authenticated lifecycle v4 credential/resource-limit/vmnet policy, closed exec environment and descriptor set, bounded atomic startup grants, signed daemon handoff, adopted file and socket-directory consumers, and one fixed session-bound vsock connection facet implemented; general dynamic brokerage missing | Require exact policy/profile/role/access/anchor/identity checks, one-time registry adoption, closed session/sequence/rights framing, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
 
 ## Native Snapshot Composite and Device Boundary
 
@@ -239,8 +239,8 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | --- | --- | --- |
 | Operator-owned private directories | Required for API sockets, vsock sockets, observability sinks, and other configured paths that should not be shared. Contained API/vsock use requires one exact preauthorized directory and safe child; direct paths remain operator-owned. | Cross-launcher name allocation and sharing policy remain operator responsibilities. |
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
-| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, and vsock-socket authority form the current contained mode. | General dynamic delivery and vmnet authorization require later explicit policy. |
-| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v3 policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports the adopted file/directory consumers, offers signed daemon detach, and exposes one dormant fixed vsock connection facet. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
+| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, and vsock-socket authority form the current contained mode. A lifecycle-v4 vmnet allowlist exists, but the only accepted signed profile is networkless. | An approved restricted-entitlement profile and real connectivity evidence remain separate gates; general dynamic delivery still requires explicit design. |
+| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v4 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports the adopted file/directory consumers, offers signed daemon detach, and exposes one dormant fixed vsock connection facet. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
 | Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope. | Keep arbitrary uid/gid, configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
@@ -272,7 +272,7 @@ before spawn; any failure drops every opened descriptor. Current hard limits are
 snapshot output child, 4096 source-path bytes, 512 records, 1024 encoded bytes
 per datagram, 64 KiB per bookmark, and 256 KiB aggregate bookmark material.
 
-Lifecycle protocol v3 uses descriptor 3 and carries one fixed reserved-zero
+Lifecycle protocol v4 uses descriptor 3 and carries one fixed reserved-zero
 worker policy only after peer authentication. A separate connected unnamed Darwin
 datagram socket at descriptor 4 carries grant-channel v1 records. A third
 connected unnamed datagram socket at descriptor 5 carries the dormant closed
@@ -554,16 +554,20 @@ is deliberately limited to the inherited endpoint, direct-parent PID,
 credentials, exact sequences, and disconnect behavior; symmetric code-signing
 authentication is not claimed.
 
-Lifecycle protocol v3 uses a fixed endian-stable header, 256-bit session identity, exact
+Lifecycle protocol v4 uses a fixed endian-stable header, 256-bit session identity, exact
 per-direction sequence, zero reserved fields, closed message kinds, fixed
 payload shapes, and a 4096-byte frame cap. Wrong magic/version/reserved fields,
 oversized or truncated input, unknown messages, replay/gap, cross-session data,
 wrong sender, and invalid state fail with one redacted category before public or
 VM work. `Hello`, `Start`, `Prepared`, exact `GrantsAccepted`, `Proceed`, `Starting`, optional committed
 `Ready(Api|NoApi)`, at most one `Cancel(SIGINT|SIGTERM)`, and path-free
-`Terminal(category, exit_code)` form the complete v3 lifecycle. `Start` alone
-carries the current credential, exact limit, and daemon-state policy; its fixed
-flags and unused fields are reserved zero. Structured exit
+`Terminal(category, exit_code)` form the complete v4 lifecycle. `Start` alone
+carries the current credential, exact limit, daemon state, and immutable
+`VmnetAuthority`. The canonical network value is denied; a positive value has
+closed host/shared bits, four zero-padded 15-byte ASCII bridge slots, and an
+independent active maximum from 1 through 4. Unknown flags, duplicates,
+inconsistent counts, malformed names, and nonzero unused bytes fail closed.
+Structured exit
 values must match the reaped public status; abrupt death may omit `Terminal`.
 The initial `Hello`, `Start`, grant transaction, and `Proceed` reads use
 absolute five-second deadlines, including across interrupted or fragmented
@@ -614,8 +618,10 @@ HVF exits remain untrusted worker inputs. Container/sealed resources plus the
 committed startup registry and fixed vsock connection facet are the current
 contained authority. Granted config, metadata, kernel, initrd, block, pmem,
 logger, metrics, serial, snapshot, API-socket, and vsock-socket resources are
-consumed through their opened identities or exact retained anchors. vmnet and
-general dynamic resources remain unbrokered.
+consumed through their opened identities or exact retained anchors. vmnet is
+not descriptor-brokered: contained acquisition is instead bounded by the
+immutable lifecycle-v4 authority described below. General dynamic resources
+remain unbrokered.
 
 ## vmnet Host Policy Boundary
 
@@ -636,6 +642,34 @@ vmnet-shaped names but can use process-local MMDS-only packet I/O without
 opening vmnet resources. Otherwise, startup opens vmnet resources for the
 configured interfaces and retains stop-on-drop cleanup ownership inside the
 process.
+
+Contained mode adds a separate authenticated admission boundary without
+changing direct mode. The outer jailer accepts repeated exact
+`--vmnet-allow host|shared|bridged:<interface>` plus one required
+`--vmnet-max-interfaces 1..=4`; the canonical default is deny. Host/shared may
+appear once each, there are at most four unique bridge names, and production
+bridge names are 1–15 ASCII bytes from `[A-Za-z0-9._-]`. This fixed value is
+carried in lifecycle-v4 `Start`, retained immutably by `ContainedSession`, and
+cannot be supplied through ordinary worker argv, environment, files,
+descriptors, or a post-Ready message.
+
+At final `InstanceStart`, after controller preflight but before grant
+consumption or starter/backend construction, the worker parses every configured
+mode/name. Complete MMDS coverage requires no authority and opens no vmnet.
+Otherwise the complete configured set—not only non-MMDS interfaces—must fit the
+active maximum and match the host/shared/bridge allowlist exactly. This timing
+is deliberate: an interface must be configured before MMDS can name it, so a
+PUT-time denial would make the same all-MMDS zero-resource configuration depend
+on API ordering. Denial is a fieldless error that reveals no interface ID,
+bridge name, count, limit, or session value.
+
+Static authority is a separate gate. Static and live code validation currently
+classify the exact App Sandbox plus Hypervisor worker as `Networkless` and
+reject every nonempty authority before worker spawn/resume. Neither
+`com.apple.vm.networking` nor `com.apple.developer.networking.vmnet` is accepted
+or added in this delivery. An approved profile and real signed vmnet lifecycle
+evidence remain later work; authenticated positive policy support here is not a
+production-connectivity claim.
 
 The vmnet path requires the host to satisfy macOS vmnet authorization,
 entitlement, and code-signing requirements. Apple's
@@ -662,9 +696,10 @@ Configured RX/TX token buckets are implemented as device-local queue admission
 with retained work and session-owned retry wakeups. They are not packet
 filters, a host firewall, or a NAT policy, and current signed limiter evidence
 uses MMDS-only packet I/O rather than direct vmnet. The boundary still lacks
-packet filtering, production network isolation, sandbox-worker vmnet authority
-and resource brokerage, runtime network hotplug, limiter-specific metrics,
-network snapshot state, and full Firecracker public packet-movement parity.
+packet filtering, production network isolation, an approved entitled worker
+profile and real contained vmnet evidence, runtime network hotplug,
+limiter-specific metrics, network snapshot state, and full Firecracker public
+packet-movement parity.
 
 ## API Socket Handling
 
@@ -1699,7 +1734,9 @@ The current scaffold does not implement:
   that limit before selecting packet I/O, opens vmnet resources only for
   non-MMDS-only startup when configured interfaces use the supported names,
   keeps no-network startup on a no-op TX sink plus empty RX source, and still
-  lacks sandbox-worker vmnet authority, a network-specific resource broker,
+  enforces bounded lifecycle-v4 vmnet authority for contained startup. The
+  shipping networkless code-sign profile rejects every positive authority
+  before worker spawn, so an approved restricted-entitlement profile,
   production connectivity policy,
   and full public vmnet packet-movement proof beyond the documented
   operator-owned vmnet boundary. The current
