@@ -565,7 +565,11 @@ impl GrantSendState {
                         .checked_add(1)
                         .ok_or(LauncherError::GrantProtocol)?;
                 }
-                Err(GrantTransportError::Io(io::ErrorKind::Interrupted)) => {}
+                Err(GrantTransportError::Io(io::ErrorKind::Interrupted)) => {
+                    // Return to the level-triggered kqueue so signals, child
+                    // exit, and the absolute deadline are observed first.
+                    return Ok(());
+                }
                 Err(GrantTransportError::Io(io::ErrorKind::WouldBlock)) => return Ok(()),
                 Err(GrantTransportError::Io(_) | GrantTransportError::Invalid) => {
                     return Err(LauncherError::GrantProtocol);
