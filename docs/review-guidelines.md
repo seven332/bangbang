@@ -169,6 +169,31 @@ serial open timing must remain unchanged. Signed normal-bundle evidence must
 cover source-path replacement, append sentinels, logger/metrics/guest-serial
 writes, redacted mismatch rollback, cleanup, and concurrent session isolation.
 
+For API/vsock directory grants, require the distinct exact
+`bangbang-grant:<GrantId>/<SocketChild>` grammar, where the child is one bounded
+ASCII component and direct mode preserves identical bytes as a path. Review
+validation-before-claim, exact singleton role/access, owner-thread scope and
+anchor lifetime, no-API non-consumption, API readiness after publication, and
+deferred vsock claim/startup failure atomicity. The transient signed binder must
+use a default-close fd5/fd6 allowlist, authenticate its parent, bind only the
+fixed private staging name, validate and transfer exactly one listener, and be
+killed/reaped before exposure. Publication must require matching filesystems,
+use fd-relative exclusive rename, reject replacement and traversal races, and
+install a strict value-redacted ownership record before the public name exists.
+
+Review the fixed vsock broker separately from general resource brokerage. Its
+initial endpoint is always inherited but dormant; activation must bind exact
+peer PID, lifecycle SessionId, first sequence, retained singleton anchor, cwd
+identity, and the already validated child. Later requests may contain only a
+monotonic sequence and `u32` port, producing only relative
+`<SocketChild>_<port>` targets and at most one validated connected AF_UNIX
+stream descriptor. Require closed frame/reserved/status variants, exact rights
+counts, pre/post target identity checks, bounded nonblocking connect, shutdown,
+EOF, and fail-closed lifecycle coupling. The launcher must never receive guest
+bytes, a grant ID, bookmark, resolved path, arbitrary child, or general selector;
+the worker must not gain `network.client`. Direct, API-only, and unused-vsock
+sessions must leave the facet dormant.
+
 ## Concurrency and Resource Management
 
 Review file descriptors, Unix sockets, temporary files, signal handlers, and VM
@@ -184,7 +209,8 @@ PID is never signaled after the child has been reaped and could be reused;
 ordinary child exits must be preserved, while signal exits use the documented
 `128 + signal` mapping.
 
-The production session owns one empty locked runtime namespace. Review worker
+The production session owns one locked runtime namespace that is empty at the
+authorization gate. Review worker
 cleanup after launcher EOF, launcher cleanup after worker exit, and bounded
 both-killed recovery separately. Every removal must compare exact type, owner,
 mode, device/inode, emptiness, pathname identity, and lock state; missing,
@@ -197,6 +223,17 @@ start a bounded owned-process exit grace rather than permitting an indefinite
 wait. Grant sending must remain nonblocking in the same event loop, continue to
 observe signals, lifecycle input, and child exit, and use one absolute
 send-plus-acknowledgment deadline.
+
+Authorized socket construction may transiently add only one fixed role-specific
+staging socket; after publication the namespace may contain only the two fixed
+strict ownership records. Review worker-side normal cleanup and
+launcher-side worker-first recovery independently: both must compare the exact
+role anchor, safe child or fixed staging name, socket owner/mode/link/device/inode,
+record contents, and namespace identity before unlinking, preserve a
+missing/replaced/non-socket target, then clear only the matching record.
+Simultaneous uncatchable launcher/worker death may leave the documented stale
+external name and private ownership record; do not imply unlink-on-close or
+populated-namespace recovery.
 
 ## Performance Review
 

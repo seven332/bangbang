@@ -90,6 +90,7 @@ const VSOCK_HOST_CONNECT_COMMAND: &str = "connect";
 
 pub type VirtioVsockMmioHandler =
     VirtioMmioRegisterHandler<VirtioVsockConfigSpace, VirtioVsockDevice>;
+pub(crate) type VsockHostWakeup = (Vec<RawFd>, Vec<RawFd>, Option<Instant>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VsockConfigInput {
@@ -284,12 +285,21 @@ impl VsockHostAcceptedConnection {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct VsockHostSocketOwner {
     listener: UnixListener,
     path: PathBuf,
-    dev: u64,
-    ino: u64,
+    direct_identity: Option<(u64, u64)>,
+}
+
+impl fmt::Debug for VsockHostSocketOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VsockHostSocketOwner")
+            .field("listener", &"<owned>")
+            .field("path", &"<redacted>")
+            .field("direct_cleanup", &self.direct_identity.is_some())
+            .finish()
+    }
 }
 
 impl VsockHostSocketOwner {
@@ -314,14 +324,31 @@ impl VsockHostSocketOwner {
         let owner = Self {
             listener,
             path: path.to_path_buf(),
-            dev: metadata.dev(),
-            ino: metadata.ino(),
+            direct_identity: Some((metadata.dev(), metadata.ino())),
         };
         if owner.owns_current_path() {
             Ok(owner)
         } else {
             Err(VsockHostSocketOwnerError::SocketPathChanged)
         }
+    }
+
+    fn from_supplied(
+        path: impl AsRef<Path>,
+        listener: SuppliedVsockListener,
+    ) -> Result<(Self, Option<Box<dyn VsockGuestConnector>>), VsockHostSocketOwnerError> {
+        let (listener, connector) = listener.into_parts();
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| VsockHostSocketOwnerError::SetNonblocking(error.kind()))?;
+        Ok((
+            Self {
+                listener,
+                path: path.as_ref().to_path_buf(),
+                direct_identity: None,
+            },
+            connector,
+        ))
     }
 
     pub(crate) fn accept_host_connection(
@@ -345,7 +372,55 @@ impl VsockHostSocketOwner {
     }
 
     fn owns_current_path(&self) -> bool {
-        socket_path_is_owned(&self.path, self.dev, self.ino).unwrap_or(false)
+        self.direct_identity
+            .is_some_and(|(dev, ino)| socket_path_is_owned(&self.path, dev, ino).unwrap_or(false))
+    }
+}
+
+/// Descriptor-only connector for guest-initiated vsock streams.
+pub trait VsockGuestConnector: fmt::Debug + Send {
+    /// Connects one Firecracker-compatible host-port socket.
+    fn connect(&mut self, host_port: u32) -> io::Result<UnixStream>;
+}
+
+/// Move-only listener supplied by an external authority for one VM start.
+pub struct SuppliedVsockListener {
+    listener: UnixListener,
+    guest_connector: Option<Box<dyn VsockGuestConnector>>,
+}
+
+impl fmt::Debug for SuppliedVsockListener {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SuppliedVsockListener")
+            .field("listener", &"<owned>")
+            .field(
+                "guest_connector",
+                &self.guest_connector.as_ref().map(|_| "<owned>"),
+            )
+            .finish()
+    }
+}
+
+impl SuppliedVsockListener {
+    /// Wraps an already-bound AF_UNIX stream listener for one startup attempt.
+    #[must_use]
+    pub fn new(listener: UnixListener) -> Self {
+        Self {
+            listener,
+            guest_connector: None,
+        }
+    }
+
+    /// Attaches the exact guest-initiated connector for this listener.
+    #[must_use]
+    pub fn with_guest_connector(mut self, connector: impl VsockGuestConnector + 'static) -> Self {
+        self.guest_connector = Some(Box::new(connector));
+        self
+    }
+
+    fn into_parts(self) -> (UnixListener, Option<Box<dyn VsockGuestConnector>>) {
+        (self.listener, self.guest_connector)
     }
 }
 
@@ -822,7 +897,11 @@ impl VsockConnectionLifecycle {
     }
 
     const fn deadline(self) -> Option<VsockConnectionDeadline> {
-        self.deadline
+        if self.local_shutdown_packet_pending {
+            None
+        } else {
+            self.deadline
+        }
     }
 
     fn mark_request_delivered(&mut self, now: Instant) {
@@ -863,16 +942,21 @@ impl VsockConnectionLifecycle {
         });
     }
 
-    fn mark_local_shutdown_packet_delivered(&mut self) -> bool {
+    fn mark_local_shutdown_packet_delivered(&mut self, now: Instant) -> bool {
         if !self.local_shutdown_packet_pending {
             return false;
         }
         self.local_shutdown_packet_pending = false;
+        self.deadline = Some(VsockConnectionDeadline {
+            kind: VsockConnectionDeadlineKind::Shutdown,
+            at: vsock_deadline_after(now, VSOCK_CONNECTION_SHUTDOWN_TIMEOUT),
+        });
         true
     }
 
     fn has_expired(self, now: Instant) -> bool {
-        self.deadline.is_some_and(|deadline| deadline.at <= now)
+        !self.local_shutdown_packet_pending
+            && self.deadline.is_some_and(|deadline| deadline.at <= now)
     }
 }
 
@@ -1369,9 +1453,10 @@ impl VsockHostConnection {
         &mut self,
         key: VsockHostConnectionKey,
         guest_cid: u32,
+        now: Instant,
     ) -> Option<VirtioVsockPacketHeader> {
         let header = self.pending_local_shutdown_packet_header(key, guest_cid)?;
-        self.lifecycle.mark_local_shutdown_packet_delivered();
+        self.lifecycle.mark_local_shutdown_packet_delivered(now);
         self.credit.mark_packet_delivered(VIRTIO_VSOCK_OP_SHUTDOWN);
         Some(header)
     }
@@ -2133,10 +2218,11 @@ impl VsockHostConnectionTable {
         &mut self,
         key: VsockHostConnectionKey,
         guest_cid: u32,
+        now: Instant,
     ) -> Option<VirtioVsockPacketHeader> {
         self.connections
             .get_mut(&key)?
-            .take_pending_local_shutdown_packet_header(key, guest_cid)
+            .take_pending_local_shutdown_packet_header(key, guest_cid, now)
     }
 
     fn earliest_deadline(&self) -> Option<Instant> {
@@ -2186,6 +2272,22 @@ impl VsockHostConnectionTable {
             self.connections
                 .values()
                 .filter(|connection| connection.can_poll_host_rw_payload())
+                .map(|connection| connection.stream().as_raw_fd()),
+        );
+    }
+
+    fn pending_guest_rw_write_fd_count(&self) -> usize {
+        self.connections
+            .values()
+            .filter(|connection| connection.has_pending_guest_rw_writes())
+            .count()
+    }
+
+    fn push_pending_guest_rw_write_fds(&self, fds: &mut Vec<RawFd>) {
+        fds.extend(
+            self.connections
+                .values()
+                .filter(|connection| connection.has_pending_guest_rw_writes())
                 .map(|connection| connection.stream().as_raw_fd()),
         );
     }
@@ -2251,8 +2353,9 @@ impl VsockHostConnectionTable {
             }
 
             let flush_failed = connection.flush_pending_guest_rw_writes().is_err();
-            let shutdown_drained =
-                connection.shutdown.fully_closed() && !connection.has_pending_guest_rw_writes();
+            let shutdown_drained = connection.shutdown.fully_closed()
+                && !connection.has_pending_guest_rw_writes()
+                && !connection.has_pending_local_shutdown_packet();
             if flush_failed || shutdown_drained {
                 let header = connection.reset_packet_header(key, guest_cid);
                 let removed = self.remove(key);
@@ -2607,6 +2710,7 @@ enum VsockGuestShutdownIgnoreReason {
     WrongDestinationCid,
     PayloadPresent,
     MissingShutdownFlags,
+    LocalConnectionClosed,
     MissingConnection,
 }
 
@@ -3405,9 +3509,10 @@ impl VsockGuestConnection {
         &mut self,
         key: VsockGuestConnectionKey,
         guest_cid: u32,
+        now: Instant,
     ) -> Option<VirtioVsockPacketHeader> {
         let header = self.pending_local_shutdown_packet_header(key, guest_cid)?;
-        self.lifecycle.mark_local_shutdown_packet_delivered();
+        self.lifecycle.mark_local_shutdown_packet_delivered(now);
         self.credit.mark_packet_delivered(VIRTIO_VSOCK_OP_SHUTDOWN);
         Some(header)
     }
@@ -3663,10 +3768,11 @@ impl VsockGuestConnectionTable {
         &mut self,
         key: VsockGuestConnectionKey,
         guest_cid: u32,
+        now: Instant,
     ) -> Option<VirtioVsockPacketHeader> {
         self.connections
             .get_mut(&key)?
-            .take_pending_local_shutdown_packet_header(key, guest_cid)
+            .take_pending_local_shutdown_packet_header(key, guest_cid, now)
     }
 
     fn earliest_deadline(&self) -> Option<Instant> {
@@ -3717,6 +3823,22 @@ impl VsockGuestConnectionTable {
                 .values()
                 .filter(|connection| connection.can_poll_host_rw_payload())
                 .map(|connection| connection.stream().as_raw_fd()),
+        );
+    }
+
+    fn pending_guest_rw_write_fd_count(&self) -> usize {
+        self.connections
+            .values()
+            .filter(|connection| connection.has_pending_guest_rw_writes())
+            .count()
+    }
+
+    fn push_pending_guest_rw_write_fds(&self, fds: &mut Vec<RawFd>) {
+        fds.extend(
+            self.connections
+                .values()
+                .filter(|connection| connection.has_pending_guest_rw_writes())
+                .map(|connection| connection.stream.as_raw_fd()),
         );
     }
 
@@ -3781,8 +3903,9 @@ impl VsockGuestConnectionTable {
             }
 
             let flush_failed = connection.flush_pending_guest_rw_writes().is_err();
-            let shutdown_drained =
-                connection.shutdown.fully_closed() && !connection.has_pending_guest_rw_writes();
+            let shutdown_drained = connection.shutdown.fully_closed()
+                && !connection.has_pending_guest_rw_writes()
+                && !connection.has_pending_local_shutdown_packet();
             if flush_failed || shutdown_drained {
                 let header = connection.reset_packet_header(key, guest_cid);
                 let removed = self.remove(key);
@@ -6498,6 +6621,7 @@ pub struct VirtioVsockDevice {
     active_event_queue: Option<VirtioVsockEventQueue>,
     host_socket_path: Option<PathBuf>,
     host_socket_owner: Option<VsockHostSocketOwner>,
+    guest_connector: Option<Box<dyn VsockGuestConnector>>,
     pending_host_connections: VecDeque<VsockHostAcceptedConnection>,
     host_connection_limit: usize,
     host_connections: VsockHostConnectionTable,
@@ -6518,6 +6642,7 @@ impl VirtioVsockDevice {
             active_event_queue: None,
             host_socket_path: None,
             host_socket_owner: None,
+            guest_connector: None,
             pending_host_connections: VecDeque::new(),
             host_connection_limit: VSOCK_HOST_CONNECTION_LIMIT,
             host_connections: VsockHostConnectionTable::new(),
@@ -6535,6 +6660,7 @@ impl VirtioVsockDevice {
             guest_cid,
             host_socket_path,
             host_socket_owner: Some(host_socket_owner),
+            guest_connector: None,
             ..Self::with_guest_cid(guest_cid)
         }
     }
@@ -6578,10 +6704,11 @@ impl VirtioVsockDevice {
         self.active_event_queue.as_ref()
     }
 
-    pub(crate) fn host_wakeup(&self) -> Result<(Vec<RawFd>, Option<Instant>), TryReserveError> {
-        let mut fds = Vec::new();
+    pub(crate) fn host_wakeup(&self) -> Result<VsockHostWakeup, TryReserveError> {
+        let mut read_fds = Vec::new();
+        let mut write_fds = Vec::new();
         if !self.is_activated() {
-            return Ok((fds, None));
+            return Ok((read_fds, write_fds, None));
         }
 
         let retained_host_connections = self
@@ -6592,33 +6719,42 @@ impl VirtioVsockDevice {
             self.host_socket_owner.is_some()
                 && retained_host_connections < self.host_connection_limit,
         );
-        let capacity = listener_fd_count
+        let read_capacity = listener_fd_count
             .saturating_add(self.pending_host_connections.len())
             .saturating_add(self.host_connections.pollable_host_rw_payload_fd_count())
             .saturating_add(self.guest_connections.pollable_host_rw_payload_fd_count());
-        fds.try_reserve_exact(capacity)?;
+        read_fds.try_reserve_exact(read_capacity)?;
+        let write_capacity = self
+            .host_connections
+            .pending_guest_rw_write_fd_count()
+            .saturating_add(self.guest_connections.pending_guest_rw_write_fd_count());
+        write_fds.try_reserve_exact(write_capacity)?;
 
         if listener_fd_count != 0
             && let Some(owner) = self.host_socket_owner.as_ref()
         {
-            fds.push(owner.listener.as_raw_fd());
+            read_fds.push(owner.listener.as_raw_fd());
         }
-        fds.extend(
+        read_fds.extend(
             self.pending_host_connections
                 .iter()
                 .map(|connection| connection.stream().as_raw_fd()),
         );
         self.host_connections
-            .push_pollable_host_rw_payload_fds(&mut fds);
+            .push_pollable_host_rw_payload_fds(&mut read_fds);
         self.guest_connections
-            .push_pollable_host_rw_payload_fds(&mut fds);
+            .push_pollable_host_rw_payload_fds(&mut read_fds);
+        self.host_connections
+            .push_pending_guest_rw_write_fds(&mut write_fds);
+        self.guest_connections
+            .push_pending_guest_rw_write_fds(&mut write_fds);
 
-        Ok((fds, self.earliest_deadline()))
+        Ok((read_fds, write_fds, self.earliest_deadline()))
     }
 
     #[cfg(test)]
     fn host_read_wakeup_fds(&self) -> Result<Vec<RawFd>, TryReserveError> {
-        self.host_wakeup().map(|(fds, _)| fds)
+        self.host_wakeup().map(|(read_fds, _, _)| read_fds)
     }
 
     fn earliest_deadline(&self) -> Option<Instant> {
@@ -6938,13 +7074,13 @@ impl VirtioVsockDevice {
             VirtioVsockPendingRxPacket::GuestConnectionShutdown { key, header } => {
                 let consumed = self
                     .guest_connections
-                    .take_pending_local_shutdown_packet_header(key, self.guest_cid);
+                    .take_pending_local_shutdown_packet_header(key, self.guest_cid, now);
                 debug_assert_eq!(consumed, Some(header));
             }
             VirtioVsockPendingRxPacket::HostConnectionShutdown { key, header } => {
                 let consumed = self
                     .host_connections
-                    .take_pending_local_shutdown_packet_header(key, self.guest_cid);
+                    .take_pending_local_shutdown_packet_header(key, self.guest_cid, now);
                 debug_assert_eq!(consumed, Some(header));
             }
             VirtioVsockPendingRxPacket::GuestConnectionCreditUpdate { key, header } => {
@@ -7166,19 +7302,28 @@ impl VirtioVsockDevice {
             });
         }
 
-        let Some(host_socket_path) = self.host_socket_path.as_ref() else {
-            return Some(VsockGuestConnectionRequestOutcome::Dropped {
-                key,
-                source: VsockGuestConnectionRequestError::MissingHostSocketPath,
-            });
+        let stream = match self.guest_connector.as_mut() {
+            Some(connector) => connector.connect(key.host_port()),
+            None => self.host_socket_path.as_ref().map_or_else(
+                || Err(io::Error::from(io::ErrorKind::NotFound)),
+                |host_socket_path| {
+                    nonblocking_unix_stream_connect(&guest_connection_socket_path(
+                        host_socket_path,
+                        key.host_port(),
+                    ))
+                },
+            ),
         };
-        let path = guest_connection_socket_path(host_socket_path, key.host_port());
-        let stream = match nonblocking_unix_stream_connect(&path) {
+        let stream = match stream {
             Ok(stream) => stream,
             Err(err) => {
                 return Some(VsockGuestConnectionRequestOutcome::Dropped {
                     key,
-                    source: VsockGuestConnectionRequestError::Connect(err.kind()),
+                    source: if self.host_socket_path.is_none() && self.guest_connector.is_none() {
+                        VsockGuestConnectionRequestError::MissingHostSocketPath
+                    } else {
+                        VsockGuestConnectionRequestError::Connect(err.kind())
+                    },
                 });
             }
         };
@@ -7383,31 +7528,38 @@ impl VirtioVsockDevice {
         let mut host_connection_updated = false;
         let mut host_connection_closed = false;
         let mut connection_reset_header = None;
+        let mut local_closed_connection_ignored = false;
         if let Ok(local_port) = VsockHostLocalPort::try_from_raw(header.dst_port()) {
             let key = VsockHostConnectionKey::new(local_port, header.src_port());
-            let transition = self
-                .host_connections
-                .connections
-                .get_mut(&key)
-                .map(|connection| {
-                    connection.refresh_peer_credit(header);
-                    connection_reset_header =
-                        Some(connection.reset_packet_header(key, self.guest_cid));
-                    let transition = connection.apply_guest_shutdown_flags(shutdown_flags);
-                    let drain_pending = transition
-                        == VsockConnectionShutdownTransition::FullyClosed
-                        && connection.has_pending_guest_rw_writes();
-                    if drain_pending {
-                        connection.arm_shutdown_deadline(now);
-                    }
-                    (transition, drain_pending)
-                });
+            let transition =
+                self.host_connections
+                    .connections
+                    .get_mut(&key)
+                    .and_then(|connection| {
+                        connection.refresh_peer_credit(header);
+                        if connection.lifecycle.is_local_closed() {
+                            local_closed_connection_ignored = true;
+                            return None;
+                        }
+                        connection_reset_header =
+                            Some(connection.reset_packet_header(key, self.guest_cid));
+                        let transition = connection.apply_guest_shutdown_flags(shutdown_flags);
+                        let drain_pending = transition
+                            == VsockConnectionShutdownTransition::FullyClosed
+                            && connection.has_pending_guest_rw_writes();
+                        let local_shutdown_pending = connection.has_pending_local_shutdown_packet();
+                        if drain_pending {
+                            connection.arm_shutdown_deadline(now);
+                        }
+                        Some((transition, drain_pending, local_shutdown_pending))
+                    });
             match transition {
-                Some((VsockConnectionShutdownTransition::PartiallyClosed, _))
-                | Some((VsockConnectionShutdownTransition::FullyClosed, true)) => {
+                Some((VsockConnectionShutdownTransition::PartiallyClosed, _, _))
+                | Some((VsockConnectionShutdownTransition::FullyClosed, true, _))
+                | Some((VsockConnectionShutdownTransition::FullyClosed, false, true)) => {
                     host_connection_updated = true;
                 }
-                Some((VsockConnectionShutdownTransition::FullyClosed, false)) => {
+                Some((VsockConnectionShutdownTransition::FullyClosed, false, false)) => {
                     host_connection_closed = self.host_connections.remove(key);
                 }
                 None => {}
@@ -7421,8 +7573,12 @@ impl VirtioVsockDevice {
             .guest_connections
             .connections
             .get_mut(&guest_key)
-            .map(|connection| {
+            .and_then(|connection| {
                 connection.refresh_peer_credit(header);
+                if connection.lifecycle.is_local_closed() {
+                    local_closed_connection_ignored = true;
+                    return None;
+                }
                 if connection_reset_header.is_none() {
                     connection_reset_header =
                         Some(connection.reset_packet_header(guest_key, self.guest_cid));
@@ -7430,17 +7586,19 @@ impl VirtioVsockDevice {
                 let transition = connection.apply_guest_shutdown_flags(shutdown_flags);
                 let drain_pending = transition == VsockConnectionShutdownTransition::FullyClosed
                     && connection.has_pending_guest_rw_writes();
+                let local_shutdown_pending = connection.has_pending_local_shutdown_packet();
                 if drain_pending {
                     connection.arm_shutdown_deadline(now);
                 }
-                (transition, drain_pending)
+                Some((transition, drain_pending, local_shutdown_pending))
             });
         match transition {
-            Some((VsockConnectionShutdownTransition::PartiallyClosed, _))
-            | Some((VsockConnectionShutdownTransition::FullyClosed, true)) => {
+            Some((VsockConnectionShutdownTransition::PartiallyClosed, _, _))
+            | Some((VsockConnectionShutdownTransition::FullyClosed, true, _))
+            | Some((VsockConnectionShutdownTransition::FullyClosed, false, true)) => {
                 guest_connection_updated = true;
             }
-            Some((VsockConnectionShutdownTransition::FullyClosed, false)) => {
+            Some((VsockConnectionShutdownTransition::FullyClosed, false, false)) => {
                 guest_connection_closed = self.guest_connections.remove(guest_key);
             }
             None => {}
@@ -7459,6 +7617,10 @@ impl VirtioVsockDevice {
             Some(VsockGuestShutdownOutcome::Updated {
                 host_connection_updated,
                 guest_connection_updated,
+            })
+        } else if local_closed_connection_ignored {
+            Some(VsockGuestShutdownOutcome::Ignored {
+                reason: VsockGuestShutdownIgnoreReason::LocalConnectionClosed,
             })
         } else {
             Some(VsockGuestShutdownOutcome::Ignored {
@@ -7619,13 +7781,11 @@ impl VirtioVsockDevice {
         self.flush_pending_guest_rw_writes();
         self.expire_connections(now);
         let host_request_dispatch = self.poll_host_request_connections();
+        self.poll_host_rw_payloads(now);
         let dispatch_tx = drained_notifications
             .iter()
             .copied()
             .any(|queue_index| queue_index == VIRTIO_VSOCK_TX_QUEUE_INDEX);
-        if !dispatch_tx {
-            self.poll_host_rw_payloads(now);
-        }
 
         let dispatch_rx = drained_notifications
             .iter()
@@ -8607,6 +8767,26 @@ impl PreparedVsockDevice {
         ))
     }
 
+    /// Prepares a device using an already-bound authority-supplied listener.
+    pub fn from_config_with_supplied_host_socket(
+        config: &VsockConfig,
+        listener: SuppliedVsockListener,
+    ) -> Result<Self, PreparedVsockDeviceError> {
+        let (owner, guest_connector) =
+            VsockHostSocketOwner::from_supplied(config.uds_path(), listener).map_err(|source| {
+                PreparedVsockDeviceError::HostSocket {
+                    guest_cid: config.guest_cid(),
+                    source,
+                }
+            })?;
+        let mut prepared = Self::from_config_with_device(
+            config,
+            VirtioVsockDevice::with_host_socket_owner(config.guest_cid(), owner),
+        );
+        prepared.device.guest_connector = guest_connector;
+        Ok(prepared)
+    }
+
     fn from_config_with_device(config: &VsockConfig, mut device: VirtioVsockDevice) -> Self {
         device.set_host_socket_path(config.uds_path());
         Self {
@@ -8953,6 +9133,7 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use crate::interrupt::DeviceInterruptKind;
@@ -8978,8 +9159,8 @@ mod tests {
     };
 
     use super::{
-        MIN_GUEST_CID, PreparedVsockDevice, VIRTIO_FEATURE_IN_ORDER, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC,
+        MIN_GUEST_CID, PreparedVsockDevice, SuppliedVsockListener, VIRTIO_FEATURE_IN_ORDER,
+        VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC,
         VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE, VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE,
         VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV,
         VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND, VIRTIO_VSOCK_HOST_CID,
@@ -9000,14 +9181,14 @@ mod tests {
         VirtioVsockRxPacketKind, VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError,
         VirtioVsockTxPacket, VirtioVsockTxPacketParseError, VirtioVsockTxQueue,
         VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
-        VsockGuestConnectionKey, VsockHostConnectHandshakeError, VsockHostConnectRequest,
-        VsockHostConnectRequestError, VsockHostConnectionKey, VsockHostConnectionTable,
-        VsockHostConnectionTableError, VsockHostLocalPort, VsockHostLocalPortAllocator,
-        VsockHostLocalPortAllocatorError, VsockHostLocalPortError, VsockHostSocketAcceptError,
-        VsockHostSocketOwner, VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout,
-        VsockMmioRegistrationError, is_transient_host_socket_accept_error,
-        is_transient_host_socket_read_error, parse_vsock_host_connect_request,
-        virtio_vsock_mmio_handler,
+        VsockGuestConnectionKey, VsockGuestConnector, VsockHostConnectHandshakeError,
+        VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostConnectionKey,
+        VsockHostConnectionTable, VsockHostConnectionTableError, VsockHostLocalPort,
+        VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortError,
+        VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
+        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        is_transient_host_socket_accept_error, is_transient_host_socket_read_error,
+        parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
     };
 
     static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -9468,6 +9649,35 @@ mod tests {
     struct TestUnixListener {
         listener: UnixListener,
         path: PathBuf,
+    }
+
+    #[derive(Debug)]
+    struct RecordingGuestConnector {
+        ports: Arc<Mutex<Vec<u32>>>,
+        peers: Vec<UnixStream>,
+    }
+
+    impl RecordingGuestConnector {
+        fn new(ports: Arc<Mutex<Vec<u32>>>) -> Self {
+            Self {
+                ports,
+                peers: Vec::new(),
+            }
+        }
+    }
+
+    impl VsockGuestConnector for RecordingGuestConnector {
+        fn connect(&mut self, host_port: u32) -> io::Result<UnixStream> {
+            let (stream, peer) = UnixStream::pair()?;
+            stream.set_nonblocking(true)?;
+            peer.set_nonblocking(true)?;
+            self.ports
+                .lock()
+                .expect("recording connector lock should remain healthy")
+                .push(host_port);
+            self.peers.push(peer);
+            Ok(stream)
+        }
     }
 
     impl TestUnixListener {
@@ -11448,19 +11658,26 @@ mod tests {
         assert!(lifecycle.is_local_closed());
         assert!(lifecycle.has_pending_local_shutdown_packet());
         let shutdown_deadline = now + Duration::from_secs(2);
-        assert_eq!(
-            lifecycle.deadline().map(|deadline| deadline.at),
-            Some(shutdown_deadline)
+        assert_eq!(lifecycle.deadline(), None);
+        assert!(
+            !lifecycle.has_expired(shutdown_deadline),
+            "undelivered local shutdown must not expire"
         );
 
         lifecycle.arm_shutdown_deadline(now + Duration::from_secs(1));
         assert_eq!(
-            lifecycle.deadline().map(|deadline| deadline.at),
-            Some(shutdown_deadline),
-            "duplicate shutdown must not extend deadline"
+            lifecycle.deadline(),
+            None,
+            "undelivered shutdown must not expose a wakeup deadline"
         );
-        assert!(lifecycle.mark_local_shutdown_packet_delivered());
-        assert!(!lifecycle.mark_local_shutdown_packet_delivered());
+        let delivered_at = now + Duration::from_secs(1);
+        assert!(lifecycle.mark_local_shutdown_packet_delivered(delivered_at));
+        assert_eq!(
+            lifecycle.deadline().map(|deadline| deadline.at),
+            Some(delivered_at + Duration::from_secs(2)),
+            "delivery starts the peer response timeout"
+        );
+        assert!(!lifecycle.mark_local_shutdown_packet_delivered(delivered_at));
     }
 
     #[test]
@@ -12611,6 +12828,63 @@ mod tests {
         drop(prepared);
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepared_vsock_device_adopts_supplied_listener_without_path_cleanup_authority() {
+        let path = unique_socket_path("prepared-supplied");
+        let listener = UnixListener::bind(&path).expect("supplied listener should bind");
+        let config = valid_vsock_config(9, path.to_string_lossy());
+
+        let prepared = PreparedVsockDevice::from_config_with_supplied_host_socket(
+            &config,
+            SuppliedVsockListener::new(listener),
+        )
+        .expect("prepared vsock should adopt listener");
+        let _client = UnixStream::connect(&path).expect("client should connect");
+        assert!(
+            prepared
+                .device()
+                .accept_host_connection()
+                .expect("supplied listener should accept")
+                .is_some()
+        );
+
+        drop(prepared);
+        assert!(path.exists(), "external guard retains cleanup authority");
+        fs::remove_file(path).expect("fixture socket should clean up");
+    }
+
+    #[test]
+    fn supplied_vsock_listener_routes_guest_connections_through_its_connector() {
+        let path = unique_socket_path("prepared-supplied-connector");
+        let listener = UnixListener::bind(&path).expect("supplied listener should bind");
+        let config = valid_vsock_config(42, path.to_string_lossy());
+        let ports = Arc::new(Mutex::new(Vec::new()));
+        let connector = RecordingGuestConnector::new(Arc::clone(&ports));
+        let supplied = SuppliedVsockListener::new(listener).with_guest_connector(connector);
+        let prepared =
+            PreparedVsockDevice::from_config_with_supplied_host_socket(&config, supplied)
+                .expect("prepared vsock should adopt connector");
+        let (_, _, _, mut device) = prepared.into_parts();
+        let key = VsockGuestConnectionKey::new(52, 4000);
+
+        assert!(matches!(
+            device.connect_guest_connection_request_packet(&guest_request_tx_packet(42, 52, 4000)),
+            Some(super::VsockGuestConnectionRequestOutcome::Retained { key: retained })
+                if retained == key
+        ));
+        assert_eq!(
+            ports
+                .lock()
+                .expect("recorded connector ports should remain readable")
+                .as_slice(),
+            &[52]
+        );
+
+        drop(device);
+        assert!(path.exists(), "external guard retains cleanup authority");
+        fs::remove_file(path).expect("fixture socket should clean up");
     }
 
     #[test]
@@ -14707,6 +14981,55 @@ mod tests {
             .expect("wakeup fd collection should succeed");
 
         assert_eq!(fds, [accepted_fd]);
+
+        device
+            .host_connections
+            .connections
+            .get_mut(&key)
+            .expect("host connection should exist")
+            .pending_guest_rw_writes
+            .push_payload(b"pending guest bytes")
+            .expect("pending guest bytes should queue");
+        let (read_fds, write_fds, deadline) = device
+            .host_wakeup()
+            .expect("read/write wakeup snapshot should collect");
+        assert_eq!(read_fds, [accepted_fd]);
+        assert_eq!(write_fds, [accepted_fd]);
+        assert_eq!(deadline, None);
+    }
+
+    #[test]
+    fn virtio_vsock_device_host_write_wakeup_fds_include_guest_connection_pending_writes() {
+        let mut device = VirtioVsockDevice::with_guest_cid(MIN_GUEST_CID);
+        activate_vsock_device(&mut device);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let (stream, _peer) = UnixStream::pair().expect("guest stream pair should open");
+        let stream_fd = stream.as_raw_fd();
+        device
+            .guest_connections
+            .insert_connected_guest_connection(
+                key,
+                stream,
+                guest_request_tx_packet(MIN_GUEST_CID, 52, 4000).header(),
+            )
+            .expect("guest connection should insert");
+        let connection = device
+            .guest_connections
+            .connections
+            .get_mut(&key)
+            .expect("guest connection should exist");
+        connection.lifecycle.mark_established();
+        connection
+            .queue_pending_guest_rw_payload_for_test(b"pending guest bytes")
+            .expect("pending guest bytes should queue");
+
+        let (read_fds, write_fds, deadline) = device
+            .host_wakeup()
+            .expect("write wakeup snapshot should collect");
+
+        assert_eq!(read_fds, [stream_fd]);
+        assert_eq!(write_fds, [stream_fd]);
+        assert_eq!(deadline, None);
     }
 
     #[test]
@@ -14748,22 +15071,23 @@ mod tests {
         guest_connection.lifecycle.mark_established();
         guest_connection.lifecycle.arm_shutdown_deadline(now);
 
-        let (_, earliest) = device
+        let (_, _, earliest) = device
             .host_wakeup()
             .expect("wakeup snapshot should collect");
         assert_eq!(earliest, Some(now + Duration::from_secs(2)));
 
         assert!(device.guest_connections.remove(guest_key));
-        let (_, next) = device
+        let (_, _, next) = device
             .host_wakeup()
             .expect("wakeup snapshot should recompute after cancellation");
         assert_eq!(next, Some(now + Duration::from_secs(3)));
 
         device.reset();
-        let (fds, deadline) = device
+        let (read_fds, write_fds, deadline) = device
             .host_wakeup()
             .expect("inactive wakeup snapshot should be empty");
-        assert!(fds.is_empty());
+        assert!(read_fds.is_empty());
+        assert!(write_fds.is_empty());
         assert_eq!(deadline, None);
         assert_eq!(
             super::vsock_deadline_after(now, Duration::MAX),
@@ -17025,7 +17349,7 @@ mod tests {
     }
 
     #[test]
-    fn virtio_vsock_notifications_drop_guest_rw_connection_on_host_write_failure() {
+    fn virtio_vsock_notifications_prioritize_host_close_before_guest_rw() {
         let (mut memory, mut handler, accepted) =
             established_guest_connection_for_test("guest-rw-fail", 52, 4000);
         let payload = b"payload";
@@ -17044,25 +17368,26 @@ mod tests {
 
         let notification = handler
             .dispatch_vsock_queue_notifications(&mut memory)
-            .expect("guest RW write failure should queue RST");
+            .expect("host close should suppress the same-window guest RW");
 
         assert_eq!(notification.guest_rw_dispatch().rw_packets(), 1);
         assert_eq!(notification.guest_rw_dispatch().forwarded_packets(), 0);
         assert_eq!(notification.guest_rw_dispatch().forwarded_bytes(), 0);
-        assert_eq!(notification.guest_rw_dispatch().dropped_connections(), 1);
-        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 1);
-        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 1);
+        assert_eq!(notification.guest_rw_dispatch().ignored_packets(), 1);
+        assert_eq!(notification.guest_rw_dispatch().dropped_connections(), 0);
+        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 0);
+        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 0);
         assert_eq!(
             handler
                 .activation_handler()
                 .pending_guest_connection_count(),
-            0
+            1
         );
         assert_eq!(
             handler
                 .activation_handler()
                 .pending_guest_reset_packet_count(),
-            1
+            0
         );
     }
 
@@ -18210,11 +18535,11 @@ mod tests {
                 .pending_guest_reset_packet_count(),
             0
         );
-        let deadline = handler
-            .activation_handler()
-            .earliest_deadline()
-            .expect("clean EOF should arm shutdown deadline");
-        assert_eq!(deadline, now + Duration::from_secs(2));
+        assert_eq!(
+            handler.activation_handler().earliest_deadline(),
+            None,
+            "clean EOF must not expose a deadline before shutdown delivery"
+        );
 
         write_vsock_rx_descriptor(
             &mut memory,
@@ -18252,6 +18577,11 @@ mod tests {
                 .activation_handler()
                 .has_guest_connection(VsockGuestConnectionKey::new(52, 4000))
         );
+        let deadline = handler
+            .activation_handler()
+            .earliest_deadline()
+            .expect("delivered shutdown should arm response deadline");
+        assert_eq!(deadline, now + Duration::from_secs(2));
 
         let expiry = handler
             .dispatch_vsock_queue_notifications_at(&mut memory, deadline)
@@ -19418,6 +19748,167 @@ mod tests {
             .insert_accepted_host_connection(accepted, request)
             .expect("freed host local port should be reusable");
         assert_eq!(reused.local_port(), key.local_port());
+    }
+
+    #[test]
+    fn local_host_shutdown_ignores_peer_shutdown_until_delivery_timeout() {
+        let (_memory, mut handler, mut client, key) =
+            established_host_connection_for_test("local-before-peer-shutdown", 4000);
+        let now = Instant::now();
+        let device = handler.activation_handler_mut();
+        let connection = device
+            .host_connections
+            .connections
+            .get_mut(&key)
+            .expect("host connection should exist");
+        assert!(connection.mark_local_closed(now));
+        assert!(connection.has_pending_local_shutdown_packet());
+        let (_, _, pending_deadline) = device
+            .host_wakeup()
+            .expect("pending local shutdown wakeup should collect");
+        assert_eq!(
+            pending_deadline, None,
+            "undelivered local shutdown must not cause an expired-deadline spin"
+        );
+
+        let outcome = device.shutdown_guest_connection_packet(
+            &guest_shutdown_tx_packet(42, key.local_port().raw(), key.peer_port()),
+            now,
+        );
+
+        assert!(matches!(
+            outcome,
+            Some(super::VsockGuestShutdownOutcome::Ignored {
+                reason: super::VsockGuestShutdownIgnoreReason::LocalConnectionClosed,
+            })
+        ));
+        assert!(device.has_host_connection(key));
+        assert!(
+            device
+                .host_connections
+                .connections
+                .get(&key)
+                .expect("local-closed host connection should remain")
+                .has_pending_local_shutdown_packet()
+        );
+        assert_eq!(device.pending_guest_reset_packet_count(), 0);
+
+        device.expire_connections(now + Duration::from_secs(2));
+
+        assert!(
+            device.has_host_connection(key),
+            "undelivered local shutdown must not expire"
+        );
+        assert_eq!(device.pending_guest_reset_packet_count(), 0);
+
+        let guest_cid = device.guest_cid;
+        let delivered_at = now + Duration::from_secs(2);
+        let delivered = device
+            .host_connections
+            .take_pending_local_shutdown_packet_header(key, guest_cid, delivered_at)
+            .expect("local shutdown should be delivered before reset");
+        assert_eq!(delivered.operation(), VIRTIO_VSOCK_OP_SHUTDOWN);
+        assert!(device.has_host_connection(key));
+        assert_eq!(device.pending_guest_reset_packet_count(), 0);
+
+        let deadline = delivered_at + Duration::from_secs(2);
+        let (_, _, delivered_deadline) = device
+            .host_wakeup()
+            .expect("delivered local shutdown wakeup should collect");
+        assert_eq!(delivered_deadline, Some(deadline));
+        device.expire_connections(deadline - Duration::from_nanos(1));
+        assert!(device.has_host_connection(key));
+        assert_eq!(device.pending_guest_reset_packet_count(), 0);
+
+        device.expire_connections(deadline);
+
+        assert!(!device.has_host_connection(key));
+        assert_eq!(device.pending_guest_reset_packet_count(), 1);
+        assert_stream_closed(
+            &mut client,
+            "expired local-closed host connection should close stream",
+        );
+    }
+
+    #[test]
+    fn same_window_host_eof_ignores_guest_shutdown_until_local_timeout() {
+        let (mut memory, mut handler, client, key) =
+            established_host_connection_for_test("same-window-host-eof", 4000);
+        let now = Instant::now();
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("host stream should half-close writes");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        let shutdown = guest_shutdown_tx_packet(42, key.local_port().raw(), key.peer_port());
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, shutdown.header());
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications_at(&mut memory, now)
+            .expect("same-window host EOF and guest shutdown should dispatch");
+
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .updated_host_connections(),
+            0
+        );
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_host_connections(),
+            0
+        );
+        assert_eq!(notification.guest_shutdown_dispatch().queued_resets(), 0);
+        assert_eq!(notification.guest_shutdown_dispatch().ignored_packets(), 1);
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("local shutdown should dispatch before reset");
+        assert_eq!(rx.delivered_shutdown_packets(), 1);
+        assert_eq!(rx.delivered_reset_packets(), 0);
+        assert_guest_shutdown_packet_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_SECOND_BUFFER),
+            42,
+            key.local_port().raw(),
+            key.peer_port(),
+        );
+        assert!(handler.activation_handler().has_host_connection(key));
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+
+        handler
+            .activation_handler_mut()
+            .expire_connections(now + Duration::from_secs(2));
+        assert!(!handler.activation_handler().has_host_connection(key));
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            1
+        );
     }
 
     #[test]

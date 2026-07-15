@@ -59,8 +59,9 @@ entries while replacing one private bootstrap marker. The Darwin wrapper in
 [`spawn.rs`](../../../crates/launcher/src/macos/spawn.rs) uses
 `POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_START_SUSPENDED`, explicitly retains
 each open standard stream, and duplicates only an unnamed lifecycle stream
-endpoint to descriptor 3 plus an unnamed startup-grant datagram endpoint to
-descriptor 4. The launcher dynamically validates the live
+endpoint to descriptor 3, an unnamed startup-grant datagram endpoint to
+descriptor 4, and one dormant socket-broker datagram endpoint to descriptor 5.
+The launcher dynamically validates the live
 worker while suspended, resumes only the private bootstrap, reads one bounded
 reserved `Hello`, verifies the now-child-attributed peer PID/credentials,
 revalidates live code, and only then sends a random session identity in `Start`.
@@ -95,8 +96,9 @@ The worker creates and locks one exact mode-0700 empty namespace beneath its
 fixed container temp root. `Prepared` reports only device/inode. The launcher
 independently derives the root and checks exact name, type, owner, mode,
 device/inode, emptiness, and live lock before grant acknowledgment and
-`Proceed`. No endpoint, argument,
-identity bytes, or resource grant is stored there. Worker EOF cleanup covers
+`Proceed`. No endpoint, argument, identity byte, or resource grant is stored
+there at that gate. After authorization, socket publication may add at most the
+two fixed strict role/child/socket-identity ownership records. Worker EOF cleanup covers
 launcher-first death; launcher cleanup covers worker-first death; a later worker
 scans at most 128 entries and removes only valid empty unlocked identity-stable
 residue when both were killed. Same-identifier workers share container
@@ -136,8 +138,9 @@ Commit creates a redacted, session-owned, bounded registry whose adoption is
 one-time by exact ID, role, and access. Mismatch never falls back to an ambient
 path. Unadopted authority drops on cancellation, terminal, disconnect,
 bootstrap failure, or process exit. SCM_RIGHTS duplicates kernel references, so
-closing the launcher's copy is cleanup rather than revocation. The empty private
-namespace still stores no resource data.
+closing the launcher's copy is cleanup rather than revocation. The private
+namespace itself grants no resource authority; its optional fixed socket
+records carry only role, safe child, and device/inode cleanup evidence.
 
 Contained mode recognizes only the exact, case-sensitive
 `bangbang-grant:<GrantId>` form. Startup config and metadata claim their
@@ -209,10 +212,55 @@ creation/FIFO behavior and logger/metrics-versus-serial open timing. Pending,
 replaced, active, cancelled, and terminal files close by ordinary cooperative
 ownership; no hard revocation is claimed.
 
+API and vsock sockets use the distinct exact contained reference
+`bangbang-grant:<GrantId>/<SocketChild>`. The child is one 1–64 byte ASCII
+`[A-Za-z0-9._-]` component other than `.` or `..`; malformed, traversal,
+separator, control, non-ASCII, missing, mismatched, or consumed values fail
+without ambient fallback. Direct mode preserves identical bytes as ordinary
+paths. Claims require the exact singleton `CreateChildren` role/access and
+complete validation first. No-API mode consumes no API-directory authority;
+vsock claims retain their scope and anchor through deferred startup, and a
+rejected replacement preserves both prior public configuration and private
+ownership.
+
+One short-lived default-close instance of the signed worker receives only a
+parent-authenticated control endpoint and the exact private namespace anchor,
+binds a fixed role-specific staging name there, validates and transfers one
+owner-only listener, and is reaped before readiness or VM-start success. The
+main worker records strict role/child/socket identity, requires the namespace
+and grant anchor to share a filesystem, and publishes exclusively with
+fd-relative `renameatx_np(RENAME_EXCL)`. It retains scope, anchor, supplied
+listener, and identity-aware cleanup. Existing, replaced, cross-filesystem, or
+identity-mismatched targets fail closed and value-redacted.
+
+The supplied API listener serves outside-container clients only after
+publication. The supplied vsock main listener accepts host-initiated traffic.
+Guest-initiated traffic uses the inherited descriptor-5 facet, which remains
+dormant otherwise. One `Activate` fixes exact peer PID, lifecycle SessionId,
+first sequence, retained `VsockSocketDirectory` anchor, cwd identity, and safe
+child. Thereafter the worker sends only monotonic sequences plus a `u32` port;
+the launcher constructs relative `<SocketChild>_<port>`, checks the socket
+target before and after a nonblocking connect, and returns at most one validated
+AF_UNIX stream descriptor. It receives no guest payload, grant ID, bookmark,
+resolved path, arbitrary child, or general selector. Closed framing, exact
+rights counts, shutdown/EOF, and lifecycle loss fail closed. No code object,
+long-lived helper, or `network.client` entitlement is added.
+
+Normal worker cleanup unlinks only a still-matching socket. After worker exit,
+the launcher can read only the two strict records and use its retained matching
+role anchors plus the fixed private staging names for the same strict
+owner/mode/link/device/inode check before clearing the records and namespace.
+Launcher-first and worker-first death preserve that cooperative ordering and
+replaced targets. Simultaneous uncatchable death may leave a stale external
+socket name and private ownership record because Darwin has no
+unlink-on-final-close facility; later automatic recovery remains limited to
+empty session namespaces.
+
 The following remain feasible work owned by #1351:
 
-- consumer adoption for API/vsock and snapshot resources;
-- dynamic post-Ready delivery and any hard-revocation broker;
+- consumer adoption for snapshot resources;
+- general dynamic post-Ready delivery and any hard-revocation broker;
+- cross-filesystem socket publication;
 - vmnet entitlement/provisioning and per-VM network policy;
 - automatic restart/reconnect and any long-lived broker/service policy;
 - exact macOS outcome mapping for jailer, seccomp, namespace, cgroup,
@@ -237,7 +285,7 @@ execution proves:
 - rejection before worker output when a private bundle copy has a missing or
   modified worker;
 - default-close removal of a deliberately inheritable unexpected descriptor,
-  retention of only lifecycle/grant endpoints, and malformed/incompatible
+  retention of only lifecycle/grant/dormant-broker endpoints, and malformed/incompatible
   bootstrap rejection before public processing;
 - path-redacted App Sandbox denial for an outside config file;
 - structured container API/no-API readiness, one-session `SIGINT`/`SIGTERM`
@@ -249,8 +297,8 @@ execution proves:
 - grant-bearing worker-first/launcher-first cleanup and two simultaneous
   sessions with noninterchangeable authority, plus behavioral proof that the
   normal bundle contains no test exerciser;
-- worker-first and launcher-first namespace cleanup, both-killed bounded stale
-  recovery, and two concurrent API sessions remaining independent when one
+- worker-first and launcher-first namespace cleanup, empty both-killed bounded
+  stale recovery, and two concurrent API sessions remaining independent when one
   worker dies;
 - both sealed and external-grant config/metadata/kernel/initrd inputs plus
   repeatable read-only/read-write block and pmem inputs starting real sandboxed
@@ -279,7 +327,22 @@ execution proves:
   console bytes written only through the launcher-opened descriptors; and
 - two simultaneous output-grant sessions using identical GrantIds but isolated
   registries, mutually exclusive logger filters, independent metrics/serial
-  files, and unchanged planted replacement paths.
+  files, and unchanged planted replacement paths;
+- an exact API-directory claim publishing an owner-only listener outside the
+  container, serving a real client after readiness, and reaping its transient
+  signed binder before exposure;
+- a delayed exact vsock-directory claim publishing and supplying the main
+  listener while leaving only launcher plus worker with unchanged exact
+  entitlements after startup;
+- a real guest reaching two distinct host ports through only the fixed launcher
+  facet and connected stream descriptors, with no guest payload crossing it;
+  and
+- a real host completing deterministic 1-MiB bidirectional transfer and both
+  write-half-close/EOF directions through the supplied granted main listener,
+  followed by identity-owned API/vsock socket and namespace cleanup; and
+- launcher-first and worker-first abrupt death after granted API pathname
+  replacement, with both surviving cleanup owners preserving the replacement
+  while clearing only the matching strict record and session namespace.
 
 Readiness events and bounded deadlines replace fixed sleeps. Destructive cases
 operate on private copies, so later checks continue to use the canonical signed
@@ -296,9 +359,10 @@ work:
 - `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
 
 The delivered package/session/grant/fd/crash subset, including exact adoption by
-the singleton startup inputs/outputs and repeatable block/pmem consumers, is real
-but does not complete any of those composite records because remaining
-consumers, dynamic-broker, network,
+the singleton startup inputs/outputs, repeatable block/pmem consumers, and
+singleton API/vsock directories plus the fixed port-only vsock facet, is real
+but does not complete any of those composite records because snapshot
+consumers, general dynamic brokerage/hard revocation, network,
 Linux-outcome, and deployment work remains. The broad `jailer`, `seccomp`,
 `seccompiler`, and `production-host` corpus records remain `audit-required`.
 Neither this audit nor the executable evidence is direct Firecracker jailer

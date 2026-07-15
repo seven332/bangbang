@@ -237,6 +237,33 @@ pub(crate) struct PreparedGrantBatch {
     records: Vec<PreparedRecord>,
 }
 
+/// Borrowed exact anchor metadata for one singleton socket-directory grant.
+#[derive(Clone, Copy)]
+pub(crate) struct SocketDirectoryAnchor {
+    descriptor: RawFd,
+    identity: ObjectIdentity,
+}
+
+impl std::fmt::Debug for SocketDirectoryAnchor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SocketDirectoryAnchor")
+            .field("descriptor", &"<borrowed>")
+            .field("identity", &"<redacted>")
+            .finish()
+    }
+}
+
+impl SocketDirectoryAnchor {
+    pub(crate) const fn descriptor(self) -> RawFd {
+        self.descriptor
+    }
+
+    pub(crate) const fn identity(self) -> ObjectIdentity {
+        self.identity
+    }
+}
+
 impl std::fmt::Debug for PreparedGrantBatch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -379,6 +406,37 @@ impl PreparedGrantBatch {
                 descriptor: record.descriptor.as_ref().map(AsRawFd::as_raw_fd),
             })
             .collect()
+    }
+
+    /// Borrows the exact retained anchor for one singleton socket-directory role.
+    pub(crate) fn socket_directory_anchor(
+        &self,
+        role: ResourceRole,
+    ) -> Option<SocketDirectoryAnchor> {
+        if !matches!(
+            role,
+            ResourceRole::ApiSocketDirectory | ResourceRole::VsockSocketDirectory
+        ) {
+            return None;
+        }
+        self.records
+            .iter()
+            .find_map(|prepared| match &prepared.record {
+                GrantRecord::ScopedDirectory {
+                    role: record_role,
+                    access: GrantAccess::CreateChildren,
+                    identity,
+                    ..
+                } if *record_role == role => prepared
+                    .descriptor
+                    .as_ref()
+                    .map(AsRawFd::as_raw_fd)
+                    .map(|descriptor| SocketDirectoryAnchor {
+                        descriptor,
+                        identity: *identity,
+                    }),
+                _ => None,
+            })
     }
 }
 
@@ -605,6 +663,21 @@ mod tests {
             .expect("ordinary arguments should parse");
         assert_eq!(input.worker_args, vec![OsString::from("--version"), opaque]);
         assert!(input.manifest.is_none());
+    }
+
+    #[test]
+    fn socket_directory_anchor_debug_redacts_descriptor_and_identity() {
+        let anchor = SocketDirectoryAnchor {
+            descriptor: 52,
+            identity: ObjectIdentity {
+                device: 53,
+                inode: 59,
+            },
+        };
+        let debug = format!("{anchor:?}");
+        assert!(!debug.contains("52"));
+        assert!(!debug.contains("53"));
+        assert!(!debug.contains("59"));
     }
 
     #[test]

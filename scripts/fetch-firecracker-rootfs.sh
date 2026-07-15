@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v35"
+direct_boot_variant="direct-boot-v38"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -1331,8 +1331,8 @@ def receive_and_verify_deterministic_stream(stream, seed):
 def expect_eof(stream):
     try:
         trailing = stream.recv(1)
-    except OSError:
-        fail("EOF_READ")
+    except OSError as error:
+        fail(f"EOF_READ_{error.errno}")
     if trailing:
         fail("TRAILING_DATA")
 
@@ -1567,8 +1567,8 @@ def receive_and_verify_deterministic_stream(stream, seed):
 def expect_eof(stream):
     try:
         trailing = stream.recv(1)
-    except OSError:
-        fail("EOF_READ")
+    except OSError as error:
+        fail(f"EOF_READ_{error.errno}")
     if trailing:
         fail("TRAILING_DATA")
 
@@ -1604,11 +1604,11 @@ try:
     try:
         connection.settimeout(SOCKET_TIMEOUT)
         send_deterministic_stream(connection, GUEST_STREAM_SEED)
-        receive_and_verify_deterministic_stream(connection, HOST_STREAM_SEED)
         try:
             connection.shutdown(socket.SHUT_WR)
         except OSError:
             fail("SHUTDOWN_WRITE")
+        receive_and_verify_deterministic_stream(connection, HOST_STREAM_SEED)
         expect_eof(connection)
     finally:
         connection.close()

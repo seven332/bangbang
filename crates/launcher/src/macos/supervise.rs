@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -8,13 +9,16 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use bangbang_session::macos::grant_transport::{GrantTransportError, send_grant};
-use bangbang_session::macos::runtime::{LauncherNamespace, NamespaceIdentity};
+use bangbang_session::macos::runtime::{
+    LauncherNamespace, NamespaceIdentity, RuntimeError, SocketOwnershipRecord,
+};
 use bangbang_session::{
     CancelSignal, Frame, FrameDecoder, LauncherLifecycle, Message, TerminalCategory, encode_frame,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
 
+use super::socket_broker::LauncherSocketBroker;
 use super::spawn::OwnedWorker;
 use crate::LauncherError;
 use crate::grant_manifest::{OutboundGrant, PreparedGrantBatch};
@@ -158,16 +162,21 @@ pub(crate) fn wait_session(
     worker: &mut OwnedWorker,
     session: &mut UnixStream,
     grant_socket: &mut UnixDatagram,
+    socket_broker: &mut UnixDatagram,
     mut lifecycle: LauncherLifecycle,
     mut wakeups: SignalWakeups,
     grants: &PreparedGrantBatch,
 ) -> Result<ExitStatus, LauncherError> {
     let session_id = lifecycle.session();
     let mut observation = SessionObservation::default();
+    let auxiliary = AuxiliaryChannels {
+        grant_socket,
+        socket_broker,
+    };
     let result = wait_session_inner(
         worker,
         session,
-        grant_socket,
+        auxiliary,
         &mut lifecycle,
         &mut wakeups,
         &mut observation,
@@ -176,14 +185,18 @@ pub(crate) fn wait_session(
     if result.is_err() {
         let _ = session.shutdown(std::net::Shutdown::Both);
         shutdown_grants(grant_socket);
+        let _ = socket_broker.shutdown(std::net::Shutdown::Both);
         worker.terminate_and_reap();
     }
 
     let cleanup = if let Some(namespace) = observation.namespace.as_mut() {
-        namespace.cleanup()
+        cleanup_namespace_after_worker(namespace, grants)
     } else {
-        LauncherNamespace::recover_after_worker_exit(session_id)
-            .and_then(|recovered| recovered.map_or(Ok(()), |mut namespace| namespace.cleanup()))
+        LauncherNamespace::recover_after_worker_exit(session_id).and_then(|recovered| {
+            recovered.map_or(Ok(()), |mut namespace| {
+                cleanup_namespace_after_worker(&mut namespace, grants)
+            })
+        })
     }
     .map_err(|_| LauncherError::RuntimeNamespace);
 
@@ -200,25 +213,103 @@ pub(crate) fn wait_session(
     }
 }
 
+fn cleanup_namespace_after_worker(
+    namespace: &mut LauncherNamespace,
+    grants: &PreparedGrantBatch,
+) -> Result<(), RuntimeError> {
+    for record in namespace.socket_ownership_records()? {
+        let anchor = grants
+            .socket_directory_anchor(record.role())
+            .ok_or(RuntimeError::InvalidEntry)?;
+        unlink_owned_socket(anchor.descriptor(), &record)?;
+        namespace.unlink_staged_socket(&record)?;
+        namespace.clear_socket_record(&record)?;
+    }
+    namespace.cleanup()
+}
+
+fn unlink_owned_socket(
+    directory: RawFd,
+    record: &SocketOwnershipRecord,
+) -> Result<(), RuntimeError> {
+    let child = CString::new(record.child().as_bytes()).map_err(|_| RuntimeError::InvalidEntry)?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: The retained anchor and bounded C string remain live; stat is writable.
+    if unsafe {
+        libc::fstatat(
+            directory,
+            child.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(RuntimeError::Filesystem(error.kind()))
+        };
+    }
+    // SAFETY: Successful fstatat initialized the complete result.
+    let stat = unsafe { stat.assume_init() };
+    // SAFETY: `geteuid` has no pointer or ownership contract.
+    let uid = unsafe { libc::geteuid() };
+    let identity = bangbang_session::ObjectIdentity {
+        device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
+        inode: stat.st_ino,
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+        || stat.st_mode & 0o7777 != 0o600
+        || stat.st_uid != uid
+        || stat.st_nlink != 1
+        || identity != record.identity()
+    {
+        return Ok(());
+    }
+    // SAFETY: The retained directory and bounded child name the identity-checked socket.
+    if unsafe { libc::unlinkat(directory, child.as_ptr(), 0) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(RuntimeError::Filesystem(error.kind()))
+    }
+}
+
 #[derive(Debug, Default)]
 struct SessionObservation {
     namespace: Option<LauncherNamespace>,
     terminal: Option<(TerminalCategory, u8)>,
 }
 
+struct AuxiliaryChannels<'a> {
+    grant_socket: &'a mut UnixDatagram,
+    socket_broker: &'a mut UnixDatagram,
+}
+
 fn wait_session_inner(
     worker: &mut OwnedWorker,
     session: &mut UnixStream,
-    grant_socket: &mut UnixDatagram,
+    auxiliary: AuxiliaryChannels<'_>,
     lifecycle: &mut LauncherLifecycle,
     wakeups: &mut SignalWakeups,
     observation: &mut SessionObservation,
     grants: &PreparedGrantBatch,
 ) -> Result<ExitStatus, LauncherError> {
+    let AuxiliaryChannels {
+        grant_socket,
+        socket_broker,
+    } = auxiliary;
     session
         .set_nonblocking(true)
         .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
     grant_socket
+        .set_nonblocking(true)
+        .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
+    socket_broker
         .set_nonblocking(true)
         .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
     let kqueue = create_kqueue()?;
@@ -227,6 +318,8 @@ fn wait_session_inner(
     let session_fd = usize::try_from(session.as_raw_fd())
         .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
     let grant_fd = usize::try_from(grant_socket.as_raw_fd())
+        .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
+    let broker_fd = usize::try_from(socket_broker.as_raw_fd())
         .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
     let changes = [
         event(
@@ -261,6 +354,12 @@ fn wait_session_inner(
             libc::EV_ADD | libc::EV_DISABLE,
             0,
         ),
+        event(
+            broker_fd,
+            libc::EVFILT_READ,
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            0,
+        ),
     ];
     register_events(kqueue.as_raw_fd(), &changes)?;
 
@@ -269,6 +368,7 @@ fn wait_session_inner(
     let mut exit_deadline: Option<Instant> = None;
     let mut session_closed = false;
     let mut grant_send = GrantSendState::new(grants, lifecycle.session());
+    let mut broker = LauncherSocketBroker::new(lifecycle.session());
     loop {
         let deadline = [cancellation_deadline, exit_deadline, grant_send.deadline()]
             .into_iter()
@@ -305,6 +405,20 @@ fn wait_session_inner(
         }
         if observation.terminal.is_some() {
             exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
+        }
+
+        if !child_exited
+            && events
+                .iter()
+                .any(|queued| queued.filter == libc::EVFILT_READ && queued.ident == broker_fd)
+        {
+            broker.drain(
+                socket_broker,
+                worker.pid(),
+                lifecycle.state(),
+                lifecycle.is_cancelled(),
+                grants,
+            )?;
         }
 
         for queued in &events {
@@ -768,7 +882,41 @@ fn duration_timespec(duration: Duration) -> libc::timespec {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use bangbang_session::{ObjectIdentity, ResourceRole, SocketChild};
+
     use super::*;
+
+    static NEXT_SOCKET_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct SocketTestRoot(PathBuf);
+
+    impl SocketTestRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "bangbang-launcher-socket-cleanup-{}-{}",
+                std::process::id(),
+                NEXT_SOCKET_TEST_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("socket cleanup root should create");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for SocketTestRoot {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("socket cleanup root should remove");
+        }
+    }
 
     #[test]
     fn event_batch_defers_reaping_until_all_events_are_available() {
@@ -802,5 +950,45 @@ mod tests {
             .expect("test deadline should be representable");
         assert_eq!(timeout_until(Some(deadline)), Some(Duration::ZERO));
         assert_eq!(timeout_until(None), None);
+    }
+
+    #[test]
+    fn worker_exit_cleanup_removes_only_the_recorded_socket_identity() {
+        let root = SocketTestRoot::new();
+        let directory = fs::File::open(root.path()).expect("directory should open");
+        let child = SocketChild::parse("api.sock").expect("child should parse");
+        let path = root.path().join("api.sock");
+        let listener = UnixListener::bind(&path).expect("socket should bind");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("socket permissions should tighten");
+        let metadata = fs::symlink_metadata(&path).expect("socket metadata should read");
+        let record = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            child.clone(),
+            ObjectIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        )
+        .expect("record should construct");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+            .expect("socket permissions should change");
+        unlink_owned_socket(directory.as_raw_fd(), &record)
+            .expect("mode-mismatched socket should be preserved");
+        assert!(path.exists());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("socket permissions should restore");
+        unlink_owned_socket(directory.as_raw_fd(), &record).expect("recorded socket should clean");
+        assert!(!path.exists());
+        drop(listener);
+
+        let replacement_listener =
+            UnixListener::bind(&path).expect("replacement socket should bind");
+        unlink_owned_socket(directory.as_raw_fd(), &record)
+            .expect("replacement identity should be preserved");
+        assert!(path.exists());
+        drop(replacement_listener);
+        fs::remove_file(path).expect("replacement socket should remove");
     }
 }

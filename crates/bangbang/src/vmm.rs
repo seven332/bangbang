@@ -92,11 +92,21 @@ use bangbang_runtime::startup::{
     update_block_device_for_devices_with_opened,
     update_network_interface_rate_limiters_for_devices, update_pmem_rate_limiter_for_devices,
 };
+#[cfg(target_os = "macos")]
+use bangbang_runtime::vsock::SuppliedVsockListener;
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
+#[cfg(target_os = "macos")]
+use bangbang_session::macos::runtime::WorkerSocketNamespace;
 use bangbang_session::{GrantAccess, ResourceRole};
 
+#[cfg(target_os = "macos")]
+use crate::anchored_socket::{AnchoredSocketGuard, bind as bind_anchored_socket};
 use crate::contained_session::GrantAuthority;
+#[cfg(target_os = "macos")]
+use crate::contained_session::{
+    ClaimedSocketDirectory, DirectoryGrantAuthority, SocketBrokerAuthority,
+};
 use crate::host_network::virtio_vmnet::{
     MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError,
     MmdsOnlyVirtioNetworkPacketIoProvider, MmdsOnlyVirtioNetworkPacketIoProviderBuildError,
@@ -1237,6 +1247,26 @@ impl fmt::Debug for SerialGrantState {
     }
 }
 
+#[cfg(target_os = "macos")]
+enum VsockGrantState {
+    PathBased,
+    Prepared(ClaimedSocketDirectory),
+    Consumed,
+    Active(AnchoredSocketGuard),
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for VsockGrantState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PathBased => formatter.write_str("PathBased"),
+            Self::Prepared(_) => formatter.write_str("Prepared(<owned>)"),
+            Self::Consumed => formatter.write_str("Consumed"),
+            Self::Active(guard) => formatter.debug_tuple("Active").field(guard).finish(),
+        }
+    }
+}
+
 const fn grant_access_for_read_only(read_only: bool) -> GrantAccess {
     if read_only {
         GrantAccess::ReadOnly
@@ -1264,6 +1294,14 @@ where
     drive_grant_states: BTreeMap<String, BackingGrantState<BlockFileBacking>>,
     pmem_grant_states: BTreeMap<String, BackingGrantState<PmemFileBacking>>,
     serial_grant_state: SerialGrantState,
+    #[cfg(target_os = "macos")]
+    directory_grant_authority: Option<DirectoryGrantAuthority>,
+    #[cfg(target_os = "macos")]
+    socket_broker_authority: Option<SocketBrokerAuthority>,
+    #[cfg(target_os = "macos")]
+    socket_namespace: Option<WorkerSocketNamespace>,
+    #[cfg(target_os = "macos")]
+    vsock_grant_state: VsockGrantState,
 }
 
 impl ProcessVmm<HvfInstanceStartExecutor> {
@@ -1335,6 +1373,14 @@ where
             drive_grant_states: BTreeMap::new(),
             pmem_grant_states: BTreeMap::new(),
             serial_grant_state: SerialGrantState::PathBased,
+            #[cfg(target_os = "macos")]
+            directory_grant_authority: None,
+            #[cfg(target_os = "macos")]
+            socket_broker_authority: None,
+            #[cfg(target_os = "macos")]
+            socket_namespace: None,
+            #[cfg(target_os = "macos")]
+            vsock_grant_state: VsockGrantState::PathBased,
         }
     }
 
@@ -1353,6 +1399,19 @@ where
 
     pub(crate) fn with_grant_authority(mut self, authority: Option<GrantAuthority>) -> Self {
         self.grant_authority = authority;
+        self
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_socket_grant_authority(
+        mut self,
+        authority: Option<DirectoryGrantAuthority>,
+        broker: Option<SocketBrokerAuthority>,
+        namespace: Option<WorkerSocketNamespace>,
+    ) -> Self {
+        self.directory_grant_authority = authority;
+        self.socket_broker_authority = broker;
+        self.socket_namespace = namespace;
         self
     }
 
@@ -1409,6 +1468,7 @@ where
             VmmAction::PutMetrics(input) => self.put_metrics(input),
             VmmAction::PutPmem(input) => self.put_pmem(input),
             VmmAction::PutSerial(input) => self.put_serial(input),
+            VmmAction::PutVsock(input) => self.put_vsock(input),
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
             VmmAction::CreateSnapshot(input) => self.create_snapshot(input),
@@ -1516,6 +1576,10 @@ where
 
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
         self.controller.preflight_instance_start()?;
+        #[cfg(target_os = "macos")]
+        let vsock_grant_consumed = matches!(self.vsock_grant_state, VsockGrantState::Consumed);
+        #[cfg(not(target_os = "macos"))]
+        let vsock_grant_consumed = false;
         if matches!(self.boot_grant_state, BootGrantState::Consumed)
             || self
                 .drive_grant_states
@@ -1526,6 +1590,7 @@ where
                 .values()
                 .any(|state| matches!(state, BackingGrantState::Consumed))
             || matches!(self.serial_grant_state, SerialGrantState::Consumed)
+            || vsock_grant_consumed
         {
             return Err(VmmActionError::ResourceGrant);
         }
@@ -1566,10 +1631,53 @@ where
                 SerialGrantState::Prepared(output) => Some(output),
                 SerialGrantState::Consumed => return Err(VmmActionError::ResourceGrant),
             };
+        #[cfg(target_os = "macos")]
+        let prepared_vsock =
+            match std::mem::replace(&mut self.vsock_grant_state, VsockGrantState::Consumed) {
+                VsockGrantState::PathBased => {
+                    self.vsock_grant_state = VsockGrantState::PathBased;
+                    None
+                }
+                VsockGrantState::Prepared(claim) => Some(claim),
+                VsockGrantState::Consumed | VsockGrantState::Active(_) => {
+                    return Err(VmmActionError::ResourceGrant);
+                }
+            };
         let mut startup_resources =
             VmStartupResources::new(boot_files, block_backings, pmem_backings);
         if let Some(serial_output) = serial_output {
             startup_resources = startup_resources.with_serial_output(serial_output);
+        }
+        #[cfg(target_os = "macos")]
+        let mut active_vsock_guard = None;
+        #[cfg(target_os = "macos")]
+        if let Some(claim) = prepared_vsock {
+            let namespace = self
+                .socket_namespace
+                .as_ref()
+                .ok_or(VmmActionError::ResourceGrant)?
+                .try_clone()
+                .map_err(|_| VmmActionError::ResourceGrant)?;
+            let broker = self
+                .socket_broker_authority
+                .as_ref()
+                .ok_or(VmmActionError::ResourceGrant)?
+                .take_endpoint()
+                .map_err(|_| VmmActionError::ResourceGrant)?;
+            let socket = bind_anchored_socket(
+                namespace,
+                claim,
+                ResourceRole::VsockSocketDirectory,
+                Some(broker),
+            )
+            .map_err(|_| VmmActionError::ResourceGrant)?;
+            let (listener, guard, connector) = socket
+                .into_vsock_parts()
+                .map_err(|_| VmmActionError::ResourceGrant)?;
+            startup_resources = startup_resources.with_supplied_vsock_listener(
+                SuppliedVsockListener::new(listener).with_guest_connector(connector),
+            );
+            active_vsock_guard = Some(guard);
         }
         let controller = &mut self.controller;
         let starter = &mut self.starter;
@@ -1585,6 +1693,10 @@ where
             Ok(data) => match started_session {
                 Some(session) => {
                     self.started_session = Some(session);
+                    #[cfg(target_os = "macos")]
+                    if let Some(guard) = active_vsock_guard.take() {
+                        self.vsock_grant_state = VsockGrantState::Active(guard);
+                    }
                     Ok(data)
                 }
                 None => Err(VmmActionError::InstanceStart(BackendError::InvalidState(
@@ -1738,6 +1850,28 @@ where
 
         self.controller.commit_serial_config(config);
         self.serial_grant_state = grant_state;
+        Ok(VmmData::Empty)
+    }
+
+    fn put_vsock(&mut self, input: VsockConfigInput) -> Result<VmmData, VmmActionError> {
+        let config = self.controller.prepare_vsock_config(input)?;
+        #[cfg(target_os = "macos")]
+        let grant_state = match &self.directory_grant_authority {
+            Some(authority) => match authority
+                .claim_socket_directory(config.uds_path(), ResourceRole::VsockSocketDirectory)
+                .map_err(|_| VmmActionError::ResourceGrant)?
+            {
+                Some(claim) => VsockGrantState::Prepared(claim),
+                None => VsockGrantState::PathBased,
+            },
+            None => VsockGrantState::PathBased,
+        };
+
+        self.controller.commit_vsock_config(config);
+        #[cfg(target_os = "macos")]
+        {
+            self.vsock_grant_state = grant_state;
+        }
         Ok(VmmData::Empty)
     }
 

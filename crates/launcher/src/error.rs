@@ -26,6 +26,8 @@ pub enum LauncherError {
     GrantPreparation,
     /// The private startup grant transaction failed.
     GrantProtocol,
+    /// The closed launcher-vsock broker protocol failed.
+    SocketBroker,
     /// The private per-VM runtime namespace failed validation or cleanup.
     RuntimeNamespace,
     /// Waiting for the embedded worker failed.
@@ -66,6 +68,7 @@ impl fmt::Display for LauncherError {
             Self::InvalidGrantInput => formatter.write_str("invalid resource grant input"),
             Self::GrantPreparation => formatter.write_str("resource grant preparation failed"),
             Self::GrantProtocol => formatter.write_str("private resource grant failed"),
+            Self::SocketBroker => formatter.write_str("private socket broker failed"),
             Self::RuntimeNamespace => {
                 formatter.write_str("private worker runtime namespace failed")
             }

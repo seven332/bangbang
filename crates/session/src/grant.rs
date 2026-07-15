@@ -12,6 +12,8 @@ pub const MAX_GRANTS: u16 = 64;
 pub const MAX_GRANT_RECORDS: u16 = 512;
 /// Maximum bytes in one grant identifier.
 pub const MAX_GRANT_ID_BYTES: usize = 64;
+/// Maximum bytes in one contained Unix-socket child name.
+pub const MAX_SOCKET_CHILD_BYTES: usize = 64;
 /// Maximum bytes in one ephemeral bookmark.
 pub const MAX_BOOKMARK_BYTES: u32 = 64 * 1024;
 /// Maximum bookmark bytes across one batch.
@@ -91,6 +93,38 @@ impl GrantId {
 impl fmt::Debug for GrantId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("GrantId(<redacted>)")
+    }
+}
+
+/// Bounded single-component child name for a contained Unix socket.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SocketChild(String);
+
+impl SocketChild {
+    /// Validates one child from the closed capability-reference character set.
+    pub fn parse(value: &str) -> Result<Self, ProtocolError> {
+        if value.is_empty()
+            || value.len() > MAX_SOCKET_CHILD_BYTES
+            || matches!(value, "." | "..")
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the exact child bytes. These bytes must not be logged.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for SocketChild {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SocketChild(<redacted>)")
     }
 }
 
@@ -834,6 +868,31 @@ mod tests {
             encode_grant_frame(&invalid),
             Err(ProtocolError::InvalidFrame)
         );
+    }
+
+    #[test]
+    fn socket_children_use_one_bounded_redacted_component() {
+        for value in ["api.sock", "VSOCK_1", "socket-2"] {
+            let child = SocketChild::parse(value).expect("safe child should parse");
+            assert_eq!(child.as_bytes(), value.as_bytes());
+            assert!(!format!("{child:?}").contains(value));
+        }
+        for value in [
+            "",
+            ".",
+            "..",
+            "with/slash",
+            "with\\slash",
+            "space name",
+            "雪",
+        ] {
+            assert_eq!(SocketChild::parse(value), Err(ProtocolError::InvalidFrame));
+        }
+        assert_eq!(
+            SocketChild::parse(&"a".repeat(MAX_SOCKET_CHILD_BYTES + 1)),
+            Err(ProtocolError::InvalidFrame)
+        );
+        assert!(SocketChild::parse(&"a".repeat(MAX_SOCKET_CHILD_BYTES)).is_ok());
     }
 
     #[test]

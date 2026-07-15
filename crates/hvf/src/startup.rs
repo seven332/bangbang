@@ -5500,7 +5500,7 @@ fn start_run_loop_vsock_wakeup_monitor(
         return Ok(HvfArm64BootRunLoopWakeupMonitor::inactive());
     }
 
-    let (fds, deadline) = {
+    let (read_fds, write_fds, deadline) = {
         let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(dispatcher)
             .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
         runtime_resources
@@ -5511,7 +5511,13 @@ fn start_run_loop_vsock_wakeup_monitor(
             .into_parts()
     };
 
-    HvfArm64BootRunLoopWakeupMonitor::start(fds, deadline, vcpu_control, wakeup_token)
+    HvfArm64BootRunLoopWakeupMonitor::start(
+        read_fds,
+        write_fds,
+        deadline,
+        vcpu_control,
+        wakeup_token,
+    )
 }
 
 trait BootSessionRunLoopSession {
@@ -6184,20 +6190,20 @@ impl HvfArm64BootRunLoopWakeupMonitor {
     }
 
     fn start(
-        mut fds: Vec<RawFd>,
+        host_read_fds: Vec<RawFd>,
+        host_write_fds: Vec<RawFd>,
         deadline: Option<Instant>,
         vcpu_control: HvfVcpuRunControl,
         wakeup_token: HvfArm64BootRunLoopWakeupToken,
     ) -> Result<Self, HvfArm64BootRunLoopWakeupMonitorError> {
-        fds.sort_unstable();
-        fds.dedup();
-        if fds.is_empty() && deadline.is_none() {
+        if host_read_fds.is_empty() && host_write_fds.is_empty() && deadline.is_none() {
             return Ok(Self::inactive());
         }
 
         let (stop_reader, stop_writer) =
             UnixStream::pair().map_err(|source| Self::create_stop_pipe_error(source.kind()))?;
-        let mut pollfds = vsock_wakeup_pollfds(fds, stop_reader.as_raw_fd())?;
+        let mut pollfds =
+            vsock_wakeup_pollfds(host_read_fds, host_write_fds, stop_reader.as_raw_fd())?;
         let pollfd_count = libc::nfds_t::try_from(pollfds.len()).map_err(|_| {
             HvfArm64BootRunLoopWakeupMonitorError::TooManyPollFds {
                 count: pollfds.len(),
@@ -6263,23 +6269,63 @@ impl HvfArm64BootRunLoopWakeupMonitor {
 }
 
 fn vsock_wakeup_pollfds(
-    fds: Vec<RawFd>,
+    mut host_read_fds: Vec<RawFd>,
+    mut host_write_fds: Vec<RawFd>,
     stop_fd: RawFd,
 ) -> Result<Vec<libc::pollfd>, HvfArm64BootRunLoopWakeupMonitorError> {
+    host_read_fds.sort_unstable();
+    host_read_fds.dedup();
+    host_write_fds.sort_unstable();
+    host_write_fds.dedup();
     let mut pollfds = Vec::new();
     pollfds
-        .try_reserve_exact(fds.len().saturating_add(1))
+        .try_reserve_exact(
+            host_read_fds
+                .len()
+                .saturating_add(host_write_fds.len())
+                .saturating_add(1),
+        )
         .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
     pollfds.push(libc::pollfd {
         fd: stop_fd,
         events: libc::POLLIN,
         revents: 0,
     });
-    pollfds.extend(fds.into_iter().map(|fd| libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    }));
+    let mut read_index = 0;
+    let mut write_index = 0;
+    while read_index < host_read_fds.len() || write_index < host_write_fds.len() {
+        let read_fd = host_read_fds.get(read_index).copied();
+        let write_fd = host_write_fds.get(write_index).copied();
+        let (fd, events) = match (read_fd, write_fd) {
+            (Some(read_fd), Some(write_fd)) if read_fd == write_fd => {
+                read_index += 1;
+                write_index += 1;
+                (read_fd, libc::POLLIN | libc::POLLOUT)
+            }
+            (Some(read_fd), Some(write_fd)) if read_fd < write_fd => {
+                read_index += 1;
+                (read_fd, libc::POLLIN)
+            }
+            (Some(_), Some(write_fd)) => {
+                write_index += 1;
+                (write_fd, libc::POLLOUT)
+            }
+            (Some(read_fd), None) => {
+                read_index += 1;
+                (read_fd, libc::POLLIN)
+            }
+            (None, Some(write_fd)) => {
+                write_index += 1;
+                (write_fd, libc::POLLOUT)
+            }
+            (None, None) => break,
+        };
+        pollfds.push(libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        });
+    }
 
     Ok(pollfds)
 }
@@ -6380,7 +6426,7 @@ fn vsock_wakeup_poll_timeout(deadline: Option<Instant>, now: Instant) -> libc::c
 }
 
 const fn pollfd_has_wakeup_event(revents: libc::c_short) -> bool {
-    revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    revents & (libc::POLLIN | libc::POLLOUT | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
 fn lock_boot_mmio_dispatcher(
@@ -8353,6 +8399,27 @@ mod tests {
     }
 
     #[test]
+    fn vsock_wakeup_pollfds_preserve_read_and_write_interests() {
+        let pollfds = super::vsock_wakeup_pollfds(vec![13, 11, 13], vec![12, 13, 12], 10)
+            .expect("vsock poll descriptors should build");
+        let descriptors = pollfds
+            .iter()
+            .map(|pollfd| (pollfd.fd, pollfd.events, pollfd.revents))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            descriptors,
+            [
+                (10, libc::POLLIN, 0),
+                (11, libc::POLLIN, 0),
+                (12, libc::POLLOUT, 0),
+                (13, libc::POLLIN | libc::POLLOUT, 0),
+            ]
+        );
+        assert!(super::pollfd_has_wakeup_event(libc::POLLOUT));
+    }
+
+    #[test]
     fn vsock_wakeup_poll_timeout_rounds_up_and_clamps_absolute_deadline() {
         let now = Instant::now();
 
@@ -8528,6 +8595,7 @@ mod tests {
                 .expect("test coordinator should build");
         let wakeup = super::HvfArm64BootRunLoopWakeupToken::default();
         let monitor = super::HvfArm64BootRunLoopWakeupMonitor::start(
+            Vec::new(),
             Vec::new(),
             Some(Instant::now() + Duration::from_secs(60 * 60)),
             coordinator.control(),

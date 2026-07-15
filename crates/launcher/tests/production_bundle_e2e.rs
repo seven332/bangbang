@@ -11,8 +11,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{PermissionsExt, symlink};
-use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -27,7 +27,7 @@ use bangbang_launcher::{
 };
 use bangbang_session::{
     Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD,
-    SessionId, encode_frame,
+    SOCKET_BROKER_FD, SessionId, encode_frame,
 };
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
@@ -80,6 +80,34 @@ const OUTPUT_LOGGER_SEED: &[u8] = b"logger-seed\n";
 const OUTPUT_METRICS_SEED: &[u8] = b"metrics-seed\n";
 const OUTPUT_SERIAL_SEED: &[u8] = b"serial-seed\n";
 const OUTPUT_REPLACEMENT: &[u8] = b"replacement-path-must-remain-unused\n";
+const API_SOCKET_DIRECTORY_ID: &str = "grant-api-socket-directory-1365";
+const VSOCK_SOCKET_DIRECTORY_ID: &str = "grant-vsock-socket-directory-1365";
+const API_SOCKET_CHILD: &str = "api-1365.sock";
+const VSOCK_SOCKET_CHILD: &str = "vsock-1365.sock";
+const API_SOCKET_REF: &str = "bangbang-grant:grant-api-socket-directory-1365/api-1365.sock";
+const VSOCK_SOCKET_REF: &str = "bangbang-grant:grant-vsock-socket-directory-1365/vsock-1365.sock";
+const GRANTED_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
+const GRANTED_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_MULTISTREAM_OK";
+const GRANTED_VSOCK_EXCHANGES: &[(u32, &[u8], &[u8])] = &[
+    (
+        5007,
+        b"BANGBANG_VSOCK_GUEST_MULTI_ONE",
+        b"BANGBANG_VSOCK_HOST_MULTI_ONE",
+    ),
+    (
+        5008,
+        b"BANGBANG_VSOCK_GUEST_MULTI_TWO",
+        b"BANGBANG_VSOCK_HOST_MULTI_TWO",
+    ),
+];
+const GRANTED_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
+const GRANTED_HOST_VSOCK_READY_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_READY";
+const GRANTED_HOST_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_OK";
+const GRANTED_HOST_VSOCK_PORT: u32 = 5006;
+const GRANTED_HOST_VSOCK_STREAM_BYTES: usize = 1024 * 1024;
+const GRANTED_HOST_VSOCK_CHUNK_BYTES: usize = 16 * 1024;
+const GRANTED_HOST_VSOCK_GUEST_SEED: u8 = 0x3d;
+const GRANTED_HOST_VSOCK_HOST_SEED: u8 = 0xa7;
 const GUEST_SERIAL_MARKER: &[u8] = b"Linux version";
 const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
 const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
@@ -400,6 +428,342 @@ fn normal_bundle_delays_boot_claim_until_api_and_keeps_opened_identity() {
         "guest should reach SYSTEM_OFF: {status:?}"
     );
     assert!(!running.socket.exists());
+}
+
+#[test]
+fn normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers() {
+    let bundle = production_bundle();
+    let fixture = SocketDirectoryGrantFixture::new("guest-vsock");
+    let mut listeners = Vec::new();
+    for &(port, _, _) in GRANTED_VSOCK_EXCHANGES {
+        let path = fixture.vsock_port_path(port);
+        let listener = UnixListener::bind(&path).expect("granted vsock port listener should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("granted vsock port listener should be nonblocking");
+        listeners.push((port, path, listener));
+    }
+
+    let mut running = spawn_ready_socket_grant_api_launcher(&bundle, &fixture, "guest-vsock");
+    assert_socket_mode(&fixture.api_socket(), 0o600, "granted API socket");
+    let worker = only_worker_pid(&running.child);
+    assert!(
+        child_pids(worker).is_empty(),
+        "short-lived API binder must be reaped before readiness"
+    );
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT granted-vsock machine config",
+    );
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "boot_args": GRANTED_VSOCK_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot source should serialize"),
+        ),
+        204,
+        "PUT granted-vsock boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": GUEST_ROOTFS_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT granted-vsock rootfs",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": GUEST_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+            }),
+            "PUT granted-vsock data drive",
+        ),
+        (
+            "/vsock",
+            serde_json::json!({"guest_cid": 3, "uds_path": VSOCK_SOCKET_REF}),
+            "PUT granted-vsock device",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("granted-vsock request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert!(
+        !fixture.vsock_socket().exists(),
+        "vsock directory claim must remain deferred until VM start"
+    );
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start granted-vsock guest",
+    );
+    assert_socket_mode(&fixture.vsock_socket(), 0o600, "granted vsock socket");
+    assert!(
+        child_pids(worker).is_empty(),
+        "granted vsock must not retain a connector helper"
+    );
+
+    let mut streams = Vec::new();
+    for ((port, path, listener), &(expected_port, _, _)) in
+        listeners.into_iter().zip(GRANTED_VSOCK_EXCHANGES)
+    {
+        assert_eq!(port, expected_port);
+        let stream = wait_for_unix_listener_accept(&listener, PROCESS_TIMEOUT)
+            .unwrap_or_else(|error| panic!("guest vsock port {port} should connect: {error}"));
+        drop(listener);
+        fs::remove_file(&path).expect("host-owned vsock port path should clean up");
+        stream
+            .set_nonblocking(true)
+            .expect("accepted vsock stream should remain nonblocking");
+        streams.push(stream);
+    }
+
+    for (stream, &(_, guest_payload, _)) in streams.iter_mut().zip(GRANTED_VSOCK_EXCHANGES) {
+        let mut received = vec![0_u8; guest_payload.len()];
+        read_exact_nonblocking(stream, &mut received, PROCESS_TIMEOUT)
+            .expect("guest vsock payload should arrive");
+        assert_eq!(received, guest_payload);
+    }
+    for (stream, &(_, _, host_payload)) in streams.iter_mut().zip(GRANTED_VSOCK_EXCHANGES) {
+        write_all_nonblocking(stream, host_payload, PROCESS_TIMEOUT)
+            .expect("host vsock reply should write");
+    }
+
+    wait_for_file_contains(&fixture.devices.data, GRANTED_VSOCK_MARKER, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| panic!("guest vsock marker should reach data drive: {error}"));
+    drop(streams);
+    stop_running_launcher(&mut running, "granted-vsock guest shutdown");
+    assert!(!fixture.api_socket().exists());
+    assert!(!fixture.vsock_socket().exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn normal_bundle_routes_host_vsock_through_supplied_granted_listener() {
+    let bundle = production_bundle();
+    let fixture = SocketDirectoryGrantFixture::new("host-vsock");
+    let mut running = spawn_ready_socket_grant_api_launcher(&bundle, &fixture, "host-vsock");
+    let worker = only_worker_pid(&running.child);
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT granted host-vsock machine config",
+    );
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "boot_args": GRANTED_HOST_VSOCK_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot source should serialize"),
+        ),
+        204,
+        "PUT granted host-vsock boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": GUEST_ROOTFS_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT granted host-vsock rootfs",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": GUEST_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+            }),
+            "PUT granted host-vsock data drive",
+        ),
+        (
+            "/vsock",
+            serde_json::json!({"guest_cid": 3, "uds_path": VSOCK_SOCKET_REF}),
+            "PUT granted host-vsock device",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("host-vsock request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start granted host-vsock guest",
+    );
+    assert_socket_mode(&fixture.vsock_socket(), 0o600, "granted host-vsock socket");
+    assert!(
+        child_pids(worker).is_empty(),
+        "granted host-vsock must not retain a connector helper"
+    );
+    wait_for_file_contains(
+        &fixture.devices.data,
+        GRANTED_HOST_VSOCK_READY_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("host-vsock ready marker should reach data drive: {error}"));
+
+    let mut stream = UnixStream::connect(fixture.vsock_socket())
+        .expect("host should connect to the granted main vsock listener");
+    stream
+        .set_nonblocking(true)
+        .expect("host-vsock stream should become nonblocking");
+    let connect = format!("CONNECT {GRANTED_HOST_VSOCK_PORT}\n");
+    write_all_nonblocking(&mut stream, connect.as_bytes(), PROCESS_TIMEOUT)
+        .expect("host-vsock CONNECT request should write");
+    let response = read_line_nonblocking(&mut stream, 32, PROCESS_TIMEOUT)
+        .expect("host-vsock CONNECT response should arrive");
+    let response = std::str::from_utf8(&response).expect("CONNECT response should be UTF-8");
+    let local_port = response
+        .strip_prefix("OK ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .and_then(|value| value.parse::<u32>().ok());
+    assert!(
+        local_port.is_some(),
+        "CONNECT response should contain a local port"
+    );
+
+    verify_deterministic_stream(&mut stream, GRANTED_HOST_VSOCK_GUEST_SEED, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| {
+            let marker = fs::read(&fixture.devices.data).unwrap_or_default();
+            panic!(
+                "guest-to-host deterministic stream should verify: {error}; guest marker: {:?}",
+                String::from_utf8_lossy(&marker)
+            )
+        });
+    write_deterministic_stream(&mut stream, GRANTED_HOST_VSOCK_HOST_SEED, PROCESS_TIMEOUT)
+        .expect("host-to-guest deterministic stream should write");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("host-vsock stream should half-close writes");
+    wait_for_file_contains(
+        &fixture.devices.data,
+        GRANTED_HOST_VSOCK_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        let marker = fs::read(&fixture.devices.data).unwrap_or_default();
+        panic!(
+            "host-vsock success marker should reach data drive: {error}; guest marker: {:?}",
+            String::from_utf8_lossy(&marker)
+        )
+    });
+    wait_for_nonblocking_eof(&mut stream, PROCESS_TIMEOUT)
+        .expect("guest should half-close and close the host-vsock stream");
+
+    drop(stream);
+    stop_running_launcher(&mut running, "granted host-vsock shutdown");
+    assert!(!fixture.api_socket().exists());
+    assert!(!fixture.vsock_socket().exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn normal_bundle_granted_socket_cleanup_preserves_replacements_in_both_death_orders() {
+    let bundle = production_bundle();
+    recover_session_root(&bundle);
+
+    let launcher_fixture = SocketDirectoryGrantFixture::new("socket-launcher-first");
+    let mut launcher_first =
+        spawn_ready_socket_grant_api_launcher(&bundle, &launcher_fixture, "socket-launcher-first");
+    let launcher_owned = launcher_fixture.api_directory.join("launcher-owned.sock");
+    fs::rename(launcher_fixture.api_socket(), &launcher_owned)
+        .expect("launcher-first owned socket should move aside");
+    let launcher_replacement = UnixListener::bind(launcher_fixture.api_socket())
+        .expect("launcher-first replacement socket should bind");
+    let worker_pid = only_worker_pid(&launcher_first.child);
+    let worker_exit = ProcessExitWatch::new(worker_pid);
+    let launcher_pid = i32::try_from(launcher_first.child.id()).expect("launcher PID should fit");
+    // SAFETY: This targets the live unreaped launcher while its worker remains
+    // bound to the inherited lifecycle endpoint.
+    assert_eq!(unsafe { libc::kill(launcher_pid, libc::SIGKILL) }, 0);
+    let status = launcher_first.wait("granted socket launcher-first SIGKILL");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert!(
+        worker_exit.wait(PROCESS_TIMEOUT),
+        "worker should exit after granted socket launcher EOF"
+    );
+    assert!(
+        launcher_fixture.api_socket().exists(),
+        "worker cleanup must preserve a replacement socket"
+    );
+    assert!(launcher_owned.exists());
+    assert!(session_entries().is_empty());
+    drop(launcher_replacement);
+
+    let worker_fixture = SocketDirectoryGrantFixture::new("socket-worker-first");
+    let mut worker_first =
+        spawn_ready_socket_grant_api_launcher(&bundle, &worker_fixture, "socket-worker-first");
+    let worker_owned = worker_fixture.api_directory.join("worker-owned.sock");
+    fs::rename(worker_fixture.api_socket(), &worker_owned)
+        .expect("worker-first owned socket should move aside");
+    let worker_replacement = UnixListener::bind(worker_fixture.api_socket())
+        .expect("worker-first replacement socket should bind");
+    let worker_pid = only_worker_pid(&worker_first.child);
+    // SAFETY: This targets the live child of the unreaped launcher.
+    assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
+    let status = worker_first.wait("granted socket worker-first SIGKILL");
+    assert_eq!(status.signal(), None);
+    assert_eq!(status.code(), Some(128 + libc::SIGKILL));
+    assert!(
+        worker_fixture.api_socket().exists(),
+        "launcher cleanup must preserve a replacement socket"
+    );
+    assert!(worker_owned.exists());
+    assert!(session_entries().is_empty());
+    drop(worker_replacement);
 }
 
 #[test]
@@ -1467,11 +1831,14 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
         UnixStream::pair().expect("bootstrap socketpair should open");
     let (_grant_parent, grant_child_endpoint) =
         UnixDatagram::pair().expect("grant socketpair should open");
+    let (_broker_parent, broker_child_endpoint) =
+        UnixDatagram::pair().expect("broker socketpair should open");
     parent
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bootstrap read timeout should set");
     let child_fd = child_endpoint.as_raw_fd();
     let grant_child_fd = grant_child_endpoint.as_raw_fd();
+    let broker_child_fd = broker_child_endpoint.as_raw_fd();
     let mut command = Command::new(worker_executable(&bundle));
     command
         .env(SESSION_ENV_KEY, SESSION_ENV_VALUE)
@@ -1489,6 +1856,9 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
             if libc::dup2(grant_child_fd, GRANT_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if libc::dup2(broker_child_fd, SOCKET_BROKER_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -1497,6 +1867,7 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
     let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
     drop(child_endpoint);
     drop(grant_child_endpoint);
+    drop(broker_child_endpoint);
 
     let mut hello_bytes = vec![0_u8; 56];
     parent
@@ -2019,6 +2390,93 @@ impl GuestDeviceGrantFixture {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+}
+
+#[derive(Debug)]
+struct SocketDirectoryGrantFixture {
+    devices: GuestDeviceGrantFixture,
+    _socket_root: TestDir,
+    api_directory: PathBuf,
+    vsock_directory: PathBuf,
+}
+
+impl SocketDirectoryGrantFixture {
+    fn new(case: &str) -> Self {
+        let devices = GuestDeviceGrantFixture::new(case);
+        let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let socket_root = TestDir(
+            PathBuf::from("/private/tmp").join(format!("bbs-{}-{socket_id}", std::process::id())),
+        );
+        fs::create_dir(socket_root.path()).expect("short socket root should be created");
+        let api_directory = socket_root.path().join("a");
+        let vsock_directory = socket_root.path().join("v");
+        fs::create_dir(&api_directory).expect("API socket directory should be created");
+        fs::create_dir(&vsock_directory).expect("vsock socket directory should be created");
+
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(&devices.manifest).expect("device grant manifest should read"),
+        )
+        .expect("device grant manifest should parse");
+        let grants = manifest
+            .get_mut("grants")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("device grant manifest should contain grants");
+        grants.extend([
+            serde_json::json!({
+                "id": API_SOCKET_DIRECTORY_ID,
+                "role": "api-socket-directory",
+                "access": "create-children",
+                "source": path_text(&api_directory),
+            }),
+            serde_json::json!({
+                "id": VSOCK_SOCKET_DIRECTORY_ID,
+                "role": "vsock-socket-directory",
+                "access": "create-children",
+                "source": path_text(&vsock_directory),
+            }),
+        ]);
+        fs::write(
+            &devices.manifest,
+            serde_json::to_vec(&manifest).expect("socket grant manifest should serialize"),
+        )
+        .expect("socket grant manifest should write");
+
+        Self {
+            devices,
+            _socket_root: socket_root,
+            api_directory,
+            vsock_directory,
+        }
+    }
+
+    fn api_socket(&self) -> PathBuf {
+        self.api_directory.join(API_SOCKET_CHILD)
+    }
+
+    fn vsock_socket(&self) -> PathBuf {
+        self.vsock_directory.join(VSOCK_SOCKET_CHILD)
+    }
+
+    fn vsock_port_path(&self, port: u32) -> PathBuf {
+        let mut path = self.vsock_socket().into_os_string();
+        path.push(format!("_{port}"));
+        PathBuf::from(path)
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        let mut sensitive = self.devices.sensitive_strings();
+        sensitive.extend([
+            path_text(&self.api_directory).to_owned(),
+            path_text(&self.vsock_directory).to_owned(),
+            API_SOCKET_DIRECTORY_ID.to_owned(),
+            VSOCK_SOCKET_DIRECTORY_ID.to_owned(),
+            API_SOCKET_REF.to_owned(),
+            VSOCK_SOCKET_REF.to_owned(),
+            API_SOCKET_CHILD.to_owned(),
+            VSOCK_SOCKET_CHILD.to_owned(),
+        ]);
+        sensitive
     }
 }
 
@@ -2846,6 +3304,46 @@ fn spawn_ready_device_grant_api_launcher(
     }
 }
 
+fn spawn_ready_socket_grant_api_launcher(
+    bundle: &Path,
+    fixture: &SocketDirectoryGrantFixture,
+    name: &str,
+) -> RunningApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket = fixture.api_socket();
+    let mut child = Command::new(launcher(bundle))
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.devices.manifest)
+        .arg("--")
+        .args(["--api-sock", API_SOCKET_REF])
+        .args(["--id", &format!("{name}-{test_id}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("socket-directory grant launcher should start");
+    let (ready, stdout_reader) = read_stdout_until_ready(&mut child);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "socket-directory grant API should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningApiLauncher {
+        child,
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive: fixture.sensitive_strings(),
+        completed: false,
+    }
+}
+
 fn spawn_ready_output_grant_api_launcher(
     bundle: &Path,
     fixture: &OutputGrantFixture,
@@ -2984,6 +3482,12 @@ fn session_entries() -> Vec<PathBuf> {
 
 fn only_worker_pid(launcher: &Child) -> libc::pid_t {
     let parent = libc::pid_t::try_from(launcher.id()).expect("launcher PID should fit");
+    let children = child_pids(parent);
+    assert_eq!(children.len(), 1, "launcher should own exactly one worker");
+    children[0]
+}
+
+fn child_pids(parent: libc::pid_t) -> Vec<libc::pid_t> {
     let mut pids = [0 as libc::pid_t; 16];
     let buffer_bytes =
         i32::try_from(std::mem::size_of_val(&pids)).expect("child PID buffer should fit");
@@ -2991,17 +3495,16 @@ fn only_worker_pid(launcher: &Child) -> libc::pid_t {
     // live and unreaped while libproc takes this synchronous snapshot.
     let returned =
         unsafe { libc::proc_listchildpids(parent, pids.as_mut_ptr().cast(), buffer_bytes) };
-    assert!(returned > 0, "launcher should own one worker");
+    if returned <= 0 {
+        return Vec::new();
+    }
     let count = usize::try_from(returned).expect("libproc child count should fit");
-    let children = pids
-        .get(..count)
+    pids.get(..count)
         .expect("libproc count should fit buffer")
         .iter()
         .copied()
         .filter(|pid| *pid > 0)
-        .collect::<Vec<_>>();
-    assert_eq!(children.len(), 1, "launcher should own exactly one worker");
-    children[0]
+        .collect::<Vec<_>>()
 }
 
 #[derive(Debug)]
@@ -3195,6 +3698,9 @@ fn wait_for_child_exit(child: &Child, timeout: Duration) -> bool {
             std::ptr::null(),
         )
     };
+    if registered < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return true;
+    }
     assert_eq!(registered, 0, "child exit event should register");
 
     let deadline = Instant::now()
@@ -3329,6 +3835,209 @@ fn wait_for_file_contains(path: &Path, marker: &[u8], timeout: Duration) -> Resu
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn wait_for_unix_listener_accept(
+    listener: &UnixListener,
+    timeout: Duration,
+) -> std::io::Result<UnixStream> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .expect("listener deadline should fit Instant");
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return Ok(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_socket_event(listener.as_raw_fd(), libc::POLLIN, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn read_exact_nonblocking(
+    stream: &mut UnixStream,
+    bytes: &mut [u8],
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .expect("read deadline should fit Instant");
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match stream.read(&mut bytes[offset..]) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(length) => offset += length,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_socket_event(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_nonblocking(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .expect("write deadline should fit Instant");
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(length) => offset += length,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_socket_event(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn read_line_nonblocking(
+    stream: &mut UnixStream,
+    maximum: usize,
+    timeout: Duration,
+) -> std::io::Result<Vec<u8>> {
+    let mut line = Vec::with_capacity(maximum);
+    while line.len() < maximum {
+        let mut byte = [0_u8; 1];
+        read_exact_nonblocking(stream, &mut byte, timeout)?;
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            return Ok(line);
+        }
+    }
+    Err(std::io::ErrorKind::InvalidData.into())
+}
+
+fn deterministic_vsock_chunk(offset: usize, length: usize, seed: u8) -> Vec<u8> {
+    (offset..offset + length)
+        .map(|position| {
+            let value = (position * 131 + usize::from(seed)) ^ (position >> 8) ^ (position >> 16);
+            u8::try_from(value & 0xff).expect("deterministic byte should fit")
+        })
+        .collect()
+}
+
+fn verify_deterministic_stream(
+    stream: &mut UnixStream,
+    seed: u8,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let mut offset = 0;
+    while offset < GRANTED_HOST_VSOCK_STREAM_BYTES {
+        let length = GRANTED_HOST_VSOCK_CHUNK_BYTES.min(GRANTED_HOST_VSOCK_STREAM_BYTES - offset);
+        let mut received = vec![0_u8; length];
+        read_exact_nonblocking(stream, &mut received, timeout).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("{error} after {offset} deterministic bytes"),
+            )
+        })?;
+        if received != deterministic_vsock_chunk(offset, length, seed) {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        offset += length;
+    }
+    Ok(())
+}
+
+fn write_deterministic_stream(
+    stream: &mut UnixStream,
+    seed: u8,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let mut offset = 0;
+    while offset < GRANTED_HOST_VSOCK_STREAM_BYTES {
+        let length = GRANTED_HOST_VSOCK_CHUNK_BYTES.min(GRANTED_HOST_VSOCK_STREAM_BYTES - offset);
+        write_all_nonblocking(
+            stream,
+            &deterministic_vsock_chunk(offset, length, seed),
+            timeout,
+        )?;
+        offset += length;
+    }
+    Ok(())
+}
+
+fn wait_for_nonblocking_eof(stream: &mut UnixStream, timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .expect("EOF deadline should fit Instant");
+    let mut byte = [0_u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => return Ok(()),
+            Ok(_) => return Err(std::io::ErrorKind::InvalidData.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_socket_event(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn wait_for_socket_event(
+    descriptor: libc::c_int,
+    events: libc::c_short,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let rounded_millis = remaining.as_millis().saturating_add(u128::from(
+            !remaining.subsec_nanos().is_multiple_of(1_000_000),
+        ));
+        let timeout = i32::try_from(rounded_millis).unwrap_or(i32::MAX);
+        let mut poll_fd = libc::pollfd {
+            fd: descriptor,
+            events,
+            revents: 0,
+        };
+        // SAFETY: The single initialized poll entry is writable for this
+        // bounded synchronous event wait.
+        let ready = unsafe { libc::poll(&raw mut poll_fd, 1, timeout) };
+        if ready > 0 {
+            if poll_fd.revents & libc::POLLNVAL != 0 {
+                return Err(std::io::ErrorKind::InvalidInput.into());
+            }
+            if poll_fd.revents & (events | libc::POLLERR | libc::POLLHUP) != 0 {
+                return Ok(());
+            }
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        if ready == 0 {
+            if Instant::now() >= deadline {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn assert_socket_mode(path: &Path, expected_mode: u32, context: &str) {
+    let metadata = fs::symlink_metadata(path).expect("published socket metadata should exist");
+    assert!(
+        metadata.file_type().is_socket(),
+        "{context} should be a socket"
+    );
+    assert_eq!(
+        metadata.permissions().mode() & 0o777,
+        expected_mode,
+        "{context} should have exact owner-only permissions"
+    );
 }
 
 fn http_get(socket: &Path, path: &str) -> String {
