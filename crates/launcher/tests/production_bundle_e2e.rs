@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -26,11 +26,19 @@ use bangbang_launcher::{
     WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 use bangbang_session::{
-    Frame, FrameDecoder, Message, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SessionId,
-    encode_frame,
+    Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD,
+    SessionId, encode_frame,
 };
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
+const GRANT_TEST_BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH";
+const GRANT_MANIFEST_OPTION: &str = "--bangbang-grant-manifest";
+const GRANT_PROBE_OPTION: &str = "--bangbang-internal-grant-probe-v1";
+const GRANT_PROBE_READY: &str = "status: grant integration probe ready";
+const GRANT_DELAY_OPTION: &str = "--bangbang-internal-grant-delay-v1";
+const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
+const GRANT_PROBE_MARKER: &str = "grant-integration-probe.enabled";
+const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
 const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 const PROCESS_FAILURE_EXIT_CODE: i32 = 1;
@@ -43,6 +51,22 @@ fn production_bundle() -> PathBuf {
         .expect("signed runner must provide the production bundle path");
     let path = PathBuf::from(path);
     assert_eq!(path.file_name(), Some(OsStr::new(OUTER_BUNDLE_NAME)));
+    path
+}
+
+fn grant_test_bundle() -> PathBuf {
+    let path = std::env::var_os(GRANT_TEST_BUNDLE_ENV)
+        .filter(|value| !value.is_empty())
+        .expect("signed runner must provide the grant test bundle path");
+    let path = PathBuf::from(path);
+    assert_eq!(path.file_name(), Some(OsStr::new(OUTER_BUNDLE_NAME)));
+    assert!(
+        worker_bundle(&path)
+            .join("Contents/Resources")
+            .join(GRANT_PROBE_MARKER)
+            .is_file(),
+        "grant exerciser bundle must carry a visible test-only marker"
+    );
     path
 }
 
@@ -243,6 +267,128 @@ fn launcher_preserves_sandbox_outside_path_denial_and_redaction() {
 }
 
 #[test]
+fn normal_production_bundle_excludes_grant_probe_behavior() {
+    let bundle = production_bundle();
+    assert!(
+        !worker_bundle(&bundle)
+            .join("Contents/Resources")
+            .join(GRANT_PROBE_MARKER)
+            .exists(),
+        "normal production bundle must not carry the probe marker"
+    );
+    let fixture = GrantProbeFixture::new("single", false);
+    let output = run_grant_probe(&bundle, &fixture, "single");
+    assert_eq!(output.status.code(), Some(ARGUMENT_PARSING_EXIT_CODE));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(GRANT_PROBE_READY));
+    fixture.assert_unmodified();
+}
+
+#[test]
+fn signed_grants_authorize_only_typed_read_write_and_directory_operations() {
+    let bundle = grant_test_bundle();
+    let fixture = GrantProbeFixture::new("single", false);
+    let output = run_grant_probe(&bundle, &fixture, "single");
+    assert_output_success(&output, "signed resource grant probe");
+    fixture.assert_completed();
+    assert_grant_output_redacted(&output, &fixture);
+}
+
+#[test]
+fn signed_grant_mismatch_fails_closed_without_mutation() {
+    let bundle = grant_test_bundle();
+    let fixture = GrantProbeFixture::new("single", true);
+    let output = run_grant_probe(&bundle, &fixture, "single");
+    assert_eq!(output.status.code(), Some(PROCESS_FAILURE_EXIT_CODE));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "bangbang: private launcher session failed\n"
+    );
+    fixture.assert_unmodified();
+    assert_grant_output_redacted(&output, &fixture);
+}
+
+#[test]
+fn signal_cancels_an_incomplete_grant_phase_without_waiting_for_timeout() {
+    let bundle = grant_test_bundle();
+    let fixture = GrantProbeFixture::new("single", false);
+    let mut delayed = spawn_holding_grant_delay(&bundle, &fixture);
+    let started = Instant::now();
+    delayed.stop(libc::SIGTERM, "delayed grant cancellation");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "event-driven cancellation must beat the grant deadline"
+    );
+    fixture.assert_unmodified();
+}
+
+#[test]
+fn incomplete_grant_phase_obeys_one_absolute_deadline() {
+    let bundle = grant_test_bundle();
+    let fixture = GrantProbeFixture::new("single", false);
+    let started = Instant::now();
+    let output = run_with_timeout(
+        &mut grant_delay_command(&bundle, &fixture),
+        PROCESS_TIMEOUT,
+        "grant absolute deadline",
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(output.status.code(), Some(PROCESS_FAILURE_EXIT_CODE));
+    assert!(elapsed >= Duration::from_secs(4));
+    assert!(elapsed < Duration::from_secs(10));
+    fixture.assert_unmodified();
+    assert_grant_output_redacted(&output, &fixture);
+}
+
+#[test]
+fn concurrent_signed_grant_sessions_keep_authority_noninterchangeable() {
+    let bundle = grant_test_bundle();
+    recover_session_root(&bundle);
+    let alpha_fixture = GrantProbeFixture::new("alpha", false);
+    let beta_fixture = GrantProbeFixture::new("beta", false);
+    let mut alpha = spawn_holding_grant_probe(&bundle, &alpha_fixture, "hold-alpha");
+    let mut beta = spawn_holding_grant_probe(&bundle, &beta_fixture, "hold-beta");
+    assert_eq!(session_entries().len(), 2);
+    alpha.stop(libc::SIGTERM, "alpha grant probe");
+    beta.stop(libc::SIGTERM, "beta grant probe");
+    alpha_fixture.assert_completed();
+    beta_fixture.assert_completed();
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn signed_grant_scopes_cleanup_across_both_process_crash_orders() {
+    let bundle = grant_test_bundle();
+    recover_session_root(&bundle);
+
+    let launcher_fixture = GrantProbeFixture::new("hold", false);
+    let mut launcher_first = spawn_holding_grant_probe(&bundle, &launcher_fixture, "hold");
+    let worker_pid = only_worker_pid(&launcher_first.child);
+    let worker_exit = ProcessExitWatch::new(worker_pid);
+    let launcher_pid = i32::try_from(launcher_first.child.id()).expect("launcher PID should fit");
+    // SAFETY: The unreaped launcher owns this PID and its worker observes the
+    // authenticated lifecycle EOF independently.
+    assert_eq!(unsafe { libc::kill(launcher_pid, libc::SIGKILL) }, 0);
+    let launcher_status = launcher_first.wait("grant launcher SIGKILL");
+    assert_eq!(launcher_status.signal(), Some(libc::SIGKILL));
+    assert!(
+        worker_exit.wait(PROCESS_TIMEOUT),
+        "grant worker should exit after launcher EOF"
+    );
+    launcher_fixture.assert_completed();
+    assert!(session_entries().is_empty());
+
+    let worker_fixture = GrantProbeFixture::new("hold", false);
+    let mut worker_first = spawn_holding_grant_probe(&bundle, &worker_fixture, "hold");
+    let worker_pid = only_worker_pid(&worker_first.child);
+    // SAFETY: The worker is the one live child of the unreaped launcher.
+    assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
+    let worker_status = worker_first.wait("grant worker SIGKILL");
+    assert_eq!(worker_status.code(), Some(128 + libc::SIGKILL));
+    worker_fixture.assert_completed();
+    assert!(session_entries().is_empty());
+}
+
+#[test]
 fn launcher_forwards_graceful_signals_and_worker_cleans_owned_socket() {
     run_graceful_signal_case(libc::SIGINT, "sigint");
     run_graceful_signal_case(libc::SIGTERM, "sigterm");
@@ -310,10 +456,13 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
     let bundle = production_bundle();
     let (mut parent, child_endpoint) =
         UnixStream::pair().expect("bootstrap socketpair should open");
+    let (_grant_parent, grant_child_endpoint) =
+        UnixDatagram::pair().expect("grant socketpair should open");
     parent
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bootstrap read timeout should set");
     let child_fd = child_endpoint.as_raw_fd();
+    let grant_child_fd = grant_child_endpoint.as_raw_fd();
     let mut command = Command::new(worker_executable(&bundle));
     command
         .env(SESSION_ENV_KEY, SESSION_ENV_VALUE)
@@ -328,6 +477,9 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
             if libc::dup2(child_fd, SESSION_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if libc::dup2(grant_child_fd, GRANT_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -335,6 +487,7 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
     let stdout_reader = read_stream(child.stdout.take().expect("stdout should be piped"));
     let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
     drop(child_endpoint);
+    drop(grant_child_endpoint);
 
     let mut hello_bytes = vec![0_u8; 56];
     parent
@@ -355,7 +508,7 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
         message: Message::Start,
     })
     .expect("start frame should encode");
-    malformed[4..6].copy_from_slice(&2_u16.to_be_bytes());
+    malformed[4..6].copy_from_slice(&1_u16.to_be_bytes());
     parent
         .write_all(&malformed)
         .expect("malformed bootstrap should write");
@@ -487,6 +640,310 @@ fn run_graceful_signal_case(signal: i32, name: &str) {
         !socket.exists(),
         "{name} should remove the owned API socket"
     );
+}
+
+#[derive(Debug)]
+struct GrantProbeFixture {
+    _root: TestDir,
+    read: PathBuf,
+    write: PathBuf,
+    directory: PathBuf,
+    manifest: PathBuf,
+    outside: PathBuf,
+    case: String,
+    initial_write: Vec<u8>,
+}
+
+impl GrantProbeFixture {
+    fn new(case: &str, mismatched_read_role: bool) -> Self {
+        let root = TestDir::new(&format!("grant-{case}"));
+        let canonical_root = fs::canonicalize(root.path()).expect("grant root should canonicalize");
+        let read = canonical_root.join("read.input");
+        let write = canonical_root.join("write.output");
+        let directory = canonical_root.join("authorized-directory");
+        let manifest = canonical_root.join("grant-manifest.json");
+        let outside = canonical_root.join(GRANT_PROBE_OUTSIDE);
+        let expected_read = Self::expected_read(case);
+        let expected_write = Self::expected_write(case);
+        let initial_write = vec![b'?'; expected_write.len()];
+        fs::write(&read, expected_read).expect("grant read fixture should be written");
+        fs::write(&write, &initial_write).expect("grant write fixture should be written");
+        fs::create_dir(&directory).expect("grant directory should be created");
+        fs::write(&outside, b"outside-authority\n").expect("outside fixture should be written");
+
+        let read_role = if mismatched_read_role {
+            "initrd-image"
+        } else {
+            "kernel-image"
+        };
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": format!("probe-read-{case}"),
+                    "role": read_role,
+                    "access": "read-only",
+                    "source": path_text(&read),
+                },
+                {
+                    "id": format!("probe-write-{case}"),
+                    "role": "logger-sink",
+                    "access": "write-only",
+                    "source": path_text(&write),
+                },
+                {
+                    "id": format!("probe-dir-{case}"),
+                    "role": "api-socket-directory",
+                    "access": "create-children",
+                    "source": path_text(&directory),
+                }
+            ]
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("grant manifest should serialize"),
+        )
+        .expect("grant manifest should be written");
+        Self {
+            _root: root,
+            read,
+            write,
+            directory,
+            manifest,
+            outside,
+            case: case.to_owned(),
+            initial_write,
+        }
+    }
+
+    fn expected_read(case: &str) -> Vec<u8> {
+        format!("bangbang-grant-read-{case}\n").into_bytes()
+    }
+
+    fn expected_write(case: &str) -> Vec<u8> {
+        format!("bangbang-grant-write-{case}\n").into_bytes()
+    }
+
+    fn child(&self) -> PathBuf {
+        self.directory
+            .join(format!("bangbang-grant-{}.out", self.case))
+    }
+
+    fn assert_unmodified(&self) {
+        assert_eq!(
+            fs::read(&self.read).expect("read fixture should remain readable"),
+            Self::expected_read(&self.case)
+        );
+        assert_eq!(
+            fs::read(&self.write).expect("write fixture should remain readable"),
+            self.initial_write
+        );
+        assert!(!self.child().exists());
+        assert_eq!(
+            fs::read(&self.outside).expect("outside fixture should remain readable"),
+            b"outside-authority\n"
+        );
+    }
+
+    fn assert_completed(&self) {
+        assert_eq!(
+            fs::read(&self.read).expect("read fixture should remain readable"),
+            Self::expected_read(&self.case)
+        );
+        assert_eq!(
+            fs::read(&self.write).expect("granted write should be readable by host"),
+            Self::expected_write(&self.case)
+        );
+        assert_eq!(
+            fs::read(self.child()).expect("granted child should be readable by host"),
+            Self::expected_write(&self.case)
+        );
+        assert_eq!(
+            fs::read(&self.outside).expect("outside fixture should remain readable"),
+            b"outside-authority\n"
+        );
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            &self.read,
+            &self.write,
+            &self.directory,
+            &self.manifest,
+            &self.outside,
+        ]
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .chain([
+            format!("probe-read-{}", self.case),
+            format!("probe-write-{}", self.case),
+            format!("probe-dir-{}", self.case),
+            String::from_utf8(Self::expected_read(&self.case))
+                .expect("expected read should be UTF-8"),
+            String::from_utf8(Self::expected_write(&self.case))
+                .expect("expected write should be UTF-8"),
+        ])
+        .collect()
+    }
+}
+
+fn grant_probe_command(bundle: &Path, fixture: &GrantProbeFixture, case: &str) -> Command {
+    let mut command = Command::new(launcher(bundle));
+    command
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .arg(GRANT_PROBE_OPTION)
+        .arg(case);
+    command
+}
+
+fn grant_delay_command(bundle: &Path, fixture: &GrantProbeFixture) -> Command {
+    let mut command = Command::new(launcher(bundle));
+    command
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .arg(GRANT_DELAY_OPTION);
+    command
+}
+
+fn run_grant_probe(bundle: &Path, fixture: &GrantProbeFixture, case: &str) -> Output {
+    run_with_timeout(
+        &mut grant_probe_command(bundle, fixture, case),
+        PROCESS_TIMEOUT,
+        "signed grant probe",
+    )
+}
+
+fn assert_grant_output_redacted(output: &Output, fixture: &GrantProbeFixture) {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for sensitive in fixture.sensitive_strings() {
+        assert!(
+            !combined.contains(&sensitive),
+            "grant diagnostics must redact sensitive input"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct HoldingGrantProbe {
+    child: Child,
+    stdout_reader: Option<JoinHandle<String>>,
+    stderr_reader: Option<JoinHandle<String>>,
+    sensitive: Vec<String>,
+    completed: bool,
+}
+
+impl HoldingGrantProbe {
+    fn wait(&mut self, context: &str) -> ExitStatus {
+        let status = if wait_for_child_exit(&self.child, PROCESS_TIMEOUT) {
+            self.child
+                .wait()
+                .expect("grant launcher wait should succeed")
+        } else {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+            panic!("timed out waiting for {context}");
+        };
+        self.completed = true;
+        let stdout = self
+            .stdout_reader
+            .take()
+            .expect("grant stdout reader should exist")
+            .join()
+            .expect("grant stdout reader should join");
+        let stderr = self
+            .stderr_reader
+            .take()
+            .expect("grant stderr reader should exist")
+            .join()
+            .expect("grant stderr reader should join");
+        let combined = format!("{stdout}{stderr}");
+        for sensitive in &self.sensitive {
+            assert!(!combined.contains(sensitive));
+        }
+        status
+    }
+
+    fn stop(&mut self, signal: i32, context: &str) {
+        let pid = i32::try_from(self.child.id()).expect("grant launcher PID should fit");
+        // SAFETY: The unreaped launcher owns this PID and signal is fixed by the test.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+        let status = self.wait(context);
+        assert!(status.success(), "{context} should stop successfully");
+    }
+}
+
+impl Drop for HoldingGrantProbe {
+    fn drop(&mut self) {
+        if !self.completed {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn spawn_holding_grant_probe(
+    bundle: &Path,
+    fixture: &GrantProbeFixture,
+    case: &str,
+) -> HoldingGrantProbe {
+    let mut command = grant_probe_command(bundle, fixture, case);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("holding grant probe should start");
+    let (ready, stdout_reader) = read_stdout_until_line(&mut child, GRANT_PROBE_READY);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!("grant probe should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    }
+    HoldingGrantProbe {
+        child,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive: fixture.sensitive_strings(),
+        completed: false,
+    }
+}
+
+fn spawn_holding_grant_delay(bundle: &Path, fixture: &GrantProbeFixture) -> HoldingGrantProbe {
+    let mut command = grant_delay_command(bundle, fixture);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("delayed grant probe should start");
+    let (ready, stdout_reader) = read_stdout_until_line(&mut child, GRANT_DELAY_READY);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "delayed grant phase should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    HoldingGrantProbe {
+        child,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive: fixture.sensitive_strings(),
+        completed: false,
+    }
 }
 
 #[derive(Debug)]
@@ -715,6 +1172,13 @@ fn container_tmp_dir() -> PathBuf {
 }
 
 fn read_stdout_until_ready(child: &mut Child) -> (Receiver<()>, JoinHandle<String>) {
+    read_stdout_until_line(child, "status: API server listening")
+}
+
+fn read_stdout_until_line(
+    child: &mut Child,
+    expected_line: &'static str,
+) -> (Receiver<()>, JoinHandle<String>) {
     let stdout = child.stdout.take().expect("stdout should be piped");
     let (ready_sender, ready_receiver) = mpsc::channel();
     let reader = thread::spawn(move || {
@@ -722,7 +1186,7 @@ fn read_stdout_until_ready(child: &mut Child) -> (Receiver<()>, JoinHandle<Strin
         let mut ready_sender = Some(ready_sender);
         for line in BufReader::new(stdout).lines() {
             let line = line.expect("launcher stdout should be readable");
-            if line == "status: API server listening"
+            if line == expected_line
                 && let Some(sender) = ready_sender.take()
             {
                 let _ = sender.send(());

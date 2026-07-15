@@ -2997,9 +2997,13 @@ host isolation boundary. The lower-level `app_sandbox` target proves that the
 HVF lifecycle and process can execute inside App Sandbox. The separate
 `production_bundle` target proves the fixed launcher/nested-worker package,
 signature and entitlement split, tamper gate, container denial/redaction,
-signal/exit forwarding, socket cleanup, and real HVF guest lifecycle. The
-ordinary CLI remains uncontained, and security-scoped grants, authenticated
-resource brokerage, vmnet provisioning, Linux seccomp outcome classification,
+signal/exit forwarding, mandatory lifecycle-v2 grant acknowledgment, typed
+SCM_RIGHTS file authority, one-session directory bookmark scope, atomic
+rollback, grant-bearing crash/concurrency behavior, socket cleanup, and real HVF
+guest lifecycle. The ordinary CLI remains uncontained. This is a startup grant
+foundation: existing config/metadata/kernel/initrd, block/pmem, socket,
+observability, and snapshot path consumers do not adopt the registry yet.
+Dynamic brokerage, vmnet provisioning, Linux seccomp outcome classification,
 and deployment signing policy remain later #1351 work.
 
 ## Validation Expectations

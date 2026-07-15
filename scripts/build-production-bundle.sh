@@ -104,7 +104,7 @@ cargo build \
   --bin bangbang \
   --bin bangbang-launcher \
   --release \
-  --all-features \
+  --no-default-features \
   --locked \
   --target "$target_triple"
 

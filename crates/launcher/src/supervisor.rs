@@ -29,16 +29,16 @@ where
 
         use bangbang_session::{LauncherLifecycle, SessionId};
 
+        let input = crate::grant_manifest::LaunchInput::parse(args.into_iter().collect())?;
         let executable = std::env::current_exe().map_err(|_| LauncherError::InvalidBundleLayout)?;
         let layout = BundleLayout::from_launcher_executable(&executable)?;
         crate::macos::code_sign::validate_bundle(&layout)?;
+        let (worker_args, grants) = input.prepare()?;
         let wakeups = crate::macos::supervise::SignalWakeups::install()?;
         let session_id = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
         let mut lifecycle = LauncherLifecycle::new(session_id);
-        let mut spawned = crate::macos::spawn::spawn_suspended(
-            layout.worker_executable(),
-            args.into_iter().collect(),
-        )?;
+        let mut spawned =
+            crate::macos::spawn::spawn_suspended(layout.worker_executable(), worker_args)?;
         crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?;
         spawned.worker.resume()?;
         crate::macos::supervise::read_bootstrap_hello(&mut spawned.session, &mut lifecycle)?;
@@ -52,8 +52,10 @@ where
         let status = crate::macos::supervise::wait_session(
             &mut spawned.worker,
             &mut spawned.session,
+            &mut spawned.grants,
             lifecycle,
             wakeups,
+            &grants,
         )?;
         map_exit_status(status)
     }

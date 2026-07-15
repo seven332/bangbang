@@ -20,6 +20,12 @@ pub enum LauncherError {
     InvalidWorkerIdentity,
     /// The bounded private launcher-worker protocol failed.
     SessionProtocol,
+    /// The explicit external-resource manifest or launcher envelope is invalid.
+    InvalidGrantInput,
+    /// An approved host resource could not be prepared without weakening identity.
+    GrantPreparation,
+    /// The private startup grant transaction failed.
+    GrantProtocol,
     /// The private per-VM runtime namespace failed validation or cleanup.
     RuntimeNamespace,
     /// Waiting for the embedded worker failed.
@@ -57,6 +63,9 @@ impl fmt::Display for LauncherError {
                 formatter.write_str("sandbox worker identity validation failed")
             }
             Self::SessionProtocol => formatter.write_str("private worker session failed"),
+            Self::InvalidGrantInput => formatter.write_str("invalid resource grant input"),
+            Self::GrantPreparation => formatter.write_str("resource grant preparation failed"),
+            Self::GrantProtocol => formatter.write_str("private resource grant failed"),
             Self::RuntimeNamespace => {
                 formatter.write_str("private worker runtime namespace failed")
             }

@@ -23,22 +23,30 @@ mod platform {
     use std::ffi::OsStr;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
+    use bangbang_session::macos::grant_registry::{
+        CommittedGrantBatch, GrantRegistry, StagedGrantBatch,
+    };
+    use bangbang_session::macos::grant_transport::receive_grant;
     use bangbang_session::macos::runtime::WorkerNamespace;
-    use bangbang_session::macos::{set_cloexec, verify_peer};
+    use bangbang_session::macos::{set_cloexec, verify_peer, verify_peer_pid};
     use bangbang_session::{
-        Frame, FrameDecoder, Message, Readiness, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD,
-        TerminalCategory, WorkerLifecycle, encode_frame,
+        Frame, FrameDecoder, GRANT_FD, Message, Readiness, SESSION_ENV_KEY, SESSION_ENV_VALUE,
+        SESSION_FD, TerminalCategory, WorkerLifecycle, encode_frame,
     };
 
     use super::ContainedSessionError;
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+    #[cfg(feature = "grant-integration-probe")]
+    const GRANT_DELAY_PROBE: &str = "--bangbang-internal-grant-delay-v1";
+    #[cfg(feature = "grant-integration-probe")]
+    const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ControlState {
@@ -86,6 +94,7 @@ mod platform {
         wakeup_reader: Option<UnixStream>,
         wakeup_writer: Option<UnixStream>,
         reader: Option<JoinHandle<()>>,
+        grants: Option<GrantRegistry>,
         started: bool,
         closed: bool,
     }
@@ -114,16 +123,22 @@ mod platform {
                 return Err(ContainedSessionError);
             }
             set_cloexec(SESSION_FD).map_err(|_| ContainedSessionError)?;
+            set_cloexec(GRANT_FD).map_err(|_| ContainedSessionError)?;
             // SAFETY: The validated private bootstrap contract transfers the
             // fixed descriptor exactly once into this process object.
             let owned = unsafe { OwnedFd::from_raw_fd(SESSION_FD) };
             let mut stream = UnixStream::from(owned);
+            // SAFETY: The same validated bootstrap contract transfers fixed
+            // grant descriptor 4 exactly once into this process object.
+            let grant_owned = unsafe { OwnedFd::from_raw_fd(GRANT_FD) };
+            let grant_socket = UnixDatagram::from(grant_owned);
             stream
                 .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
                 .map_err(|_| ContainedSessionError)?;
             // SAFETY: `getppid` has no pointer or ownership contract.
             let parent = unsafe { libc::getppid() };
             verify_peer(stream.as_raw_fd(), parent).map_err(|_| ContainedSessionError)?;
+            verify_peer_pid(grant_socket.as_raw_fd(), parent).map_err(|_| ContainedSessionError)?;
 
             let mut decoder = FrameDecoder::default();
             let mut lifecycle = WorkerLifecycle::new();
@@ -145,17 +160,60 @@ mod platform {
                 .map_err(|_| ContainedSessionError)?;
             write_frame(&mut stream, prepared)?;
 
-            let next = read_frame(&mut stream, &mut decoder, handshake_deadline()?)?;
-            let next = lifecycle.receive(next).map_err(|_| ContainedSessionError)?;
-            let started = match next {
-                Message::Proceed => {
-                    verify_peer(stream.as_raw_fd(), parent).map_err(|_| ContainedSessionError)?;
-                    let starting = lifecycle.starting().map_err(|_| ContainedSessionError)?;
-                    write_frame(&mut stream, starting)?;
+            #[cfg(feature = "grant-integration-probe")]
+            let receive_grants =
+                if env::args_os().nth(1).as_deref() == Some(OsStr::new(GRANT_DELAY_PROBE)) {
+                    println!("{GRANT_DELAY_READY}");
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|_| ContainedSessionError)?;
+                    false
+                } else {
                     true
+                };
+            #[cfg(not(feature = "grant-integration-probe"))]
+            let receive_grants = true;
+
+            let grant_outcome = receive_grant_batch(
+                &mut stream,
+                &mut decoder,
+                &mut lifecycle,
+                &grant_socket,
+                session,
+                handshake_deadline()?,
+                receive_grants,
+            )?;
+            drop(grant_socket);
+            let (grants, cancelled) = match grant_outcome {
+                GrantPhaseOutcome::Committed(committed) => {
+                    let accepted = lifecycle
+                        .grants_accepted(
+                            committed.batch,
+                            committed.grant_count,
+                            committed.final_sequence,
+                        )
+                        .map_err(|_| ContainedSessionError)?;
+                    write_frame(&mut stream, accepted)?;
+                    (committed.registry, false)
                 }
-                Message::Cancel(_) => false,
-                _ => return Err(ContainedSessionError),
+                GrantPhaseOutcome::Cancelled => (GrantRegistry::default(), true),
+            };
+            let started = if cancelled {
+                false
+            } else {
+                let next = read_frame(&mut stream, &mut decoder, handshake_deadline()?)?;
+                let next = lifecycle.receive(next).map_err(|_| ContainedSessionError)?;
+                match next {
+                    Message::Proceed => {
+                        verify_peer(stream.as_raw_fd(), parent)
+                            .map_err(|_| ContainedSessionError)?;
+                        let starting = lifecycle.starting().map_err(|_| ContainedSessionError)?;
+                        write_frame(&mut stream, starting)?;
+                        true
+                    }
+                    Message::Cancel(_) => false,
+                    _ => return Err(ContainedSessionError),
+                }
             };
             stream
                 .set_read_timeout(None)
@@ -201,6 +259,7 @@ mod platform {
                 wakeup_reader: Some(wakeup_reader),
                 wakeup_writer: Some(wakeup_writer),
                 reader,
+                grants: Some(grants),
                 started,
                 closed: false,
             }))
@@ -227,6 +286,13 @@ mod platform {
 
         pub(crate) fn was_cancelled(&self) -> bool {
             self.control.state().ok() == Some(ControlState::Cancelled)
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        pub(crate) fn grant_registry_mut(
+            &mut self,
+        ) -> Result<&mut GrantRegistry, ContainedSessionError> {
+            self.grants.as_mut().ok_or(ContainedSessionError)
         }
 
         pub(crate) fn send_ready(
@@ -274,6 +340,7 @@ mod platform {
             }
             self.closed = true;
             self.control.closing.store(true, Ordering::Release);
+            self.grants.take();
             let _ = self.stream.shutdown(std::net::Shutdown::Both);
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
@@ -285,6 +352,102 @@ mod platform {
     impl Drop for ContainedSession {
         fn drop(&mut self) {
             self.close();
+        }
+    }
+
+    enum GrantPhaseOutcome {
+        Committed(CommittedGrantBatch),
+        Cancelled,
+    }
+
+    fn receive_grant_batch(
+        stream: &mut UnixStream,
+        decoder: &mut FrameDecoder,
+        lifecycle: &mut WorkerLifecycle,
+        grant_socket: &UnixDatagram,
+        session: bangbang_session::SessionId,
+        deadline: Instant,
+        receive_grants: bool,
+    ) -> Result<GrantPhaseOutcome, ContainedSessionError> {
+        let mut staged = StagedGrantBatch::new(session);
+        loop {
+            if let Some(frame) = decoder.next_frame().map_err(|_| ContainedSessionError)? {
+                return receive_grant_control(lifecycle, frame);
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(ContainedSessionError)?;
+            let millis = remaining.as_millis().max(1);
+            let timeout = i32::try_from(millis).unwrap_or(i32::MAX);
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: grant_socket.as_raw_fd(),
+                    events: if receive_grants { libc::POLLIN } else { 0 },
+                    revents: 0,
+                },
+            ];
+            // SAFETY: descriptors is writable for its exact element count and
+            // both descriptors remain owned during the synchronous poll.
+            let result = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    libc::nfds_t::try_from(descriptors.len()).map_err(|_| ContainedSessionError)?,
+                    timeout,
+                )
+            };
+            if result < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(ContainedSessionError);
+            }
+            if result == 0 {
+                return Err(ContainedSessionError);
+            }
+            if descriptors
+                .first()
+                .is_some_and(|descriptor| descriptor.revents & libc::POLLIN != 0)
+            {
+                let frame = read_frame(stream, decoder, deadline)?;
+                return receive_grant_control(lifecycle, frame);
+            }
+            if descriptors
+                .get(1)
+                .is_some_and(|descriptor| descriptor.revents & libc::POLLIN != 0)
+            {
+                let received = receive_grant(grant_socket).map_err(|_| ContainedSessionError)?;
+                if let Some(committed) =
+                    staged.accept(received).map_err(|_| ContainedSessionError)?
+                {
+                    return Ok(GrantPhaseOutcome::Committed(committed));
+                }
+            }
+            let invalid = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+            if descriptors
+                .iter()
+                .any(|descriptor| descriptor.revents & invalid != 0)
+            {
+                return Err(ContainedSessionError);
+            }
+        }
+    }
+
+    fn receive_grant_control(
+        lifecycle: &mut WorkerLifecycle,
+        frame: Frame,
+    ) -> Result<GrantPhaseOutcome, ContainedSessionError> {
+        match lifecycle
+            .receive(frame)
+            .map_err(|_| ContainedSessionError)?
+        {
+            Message::Cancel(_) => Ok(GrantPhaseOutcome::Cancelled),
+            _ => Err(ContainedSessionError),
         }
     }
 

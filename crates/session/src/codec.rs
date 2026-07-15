@@ -1,13 +1,15 @@
 use std::fmt;
 
-/// Maximum encoded v1 frame size, including its fixed header.
+use crate::BatchId;
+
+/// Maximum encoded v2 frame size, including its fixed header.
 pub const MAX_FRAME_BYTES: usize = 4096;
-/// Encoded v1 header size.
+/// Encoded v2 header size.
 pub const HEADER_BYTES: usize = 56;
 const MAX_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - HEADER_BYTES;
 const MAX_BUFFER_BYTES: usize = MAX_FRAME_BYTES * 2;
-const MAGIC: [u8; 4] = *b"BBS1";
-const VERSION: u16 = 1;
+const MAGIC: [u8; 4] = *b"BBS2";
+const VERSION: u16 = 2;
 
 /// Random identity bound to every frame in one process session.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -119,7 +121,7 @@ pub enum TerminalCategory {
     Unstructured,
 }
 
-/// Closed v1 lifecycle message set.
+/// Closed v2 lifecycle message set.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Message {
     /// Proves that the resumed worker reached its no-authority bootstrap.
@@ -132,6 +134,15 @@ pub enum Message {
     Cancel(CancelSignal),
     /// Reports the locked worker-container namespace identity.
     Prepared { device: u64, inode: u64 },
+    /// Reports atomic acceptance of the startup grant batch.
+    GrantsAccepted {
+        /// Exact redacted batch identity.
+        batch: BatchId,
+        /// Number of semantic grants accepted.
+        grant_count: u16,
+        /// Final launcher-to-worker grant record sequence.
+        final_sequence: u64,
+    },
     /// Reports entry into public command/startup processing.
     Starting,
     /// Reports committed API or no-API readiness.
@@ -153,6 +164,9 @@ impl fmt::Debug for Message {
             Self::Prepared { .. } => {
                 formatter.write_str("Prepared { device: <redacted>, inode: <redacted> }")
             }
+            Self::GrantsAccepted { .. } => formatter.write_str(
+                "GrantsAccepted { batch: <redacted>, grant_count: <redacted>, final_sequence: <redacted> }",
+            ),
             Self::Starting => formatter.write_str("Starting"),
             Self::Ready(_) => formatter.write_str("Ready(<redacted>)"),
             Self::Terminal { .. } => {
@@ -170,6 +184,7 @@ impl Message {
             Self::Start | Self::Proceed | Self::Cancel(_) => Role::Launcher,
             Self::Hello
             | Self::Prepared { .. }
+            | Self::GrantsAccepted { .. }
             | Self::Starting
             | Self::Ready(_)
             | Self::Terminal { .. } => Role::Worker,
@@ -211,7 +226,7 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Encodes one bounded v1 frame.
+/// Encodes one bounded v2 frame.
 pub fn encode_frame(frame: Frame) -> Result<Vec<u8>, ProtocolError> {
     let (kind, payload) = encode_message(frame.message);
     let payload_len = u32::try_from(payload.len()).map_err(|_| ProtocolError::InvalidFrame)?;
@@ -248,6 +263,17 @@ fn encode_message(message: Message) -> (u16, Vec<u8>) {
             payload.extend_from_slice(&device.to_be_bytes());
             payload.extend_from_slice(&inode.to_be_bytes());
             (4, payload)
+        }
+        Message::GrantsAccepted {
+            batch,
+            grant_count,
+            final_sequence,
+        } => {
+            let mut payload = Vec::with_capacity(26);
+            payload.extend_from_slice(batch.as_bytes());
+            payload.extend_from_slice(&grant_count.to_be_bytes());
+            payload.extend_from_slice(&final_sequence.to_be_bytes());
+            (9, payload)
         }
         Message::Starting => (5, Vec::new()),
         Message::Ready(readiness) => (
@@ -379,6 +405,22 @@ fn decode_message(kind: u16, payload: &[u8]) -> Result<Message, ProtocolError> {
             device: read_u64(payload, 0)?,
             inode: read_u64(payload, 8)?,
         }),
+        (9, payload) if payload.len() == 26 => {
+            let batch: [u8; 16] = payload
+                .get(..16)
+                .ok_or(ProtocolError::InvalidFrame)?
+                .try_into()
+                .map_err(|_| ProtocolError::InvalidFrame)?;
+            let batch = BatchId::from_bytes(batch);
+            if batch.is_zero() {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            Ok(Message::GrantsAccepted {
+                batch,
+                grant_count: read_u16(payload, 16)?,
+                final_sequence: read_u64(payload, 18)?,
+            })
+        }
         (5, []) => Ok(Message::Starting),
         (6, [1]) => Ok(Message::Ready(Readiness::Api)),
         (6, [2]) => Ok(Message::Ready(Readiness::NoApi)),
@@ -443,6 +485,11 @@ mod tests {
             Message::Prepared {
                 device: 17,
                 inode: 29,
+            },
+            Message::GrantsAccepted {
+                batch: BatchId::from_bytes([3; 16]),
+                grant_count: 2,
+                final_sequence: 4,
             },
             Message::Starting,
             Message::Ready(Readiness::Api),
@@ -567,7 +614,7 @@ mod tests {
         };
         for (offset, bytes) in [
             (0, b"FAIL".to_vec()),
-            (4, 2_u16.to_be_bytes().to_vec()),
+            (4, 1_u16.to_be_bytes().to_vec()),
             (12, 1_u32.to_be_bytes().to_vec()),
         ] {
             let mut encoded = encode_frame(frame).expect("frame should encode");

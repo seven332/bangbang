@@ -1,12 +1,13 @@
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::ptr;
 use std::time::{Duration, Instant};
 
+use bangbang_session::macos::grant_transport::{GrantTransportError, send_grant};
 use bangbang_session::macos::runtime::{LauncherNamespace, NamespaceIdentity};
 use bangbang_session::{
     CancelSignal, Frame, FrameDecoder, LauncherLifecycle, Message, TerminalCategory, encode_frame,
@@ -16,10 +17,12 @@ use signal_hook::{SigId, low_level};
 
 use super::spawn::OwnedWorker;
 use crate::LauncherError;
+use crate::grant_manifest::{OutboundGrant, PreparedGrantBatch};
 
 const CANCELLATION_GRACE: Duration = Duration::from_secs(5);
 const SESSION_EXIT_GRACE: Duration = Duration::from_secs(5);
 const BOOTSTRAP_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const GRANT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct SignalWakeup {
@@ -154,26 +157,29 @@ pub(crate) fn read_bootstrap_hello(
 pub(crate) fn wait_session(
     worker: &mut OwnedWorker,
     session: &mut UnixStream,
+    grant_socket: &mut UnixDatagram,
     mut lifecycle: LauncherLifecycle,
     mut wakeups: SignalWakeups,
+    grants: &PreparedGrantBatch,
 ) -> Result<ExitStatus, LauncherError> {
     let session_id = lifecycle.session();
-    let mut namespace = None;
-    let mut terminal = None;
+    let mut observation = SessionObservation::default();
     let result = wait_session_inner(
         worker,
         session,
+        grant_socket,
         &mut lifecycle,
         &mut wakeups,
-        &mut namespace,
-        &mut terminal,
+        &mut observation,
+        grants,
     );
     if result.is_err() {
         let _ = session.shutdown(std::net::Shutdown::Both);
+        shutdown_grants(grant_socket);
         worker.terminate_and_reap();
     }
 
-    let cleanup = if let Some(namespace) = namespace.as_mut() {
+    let cleanup = if let Some(namespace) = observation.namespace.as_mut() {
         namespace.cleanup()
     } else {
         LauncherNamespace::recover_after_worker_exit(session_id)
@@ -184,7 +190,7 @@ pub(crate) fn wait_session(
     match result {
         Ok(status) => {
             cleanup?;
-            validate_terminal(status, terminal)?;
+            validate_terminal(status, observation.terminal)?;
             Ok(status)
         }
         Err(error) => {
@@ -194,21 +200,33 @@ pub(crate) fn wait_session(
     }
 }
 
+#[derive(Debug, Default)]
+struct SessionObservation {
+    namespace: Option<LauncherNamespace>,
+    terminal: Option<(TerminalCategory, u8)>,
+}
+
 fn wait_session_inner(
     worker: &mut OwnedWorker,
     session: &mut UnixStream,
+    grant_socket: &mut UnixDatagram,
     lifecycle: &mut LauncherLifecycle,
     wakeups: &mut SignalWakeups,
-    namespace: &mut Option<LauncherNamespace>,
-    terminal: &mut Option<(TerminalCategory, u8)>,
+    observation: &mut SessionObservation,
+    grants: &PreparedGrantBatch,
 ) -> Result<ExitStatus, LauncherError> {
     session
+        .set_nonblocking(true)
+        .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
+    grant_socket
         .set_nonblocking(true)
         .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
     let kqueue = create_kqueue()?;
     let child_pid = usize::try_from(worker.pid())
         .map_err(|_| LauncherError::WorkerWait(io::ErrorKind::InvalidInput))?;
     let session_fd = usize::try_from(session.as_raw_fd())
+        .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
+    let grant_fd = usize::try_from(grant_socket.as_raw_fd())
         .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
     let changes = [
         event(
@@ -237,6 +255,12 @@ fn wait_session_inner(
             libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
             libc::NOTE_EXIT,
         ),
+        event(
+            grant_fd,
+            libc::EVFILT_WRITE,
+            libc::EV_ADD | libc::EV_DISABLE,
+            0,
+        ),
     ];
     register_events(kqueue.as_raw_fd(), &changes)?;
 
@@ -244,12 +268,12 @@ fn wait_session_inner(
     let mut cancellation_deadline: Option<Instant> = None;
     let mut exit_deadline: Option<Instant> = None;
     let mut session_closed = false;
+    let mut grant_send = GrantSendState::new(grants, lifecycle.session());
     loop {
-        let deadline = match (cancellation_deadline, exit_deadline) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        };
+        let deadline = [cancellation_deadline, exit_deadline, grant_send.deadline()]
+            .into_iter()
+            .flatten()
+            .min();
         let timeout = timeout_until(deadline);
         let events = wait_events(kqueue.as_raw_fd(), timeout)?;
         let child_exited = events.iter().any(|queued| {
@@ -262,8 +286,14 @@ fn wait_session_inner(
         // a channel that the worker has just closed.
         for queued in &events {
             if !session_closed && queued.filter == libc::EVFILT_READ && queued.ident == session_fd {
-                session_closed =
-                    drain_session(session, &mut decoder, lifecycle, namespace, terminal)?;
+                session_closed = drain_session(
+                    session,
+                    grant_socket,
+                    &mut decoder,
+                    lifecycle,
+                    observation,
+                    &mut grant_send,
+                )?;
                 if session_closed {
                     exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
                     register_events(
@@ -273,7 +303,7 @@ fn wait_session_inner(
                 }
             }
         }
-        if terminal.is_some() {
+        if observation.terminal.is_some() {
             exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
         }
 
@@ -286,7 +316,7 @@ fn wait_session_inner(
                     && signal.drain()?
                     && !child_exited
                     && !session_closed
-                    && terminal.is_none()
+                    && observation.terminal.is_none()
                     && !lifecycle.is_cancelled()
                 {
                     let signal = match signal.signal {
@@ -298,16 +328,46 @@ fn wait_session_inner(
                         .cancel(signal)
                         .map_err(|_| LauncherError::SessionProtocol)?;
                     write_frame(session, frame)?;
+                    grant_send.cancel();
+                    shutdown_grants(grant_socket);
                     cancellation_deadline = Some(Instant::now() + CANCELLATION_GRACE);
                 }
             }
+        }
+
+        sync_grant_write_event(kqueue.as_raw_fd(), grant_fd, &mut grant_send)?;
+        if !lifecycle.is_cancelled()
+            && events.iter().any(|queued| {
+                queued.filter == libc::EVFILT_WRITE
+                    && queued.ident == grant_fd
+                    && queued.flags & libc::EV_ERROR != 0
+            })
+        {
+            return Err(LauncherError::GrantProtocol);
+        }
+        if events.iter().any(|queued| {
+            queued.filter == libc::EVFILT_WRITE
+                && queued.ident == grant_fd
+                && queued.flags & libc::EV_ERROR == 0
+        }) && !lifecycle.is_cancelled()
+            && !child_exited
+        {
+            grant_send.pump(grant_socket)?;
+            sync_grant_write_event(kqueue.as_raw_fd(), grant_fd, &mut grant_send)?;
         }
 
         if child_exited {
             // Drain all bytes made readable with this exit before reaping, so
             // terminal state cannot lose a same-batch race.
             if !session_closed {
-                let _ = drain_session(session, &mut decoder, lifecycle, namespace, terminal)?;
+                let _ = drain_session(
+                    session,
+                    grant_socket,
+                    &mut decoder,
+                    lifecycle,
+                    observation,
+                    &mut grant_send,
+                )?;
             }
             break;
         }
@@ -320,6 +380,9 @@ fn wait_session_inner(
                 .map_err(LauncherError::SignalForward)?;
             cancellation_deadline = None;
         }
+        if grant_send.has_timed_out(Instant::now()) {
+            return Err(LauncherError::GrantProtocol);
+        }
     }
 
     worker.wait()
@@ -331,10 +394,11 @@ fn timeout_until(deadline: Option<Instant>) -> Option<Duration> {
 
 fn drain_session(
     session: &mut UnixStream,
+    grant_socket: &mut UnixDatagram,
     decoder: &mut FrameDecoder,
     lifecycle: &mut LauncherLifecycle,
-    namespace: &mut Option<LauncherNamespace>,
-    terminal: &mut Option<(TerminalCategory, u8)>,
+    observation: &mut SessionObservation,
+    grant_send: &mut GrantSendState,
 ) -> Result<bool, LauncherError> {
     let mut buffer = [0_u8; 4096];
     loop {
@@ -343,6 +407,9 @@ fn drain_session(
                 decoder
                     .finish()
                     .map_err(|_| LauncherError::SessionProtocol)?;
+                if grant_send.requires_ack() && !lifecycle.is_cancelled() {
+                    return Err(LauncherError::GrantProtocol);
+                }
                 return Ok(true);
             }
             Ok(length) => {
@@ -353,12 +420,17 @@ fn drain_session(
                     .next_frame()
                     .map_err(|_| LauncherError::SessionProtocol)?
                 {
+                    if matches!(frame.message, Message::GrantsAccepted { .. })
+                        && !grant_send.write_complete()
+                    {
+                        return Err(LauncherError::GrantProtocol);
+                    }
                     let message = lifecycle
                         .receive(frame)
                         .map_err(|_| LauncherError::SessionProtocol)?;
                     match message {
                         Message::Prepared { device, inode } => {
-                            if namespace.is_some() {
+                            if observation.namespace.is_some() {
                                 return Err(LauncherError::SessionProtocol);
                             }
                             let validated = LauncherNamespace::validate(
@@ -366,12 +438,26 @@ fn drain_session(
                                 NamespaceIdentity { device, inode },
                             )
                             .map_err(|_| LauncherError::RuntimeNamespace)?;
-                            *namespace = Some(validated);
+                            observation.namespace = Some(validated);
                             if !lifecycle.is_cancelled() {
+                                lifecycle
+                                    .expect_grants(
+                                        grant_send.batch(),
+                                        grant_send.grant_count(),
+                                        grant_send.final_sequence(),
+                                    )
+                                    .map_err(|_| LauncherError::SessionProtocol)?;
+                                grant_send.begin()?;
+                            }
+                        }
+                        Message::GrantsAccepted { .. } => {
+                            if !lifecycle.is_cancelled() {
+                                grant_send.acknowledge()?;
                                 let proceed = lifecycle
                                     .proceed()
                                     .map_err(|_| LauncherError::SessionProtocol)?;
                                 write_frame(session, proceed)?;
+                                shutdown_grants(grant_socket);
                             }
                         }
                         Message::Starting | Message::Ready(_) => {}
@@ -379,7 +465,11 @@ fn drain_session(
                             category,
                             exit_code,
                         } => {
-                            if terminal.replace((category, exit_code)).is_some() {
+                            if observation
+                                .terminal
+                                .replace((category, exit_code))
+                                .is_some()
+                            {
                                 return Err(LauncherError::SessionProtocol);
                             }
                         }
@@ -394,6 +484,155 @@ fn drain_session(
             Err(_) => return Err(LauncherError::SessionProtocol),
         }
     }
+}
+
+struct GrantSendState {
+    batch: bangbang_session::BatchId,
+    grant_count: u16,
+    final_sequence: u64,
+    outbound: Vec<OutboundGrant>,
+    next: usize,
+    deadline: Option<Instant>,
+    event_enabled: bool,
+    started: bool,
+    acknowledged: bool,
+    cancelled: bool,
+}
+
+impl std::fmt::Debug for GrantSendState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrantSendState")
+            .field("batch", &self.batch)
+            .field("progress", &"<redacted>")
+            .field("started", &self.started)
+            .field("acknowledged", &self.acknowledged)
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
+}
+
+impl GrantSendState {
+    fn new(grants: &PreparedGrantBatch, session: bangbang_session::SessionId) -> Self {
+        Self {
+            batch: grants.batch(),
+            grant_count: grants.grant_count(),
+            final_sequence: grants.final_sequence(),
+            outbound: grants.outbound(session),
+            next: 0,
+            deadline: None,
+            event_enabled: false,
+            started: false,
+            acknowledged: false,
+            cancelled: false,
+        }
+    }
+
+    const fn batch(&self) -> bangbang_session::BatchId {
+        self.batch
+    }
+
+    const fn grant_count(&self) -> u16 {
+        self.grant_count
+    }
+
+    const fn final_sequence(&self) -> u64 {
+        self.final_sequence
+    }
+
+    fn begin(&mut self) -> Result<(), LauncherError> {
+        if self.started || self.acknowledged || self.cancelled || self.outbound.is_empty() {
+            return Err(LauncherError::GrantProtocol);
+        }
+        self.started = true;
+        self.deadline = Some(
+            Instant::now()
+                .checked_add(GRANT_TIMEOUT)
+                .ok_or(LauncherError::GrantProtocol)?,
+        );
+        Ok(())
+    }
+
+    fn pump(&mut self, socket: &UnixDatagram) -> Result<(), LauncherError> {
+        if !self.started || self.acknowledged || self.cancelled {
+            return Err(LauncherError::GrantProtocol);
+        }
+        while let Some(grant) = self.outbound.get(self.next) {
+            match send_grant(socket, &grant.frame, grant.descriptor) {
+                Ok(()) => {
+                    self.next = self
+                        .next
+                        .checked_add(1)
+                        .ok_or(LauncherError::GrantProtocol)?;
+                }
+                Err(GrantTransportError::Io(io::ErrorKind::Interrupted)) => {}
+                Err(GrantTransportError::Io(io::ErrorKind::WouldBlock)) => return Ok(()),
+                Err(GrantTransportError::Io(_) | GrantTransportError::Invalid) => {
+                    return Err(LauncherError::GrantProtocol);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_complete(&self) -> bool {
+        self.started && self.next == self.outbound.len()
+    }
+
+    fn requires_write_event(&self) -> bool {
+        self.started && !self.acknowledged && !self.cancelled && !self.write_complete()
+    }
+
+    const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn has_timed_out(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    fn requires_ack(&self) -> bool {
+        self.started && !self.acknowledged && !self.cancelled
+    }
+
+    fn acknowledge(&mut self) -> Result<(), LauncherError> {
+        if !self.write_complete() || self.acknowledged || self.cancelled {
+            return Err(LauncherError::GrantProtocol);
+        }
+        self.acknowledged = true;
+        self.deadline = None;
+        Ok(())
+    }
+
+    fn cancel(&mut self) {
+        self.cancelled = true;
+        self.deadline = None;
+    }
+}
+
+fn sync_grant_write_event(
+    kqueue: RawFd,
+    grant_fd: usize,
+    state: &mut GrantSendState,
+) -> Result<(), LauncherError> {
+    let should_enable = state.requires_write_event();
+    if should_enable == state.event_enabled {
+        return Ok(());
+    }
+    let flag = if should_enable {
+        libc::EV_ENABLE
+    } else {
+        libc::EV_DISABLE
+    };
+    register_events(kqueue, &[event(grant_fd, libc::EVFILT_WRITE, flag, 0)])?;
+    state.event_enabled = should_enable;
+    Ok(())
+}
+
+fn shutdown_grants(socket: &UnixDatagram) {
+    // SAFETY: The socket remains owned and shutdown only closes its connected
+    // communication directions; final descriptor ownership stays with Rust.
+    let _ = unsafe { libc::shutdown(socket.as_raw_fd(), libc::SHUT_RDWR) };
 }
 
 fn validate_terminal(
@@ -479,7 +718,7 @@ fn wait_events(
         None => None,
     };
     loop {
-        let mut events = [MaybeUninit::<libc::kevent>::uninit(); 4];
+        let mut events = [MaybeUninit::<libc::kevent>::uninit(); 5];
         let timeout = deadline
             .map(|deadline| duration_timespec(deadline.saturating_duration_since(Instant::now())));
         let timeout_ptr = timeout
@@ -493,7 +732,7 @@ fn wait_events(
                 ptr::null(),
                 0,
                 events.as_mut_ptr().cast(),
-                4,
+                5,
                 timeout_ptr,
             )
         };

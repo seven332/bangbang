@@ -4,12 +4,12 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
 
-use bangbang_session::{SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD};
+use bangbang_session::{GRANT_FD, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD};
 
 use crate::LauncherError;
 
@@ -122,6 +122,7 @@ impl Drop for OwnedWorker {
 pub(crate) struct SuspendedWorker {
     pub(crate) worker: OwnedWorker,
     pub(crate) session: UnixStream,
+    pub(crate) grants: UnixDatagram,
 }
 
 pub(crate) fn spawn_suspended(
@@ -132,6 +133,10 @@ pub(crate) fn spawn_suspended(
         UnixStream::pair().map_err(|error| LauncherError::SessionSetup(error.kind()))?;
     let parent = duplicate_stream_at_or_above(parent, MIN_TRANSPORT_FD)?;
     let child = duplicate_stream_at_or_above(child, MIN_TRANSPORT_FD)?;
+    let (grant_parent, grant_child) =
+        UnixDatagram::pair().map_err(|error| LauncherError::SessionSetup(error.kind()))?;
+    let grant_parent = duplicate_datagram_at_or_above(grant_parent, MIN_TRANSPORT_FD)?;
+    let grant_child = duplicate_datagram_at_or_above(grant_child, MIN_TRANSPORT_FD)?;
 
     let executable = cstring(executable.as_os_str())
         .map_err(|_| LauncherError::WorkerSpawn(io::ErrorKind::InvalidInput))?;
@@ -151,6 +156,10 @@ pub(crate) fn spawn_suspended(
     actions.duplicate(child.as_raw_fd(), SESSION_FD)?;
     if child.as_raw_fd() != SESSION_FD {
         actions.close(child.as_raw_fd())?;
+    }
+    actions.duplicate(grant_child.as_raw_fd(), GRANT_FD)?;
+    if grant_child.as_raw_fd() != GRANT_FD {
+        actions.close(grant_child.as_raw_fd())?;
     }
 
     let mut pid = 0;
@@ -173,9 +182,11 @@ pub(crate) fn spawn_suspended(
         ));
     }
     drop(child);
+    drop(grant_child);
     Ok(SuspendedWorker {
         worker: OwnedWorker { pid, status: None },
         session: parent,
+        grants: grant_parent,
     })
 }
 
@@ -195,6 +206,24 @@ fn duplicate_stream_at_or_above(
     // into `OwnedFd`, then `UnixStream`.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     Ok(UnixStream::from(owned))
+}
+
+fn duplicate_datagram_at_or_above(
+    datagram: UnixDatagram,
+    minimum: RawFd,
+) -> Result<UnixDatagram, LauncherError> {
+    // SAFETY: The source remains live during fcntl; a successful result is an
+    // independent close-on-exec descriptor for the same connected socket.
+    let fd = unsafe { libc::fcntl(datagram.as_raw_fd(), libc::F_DUPFD_CLOEXEC, minimum) };
+    if fd < 0 {
+        return Err(LauncherError::SessionSetup(
+            io::Error::last_os_error().kind(),
+        ));
+    }
+    // SAFETY: fd is a fresh connected datagram descriptor and ownership moves
+    // into OwnedFd, then UnixDatagram.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    Ok(UnixDatagram::from(owned))
 }
 
 fn descriptor_is_open(fd: RawFd) -> Result<bool, LauncherError> {

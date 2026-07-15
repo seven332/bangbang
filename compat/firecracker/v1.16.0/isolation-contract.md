@@ -32,7 +32,9 @@ Publication uses a same-volume exclusive rename implemented in
 or merges an existing final app. Failure cleanup owns only the unpublished
 staging tree. The normal
 [`build-production-bundle.sh`](../../../scripts/build-production-bundle.sh)
-wrapper exposes no resource overlay.
+wrapper explicitly builds without default features and exposes no resource
+overlay. The integration-only grant exerciser is therefore absent from normal
+product bundles; an all-features development binary is not a shippable package.
 
 Runtime layout validation in
 [`layout.rs`](../../../crates/launcher/src/layout.rs) derives the worker only
@@ -56,30 +58,44 @@ passes every worker argument byte in order and preserves ordinary environment
 entries while replacing one private bootstrap marker. The Darwin wrapper in
 [`spawn.rs`](../../../crates/launcher/src/macos/spawn.rs) uses
 `POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_START_SUSPENDED`, explicitly retains
-each open standard stream, and duplicates only one unnamed socketpair endpoint
-to the fixed internal descriptor. The launcher dynamically validates the live
+each open standard stream, and duplicates only an unnamed lifecycle stream
+endpoint to descriptor 3 plus an unnamed startup-grant datagram endpoint to
+descriptor 4. The launcher dynamically validates the live
 worker while suspended, resumes only the private bootstrap, reads one bounded
 reserved `Hello`, verifies the now-child-attributed peer PID/credentials,
 revalidates live code, and only then sends a random session identity in `Start`.
 
-[`bangbang-session`](../../../crates/session/src/lib.rs) defines the closed v1
-binary contract. Frames have fixed magic/version/reserved fields, a 256-bit
+[`bangbang-session`](../../../crates/session/src/lib.rs) defines the closed
+lifecycle-v2 binary contract. Frames have fixed magic/version/reserved fields, a 256-bit
 identity, exact per-direction sequence numbers, fixed payload shapes, and a
 4096-byte cap. Replay, sequence gaps, cross-session or wrong-role messages,
 malformed/unknown/oversized/truncated data, and invalid lifecycle transitions
 fail with one redacted category. State is monotonic through `Hello`, `Start`,
-`Prepared`, `Proceed`, `Starting`, optional committed API/no-API `Ready`, one
+`Prepared`, exact `GrantsAccepted`, `Proceed`, `Starting`, optional committed API/no-API `Ready`, one
 graceful `Cancel`, and path-free `Terminal`. The worker verifies matching
 effective credentials and `LOCAL_PEERPID == getppid()` before and after the
 gate. App Sandbox denies its Security.framework lookup of the parent, so only
 the launcher code-validates its peer; this asymmetry is part of the contract.
-`Hello`, `Start`, and `Proceed` reads have absolute five-second deadlines, and
-`Terminal` or EOF starts a five-second owned-process exit grace.
+`Hello`, `Start`, the grant transaction, and `Proceed` have absolute five-second
+deadlines, and `Terminal` or EOF starts a five-second owned-process exit grace.
+
+Grant-channel v1 uses one complete AF_UNIX datagram per record with a 1024-byte
+application cap, independent random 128-bit BatchId, exact lifecycle SessionId
+and sequence, closed record kind, payload length, reserved fields, and declared
+descriptor count. `Begin` declares exact counts, file/directory records carry at
+most one SCM_RIGHTS descriptor, bookmark fragments are contiguous, and `Commit`
+must reproduce the declaration. The worker immediately owns every delivered fd,
+rejects payload/control truncation or malformed ancillary data, restores
+FD_CLOEXEC, independently checks access/status flags and fstat identity, and
+poisons the whole staged batch on any inconsistency. No authority is visible
+until Commit moves everything into one bounded session registry. Even an empty
+batch requires an exact acknowledgment before `Proceed`.
 
 The worker creates and locks one exact mode-0700 empty namespace beneath its
 fixed container temp root. `Prepared` reports only device/inode. The launcher
 independently derives the root and checks exact name, type, owner, mode,
-device/inode, emptiness, and live lock before `Proceed`. No endpoint, argument,
+device/inode, emptiness, and live lock before grant acknowledgment and
+`Proceed`. No endpoint, argument,
 identity bytes, or resource grant is stored there. Worker EOF cleanup covers
 launcher-first death; launcher cleanup covers worker-first death; a later worker
 scans at most 128 entries and removes only valid empty unlocked identity-stable
@@ -95,20 +111,43 @@ host paths, configuration contents, and HVF exits remain untrusted inputs to the
 worker. Product errors expose stable categories rather than package paths,
 signing identities, platform-tool output, or worker payloads.
 
-Contained mode currently authorizes only app-container paths and resources
-sealed into the worker bundle before signing. The normal product embeds no guest
-resources. The private namespace is intentionally empty, and the lifecycle
-messages contain no resource paths, descriptors, bookmarks, or guest/API data.
-The launcher does not open, validate, transfer, or revoke kernel, initrd, disk,
-snapshot, vsock, observability, vmnet, or API-socket resources for the worker.
-Operators may still use the direct uncontained executable for the existing
-host-path surface, but that mode is not evidence for the production containment
-records.
+Contained mode authorizes app-container and sealed-bundle paths plus one explicit
+bounded startup grant batch. The normal product embeds no guest resources. An
+argv-position-one envelope names one strict manifest; otherwise worker argument
+bytes remain unchanged. The launcher reads the manifest once, walks every
+absolute source path component without following symlinks or accepting
+`.`/`..`, opens existing regular files/directories with exact access, records
+type/device/inode/status, rejects aliases, and prepares the entire RAII batch
+before spawn. Paths, IDs, identity values, bookmark bytes, and contents remain
+out of diagnostics.
+
+The closed roles cover read-only startup config/metadata, kernel/initrd and
+snapshot inputs; repeatable read-only/read-write drive and pmem backing;
+write-only logger/metrics/serial sinks; and create-children API/vsock/snapshot
+output directories. Regular-file authority is descriptor-only. Each mutable
+directory combines an anchor descriptor with a bounded freshly minted ordinary
+implicit bookmark. The worker explicitly starts scope, requires exact resolved
+anchor identity and access, and balances scope on every exit. The platform stale
+bit is private and never sufficient by itself for acceptance or rejection;
+concrete resolution/scope/identity/access validation decides. Operator-supplied
+or persisted bookmark bytes are unsupported.
+
+Commit creates a redacted, session-owned, bounded registry whose adoption is
+one-time by exact ID, role, and access. Mismatch never falls back to an ambient
+path. Unadopted authority drops on cancellation, terminal, disconnect,
+bootstrap failure, or process exit. SCM_RIGHTS duplicates kernel references, so
+closing the launcher's copy is cleanup rather than revocation. The empty private
+namespace still stores no resource data. Existing Firecracker path consumers
+remain unchanged in this foundation slice and therefore cannot yet use these
+grants. Operators may still use the direct uncontained executable for the
+existing host-path surface, but that mode is not evidence for the production
+containment records.
 
 The following remain feasible work owned by #1351:
 
-- security-scoped external-file grants or descriptor transfer with
-  resource-specific authority, bounds, replacement detection, and cleanup;
+- consumer adoption for config/metadata/kernel/initrd, block/pmem,
+  API/vsock/observability, and snapshot resources;
+- dynamic post-Ready delivery and any hard-revocation broker;
 - vmnet entitlement/provisioning and per-VM network policy;
 - automatic restart/reconnect and any long-lived broker/service policy;
 - exact macOS outcome mapping for jailer, seccomp, namespace, cgroup,
@@ -121,22 +160,33 @@ The following remain feasible work owned by #1351:
 [`production_bundle_e2e.rs`](../../../crates/launcher/tests/production_bundle_e2e.rs)
 runs only through
 [`run-integration-tests.sh`](../../../scripts/run-integration-tests.sh). The
-runner builds the release binaries, assembles and signs the real fixed bundle,
-and compiles the disabled-by-default target before an unsupported CI host may
-skip execution. Supported Apple Silicon execution proves:
+runner first builds, assembles, and signs the normal no-default-feature release
+bundle. It then builds a visibly marked integration-only bundle with the
+`grant-integration-probe` feature and compiles the disabled-by-default target
+before an unsupported CI host may skip execution. Supported Apple Silicon
+execution proves:
 
 - exact identifiers, entitlement separation, Hardened Runtime, and strict
   recursive signature validity;
 - unchanged help/output and representative nonzero worker status forwarding;
 - rejection before worker output when a private bundle copy has a missing or
   modified worker;
-- default-close removal of a deliberately inheritable unexpected descriptor and
-  malformed/incompatible bootstrap rejection before public processing;
+- default-close removal of a deliberately inheritable unexpected descriptor,
+  retention of only lifecycle/grant endpoints, and malformed/incompatible
+  bootstrap rejection before public processing;
 - path-redacted App Sandbox denial for an outside config file;
 - structured container API/no-API readiness, one-session `SIGINT`/`SIGTERM`
   cancellation, successful terminal status, and owned-socket cleanup;
-- worker-first and launcher-first cleanup, both-killed bounded stale recovery,
-  and two concurrent sessions remaining independent when one worker dies; and
+- mandatory empty-batch acknowledgment, exact read-only and write-only fd
+  enforcement, mutable-directory scope with outside-parent denial, typed
+  mismatch rollback, redaction, signal cancellation during staging, and one
+  absolute grant deadline;
+- grant-bearing worker-first/launcher-first cleanup and two simultaneous
+  sessions with noninterchangeable authority, plus behavioral proof that the
+  normal bundle contains no test exerciser;
+- worker-first and launcher-first namespace cleanup, both-killed bounded stale
+  recovery, and two concurrent API sessions remaining independent when one
+  worker dies; and
 - a test-only sealed kernel/initrd/config starting a real sandboxed HVF guest
   through the launcher and ending successfully through PSCI `SYSTEM_OFF`.
 
@@ -154,8 +204,9 @@ work:
 - `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`
 - `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
 
-The delivered package/session/fd/crash subset above is real but does not
-complete any of those composite records. The broad `jailer`, `seccomp`,
+The delivered package/session/grant/fd/crash subset above is real but does not
+complete any of those composite records because consumer, dynamic-broker,
+network, Linux-outcome, and deployment work remains. The broad `jailer`, `seccomp`,
 `seccompiler`, and `production-host` corpus records remain `audit-required`.
 Neither this audit nor the executable evidence is direct Firecracker jailer
 parity.

@@ -256,15 +256,16 @@ entitlements; the outer launcher is signed last without either entitlement.
 Both use Hardened Runtime. Before every launch, the outer executable validates
 the fixed bundle layout, nested signatures, identifiers, and required worker
 entitlements. It then starts the fixed worker suspended with a default-close
-descriptor policy: only open standard streams and one private session endpoint
-survive. The launcher validates the live worker code before resuming it and
+descriptor policy: only open standard streams, one private lifecycle endpoint,
+and one private startup-grant endpoint survive. The launcher validates the live worker code before resuming it and
 again after the worker has used the endpoint and sent the bounded pre-session
 greeting.
 
-Each launch uses an unnamed Unix socketpair and a random 256-bit session
-identity. Protocol v1 has a 4-KiB frame limit, exact per-direction sequence
-numbers, closed message variants, and monotonic
-`prepared -> starting -> ready -> terminal` state. The launcher authenticates
+Each launch uses unnamed lifecycle stream and grant datagram socketpairs plus a
+random 256-bit session identity. Lifecycle protocol v2 has a 4-KiB frame limit,
+exact per-direction sequence numbers, closed message variants, and monotonic
+`prepared -> grants-accepted -> starting -> ready -> terminal` state. Even an
+empty grant batch must be atomically acknowledged before `Proceed`. The launcher authenticates
 the live worker PID, effective credentials, signature, identity, and exact
 entitlements. The sandboxed worker verifies that the peer PID is its direct
 parent and that effective credentials match; App Sandbox prevents the worker
@@ -282,15 +283,42 @@ deadlines; cancellation and post-`Terminal`/EOF process-exit waits use a
 five-second grace before owned-worker escalation. A surviving worker cleans
 after launcher EOF; a surviving launcher cleans after worker exit; a later
 worker performs bounded identity-checked recovery when both were killed.
-Concurrent sessions retain independent identities, processes, namespaces, and
-API sockets.
+Concurrent sessions retain independent identities, processes, namespaces,
+grant registries, and API sockets.
 
-Contained mode currently supports only app-container or sealed bundle
-resources. The session namespace is empty and carries no grant material. The
-public build wrapper does not embed guest files, and there is no security-scoped
-bookmark, external-file grant/descriptor broker, vmnet provisioning, automatic
-restart policy, Developer ID possession proof, launch-constraint policy, or
-notarization workflow yet. Same-identifier workers share one App Sandbox
+The launcher recognizes one optional envelope only in argv position one:
+
+```text
+--bangbang-grant-manifest MANIFEST -- FIRECRACKER_ARGS...
+```
+
+Manifest v1 is bounded strict JSON with `version: 1` and a `grants` array. Each
+grant has a 64-byte ASCII `id`, one closed `role`, exact `access`, and an
+absolute UTF-8 `source` path. The launcher walks resource paths component by
+component without following symlinks or accepting `.`/`..`, opens every
+existing resource before spawn, rejects aliases and type/access conflicts, and
+prepares the complete batch atomically. Regular-file roles transfer only an
+identity-checked descriptor. The three create-children directory roles combine
+an anchor descriptor with a bounded one-session implicit bookmark whose
+resolved inode and active scope are revalidated in the worker.
+
+The initial roles are startup config/metadata, kernel/initrd, repeatable
+drive/pmem backing, logger/metrics/serial sinks, snapshot describe/state/memory
+inputs, and API/vsock/snapshot-output directories. The exact access matrix and
+hard limits are part of the closed protocol; unknown roles and operator-supplied
+bookmark bytes are rejected. Grant delivery uses 1024-byte datagrams, bounded
+bookmark fragmentation, SCM_RIGHTS, one five-second absolute deadline, and a
+session-owned one-time typed registry. Closing the launcher's duplicate does
+not revoke an already delivered descriptor; cleanup is cooperative ownership.
+
+This release provides the authorization foundation only. Existing
+Firecracker-facing path consumers do not adopt these grants yet, so the
+manifest does not make external kernel, disk, socket, telemetry, or snapshot
+paths usable by those consumers. Dynamic post-Ready brokerage, vmnet
+provisioning, automatic restart policy, Developer ID possession proof,
+launch-constraint policy, and notarization workflow remain. The session
+namespace stays empty and stores no path, descriptor, bookmark, or grant bytes.
+Same-identifier workers share one App Sandbox
 container, so namespace locks and identity checks protect cooperative sessions
 and replacements but do not isolate a malicious same-bundle sibling. See
 [macOS Host Security Model](docs/security.md) for the precise trust boundary.
@@ -609,7 +637,11 @@ static and live-worker validation, tamper rejection, the descriptor allowlist,
 malformed-bootstrap rejection, container-only path denial and redaction,
 structured API/no-API readiness and cancellation, worker-first/launcher-first/
 both-killed namespace cleanup, concurrent-session isolation, owned-socket
-cleanup, and a real sandboxed HVF guest through `SYSTEM_OFF`.
+cleanup, mandatory empty-grant startup, typed read-only/write-only/directory
+grants, mismatch rollback, grant-phase cancellation/deadline behavior,
+grant-bearing crash/concurrency isolation, absence of the test exerciser from
+the normal production build, and a real sandboxed HVF guest through
+`SYSTEM_OFF`.
 
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
 validation work:
