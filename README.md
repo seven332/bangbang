@@ -313,7 +313,8 @@ not revoke an already delivered descriptor; cleanup is cooperative ownership.
 
 Production consumers now adopt read-only startup config, startup metadata,
 kernel, and initrd grants plus repeatable read-only/read-write block and pmem
-backing grants. In authenticated contained mode the exact
+backing grants and singleton write-only logger, metrics, and serial sink grants.
+In authenticated contained mode the exact
 case-sensitive private reference `bangbang-grant:<GrantId>` claims one matching
 ID/role/access entry; malformed, missing, mismatched, or consumed claims fail
 without pathname or singleton fallback. Direct mode treats the same bytes as an
@@ -340,7 +341,17 @@ configuration with unused authority. Authorized configuration responses may
 return submitted tags, while logs, faults, errors, and derived debug output stay
 value-redacted.
 
-API/vsock directories, observability and snapshot consumers, dynamic
+Logger and metrics validate before claiming, normalize the transferred regular
+file to append/nonblocking behavior without upgrading its kernel-enforced
+write-only access, and retain the opened sink. A logger update without
+`log_path` retains that sink and consumes no grant; metrics remains one-time
+initialized. Serial retains a prepared output until startup, moves it into the
+VM without reopening the reference, and requires successful reconfiguration
+after a startup attempt consumes it. Clearing or replacing serial before start
+drops the prepared output. Direct paths retain their existing create, FIFO-like,
+and open-timing behavior.
+
+API/vsock directories, snapshot consumers, dynamic
 post-Ready brokerage, vmnet provisioning, automatic restart policy, Developer
 ID possession proof, launch-constraint policy, and notarization workflow
 remain. The session
@@ -669,10 +680,13 @@ grants, mismatch rollback, grant-phase cancellation/deadline behavior,
 grant-bearing crash/concurrency isolation, absence of the test exerciser from
 the normal production build, exact external config/metadata/kernel/initrd
 adoption by the normal worker, config-file and delayed API block/pmem adoption,
+startup-CLI/config-file and delayed-API logger/metrics/serial adoption,
 pathname-replacement identity, exact role/access and one-time failures,
 read-only guest-write rejection, writable block persistence, pmem read/flush,
-preauthorized live block replacement, limiter-only backing retention, redacted
-failure atomicity, and real sandboxed HVF guests through `SYSTEM_OFF`.
+guest console output through the transferred serial descriptor, terminal
+metrics, concurrent output-session isolation, preauthorized live block
+replacement, limiter-only backing retention, redacted failure atomicity, and
+real sandboxed HVF guests through `SYSTEM_OFF`.
 
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
 validation work:

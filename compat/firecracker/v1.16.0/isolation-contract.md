@@ -192,9 +192,26 @@ backing; pmem has no live backing replacement. Authorized `GET /vm/config`
 responses may contain submitted tags. Faults, errors, logs, and nested debug
 output exclude tags, IDs, paths, descriptor identity, and contents.
 
+Logger, metrics, and serial consume singleton exact-ID `WriteOnly` grants only
+after complete lifecycle and input validation. The worker adopts each existing
+regular file without reopening its tag, preserves kernel-enforced write-only
+access, and sets and verifies append/nonblocking status. Logger path-free
+updates retain the installed sink and claim nothing; a path-bearing update
+commits the replacement sink and fields together. Metrics rejects repeat
+initialization before claim and retains the adopted sink through initial,
+periodic, explicit, and terminal transactions.
+
+Serial retains one prepared output beside the committed configuration. A clear
+or replacement drops that ownership; startup moves it once through the shared
+resource aggregate and marks it consumed. A later startup failure requires a
+validated serial reconfiguration before retry. Direct paths keep their current
+creation/FIFO behavior and logger/metrics-versus-serial open timing. Pending,
+replaced, active, cancelled, and terminal files close by ordinary cooperative
+ownership; no hard revocation is claimed.
+
 The following remain feasible work owned by #1351:
 
-- consumer adoption for API/vsock/observability and snapshot resources;
+- consumer adoption for API/vsock and snapshot resources;
 - dynamic post-Ready delivery and any hard-revocation broker;
 - vmnet entitlement/provisioning and per-VM network policy;
 - automatic restart/reconnect and any long-lived broker/service policy;
@@ -255,7 +272,14 @@ execution proves:
   opened file remains unchanged; and
 - preauthorized after-start block replacement synchronized by guest
   virtio-mem ready/grow/shrink markers so later writes reach the already-opened
-  replacement object rather than the planted pathname.
+  replacement object rather than the planted pathname;
+- startup-CLI/config-file and delayed-API logger/metrics/serial adoption by the
+  normal worker, including source-path replacement, append sentinels, redacted
+  mismatch and one-time failures, initial/terminal metrics, and real guest
+  console bytes written only through the launcher-opened descriptors; and
+- two simultaneous output-grant sessions using identical GrantIds but isolated
+  registries, mutually exclusive logger filters, independent metrics/serial
+  files, and unchanged planted replacement paths.
 
 Readiness events and bounded deadlines replace fixed sleeps. Destructive cases
 operate on private copies, so later checks continue to use the canonical signed
@@ -272,9 +296,9 @@ work:
 - `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
 
 The delivered package/session/grant/fd/crash subset, including exact adoption by
-the singleton startup inputs and repeatable block/pmem consumers, is real but
-does not complete any of those composite records because remaining consumers,
-dynamic-broker, network,
+the singleton startup inputs/outputs and repeatable block/pmem consumers, is real
+but does not complete any of those composite records because remaining
+consumers, dynamic-broker, network,
 Linux-outcome, and deployment work remains. The broad `jailer`, `seccomp`,
 `seccompiler`, and `production-host` corpus records remain `audit-required`.
 Neither this audit nor the executable evidence is direct Firecracker jailer

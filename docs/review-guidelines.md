@@ -155,6 +155,20 @@ fails. Path-free block and pmem limiter updates must retain ownership and claim
 nothing. Authorized configuration output may contain the submitted tag; all
 diagnostics and nested `Debug` output must remain value-redacted.
 
+For logger/metrics/serial sink grants, require exact singleton role plus
+write-only access after complete lifecycle/input preflight. Descriptor adoption
+must preserve `O_WRONLY`, require an existing regular file, and set and verify
+append/nonblocking status without reopening a submitted reference. Review
+logger path-free updates as no-claim sink retention with all requested fields
+committed together; review metrics repeat initialization before any reference
+inspection or claim. Keep serial private ownership synchronized with wholesale
+replace/clear config: `Prepared` moves once into startup, `Consumed` blocks
+retry before any other resource moves, and a later validated `PutSerial` is the
+only reset. Direct path creation, FIFO-like support, and logger/metrics versus
+serial open timing must remain unchanged. Signed normal-bundle evidence must
+cover source-path replacement, append sentinels, logger/metrics/guest-serial
+writes, redacted mismatch rollback, cleanup, and concurrent session isolation.
+
 ## Concurrency and Resource Management
 
 Review file descriptors, Unix sockets, temporary files, signal handlers, and VM

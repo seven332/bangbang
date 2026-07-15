@@ -65,9 +65,18 @@ const fn block_latency_delta(
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MetricsConfigInput {
     metrics_path: PathBuf,
+}
+
+impl fmt::Debug for MetricsConfigInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsConfigInput")
+            .field("metrics_path", &"<redacted>")
+            .finish()
+    }
 }
 
 impl MetricsConfigInput {
@@ -88,9 +97,18 @@ impl MetricsConfigInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MetricsConfig {
     metrics_path: PathBuf,
+}
+
+impl fmt::Debug for MetricsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsConfig")
+            .field("metrics_path", &"<redacted>")
+            .finish()
+    }
 }
 
 impl MetricsConfig {
@@ -173,6 +191,20 @@ pub struct MetricsState {
     put_api_requests: PutApiRequestMetrics,
 }
 
+/// A fully validated metrics configuration with a ready output sink.
+pub struct PreparedMetricsConfig {
+    sink: MetricsSink,
+}
+
+impl fmt::Debug for PreparedMetricsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedMetricsConfig")
+            .field("sink", &"<owned>")
+            .finish()
+    }
+}
+
 impl MetricsState {
     pub(crate) fn with_shared_logger_metrics(shared_logger_metrics: SharedLoggerMetrics) -> Self {
         Self {
@@ -182,14 +214,42 @@ impl MetricsState {
     }
 
     pub fn configure(&mut self, input: MetricsConfigInput) -> Result<(), MetricsConfigError> {
+        let config = self.validate_config(input)?;
+        let prepared = Self::prepare_config(config, None)?;
+        self.commit_config(prepared);
+
+        Ok(())
+    }
+
+    /// Validates a metrics request without opening or installing its sink.
+    pub fn validate_config(
+        &self,
+        input: MetricsConfigInput,
+    ) -> Result<MetricsConfig, MetricsConfigError> {
         if self.sink.is_some() {
             return Err(MetricsConfigError::AlreadyInitialized);
         }
 
-        let config = input.validate()?;
-        self.sink = Some(MetricsSink::open(&config)?);
+        input.validate()
+    }
 
-        Ok(())
+    /// Prepares a validated metrics sink without mutating process metrics state.
+    pub fn prepare_config(
+        config: MetricsConfig,
+        provided_file: Option<File>,
+    ) -> Result<PreparedMetricsConfig, MetricsConfigError> {
+        let sink = match provided_file {
+            Some(file) => MetricsSink::from_file(file)?,
+            None => MetricsSink::open(&config)?,
+        };
+
+        Ok(PreparedMetricsConfig { sink })
+    }
+
+    /// Installs a prepared sink without further fallible work.
+    pub fn commit_config(&mut self, prepared: PreparedMetricsConfig) {
+        debug_assert!(self.sink.is_none());
+        self.sink = Some(prepared.sink);
     }
 
     pub fn flush(&mut self) -> Result<bool, MetricsFlushError> {
@@ -4820,18 +4880,32 @@ impl BootRunLoopMetricStatus {
     }
 }
 
-#[derive(Debug)]
 struct MetricsSink {
     output: Box<dyn MetricsOutput>,
+}
+
+impl fmt::Debug for MetricsSink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsSink")
+            .finish_non_exhaustive()
+    }
 }
 
 trait MetricsOutput: fmt::Debug + Send {
     fn write_json_line(&mut self, line: &serde_json::Value) -> Result<(), MetricsFlushError>;
 }
 
-#[derive(Debug)]
 struct FileMetricsOutput {
     writer: LineWriter<File>,
+}
+
+impl fmt::Debug for FileMetricsOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileMetricsOutput")
+            .finish_non_exhaustive()
+    }
 }
 
 impl MetricsOutput for FileMetricsOutput {
@@ -5309,6 +5383,14 @@ impl MetricsSink {
             .open(config.metrics_path())
             .map_err(|err| MetricsConfigError::OpenFile(err.kind()))?;
 
+        Ok(Self::new(Box::new(FileMetricsOutput {
+            writer: LineWriter::new(file),
+        })))
+    }
+
+    fn from_file(file: File) -> Result<Self, MetricsConfigError> {
+        let file = crate::output_file::adopt_write_only_file(file)
+            .map_err(MetricsConfigError::OpenFile)?;
         Ok(Self::new(Box::new(FileMetricsOutput {
             writer: LineWriter::new(file),
         })))
@@ -5861,7 +5943,7 @@ impl MetricsSink {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::io::ErrorKind;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -8216,6 +8298,35 @@ mod tests {
         assert!(!second_path.exists());
 
         fs::remove_file(first_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn prepared_metrics_adopts_write_only_file_and_appends_on_flush() {
+        let path = unique_metrics_path("provided");
+        fs::write(&path, b"seed\n").expect("fixture should write");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("write-only fixture should open");
+        let mut state = MetricsState::default();
+        let config = state
+            .validate_config(MetricsConfigInput::new("bangbang-grant:metrics"))
+            .expect("metrics config should validate");
+        let prepared = MetricsState::prepare_config(config, Some(file))
+            .expect("provided metrics should prepare");
+        assert_eq!(
+            format!("{prepared:?}"),
+            "PreparedMetricsConfig { sink: \"<owned>\" }"
+        );
+
+        state.commit_config(prepared);
+        assert_eq!(state.flush(), Ok(true));
+        assert_eq!(
+            fs::read_to_string(&path).expect("metrics output should read"),
+            "seed\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
     }
 
     #[test]
