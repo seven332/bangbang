@@ -822,11 +822,19 @@ mod platform {
             access: GrantAccess,
             path: &Path,
         ) -> (GrantRecord, OwnedFd) {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(access == GrantAccess::ReadWrite)
-                .open(path)
-                .expect("grant fixture should open");
+            let mut options = OpenOptions::new();
+            match access {
+                GrantAccess::ReadOnly | GrantAccess::CreateChildren => {
+                    options.read(true);
+                }
+                GrantAccess::WriteOnly => {
+                    options.write(true);
+                }
+                GrantAccess::ReadWrite => {
+                    options.read(true).write(true);
+                }
+            }
+            let file = options.open(path).expect("grant fixture should open");
             let descriptor: OwnedFd = file.into();
             let mut stat = MaybeUninit::<libc::stat>::uninit();
             assert_eq!(
@@ -865,8 +873,8 @@ mod platform {
                     batch,
                     0,
                     GrantRecord::Begin {
-                        grant_count: 5,
-                        record_count: 7,
+                        grant_count: 8,
+                        record_count: 10,
                         bookmark_bytes: 0,
                     },
                     None,
@@ -898,14 +906,29 @@ mod platform {
                     ResourceRole::DriveBacking,
                     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vmm.rs"),
                 ),
+                (
+                    "logger",
+                    ResourceRole::LoggerSink,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/grant_integration_probe.rs"),
+                ),
+                (
+                    "metrics",
+                    ResourceRole::MetricsSink,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/periodic_metrics.rs"),
+                ),
+                (
+                    "serial",
+                    ResourceRole::SerialSink,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/test_support.rs"),
+                ),
             ]
             .into_iter()
             .enumerate()
             {
-                let access = if id == "drive-rw" {
-                    GrantAccess::ReadWrite
-                } else {
-                    GrantAccess::ReadOnly
+                let access = match id {
+                    "drive-rw" => GrantAccess::ReadWrite,
+                    "logger" | "metrics" | "serial" => GrantAccess::WriteOnly,
+                    _ => GrantAccess::ReadOnly,
                 };
                 let (record, descriptor) = file_record(id, role, access, &path);
                 staged
@@ -922,10 +945,10 @@ mod platform {
                 .accept(received(
                     session,
                     batch,
-                    6,
+                    9,
                     GrantRecord::Commit {
-                        grant_count: 5,
-                        record_count: 7,
+                        grant_count: 8,
+                        record_count: 10,
                         bookmark_bytes: 0,
                     },
                     None,
@@ -1015,6 +1038,54 @@ mod platform {
                         GrantAccess::ReadWrite,
                     )
                     .expect("exact read-write drive claim should validate")
+                    .is_some()
+            );
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:logger"),
+                        ResourceRole::LoggerSink,
+                        GrantAccess::ReadOnly,
+                    )
+                    .is_err()
+            );
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:logger"),
+                        ResourceRole::MetricsSink,
+                        GrantAccess::WriteOnly,
+                    )
+                    .is_err()
+            );
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:logger"),
+                        ResourceRole::LoggerSink,
+                        GrantAccess::WriteOnly,
+                    )
+                    .expect("output mismatch should preserve exact grant")
+                    .is_some()
+            );
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:metrics"),
+                        ResourceRole::MetricsSink,
+                        GrantAccess::WriteOnly,
+                    )
+                    .expect("metrics output should claim")
+                    .is_some()
+            );
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:serial"),
+                        ResourceRole::SerialSink,
+                        GrantAccess::WriteOnly,
+                    )
+                    .expect("serial output should claim")
                     .is_some()
             );
             assert!(

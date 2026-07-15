@@ -67,6 +67,20 @@ const GUEST_REPLACEMENT_REF: &str = "bangbang-grant:grant-guest-replacement-1362
 const GUEST_PMEM_REF: &str = "bangbang-grant:grant-guest-pmem-1362";
 const GUEST_READ_ONLY_DATA_REF: &str = "bangbang-grant:grant-guest-read-only-data-1362";
 const GUEST_MISSING_REF: &str = "bangbang-grant:grant-guest-missing-1362";
+const OUTPUT_LOGGER_ID: &str = "grant-logger-sink-1364";
+const OUTPUT_METRICS_ID: &str = "grant-metrics-sink-1364";
+const OUTPUT_SERIAL_ID: &str = "grant-serial-sink-1364";
+const OUTPUT_LOGGER_REF: &str = "bangbang-grant:grant-logger-sink-1364";
+const OUTPUT_METRICS_REF: &str = "bangbang-grant:grant-metrics-sink-1364";
+const OUTPUT_SERIAL_REF: &str = "bangbang-grant:grant-serial-sink-1364";
+const OUTPUT_MISSING_REF: &str = "bangbang-grant:grant-missing-sink-1364";
+const OUTPUT_CONFIG_ID: &str = "grant-output-config-1364";
+const OUTPUT_CONFIG_REF: &str = "bangbang-grant:grant-output-config-1364";
+const OUTPUT_LOGGER_SEED: &[u8] = b"logger-seed\n";
+const OUTPUT_METRICS_SEED: &[u8] = b"metrics-seed\n";
+const OUTPUT_SERIAL_SEED: &[u8] = b"serial-seed\n";
+const OUTPUT_REPLACEMENT: &[u8] = b"replacement-path-must-remain-unused\n";
+const GUEST_SERIAL_MARKER: &[u8] = b"Linux version";
 const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
 const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
 const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
@@ -386,6 +400,276 @@ fn normal_bundle_delays_boot_claim_until_api_and_keeps_opened_identity() {
         "guest should reach SYSTEM_OFF: {status:?}"
     );
     assert!(!running.socket.exists());
+}
+
+#[test]
+fn normal_bundle_adopts_delayed_output_grants_by_descriptor_identity() {
+    let bundle = production_bundle();
+    let fixture = OutputGrantFixture::new("delayed-output");
+    let mut running = spawn_ready_output_grant_api_launcher(&bundle, &fixture, "delayed-output");
+    fixture.replace_source_pathnames();
+
+    for body in [
+        serde_json::json!({"log_path": OUTPUT_METRICS_REF}),
+        serde_json::json!({"log_path": OUTPUT_MISSING_REF}),
+        serde_json::json!({"log_path": "bangbang-grant:"}),
+    ] {
+        let response = http_put(
+            &running.socket,
+            "/logger",
+            &serde_json::to_string(&body).expect("logger mismatch should serialize"),
+        );
+        assert_output_private_grant_fault(&response, &fixture);
+    }
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/logger",
+            &serde_json::to_string(&serde_json::json!({
+                "log_path": OUTPUT_LOGGER_REF,
+                "level": "Info",
+                "show_level": true,
+            }))
+            .expect("logger request should serialize"),
+        ),
+        204,
+        "PUT granted logger",
+    );
+    assert_http_status(
+        &http_put(&running.socket, "/logger", r#"{"show_level":false}"#),
+        204,
+        "PUT path-free logger update",
+    );
+    assert_http_status(
+        &http_get(&running.socket, "/"),
+        200,
+        "GET instance after path-free logger update",
+    );
+    let duplicate_logger = http_put(
+        &running.socket,
+        "/logger",
+        &serde_json::to_string(&serde_json::json!({"log_path": OUTPUT_LOGGER_REF}))
+            .expect("duplicate logger should serialize"),
+    );
+    assert_output_private_grant_fault(&duplicate_logger, &fixture);
+
+    let wrong_serial_role = http_put(
+        &running.socket,
+        "/serial",
+        &serde_json::to_string(&serde_json::json!({
+            "serial_out_path": OUTPUT_METRICS_REF,
+        }))
+        .expect("wrong-role serial should serialize"),
+    );
+    assert_output_private_grant_fault(&wrong_serial_role, &fixture);
+    let wrong_metrics_role = http_put(
+        &running.socket,
+        "/metrics",
+        &serde_json::to_string(&serde_json::json!({
+            "metrics_path": OUTPUT_SERIAL_REF,
+        }))
+        .expect("wrong-role metrics should serialize"),
+    );
+    assert_output_private_grant_fault(&wrong_metrics_role, &fixture);
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/metrics",
+            &serde_json::to_string(&serde_json::json!({
+                "metrics_path": OUTPUT_METRICS_REF,
+            }))
+            .expect("metrics request should serialize"),
+        ),
+        204,
+        "PUT granted metrics",
+    );
+    let repeated_metrics = http_put(
+        &running.socket,
+        "/metrics",
+        &serde_json::to_string(&serde_json::json!({
+            "metrics_path": OUTPUT_MISSING_REF,
+        }))
+        .expect("repeated metrics should serialize"),
+    );
+    assert!(
+        repeated_metrics.starts_with("HTTP/1.1 400 "),
+        "repeated metrics should reject"
+    );
+    assert!(repeated_metrics.contains("metrics system is already initialized"));
+    assert!(!repeated_metrics.contains(OUTPUT_MISSING_REF));
+    assert!(!repeated_metrics.contains("private resource grant failed"));
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/serial",
+            &serde_json::to_string(&serde_json::json!({
+                "serial_out_path": OUTPUT_SERIAL_REF,
+            }))
+            .expect("serial request should serialize"),
+        ),
+        204,
+        "PUT granted serial",
+    );
+    let duplicate_serial = http_put(
+        &running.socket,
+        "/serial",
+        &serde_json::to_string(&serde_json::json!({
+            "serial_out_path": OUTPUT_SERIAL_REF,
+        }))
+        .expect("duplicate serial should serialize"),
+    );
+    assert_output_private_grant_fault(&duplicate_serial, &fixture);
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT output-grant machine config",
+    );
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "initrd_path": path_text(&resources.join("guest-initrd")),
+        "boot_args": "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init",
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot source should serialize"),
+        ),
+        204,
+        "PUT output-grant boot source",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start output-grant guest",
+    );
+
+    wait_for_file_contains(&fixture.opened_serial, GUEST_SERIAL_MARKER, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| panic!("guest serial output should reach granted file: {error}"));
+    let status = running.wait("output-grant guest SYSTEM_OFF");
+    assert!(
+        status.success(),
+        "guest should reach SYSTEM_OFF: {status:?}"
+    );
+    assert!(!running.socket.exists());
+    assert!(session_entries().is_empty());
+
+    fixture.assert_original_outputs();
+    fixture.assert_replacement_outputs_unchanged();
+}
+
+#[test]
+fn normal_bundle_adopts_output_grants_from_config_file_and_startup_cli() {
+    let bundle = production_bundle();
+    for (case, mode) in [
+        ("config-file-output", OutputStartupMode::ConfigFile),
+        ("startup-cli-output", OutputStartupMode::StartupCli),
+    ] {
+        let fixture = OutputStartupGrantFixture::new(&bundle, case, mode);
+        let mut command = Command::new(launcher(&bundle));
+        command
+            .arg(GRANT_MANIFEST_OPTION)
+            .arg(&fixture.manifest)
+            .arg("--");
+        if matches!(mode, OutputStartupMode::StartupCli) {
+            command.args(["--log-path", OUTPUT_LOGGER_REF]);
+            command.args(["--metrics-path", OUTPUT_METRICS_REF]);
+        }
+        command.args(["--config-file", OUTPUT_CONFIG_REF, "--no-api"]);
+
+        let output = run_with_timeout(
+            &mut command,
+            PROCESS_TIMEOUT,
+            "startup output-grant guest SYSTEM_OFF",
+        );
+
+        assert_output_success(&output, "startup output-grant guest SYSTEM_OFF");
+        fixture.assert_output_redacted(&output);
+        fixture.outputs.assert_current_outputs();
+        assert!(session_entries().is_empty());
+    }
+}
+
+#[test]
+fn normal_bundle_keeps_concurrent_output_grant_sessions_isolated() {
+    let bundle = production_bundle();
+    let first_fixture = OutputGrantFixture::new("concurrent-output-a");
+    let second_fixture = OutputGrantFixture::new("concurrent-output-b");
+    let mut first =
+        spawn_ready_output_grant_api_launcher(&bundle, &first_fixture, "concurrent-output-a");
+    let mut second =
+        spawn_ready_output_grant_api_launcher(&bundle, &second_fixture, "concurrent-output-b");
+    assert_eq!(session_entries().len(), 2);
+    first_fixture.replace_source_pathnames();
+    second_fixture.replace_source_pathnames();
+
+    configure_output_grant_session(&bundle, &first, "bangbang_runtime::vmm_action");
+    configure_output_grant_session(&bundle, &second, "bangbang_runtime::api_server");
+
+    assert_http_status(
+        &http_put(
+            &first.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start first concurrent output-grant guest",
+    );
+    assert_http_status(
+        &http_put(
+            &second.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start second concurrent output-grant guest",
+    );
+
+    for fixture in [&first_fixture, &second_fixture] {
+        wait_for_file_contains(&fixture.opened_serial, GUEST_SERIAL_MARKER, PROCESS_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("concurrent guest serial should reach granted file: {error}")
+            });
+    }
+    assert!(first.wait("first concurrent output-grant guest").success());
+    assert!(
+        second
+            .wait("second concurrent output-grant guest")
+            .success()
+    );
+    assert!(session_entries().is_empty());
+
+    first_fixture.assert_original_outputs_with_logger_expectations(false, true);
+    second_fixture.assert_original_outputs_with_logger_expectations(true, false);
+    first_fixture.assert_replacement_outputs_unchanged();
+    second_fixture.assert_replacement_outputs_unchanged();
+    let first_logger =
+        fs::read(&first_fixture.opened_logger).expect("first concurrent logger should read");
+    let second_logger =
+        fs::read(&second_fixture.opened_logger).expect("second concurrent logger should read");
+    assert!(
+        !first_logger
+            .windows(b"The API server received".len())
+            .any(|window| window == b"The API server received")
+    );
+    assert!(
+        !second_logger
+            .windows(b"action=InstanceStart\n".len())
+            .any(|window| window == b"action=InstanceStart\n")
+    );
 }
 
 #[test]
@@ -1738,12 +2022,328 @@ impl GuestDeviceGrantFixture {
     }
 }
 
+#[derive(Debug)]
+struct OutputGrantFixture {
+    _root: TestDir,
+    logger: PathBuf,
+    metrics: PathBuf,
+    serial: PathBuf,
+    opened_logger: PathBuf,
+    opened_metrics: PathBuf,
+    opened_serial: PathBuf,
+    manifest: PathBuf,
+}
+
+impl OutputGrantFixture {
+    fn new(case: &str) -> Self {
+        let root = TestDir::new(&format!("output-grant-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("output grant root should canonicalize");
+        let logger = canonical_root.join("external-logger.out");
+        let metrics = canonical_root.join("external-metrics.out");
+        let serial = canonical_root.join("external-serial.out");
+        let opened_logger = canonical_root.join("opened-logger.out");
+        let opened_metrics = canonical_root.join("opened-metrics.out");
+        let opened_serial = canonical_root.join("opened-serial.out");
+        let manifest = canonical_root.join("grant-manifest.json");
+
+        fs::write(&logger, OUTPUT_LOGGER_SEED).expect("logger fixture should write");
+        fs::write(&metrics, OUTPUT_METRICS_SEED).expect("metrics fixture should write");
+        fs::write(&serial, OUTPUT_SERIAL_SEED).expect("serial fixture should write");
+
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": OUTPUT_LOGGER_ID,
+                    "role": "logger-sink",
+                    "access": "write-only",
+                    "source": path_text(&logger),
+                },
+                {
+                    "id": OUTPUT_METRICS_ID,
+                    "role": "metrics-sink",
+                    "access": "write-only",
+                    "source": path_text(&metrics),
+                },
+                {
+                    "id": OUTPUT_SERIAL_ID,
+                    "role": "serial-sink",
+                    "access": "write-only",
+                    "source": path_text(&serial),
+                },
+            ],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("output grant manifest should serialize"),
+        )
+        .expect("output grant manifest should write");
+
+        Self {
+            _root: root,
+            logger,
+            metrics,
+            serial,
+            opened_logger,
+            opened_metrics,
+            opened_serial,
+            manifest,
+        }
+    }
+
+    fn replace_source_pathnames(&self) {
+        for (source, opened) in [
+            (&self.logger, &self.opened_logger),
+            (&self.metrics, &self.opened_metrics),
+            (&self.serial, &self.opened_serial),
+        ] {
+            fs::rename(source, opened).expect("launcher-opened output should move");
+            fs::write(source, OUTPUT_REPLACEMENT).expect("replacement output should write");
+        }
+    }
+
+    fn assert_original_outputs(&self) {
+        self.assert_original_outputs_with_logger_expectations(true, true);
+    }
+
+    fn assert_original_outputs_with_logger_expectations(&self, api: bool, action: bool) {
+        Self::assert_outputs_at(
+            &self.opened_logger,
+            &self.opened_metrics,
+            &self.opened_serial,
+            api,
+            action,
+        );
+    }
+
+    fn assert_current_outputs(&self) {
+        Self::assert_outputs_at(&self.logger, &self.metrics, &self.serial, false, true);
+    }
+
+    fn assert_outputs_at(
+        logger_path: &Path,
+        metrics_path: &Path,
+        serial_path: &Path,
+        api: bool,
+        action: bool,
+    ) {
+        let logger = fs::read(logger_path).expect("granted logger output should read");
+        assert!(logger.starts_with(OUTPUT_LOGGER_SEED));
+        if api {
+            assert!(
+                logger
+                    .windows(b"The API server received".len())
+                    .any(|window| window == b"The API server received")
+            );
+        }
+        if action {
+            assert!(
+                logger
+                    .windows(b"action=InstanceStart\n".len())
+                    .any(|window| window == b"action=InstanceStart\n")
+            );
+        }
+
+        let metrics = fs::read_to_string(metrics_path).expect("granted metrics output should read");
+        let seed = std::str::from_utf8(OUTPUT_METRICS_SEED).expect("metrics seed should be UTF-8");
+        let payload = metrics
+            .strip_prefix(seed)
+            .expect("metrics writes should append after existing bytes");
+        let lines = payload.lines().collect::<Vec<_>>();
+        assert!(
+            lines.len() >= 2,
+            "initial and terminal metrics writes should both be present"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
+            "each appended metrics line should be valid JSON"
+        );
+        assert!(lines.iter().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/vmm/metrics_flush_count")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                == Some(1)
+        }));
+
+        let serial = fs::read(serial_path).expect("granted serial output should read");
+        assert!(serial.starts_with(OUTPUT_SERIAL_SEED));
+        assert!(
+            serial
+                .windows(GUEST_SERIAL_MARKER.len())
+                .any(|window| window == GUEST_SERIAL_MARKER)
+        );
+    }
+
+    fn assert_replacement_outputs_unchanged(&self) {
+        for path in [&self.logger, &self.metrics, &self.serial] {
+            assert_eq!(
+                fs::read(path).expect("replacement output should read"),
+                OUTPUT_REPLACEMENT
+            );
+        }
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.logger),
+            path_text(&self.metrics),
+            path_text(&self.serial),
+            path_text(&self.opened_logger),
+            path_text(&self.opened_metrics),
+            path_text(&self.opened_serial),
+            path_text(&self.manifest),
+            OUTPUT_LOGGER_ID,
+            OUTPUT_METRICS_ID,
+            OUTPUT_SERIAL_ID,
+            OUTPUT_LOGGER_REF,
+            OUTPUT_METRICS_REF,
+            OUTPUT_SERIAL_REF,
+            OUTPUT_MISSING_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OutputStartupMode {
+    ConfigFile,
+    StartupCli,
+}
+
+#[derive(Debug)]
+struct OutputStartupGrantFixture {
+    outputs: OutputGrantFixture,
+    config: PathBuf,
+    manifest: PathBuf,
+}
+
+impl OutputStartupGrantFixture {
+    fn new(bundle: &Path, case: &str, mode: OutputStartupMode) -> Self {
+        let outputs = OutputGrantFixture::new(case);
+        let root = outputs
+            .logger
+            .parent()
+            .expect("output fixture should have a root");
+        let config = root.join("external-config.json");
+        let manifest = root.join("startup-grant-manifest.json");
+        let resources = worker_bundle(bundle).join("Contents/Resources");
+        let mut config_json = serde_json::json!({
+            "machine-config": {"vcpu_count": 1, "mem_size_mib": 256},
+            "boot-source": {
+                "kernel_image_path": path_text(&resources.join("guest-kernel")),
+                "initrd_path": path_text(&resources.join("guest-initrd")),
+                "boot_args": "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init",
+            },
+            "serial": {"serial_out_path": OUTPUT_SERIAL_REF},
+        });
+        if matches!(mode, OutputStartupMode::ConfigFile) {
+            let object = config_json
+                .as_object_mut()
+                .expect("startup config should be an object");
+            object.insert(
+                "metrics".to_owned(),
+                serde_json::json!({"metrics_path": OUTPUT_METRICS_REF}),
+            );
+            object.insert(
+                "logger".to_owned(),
+                serde_json::json!({"log_path": OUTPUT_LOGGER_REF}),
+            );
+        }
+        fs::write(
+            &config,
+            serde_json::to_vec(&config_json).expect("output startup config should serialize"),
+        )
+        .expect("output startup config should write");
+
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": OUTPUT_CONFIG_ID,
+                    "role": "startup-config",
+                    "access": "read-only",
+                    "source": path_text(&config),
+                },
+                {
+                    "id": OUTPUT_LOGGER_ID,
+                    "role": "logger-sink",
+                    "access": "write-only",
+                    "source": path_text(&outputs.logger),
+                },
+                {
+                    "id": OUTPUT_METRICS_ID,
+                    "role": "metrics-sink",
+                    "access": "write-only",
+                    "source": path_text(&outputs.metrics),
+                },
+                {
+                    "id": OUTPUT_SERIAL_ID,
+                    "role": "serial-sink",
+                    "access": "write-only",
+                    "source": path_text(&outputs.serial),
+                },
+            ],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json)
+                .expect("output startup grant manifest should serialize"),
+        )
+        .expect("output startup grant manifest should write");
+
+        Self {
+            outputs,
+            config,
+            manifest,
+        }
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        let mut sensitive = self.outputs.sensitive_strings();
+        sensitive.extend([
+            path_text(&self.config).to_owned(),
+            path_text(&self.manifest).to_owned(),
+            OUTPUT_CONFIG_ID.to_owned(),
+            OUTPUT_CONFIG_REF.to_owned(),
+        ]);
+        sensitive
+    }
+
+    fn assert_output_redacted(&self, output: &Output) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for sensitive in self.sensitive_strings() {
+            assert!(
+                !stdout.contains(&sensitive),
+                "stdout leaked output grant data"
+            );
+            assert!(
+                !stderr.contains(&sensitive),
+                "stderr leaked output grant data"
+            );
+        }
+    }
+}
+
 fn assert_private_grant_fault(response: &str, fixture: &StartupGrantFixture) {
     assert_redacted_private_grant_fault(response, fixture.sensitive_strings());
     assert!(!response.contains("bangbang-grant:missing"));
 }
 
 fn assert_device_private_grant_fault(response: &str, fixture: &GuestDeviceGrantFixture) {
+    assert_redacted_private_grant_fault(response, fixture.sensitive_strings());
+}
+
+fn assert_output_private_grant_fault(response: &str, fixture: &OutputGrantFixture) {
     assert_redacted_private_grant_fault(response, fixture.sensitive_strings());
 }
 
@@ -2244,6 +2844,108 @@ fn spawn_ready_device_grant_api_launcher(
         sensitive: fixture.sensitive_strings(),
         completed: false,
     }
+}
+
+fn spawn_ready_output_grant_api_launcher(
+    bundle: &Path,
+    fixture: &OutputGrantFixture,
+    name: &str,
+) -> RunningApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket =
+        container_tmp_dir().join(format!("bbo-{:x}-{test_id:x}.sock", std::process::id(),));
+    let mut child = Command::new(launcher(bundle))
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .args(["--api-sock", path_text(&socket)])
+        .args(["--id", &format!("{name}-{test_id}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("output-grant launcher should start");
+    let (ready, stdout_reader) = read_stdout_until_ready(&mut child);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "output-grant API should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningApiLauncher {
+        child,
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive: fixture.sensitive_strings(),
+        completed: false,
+    }
+}
+
+fn configure_output_grant_session(
+    bundle: &Path,
+    running: &RunningApiLauncher,
+    logger_module: &str,
+) {
+    for (path, body, context) in [
+        (
+            "/logger",
+            serde_json::json!({
+                "log_path": OUTPUT_LOGGER_REF,
+                "module": logger_module,
+            }),
+            "PUT concurrent granted logger",
+        ),
+        (
+            "/metrics",
+            serde_json::json!({"metrics_path": OUTPUT_METRICS_REF}),
+            "PUT concurrent granted metrics",
+        ),
+        (
+            "/serial",
+            serde_json::json!({"serial_out_path": OUTPUT_SERIAL_REF}),
+            "PUT concurrent granted serial",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("output grant request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT concurrent output-grant machine config",
+    );
+    let resources = worker_bundle(bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "initrd_path": path_text(&resources.join("guest-initrd")),
+        "boot_args": "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init",
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot source should serialize"),
+        ),
+        204,
+        "PUT concurrent output-grant boot source",
+    );
 }
 
 fn recover_session_root(bundle: &Path) {

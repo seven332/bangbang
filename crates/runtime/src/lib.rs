@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod mmds;
 pub mod mmio;
 pub mod network;
+pub(crate) mod output_file;
 pub mod pmem;
 pub mod rtc;
 pub mod serial;
@@ -32,6 +33,7 @@ pub mod virtio_queue;
 pub mod vsock;
 
 use std::fmt;
+use std::fs::File;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InstanceState {
@@ -912,6 +914,88 @@ impl VmmController {
         self.snapshot_load_history_fresh = false;
     }
 
+    /// Validates a logger update without opening or installing its sink.
+    pub fn prepare_logger_config(
+        &self,
+        input: logger::LoggerConfigInput,
+    ) -> Result<logger::LoggerConfig, VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutLogger",
+                state: self.instance_info.state,
+            });
+        }
+
+        input.validate().map_err(VmmActionError::LoggerConfig)
+    }
+
+    /// Prepares a validated logger update with an optional provided sink file.
+    pub fn prepare_logger_update(
+        &self,
+        config: logger::LoggerConfig,
+        provided_file: Option<File>,
+    ) -> Result<logger::PreparedLoggerConfig, VmmActionError> {
+        logger::LoggerState::prepare_config(config, provided_file)
+            .map_err(VmmActionError::LoggerConfig)
+    }
+
+    /// Commits a prepared logger update without further fallible work.
+    pub fn commit_logger_config(&mut self, prepared: logger::PreparedLoggerConfig) {
+        self.logger_state.commit_config(prepared);
+    }
+
+    /// Validates metrics configuration without opening or installing its sink.
+    pub fn prepare_metrics_config(
+        &self,
+        input: metrics::MetricsConfigInput,
+    ) -> Result<metrics::MetricsConfig, VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutMetrics",
+                state: self.instance_info.state,
+            });
+        }
+
+        self.metrics_state
+            .validate_config(input)
+            .map_err(VmmActionError::MetricsConfig)
+    }
+
+    /// Prepares a validated metrics sink without mutating controller state.
+    pub fn prepare_metrics_update(
+        &self,
+        config: metrics::MetricsConfig,
+        provided_file: Option<File>,
+    ) -> Result<metrics::PreparedMetricsConfig, VmmActionError> {
+        metrics::MetricsState::prepare_config(config, provided_file)
+            .map_err(VmmActionError::MetricsConfig)
+    }
+
+    /// Commits a prepared metrics sink without further fallible work.
+    pub fn commit_metrics_config(&mut self, prepared: metrics::PreparedMetricsConfig) {
+        self.metrics_state.commit_config(prepared);
+    }
+
+    /// Validates a serial replacement without mutating controller state.
+    pub fn prepare_serial_config(
+        &self,
+        input: serial::SerialConfigInput,
+    ) -> Result<serial::SerialConfig, VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutSerial",
+                state: self.instance_info.state,
+            });
+        }
+
+        input.validate().map_err(VmmActionError::SerialConfig)
+    }
+
+    /// Commits a validated serial replacement without further fallible work.
+    pub fn commit_serial_config(&mut self, config: serial::SerialConfig) {
+        self.serial_config = config;
+    }
+
     pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {
         if self.instance_info.state != InstanceState::NotStarted {
             return Err(VmmActionError::UnsupportedState {
@@ -1477,16 +1561,9 @@ impl VmmController {
                 Ok(VmmData::Empty)
             }
             VmmAction::PutLogger(config) => {
-                if self.instance_info.state != InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
-                self.logger_state
-                    .configure(config)
-                    .map_err(VmmActionError::LoggerConfig)?;
+                let config = self.prepare_logger_config(config)?;
+                let prepared = self.prepare_logger_update(config, None)?;
+                self.commit_logger_config(prepared);
 
                 Ok(VmmData::Empty)
             }
@@ -1521,16 +1598,9 @@ impl VmmController {
                 Ok(VmmData::Empty)
             }
             VmmAction::PutMetrics(config) => {
-                if self.instance_info.state != InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
-                self.metrics_state
-                    .configure(config)
-                    .map_err(VmmActionError::MetricsConfig)?;
+                let config = self.prepare_metrics_config(config)?;
+                let prepared = self.prepare_metrics_update(config, None)?;
+                self.commit_metrics_config(prepared);
 
                 Ok(VmmData::Empty)
             }
@@ -1588,14 +1658,8 @@ impl VmmController {
                 Ok(VmmData::Empty)
             }
             VmmAction::PutSerial(config) => {
-                if self.instance_info.state != InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
-                self.serial_config = config.validate().map_err(VmmActionError::SerialConfig)?;
+                let config = self.prepare_serial_config(config)?;
+                self.commit_serial_config(config);
 
                 Ok(VmmData::Empty)
             }
@@ -2347,6 +2411,47 @@ mod tests {
             VmmAction::PutMmdsConfig(mmds_config_input()).name(),
             "PutMmdsConfig"
         );
+    }
+
+    #[test]
+    fn output_configuration_debug_redacts_paths_references_and_logger_module() {
+        let sensitive = "bangbang-grant:private-output";
+        let actions = [
+            VmmAction::PutLogger(
+                LoggerConfigInput::new()
+                    .with_log_path(sensitive)
+                    .with_module(sensitive),
+            ),
+            VmmAction::PutMetrics(MetricsConfigInput::new(sensitive)),
+            VmmAction::PutSerial(SerialConfigInput::new().with_serial_out_path(sensitive)),
+        ];
+
+        for action in actions {
+            let debug = format!("{action:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains(sensitive));
+        }
+
+        let logger = LoggerConfigInput::new()
+            .with_log_path(sensitive)
+            .with_module(sensitive)
+            .validate()
+            .expect("logger config should validate");
+        let metrics = MetricsConfigInput::new(sensitive)
+            .validate()
+            .expect("metrics config should validate");
+        let serial = SerialConfigInput::new()
+            .with_serial_out_path(sensitive)
+            .validate()
+            .expect("serial config should validate");
+        for debug in [
+            format!("{logger:?}"),
+            format!("{metrics:?}"),
+            format!("{serial:?}"),
+        ] {
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains(sensitive));
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::panic::Location;
@@ -85,13 +85,26 @@ impl fmt::Display for LoggerLevelParseError {
 
 impl std::error::Error for LoggerLevelParseError {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct LoggerConfigInput {
     log_path: Option<PathBuf>,
     level: Option<LoggerLevel>,
     show_level: Option<bool>,
     show_log_origin: Option<bool>,
     module: Option<String>,
+}
+
+impl fmt::Debug for LoggerConfigInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoggerConfigInput")
+            .field("log_path", &self.log_path.as_ref().map(|_| "<redacted>"))
+            .field("level", &self.level)
+            .field("show_level", &self.show_level)
+            .field("show_log_origin", &self.show_log_origin)
+            .field("module", &self.module.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl LoggerConfigInput {
@@ -143,13 +156,26 @@ impl LoggerConfigInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LoggerConfig {
     log_path: Option<PathBuf>,
     level: Option<LoggerLevel>,
     show_level: Option<bool>,
     show_log_origin: Option<bool>,
     module: Option<String>,
+}
+
+impl fmt::Debug for LoggerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoggerConfig")
+            .field("log_path", &self.log_path.as_ref().map(|_| "<redacted>"))
+            .field("level", &self.level)
+            .field("show_level", &self.show_level)
+            .field("show_log_origin", &self.show_log_origin)
+            .field("module", &self.module.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl LoggerConfig {
@@ -397,7 +423,6 @@ impl BootTimerLogger {
     }
 }
 
-#[derive(Debug)]
 pub struct LoggerState {
     sink: Option<LoggerSink>,
     level: LoggerLevel,
@@ -406,6 +431,37 @@ pub struct LoggerState {
     module: Option<String>,
     metrics: SharedLoggerMetrics,
     boot_timer_rate_limiter: BootTimerLogRateLimiter,
+}
+
+impl fmt::Debug for LoggerState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoggerState")
+            .field("sink", &self.sink.as_ref().map(|_| "<owned>"))
+            .field("level", &self.level)
+            .field("show_level", &self.show_level)
+            .field("show_log_origin", &self.show_log_origin)
+            .field("module", &self.module.as_ref().map(|_| "<redacted>"))
+            .field("metrics", &self.metrics)
+            .field("boot_timer_rate_limiter", &self.boot_timer_rate_limiter)
+            .finish()
+    }
+}
+
+/// A fully validated logger update whose optional replacement sink is ready.
+pub struct PreparedLoggerConfig {
+    config: LoggerConfig,
+    sink: Option<LoggerSink>,
+}
+
+impl fmt::Debug for PreparedLoggerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedLoggerConfig")
+            .field("config", &self.config)
+            .field("sink", &self.sink.as_ref().map(|_| "<owned>"))
+            .finish()
+    }
 }
 
 impl Default for LoggerState {
@@ -440,7 +496,34 @@ impl LoggerState {
 
     pub fn configure(&mut self, input: LoggerConfigInput) -> Result<(), LoggerConfigError> {
         let config = input.validate()?;
-        let sink = config.log_path().map(LoggerSink::open).transpose()?;
+        let prepared = Self::prepare_config(config, None)?;
+        self.commit_config(prepared);
+
+        Ok(())
+    }
+
+    /// Prepares an update without mutating the active logger state.
+    pub fn prepare_config(
+        config: LoggerConfig,
+        provided_file: Option<File>,
+    ) -> Result<PreparedLoggerConfig, LoggerConfigError> {
+        let sink = match (config.log_path(), provided_file) {
+            (Some(_), Some(file)) => Some(LoggerSink::from_file(file)?),
+            (Some(path), None) => Some(LoggerSink::open(path)?),
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(LoggerConfigError::OpenFile(
+                    std::io::ErrorKind::InvalidInput,
+                ));
+            }
+        };
+
+        Ok(PreparedLoggerConfig { config, sink })
+    }
+
+    /// Commits a previously prepared update without further fallible work.
+    pub fn commit_config(&mut self, prepared: PreparedLoggerConfig) {
+        let PreparedLoggerConfig { config, sink } = prepared;
 
         if let Some(sink) = sink {
             self.sink = Some(sink);
@@ -457,8 +540,6 @@ impl LoggerState {
         if let Some(module) = config.module {
             self.module = Some(module);
         }
-
-        Ok(())
     }
 
     #[track_caller]
@@ -578,6 +659,12 @@ impl LoggerSink {
             .open(path)
             .map_err(|err| LoggerConfigError::OpenFile(err.kind()))?;
 
+        Ok(Self::from_writer(file))
+    }
+
+    fn from_file(file: File) -> Result<Self, LoggerConfigError> {
+        let file =
+            crate::output_file::adopt_write_only_file(file).map_err(LoggerConfigError::OpenFile)?;
         Ok(Self::from_writer(file))
     }
 
@@ -703,7 +790,7 @@ fn module_filter_allows(filter: Option<&str>, module_path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::io::{Error, ErrorKind, Write};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1583,6 +1670,37 @@ mod tests {
         assert!(state.show_level());
         assert!(!state.show_log_origin());
         assert_eq!(state.module(), Some("runtime"));
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn prepared_logger_adopts_write_only_file_and_appends_before_commit() {
+        let path = unique_logger_path("provided");
+        fs::write(&path, b"seed\n").expect("fixture should write");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("write-only fixture should open");
+        let config = LoggerConfigInput::new()
+            .with_log_path("bangbang-grant:logger")
+            .with_level(LoggerLevel::Info)
+            .validate()
+            .expect("logger config should validate");
+        let prepared = LoggerState::prepare_config(config, Some(file))
+            .expect("provided logger should prepare");
+        let debug = format!("{prepared:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("<owned>"));
+        assert!(!debug.contains("bangbang-grant:logger"));
+
+        let mut state = LoggerState::default();
+        state.commit_config(prepared);
+        assert!(state.log_action("ProvidedLogger"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("logger output should read"),
+            "seed\naction=ProvidedLogger\n"
+        );
 
         fs::remove_file(path).expect("fixture should clean up");
     }

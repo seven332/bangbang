@@ -1221,6 +1221,22 @@ impl<T> fmt::Debug for BackingGrantState<T> {
     }
 }
 
+enum SerialGrantState {
+    PathBased,
+    Prepared(SerialOutputFile),
+    Consumed,
+}
+
+impl fmt::Debug for SerialGrantState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PathBased => formatter.write_str("PathBased"),
+            Self::Prepared(_) => formatter.write_str("Prepared(<owned>)"),
+            Self::Consumed => formatter.write_str("Consumed"),
+        }
+    }
+}
+
 const fn grant_access_for_read_only(read_only: bool) -> GrantAccess {
     if read_only {
         GrantAccess::ReadOnly
@@ -1247,6 +1263,7 @@ where
     boot_grant_state: BootGrantState,
     drive_grant_states: BTreeMap<String, BackingGrantState<BlockFileBacking>>,
     pmem_grant_states: BTreeMap<String, BackingGrantState<PmemFileBacking>>,
+    serial_grant_state: SerialGrantState,
 }
 
 impl ProcessVmm<HvfInstanceStartExecutor> {
@@ -1317,6 +1334,7 @@ where
             boot_grant_state: BootGrantState::PathBased,
             drive_grant_states: BTreeMap::new(),
             pmem_grant_states: BTreeMap::new(),
+            serial_grant_state: SerialGrantState::PathBased,
         }
     }
 
@@ -1387,7 +1405,10 @@ where
             VmmAction::InstanceStart => self.start_instance(),
             VmmAction::PutBootSource(input) => self.put_boot_source(input),
             VmmAction::PutDrive(input) => self.put_drive(input),
+            VmmAction::PutLogger(input) => self.put_logger(input),
+            VmmAction::PutMetrics(input) => self.put_metrics(input),
             VmmAction::PutPmem(input) => self.put_pmem(input),
+            VmmAction::PutSerial(input) => self.put_serial(input),
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
             VmmAction::CreateSnapshot(input) => self.create_snapshot(input),
@@ -1504,6 +1525,7 @@ where
                 .pmem_grant_states
                 .values()
                 .any(|state| matches!(state, BackingGrantState::Consumed))
+            || matches!(self.serial_grant_state, SerialGrantState::Consumed)
         {
             return Err(VmmActionError::ResourceGrant);
         }
@@ -1535,7 +1557,20 @@ where
             let previous = pmem_backings.insert(pmem_id.clone(), backing);
             debug_assert!(previous.is_none());
         }
-        let startup_resources = VmStartupResources::new(boot_files, block_backings, pmem_backings);
+        let serial_output =
+            match std::mem::replace(&mut self.serial_grant_state, SerialGrantState::Consumed) {
+                SerialGrantState::PathBased => {
+                    self.serial_grant_state = SerialGrantState::PathBased;
+                    None
+                }
+                SerialGrantState::Prepared(output) => Some(output),
+                SerialGrantState::Consumed => return Err(VmmActionError::ResourceGrant),
+            };
+        let mut startup_resources =
+            VmStartupResources::new(boot_files, block_backings, pmem_backings);
+        if let Some(serial_output) = serial_output {
+            startup_resources = startup_resources.with_serial_output(serial_output);
+        }
         let controller = &mut self.controller;
         let starter = &mut self.starter;
         let mut started_session = None;
@@ -1609,6 +1644,52 @@ where
         Ok(VmmData::Empty)
     }
 
+    fn put_logger(&mut self, input: LoggerConfigInput) -> Result<VmmData, VmmActionError> {
+        let config = self.controller.prepare_logger_config(input)?;
+        let provided_file = match (&self.grant_authority, config.log_path()) {
+            (Some(authority), Some(reference)) => authority
+                .claim_file(reference, ResourceRole::LoggerSink, GrantAccess::WriteOnly)
+                .map_err(|_| VmmActionError::ResourceGrant)?,
+            _ => None,
+        };
+        let adopted = provided_file.is_some();
+        let prepared = self
+            .controller
+            .prepare_logger_update(config, provided_file)
+            .map_err(|error| match error {
+                VmmActionError::LoggerConfig(_) if adopted => VmmActionError::ResourceGrant,
+                error => error,
+            })?;
+
+        self.controller.commit_logger_config(prepared);
+        Ok(VmmData::Empty)
+    }
+
+    fn put_metrics(&mut self, input: MetricsConfigInput) -> Result<VmmData, VmmActionError> {
+        let config = self.controller.prepare_metrics_config(input)?;
+        let provided_file = match &self.grant_authority {
+            Some(authority) => authority
+                .claim_file(
+                    config.metrics_path(),
+                    ResourceRole::MetricsSink,
+                    GrantAccess::WriteOnly,
+                )
+                .map_err(|_| VmmActionError::ResourceGrant)?,
+            None => None,
+        };
+        let adopted = provided_file.is_some();
+        let prepared = self
+            .controller
+            .prepare_metrics_update(config, provided_file)
+            .map_err(|error| match error {
+                VmmActionError::MetricsConfig(_) if adopted => VmmActionError::ResourceGrant,
+                error => error,
+            })?;
+
+        self.controller.commit_metrics_config(prepared);
+        Ok(VmmData::Empty)
+    }
+
     fn put_pmem(&mut self, input: PmemConfigInput) -> Result<VmmData, VmmActionError> {
         let config = self.controller.prepare_pmem_config(input)?;
         let backing = match &self.grant_authority {
@@ -1636,6 +1717,27 @@ where
                 self.pmem_grant_states.remove(&pmem_id);
             }
         }
+        Ok(VmmData::Empty)
+    }
+
+    fn put_serial(&mut self, input: SerialConfigInput) -> Result<VmmData, VmmActionError> {
+        let config = self.controller.prepare_serial_config(input)?;
+        let output = match (&self.grant_authority, config.serial_out_path()) {
+            (Some(authority), Some(reference)) => authority
+                .claim_file(reference, ResourceRole::SerialSink, GrantAccess::WriteOnly)
+                .map_err(|_| VmmActionError::ResourceGrant)?
+                .map(SerialOutputFile::from_file)
+                .transpose()
+                .map_err(|_| VmmActionError::ResourceGrant)?,
+            _ => None,
+        };
+        let grant_state = match output {
+            Some(output) => SerialGrantState::Prepared(output),
+            None => SerialGrantState::PathBased,
+        };
+
+        self.controller.commit_serial_config(config);
+        self.serial_grant_state = grant_state;
         Ok(VmmData::Empty)
     }
 
@@ -2256,16 +2358,25 @@ impl HvfInstanceStartExecutor {
     fn serial_output_for_controller(
         &self,
         controller: &VmmController,
+        provided_output: Option<SerialOutputFile>,
     ) -> Result<SharedSerialOutput, SerialConfigError> {
-        match controller.serial_config().serial_out_path() {
-            Some(path) => Ok(SharedSerialOutput::with_rate_limiter(
+        match (
+            controller.serial_config().serial_out_path(),
+            provided_output,
+        ) {
+            (Some(_), Some(output)) => Ok(SharedSerialOutput::with_rate_limiter(
+                output,
+                controller.serial_config().rate_limiter(),
+            )),
+            (Some(path), None) => Ok(SharedSerialOutput::with_rate_limiter(
                 SerialOutputFile::open(path)?,
                 controller.serial_config().rate_limiter(),
             )),
-            None => Ok(SharedSerialOutput::with_rate_limiter(
+            (None, None) => Ok(SharedSerialOutput::with_rate_limiter(
                 self.serial_output.clone(),
                 controller.serial_config().rate_limiter(),
             )),
+            (None, Some(_)) => Err(SerialConfigError::ProvidedOutputWithoutPath),
         }
     }
 
@@ -2274,7 +2385,7 @@ impl HvfInstanceStartExecutor {
         &self,
         controller: &VmmController,
     ) -> Result<HvfArm64BootSessionConfig, SerialConfigError> {
-        let serial_output = self.serial_output_for_controller(controller)?;
+        let serial_output = self.serial_output_for_controller(controller, None)?;
         Ok(self.boot_session_config_for_controller_with_serial_output(controller, serial_output))
     }
 
@@ -2325,10 +2436,11 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     fn start_with_startup_resources(
         &mut self,
         controller: &VmmController,
-        startup_resources: VmStartupResources,
+        mut startup_resources: VmStartupResources,
     ) -> Result<Self::Session, BackendError> {
+        let provided_serial_output = startup_resources.take_serial_output();
         let serial_output = self
-            .serial_output_for_controller(controller)
+            .serial_output_for_controller(controller, provided_serial_output)
             .map_err(|err| {
                 BackendError::Hypervisor(format!("failed to initialize serial output: {err}"))
             })?;
@@ -5543,7 +5655,8 @@ mod tests {
     };
     use bangbang_runtime::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialConfigInput, SerialOutput,
-        SerialOutputMetrics, SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
+        SerialOutputFile, SerialOutputMetrics, SerialRateLimiterConfig, SharedSerialOutput,
+        SharedSerialOutputBuffer,
     };
     use bangbang_runtime::snapshot::{
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
@@ -5596,9 +5709,10 @@ mod tests {
         NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
         ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
         ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm,
-        ProcessVmnetPacketIoBackendFactory, SnapshotCreateSession, SnapshotV1LoadSuccess,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        process_vmnet_packet_io_provider_from_configs, require_native_v1_composite_record,
+        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
+        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
+        require_native_v1_composite_record,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -6419,6 +6533,7 @@ mod tests {
         result: FakeStartResult,
         calls: usize,
         provided_boot_file_calls: usize,
+        provided_serial_output_calls: usize,
         snapshot_publication_failure: bool,
     }
 
@@ -6432,6 +6547,7 @@ mod tests {
                 result: FakeStartResult::Success(Box::new(session)),
                 calls: 0,
                 provided_boot_file_calls: 0,
+                provided_serial_output_calls: 0,
                 snapshot_publication_failure: false,
             }
         }
@@ -6446,6 +6562,7 @@ mod tests {
                 result: FakeStartResult::Failure(source),
                 calls: 0,
                 provided_boot_file_calls: 0,
+                provided_serial_output_calls: 0,
                 snapshot_publication_failure: false,
             }
         }
@@ -6468,10 +6585,17 @@ mod tests {
         fn start_with_startup_resources(
             &mut self,
             controller: &bangbang_runtime::VmmController,
-            startup_resources: VmStartupResources,
+            mut startup_resources: VmStartupResources,
         ) -> Result<Self::Session, BackendError> {
+            let serial_output = startup_resources.take_serial_output();
             if !startup_resources.is_empty() {
                 self.provided_boot_file_calls += 1;
+            }
+            if let Some(mut serial_output) = serial_output {
+                self.provided_serial_output_calls += 1;
+                serial_output
+                    .write_byte(b'!')
+                    .map_err(|_| BackendError::InvalidState("fake serial output write failed"))?;
             }
             self.start(controller)
         }
@@ -13146,6 +13270,95 @@ mod tests {
         assert_eq!(reconfigured, VmmActionError::InstanceStart(source));
         assert_eq!(vmm.starter.calls, 2);
         assert_eq!(vmm.starter.provided_boot_file_calls, 1);
+    }
+
+    #[test]
+    fn provided_serial_output_moves_once_and_requires_reconfiguration_after_failure() {
+        let source = BackendError::InvalidState("provided serial startup failed");
+        let output_path = TempFilePath::create_with_bytes("provided-serial", b"seed");
+        let replacement_path = TempFilePath::create("replacement-serial");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(output_path.path())
+            .expect("write-only serial fixture should open");
+        let output = SerialOutputFile::from_file(file).expect("serial output should adopt");
+        let mut vmm = configured_vmm(FakeStarter::failure(source.clone()));
+        vmm.handle_action(VmmAction::PutSerial(
+            SerialConfigInput::new().with_serial_out_path("bangbang-grant:serial"),
+        ))
+        .expect("tagged serial config should store in direct test mode");
+        vmm.serial_grant_state = SerialGrantState::Prepared(output);
+
+        let debug = format!("{vmm:?}");
+        assert!(debug.contains("Prepared(<owned>)"));
+        assert!(!debug.contains("bangbang-grant:serial"));
+        let first = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("provided serial startup failure should propagate");
+
+        assert_eq!(first, VmmActionError::InstanceStart(source.clone()));
+        assert_eq!(vmm.starter.calls, 1);
+        assert_eq!(vmm.starter.provided_boot_file_calls, 0);
+        assert_eq!(vmm.starter.provided_serial_output_calls, 1);
+        assert_eq!(
+            fs::read(output_path.path()).expect("provided serial output should read"),
+            b"seed!"
+        );
+        assert!(matches!(vmm.serial_grant_state, SerialGrantState::Consumed));
+
+        let retry = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("consumed serial output must not be reused");
+        assert_eq!(retry, VmmActionError::ResourceGrant);
+        assert_eq!(vmm.starter.calls, 1);
+
+        vmm.handle_action(VmmAction::PutSerial(
+            SerialConfigInput::new()
+                .with_serial_out_path(replacement_path.path().to_string_lossy()),
+        ))
+        .expect("ordinary serial replacement should reset consumed state");
+        assert!(matches!(
+            vmm.serial_grant_state,
+            SerialGrantState::PathBased
+        ));
+        let reconfigured = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("fake starter should still fail after reconfiguration");
+        assert_eq!(reconfigured, VmmActionError::InstanceStart(source));
+        assert_eq!(vmm.starter.calls, 2);
+        assert_eq!(vmm.starter.provided_serial_output_calls, 1);
+    }
+
+    #[test]
+    fn clearing_serial_config_drops_prepared_output_before_startup() {
+        let output_path = TempFilePath::create_with_bytes("clear-provided-serial", b"seed");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(output_path.path())
+            .expect("write-only serial fixture should open");
+        let output = SerialOutputFile::from_file(file).expect("serial output should adopt");
+        let mut vmm = configured_vmm(FakeStarter::success(19));
+        vmm.handle_action(VmmAction::PutSerial(
+            SerialConfigInput::new().with_serial_out_path("bangbang-grant:serial"),
+        ))
+        .expect("tagged serial config should store in direct test mode");
+        vmm.serial_grant_state = SerialGrantState::Prepared(output);
+
+        vmm.handle_action(VmmAction::PutSerial(SerialConfigInput::new()))
+            .expect("serial clear should commit");
+
+        assert_eq!(vmm.serial_config(), &SerialConfig::default());
+        assert!(matches!(
+            vmm.serial_grant_state,
+            SerialGrantState::PathBased
+        ));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup after serial clear should succeed");
+        assert_eq!(vmm.starter.provided_serial_output_calls, 0);
+        assert_eq!(
+            fs::read(output_path.path()).expect("cleared serial output should read"),
+            b"seed"
+        );
     }
 
     #[test]

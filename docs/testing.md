@@ -746,7 +746,19 @@ may skip execution. On supported Apple Silicon it proves:
   original opened backing remains unchanged; and
 - preauthorized after-start block replacement synchronized by the guest's
   virtio-mem ready/grow/shrink markers, proving subsequent guest writes reach
-  the launcher-opened replacement object rather than a planted pathname.
+  the launcher-opened replacement object rather than a planted pathname;
+- exact write-only logger, metrics, and serial sink adoption through startup
+  CLI, config-file, and delayed API paths in the normal bundle; the delayed case
+  renames every launcher-opened source and plants replacements before claim,
+  then proves API/action logger records, initial and terminal metrics JSON, and
+  real guest console bytes append only to the opened originals;
+- malformed, missing, wrong-role, repeated metrics, and consumed output claims
+  fail without replacing prior sinks or consuming a valid cross-role grant;
+  faults and process output stay path/ID/reference-redacted; and
+- two simultaneous workers reuse the same three GrantIds in independent
+  registries, apply mutually exclusive logger module filters, start real guests,
+  and write logger/metrics/serial output only to their own opened objects while
+  planted replacement paths remain unchanged.
 
 The production target receives the same generated direct-boot ext4 fixture as
 the signed executable target, but supplies it only as an external drive grant;
@@ -1002,6 +1014,15 @@ round-trips serial MMIO metadata and six mutable register bytes, and constructs
 a fresh empty output buffer with empty UART metrics. It does not preserve
 public output configuration, buffered/in-flight TX bytes, limiter state, or
 counters.
+
+Contained output tests separately cover transferred regular files: the shared
+adoption helper rejects non-regular or non-`O_WRONLY` descriptors, verifies
+append/nonblocking status without upgrading access, and appends across multiple
+writes. Logger prepare/commit tests cover path-free sink retention and atomic
+replacement; metrics tests retain duplicate-before-claim and flush-baseline
+ordering; serial/startup tests cover clear/replacement, move-only prepared and
+consumed state, one-attempt failure, explicit reconfiguration, and debug
+redaction. Direct create/FIFO/open timing remains covered by the original tests.
 
 Production reachability is intentionally narrower than those normative tests.
 The existing API-driven and config-file-driven signed executable scenarios each

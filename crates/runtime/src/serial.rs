@@ -267,10 +267,23 @@ impl SerialRateLimiterConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SerialConfigInput {
     serial_out_path: Option<String>,
     rate_limiter: Option<SerialRateLimiterConfig>,
+}
+
+impl fmt::Debug for SerialConfigInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SerialConfigInput")
+            .field(
+                "serial_out_path",
+                &self.serial_out_path.as_ref().map(|_| "<redacted>"),
+            )
+            .field("rate_limiter", &self.rate_limiter)
+            .finish()
+    }
 }
 
 impl SerialConfigInput {
@@ -304,10 +317,23 @@ impl SerialConfigInput {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SerialConfig {
     serial_out_path: Option<PathBuf>,
     rate_limiter: Option<SerialRateLimiterConfig>,
+}
+
+impl fmt::Debug for SerialConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SerialConfig")
+            .field(
+                "serial_out_path",
+                &self.serial_out_path.as_ref().map(|_| "<redacted>"),
+            )
+            .field("rate_limiter", &self.rate_limiter)
+            .finish()
+    }
 }
 
 impl SerialConfig {
@@ -345,6 +371,7 @@ pub enum SerialConfigError {
     EmptyOutputPath,
     InvalidOutputPath,
     OpenOutput(std::io::ErrorKind),
+    ProvidedOutputWithoutPath,
 }
 
 impl fmt::Display for SerialConfigError {
@@ -356,6 +383,9 @@ impl fmt::Display for SerialConfigError {
             }
             Self::OpenOutput(kind) => {
                 write!(f, "serial output could not be initialized: {kind:?}")
+            }
+            Self::ProvidedOutputWithoutPath => {
+                f.write_str("provided serial output does not match configuration")
             }
         }
     }
@@ -604,9 +634,16 @@ fn serial_token_bucket(config: SerialRateLimiterConfig) -> Option<TokenBucket> {
     ))
 }
 
-#[derive(Debug)]
 pub struct SerialOutputFile {
     file: File,
+}
+
+impl fmt::Debug for SerialOutputFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SerialOutputFile")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SerialOutputFile {
@@ -619,6 +656,13 @@ impl SerialOutputFile {
             .open(path)
             .map_err(|err| SerialConfigError::OpenOutput(err.kind()))?;
 
+        Ok(Self { file })
+    }
+
+    /// Adopts an authority-provided write-only regular file as serial output.
+    pub fn from_file(file: File) -> Result<Self, SerialConfigError> {
+        let file = crate::output_file::adopt_write_only_file(file)
+            .map_err(SerialConfigError::OpenOutput)?;
         Ok(Self { file })
     }
 }
@@ -1076,7 +1120,7 @@ fn has_control_character(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1616,6 +1660,28 @@ mod tests {
         output.write_byte(b'b').expect("second byte should write");
 
         assert_eq!(fs::read(&path).expect("serial output should read"), b"ab");
+        fs::remove_file(path).expect("serial output should clean up");
+    }
+
+    #[test]
+    fn file_output_adopts_write_only_file_and_appends_bytes() {
+        let path = unique_serial_output_path("provided-file-output");
+        fs::write(&path, b"seed").expect("fixture should write");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("write-only fixture should open");
+        let mut output =
+            SerialOutputFile::from_file(file).expect("provided serial output should adopt");
+        assert_eq!(format!("{output:?}"), "SerialOutputFile { .. }");
+
+        output.write_byte(b'a').expect("first byte should write");
+        output.write_byte(b'b').expect("second byte should write");
+
+        assert_eq!(
+            fs::read(&path).expect("serial output should read"),
+            b"seedab"
+        );
         fs::remove_file(path).expect("serial output should clean up");
     }
 

@@ -70,8 +70,8 @@ use crate::pmem::{
 };
 use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use crate::serial::{
-    SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialMmioDevice, SharedSerialOutput,
-    SharedSerialOutputBuffer,
+    SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialMmioDevice, SerialOutputFile,
+    SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use crate::snapshot_device::{
     SnapshotV1BlockRetryState, SnapshotV1DeviceCaptureInput, SnapshotV1DeviceState,
@@ -100,6 +100,7 @@ pub struct VmStartupResources {
     boot_files: BootSourceFiles,
     block_backings: BTreeMap<String, BlockFileBacking>,
     pmem_backings: BTreeMap<String, PmemFileBacking>,
+    serial_output: Option<SerialOutputFile>,
 }
 
 impl fmt::Debug for VmStartupResources {
@@ -114,6 +115,10 @@ impl fmt::Debug for VmStartupResources {
             .field(
                 "pmem_backings",
                 &(!self.pmem_backings.is_empty()).then_some("<owned>"),
+            )
+            .field(
+                "serial_output",
+                &self.serial_output.as_ref().map(|_| "<owned>"),
             )
             .finish()
     }
@@ -130,6 +135,7 @@ impl VmStartupResources {
             boot_files,
             block_backings,
             pmem_backings,
+            serial_output: None,
         }
     }
 
@@ -138,12 +144,25 @@ impl VmStartupResources {
         Self::new(boot_files, BTreeMap::new(), BTreeMap::new())
     }
 
+    /// Adds an already-opened serial output for this startup attempt.
+    #[must_use]
+    pub fn with_serial_output(mut self, serial_output: SerialOutputFile) -> Self {
+        self.serial_output = Some(serial_output);
+        self
+    }
+
+    /// Takes the already-opened serial output, if one was supplied.
+    pub fn take_serial_output(&mut self) -> Option<SerialOutputFile> {
+        self.serial_output.take()
+    }
+
     /// Returns whether every startup resource should use its configured path.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.boot_files.is_empty()
             && self.block_backings.is_empty()
             && self.pmem_backings.is_empty()
+            && self.serial_output.is_none()
     }
 
     fn into_parts(
@@ -153,6 +172,7 @@ impl VmStartupResources {
         BTreeMap<String, BlockFileBacking>,
         BTreeMap<String, PmemFileBacking>,
     ) {
+        debug_assert!(self.serial_output.is_none());
         (self.boot_files, self.block_backings, self.pmem_backings)
     }
 }
@@ -4225,10 +4245,11 @@ mod tests {
         Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources,
         Arm64BootRtcDeviceConfig, Arm64BootRtcMmioRegistrationError, Arm64BootSerialDeviceConfig,
         Arm64BootSerialMmioRegistrationError, Arm64BootVmGenIdDevice,
-        Arm64BootVmGenIdReplacementError, MIB, arm64_boot_network_device_metadata,
-        balloon_hinting_status_for_device, balloon_stats_for_device, block_device_metadata,
-        ensure_nonzero_vmgenid_generation_id, initial_vmclock_abi_bytes, initial_vmclock_range,
-        initial_vmgenid_range, replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
+        Arm64BootVmGenIdReplacementError, MIB, VmStartupResources,
+        arm64_boot_network_device_metadata, balloon_hinting_status_for_device,
+        balloon_stats_for_device, block_device_metadata, ensure_nonzero_vmgenid_generation_id,
+        initial_vmclock_abi_bytes, initial_vmclock_range, initial_vmgenid_range,
+        replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
         stop_balloon_hinting_for_device, update_balloon_config_for_device,
         update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
     };
@@ -4409,6 +4430,24 @@ mod tests {
 
     fn missing_path(name: &str) -> PathBuf {
         temp_path(name)
+    }
+
+    #[test]
+    fn startup_resources_retain_and_redact_provided_serial_output() {
+        let fixture = temp_file("provided-serial", b"seed");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(fixture.path())
+            .expect("write-only serial fixture should open");
+        let output = SerialOutputFile::from_file(file).expect("serial output should adopt");
+        let mut resources = VmStartupResources::default().with_serial_output(output);
+
+        assert!(!resources.is_empty());
+        let debug = format!("{resources:?}");
+        assert!(debug.contains("serial_output: Some(\"<owned>\")"));
+        assert!(!debug.contains(fixture.path().to_string_lossy().as_ref()));
+        assert!(resources.take_serial_output().is_some());
+        assert!(resources.is_empty());
     }
 
     fn arm64_image() -> Vec<u8> {
