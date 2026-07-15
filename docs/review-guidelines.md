@@ -120,9 +120,24 @@ signed worker before resume and again after child-attributed `Hello`; the worker
 can require only matching effective credentials, the inherited endpoint, and
 `LOCAL_PEERPID == getppid()` because App Sandbox denies its parent-code lookup.
 No public/VM/resource side effect may precede random-session `Start` and the
-independently validated `Prepared`/`Proceed` namespace gate. Keep v1 frames at
-4096 bytes or less, sequences exact, message/state variants closed, diagnostics
-redacted, and the all-zero identity exclusive to the initial greeting.
+independently validated `Prepared`/grant-ack/`Proceed` gates. Keep lifecycle v2
+frames at 4096 bytes or less, sequences exact, message/state variants closed,
+diagnostics redacted, and the all-zero identity exclusive to the initial
+greeting. Even an empty grant batch must be acknowledged before `Proceed`.
+
+For startup-grant changes, separately review the argv-position-one envelope,
+strict manifest bounds, component-by-component no-follow opening, role/access
+matrix, alias/type/identity checks, and all-before-spawn preparation. Grant
+datagrams must remain at most 1024 bytes and bind session, batch, sequence,
+payload length, reserved fields, and actual descriptor count. Ancillary parsing
+must own every received fd before later validation, reject truncation or
+malformed cmsghdr values, set FD_CLOEXEC, and drop the entire staged batch on any
+error. Directory bookmarks are allowed only for the closed create-children
+roles with an exact anchor, balanced scope, concrete access validation, and no
+operator-supplied or persisted bytes. Treat the stale bit as private evidence,
+not sufficient validity or invalidity. Registry adoption must be one-time and
+typed with no ambient path fallback. Closing a sender duplicate is cleanup, not
+hard revocation.
 
 ## Concurrency and Resource Management
 
@@ -149,7 +164,9 @@ escalation, and concurrent launchers must never share session state or signal,
 reap, or clean each other's workers and namespaces. Absolute handshake
 deadlines must survive fragmented reads and `EINTR`; `Terminal` or EOF must also
 start a bounded owned-process exit grace rather than permitting an indefinite
-wait.
+wait. Grant sending must remain nonblocking in the same event loop, continue to
+observe signals, lifecycle input, and child exit, and use one absolute
+send-plus-acknowledgment deadline.
 
 ## Performance Review
 

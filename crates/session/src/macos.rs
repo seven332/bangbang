@@ -3,6 +3,9 @@
 use std::io;
 use std::os::fd::RawFd;
 
+pub mod bookmark;
+pub mod grant_registry;
+pub mod grant_transport;
 pub mod runtime;
 
 /// Kernel-authenticated identity of a connected local-socket peer.
@@ -16,7 +19,7 @@ pub struct PeerIdentity {
     pub pid: libc::pid_t,
 }
 
-/// Reads effective credentials and live PID from a connected Unix stream.
+/// Reads effective credentials and live PID from a connected Unix socket.
 pub fn peer_identity(fd: RawFd) -> io::Result<PeerIdentity> {
     let mut uid = 0;
     let mut gid = 0;
@@ -26,6 +29,12 @@ pub fn peer_identity(fd: RawFd) -> io::Result<PeerIdentity> {
         return Err(io::Error::last_os_error());
     }
 
+    let pid = peer_pid(fd)?;
+    Ok(PeerIdentity { uid, gid, pid })
+}
+
+/// Reads the live PID from any connected Darwin local socket.
+pub fn peer_pid(fd: RawFd) -> io::Result<libc::pid_t> {
     let mut pid = 0;
     let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::pid_t>())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -46,7 +55,7 @@ pub fn peer_identity(fd: RawFd) -> io::Result<PeerIdentity> {
     if usize::try_from(length).ok() != Some(std::mem::size_of::<libc::pid_t>()) || pid <= 0 {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
-    Ok(PeerIdentity { uid, gid, pid })
+    Ok(pid)
 }
 
 /// Verifies the exact effective identity and PID expected by one side.
@@ -60,6 +69,15 @@ pub fn verify_peer(fd: RawFd, expected_pid: libc::pid_t) -> io::Result<PeerIdent
         return Err(io::Error::from(io::ErrorKind::PermissionDenied));
     }
     Ok(peer)
+}
+
+/// Verifies the live PID of a connected local socket peer.
+pub fn verify_peer_pid(fd: RawFd, expected_pid: libc::pid_t) -> io::Result<libc::pid_t> {
+    let pid = peer_pid(fd)?;
+    if pid != expected_pid {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
+    Ok(pid)
 }
 
 /// Marks a taken bootstrap descriptor close-on-exec immediately.
@@ -79,7 +97,7 @@ pub fn set_cloexec(fd: RawFd) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsRawFd;
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
 
     use super::*;
 
@@ -99,5 +117,20 @@ mod tests {
         let error = verify_peer(left.as_raw_fd(), wrong_pid)
             .expect_err("a mismatched expected PID must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn datagram_socketpair_reports_current_process() {
+        let (left, _right) = UnixDatagram::pair().expect("datagram pair should open");
+        // SAFETY: getpid has no pointer or ownership contract.
+        let current = unsafe { libc::getpid() };
+        assert_eq!(
+            peer_pid(left.as_raw_fd()).expect("datagram peer PID should read"),
+            current
+        );
+        assert_eq!(
+            verify_peer_pid(left.as_raw_fd(), current).expect("datagram peer PID should verify"),
+            current
+        );
     }
 }

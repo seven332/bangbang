@@ -693,10 +693,12 @@ identity is part of this test contract. `--allow-unsupported` still builds and
 signs both app bundles before runtime validation may be skipped.
 
 The `production_bundle` target exercises the shipped topology instead of the
-minimal App Sandbox fixtures. It performs a release build, creates one fixed
-outer app and separately signed nested worker, inspects both signatures, and
-compiles the disabled-by-default `production_bundle_e2e` target before an
-unsupported runner may skip execution. On supported Apple Silicon it proves:
+minimal App Sandbox fixtures. It first performs an explicit no-default-feature
+release build for the normal fixed outer app and separately signed nested
+worker. It then builds a visibly test-only second bundle with only the
+`grant-integration-probe` feature and marker resource, and compiles the
+disabled-by-default `production_bundle_e2e` target before an unsupported runner
+may skip execution. On supported Apple Silicon it proves:
 
 - exact launcher and worker identifiers, Hardened Runtime on both, no launcher
   App Sandbox/Hypervisor authority, and exactly those two worker entitlements;
@@ -706,8 +708,9 @@ unsupported runner may skip execution. On supported Apple Silicon it proves:
   or missing worker;
 - suspended and post-`Hello` live-worker validation, bounded malformed bootstrap
   rejection before public readiness, and stable path/identity/frame redaction;
-- a default-close spawn allowlist that retains standard streams and the private
-  endpoint while making a deliberately inheritable unexpected fd unavailable;
+- a default-close spawn allowlist that retains standard streams plus only the
+  private lifecycle and grant endpoints while making a deliberately inheritable
+  unexpected fd unavailable;
 - container-only API socket readiness plus path-redacted denial of an outside
   config file;
 - `SIGINT` and `SIGTERM` as one graceful session cancellation with successful
@@ -716,23 +719,37 @@ unsupported runner may skip execution. On supported Apple Silicon it proves:
   recovery, and preservation of the concurrent peer namespace;
 - two simultaneous API sessions remaining independent when one worker is
   killed and the other is queried and then gracefully stopped; and
+- mandatory lifecycle-v2 acknowledgment for even an empty batch; exact
+  SCM_RIGHTS read-only/write-only enforcement; one-session directory bookmark
+  scope and outside-parent denial; typed mismatch rollback; path/ID/content
+  redaction; signal cancellation during an incomplete batch; one absolute grant
+  deadline; both grant-bearing crash orders; and concurrent sessions whose
+  distinct grant authority cannot be interchanged;
+- rejection of the internal grant probe by the normal production worker with no
+  resource mutation, proving the exerciser is absent from the shipped build;
+  and
 - a sealed test-only kernel/initrd/config launching a real sandboxed HVF guest
   after committed no-API readiness and ending through PSCI `SYSTEM_OFF`.
 
-The runner's resource overlay is an internal signed-test input to the lower-
-level package tool. `scripts/build-production-bundle.sh` does not expose it or
-place guest resources in a normal product. Tests use readiness events and
-bounded deadlines rather than fixed sleeps.
+The runner's resource overlays and grant exerciser are internal signed-test
+inputs. `scripts/build-production-bundle.sh` explicitly excludes the feature,
+does not expose an overlay, and places no guest resources in a normal product.
+The all-features development binary is not a shippable bundle. Tests use
+readiness events and bounded deadlines rather than fixed sleeps.
 
-Portable `bangbang-session` tests exhaustively split and coalesce every v1
+Portable `bangbang-session` tests exhaustively split and coalesce every v2
 message frame and cover wrong magic/version/reserved data, exact frame/buffer
 limits, oversized input, EOF rejection, replay, sequence gaps, cross-session and
 wrong-role/state input, reserved identity use, monotonic API/early-command/
-cancellation state, and payload/identity-redacted formatting. Darwin unit tests
-cover kernel peer acceptance and PID rejection, exact namespace naming/root
-derivation, bounded independent directory iteration across repeated checks,
-stale empty-directory recovery, populated-entry preservation, and
-replacement-safe cleanup. These tests do not replace the signed target:
+cancellation/grant state, and payload/identity-redacted formatting. Grant codec
+tests cover every closed record, limit and descriptor declaration. Darwin unit
+tests cover SCM_RIGHTS and FD_CLOEXEC, payload/control truncation, malformed
+ancillary cleanup, exact descriptor access/type/identity, sequence/session/batch
+poisoning and rollback, fragmented bookmark scope, kernel peer acceptance and
+PID rejection, exact namespace naming/root derivation, bounded independent
+directory iteration across repeated checks, stale empty-directory recovery,
+populated-entry preservation, and replacement-safe cleanup. These tests do not
+replace the signed target:
 default-close spawning, dynamic code identity, App Sandbox root resolution,
 crash order, and real HVF claims require the packaged execution above.
 

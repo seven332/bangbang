@@ -1,4 +1,7 @@
-use crate::{Frame, Message, ProtocolError, Readiness, Role, SessionId};
+use crate::{
+    BatchId, Frame, MAX_GRANT_RECORDS, MAX_GRANTS, Message, ProtocolError, Readiness, Role,
+    SessionId,
+};
 
 /// Launcher-observed monotonic lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,7 +12,9 @@ pub enum LauncherState {
     ReadyToStart,
     /// `Start` was sent; namespace proof is pending.
     AwaitPrepared,
-    /// A valid namespace proof arrived and local validation may authorize it.
+    /// A valid namespace proof arrived and the mandatory grant batch is pending.
+    AwaitGrants,
+    /// The exact grant batch was accepted and startup may be authorized.
     ReadyToProceed,
     /// Namespace was accepted and `Proceed` was sent.
     AwaitStarting,
@@ -28,7 +33,9 @@ pub enum WorkerState {
     AwaitStart,
     /// `Start` was accepted; the namespace has not yet been reported.
     Preparing,
-    /// Namespace is locked and `Proceed` or early cancellation is pending.
+    /// Namespace is locked and the mandatory grant batch is pending.
+    AwaitGrants,
+    /// Grants were atomically committed and startup or cancellation is pending.
     AwaitProceed,
     /// Public command/startup processing has begun.
     Starting,
@@ -46,6 +53,7 @@ pub struct LauncherLifecycle {
     incoming_sequence: u64,
     outgoing_sequence: u64,
     cancelled: bool,
+    expected_grants: Option<(BatchId, u16, u64)>,
 }
 
 impl LauncherLifecycle {
@@ -58,6 +66,7 @@ impl LauncherLifecycle {
             incoming_sequence: 0,
             outgoing_sequence: 0,
             cancelled: false,
+            expected_grants: None,
         }
     }
 
@@ -100,12 +109,33 @@ impl LauncherLifecycle {
         self.outgoing(Message::Proceed)
     }
 
+    /// Binds the exact grant acknowledgment expected before startup.
+    pub fn expect_grants(
+        &mut self,
+        batch: BatchId,
+        grant_count: u16,
+        final_sequence: u64,
+    ) -> Result<(), ProtocolError> {
+        if self.state != LauncherState::AwaitGrants
+            || self.cancelled
+            || self.expected_grants.is_some()
+            || batch.is_zero()
+            || grant_count > MAX_GRANTS
+            || !(1..u64::from(MAX_GRANT_RECORDS)).contains(&final_sequence)
+        {
+            return Err(ProtocolError::InvalidLifecycle);
+        }
+        self.expected_grants = Some((batch, grant_count, final_sequence));
+        Ok(())
+    }
+
     /// Creates the only cancellation frame for this session.
     pub fn cancel(&mut self, signal: crate::CancelSignal) -> Result<Frame, ProtocolError> {
         if self.cancelled
             || !matches!(
                 self.state,
                 LauncherState::AwaitPrepared
+                    | LauncherState::AwaitGrants
                     | LauncherState::ReadyToProceed
                     | LauncherState::AwaitStarting
                     | LauncherState::Starting
@@ -134,6 +164,17 @@ impl LauncherLifecycle {
         self.validate_incoming(frame, Role::Worker)?;
         match (self.state, frame.message) {
             (LauncherState::AwaitPrepared, Message::Prepared { .. }) => {
+                self.state = LauncherState::AwaitGrants;
+            }
+            (
+                LauncherState::AwaitGrants,
+                Message::GrantsAccepted {
+                    batch,
+                    grant_count,
+                    final_sequence,
+                },
+            ) if self.expected_grants == Some((batch, grant_count, final_sequence)) => {
+                self.expected_grants = None;
                 self.state = LauncherState::ReadyToProceed;
             }
             (LauncherState::AwaitStarting, Message::Starting) => {
@@ -147,7 +188,9 @@ impl LauncherLifecycle {
             }
             // A cancelled bootstrap may still report Prepared before it sees Cancel.
             (
-                LauncherState::AwaitPrepared | LauncherState::ReadyToProceed,
+                LauncherState::AwaitPrepared
+                | LauncherState::AwaitGrants
+                | LauncherState::ReadyToProceed,
                 Message::Terminal { .. },
             ) if self.cancelled => {
                 self.state = LauncherState::Terminal;
@@ -250,6 +293,7 @@ impl WorkerLifecycle {
             }
             (
                 WorkerState::Preparing
+                | WorkerState::AwaitGrants
                 | WorkerState::AwaitProceed
                 | WorkerState::Starting
                 | WorkerState::Ready(_),
@@ -285,8 +329,31 @@ impl WorkerLifecycle {
         if self.state != WorkerState::Preparing || self.cancelled {
             return Err(ProtocolError::InvalidLifecycle);
         }
-        self.state = WorkerState::AwaitProceed;
+        self.state = WorkerState::AwaitGrants;
         self.outgoing(Message::Prepared { device, inode })
+    }
+
+    /// Reports atomic grant acceptance and starts the startup-authorization wait.
+    pub fn grants_accepted(
+        &mut self,
+        batch: BatchId,
+        grant_count: u16,
+        final_sequence: u64,
+    ) -> Result<Frame, ProtocolError> {
+        if self.state != WorkerState::AwaitGrants
+            || self.cancelled
+            || batch.is_zero()
+            || grant_count > MAX_GRANTS
+            || !(1..u64::from(MAX_GRANT_RECORDS)).contains(&final_sequence)
+        {
+            return Err(ProtocolError::InvalidLifecycle);
+        }
+        self.state = WorkerState::AwaitProceed;
+        self.outgoing(Message::GrantsAccepted {
+            batch,
+            grant_count,
+            final_sequence,
+        })
     }
 
     /// Creates the starting notification after valid `Proceed`.
@@ -363,6 +430,17 @@ mod tests {
         assert_eq!(worker.receive(start), Ok(Message::Start));
     }
 
+    fn exchange_grants(launcher: &mut LauncherLifecycle, worker: &mut WorkerLifecycle) {
+        let batch = BatchId::from_bytes([9; 16]);
+        launcher
+            .expect_grants(batch, 0, 1)
+            .expect("grant expectation should bind");
+        let accepted = worker
+            .grants_accepted(batch, 0, 1)
+            .expect("grant acceptance should send");
+        assert_eq!(launcher.receive(accepted), Ok(accepted.message));
+    }
+
     #[test]
     fn api_lifecycle_is_monotonic() {
         let mut launcher = LauncherLifecycle::new(session(1));
@@ -370,6 +448,7 @@ mod tests {
         exchange_start(&mut launcher, &mut worker);
         let prepared = worker.prepared(2, 3).expect("prepared should send");
         assert_eq!(launcher.receive(prepared), Ok(prepared.message));
+        exchange_grants(&mut launcher, &mut worker);
         let proceed = launcher.proceed().expect("proceed should send");
         assert_eq!(worker.receive(proceed), Ok(Message::Proceed));
         let starting = worker.starting().expect("starting should send");
@@ -391,6 +470,7 @@ mod tests {
         launcher
             .receive(worker.prepared(4, 5).expect("prepared should send"))
             .expect("prepared should receive");
+        exchange_grants(&mut launcher, &mut worker);
         worker
             .receive(launcher.proceed().expect("proceed should send"))
             .expect("proceed should receive");
@@ -521,6 +601,8 @@ mod tests {
 
         let prepared = worker.prepared(10, 11).expect("prepared should send");
         launcher.receive(prepared).expect("prepared should receive");
+        assert_eq!(launcher.proceed(), Err(ProtocolError::InvalidLifecycle));
+        exchange_grants(&mut launcher, &mut worker);
         let proceed = launcher.proceed().expect("proceed should now send");
         assert_eq!(worker.receive(proceed), Ok(Message::Proceed));
     }

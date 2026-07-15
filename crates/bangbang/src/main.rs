@@ -12,6 +12,8 @@ use std::time::Instant;
 
 mod api_server;
 mod contained_session;
+#[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
+mod grant_integration_probe;
 #[doc(hidden)]
 #[cfg(target_os = "macos")]
 pub mod host_network;
@@ -89,7 +91,14 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
     if contained_shutdown_requested(contained)? {
         return Ok(());
     }
-    let args = parse_process_args(env::args_os().skip(1))?;
+    let raw_args = env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
+    if grant_integration_probe::is_requested(&raw_args) {
+        let session = contained.as_mut().ok_or(ProcessError::ContainedSession)?;
+        return grant_integration_probe::run(session, &raw_args)
+            .map_err(|_| ProcessError::ContainedSession);
+    }
+    let args = parse_process_args(raw_args)?;
     if contained_shutdown_requested(contained)? {
         return Ok(());
     }

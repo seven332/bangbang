@@ -7,6 +7,8 @@ repository.workspace = true
 [dependencies]
 bangbang-session = { path = "../session" }
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 signal-hook = "0.3"
 
 [[bin]]

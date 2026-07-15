@@ -240,7 +240,7 @@ build_production_bundle_tests() {
     --bin bangbang \
     --bin bangbang-launcher \
     --release \
-    --all-features \
+    --no-default-features \
     --locked \
     --target "$target_triple"
 
@@ -283,6 +283,31 @@ PY
     --output "$production_bundle_path" \
     --signing-identity - \
     --test-worker-resources "$production_resources"
+
+  cargo build \
+    -p bangbang \
+    --bin bangbang \
+    --release \
+    --no-default-features \
+    --features grant-integration-probe \
+    --locked \
+    --target "$target_triple"
+
+  production_grant_test_bundle_path="$tmp_dir/grant-integration-test/Bangbang.app"
+  production_grant_test_resources="$tmp_dir/grant-integration-test-resources"
+  mkdir -p "$tmp_dir/grant-integration-test" "$production_grant_test_resources"
+  python3 - "$production_grant_test_resources/grant-integration-probe.enabled" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_text("test-only\n", encoding="utf-8")
+PY
+  "$repo_root/target/release/bangbang-bundle" \
+    --launcher "$repo_root/target/$target_triple/release/bangbang-launcher" \
+    --worker "$repo_root/target/$target_triple/release/bangbang" \
+    --output "$production_grant_test_bundle_path" \
+    --signing-identity - \
+    --test-worker-resources "$production_grant_test_resources"
 
   cargo test \
     -p bangbang-launcher \
@@ -346,6 +371,7 @@ executable_hvf_e2e_bangbang=""
 app_sandbox_hvf_bin=""
 app_sandbox_bangbang_bin=""
 production_bundle_path=""
+production_grant_test_bundle_path=""
 
 for test_name in "${selected_tests[@]}"; do
   case "$test_name" in
@@ -457,6 +483,7 @@ fi
 if contains production_bundle "${selected_tests[@]}"; then
   if [[ "${#test_args[@]}" -eq 0 ]]; then
     BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
+      BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH="$production_grant_test_bundle_path" \
       cargo test \
         -p bangbang-launcher \
         --test production_bundle_e2e \
@@ -467,6 +494,7 @@ if contains production_bundle "${selected_tests[@]}"; then
         --test-threads=1
   else
     BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
+      BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH="$production_grant_test_bundle_path" \
       cargo test \
         -p bangbang-launcher \
         --test production_bundle_e2e \

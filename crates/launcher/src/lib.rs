@@ -1,6 +1,8 @@
 //! Production macOS bundle construction and launcher supervision.
 
 mod error;
+#[cfg(target_os = "macos")]
+mod grant_manifest;
 mod layout;
 #[cfg(target_os = "macos")]
 mod macos;
