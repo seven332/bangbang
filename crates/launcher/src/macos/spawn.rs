@@ -1,4 +1,3 @@
-use std::env;
 use std::ffi::{CString, OsStr, OsString, c_char};
 use std::io;
 use std::mem::MaybeUninit;
@@ -16,6 +15,10 @@ use bangbang_session::{
 use crate::LauncherError;
 
 const MIN_TRANSPORT_FD: RawFd = 10;
+pub(crate) const DAEMON_HANDOFF_FD: RawFd = 6;
+pub(crate) const DAEMON_ENV_KEY: &str = "BANGBANG_INTERNAL_DAEMON_V1";
+pub(crate) const DAEMON_ENV_VALUE: &str = "1";
+const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
 
 unsafe extern "C" {
     fn posix_spawn_file_actions_addinherit_np(
@@ -28,6 +31,7 @@ unsafe extern "C" {
 pub(crate) struct OwnedWorker {
     pid: libc::pid_t,
     status: Option<ExitStatus>,
+    released: bool,
 }
 
 impl std::fmt::Debug for OwnedWorker {
@@ -36,6 +40,7 @@ impl std::fmt::Debug for OwnedWorker {
             .debug_struct("OwnedWorker")
             .field("pid", &self.pid)
             .field("reaped", &self.status.is_some())
+            .field("released", &self.released)
             .finish()
     }
 }
@@ -111,11 +116,18 @@ impl OwnedWorker {
         }
         let _ = self.wait();
     }
+
+    pub(crate) fn release(mut self) -> libc::pid_t {
+        self.released = true;
+        self.pid
+    }
 }
 
 impl Drop for OwnedWorker {
     fn drop(&mut self) {
-        self.terminate_and_reap();
+        if !self.released {
+            self.terminate_and_reap();
+        }
     }
 }
 
@@ -153,7 +165,7 @@ pub(crate) fn spawn_suspended(
     let env_pointers = pointer_array(&env);
 
     let mut attributes = SpawnAttributes::new()?;
-    attributes.configure()?;
+    attributes.configure(false)?;
     let mut actions = SpawnFileActions::new()?;
     for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
         if descriptor_is_open(fd)? {
@@ -196,11 +208,95 @@ pub(crate) fn spawn_suspended(
     drop(grant_child);
     drop(broker_child);
     Ok(SuspendedWorker {
-        worker: OwnedWorker { pid, status: None },
+        worker: OwnedWorker {
+            pid,
+            status: None,
+            released: false,
+        },
         session: parent,
         grants: grant_parent,
         socket_broker: broker_parent,
     })
+}
+
+pub(crate) fn spawn_daemon_suspended(
+    executable: &Path,
+    args: Vec<OsString>,
+) -> Result<(OwnedWorker, UnixStream), LauncherError> {
+    let (parent, child) =
+        UnixStream::pair().map_err(|error| LauncherError::SessionSetup(error.kind()))?;
+    let parent = duplicate_stream_at_or_above(parent, MIN_TRANSPORT_FD)?;
+    let child = duplicate_stream_at_or_above(child, MIN_TRANSPORT_FD)?;
+    // SAFETY: The fixed path is NUL-terminated; a successful descriptor is
+    // immediately transferred into `OwnedFd`.
+    let null_fd = unsafe {
+        libc::open(
+            c"/dev/null".as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if null_fd < 0 {
+        return Err(LauncherError::DaemonHandoff);
+    }
+    // SAFETY: `null_fd` is a fresh successful descriptor owned by this scope.
+    let null_fd = unsafe { OwnedFd::from_raw_fd(null_fd) };
+    let null_fd = duplicate_fd_at_or_above(null_fd.as_raw_fd(), MIN_TRANSPORT_FD)?;
+
+    let executable = cstring(executable.as_os_str()).map_err(|_| LauncherError::DaemonHandoff)?;
+    let argv = argv(&executable, args)?;
+    let env = vec![
+        CString::new(format!("{DAEMON_ENV_KEY}={DAEMON_ENV_VALUE}"))
+            .map_err(|_| LauncherError::DaemonHandoff)?,
+    ];
+    let argv_pointers = pointer_array(&argv);
+    let env_pointers = pointer_array(&env);
+    let mut attributes = SpawnAttributes::new()?;
+    attributes.configure(true)?;
+    let mut actions = SpawnFileActions::new()?;
+    for standard in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        actions.duplicate(null_fd.as_raw_fd(), standard)?;
+    }
+    actions.duplicate(child.as_raw_fd(), DAEMON_HANDOFF_FD)?;
+    if child.as_raw_fd() != DAEMON_HANDOFF_FD {
+        actions.close(child.as_raw_fd())?;
+    }
+    actions.close(null_fd.as_raw_fd())?;
+
+    let mut pid = 0;
+    // SAFETY: All strings, pointer arrays, actions, attributes, and output PID
+    // storage remain live for this synchronous spawn call.
+    let result = unsafe {
+        libc::posix_spawn(
+            &raw mut pid,
+            executable.as_ptr(),
+            actions.as_ptr(),
+            attributes.as_ptr(),
+            argv_pointers.as_ptr(),
+            env_pointers.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(LauncherError::DaemonHandoff);
+    }
+    drop(child);
+    Ok((
+        OwnedWorker {
+            pid,
+            status: None,
+            released: false,
+        },
+        parent,
+    ))
+}
+
+fn duplicate_fd_at_or_above(fd: RawFd, minimum: RawFd) -> Result<OwnedFd, LauncherError> {
+    // SAFETY: The source is live for `fcntl`; success returns a fresh descriptor.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
+    if duplicate < 0 {
+        return Err(LauncherError::DaemonHandoff);
+    }
+    // SAFETY: `duplicate` is a fresh descriptor whose ownership is transferred.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
 fn duplicate_stream_at_or_above(
@@ -261,30 +357,10 @@ fn argv(executable: &CString, args: Vec<OsString>) -> Result<Vec<CString>, Launc
 }
 
 fn environment() -> Result<Vec<CString>, LauncherError> {
-    environment_from(env::vars_os())
-}
-
-fn environment_from<I>(variables: I) -> Result<Vec<CString>, LauncherError>
-where
-    I: IntoIterator<Item = (OsString, OsString)>,
-{
-    let key = OsStr::new(SESSION_ENV_KEY);
-    let mut entries = variables
-        .into_iter()
-        .filter(|(name, _)| name != key)
-        .map(|(name, value)| {
-            let mut entry = Vec::with_capacity(name.len().saturating_add(value.len()) + 1);
-            entry.extend_from_slice(name.as_bytes());
-            entry.push(b'=');
-            entry.extend_from_slice(value.as_bytes());
-            CString::new(entry).map_err(|_| LauncherError::WorkerSpawn(io::ErrorKind::InvalidInput))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.push(
+    Ok(vec![
         CString::new(format!("{SESSION_ENV_KEY}={SESSION_ENV_VALUE}"))
             .map_err(|_| LauncherError::WorkerSpawn(io::ErrorKind::InvalidInput))?,
-    );
-    Ok(entries)
+    ])
 }
 
 fn pointer_array(values: &[CString]) -> Vec<*mut c_char> {
@@ -316,7 +392,7 @@ impl SpawnAttributes {
         Ok(attributes)
     }
 
-    fn configure(&mut self) -> Result<(), LauncherError> {
+    fn configure(&mut self, create_session: bool) -> Result<(), LauncherError> {
         let mut defaults = MaybeUninit::<libc::sigset_t>::uninit();
         // SAFETY: `defaults` is writable for a signal set.
         if unsafe { libc::sigemptyset(defaults.as_mut_ptr()) } != 0 {
@@ -334,9 +410,12 @@ impl SpawnAttributes {
         cvt_spawn(unsafe {
             libc::posix_spawnattr_setsigdefault(self.value.as_mut_ptr(), defaults.as_ptr())
         })?;
-        let flags = libc::POSIX_SPAWN_CLOEXEC_DEFAULT
+        let mut flags = libc::POSIX_SPAWN_CLOEXEC_DEFAULT
             | libc::POSIX_SPAWN_START_SUSPENDED
             | libc::POSIX_SPAWN_SETSIGDEF;
+        if create_session {
+            flags |= POSIX_SPAWN_SETSID;
+        }
         let flags = libc::c_short::try_from(flags)
             .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
         // SAFETY: This wrapper owns one initialized attribute object.
@@ -421,19 +500,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_environment_value_replaces_inherited_copy() {
-        let entries = environment_from([
-            (OsString::from("ORDINARY"), OsString::from("value")),
-            (OsString::from(SESSION_ENV_KEY), OsString::from("forged")),
-        ])
-        .expect("environment should encode");
-        let matching = entries
-            .iter()
-            .filter(|entry| entry.as_bytes().starts_with(SESSION_ENV_KEY.as_bytes()))
-            .collect::<Vec<_>>();
-        assert_eq!(matching.len(), 1);
+    fn private_environment_contains_only_the_lifecycle_marker() {
+        let entries = environment().expect("environment should encode");
+        assert_eq!(entries.len(), 1);
         assert_eq!(
-            matching[0].as_bytes(),
+            entries[0].as_bytes(),
             format!("{SESSION_ENV_KEY}={SESSION_ENV_VALUE}").as_bytes()
         );
     }

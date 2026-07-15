@@ -54,29 +54,42 @@ worker process and repeats that live-code check after bootstrap, so the launch
 authorization is not based only on a pre-spawn pathname check.
 
 The launcher in [`supervisor.rs`](../../../crates/launcher/src/supervisor.rs)
-passes every worker argument byte in order and preserves ordinary environment
-entries while replacing one private bootstrap marker. The Darwin wrapper in
+passes ordinary worker argument bytes unchanged, or accepts one exact
+argv-position-one `--bangbang-jailer-v1 ... --` policy envelope before the
+existing optional grant envelope. The policy binds one ID, the exact embedded
+worker, current real/effective uid and gid, repeatable last-value
+`fsize`/`no-file` limits, and optional daemon mode; it injects the ID and sampled
+timing once and rejects conflicting forwarded singletons. The Darwin wrapper in
 [`spawn.rs`](../../../crates/launcher/src/macos/spawn.rs) uses
 `POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_START_SUSPENDED`, explicitly retains
 each open standard stream, and duplicates only an unnamed lifecycle stream
 endpoint to descriptor 3, an unnamed startup-grant datagram endpoint to
 descriptor 4, and one dormant socket-broker datagram endpoint to descriptor 5.
+It constructs the exec environment from only the private lifecycle marker;
+ambient parent, loader, and debug variables are not forwarded. Darwin may add
+runtime-owned entries, but none carries caller authority.
 The launcher dynamically validates the live
 worker while suspended, resumes only the private bootstrap, reads one bounded
 reserved `Hello`, verifies the now-child-attributed peer PID/credentials,
-revalidates live code, and only then sends a random session identity in `Start`.
+revalidates live code, and only then sends a random session identity plus one
+fixed redacted `WorkerPolicy` in `Start`.
 
 [`bangbang-session`](../../../crates/session/src/lib.rs) defines the closed
-lifecycle-v2 binary contract. Frames have fixed magic/version/reserved fields, a 256-bit
+lifecycle-v3 binary contract. Frames have fixed magic/version/reserved fields, a 256-bit
 identity, exact per-direction sequence numbers, fixed payload shapes, and a
 4096-byte cap. Replay, sequence gaps, cross-session or wrong-role messages,
 malformed/unknown/oversized/truncated data, and invalid lifecycle transitions
 fail with one redacted category. State is monotonic through `Hello`, `Start`,
 `Prepared`, exact `GrantsAccepted`, `Proceed`, `Starting`, optional committed API/no-API `Ready`, one
 graceful `Cancel`, and path-free `Terminal`. The worker verifies matching
-effective credentials and `LOCAL_PEERPID == getppid()` before and after the
-gate. App Sandbox denies its Security.framework lookup of the parent, so only
-the launcher code-validates its peer; this asymmetry is part of the contract.
+real/effective credentials, matching process session, and
+`LOCAL_PEERPID == getppid()` before the policy can affect public processing. It
+applies exact soft/hard `RLIMIT_FSIZE` and `RLIMIT_NOFILE` values without raising
+the inherited hard bound, reads them back, creates the private namespace, enters
+it through the retained descriptor, and verifies cwd identity before
+`Prepared`. The default production no-file value is 2048. App Sandbox denies
+its Security.framework lookup of the parent, so only the launcher code-validates
+its peer; this asymmetry is part of the contract.
 `Hello`, `Start`, the grant transaction, and `Proceed` have absolute five-second
 deadlines, and `Terminal` or EOF starts a five-second owned-process exit grace.
 
@@ -93,7 +106,8 @@ until Commit moves everything into one bounded session registry. Even an empty
 batch requires an exact acknowledgment before `Proceed`.
 
 The worker creates and locks one exact mode-0700 empty namespace beneath its
-fixed container temp root. `Prepared` reports only device/inode. The launcher
+fixed container temp root and enters it by descriptor. `Prepared` reports only
+device/inode. The launcher
 independently derives the root and checks exact name, type, owner, mode,
 device/inode, emptiness, and live lock before grant acknowledgment and
 `Proceed`. No endpoint, argument, identity byte, or resource grant is stored
@@ -105,6 +119,19 @@ residue when both were killed. Same-identifier workers share container
 authority, so this is cooperative replacement-safe ownership rather than
 malicious-sibling isolation.
 
+Daemon policy re-executes the same statically and dynamically validated outer
+launcher with `CLOEXEC_DEFAULT | START_SUSPENDED | SETSID`, an environment
+containing only one private handoff marker, `/dev/null` on descriptors 0–2, and
+one fixed handoff stream on descriptor 6. The daemon child authenticates its
+direct parent and same-code identity, repeats bundle/policy/grant validation,
+and remains the sole worker supervisor. A closed reserved-zero 40-byte protocol
+provides `Hello`, timing `Start`, worker `Ready(supervisor PID)`, exact PID
+`Ack`, and redacted pre-Ready failure. The original caller prints one PID line
+only after committed API/no-API readiness and acknowledgment. Parent EOF or a
+signal before acknowledgment cancels the unpublished worker; afterward the
+handoff closes and SIGINT/SIGTERM to the returned supervisor PID uses ordinary
+session cancellation, reap, and identity-safe cleanup.
+
 ## Trust and resource authority
 
 The outer launcher, fixed package metadata, and signed nested executable are
@@ -114,9 +141,10 @@ worker. Product errors expose stable categories rather than package paths,
 signing identities, platform-tool output, or worker payloads.
 
 Contained mode authorizes app-container and sealed-bundle paths plus one explicit
-bounded startup grant batch. The normal product embeds no guest resources. An
-argv-position-one envelope names one strict manifest; otherwise worker argument
-bytes remain unchanged. The launcher reads the manifest once, walks every
+bounded startup grant batch. The normal product embeds no guest resources. The
+grant envelope is position one for an ordinary launch or immediately follows
+the jailer-policy delimiter; otherwise worker argument bytes remain unchanged.
+The launcher reads the manifest once, walks every
 absolute source path component without following symlinks or accepting
 `.`/`..`, opens existing regular files/directories with exact access, records
 type/device/inode/status, rejects aliases, and prepares the entire RAII batch
@@ -295,8 +323,10 @@ The following remain feasible work owned by #1351:
 - cross-filesystem socket publication;
 - vmnet entitlement/provisioning and per-VM network policy;
 - automatic restart/reconnect and any long-lived broker/service policy;
-- exact macOS outcome mapping for jailer, seccomp, namespace, cgroup,
-  privilege, resource-limit, and production-host requirements;
+- arbitrary uid/gid transition, configurable chroot ownership, and any
+  installer-owned or elevated service needed to support them;
+- exact macOS outcome mapping for remaining jailer cgroup/network/PID-namespace
+  arguments, seccomp/seccompiler, and production-host requirements;
 - Developer ID/team possession, notarization, launch constraints, and release
   policy.
 
@@ -314,6 +344,15 @@ execution proves:
 - exact identifiers, entitlement separation, Hardened Runtime, and strict
   recursive signature validity;
 - unchanged help/output and representative nonzero worker status forwarding;
+- exact jailer-policy help/version grammar, fixed executable/current credential
+  binding, ID/timing injection, nested grant composition, last-value/default
+  limits, closed environment, private cwd, and value-redacted rejection;
+- kernel-enforced `RLIMIT_NOFILE` exhaustion and `RLIMIT_FSIZE` termination in
+  the real sandboxed worker without leaked session state;
+- daemon API readiness before the one-line PID result, distinct concurrent
+  supervisors, peer survival after one termination, graceful post-ack cleanup,
+  and original-parent loss before acknowledgment cancelling both worker and
+  private namespace;
 - rejection before worker output when a private bundle copy has a missing or
   modified worker;
 - default-close removal of a deliberately inheritable unexpected descriptor,
@@ -397,13 +436,23 @@ work:
 - `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`
 - `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
 
-The delivered package/session/grant/fd/crash subset, including exact adoption by
+Five jailer leaf records are now `implemented-and-verified`:
+`tool-argument:jailer/id`, fixed-code `exec-file`, `resource-limit`,
+`daemonize`, and `version`. Their local implementation and signed validation
+references are machine-checked in the inventory. This moves the 417-record
+delivery inventory to 26 implemented-and-verified, 388 audit-required, and
+three missing-platform-feasible records.
+
+The delivered package/session/policy/grant/fd/crash subset, including exact adoption by
 the singleton startup inputs/outputs, repeatable block/pmem consumers, and
 singleton API/vsock directories plus the fixed port-only vsock facet, and
 snapshot describe/state/memory/root/output consumers with exact crash cleanup,
 is real but does not complete any of those composite records because general
 dynamic brokerage/hard revocation, network,
-Linux-outcome, and deployment work remains. The broad `jailer`, `seccomp`,
-`seccompiler`, and `production-host` corpus records remain `audit-required`.
-Neither this audit nor the executable evidence is direct Firecracker jailer
-parity.
+Linux-outcome, arbitrary credential/root authority, and deployment work remains.
+The jailer `uid`, `gid`, `chroot-base-dir`, cgroup, network/PID-namespace,
+parent-cgroup, aggregate operation, and broad corpus records remain
+`audit-required`, as do the broad `seccomp`, `seccompiler`, and
+`production-host` corpus records.
+This audit certifies only the named observable macOS outcomes, not direct Linux
+jailer mechanism parity.

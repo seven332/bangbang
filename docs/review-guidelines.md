@@ -117,15 +117,37 @@ same-user replacement without a stronger launch-constraint design.
 For launcher-worker session changes, review both asymmetric authentication
 directions: the launcher must bind the unreaped PID to the expected dynamic
 signed worker before resume and again after child-attributed `Hello`; the worker
-can require only matching effective credentials, the inherited endpoint, and
-`LOCAL_PEERPID == getppid()` because App Sandbox denies its parent-code lookup.
+can require matching real/effective credentials, session identity, the inherited
+endpoint, and `LOCAL_PEERPID == getppid()` because App Sandbox denies its
+parent-code lookup.
 No public/VM/resource side effect may precede random-session `Start` and the
-independently validated `Prepared`/grant-ack/`Proceed` gates. Keep lifecycle v2
+independently validated `Prepared`/grant-ack/`Proceed` gates. Keep lifecycle v3
 frames at 4096 bytes or less, sequences exact, message/state variants closed,
 diagnostics redacted, and the all-zero identity exclusive to the initial
 greeting. Even an empty grant batch must be acknowledged before `Proceed`.
 
-For startup-grant changes, separately review the argv-position-one envelope,
+For production launch-policy changes, preserve exact argv-position-one
+activation and the mandatory policy delimiter, fixed executable/current
+credential binding, singleton and forwarded-timing conflict rejection,
+last-value `fsize`/`no-file` behavior, the 2048 no-file default, and unchanged
+nested grant/worker bytes. `Start(WorkerPolicy)` must remain fixed-size,
+reserved-zero, authenticated, and value-redacted. The worker must install and
+read back exact soft/hard limits without raising an inherited hard bound, then
+descriptor-enter and recheck the locked private namespace before `Prepared`.
+The exec environment remains a closed marker-only input; platform-created
+runtime variables are not caller authority and must not justify forwarding
+ambient values.
+
+For daemon-mode changes, require same-code static/live validation, default-close
+`SETSID` re-exec, `/dev/null` standard streams, one fixed marker and handoff fd,
+kernel peer checks after resume, closed reserved-zero frames, and one absolute
+Ready/ack deadline. The printed PID is the still-live supervisor and may appear
+only after committed worker readiness plus exact acknowledgment. Original loss
+before ack cancels the worker; after ack the handoff closes. Review both crash
+orders, signal ownership, PID reuse safety, concurrent sessions, and cleanup.
+
+For startup-grant changes, separately review its position-one envelope for
+ordinary launches and its exact position immediately after a jailer delimiter,
 strict manifest bounds, component-by-component no-follow opening, role/access
 matrix, alias/type/identity checks, and all-before-spawn preparation. Grant
 datagrams must remain at most 1024 bytes and bind session, batch, sequence,

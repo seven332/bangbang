@@ -152,8 +152,31 @@ pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<(), LauncherError
 }
 
 pub(crate) fn validate_worker_process(pid: libc::pid_t) -> Result<(), LauncherError> {
+    validate_process(
+        pid,
+        &worker_requirement_text(),
+        EntitlementProfile::Worker,
+        LauncherError::InvalidWorkerIdentity,
+    )
+}
+
+pub(crate) fn validate_launcher_process(pid: libc::pid_t) -> Result<(), LauncherError> {
+    validate_process(
+        pid,
+        &outer_requirement_text(),
+        EntitlementProfile::Outer,
+        LauncherError::InvalidBundleSignature,
+    )
+}
+
+fn validate_process(
+    pid: libc::pid_t,
+    requirement_text: &str,
+    profile: EntitlementProfile,
+    failure: LauncherError,
+) -> Result<(), LauncherError> {
     if pid <= 0 {
-        return Err(LauncherError::InvalidWorkerIdentity);
+        return Err(failure);
     }
     let pid_value = pid;
     // SAFETY: `pid_value` remains live for the synchronous call and Core
@@ -165,12 +188,11 @@ pub(crate) fn validate_worker_process(pid: libc::pid_t) -> Result<(), LauncherEr
             (&raw const pid_value).cast(),
         )
     };
-    let pid_number =
-        CfOwned(NonNull::new(pid_number.cast_mut()).ok_or(LauncherError::InvalidWorkerIdentity)?);
+    let pid_number = CfOwned(NonNull::new(pid_number.cast_mut()).ok_or(failure)?);
     // SAFETY: Security.framework exports this immutable CFString key.
     let pid_key = unsafe { kSecGuestAttributePid };
     if pid_key.is_null() {
-        return Err(LauncherError::InvalidWorkerIdentity);
+        return Err(failure);
     }
     let keys = [pid_key];
     let values = [pid_number.as_ptr()];
@@ -186,8 +208,7 @@ pub(crate) fn validate_worker_process(pid: libc::pid_t) -> Result<(), LauncherEr
             &raw const kCFTypeDictionaryValueCallBacks,
         )
     };
-    let attributes =
-        CfOwned(NonNull::new(attributes.cast_mut()).ok_or(LauncherError::InvalidWorkerIdentity)?);
+    let attributes = CfOwned(NonNull::new(attributes.cast_mut()).ok_or(failure)?);
     let mut code = ptr::null();
     // SAFETY: `attributes` is a retained CFDictionary and `code` is writable
     // storage for the retained dynamic SecCode result.
@@ -200,20 +221,18 @@ pub(crate) fn validate_worker_process(pid: libc::pid_t) -> Result<(), LauncherEr
         )
     } != 0
     {
-        return Err(LauncherError::InvalidWorkerIdentity);
+        return Err(failure);
     }
-    let code = CfOwned(NonNull::new(code.cast_mut()).ok_or(LauncherError::InvalidWorkerIdentity)?);
-    let requirement = requirement(&worker_requirement_text())
-        .map_err(|_| LauncherError::InvalidWorkerIdentity)?;
+    let code = CfOwned(NonNull::new(code.cast_mut()).ok_or(failure)?);
+    let requirement = requirement(requirement_text).map_err(|_| failure)?;
     // SAFETY: `code` and `requirement` are live retained Security objects for
     // this synchronous dynamic validity check.
     if unsafe { SecCodeCheckValidity(code.as_ptr(), SEC_CS_DEFAULT_FLAGS, requirement.as_ptr()) }
         != 0
     {
-        return Err(LauncherError::InvalidWorkerIdentity);
+        return Err(failure);
     }
-    validate_entitlements(&code, EntitlementProfile::Worker)
-        .map_err(|_| LauncherError::InvalidWorkerIdentity)
+    validate_entitlements(&code, profile).map_err(|_| failure)
 }
 
 fn outer_requirement_text() -> String {

@@ -19,6 +19,7 @@ use bangbang_session::{
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
 
+use super::daemon::{DaemonNotifier, NotifierEvent};
 use super::socket_broker::LauncherSocketBroker;
 use super::spawn::OwnedWorker;
 use crate::LauncherError;
@@ -162,31 +163,30 @@ pub(crate) fn read_bootstrap_hello(
 pub(crate) fn wait_session(
     worker: &mut OwnedWorker,
     session: &mut UnixStream,
-    grant_socket: &mut UnixDatagram,
-    socket_broker: &mut UnixDatagram,
+    mut auxiliary: AuxiliaryChannels<'_>,
     mut lifecycle: LauncherLifecycle,
     mut wakeups: SignalWakeups,
     grants: &PreparedGrantBatch,
+    notifier: Option<&mut DaemonNotifier>,
 ) -> Result<ExitStatus, LauncherError> {
     let session_id = lifecycle.session();
     let mut observation = SessionObservation::default();
-    let auxiliary = AuxiliaryChannels {
-        grant_socket,
-        socket_broker,
-    };
     let result = wait_session_inner(
         worker,
         session,
-        auxiliary,
+        &mut auxiliary,
         &mut lifecycle,
         &mut wakeups,
-        &mut observation,
         grants,
+        SessionHooks {
+            observation: &mut observation,
+            notifier,
+        },
     );
     if result.is_err() {
         let _ = session.shutdown(std::net::Shutdown::Both);
-        shutdown_grants(grant_socket);
-        let _ = socket_broker.shutdown(std::net::Shutdown::Both);
+        shutdown_grants(auxiliary.grant_socket);
+        let _ = auxiliary.socket_broker.shutdown(std::net::Shutdown::Both);
         worker.terminate_and_reap();
     }
 
@@ -342,27 +342,47 @@ fn unlink_owned_snapshot_staging(
 #[derive(Debug, Default)]
 struct SessionObservation {
     namespace: Option<LauncherNamespace>,
+    readiness: Option<bangbang_session::Readiness>,
     terminal: Option<(TerminalCategory, u8)>,
 }
 
-struct AuxiliaryChannels<'a> {
+pub(crate) struct AuxiliaryChannels<'a> {
     grant_socket: &'a mut UnixDatagram,
     socket_broker: &'a mut UnixDatagram,
+}
+
+impl<'a> AuxiliaryChannels<'a> {
+    pub(crate) fn new(
+        grant_socket: &'a mut UnixDatagram,
+        socket_broker: &'a mut UnixDatagram,
+    ) -> Self {
+        Self {
+            grant_socket,
+            socket_broker,
+        }
+    }
+}
+
+struct SessionHooks<'a> {
+    observation: &'a mut SessionObservation,
+    notifier: Option<&'a mut DaemonNotifier>,
 }
 
 fn wait_session_inner(
     worker: &mut OwnedWorker,
     session: &mut UnixStream,
-    auxiliary: AuxiliaryChannels<'_>,
+    auxiliary: &mut AuxiliaryChannels<'_>,
     lifecycle: &mut LauncherLifecycle,
     wakeups: &mut SignalWakeups,
-    observation: &mut SessionObservation,
     grants: &PreparedGrantBatch,
+    hooks: SessionHooks<'_>,
 ) -> Result<ExitStatus, LauncherError> {
-    let AuxiliaryChannels {
-        grant_socket,
-        socket_broker,
-    } = auxiliary;
+    let grant_socket = &mut *auxiliary.grant_socket;
+    let socket_broker = &mut *auxiliary.socket_broker;
+    let SessionHooks {
+        observation,
+        mut notifier,
+    } = hooks;
     session
         .set_nonblocking(true)
         .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
@@ -381,7 +401,7 @@ fn wait_session_inner(
         .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
     let broker_fd = usize::try_from(socket_broker.as_raw_fd())
         .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
-    let changes = [
+    let mut changes = vec![
         event(
             usize::try_from(wakeups.signals[0].reader.as_raw_fd())
                 .map_err(|_| LauncherError::SignalSetup(io::ErrorKind::InvalidInput))?,
@@ -421,6 +441,20 @@ fn wait_session_inner(
             0,
         ),
     ];
+    let notifier_fd = notifier
+        .as_ref()
+        .map(|notifier| {
+            usize::try_from(notifier.as_raw_fd()?).map_err(|_| LauncherError::DaemonHandoff)
+        })
+        .transpose()?;
+    if let Some(notifier_fd) = notifier_fd {
+        changes.push(event(
+            notifier_fd,
+            libc::EVFILT_READ,
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            0,
+        ));
+    }
     register_events(kqueue.as_raw_fd(), &changes)?;
 
     let mut decoder = FrameDecoder::default();
@@ -430,10 +464,16 @@ fn wait_session_inner(
     let mut grant_send = GrantSendState::new(grants, lifecycle.session());
     let mut broker = LauncherSocketBroker::new(lifecycle.session());
     loop {
-        let deadline = [cancellation_deadline, exit_deadline, grant_send.deadline()]
-            .into_iter()
-            .flatten()
-            .min();
+        let notifier_deadline = notifier.as_ref().and_then(|notifier| notifier.deadline());
+        let deadline = [
+            cancellation_deadline,
+            exit_deadline,
+            grant_send.deadline(),
+            notifier_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let timeout = timeout_until(deadline);
         let events = wait_events(kqueue.as_raw_fd(), timeout)?;
         let child_exited = events.iter().any(|queued| {
@@ -467,6 +507,53 @@ fn wait_session_inner(
             exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
         }
 
+        if observation.readiness.is_some()
+            && let Some(notifier) = notifier.as_deref_mut()
+            && notifier.is_awaiting_ready()
+        {
+            // SAFETY: `getpid` has no pointer or ownership contract.
+            let supervisor_pid = unsafe { libc::getpid() };
+            notifier.notify_ready(supervisor_pid)?;
+        }
+
+        if let (Some(notifier_fd), Some(notifier)) = (notifier_fd, notifier.as_deref_mut())
+            && events
+                .iter()
+                .any(|queued| queued.filter == libc::EVFILT_READ && queued.ident == notifier_fd)
+        {
+            match notifier.drain()? {
+                NotifierEvent::Pending => {}
+                NotifierEvent::Acknowledged => {
+                    register_events(
+                        kqueue.as_raw_fd(),
+                        &[event(notifier_fd, libc::EVFILT_READ, libc::EV_DELETE, 0)],
+                    )?;
+                    notifier.close_transport();
+                }
+                NotifierEvent::ParentLost => {
+                    register_events(
+                        kqueue.as_raw_fd(),
+                        &[event(notifier_fd, libc::EVFILT_READ, libc::EV_DELETE, 0)],
+                    )?;
+                    notifier.close_transport();
+                    if !child_exited
+                        && !session_closed
+                        && observation.terminal.is_none()
+                        && !lifecycle.is_cancelled()
+                    {
+                        request_cancellation(
+                            lifecycle,
+                            session,
+                            &mut grant_send,
+                            grant_socket,
+                            &mut cancellation_deadline,
+                            CancelSignal::Terminate,
+                        )?;
+                    }
+                }
+            }
+        }
+
         if !child_exited
             && events
                 .iter()
@@ -498,13 +585,14 @@ fn wait_session_inner(
                         SIGTERM => CancelSignal::Terminate,
                         _ => return Err(LauncherError::SessionProtocol),
                     };
-                    let frame = lifecycle
-                        .cancel(signal)
-                        .map_err(|_| LauncherError::SessionProtocol)?;
-                    write_frame(session, frame)?;
-                    grant_send.cancel();
-                    shutdown_grants(grant_socket);
-                    cancellation_deadline = Some(Instant::now() + CANCELLATION_GRACE);
+                    request_cancellation(
+                        lifecycle,
+                        session,
+                        &mut grant_send,
+                        grant_socket,
+                        &mut cancellation_deadline,
+                        signal,
+                    )?;
                 }
             }
         }
@@ -557,9 +645,34 @@ fn wait_session_inner(
         if grant_send.has_timed_out(Instant::now()) {
             return Err(LauncherError::GrantProtocol);
         }
+        if notifier
+            .as_ref()
+            .and_then(|notifier| notifier.deadline())
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(LauncherError::DaemonHandoff);
+        }
     }
 
     worker.wait()
+}
+
+fn request_cancellation(
+    lifecycle: &mut LauncherLifecycle,
+    session: &mut UnixStream,
+    grant_send: &mut GrantSendState,
+    grant_socket: &UnixDatagram,
+    cancellation_deadline: &mut Option<Instant>,
+    signal: CancelSignal,
+) -> Result<(), LauncherError> {
+    let frame = lifecycle
+        .cancel(signal)
+        .map_err(|_| LauncherError::SessionProtocol)?;
+    write_frame(session, frame)?;
+    grant_send.cancel();
+    shutdown_grants(grant_socket);
+    *cancellation_deadline = Some(Instant::now() + CANCELLATION_GRACE);
+    Ok(())
 }
 
 fn timeout_until(deadline: Option<Instant>) -> Option<Duration> {
@@ -634,7 +747,12 @@ fn drain_session(
                                 shutdown_grants(grant_socket);
                             }
                         }
-                        Message::Starting | Message::Ready(_) => {}
+                        Message::Starting => {}
+                        Message::Ready(readiness) => {
+                            if observation.readiness.replace(readiness).is_some() {
+                                return Err(LauncherError::SessionProtocol);
+                            }
+                        }
                         Message::Terminal {
                             category,
                             exit_code,
@@ -647,7 +765,10 @@ fn drain_session(
                                 return Err(LauncherError::SessionProtocol);
                             }
                         }
-                        Message::Hello | Message::Start | Message::Proceed | Message::Cancel(_) => {
+                        Message::Hello
+                        | Message::Start(_)
+                        | Message::Proceed
+                        | Message::Cancel(_) => {
                             return Err(LauncherError::SessionProtocol);
                         }
                     }
@@ -896,7 +1017,7 @@ fn wait_events(
         None => None,
     };
     loop {
-        let mut events = [MaybeUninit::<libc::kevent>::uninit(); 5];
+        let mut events = [MaybeUninit::<libc::kevent>::uninit(); 7];
         let timeout = deadline
             .map(|deadline| duration_timespec(deadline.saturating_duration_since(Instant::now())));
         let timeout_ptr = timeout
@@ -910,7 +1031,7 @@ fn wait_events(
                 ptr::null(),
                 0,
                 events.as_mut_ptr().cast(),
-                5,
+                7,
                 timeout_ptr,
             )
         };

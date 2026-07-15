@@ -3,6 +3,8 @@
 mod error;
 #[cfg(target_os = "macos")]
 mod grant_manifest;
+#[cfg(target_os = "macos")]
+mod launch_policy;
 mod layout;
 #[cfg(target_os = "macos")]
 mod macos;

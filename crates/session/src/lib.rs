@@ -8,7 +8,7 @@ mod state;
 
 pub use codec::{
     CancelSignal, Frame, FrameDecoder, Message, ProtocolError, Readiness, Role, SessionId,
-    TerminalCategory, encode_frame,
+    TerminalCategory, WorkerPolicy, encode_frame,
 };
 pub use grant::{
     BatchId, GRANT_HEADER_BYTES, GrantAccess, GrantFrame, GrantId, GrantObjectKind, GrantRecord,
@@ -29,7 +29,7 @@ pub const GRANT_FD: libc::c_int = 4;
 pub const SOCKET_BROKER_FD: libc::c_int = 5;
 
 /// Private environment marker installed by the production launcher.
-pub const SESSION_ENV_KEY: &str = "BANGBANG_INTERNAL_SESSION_V2";
+pub const SESSION_ENV_KEY: &str = "BANGBANG_INTERNAL_SESSION_V3";
 
 /// Exact value required for [`SESSION_ENV_KEY`].
-pub const SESSION_ENV_VALUE: &str = "2";
+pub const SESSION_ENV_VALUE: &str = "3";

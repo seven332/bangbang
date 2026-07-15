@@ -47,14 +47,18 @@ map to the current macOS/HVF scaffold:
 - chroot setup
 - privilege dropping after privileged resource preparation
 
-bangbang currently rejects Linux-specific Firecracker process options rather
-than silently accepting them. The production bundle supplies a macOS App
-Sandbox launcher/worker boundary plus bounded per-VM lifecycle, startup-grant,
-and socket-broker channels. Contained startup config, startup metadata, kernel, and initrd inputs
+bangbang rejects Linux-specific Firecracker process options rather than
+silently accepting them. The production bundle now supplies an unprivileged
+macOS outcome for the jailer's fixed executable/current-user identity, private
+working root, closed environment and descriptors, exact file/descriptor limits,
+and foreground/detached lifecycle ownership. It uses a signed App Sandbox
+launcher/worker boundary plus bounded per-VM lifecycle, startup-grant, daemon
+handoff, and socket-broker channels. Contained startup config, startup metadata, kernel, and initrd inputs
 adopt exact read-only grants; block and pmem devices adopt exact repeatable
 read-only/read-write backing grants; logger, metrics, and serial adopt exact
-singleton write-only sink grants. Exact seccomp/jailer outcome replacement and
-complete distribution-signing policy remain absent.
+singleton write-only sink grants. Arbitrary uid/gid transition, configurable
+chroot ownership, cgroups, network/PID namespaces, seccomp, and complete
+distribution-signing policy remain absent.
 
 Apple App Sandbox is a supportable containment building block, not a direct
 jailer port. The lower-level signed target packages real binaries as minimal
@@ -117,13 +121,13 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 
 | Area | Current status | Review expectation |
 | --- | --- | --- |
-| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Platform-limited unsupported | Reject matching Firecracker process options or document a concrete macOS replacement before accepting any no-op behavior. |
+| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate current-user checks with arbitrary uid/gid transition or a private cwd with chroot. |
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
 | Network and vmnet | Implemented virtio-MMIO/MMDS-only subset; direct vmnet conditional | Keep supported `host_dev_name` forms, startup validation, MMDS-only behavior, entitlement requirements, and non-goals documented when network behavior changes. |
 | macOS App Sandbox | Production nested worker implemented for container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, API-socket, and vsock-socket resources | Keep the ordinary CLI explicitly uncontained and prove package identity plus real ungranted denial and granted operation behavior without adding ambient network authority. |
-| Launcher and resource broker | Authenticated lifecycle v2, bounded atomic startup grants, adopted file and socket-directory consumers, and one fixed session-bound vsock connection facet implemented; remaining consumers and general dynamic brokerage missing | Require exact role/access/anchor/identity checks, one-time registry adoption, closed session/sequence/rights framing, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
+| Launcher and resource broker | Authenticated lifecycle v3 policy, closed exec environment and descriptor set, bounded atomic startup grants, signed daemon handoff, adopted file and socket-directory consumers, and one fixed session-bound vsock connection facet implemented; general dynamic brokerage missing | Require exact policy/role/access/anchor/identity checks, one-time registry adoption, closed session/sequence/rights framing, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
 
 ## Native Snapshot Composite and Device Boundary
 
@@ -236,8 +240,8 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | Operator-owned private directories | Required for API sockets, vsock sockets, observability sinks, and other configured paths that should not be shared. Contained API/vsock use requires one exact preauthorized directory and safe child; direct paths remain operator-owned. | Cross-launcher name allocation and sharing policy remain operator responsibilities. |
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
 | macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, and vsock-socket authority form the current contained mode. | General dynamic delivery and vmnet authorization require later explicit policy. |
-| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one default-close worker, authenticates lifecycle v2, owns cancellation/status, coordinates the private namespace, atomically transfers a bounded typed startup batch, supports the adopted file/directory consumers, and exposes one dormant fixed vsock connection facet. | Keep that facet fixed to one exact anchor/child and port-only requests; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
-| Firecracker Linux jailer model | Platform-limited unsupported as a direct port. | Keep Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege-drop flags rejected or documented until macOS replacements exist. |
+| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v3 policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports the adopted file/directory consumers, offers signed daemon detach, and exposes one dormant fixed vsock connection facet. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
+| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope. | Keep arbitrary uid/gid, configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
 privilege-dropping flow, or new public API. PRs that add host resource types
@@ -246,9 +250,10 @@ launcher, broker, or sandbox profile would need to own it.
 
 ## Startup Grant Authority
 
-Only an exact argv-position-one envelope activates grants:
+Only an exact argv-position-one grant envelope, or the same envelope immediately
+after a `--bangbang-jailer-v1 ... --` delimiter, activates grants:
 `--bangbang-grant-manifest MANIFEST -- FIRECRACKER_ARGS...`. Otherwise the
-launcher preserves every worker argument byte. The strict JSON manifest is read
+launcher preserves every non-policy worker argument byte. The strict JSON manifest is read
 once from a no-follow regular-file descriptor and never accepts descriptors or
 bookmark bytes from the operator. Its closed roles are read-only startup
 config/metadata, kernel/initrd and snapshot inputs; read-only or read-write
@@ -267,7 +272,8 @@ before spawn; any failure drops every opened descriptor. Current hard limits are
 snapshot output child, 4096 source-path bytes, 512 records, 1024 encoded bytes
 per datagram, 64 KiB per bookmark, and 256 KiB aggregate bookmark material.
 
-Lifecycle protocol v2 uses descriptor 3. A separate connected unnamed Darwin
+Lifecycle protocol v3 uses descriptor 3 and carries one fixed reserved-zero
+worker policy only after peer authentication. A separate connected unnamed Darwin
 datagram socket at descriptor 4 carries grant-channel v1 records. A third
 connected unnamed datagram socket at descriptor 5 carries the dormant closed
 vsock broker protocol; it is not a general grant channel. Every grant record
@@ -528,8 +534,8 @@ not anchor a certificate or Team ID, so they do not authenticate a wholly
 replaced and separately validly signed package; Developer ID/team policy and
 kernel launch constraints remain deployment work.
 
-The launcher preserves original argument bytes and ordinary environment entries
-while replacing one private bootstrap marker. Direct Darwin `posix_spawn` uses
+The launcher preserves non-policy worker argument bytes and supplies an exec
+environment containing only one private bootstrap marker. Direct Darwin `posix_spawn` uses
 `CLOEXEC_DEFAULT | START_SUSPENDED`; file actions retain each open standard
 stream and duplicate exactly the lifecycle stream, startup-grant datagram, and
 dormant socket-broker datagram endpoints to fixed internal descriptors 3, 4,
@@ -539,20 +545,25 @@ mark those descriptors close-on-exec, require
 peer effective UID/GID to match, require `LOCAL_PEERPID == getppid()`, send one
 no-payload `Hello` under the reserved all-zero identity, and block. The launcher
 then checks the child-attributed peer PID/credentials and live code again before
-sending a fresh random session identity. App Sandbox denies the worker's
+sending a fresh random session identity and fixed redacted policy. The worker
+removes the marker, checks real/effective identity and session state, installs
+and reads back exact `RLIMIT_FSIZE`/`RLIMIT_NOFILE`, creates and descriptor-enters
+the locked private namespace, and only then reports `Prepared`. App Sandbox denies the worker's
 Security.framework lookup of its unsandboxed parent, so worker-to-launcher trust
 is deliberately limited to the inherited endpoint, direct-parent PID,
 credentials, exact sequences, and disconnect behavior; symmetric code-signing
 authentication is not claimed.
 
-Lifecycle protocol v2 uses a fixed endian-stable header, 256-bit session identity, exact
+Lifecycle protocol v3 uses a fixed endian-stable header, 256-bit session identity, exact
 per-direction sequence, zero reserved fields, closed message kinds, fixed
 payload shapes, and a 4096-byte frame cap. Wrong magic/version/reserved fields,
 oversized or truncated input, unknown messages, replay/gap, cross-session data,
 wrong sender, and invalid state fail with one redacted category before public or
 VM work. `Hello`, `Start`, `Prepared`, exact `GrantsAccepted`, `Proceed`, `Starting`, optional committed
 `Ready(Api|NoApi)`, at most one `Cancel(SIGINT|SIGTERM)`, and path-free
-`Terminal(category, exit_code)` form the complete v2 lifecycle. Structured exit
+`Terminal(category, exit_code)` form the complete v3 lifecycle. `Start` alone
+carries the current credential, exact limit, and daemon-state policy; its fixed
+flags and unused fields are reserved zero. Structured exit
 values must match the reaped public status; abrupt death may omit `Terminal`.
 The initial `Hello`, `Start`, grant transaction, and `Proceed` reads use
 absolute five-second deadlines, including across interrupted or fragmented
@@ -571,6 +582,18 @@ ID, bookmark, descriptor, payload, argument, or session value. Same-identifier
 workers share the container, so the lock and identity checks preserve unrelated
 or replaced cooperative sessions but do not defend against a malicious
 same-bundle sibling with equivalent container authority.
+
+Daemon mode introduces no new code identity or root authority. The original
+launcher starts the same validated outer executable suspended with
+`CLOEXEC_DEFAULT | SETSID`, `/dev/null` standard streams, one marker-only
+environment, and only a fixed descriptor-6 handoff. A 40-byte reserved-zero
+protocol authenticates parent/child code and kernel peer identity, transfers
+timing, and publishes the supervisor PID only after worker readiness. Parent
+EOF/signal before acknowledgment is cancellation authority; after exact PID
+acknowledgment the handoff closes. The returned session-leading launcher stays
+responsible for signals, worker reap, grants, sockets, and namespace cleanup.
+No ambient PID-file path, orphaned worker, restart service, or privilege change
+is introduced.
 
 The launcher kqueue watches both graceful signals, the session stream, grant
 socket writability, broker input, and the unreaped child. The first signal sends one bounded cancellation and starts a

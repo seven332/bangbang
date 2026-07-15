@@ -231,6 +231,7 @@ mod platform {
     use std::ffi::OsStr;
     use std::fs::File;
     use std::io::{Read, Write};
+    use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::path::Path;
@@ -258,7 +259,7 @@ mod platform {
     use bangbang_session::{
         Frame, FrameDecoder, GRANT_FD, GrantAccess, GrantId, Message, ObjectIdentity, Readiness,
         ResourceRole, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId,
-        SnapshotOutputChild, TerminalCategory, WorkerLifecycle, encode_frame,
+        SnapshotOutputChild, TerminalCategory, WorkerLifecycle, WorkerPolicy, encode_frame,
     };
 
     use super::{
@@ -271,6 +272,22 @@ mod platform {
     const GRANT_DELAY_PROBE: &str = "--bangbang-internal-grant-delay-v1";
     #[cfg(feature = "grant-integration-probe")]
     const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
+
+    #[cfg(feature = "grant-integration-probe")]
+    fn grant_delay_requested() -> bool {
+        let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+        match arguments.as_slice() {
+            [probe] => probe == OsStr::new(GRANT_DELAY_PROBE),
+            [id, _, start, _, start_cpu, _, parent_cpu, _, probe] => {
+                id == OsStr::new("--id")
+                    && start == OsStr::new("--start-time-us")
+                    && start_cpu == OsStr::new("--start-time-cpu-us")
+                    && parent_cpu == OsStr::new("--parent-cpu-time-us")
+                    && probe == OsStr::new(GRANT_DELAY_PROBE)
+            }
+            _ => false,
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ControlState {
@@ -801,6 +818,7 @@ mod platform {
         directory_grants: DirectoryGrantAuthority,
         socket_broker: SocketBrokerAuthority,
         socket_namespace: WorkerSocketNamespace,
+        policy: WorkerPolicy,
         started: bool,
         closed: bool,
     }
@@ -810,6 +828,7 @@ mod platform {
             formatter
                 .debug_struct("ContainedSession")
                 .field("identity", &"<redacted>")
+                .field("policy", &self.policy)
                 .field("started", &self.started)
                 .field("closed", &self.closed)
                 .finish()
@@ -857,15 +876,17 @@ mod platform {
             let hello = lifecycle.hello().map_err(|_| ContainedSessionError)?;
             write_frame(&mut stream, hello)?;
             let start = read_frame(&mut stream, &mut decoder, handshake_deadline()?)?;
-            if lifecycle
+            let policy = match lifecycle
                 .receive(start)
                 .map_err(|_| ContainedSessionError)?
-                != Message::Start
             {
-                return Err(ContainedSessionError);
-            }
+                Message::Start(policy) => policy,
+                _ => return Err(ContainedSessionError),
+            };
+            install_worker_policy(policy, parent)?;
             let session = lifecycle.session().ok_or(ContainedSessionError)?;
             let namespace = WorkerNamespace::create(session).map_err(|_| ContainedSessionError)?;
+            namespace.enter().map_err(|_| ContainedSessionError)?;
             let identity = namespace.identity();
             let socket_namespace = namespace
                 .socket_namespace()
@@ -876,16 +897,15 @@ mod platform {
             write_frame(&mut stream, prepared)?;
 
             #[cfg(feature = "grant-integration-probe")]
-            let receive_grants =
-                if env::args_os().nth(1).as_deref() == Some(OsStr::new(GRANT_DELAY_PROBE)) {
-                    println!("{GRANT_DELAY_READY}");
-                    std::io::stdout()
-                        .flush()
-                        .map_err(|_| ContainedSessionError)?;
-                    false
-                } else {
-                    true
-                };
+            let receive_grants = if grant_delay_requested() {
+                println!("{GRANT_DELAY_READY}");
+                std::io::stdout()
+                    .flush()
+                    .map_err(|_| ContainedSessionError)?;
+                false
+            } else {
+                true
+            };
             #[cfg(not(feature = "grant-integration-probe"))]
             let receive_grants = true;
 
@@ -982,6 +1002,7 @@ mod platform {
                 directory_grants,
                 socket_broker,
                 socket_namespace,
+                policy,
                 started,
                 closed: false,
             }))
@@ -1031,6 +1052,40 @@ mod platform {
             self.socket_namespace
                 .try_clone()
                 .map(Some)
+                .map_err(|_| ContainedSessionError)
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        pub(crate) fn verify_launch_policy(
+            &self,
+            no_file: u64,
+            file_size: Option<u64>,
+            daemonized: bool,
+        ) -> Result<(), ContainedSessionError> {
+            if self.policy.no_file() != no_file
+                || self.policy.file_size() != file_size
+                || self.policy.is_daemonized() != daemonized
+                || [
+                    "BANGBANG_POLICY_SECRET",
+                    "DYLD_INSERT_LIBRARIES",
+                    "DYLD_LIBRARY_PATH",
+                    "RUST_LOG",
+                ]
+                .into_iter()
+                .any(|name| env::var_os(name).is_some())
+            {
+                return Err(ContainedSessionError);
+            }
+            verify_installed_limit(libc::RLIMIT_NOFILE, no_file)?;
+            if let Some(file_size) = file_size {
+                verify_installed_limit(libc::RLIMIT_FSIZE, file_size)?;
+            }
+            self.namespace
+                .lock()
+                .map_err(|_| ContainedSessionError)?
+                .as_ref()
+                .ok_or(ContainedSessionError)?
+                .verify_current_directory()
                 .map_err(|_| ContainedSessionError)
         }
 
@@ -1096,6 +1151,126 @@ mod platform {
             }
             cleanup_namespace(&self.namespace);
         }
+    }
+
+    fn install_worker_policy(
+        policy: WorkerPolicy,
+        parent: libc::pid_t,
+    ) -> Result<(), ContainedSessionError> {
+        // SAFETY: Credential and session getters take no retained pointers.
+        let (uid, effective_uid, gid, effective_gid, session, parent_session) = unsafe {
+            (
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+                libc::getsid(0),
+                libc::getsid(parent),
+            )
+        };
+        if uid != policy.uid()
+            || effective_uid != policy.uid()
+            || gid != policy.gid()
+            || effective_gid != policy.gid()
+            || session < 0
+            || parent_session < 0
+            || session != parent_session
+            || (policy.is_daemonized() && parent_session != parent)
+        {
+            return Err(ContainedSessionError);
+        }
+        if policy.is_daemonized() {
+            verify_daemon_standard_streams()?;
+        }
+        if let Some(file_size) = policy.file_size() {
+            install_resource_limit(libc::RLIMIT_FSIZE, file_size)?;
+        }
+        install_resource_limit(libc::RLIMIT_NOFILE, policy.no_file())
+    }
+
+    fn verify_daemon_standard_streams() -> Result<(), ContainedSessionError> {
+        let mut expected_device = None;
+        for descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `stat` is writable for one result and the descriptor is borrowed.
+            if unsafe { libc::fstat(descriptor, stat.as_mut_ptr()) } != 0 {
+                return Err(ContainedSessionError);
+            }
+            // SAFETY: Successful `fstat` initialized the complete result.
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFCHR {
+                return Err(ContainedSessionError);
+            }
+            match expected_device {
+                None => expected_device = Some(stat.st_rdev),
+                Some(device) if device == stat.st_rdev => {}
+                Some(_) => return Err(ContainedSessionError),
+            }
+        }
+        Ok(())
+    }
+
+    fn install_resource_limit(
+        resource: libc::c_int,
+        requested: u64,
+    ) -> Result<(), ContainedSessionError> {
+        let mut inherited = MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `inherited` is writable for one rlimit result.
+        if unsafe { libc::getrlimit(resource, inherited.as_mut_ptr()) } != 0 {
+            return Err(ContainedSessionError);
+        }
+        // SAFETY: Successful `getrlimit` initialized the complete result.
+        let inherited = unsafe { inherited.assume_init() };
+        let exact = exact_resource_limit(inherited, requested)?;
+        // SAFETY: `exact` is a fully initialized limit for a fixed supported resource.
+        if unsafe { libc::setrlimit(resource, &raw const exact) } != 0 {
+            return Err(ContainedSessionError);
+        }
+        let mut installed = MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `installed` is writable for one rlimit result.
+        if unsafe { libc::getrlimit(resource, installed.as_mut_ptr()) } != 0 {
+            return Err(ContainedSessionError);
+        }
+        // SAFETY: Successful `getrlimit` initialized the complete result.
+        let installed = unsafe { installed.assume_init() };
+        if installed.rlim_cur != exact.rlim_cur || installed.rlim_max != exact.rlim_max {
+            return Err(ContainedSessionError);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "grant-integration-probe")]
+    fn verify_installed_limit(
+        resource: libc::c_int,
+        expected: u64,
+    ) -> Result<(), ContainedSessionError> {
+        let expected = libc::rlim_t::try_from(expected).map_err(|_| ContainedSessionError)?;
+        let mut installed = MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `installed` is writable for one rlimit result.
+        if unsafe { libc::getrlimit(resource, installed.as_mut_ptr()) } != 0 {
+            return Err(ContainedSessionError);
+        }
+        // SAFETY: Successful `getrlimit` initialized the complete result.
+        let installed = unsafe { installed.assume_init() };
+        if installed.rlim_cur == expected && installed.rlim_max == expected {
+            Ok(())
+        } else {
+            Err(ContainedSessionError)
+        }
+    }
+
+    fn exact_resource_limit(
+        inherited: libc::rlimit,
+        requested: u64,
+    ) -> Result<libc::rlimit, ContainedSessionError> {
+        let requested = libc::rlim_t::try_from(requested).map_err(|_| ContainedSessionError)?;
+        if requested > inherited.rlim_max {
+            return Err(ContainedSessionError);
+        }
+        Ok(libc::rlimit {
+            rlim_cur: requested,
+            rlim_max: requested,
+        })
     }
 
     impl Drop for ContainedSession {
@@ -1338,7 +1513,20 @@ mod platform {
             ObjectIdentity, ResourceRole, SessionId,
         };
 
-        use super::{GrantAuthority, GrantClaimError};
+        use super::{GrantAuthority, GrantClaimError, exact_resource_limit};
+
+        #[test]
+        fn exact_limit_never_raises_the_inherited_hard_limit() {
+            let inherited = libc::rlimit {
+                rlim_cur: 1024,
+                rlim_max: 4096,
+            };
+            let exact =
+                exact_resource_limit(inherited, 2048).expect("lower hard limit should validate");
+            assert_eq!(exact.rlim_cur, 2048);
+            assert_eq!(exact.rlim_max, 2048);
+            assert!(exact_resource_limit(inherited, 4097).is_err());
+        }
 
         fn received(
             session: SessionId,
