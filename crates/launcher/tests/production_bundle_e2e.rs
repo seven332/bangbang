@@ -268,6 +268,10 @@ fn production_bundle_has_exact_nested_signing_contract() {
     assert_eq!(worker_entitlements.matches("<key>").count(), 2);
     assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
     assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+    assert!(
+        !worker.join("Contents/embedded.provisionprofile").exists(),
+        "networkless production worker must not embed a provisioning profile"
+    );
 }
 
 #[test]
@@ -653,6 +657,87 @@ fn launcher_rejects_modified_missing_or_wrongly_signed_worker_before_execution()
 <key>com.apple.security.app-sandbox</key><true/>
 <key>com.apple.security.hypervisor</key><true/>
 </dict></plist>"#;
+
+    let unexpected_profile = TestDir::new("unexpected-profile");
+    let unexpected_profile_bundle = unexpected_profile.path().join(OUTER_BUNDLE_NAME);
+    copy_tree(&source, &unexpected_profile_bundle);
+    fs::write(
+        worker_bundle(&unexpected_profile_bundle).join("Contents/embedded.provisionprofile"),
+        b"networkless-profile-must-remain-absent",
+    )
+    .expect("unexpected profile should be written");
+    resign_worker_and_outer(&unexpected_profile_bundle, valid_entitlements, true, true);
+    assert_invalid_bundle(run_launcher(
+        &unexpected_profile_bundle,
+        &[OsStr::new("--help")],
+    ));
+
+    let vmnet_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>com.apple.security.app-sandbox</key><true/>
+<key>com.apple.security.hypervisor</key><true/>
+<key>com.apple.vm.networking</key><true/>
+<key>com.apple.application-identifier</key><string>APPID12345.dev.bangbang.worker</string>
+<key>com.apple.developer.team-identifier</key><string>TEAM123456</string>
+</dict></plist>"#;
+
+    let vmnet_without_profile = TestDir::new("vmnet-without-profile");
+    let vmnet_without_profile_bundle = vmnet_without_profile.path().join(OUTER_BUNDLE_NAME);
+    copy_tree(&source, &vmnet_without_profile_bundle);
+    resign_worker_and_outer(
+        &vmnet_without_profile_bundle,
+        vmnet_entitlements,
+        true,
+        true,
+    );
+    assert_invalid_bundle(run_launcher(
+        &vmnet_without_profile_bundle,
+        &[OsStr::new("--help")],
+    ));
+
+    let developer_extra = TestDir::new("developer-vmnet-extra");
+    let developer_extra_bundle = developer_extra.path().join(OUTER_BUNDLE_NAME);
+    copy_tree(&source, &developer_extra_bundle);
+    fs::write(
+        worker_bundle(&developer_extra_bundle).join("Contents/embedded.provisionprofile"),
+        b"negative-static-profile-fixture",
+    )
+    .expect("negative profile should be written");
+    resign_worker_and_outer(
+        &developer_extra_bundle,
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>com.apple.security.app-sandbox</key><true/>
+<key>com.apple.security.hypervisor</key><true/>
+<key>com.apple.vm.networking</key><true/>
+<key>com.apple.application-identifier</key><string>APPID12345.dev.bangbang.worker</string>
+<key>com.apple.developer.team-identifier</key><string>TEAM123456</string>
+<key>com.apple.developer.networking.vmnet</key><true/>
+</dict></plist>"#,
+        true,
+        true,
+    );
+    assert_invalid_bundle(run_launcher(
+        &developer_extra_bundle,
+        &[OsStr::new("--help")],
+    ));
+
+    let denied_vmnet = TestDir::new("denied-vmnet-policy");
+    let denied_vmnet_bundle = denied_vmnet.path().join(OUTER_BUNDLE_NAME);
+    copy_tree(&source, &denied_vmnet_bundle);
+    fs::write(
+        worker_bundle(&denied_vmnet_bundle).join("Contents/embedded.provisionprofile"),
+        b"negative-policy-profile-fixture",
+    )
+    .expect("negative profile should be written");
+    resign_worker_and_outer(&denied_vmnet_bundle, vmnet_entitlements, true, true);
+    let denied = run_launcher(&denied_vmnet_bundle, &[OsStr::new("--help")]);
+    assert_eq!(denied.status.code(), Some(PROCESS_FAILURE_EXIT_CODE));
+    assert!(denied.stdout.is_empty(), "worker must not execute");
+    assert_eq!(
+        String::from_utf8_lossy(&denied.stderr),
+        "bangbang launcher: invalid production launch policy\n"
+    );
 
     let worker_without_runtime = TestDir::new("worker-without-runtime");
     let worker_without_runtime_bundle = worker_without_runtime.path().join(OUTER_BUNDLE_NAME);

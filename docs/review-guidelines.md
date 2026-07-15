@@ -113,6 +113,13 @@ exclusive publication, private staging cleanup, and error redaction. Existing
 destinations must never be replaced or merged. Static-code validation is an
 at-rest tamper gate; do not treat it as atomic protection from concurrent
 same-user replacement without a stronger launch-constraint design.
+Vmnet packaging must additionally keep the caller profile bounded and
+open-once, preserve separate App ID-prefix and Team ID relationships, require
+the documented runtime entitlement and an allowed signing leaf, and complete
+the disposable same-authorization AMFI probe before publication. The probe may
+execute only the already-running package tool's immediate-success command,
+never the caller-supplied worker. A blocked preflight is gate evidence, not
+connectivity evidence.
 
 For launcher-worker session changes, review both asymmetric authentication
 directions: the launcher must bind the unreaped PID to the expected dynamic

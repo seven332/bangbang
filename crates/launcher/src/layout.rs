@@ -20,6 +20,12 @@ pub const WORKER_EXECUTABLE_NAME: &str = "bangbang-worker";
 pub(crate) const APP_SANDBOX_ENTITLEMENT: &str = "com.apple.security.app-sandbox";
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const HYPERVISOR_ENTITLEMENT: &str = "com.apple.security.hypervisor";
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const VMNET_ENTITLEMENT: &str = "com.apple.vm.networking";
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const APPLICATION_IDENTIFIER_ENTITLEMENT: &str = "com.apple.application-identifier";
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const TEAM_IDENTIFIER_ENTITLEMENT: &str = "com.apple.developer.team-identifier";
 
 /// Fixed production bundle paths derived from the running launcher executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +79,14 @@ impl BundleLayout {
     #[must_use]
     pub fn worker_executable(&self) -> &Path {
         &self.worker_executable
+    }
+
+    /// Returns the fixed nested worker provisioning-profile path.
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    pub(crate) fn worker_provisioning_profile(&self) -> PathBuf {
+        self.worker_bundle
+            .join("Contents/embedded.provisionprofile")
     }
 
     fn validate_entries(&self) -> Result<(), LauncherError> {

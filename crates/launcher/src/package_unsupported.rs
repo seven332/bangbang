@@ -7,3 +7,9 @@ pub fn build_bundle(options: &PackageOptions) -> Result<PathBuf, PackageError> {
     let _ = options;
     Err(PackageError::UnsupportedPlatform)
 }
+
+/// Reports that production vmnet preflight is unavailable on this target.
+pub fn preflight_bundle(options: &PackageOptions) -> Result<(), PackageError> {
+    let _ = options;
+    Err(PackageError::UnsupportedPlatform)
+}

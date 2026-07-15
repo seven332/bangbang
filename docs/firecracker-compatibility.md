@@ -3090,15 +3090,21 @@ launcher port facet without guest payloads or an outgoing-network entitlement.
 Signed normal-bundle proof covers outside-container API clients, real guest- and
 host-initiated vsock traffic, no surviving helper, and unchanged entitlements.
 Snapshot path consumers use exact state/memory/root and repeatable output grants.
-General dynamic brokerage, cross-filesystem socket publication, hard revocation,
-and vmnet provisioning remain incomplete. Lifecycle v4 now carries a canonical
+General dynamic brokerage, cross-filesystem socket publication, and hard
+revocation remain incomplete. Lifecycle v4 carries a canonical
 bounded host/shared/exact-bridge allowlist plus a separate 1-through-4 active
 limit, retains it immutably in contained workers, and applies it to the complete
 non-MMDS-only interface set before any startup resource or vmnet backend is
 acquired. Direct mode is unchanged and all-MMDS requires no vmnet authority.
-The shipping App Sandbox plus Hypervisor worker is still an exact networkless
-profile and rejects every positive authority before spawn/resume; no restricted
-Apple vmnet entitlement or real contained connectivity is claimed. Arbitrary
+The default App Sandbox plus Hypervisor worker is an exact profile-absent
+networkless profile and rejects every positive authority before spawn/resume.
+An explicit caller-approved vmnet package profile requires a named identity,
+bounded captured profile, exact five-key signature, profile-listed signing
+leaf, and successful disposable current-host authorization probe before
+publication; runtime static/live checks then require that profile and a
+nonempty lifecycle authority. This establishes the production packaging and
+policy gate but does not claim a repository-owned restricted credential,
+`vmnet_start_interface` success, or real contained connectivity. Arbitrary
 credential/chroot authority, remaining Linux
 jailer controls, seccomp outcome classification, and deployment signing policy
 remain later #1351 work.

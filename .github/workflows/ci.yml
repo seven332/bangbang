@@ -56,6 +56,20 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 
+      - name: Verify vmnet preflight fails closed without credentials
+        run: |
+          set +e
+          preflight_output="$(scripts/preflight-production-vmnet.sh \
+            --output "$RUNNER_TEMP/Bangbang.app" \
+            --signing-identity "Unavailable CI Identity" \
+            --provisioning-profile "$RUNNER_TEMP/absent.provisionprofile" 2>&1)"
+          preflight_status=$?
+          set -e
+          if [[ "$preflight_status" -ne 3 || "$preflight_output" != "bangbang vmnet preflight: blocked" ]]; then
+            echo "vmnet preflight did not produce the fixed blocked contract" >&2
+            exit 1
+          fi
+
       - name: Run HVF unit tests
         run: cargo test -p bangbang-hvf --lib --all-features --locked
 

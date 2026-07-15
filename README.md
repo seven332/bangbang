@@ -261,9 +261,42 @@ scripts/build-production-bundle.sh \
   --signing-identity "Developer ID Application: Example (TEAMID)"
 ```
 
-The worker is signed first with exactly App Sandbox and Hypervisor
-entitlements; the outer launcher is signed last without either entitlement.
-Both use Hardened Runtime. Before every launch, the outer executable validates
+`networkless` is the default worker profile. An operator with an Apple-approved
+vmnet provisioning profile can test the exact restricted authorization without
+publishing an app:
+
+```sh
+scripts/preflight-production-vmnet.sh \
+  --output /private/operator/Bangbang.app \
+  --signing-identity "Developer ID Application: Example (TEAMID)" \
+  --provisioning-profile /private/operator/vmnet.provisionprofile
+```
+
+The command prints exactly `bangbang vmnet preflight: ready` on success. Any
+profile, identity, signing, inspection, or current-host authorization failure
+prints exactly `bangbang vmnet preflight: blocked` and exits 3. A successful
+preflight permits the same inputs to publish:
+
+```sh
+scripts/build-production-bundle.sh \
+  --output /private/operator/Bangbang.app \
+  --worker-profile vmnet \
+  --signing-identity "Developer ID Application: Example (TEAMID)" \
+  --provisioning-profile /private/operator/vmnet.provisionprofile
+```
+
+The networkless worker is signed first with exactly App Sandbox and Hypervisor.
+The vmnet worker instead has exactly those two Boolean claims, Boolean
+`com.apple.vm.networking`, and the profile-derived application and team
+identifiers; its captured profile is embedded before signing. Both profiles
+use Hardened Runtime, and the outer launcher is signed last without
+entitlements. Packaging checks the bounded profile relationships and validity,
+requires the actual signing leaf to be listed by the profile, and inspects the
+final two-or-five-key signature. Before vmnet publication it signs and runs a
+disposable copy of the already-running package tool with the same identity,
+profile, App ID, and entitlements. That private command exits immediately, so
+the caller-supplied worker is never executed during packaging. Before every
+launch, the outer executable validates
 the fixed bundle layout, nested signatures, identifiers, and required worker
 entitlements. It then starts the fixed worker suspended with a default-close
 descriptor policy: only open standard streams, one private lifecycle endpoint,
@@ -294,10 +327,13 @@ default denies system vmnet; a nonempty value can independently allow host and
 shared modes, up to four exact 15-byte ASCII bridge names, and a separate active
 interface maximum from 1 through 4. The authority is bound to the same random
 session, sender role, sequence, fixed worker identity, and daemon handoff as the
-credential/limit policy. The shipping two-entitlement worker is classified as
-the closed `Networkless` profile, so every nonempty vmnet policy is rejected
-before worker spawn or resume. No current production bundle adds either Apple
-vmnet entitlement or claims external connectivity.
+credential/limit policy. A two-entitlement/profile-absent worker is classified
+as `Networkless` and rejects every nonempty vmnet policy. An exact
+five-entitlement/profile-present worker is classified as `Vmnet` and requires a
+nonempty authority before spawn or resume. Packaging authorization proves only
+that the current host accepted that restricted signature/profile combination;
+real `vmnet_start_interface`, packet connectivity, teardown, crash, and
+concurrency evidence remain separate and are not claimed here.
 
 Before public argument or VM processing, the worker creates and locks a unique
 mode-0700 empty namespace in its App Sandbox container and enters it through the
@@ -487,8 +523,9 @@ the worker still has exactly App Sandbox and Hypervisor entitlements and steady
 state remains one launcher plus one worker.
 
 General dynamic post-Ready brokerage, hard revocation, cross-filesystem socket
-publication, an approved static vmnet profile and provisioning, broader snapshot profiles, automatic restart
-policy, Developer ID possession proof, launch-constraint policy, and
+publication, real contained vmnet connectivity and lifecycle evidence, broader
+snapshot profiles, automatic restart policy, repository-owned Developer ID or
+profile possession, launch-constraint policy, and
 notarization workflow remain. The session namespace must be empty at the
 `Prepared` gate. Authorized construction may transiently add one fixed
 role-specific staging socket or one strict record per active snapshot artifact;

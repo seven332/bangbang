@@ -1,4 +1,6 @@
 use std::ffi::c_void;
+use std::fmt;
+use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::{self, NonNull};
@@ -6,16 +8,31 @@ use std::ptr::{self, NonNull};
 use crate::{BundleLayout, LauncherError};
 
 /// Exact statically and dynamically validated worker entitlement profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum WorkerProfile {
     /// App Sandbox plus Hypervisor.framework, with no vmnet entitlement.
     Networkless,
+    /// Exact production vmnet claims bound to one approved team and application identifier.
+    Vmnet {
+        application_identifier: String,
+        team_identifier: String,
+    },
+}
+
+impl fmt::Debug for WorkerProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Networkless => formatter.write_str("Networkless"),
+            Self::Vmnet { .. } => formatter.write_str("Vmnet(<redacted>)"),
+        }
+    }
 }
 
 impl WorkerProfile {
-    pub(crate) const fn admits(self, authority: bangbang_session::VmnetAuthority) -> bool {
+    pub(crate) fn admits(&self, authority: bangbang_session::VmnetAuthority) -> bool {
         match self {
             Self::Networkless => authority.is_denied(),
+            Self::Vmnet { .. } => !authority.is_denied(),
         }
     }
 }
@@ -61,6 +78,14 @@ unsafe extern "C" {
         encoding: CfStringEncoding,
         is_external_representation: u8,
     ) -> *const c_void;
+    fn CFStringGetTypeID() -> CfTypeId;
+    fn CFStringGetLength(string: *const c_void) -> CfIndex;
+    fn CFStringGetCString(
+        string: *const c_void,
+        buffer: *mut i8,
+        buffer_size: CfIndex,
+        encoding: CfStringEncoding,
+    ) -> u8;
     fn CFGetTypeID(value: *const c_void) -> CfTypeId;
     fn CFDictionaryGetCount(dictionary: *const c_void) -> CfIndex;
     fn CFDictionaryGetTypeID() -> CfTypeId;
@@ -154,7 +179,9 @@ pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<WorkerProfile, La
             | SEC_CS_RESTRICT_SYMLINKS,
         &outer_requirement,
     )?;
-    validate_entitlements(&outer, EntitlementProfile::Outer)?;
+    if validate_entitlements(&outer, EntitlementProfile::Outer)?.is_some() {
+        return Err(LauncherError::InvalidBundleSignature);
+    }
 
     let worker_requirement = requirement(&worker_requirement_text())?;
     let worker = static_code(layout.worker_bundle(), true)?;
@@ -163,8 +190,10 @@ pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<WorkerProfile, La
         SEC_CS_CHECK_ALL_ARCHITECTURES | SEC_CS_STRICT_VALIDATE | SEC_CS_RESTRICT_SYMLINKS,
         &worker_requirement,
     )?;
-    validate_entitlements(&worker, EntitlementProfile::Worker)?;
-    Ok(WorkerProfile::Networkless)
+    let profile = validate_entitlements(&worker, EntitlementProfile::Worker)?
+        .ok_or(LauncherError::InvalidBundleSignature)?;
+    validate_embedded_profile(layout, &profile)?;
+    Ok(profile)
 }
 
 pub(crate) fn validate_worker_process(pid: libc::pid_t) -> Result<WorkerProfile, LauncherError> {
@@ -173,17 +202,22 @@ pub(crate) fn validate_worker_process(pid: libc::pid_t) -> Result<WorkerProfile,
         &worker_requirement_text(),
         EntitlementProfile::Worker,
         LauncherError::InvalidWorkerIdentity,
-    )?;
-    Ok(WorkerProfile::Networkless)
+    )?
+    .ok_or(LauncherError::InvalidWorkerIdentity)
 }
 
 pub(crate) fn validate_launcher_process(pid: libc::pid_t) -> Result<(), LauncherError> {
-    validate_process(
+    let profile = validate_process(
         pid,
         &outer_requirement_text(),
         EntitlementProfile::Outer,
         LauncherError::InvalidBundleSignature,
-    )
+    )?;
+    if profile.is_none() {
+        Ok(())
+    } else {
+        Err(LauncherError::InvalidBundleSignature)
+    }
 }
 
 fn validate_process(
@@ -191,7 +225,7 @@ fn validate_process(
     requirement_text: &str,
     profile: EntitlementProfile,
     failure: LauncherError,
-) -> Result<(), LauncherError> {
+) -> Result<Option<WorkerProfile>, LauncherError> {
     if pid <= 0 {
         return Err(failure);
     }
@@ -350,7 +384,10 @@ enum EntitlementProfile {
     Worker,
 }
 
-fn validate_entitlements(code: &CfOwned, profile: EntitlementProfile) -> Result<(), LauncherError> {
+fn validate_entitlements(
+    code: &CfOwned,
+    profile: EntitlementProfile,
+) -> Result<Option<WorkerProfile>, LauncherError> {
     let mut information = ptr::null();
     // SAFETY: `code` is a valid retained static-code object and `information`
     // points to writable storage for the retained signing-information result.
@@ -374,7 +411,7 @@ fn validate_entitlements(code: &CfOwned, profile: EntitlementProfile) -> Result<
     let entitlements = unsafe { CFDictionaryGetValue(information.as_ptr(), entitlements_key) };
     if entitlements.is_null() {
         return match profile {
-            EntitlementProfile::Outer => Ok(()),
+            EntitlementProfile::Outer => Ok(None),
             EntitlementProfile::Worker => Err(LauncherError::InvalidBundleSignature),
         };
     }
@@ -385,13 +422,82 @@ fn validate_entitlements(code: &CfOwned, profile: EntitlementProfile) -> Result<
     // SAFETY: The type check above establishes a live CFDictionary.
     let count = unsafe { CFDictionaryGetCount(entitlements) };
     match profile {
-        EntitlementProfile::Outer if count == 0 => Ok(()),
+        EntitlementProfile::Outer if count == 0 => Ok(None),
         EntitlementProfile::Outer => Err(LauncherError::InvalidBundleSignature),
         EntitlementProfile::Worker if count == 2 => {
             require_true_entitlement(entitlements, crate::layout::APP_SANDBOX_ENTITLEMENT)?;
-            require_true_entitlement(entitlements, crate::layout::HYPERVISOR_ENTITLEMENT)
+            require_true_entitlement(entitlements, crate::layout::HYPERVISOR_ENTITLEMENT)?;
+            classify_worker_profile(count, false, None, None).map(Some)
+        }
+        EntitlementProfile::Worker if count == 5 => {
+            require_true_entitlement(entitlements, crate::layout::APP_SANDBOX_ENTITLEMENT)?;
+            require_true_entitlement(entitlements, crate::layout::HYPERVISOR_ENTITLEMENT)?;
+            require_true_entitlement(entitlements, crate::layout::VMNET_ENTITLEMENT)?;
+            let application_identifier = require_string_entitlement(
+                entitlements,
+                crate::layout::APPLICATION_IDENTIFIER_ENTITLEMENT,
+            )?;
+            let team_identifier = require_string_entitlement(
+                entitlements,
+                crate::layout::TEAM_IDENTIFIER_ENTITLEMENT,
+            )?;
+            classify_worker_profile(
+                count,
+                true,
+                Some(application_identifier),
+                Some(team_identifier),
+            )
+            .map(Some)
         }
         EntitlementProfile::Worker => Err(LauncherError::InvalidBundleSignature),
+    }
+}
+
+fn classify_worker_profile(
+    count: CfIndex,
+    vmnet: bool,
+    application_identifier: Option<String>,
+    team_identifier: Option<String>,
+) -> Result<WorkerProfile, LauncherError> {
+    match (count, vmnet, application_identifier, team_identifier) {
+        (2, false, None, None) => Ok(WorkerProfile::Networkless),
+        (5, true, Some(application_identifier), Some(team_identifier))
+            if crate::provisioning_profile::valid_application_identifier(
+                &application_identifier,
+            ) && crate::provisioning_profile::valid_team_identifier(&team_identifier) =>
+        {
+            Ok(WorkerProfile::Vmnet {
+                application_identifier,
+                team_identifier,
+            })
+        }
+        _ => Err(LauncherError::InvalidBundleSignature),
+    }
+}
+
+fn validate_embedded_profile(
+    layout: &BundleLayout,
+    profile: &WorkerProfile,
+) -> Result<(), LauncherError> {
+    let path = layout.worker_provisioning_profile();
+    match profile {
+        WorkerProfile::Networkless => match fs::symlink_metadata(path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) | Err(_) => Err(LauncherError::InvalidBundleSignature),
+        },
+        WorkerProfile::Vmnet { .. } => {
+            let metadata =
+                fs::symlink_metadata(path).map_err(|_| LauncherError::InvalidBundleSignature)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() == 0
+                || metadata.len()
+                    > crate::provisioning_profile::MAX_PROVISIONING_PROFILE_BYTES as u64
+            {
+                return Err(LauncherError::InvalidBundleSignature);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -447,6 +553,54 @@ fn require_true_entitlement(dictionary: *const c_void, key: &str) -> Result<(), 
     Ok(())
 }
 
+fn require_string_entitlement(
+    dictionary: *const c_void,
+    key: &str,
+) -> Result<String, LauncherError> {
+    const MAX_ENTITLEMENT_STRING_BYTES: usize = 128;
+
+    let key = cf_string(key)?;
+    // SAFETY: `dictionary` is a live CFDictionary checked by the caller and
+    // `key` is a live CFString for this lookup.
+    let value = unsafe { CFDictionaryGetValue(dictionary, key.as_ptr()) };
+    if value.is_null() {
+        return Err(LauncherError::InvalidBundleSignature);
+    }
+    // SAFETY: `value` is borrowed from the live dictionary, and the type-ID
+    // query does not consume it; Core Foundation exports the string type ID.
+    if unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
+        return Err(LauncherError::InvalidBundleSignature);
+    }
+    // SAFETY: The type check establishes a live CFString for this bounded query.
+    let length = unsafe { CFStringGetLength(value) };
+    if length <= 0 || length as usize > MAX_ENTITLEMENT_STRING_BYTES {
+        return Err(LauncherError::InvalidBundleSignature);
+    }
+    let mut buffer = [0_i8; MAX_ENTITLEMENT_STRING_BYTES + 1];
+    // SAFETY: `value` is a live CFString and `buffer` is writable for the exact
+    // capacity supplied, including the terminating NUL byte.
+    if unsafe {
+        CFStringGetCString(
+            value,
+            buffer.as_mut_ptr(),
+            buffer.len() as CfIndex,
+            CF_STRING_ENCODING_UTF8,
+        )
+    } == 0
+    {
+        return Err(LauncherError::InvalidBundleSignature);
+    }
+    let bytes = buffer
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    if bytes.len() != length as usize {
+        return Err(LauncherError::InvalidBundleSignature);
+    }
+    String::from_utf8(bytes).map_err(|_| LauncherError::InvalidBundleSignature)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::layout::{APP_SANDBOX_ENTITLEMENT, HYPERVISOR_ENTITLEMENT};
@@ -469,5 +623,70 @@ mod tests {
     fn static_requirements_compile() {
         requirement(&outer_requirement_text()).expect("outer requirement should compile");
         requirement(&worker_requirement_text()).expect("worker requirement should compile");
+    }
+
+    #[test]
+    fn classifies_only_the_two_closed_worker_profiles() {
+        assert_eq!(
+            classify_worker_profile(2, false, None, None),
+            Ok(WorkerProfile::Networkless)
+        );
+        assert_eq!(
+            classify_worker_profile(
+                5,
+                true,
+                Some("APPID12345.dev.bangbang.worker".to_owned()),
+                Some("TEAM123456".to_owned()),
+            ),
+            Ok(WorkerProfile::Vmnet {
+                application_identifier: "APPID12345.dev.bangbang.worker".to_owned(),
+                team_identifier: "TEAM123456".to_owned(),
+            })
+        );
+        for invalid in [
+            classify_worker_profile(3, false, None, None),
+            classify_worker_profile(5, false, None, None),
+            classify_worker_profile(
+                5,
+                true,
+                Some("APPID12345.dev.other".to_owned()),
+                Some("TEAM123456".to_owned()),
+            ),
+            classify_worker_profile(
+                5,
+                true,
+                Some("APPID12345.dev.bangbang.worker".to_owned()),
+                Some("TEAM-12345".to_owned()),
+            ),
+        ] {
+            assert_eq!(invalid, Err(LauncherError::InvalidBundleSignature));
+        }
+    }
+
+    #[test]
+    fn package_profile_admission_requires_matching_policy_presence() {
+        let allowed = bangbang_session::VmnetAuthority::try_new(true, false, 1, &[])
+            .expect("nonempty authority should construct");
+        let denied = bangbang_session::VmnetAuthority::denied();
+        let networkless = WorkerProfile::Networkless;
+        let vmnet = WorkerProfile::Vmnet {
+            application_identifier: "APPID12345.dev.bangbang.worker".to_owned(),
+            team_identifier: "TEAM123456".to_owned(),
+        };
+        assert!(networkless.admits(denied));
+        assert!(!networkless.admits(allowed));
+        assert!(!vmnet.admits(denied));
+        assert!(vmnet.admits(allowed));
+    }
+
+    #[test]
+    fn vmnet_profile_debug_redacts_identity_values() {
+        let profile = WorkerProfile::Vmnet {
+            application_identifier: "PRIVATE123.dev.bangbang.worker".to_owned(),
+            team_identifier: "SECRET1234".to_owned(),
+        };
+        let debug = format!("{profile:?}");
+        assert_eq!(debug, "Vmnet(<redacted>)");
+        assert!(!debug.contains("PRIVATE") && !debug.contains("SECRET"));
     }
 }
