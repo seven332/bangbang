@@ -22,11 +22,25 @@ const ARM64_LEGACY_TEXT_OFFSET: u64 = 0x80000;
 const ARM64_BASE_ALIGNMENT: u64 = 0x20_0000;
 const INIT_ARGS_SEPARATOR: &str = " -- ";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BootSource {
     kernel_image_path: PathBuf,
     initrd_path: Option<PathBuf>,
     boot_args: Option<String>,
+}
+
+impl fmt::Debug for BootSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootSource")
+            .field("kernel_image_path", &"<redacted>")
+            .field(
+                "initrd_path",
+                &self.initrd_path.as_ref().map(|_| "<redacted>"),
+            )
+            .field("boot_args", &self.boot_args)
+            .finish()
+    }
 }
 
 impl BootSource {
@@ -66,6 +80,46 @@ impl BootSource {
         memory: &mut GuestMemory,
     ) -> Result<LoadedBootSource, BootSourceLoadError> {
         load_boot_source(self, layout, memory)
+    }
+
+    /// Loads boot payloads, using already-opened files for the supplied members.
+    pub fn load_with_files(
+        &self,
+        layout: &GuestMemoryLayout,
+        memory: &mut GuestMemory,
+        files: BootSourceFiles,
+    ) -> Result<LoadedBootSource, BootSourceLoadError> {
+        load_boot_source_with_files(self, layout, memory, files)
+    }
+}
+
+/// Optional move-only boot payload descriptors supplied by an authority owner.
+#[derive(Default)]
+pub struct BootSourceFiles {
+    kernel: Option<File>,
+    initrd: Option<File>,
+}
+
+impl fmt::Debug for BootSourceFiles {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootSourceFiles")
+            .field("kernel", &self.kernel.as_ref().map(|_| "<owned>"))
+            .field("initrd", &self.initrd.as_ref().map(|_| "<owned>"))
+            .finish()
+    }
+}
+
+impl BootSourceFiles {
+    /// Creates an optional provided-file set for configured boot payloads.
+    pub fn new(kernel: Option<File>, initrd: Option<File>) -> Self {
+        Self { kernel, initrd }
+    }
+
+    /// Returns whether every payload should use its configured path.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.kernel.is_none() && self.initrd.is_none()
     }
 }
 
@@ -150,11 +204,25 @@ impl fmt::Display for BootPayloadKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BootSourceConfigInput {
     kernel_image_path: PathBuf,
     initrd_path: Option<PathBuf>,
     boot_args: Option<String>,
+}
+
+impl fmt::Debug for BootSourceConfigInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootSourceConfigInput")
+            .field("kernel_image_path", &"<redacted>")
+            .field(
+                "initrd_path",
+                &self.initrd_path.as_ref().map(|_| "<redacted>"),
+            )
+            .field("boot_args", &self.boot_args)
+            .finish()
+    }
 }
 
 impl BootSourceConfigInput {
@@ -181,11 +249,25 @@ impl BootSourceConfigInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BootSourceConfig {
     kernel_image_path: PathBuf,
     initrd_path: Option<PathBuf>,
     boot_args: Option<String>,
+}
+
+impl fmt::Debug for BootSourceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootSourceConfig")
+            .field("kernel_image_path", &"<redacted>")
+            .field(
+                "initrd_path",
+                &self.initrd_path.as_ref().map(|_| "<redacted>"),
+            )
+            .field("boot_args", &self.boot_args)
+            .finish()
+    }
 }
 
 impl BootSourceConfig {
@@ -274,6 +356,9 @@ pub enum BootSourceLoadError {
     EmptyPayload {
         payload: BootPayloadKind,
     },
+    UnexpectedProvidedFile {
+        payload: BootPayloadKind,
+    },
     PayloadTooLargeForHost {
         payload: BootPayloadKind,
         size: u64,
@@ -342,6 +427,9 @@ impl fmt::Display for BootSourceLoadError {
             }
             Self::EmptyPayload { payload } => {
                 write!(f, "{payload} payload must not be empty")
+            }
+            Self::UnexpectedProvidedFile { payload } => {
+                write!(f, "provided {payload} has no configured payload")
             }
             Self::PayloadTooLargeForHost { payload, size } => {
                 write!(
@@ -440,6 +528,7 @@ impl std::error::Error for BootSourceLoadError {
             Self::EmptyPath { .. }
             | Self::NonRegularFile { .. }
             | Self::EmptyPayload { .. }
+            | Self::UnexpectedProvidedFile { .. }
             | Self::PayloadTooLargeForHost { .. }
             | Self::PayloadSizeChanged { .. }
             | Self::PayloadDoesNotFit { .. }
@@ -559,10 +648,26 @@ pub fn load_boot_source(
     layout: &GuestMemoryLayout,
     memory: &mut GuestMemory,
 ) -> Result<LoadedBootSource, BootSourceLoadError> {
+    load_boot_source_with_files(source, layout, memory, BootSourceFiles::default())
+}
+
+pub fn load_boot_source_with_files(
+    source: &BootSource,
+    layout: &GuestMemoryLayout,
+    memory: &mut GuestMemory,
+    files: BootSourceFiles,
+) -> Result<LoadedBootSource, BootSourceLoadError> {
+    let BootSourceFiles { kernel, initrd } = files;
+    if source.initrd_path().is_none() && initrd.is_some() {
+        return Err(BootSourceLoadError::UnexpectedProvidedFile {
+            payload: BootPayloadKind::Initrd,
+        });
+    }
     let command_line = validate_command_line(source.boot_args())?;
-    let prepared_kernel = prepare_kernel_payload(source.kernel_image_path(), layout, memory)?;
+    let prepared_kernel =
+        prepare_kernel_payload(source.kernel_image_path(), kernel, layout, memory)?;
     let initrd = match source.initrd_path() {
-        Some(path) => Some(prepare_initrd_payload(path, layout, memory)?),
+        Some(path) => Some(prepare_initrd_payload(path, initrd, layout, memory)?),
         None => None,
     };
 
@@ -717,10 +822,11 @@ fn separator_is_outside_double_quotes(prefix: &str) -> bool {
 
 fn prepare_kernel_payload(
     path: &Path,
+    provided: Option<File>,
     layout: &GuestMemoryLayout,
     memory: &GuestMemory,
 ) -> Result<PreparedKernelPayload, BootSourceLoadError> {
-    let (mut file, size) = open_payload_file(path, BootPayloadKind::Kernel)?;
+    let (mut file, size) = open_payload_file(path, provided, BootPayloadKind::Kernel)?;
     validate_kernel_range(
         layout,
         memory,
@@ -736,10 +842,11 @@ fn prepare_kernel_payload(
 
 fn prepare_initrd_payload(
     path: &Path,
+    provided: Option<File>,
     layout: &GuestMemoryLayout,
     memory: &GuestMemory,
 ) -> Result<PreparedInitrdPayload, BootSourceLoadError> {
-    let (file, size) = open_payload_file(path, BootPayloadKind::Initrd)?;
+    let (file, size) = open_payload_file(path, provided, BootPayloadKind::Initrd)?;
     let address = aarch64::initrd_load_address(layout, size)
         .map_err(|source| BootSourceLoadError::InvalidLayout { source })?
         .ok_or(BootSourceLoadError::NoInitrdSpace { size })?;
@@ -767,13 +874,17 @@ fn load_kernel_payload(
 
 fn open_payload_file(
     path: &Path,
+    provided: Option<File>,
     payload: BootPayloadKind,
 ) -> Result<(File, u64), BootSourceLoadError> {
     if path.as_os_str().is_empty() {
         return Err(BootSourceLoadError::EmptyPath { payload });
     }
 
-    let file = open_payload_file_read_only(path, payload)?;
+    let file = match provided {
+        Some(file) => file,
+        None => open_payload_file_read_only(path, payload)?,
+    };
     let metadata = file
         .metadata()
         .map_err(|source| BootSourceLoadError::ReadMetadata { payload, source })?;
@@ -1088,7 +1199,7 @@ fn memory_contains_range(memory: &GuestMemory, range: GuestMemoryRange) -> bool 
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
-    use std::fs::{self, OpenOptions};
+    use std::fs::{self, File, OpenOptions};
     use std::io::{self, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -1098,7 +1209,7 @@ mod tests {
     use super::{
         ARM64_IMAGE_MAGIC, ARM64_IMAGE_MAGIC_OFFSET, ARM64_IMAGE_SIZE_OFFSET,
         ARM64_IMAGE_TEXT_OFFSET_OFFSET, ARM64_LEGACY_TEXT_OFFSET, BootCommandLineError,
-        BootPayloadKind, BootSource, BootSourceConfigError, BootSourceConfigInput,
+        BootPayloadKind, BootSource, BootSourceConfigError, BootSourceConfigInput, BootSourceFiles,
         BootSourceLoadError, DEFAULT_KERNEL_COMMAND_LINE, INIT_ARGS_SEPARATOR, KernelImageError,
         validate_command_line_text,
     };
@@ -1369,6 +1480,171 @@ mod tests {
             .read_slice(&mut read_back, initrd.address)
             .expect("loaded initrd should be readable");
         assert_eq!(read_back, initrd_bytes);
+    }
+
+    #[test]
+    fn provided_boot_files_bypass_configured_path_opening() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let initrd_bytes = b"provided initrd bytes";
+        let kernel_file = temp_file("provided-kernel", &kernel_bytes);
+        let initrd_file = temp_file("provided-initrd", initrd_bytes);
+        let source = BootSource::new("/missing/tagged-kernel")
+            .with_initrd_path("/missing/tagged-initrd")
+            .with_boot_args("console=hvc0");
+        let files = BootSourceFiles::new(
+            Some(File::open(kernel_file.as_path()).expect("provided kernel should open")),
+            Some(File::open(initrd_file.as_path()).expect("provided initrd should open")),
+        );
+
+        let loaded = source
+            .load_with_files(&layout, &mut memory, files)
+            .expect("provided boot files should load without opening configured paths");
+
+        let mut kernel_read_back = vec![0; kernel_bytes.len()];
+        memory
+            .read_slice(&mut kernel_read_back, loaded.kernel.load_address)
+            .expect("provided kernel should be readable");
+        assert_eq!(kernel_read_back, kernel_bytes);
+        let initrd = loaded.initrd.expect("provided initrd should load");
+        let mut initrd_read_back = vec![0; initrd_bytes.len()];
+        memory
+            .read_slice(&mut initrd_read_back, initrd.address)
+            .expect("provided initrd should be readable");
+        assert_eq!(initrd_read_back, initrd_bytes);
+    }
+
+    #[test]
+    fn provided_boot_files_support_each_mixed_path_direction() {
+        let layout = boot_layout();
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let initrd_bytes = b"mixed provided initrd bytes";
+        let kernel_file = temp_file("mixed-kernel", &kernel_bytes);
+        let initrd_file = temp_file("mixed-initrd", initrd_bytes);
+
+        let mut provided_kernel_memory = boot_memory(&layout);
+        let provided_kernel = BootSource::new("/missing/tagged-kernel")
+            .with_initrd_path(initrd_file.as_path())
+            .load_with_files(
+                &layout,
+                &mut provided_kernel_memory,
+                BootSourceFiles::new(
+                    Some(File::open(kernel_file.as_path()).expect("kernel should open")),
+                    None,
+                ),
+            )
+            .expect("provided kernel and path initrd should load");
+        let mut kernel_read_back = vec![0; kernel_bytes.len()];
+        provided_kernel_memory
+            .read_slice(&mut kernel_read_back, provided_kernel.kernel.load_address)
+            .expect("provided kernel should be readable");
+        assert_eq!(kernel_read_back, kernel_bytes);
+        let provided_kernel_initrd = provided_kernel
+            .initrd
+            .expect("path initrd should be present");
+        let mut initrd_read_back = vec![0; initrd_bytes.len()];
+        provided_kernel_memory
+            .read_slice(&mut initrd_read_back, provided_kernel_initrd.address)
+            .expect("path initrd should be readable");
+        assert_eq!(initrd_read_back, initrd_bytes);
+
+        let mut provided_initrd_memory = boot_memory(&layout);
+        let provided_initrd = BootSource::new(kernel_file.as_path())
+            .with_initrd_path("/missing/tagged-initrd")
+            .load_with_files(
+                &layout,
+                &mut provided_initrd_memory,
+                BootSourceFiles::new(
+                    None,
+                    Some(File::open(initrd_file.as_path()).expect("initrd should open")),
+                ),
+            )
+            .expect("path kernel and provided initrd should load");
+        let mut kernel_read_back = vec![0; kernel_bytes.len()];
+        provided_initrd_memory
+            .read_slice(&mut kernel_read_back, provided_initrd.kernel.load_address)
+            .expect("path kernel should be readable");
+        assert_eq!(kernel_read_back, kernel_bytes);
+        let provided_initrd = provided_initrd
+            .initrd
+            .expect("provided initrd should be present");
+        let mut initrd_read_back = vec![0; initrd_bytes.len()];
+        provided_initrd_memory
+            .read_slice(&mut initrd_read_back, provided_initrd.address)
+            .expect("provided initrd should be readable");
+        assert_eq!(initrd_read_back, initrd_bytes);
+    }
+
+    #[test]
+    fn provided_boot_file_debug_redacts_descriptor_details() {
+        let kernel_file = temp_file("debug-kernel", b"kernel");
+        let files = BootSourceFiles::new(
+            Some(File::open(kernel_file.as_path()).expect("kernel should open")),
+            None,
+        );
+
+        let debug = format!("{files:?}");
+        assert_eq!(
+            debug,
+            "BootSourceFiles { kernel: Some(\"<owned>\"), initrd: None }"
+        );
+        assert!(!debug.contains(kernel_file.as_path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn boot_source_debug_redacts_paths_across_input_config_and_runtime_source() {
+        let private_kernel = "bangbang-grant:private-kernel";
+        let private_initrd = "bangbang-grant:private-initrd";
+        let input = BootSourceConfigInput::new(private_kernel)
+            .with_initrd_path(private_initrd)
+            .with_boot_args("console=hvc0");
+        let config = input
+            .clone()
+            .validate()
+            .expect("private boot config should validate");
+        let source = BootSource::new(private_kernel)
+            .with_initrd_path(private_initrd)
+            .with_boot_args("console=hvc0");
+
+        for debug in [
+            format!("{input:?}"),
+            format!("{config:?}"),
+            format!("{source:?}"),
+        ] {
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains(private_kernel));
+            assert!(!debug.contains(private_initrd));
+            assert!(debug.contains("console=hvc0"));
+        }
+    }
+
+    #[test]
+    fn rejects_provided_initrd_without_configured_initrd() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("unexpected-initrd-kernel", &kernel_bytes);
+        let initrd_file = temp_file("unexpected-initrd", b"initrd");
+        let source = BootSource::new(kernel_file.as_path());
+
+        let err = source
+            .load_with_files(
+                &layout,
+                &mut memory,
+                BootSourceFiles::new(
+                    None,
+                    Some(File::open(initrd_file.as_path()).expect("provided initrd should open")),
+                ),
+            )
+            .expect_err("unconfigured provided initrd should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::UnexpectedProvidedFile {
+                payload: BootPayloadKind::Initrd
+            }
+        ));
     }
 
     #[test]
@@ -1768,7 +2044,7 @@ mod tests {
         let memory = boot_memory(&layout);
         let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
         let kernel_file = temp_file("changed-kernel", &kernel_bytes);
-        let prepared = super::prepare_kernel_payload(kernel_file.as_path(), &layout, &memory)
+        let prepared = super::prepare_kernel_payload(kernel_file.as_path(), None, &layout, &memory)
             .expect("initial valid kernel should prepare");
         let mut changed_kernel_bytes = kernel_bytes;
         write_u32_le(&mut changed_kernel_bytes, ARM64_IMAGE_MAGIC_OFFSET, 0);
@@ -1796,7 +2072,7 @@ mod tests {
         let memory = boot_memory(&layout);
         let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
         let kernel_file = temp_file("resized-kernel", &kernel_bytes);
-        let prepared = super::prepare_kernel_payload(kernel_file.as_path(), &layout, &memory)
+        let prepared = super::prepare_kernel_payload(kernel_file.as_path(), None, &layout, &memory)
             .expect("initial valid kernel should prepare");
         let file = OpenOptions::new()
             .write(true)
@@ -1844,7 +2120,7 @@ mod tests {
         let memory = boot_memory(&layout);
         let initrd_bytes = b"initrd";
         let initrd_file = temp_file("resized-initrd", initrd_bytes);
-        let prepared = super::prepare_initrd_payload(initrd_file.as_path(), &layout, &memory)
+        let prepared = super::prepare_initrd_payload(initrd_file.as_path(), None, &layout, &memory)
             .expect("initial valid initrd should prepare");
         let file = OpenOptions::new()
             .write(true)

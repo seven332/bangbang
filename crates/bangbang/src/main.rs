@@ -26,7 +26,7 @@ use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{RequestError, parse_request_with_limit};
 use bangbang_hvf::HvfBackend;
-use contained_session::ContainedSession;
+use contained_session::{ContainedSession, GrantAuthority};
 use periodic_metrics::{
     PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
 };
@@ -45,6 +45,7 @@ use bangbang_runtime::snapshot_format::{
     SnapshotFormatError, inspect_snapshot_envelope,
 };
 use bangbang_runtime::{VmmAction, VmmActionError};
+use bangbang_session::ResourceRole;
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
@@ -123,6 +124,9 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
         }
         Command::Run(config) => {
             let config = *config;
+            let grant_authority = contained
+                .as_ref()
+                .and_then(ContainedSession::grant_authority);
             preallocate_fdtable().map_err(ProcessError::FdTablePreallocation)?;
             if contained_shutdown_requested(contained)? {
                 return Ok(());
@@ -160,7 +164,8 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             )
             .with_boot_timer_enabled(boot_timer)
             .with_process_metrics_diagnostics(process_metrics_diagnostics)
-            .with_process_signal_metrics(signal_metrics.clone());
+            .with_process_signal_metrics(signal_metrics.clone())
+            .with_grant_authority(grant_authority.clone());
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
             if contained_shutdown_requested(contained)? {
                 return Ok(());
@@ -169,15 +174,22 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             if contained_shutdown_requested(contained)? {
                 return Ok(());
             }
-            apply_startup_metadata(&mut vmm, metadata.as_deref())?;
+            apply_startup_metadata_with_authority(
+                &mut vmm,
+                metadata.as_deref(),
+                grant_authority.as_ref(),
+            )?;
             if contained_shutdown_requested(contained)? {
                 return Ok(());
             }
             let _fatal_signal_handlers = FatalSignalHandlers::install()?;
             let _sigpipe_signal_handler = SigpipeSignalHandler::install(signal_metrics)?;
-            if apply_startup_config_file_with_cancel(&mut vmm, config_file.as_deref(), || {
-                contained_shutdown_requested(contained)
-            })? {
+            if apply_startup_config_file_with_cancel(
+                &mut vmm,
+                config_file.as_deref(),
+                grant_authority.as_ref(),
+                || contained_shutdown_requested(contained),
+            )? {
                 return finish_process_with_terminal_metrics(&mut vmm, Ok(()));
             }
             let result = (|| {
@@ -378,7 +390,7 @@ fn apply_startup_config_file<S>(
 where
     S: vmm::InstanceStartExecutor,
 {
-    let cancelled = apply_startup_config_file_with_cancel(vmm, config_file, || Ok(false))?;
+    let cancelled = apply_startup_config_file_with_cancel(vmm, config_file, None, || Ok(false))?;
     debug_assert!(!cancelled, "non-cancellable wrapper cannot cancel");
     Ok(())
 }
@@ -386,6 +398,7 @@ where
 fn apply_startup_config_file_with_cancel<S, C>(
     vmm: &mut ProcessVmm<S>,
     config_file: Option<&str>,
+    grant_authority: Option<&GrantAuthority>,
     mut cancelled: C,
 ) -> Result<bool, ProcessError>
 where
@@ -395,7 +408,8 @@ where
     let Some(config_file) = config_file else {
         return Ok(false);
     };
-    let actions = config_file_actions(config_file).map_err(ProcessError::ConfigFile)?;
+    let actions = config_file_actions_with_authority(config_file, grant_authority)
+        .map_err(ProcessError::ConfigFile)?;
 
     for action in actions {
         if cancelled()? {
@@ -418,14 +432,27 @@ where
     Ok(false)
 }
 
+#[cfg(test)]
 fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
-    let contents = read_limited_regular_utf8_file(config_file, CONFIG_FILE_MAX_BYTES).map_err(
-        |err| match err {
-            StartupFileReadError::Read(kind) => ConfigFileError::Read(kind),
-            StartupFileReadError::NotRegular => ConfigFileError::NotRegular,
-            StartupFileReadError::TooLarge => ConfigFileError::TooLarge,
-        },
-    )?;
+    config_file_actions_with_authority(config_file, None)
+}
+
+fn config_file_actions_with_authority(
+    config_file: &str,
+    grant_authority: Option<&GrantAuthority>,
+) -> Result<Vec<VmmAction>, ConfigFileError> {
+    let contents = read_limited_regular_utf8_input(
+        config_file,
+        CONFIG_FILE_MAX_BYTES,
+        grant_authority,
+        ResourceRole::StartupConfig,
+    )
+    .map_err(|err| match err {
+        StartupFileReadError::Read(kind) => ConfigFileError::Read(kind),
+        StartupFileReadError::NotRegular => ConfigFileError::NotRegular,
+        StartupFileReadError::TooLarge => ConfigFileError::TooLarge,
+        StartupFileReadError::Grant => ConfigFileError::Grant,
+    })?;
     config_file_actions_from_str(&contents)
 }
 
@@ -784,6 +811,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_startup_metadata<S>(
     vmm: &mut ProcessVmm<S>,
     metadata: Option<&str>,
@@ -791,10 +819,22 @@ fn apply_startup_metadata<S>(
 where
     S: vmm::InstanceStartExecutor,
 {
+    apply_startup_metadata_with_authority(vmm, metadata, None)
+}
+
+fn apply_startup_metadata_with_authority<S>(
+    vmm: &mut ProcessVmm<S>,
+    metadata: Option<&str>,
+    grant_authority: Option<&GrantAuthority>,
+) -> Result<(), ProcessError>
+where
+    S: vmm::InstanceStartExecutor,
+{
     let Some(metadata) = metadata else {
         return Ok(());
     };
-    let input = metadata_content_input(metadata).map_err(ProcessError::Metadata)?;
+    let input = metadata_content_input_with_authority(metadata, grant_authority)
+        .map_err(ProcessError::Metadata)?;
 
     vmm.handle_action(VmmAction::PutMmds(input))
         .map(|_| ())
@@ -802,15 +842,27 @@ where
         .map_err(ProcessError::Metadata)
 }
 
+#[cfg(test)]
 fn metadata_content_input(metadata_file: &str) -> Result<MmdsContentInput, MetadataFileError> {
-    let contents =
-        read_limited_regular_utf8_file(metadata_file, METADATA_FILE_MAX_BYTES).map_err(|err| {
-            match err {
-                StartupFileReadError::Read(kind) => MetadataFileError::Read(kind),
-                StartupFileReadError::NotRegular => MetadataFileError::NotRegular,
-                StartupFileReadError::TooLarge => MetadataFileError::TooLarge,
-            }
-        })?;
+    metadata_content_input_with_authority(metadata_file, None)
+}
+
+fn metadata_content_input_with_authority(
+    metadata_file: &str,
+    grant_authority: Option<&GrantAuthority>,
+) -> Result<MmdsContentInput, MetadataFileError> {
+    let contents = read_limited_regular_utf8_input(
+        metadata_file,
+        METADATA_FILE_MAX_BYTES,
+        grant_authority,
+        ResourceRole::StartupMetadata,
+    )
+    .map_err(|err| match err {
+        StartupFileReadError::Read(kind) => MetadataFileError::Read(kind),
+        StartupFileReadError::NotRegular => MetadataFileError::NotRegular,
+        StartupFileReadError::TooLarge => MetadataFileError::TooLarge,
+        StartupFileReadError::Grant => MetadataFileError::Grant,
+    })?;
     let value = parse_json_value_without_duplicate_object_keys(&contents)
         .map_err(|_| MetadataFileError::Malformed)?;
 
@@ -823,6 +875,9 @@ fn describe_snapshot(path: &str) -> Result<SnapshotEnvelopeMetadata, ProcessErro
             StartupFileReadError::Read(kind) => SnapshotInspectionError::Read(kind),
             StartupFileReadError::NotRegular => SnapshotInspectionError::NotRegular,
             StartupFileReadError::TooLarge => SnapshotInspectionError::TooLarge,
+            StartupFileReadError::Grant => {
+                SnapshotInspectionError::Read(std::io::ErrorKind::PermissionDenied)
+            }
         })
         .map_err(ProcessError::SnapshotInspection)?;
 
@@ -831,11 +886,21 @@ fn describe_snapshot(path: &str) -> Result<SnapshotEnvelopeMetadata, ProcessErro
         .map_err(ProcessError::SnapshotInspection)
 }
 
-fn read_limited_regular_utf8_file(
+fn read_limited_regular_utf8_input(
     path: &str,
     max_bytes: usize,
+    grant_authority: Option<&GrantAuthority>,
+    role: ResourceRole,
 ) -> Result<String, StartupFileReadError> {
-    let contents = read_limited_regular_file(path, max_bytes)?;
+    let file = grant_authority
+        .map(|authority| authority.claim_read_only_file(std::path::Path::new(path), role))
+        .transpose()
+        .map_err(|_| StartupFileReadError::Grant)?
+        .flatten();
+    let contents = match file {
+        Some(file) => read_limited_regular_open_file(file, max_bytes)?,
+        None => read_limited_regular_file(path, max_bytes)?,
+    };
     String::from_utf8(contents)
         .map_err(|_| StartupFileReadError::Read(std::io::ErrorKind::InvalidData))
 }
@@ -844,14 +909,20 @@ fn read_limited_regular_file(
     path: &str,
     max_bytes: usize,
 ) -> Result<Vec<u8>, StartupFileReadError> {
-    let max_bytes_u64 = max_bytes as u64;
-
     // Keep special files such as FIFOs from hanging startup before file-type validation.
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
         .map_err(|err| StartupFileReadError::Read(err.kind()))?;
+    read_limited_regular_open_file(file, max_bytes)
+}
+
+fn read_limited_regular_open_file(
+    file: fs::File,
+    max_bytes: usize,
+) -> Result<Vec<u8>, StartupFileReadError> {
+    let max_bytes_u64 = max_bytes as u64;
     let metadata = file
         .metadata()
         .map_err(|err| StartupFileReadError::Read(err.kind()))?;
@@ -1098,6 +1169,7 @@ enum StartupFileReadError {
     Read(std::io::ErrorKind),
     NotRegular,
     TooLarge,
+    Grant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1129,6 +1201,7 @@ enum ConfigFileError {
     Read(std::io::ErrorKind),
     NotRegular,
     TooLarge,
+    Grant,
     Malformed,
     MissingSection(&'static str),
     UnknownSection(String),
@@ -1154,6 +1227,7 @@ impl fmt::Display for ConfigFileError {
                 f,
                 "config file exceeds {CONFIG_FILE_MAX_BYTES} byte size limit"
             ),
+            Self::Grant => f.write_str("private resource grant failed"),
             Self::Malformed => f.write_str("malformed config file"),
             Self::MissingSection(section) => {
                 write!(f, "config file is missing required section: {section}")
@@ -1182,6 +1256,7 @@ enum MetadataFileError {
     Read(std::io::ErrorKind),
     NotRegular,
     TooLarge,
+    Grant,
     Malformed,
     Apply(VmmActionError),
 }
@@ -1195,6 +1270,7 @@ impl fmt::Display for MetadataFileError {
                 f,
                 "metadata file exceeds {METADATA_FILE_MAX_BYTES} byte size limit"
             ),
+            Self::Grant => f.write_str("private resource grant failed"),
             Self::Malformed => f.write_str("malformed metadata file"),
             Self::Apply(err) => write!(f, "failed to apply metadata: {err}"),
         }
@@ -5609,6 +5685,33 @@ mod tests {
         assert!(matches!(actions.as_slice(), [VmmAction::PutBootSource(_)]));
 
         fs::remove_file(config_path).expect("fixture file should clean up");
+    }
+
+    #[test]
+    fn direct_mode_treats_grant_reference_as_a_literal_config_filename() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let config_path = PathBuf::from(format!(
+            "bangbang-grant:direct-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::write(
+            &config_path,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"}}"#,
+        )
+        .expect("literal grant-named config should be written");
+
+        let actions = super::config_file_actions(
+            config_path
+                .to_str()
+                .expect("literal grant-named path should be UTF-8"),
+        )
+        .expect("direct mode should open the literal filename");
+
+        assert!(matches!(actions.as_slice(), [VmmAction::PutBootSource(_)]));
+        fs::remove_file(config_path).expect("literal grant-named config should clean up");
     }
 
     #[test]

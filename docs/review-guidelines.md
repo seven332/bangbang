@@ -137,7 +137,14 @@ roles with an exact anchor, balanced scope, concrete access validation, and no
 operator-supplied or persisted bytes. Treat the stale bit as private evidence,
 not sufficient validity or invalidity. Registry adoption must be one-time and
 typed with no ambient path fallback. Closing a sender duplicate is cleanup, not
-hard revocation.
+hard revocation. Only contained mode may interpret the exact, case-sensitive
+`bangbang-grant:<GrantId>` form; direct mode must preserve it as a pathname.
+Validate public state and request shape before claiming, and validate every
+member of a multi-file claim before removing any registry entry. Keep adopted
+boot descriptors beside the public configuration, never reopen a tag, and
+separate authorized `GET /vm/config` output from redacted diagnostics. Review
+the cancellation/disconnect race against pending claims, descriptor lifetime on
+every error path, and the singleton retry rule after boot consumes a grant.
 
 ## Concurrency and Resource Management
 

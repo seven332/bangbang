@@ -373,6 +373,7 @@ pub enum VmmActionError {
     BalloonUpdate(balloon::BalloonUpdateError),
     EntropyUnsupported,
     MissingBootSource,
+    ResourceGrant,
     InstanceStart(BackendError),
     Lifecycle(BackendError),
     BootSourceConfig(boot::BootSourceConfigError),
@@ -428,6 +429,7 @@ impl fmt::Display for VmmActionError {
             Self::MissingBootSource => {
                 f.write_str("boot source must be configured before InstanceStart")
             }
+            Self::ResourceGrant => f.write_str("private resource grant failed"),
             Self::InstanceStart(err) => write!(f, "failed to start microVM: {err}"),
             Self::Lifecycle(err) => write!(f, "failed to update microVM lifecycle: {err}"),
             Self::BootSourceConfig(err) => write!(f, "{err}"),
@@ -502,6 +504,7 @@ impl std::error::Error for VmmActionError {
             | Self::DriveUpdateUnsupported
             | Self::EntropyUnsupported
             | Self::MissingBootSource
+            | Self::ResourceGrant
             | Self::NetworkInterfaceUpdateUnsupported
             | Self::MemoryHotplugUnsupported
             | Self::PmemUpdateUnsupported
@@ -846,6 +849,27 @@ impl VmmController {
         update: memory_hotplug::MemoryHotplugSizeUpdate,
     ) {
         self.memory_hotplug_requested_size_mib = update.requested_size_mib();
+    }
+
+    /// Validates a boot-source replacement without mutating controller state.
+    pub fn prepare_boot_source_config(
+        &self,
+        input: boot::BootSourceConfigInput,
+    ) -> Result<boot::BootSourceConfig, VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutBootSource",
+                state: self.instance_info.state,
+            });
+        }
+
+        input.validate().map_err(VmmActionError::BootSourceConfig)
+    }
+
+    /// Commits a previously validated boot-source replacement.
+    pub fn commit_boot_source_config(&mut self, config: boot::BootSourceConfig) {
+        self.boot_source_config = Some(config);
+        self.snapshot_load_history_fresh = false;
     }
 
     pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {
@@ -1397,18 +1421,8 @@ impl VmmController {
                 Ok(VmmData::Empty)
             }
             VmmAction::PutBootSource(config) => {
-                if self.instance_info.state != InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
-                self.boot_source_config = Some(
-                    config
-                        .validate()
-                        .map_err(VmmActionError::BootSourceConfig)?,
-                );
+                let config = self.prepare_boot_source_config(config)?;
+                self.commit_boot_source_config(config);
 
                 Ok(VmmData::Empty)
             }

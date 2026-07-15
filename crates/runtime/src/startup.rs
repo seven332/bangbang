@@ -22,7 +22,8 @@ use crate::block::{
     VirtioBlockMmioHandler, VirtioBlockRuntimeRestoreInput,
 };
 use crate::boot::{
-    BootCommandLineError, BootSource, BootSourceConfig, BootSourceLoadError, LoadedBootSource,
+    BootCommandLineError, BootSource, BootSourceConfig, BootSourceFiles, BootSourceLoadError,
+    LoadedBootSource,
 };
 use crate::entropy::{
     EntropyMmioDeviceRegistration, EntropyMmioLayout, EntropyMmioRegistrationError,
@@ -3272,6 +3273,19 @@ impl Arm64BootResources {
         controller: &VmmController,
         config: Arm64BootResourceConfig<'_>,
     ) -> Result<Self, Arm64BootResourceError> {
+        Self::assemble_from_controller_with_boot_files(
+            controller,
+            config,
+            BootSourceFiles::default(),
+        )
+    }
+
+    /// Assembles resources while consuming any already-opened boot payload files.
+    pub fn assemble_from_controller_with_boot_files(
+        controller: &VmmController,
+        config: Arm64BootResourceConfig<'_>,
+        boot_files: BootSourceFiles,
+    ) -> Result<Self, Arm64BootResourceError> {
         let Arm64BootResourceConfig {
             vcpu_mpidrs,
             gic,
@@ -3329,7 +3343,7 @@ impl Arm64BootResources {
             .map_err(|source| Arm64BootResourceError::GuestMemoryAllocation { source })?;
         let boot_source = boot_source_from_config(boot_source_config);
         let mut loaded_boot_source = boot_source
-            .load(&layout, &mut memory)
+            .load_with_files(&layout, &mut memory, boot_files)
             .map_err(|source| Arm64BootResourceError::BootSourceLoad { source })?;
         append_root_drive_command_line(&mut loaded_boot_source, controller.drive_configs())?;
         let prepared_pmems =
