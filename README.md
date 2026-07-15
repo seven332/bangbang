@@ -365,7 +365,8 @@ the socket exclusively to the requested child with fd-relative
 directory to share a filesystem. The binder is reaped before API readiness or
 VM-start success; shutdown removes only an identity-matching socket. A
 simultaneous uncatchable launcher and worker death can leave a stale external
-socket name.
+socket name plus its private ownership record; automatic later recovery remains
+limited to empty session namespaces.
 
 The granted API listener is served directly and becomes ready only after
 publication. `--no-api` claims no API directory. A granted vsock keeps the
@@ -384,9 +385,10 @@ Snapshot consumers, general dynamic post-Ready brokerage, hard revocation,
 cross-filesystem socket publication, vmnet provisioning, automatic restart
 policy, Developer ID possession proof, launch-constraint policy, and
 notarization workflow remain. The session namespace must be empty at the
-`Prepared` gate; after authorization it may hold at most the two fixed socket
-ownership records containing role, safe child, and socket identity, never a
-path, descriptor, bookmark, grant ID, payload, or session byte.
+`Prepared` gate. Authorized construction may transiently add one fixed
+role-specific staging socket; after publication the namespace may hold at most
+the two fixed socket ownership records containing role, safe child, and socket
+identity, never a path, descriptor, bookmark, grant ID, payload, or session byte.
 Same-identifier workers share one App Sandbox
 container, so namespace locks and identity checks protect cooperative sessions
 and replacements but do not isolate a malicious same-bundle sibling. See
@@ -704,8 +706,9 @@ scripts/run-integration-tests.sh --test production_bundle
 This target verifies exact identifiers, entitlements, Hardened Runtime, strict
 static and live-worker validation, tamper rejection, the descriptor allowlist,
 malformed-bootstrap rejection, container-only path denial and redaction,
-structured API/no-API readiness and cancellation, worker-first/launcher-first/
-both-killed namespace cleanup, concurrent-session isolation, owned-socket
+structured API/no-API readiness and cancellation, worker-first/launcher-first
+namespace cleanup, empty both-killed namespace recovery, concurrent-session
+isolation, owned-socket
 cleanup, mandatory empty-grant startup, typed read-only/write-only/directory
 grants, mismatch rollback, grant-phase cancellation/deadline behavior,
 grant-bearing crash/concurrency isolation, absence of the test exerciser from

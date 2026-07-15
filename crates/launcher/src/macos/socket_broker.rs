@@ -19,11 +19,21 @@ use crate::grant_manifest::PreparedGrantBatch;
 const CONNECT_INTERRUPTED_RETRY_LIMIT: usize = 8;
 
 /// Session-bound state for the one dormant or active broker endpoint.
-#[derive(Debug)]
 pub(crate) struct LauncherSocketBroker {
     session: SessionId,
     next_sequence: u64,
     state: BrokerState,
+}
+
+impl std::fmt::Debug for LauncherSocketBroker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LauncherSocketBroker")
+            .field("session", &"<redacted>")
+            .field("next_sequence", &"<redacted>")
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -478,8 +488,15 @@ mod tests {
 
     #[test]
     fn broker_state_and_errors_are_redacted() {
-        let broker = LauncherSocketBroker::new(session());
-        assert!(!format!("{broker:?}").contains("0909"));
+        let mut broker = LauncherSocketBroker::new(session());
+        broker.next_sequence = 52;
+        broker.state = BrokerState::Active(
+            SocketChild::parse("sensitive-vsock.sock").expect("child should parse"),
+        );
+        let debug = format!("{broker:?}");
+        assert!(!debug.contains("0909"));
+        assert!(!debug.contains("52"));
+        assert!(!debug.contains("sensitive-vsock.sock"));
         assert_eq!(
             LauncherError::SocketBroker.to_string(),
             "private socket broker failed"

@@ -259,12 +259,7 @@ impl fmt::Debug for AnchoredSocketGuard {
 
 impl Drop for AnchoredSocketGuard {
     fn drop(&mut self) {
-        let _ = unlink_socket_if_owned(
-            self.claim.directory.anchor_fd(),
-            &self.claim.child,
-            self.record.identity(),
-        );
-        let _ = self.namespace.clear_socket_record(&self.record);
+        cleanup_published_record(&self.namespace, &self.claim, &self.record);
     }
 }
 
@@ -375,8 +370,7 @@ pub(crate) fn bind(
     let child = match child_cstring(&claim.child) {
         Ok(child) => child,
         Err(error) => {
-            let _ = unlink_relative_if_socket_at(namespace.anchor_fd(), staging, Some(identity));
-            let _ = namespace.clear_socket_record(&record);
+            cleanup_staged_record(&namespace, staging, &record);
             return Err(error);
         }
     };
@@ -392,8 +386,7 @@ pub(crate) fn bind(
     };
     if published != 0 {
         let error = io::Error::last_os_error();
-        let _ = unlink_relative_if_socket_at(namespace.anchor_fd(), staging, Some(identity));
-        let _ = namespace.clear_socket_record(&record);
+        cleanup_staged_record(&namespace, staging, &record);
         return if matches!(
             error.kind(),
             io::ErrorKind::AlreadyExists | io::ErrorKind::AddrInUse
@@ -408,8 +401,7 @@ pub(crate) fn bind(
         relative_socket_identity(claim.directory.anchor_fd(), &child),
         Ok(final_identity) if final_identity == identity
     ) {
-        let _ = unlink_socket_if_owned(claim.directory.anchor_fd(), &claim.child, identity);
-        let _ = namespace.clear_socket_record(&record);
+        cleanup_published_record(&namespace, &claim, &record);
         return Err(AnchoredSocketError::PathChanged);
     }
 
@@ -417,8 +409,7 @@ pub(crate) fn bind(
         match spawn_connector(&claim, broker.ok_or(AnchoredSocketError::Invalid)?) {
             Ok(connector) => Some(connector),
             Err(error) => {
-                let _ = unlink_socket_if_owned(claim.directory.anchor_fd(), &claim.child, identity);
-                let _ = namespace.clear_socket_record(&record);
+                cleanup_published_record(&namespace, &claim, &record);
                 return Err(error);
             }
         }
@@ -1080,7 +1071,7 @@ fn relative_socket_identity(
     // SAFETY: Successful `fstatat` initialized the complete structure.
     let stat = unsafe { stat.assume_init() };
     if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
-        || stat.st_mode & 0o777 != 0o600
+        || stat.st_mode & 0o7777 != 0o600
         || stat.st_nlink != 1
     {
         return Err(AnchoredSocketError::Invalid);
@@ -1127,6 +1118,32 @@ fn unlink_socket_if_owned(
 ) -> Result<(), AnchoredSocketError> {
     let child = child_cstring(child)?;
     unlink_relative_if_socket_at(directory, &child, Some(identity))
+}
+
+fn cleanup_staged_record(
+    namespace: &WorkerSocketNamespace,
+    staging: &std::ffi::CStr,
+    record: &SocketOwnershipRecord,
+) {
+    if unlink_relative_if_socket_at(namespace.anchor_fd(), staging, Some(record.identity())).is_ok()
+    {
+        let _ = namespace.clear_socket_record(record);
+    }
+}
+
+fn cleanup_published_record(
+    namespace: &WorkerSocketNamespace,
+    claim: &ClaimedSocketDirectory,
+    record: &SocketOwnershipRecord,
+) {
+    let cleanup =
+        unlink_socket_if_owned(claim.directory.anchor_fd(), &claim.child, record.identity());
+    if matches!(
+        cleanup,
+        Ok(()) | Err(AnchoredSocketError::Invalid | AnchoredSocketError::PathChanged)
+    ) {
+        let _ = namespace.clear_socket_record(record);
+    }
 }
 
 fn unlink_relative_if_socket(
@@ -1227,25 +1244,122 @@ impl OwnedHelper {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(AnchoredSocketError::Binder)?;
+        if let Some(status) = self.try_reap()? {
+            return helper_status(status);
+        }
+
+        // SAFETY: `kqueue` has no pointer arguments and returns a fresh
+        // descriptor on success.
+        let kqueue = unsafe { libc::kqueue() };
+        if kqueue < 0 {
+            return Err(AnchoredSocketError::Io(io::Error::last_os_error().kind()));
+        }
+        // SAFETY: The successful descriptor is uniquely owned here.
+        let kqueue = unsafe { OwnedFd::from_raw_fd(kqueue) };
+        set_cloexec(kqueue.as_raw_fd()).map_err(|error| AnchoredSocketError::Io(error.kind()))?;
+        let child = usize::try_from(self.pid).map_err(|_| AnchoredSocketError::Binder)?;
+        let change = libc::kevent {
+            ident: child,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: The change remains live for this synchronous registration;
+        // no output event buffer or timeout is supplied.
+        if unsafe {
+            libc::kevent(
+                kqueue.as_raw_fd(),
+                &raw const change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error().kind();
+            return match self.try_reap()? {
+                Some(status) => helper_status(status),
+                None => Err(AnchoredSocketError::Io(error)),
+            };
+        }
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = libc::timespec {
+                tv_sec: libc::time_t::try_from(remaining.as_secs()).unwrap_or(libc::time_t::MAX),
+                tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+            };
+            let mut event = MaybeUninit::<libc::kevent>::uninit();
+            // SAFETY: `event` provides room for one kernel-initialized result;
+            // the bounded timeout remains live for the synchronous wait.
+            let count = unsafe {
+                libc::kevent(
+                    kqueue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    &raw const timeout,
+                )
+            };
+            if count == 0 {
+                return Err(AnchoredSocketError::Binder);
+            }
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(AnchoredSocketError::Io(error.kind()));
+            }
+            // SAFETY: A positive count initialized the single output event.
+            let event = unsafe { event.assume_init() };
+            if event.ident != child
+                || event.filter != libc::EVFILT_PROC
+                || event.fflags & libc::NOTE_EXIT == 0
+            {
+                return Err(AnchoredSocketError::Binder);
+            }
+            return helper_status(self.reap_after_exit()?);
+        }
+    }
+
+    fn try_reap(&mut self) -> Result<Option<i32>, AnchoredSocketError> {
         loop {
             let mut status = 0;
             // SAFETY: PID is this object's unreaped child and status is writable.
             let result = unsafe { libc::waitpid(self.pid, &raw mut status, libc::WNOHANG) };
             if result == self.pid {
                 self.reaped = true;
-                return if status == 0 {
-                    Ok(())
-                } else {
-                    Err(AnchoredSocketError::Binder)
-                };
+                return Ok(Some(status));
             }
-            if result < 0 {
-                return Err(AnchoredSocketError::Io(io::Error::last_os_error().kind()));
+            if result == 0 {
+                return Ok(None);
             }
-            if Instant::now() >= deadline {
-                return Err(AnchoredSocketError::Binder);
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(AnchoredSocketError::Io(error.kind()));
             }
-            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn reap_after_exit(&mut self) -> Result<i32, AnchoredSocketError> {
+        loop {
+            let mut status = 0;
+            // SAFETY: NOTE_EXIT established that this owned child exited;
+            // `status` remains writable while it is synchronously reaped.
+            let result = unsafe { libc::waitpid(self.pid, &raw mut status, 0) };
+            if result == self.pid {
+                self.reaped = true;
+                return Ok(status);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(AnchoredSocketError::Io(error.kind()));
+            }
         }
     }
 
@@ -1267,6 +1381,14 @@ impl OwnedHelper {
                 return;
             }
         }
+    }
+}
+
+const fn helper_status(status: i32) -> Result<(), AnchoredSocketError> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(AnchoredSocketError::Binder)
     }
 }
 

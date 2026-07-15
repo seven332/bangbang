@@ -715,8 +715,8 @@ may skip execution. On supported Apple Silicon it proves:
   config file;
 - `SIGINT` and `SIGTERM` as one graceful session cancellation with successful
   worker/launcher exit and owned-socket cleanup;
-- worker-first and launcher-first death cleanup, both-killed stale namespace
-  recovery, and preservation of the concurrent peer namespace;
+- worker-first and launcher-first death cleanup, empty both-killed stale
+  namespace recovery, and preservation of the concurrent peer namespace;
 - two simultaneous API sessions remaining independent when one worker is
   killed and the other is queried and then gracefully stopped; and
 - mandatory lifecycle-v2 acknowledgment for even an empty batch; exact
@@ -798,10 +798,11 @@ ancillary cleanup, exact descriptor access/type/identity, sequence/session/batch
 poisoning and rollback, fragmented bookmark scope, kernel peer acceptance and
 PID rejection, exact namespace naming/root derivation, bounded independent
 directory iteration across repeated checks, stale empty-directory recovery,
-populated-entry preservation, strict socket ownership records, anchored
-exclusive publication/rollback, binder framing/descriptor validation, broker
-state and relative-target validation, and replacement-safe cleanup. These tests do not
-replace the signed target:
+populated-entry preservation, strict socket ownership records, identity-safe
+fixed-staging cleanup, anchored exclusive publication/rollback, binder
+framing/descriptor validation, broker state and relative-target validation, and
+replacement-safe cleanup. Socket readiness helpers use bounded kernel event
+waits instead of active polling. These tests do not replace the signed target:
 default-close spawning, dynamic code identity, App Sandbox root resolution,
 crash order, and real HVF claims require the packaged execution above.
 
@@ -1262,9 +1263,12 @@ listens on the test AF_VSOCK port, writes
 `BANGBANG_VSOCK_HOST_CONNECT_READY` only after the guest listener is ready,
 accepts the host's Firecracker-style `CONNECT <PORT>` request through the main
 `uds_path` after the host consumes the `OK <local_port>` response, exchanges
-and incrementally verifies the same exact 1-MiB deterministic streams and
-half-close/EOF sequence, and writes `BANGBANG_VSOCK_HOST_CONNECT_OK` only after
-every byte and aggregate count matches. With `bangbang.vsock-host-multistream=1`,
+and incrementally verifies the same exact 1-MiB deterministic streams, and
+writes `BANGBANG_VSOCK_HOST_CONNECT_OK` only after every byte and aggregate
+count matches. The guest sends its full stream and immediately write-half-closes;
+the host verifies that stream before sending its full reverse stream and
+write-half-closing. The guest then verifies the reverse stream and host EOF,
+and the host finally requires guest EOF. With `bangbang.vsock-host-multistream=1`,
 Python binds two guest AF_VSOCK listeners on distinct ports, reports ready only
 after both listeners are active, accepts two host `CONNECT <PORT>` streams
 through the main `uds_path`, sends distinct guest payloads on both streams,

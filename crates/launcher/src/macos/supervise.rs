@@ -222,6 +222,7 @@ fn cleanup_namespace_after_worker(
             .socket_directory_anchor(record.role())
             .ok_or(RuntimeError::InvalidEntry)?;
         unlink_owned_socket(anchor.descriptor(), &record)?;
+        namespace.unlink_staged_socket(&record)?;
         namespace.clear_socket_record(&record)?;
     }
     namespace.cleanup()
@@ -252,11 +253,18 @@ fn unlink_owned_socket(
     }
     // SAFETY: Successful fstatat initialized the complete result.
     let stat = unsafe { stat.assume_init() };
+    // SAFETY: `geteuid` has no pointer or ownership contract.
+    let uid = unsafe { libc::geteuid() };
     let identity = bangbang_session::ObjectIdentity {
         device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
         inode: stat.st_ino,
     };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK || identity != record.identity() {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+        || stat.st_mode & 0o7777 != 0o600
+        || stat.st_uid != uid
+        || stat.st_nlink != 1
+        || identity != record.identity()
+    {
         return Ok(());
     }
     // SAFETY: The retained directory and bounded child name the identity-checked socket.
@@ -875,7 +883,7 @@ fn duration_timespec(duration: Duration) -> libc::timespec {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -951,6 +959,8 @@ mod tests {
         let child = SocketChild::parse("api.sock").expect("child should parse");
         let path = root.path().join("api.sock");
         let listener = UnixListener::bind(&path).expect("socket should bind");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("socket permissions should tighten");
         let metadata = fs::symlink_metadata(&path).expect("socket metadata should read");
         let record = SocketOwnershipRecord::new(
             ResourceRole::ApiSocketDirectory,
@@ -962,6 +972,13 @@ mod tests {
         )
         .expect("record should construct");
 
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+            .expect("socket permissions should change");
+        unlink_owned_socket(directory.as_raw_fd(), &record)
+            .expect("mode-mismatched socket should be preserved");
+        assert!(path.exists());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("socket permissions should restore");
         unlink_owned_socket(directory.as_raw_fd(), &record).expect("recorded socket should clean");
         assert!(!path.exists());
         drop(listener);

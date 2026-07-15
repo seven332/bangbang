@@ -224,13 +224,16 @@ wait. Grant sending must remain nonblocking in the same event loop, continue to
 observe signals, lifecycle input, and child exit, and use one absolute
 send-plus-acknowledgment deadline.
 
-Once socket publication is authorized, the namespace may contain only the two
-fixed strict ownership records. Review worker-side normal cleanup and
+Authorized socket construction may transiently add only one fixed role-specific
+staging socket; after publication the namespace may contain only the two fixed
+strict ownership records. Review worker-side normal cleanup and
 launcher-side worker-first recovery independently: both must compare the exact
-role anchor, safe child, socket device/inode, record contents, and namespace
-identity before unlinking, preserve a missing/replaced/non-socket target, then
-clear only the matching record. Simultaneous uncatchable launcher/worker death
-may leave the documented stale external name; do not imply unlink-on-close.
+role anchor, safe child or fixed staging name, socket owner/mode/link/device/inode,
+record contents, and namespace identity before unlinking, preserve a
+missing/replaced/non-socket target, then clear only the matching record.
+Simultaneous uncatchable launcher/worker death may leave the documented stale
+external name and private ownership record; do not imply unlink-on-close or
+populated-namespace recovery.
 
 ## Performance Review
 

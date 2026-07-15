@@ -62,7 +62,7 @@ apps and proves the complete HVF lifecycle plus container allow/deny behavior.
 The production target separately proves the fixed outer app and nested worker,
 exact entitlement split, static and dynamic code validation, descriptor closure,
 bounded protocol rejection, signal cancellation, both surviving-process cleanup
-directions, both-killed recovery, concurrent namespace isolation, owned socket
+directions, empty-namespace both-killed recovery, concurrent namespace isolation, owned socket
 cleanup, typed startup grant allow/deny behavior, an outside-container granted
 API socket, both real granted-vsock initiation directions, and a real sandboxed guest.
 The direct CLI remains an ordinary non-sandboxed executable. Production can
@@ -414,11 +414,14 @@ the worker gains no `network.client` entitlement.
 The scope, anchor, listener, broker endpoint, ownership record, and cleanup
 guard close through one session. Worker shutdown removes only the still-matching
 socket. After worker exit, the launcher reads at most the two fixed strict
-records and uses its retained matching role anchor to remove only the recorded
-socket identity before clearing the record and namespace. Launcher-first and
-worker-first failure retain the existing cooperative cleanup ordering. If both
-processes die through uncatchable signals at the same time, the external socket
-name can remain stale because Darwin has no unlink-on-final-close Unix socket.
+records and checks both the retained matching role anchor's final child and the
+fixed private staging name. It removes only a socket with the recorded
+device/inode and exact owner, mode, and link count before clearing the record
+and namespace. Launcher-first and worker-first failure retain the existing
+cooperative cleanup ordering. If both processes die through uncatchable signals
+at the same time, the external socket name and private ownership record can
+remain stale because Darwin has no unlink-on-final-close Unix socket; automatic
+later recovery removes only empty session namespaces.
 
 Snapshot inputs/outputs, general dynamic post-Ready delivery, hard revocation,
 and cross-filesystem socket publication do not yet consume or extend their
@@ -624,7 +627,7 @@ between exact directory anchors as described above. Both modes remove the path
 on shutdown only when it still refers to the socket they created. Forced
 termination can leave a stale path; in contained mode the surviving launcher
 can clean an exact ownership record, but simultaneous uncatchable death of both
-processes remains the documented stale-name window.
+processes remains the documented stale-name and private-record window.
 
 For multiple bangbang processes, use separate socket paths in directories whose
 ownership and permissions match the intended control boundary. Do not share a

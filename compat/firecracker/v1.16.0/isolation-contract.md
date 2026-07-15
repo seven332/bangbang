@@ -248,10 +248,13 @@ long-lived helper, or `network.client` entitlement is added.
 
 Normal worker cleanup unlinks only a still-matching socket. After worker exit,
 the launcher can read only the two strict records and use its retained matching
-role anchors for the same identity check before clearing the records and
-namespace. Launcher-first and worker-first death preserve that cooperative
-ordering and replaced targets. Simultaneous uncatchable death may leave a stale
-external socket name because Darwin has no unlink-on-final-close facility.
+role anchors plus the fixed private staging names for the same strict
+owner/mode/link/device/inode check before clearing the records and namespace.
+Launcher-first and worker-first death preserve that cooperative ordering and
+replaced targets. Simultaneous uncatchable death may leave a stale external
+socket name and private ownership record because Darwin has no
+unlink-on-final-close facility; later automatic recovery remains limited to
+empty session namespaces.
 
 The following remain feasible work owned by #1351:
 
@@ -294,8 +297,8 @@ execution proves:
 - grant-bearing worker-first/launcher-first cleanup and two simultaneous
   sessions with noninterchangeable authority, plus behavioral proof that the
   normal bundle contains no test exerciser;
-- worker-first and launcher-first namespace cleanup, both-killed bounded stale
-  recovery, and two concurrent API sessions remaining independent when one
+- worker-first and launcher-first namespace cleanup, empty both-killed bounded
+  stale recovery, and two concurrent API sessions remaining independent when one
   worker dies;
 - both sealed and external-grant config/metadata/kernel/initrd inputs plus
   repeatable read-only/read-write block and pmem inputs starting real sandboxed

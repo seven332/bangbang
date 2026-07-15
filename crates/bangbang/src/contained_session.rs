@@ -66,7 +66,9 @@ fn socket_directory_reference(
 
 #[cfg(test)]
 mod reference_tests {
-    use std::path::Path;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::{Path, PathBuf};
 
     use bangbang_session::MAX_GRANT_ID_BYTES;
 
@@ -146,6 +148,8 @@ mod reference_tests {
                 Err(GrantClaimError)
             );
         }
+        let non_utf8 = PathBuf::from(OsString::from_vec(b"bangbang-grant:api/\xff".to_vec()));
+        assert_eq!(socket_directory_reference(&non_utf8), Err(GrantClaimError));
     }
 }
 

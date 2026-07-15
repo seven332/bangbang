@@ -897,7 +897,11 @@ impl VsockConnectionLifecycle {
     }
 
     const fn deadline(self) -> Option<VsockConnectionDeadline> {
-        self.deadline
+        if self.local_shutdown_packet_pending {
+            None
+        } else {
+            self.deadline
+        }
     }
 
     fn mark_request_delivered(&mut self, now: Instant) {
@@ -11654,10 +11658,7 @@ mod tests {
         assert!(lifecycle.is_local_closed());
         assert!(lifecycle.has_pending_local_shutdown_packet());
         let shutdown_deadline = now + Duration::from_secs(2);
-        assert_eq!(
-            lifecycle.deadline().map(|deadline| deadline.at),
-            Some(shutdown_deadline)
-        );
+        assert_eq!(lifecycle.deadline(), None);
         assert!(
             !lifecycle.has_expired(shutdown_deadline),
             "undelivered local shutdown must not expire"
@@ -11665,9 +11666,9 @@ mod tests {
 
         lifecycle.arm_shutdown_deadline(now + Duration::from_secs(1));
         assert_eq!(
-            lifecycle.deadline().map(|deadline| deadline.at),
-            Some(shutdown_deadline),
-            "duplicate shutdown must not extend deadline"
+            lifecycle.deadline(),
+            None,
+            "undelivered shutdown must not expose a wakeup deadline"
         );
         let delivered_at = now + Duration::from_secs(1);
         assert!(lifecycle.mark_local_shutdown_packet_delivered(delivered_at));
@@ -18534,11 +18535,11 @@ mod tests {
                 .pending_guest_reset_packet_count(),
             0
         );
-        let deadline = handler
-            .activation_handler()
-            .earliest_deadline()
-            .expect("clean EOF should arm shutdown deadline");
-        assert_eq!(deadline, now + Duration::from_secs(2));
+        assert_eq!(
+            handler.activation_handler().earliest_deadline(),
+            None,
+            "clean EOF must not expose a deadline before shutdown delivery"
+        );
 
         write_vsock_rx_descriptor(
             &mut memory,
@@ -18576,6 +18577,11 @@ mod tests {
                 .activation_handler()
                 .has_guest_connection(VsockGuestConnectionKey::new(52, 4000))
         );
+        let deadline = handler
+            .activation_handler()
+            .earliest_deadline()
+            .expect("delivered shutdown should arm response deadline");
+        assert_eq!(deadline, now + Duration::from_secs(2));
 
         let expiry = handler
             .dispatch_vsock_queue_notifications_at(&mut memory, deadline)
@@ -19757,6 +19763,13 @@ mod tests {
             .expect("host connection should exist");
         assert!(connection.mark_local_closed(now));
         assert!(connection.has_pending_local_shutdown_packet());
+        let (_, _, pending_deadline) = device
+            .host_wakeup()
+            .expect("pending local shutdown wakeup should collect");
+        assert_eq!(
+            pending_deadline, None,
+            "undelivered local shutdown must not cause an expired-deadline spin"
+        );
 
         let outcome = device.shutdown_guest_connection_packet(
             &guest_shutdown_tx_packet(42, key.local_port().raw(), key.peer_port()),
@@ -19799,6 +19812,10 @@ mod tests {
         assert_eq!(device.pending_guest_reset_packet_count(), 0);
 
         let deadline = delivered_at + Duration::from_secs(2);
+        let (_, _, delivered_deadline) = device
+            .host_wakeup()
+            .expect("delivered local shutdown wakeup should collect");
+        assert_eq!(delivered_deadline, Some(deadline));
         device.expire_connections(deadline - Duration::from_nanos(1));
         assert!(device.has_host_connection(key));
         assert_eq!(device.pending_guest_reset_packet_count(), 0);

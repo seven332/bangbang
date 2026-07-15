@@ -406,6 +406,11 @@ impl LauncherNamespace {
         Ok(records)
     }
 
+    /// Removes only the exact private staging socket described by a record.
+    pub fn unlink_staged_socket(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
+        unlink_staged_socket(self.directory.as_raw_fd(), record)
+    }
+
     /// Removes only an exact validated socket ownership record.
     pub fn clear_socket_record(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
         clear_socket_record(self.directory.as_raw_fd(), record)
@@ -714,6 +719,57 @@ fn clear_socket_record(
     Ok(())
 }
 
+fn unlink_staged_socket(
+    directory: RawFd,
+    record: &SocketOwnershipRecord,
+) -> Result<(), RuntimeError> {
+    let name = socket_staging_name(record.role)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: The directory and fixed staging name remain live, and `stat`
+    // provides writable storage for the synchronous metadata result.
+    if unsafe {
+        libc::fstatat(
+            directory,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(RuntimeError::Filesystem(error.kind()))
+        };
+    }
+    // SAFETY: Successful `fstatat` initialized the complete result.
+    let stat = unsafe { stat.assume_init() };
+    // SAFETY: `geteuid` has no pointer or ownership contract.
+    let uid = unsafe { libc::geteuid() };
+    let identity = ObjectIdentity {
+        device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
+        inode: stat.st_ino,
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+        || stat.st_mode & 0o7777 != 0o600
+        || stat.st_uid != uid
+        || stat.st_nlink != 1
+        || identity != record.identity()
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    // SAFETY: The locked namespace and fixed name identify the exact validated
+    // staging socket. The owned worker has already been reaped.
+    if unsafe { libc::unlinkat(directory, name.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(RuntimeError::Filesystem(error.kind()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_directory(fd: RawFd) -> Result<NamespaceIdentity, RuntimeError> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` is writable for one result and `fd` remains owned by caller.
@@ -953,7 +1009,8 @@ fn cstring(value: &OsStr) -> Result<CString, std::ffi::NulError> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -1156,6 +1213,44 @@ mod tests {
         // SAFETY: The fixed corrupt test file is owned by this fixture.
         let unlink_result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
         assert_eq!(unlink_result, 0);
+    }
+
+    #[test]
+    fn staged_socket_cleanup_requires_the_recorded_identity() {
+        let root = TestRoot::new();
+        let directory = open_directory(root.path()).expect("test root should open");
+        let staging = socket_staging_name(ResourceRole::ApiSocketDirectory)
+            .expect("staging name should exist");
+        let path = root.path().join(OsStr::from_bytes(staging.to_bytes()));
+        let listener = UnixListener::bind(&path).expect("staging socket should bind");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("staging permissions should tighten");
+        let metadata = fs::symlink_metadata(&path).expect("staging metadata should read");
+        let record = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            SocketChild::parse("api.sock").expect("child should parse"),
+            ObjectIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        )
+        .expect("record should construct");
+
+        unlink_staged_socket(directory.as_raw_fd(), &record)
+            .expect("recorded staging socket should clean");
+        assert!(!path.exists());
+        drop(listener);
+
+        let replacement = UnixListener::bind(&path).expect("replacement socket should bind");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("replacement permissions should tighten");
+        assert_eq!(
+            unlink_staged_socket(directory.as_raw_fd(), &record),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert!(path.exists(), "replacement identity must be preserved");
+        drop(replacement);
+        fs::remove_file(path).expect("replacement fixture should clean");
     }
 
     #[test]

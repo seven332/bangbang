@@ -238,10 +238,20 @@ pub(crate) struct PreparedGrantBatch {
 }
 
 /// Borrowed exact anchor metadata for one singleton socket-directory grant.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct SocketDirectoryAnchor {
     descriptor: RawFd,
     identity: ObjectIdentity,
+}
+
+impl std::fmt::Debug for SocketDirectoryAnchor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SocketDirectoryAnchor")
+            .field("descriptor", &"<borrowed>")
+            .field("identity", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SocketDirectoryAnchor {
@@ -653,6 +663,21 @@ mod tests {
             .expect("ordinary arguments should parse");
         assert_eq!(input.worker_args, vec![OsString::from("--version"), opaque]);
         assert!(input.manifest.is_none());
+    }
+
+    #[test]
+    fn socket_directory_anchor_debug_redacts_descriptor_and_identity() {
+        let anchor = SocketDirectoryAnchor {
+            descriptor: 52,
+            identity: ObjectIdentity {
+                device: 53,
+                inode: 59,
+            },
+        };
+        let debug = format!("{anchor:?}");
+        assert!(!debug.contains("52"));
+        assert!(!debug.contains("53"));
+        assert!(!debug.contains("59"));
     }
 
     #[test]

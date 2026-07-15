@@ -3848,10 +3848,7 @@ fn wait_for_unix_listener_accept(
         match listener.accept() {
             Ok((stream, _)) => return Ok(stream),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
-                }
-                thread::sleep(Duration::from_millis(2));
+                wait_for_socket_event(listener.as_raw_fd(), libc::POLLIN, deadline)?;
             }
             Err(error) => return Err(error),
         }
@@ -3873,10 +3870,7 @@ fn read_exact_nonblocking(
             Ok(length) => offset += length,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(std::io::ErrorKind::TimedOut.into());
-                }
-                thread::sleep(Duration::from_millis(2));
+                wait_for_socket_event(stream.as_raw_fd(), libc::POLLIN, deadline)?;
             }
             Err(error) => return Err(error),
         }
@@ -3899,10 +3893,7 @@ fn write_all_nonblocking(
             Ok(length) => offset += length,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(std::io::ErrorKind::TimedOut.into());
-                }
-                thread::sleep(Duration::from_millis(2));
+                wait_for_socket_event(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
             }
             Err(error) => return Err(error),
         }
@@ -3988,12 +3979,50 @@ fn wait_for_nonblocking_eof(stream: &mut UnixStream, timeout: Duration) -> std::
             Ok(_) => return Err(std::io::ErrorKind::InvalidData.into()),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(std::io::ErrorKind::TimedOut.into());
-                }
-                thread::sleep(Duration::from_millis(2));
+                wait_for_socket_event(stream.as_raw_fd(), libc::POLLIN, deadline)?;
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+fn wait_for_socket_event(
+    descriptor: libc::c_int,
+    events: libc::c_short,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let rounded_millis = remaining.as_millis().saturating_add(u128::from(
+            !remaining.subsec_nanos().is_multiple_of(1_000_000),
+        ));
+        let timeout = i32::try_from(rounded_millis).unwrap_or(i32::MAX);
+        let mut poll_fd = libc::pollfd {
+            fd: descriptor,
+            events,
+            revents: 0,
+        };
+        // SAFETY: The single initialized poll entry is writable for this
+        // bounded synchronous event wait.
+        let ready = unsafe { libc::poll(&raw mut poll_fd, 1, timeout) };
+        if ready > 0 {
+            if poll_fd.revents & libc::POLLNVAL != 0 {
+                return Err(std::io::ErrorKind::InvalidInput.into());
+            }
+            if poll_fd.revents & (events | libc::POLLERR | libc::POLLHUP) != 0 {
+                return Ok(());
+            }
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        if ready == 0 {
+            if Instant::now() >= deadline {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }
