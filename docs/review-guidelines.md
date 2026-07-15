@@ -169,6 +169,31 @@ serial open timing must remain unchanged. Signed normal-bundle evidence must
 cover source-path replacement, append sentinels, logger/metrics/guest-serial
 writes, redacted mismatch rollback, cleanup, and concurrent session isolation.
 
+For snapshot grants, review input and output grammars separately. Describe,
+state, and memory use exact file tags and distinct read-only roles; outputs use
+`bangbang-grant:<GrantId>/<SnapshotOutputChild>` with one 1–255 byte UTF-8
+component, no NUL or `/`, and no `.`/`..`. State preinspection may duplicate
+only the exact descriptor and must not consume authority. Decode once, discover
+any persisted root tag, then validate and atomically take every tagged state,
+memory, and read-only `DriveBacking`; no registry lock should span decode or
+memory I/O, and no submitted or persisted tag may be reopened.
+
+Review snapshot output adoption after complete request/profile preflight. The
+role is repeatable across distinct grants; a shared grant with distinct children,
+two grants, mixed ordinary/granted destinations, and retained reuse must preserve
+no-clobber memory-first/state-last semantics. All staging, checks, barriers, and
+final renames must stay relative to exact retained anchors. Do not infer that an
+open descriptor bypasses App Sandbox security-scope pathname rules: moving the
+authorized directory can legitimately deny later writes.
+
+Each granted staging inode needs a strict record before producer content. Check
+record-clear ordering on publication, conclusive cleanup, and failure; launcher
+recovery must select an anchor by exact directory identity and unlink only a
+current-user regular `0600`, link-count-one device/inode match. Missing and
+replaced entries must survive. Keep the create-before-record interval and
+simultaneous uncatchable process death explicit, and require the hidden
+post-record hold to remain test-feature-only.
+
 For API/vsock directory grants, require the distinct exact
 `bangbang-grant:<GrantId>/<SocketChild>` grammar, where the child is one bounded
 ASCII component and direct mode preserves identical bytes as a path. Review
@@ -225,8 +250,9 @@ observe signals, lifecycle input, and child exit, and use one absolute
 send-plus-acknowledgment deadline.
 
 Authorized socket construction may transiently add only one fixed role-specific
-staging socket; after publication the namespace may contain only the two fixed
-strict ownership records. Review worker-side normal cleanup and
+staging socket. Snapshot construction may transiently add one strict record per
+active artifact; successful publication leaves neither. Otherwise the namespace
+may contain only the two fixed socket records. Review worker-side normal cleanup and
 launcher-side worker-first recovery independently: both must compare the exact
 role anchor, safe child or fixed staging name, socket owner/mode/link/device/inode,
 record contents, and namespace identity before unlinking, preserve a

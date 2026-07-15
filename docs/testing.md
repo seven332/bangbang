@@ -759,6 +759,19 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
+- exact external snapshot grants creating a native-v1 pair into separate
+  output directories, reusing both retained directories for a second successful
+  pair, preserving all finals on collision, and keeping same-GrantId concurrent
+  source workers in their own directories; granted early description and two
+  fresh state/memory/root loads then prove explicit and automatic resume through
+  guest `SYSTEM_OFF`;
+- source kernel/root/metrics and load state/memory pathnames replaced after the
+  launcher opens them, with no tag reopen, no staging residue, redacted
+  wrong-role output, and no extra private session namespace;
+- a test-only hold immediately after durable snapshot staging ownership is
+  recorded, followed by worker `SIGKILL`; launcher recovery removes an exact
+  current-user regular `0600` single-link inode but preserves a same-name
+  replacement while clearing the private record and namespace;
 - exact socket-directory references publishing an owner-only API listener into
   an outside-container granted directory, serving a real client only after
   readiness, and reaping the short-lived signed binder before exposure;
@@ -789,7 +802,8 @@ message frame and cover wrong magic/version/reserved data, exact frame/buffer
 limits, oversized input, EOF rejection, replay, sequence gaps, cross-session and
 wrong-role/state input, reserved identity use, monotonic API/early-command/
 cancellation/grant state, and payload/identity-redacted formatting. Grant codec
-tests cover every closed record, limit and descriptor declaration. Socket
+tests cover every closed record, limit and descriptor declaration, including
+the 255-byte redacted snapshot child grammar. Socket
 broker codec tests cover every closed kind, exact fixed frame/reserved fields,
 session/sequence/child/port/status encoding, descriptor declarations,
 truncation, malformed ancillary data, and value-redacted formatting. Darwin unit
@@ -801,7 +815,12 @@ directory iteration across repeated checks, stale empty-directory recovery,
 populated-entry preservation, strict socket ownership records, identity-safe
 fixed-staging cleanup, anchored exclusive publication/rollback, binder
 framing/descriptor validation, broker state and relative-target validation, and
-replacement-safe cleanup. Socket readiness helpers use bounded kernel event
+replacement-safe cleanup. Snapshot registry/runtime tests additionally cover
+non-consuming exact file duplication, validate-all-before-remove state/memory/
+root and output-directory batches, shared/distinct output anchors, strict
+per-artifact record encoding, record-before-producer ordering, clear-on-success,
+supplied-root preparation without persisted-selector reopen, and exact versus
+replacement-preserving launcher cleanup. Socket readiness helpers use bounded kernel event
 waits instead of active polling. These tests do not replace the signed target:
 default-close spawning, dynamic code identity, App Sandbox root resolution,
 crash order, and real HVF claims require the packaged execution above.
@@ -860,6 +879,9 @@ truncated, trailing/inconsistent-length, corrupt, unsupported-version,
 incompatible-architecture, and incompatible-page-size files. Fixtures use
 unique temporary paths; failures must use the bad-configuration exit code,
 publish no API socket, and expose neither path nor payload sentinels.
+The contained external-file variant belongs to the signed production-bundle
+target above because it requires lifecycle grant delivery, App Sandbox bookmark
+scope, and the fixed launcher/worker topology.
 
 Run the same process-level e2e test against a signed `bangbang` executable:
 

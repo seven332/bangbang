@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
+use std::io::SeekFrom;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -19,6 +20,15 @@ struct FileIdentity {
     inode: libc::ino_t,
 }
 
+impl FileIdentity {
+    fn cleanup_identity(self) -> SnapshotArtifactIdentity {
+        SnapshotArtifactIdentity::new(
+            u64::from(u32::from_ne_bytes(self.device.to_ne_bytes())),
+            self.inode,
+        )
+    }
+}
+
 #[derive(Debug)]
 struct SplitFinalPath {
     parent: PathBuf,
@@ -30,6 +40,7 @@ struct OpenedFinalPath {
     directory: File,
     directory_identity: FileIdentity,
     component: CString,
+    tracker: Option<Arc<dyn SnapshotStagingTracker>>,
 }
 
 struct StagingFile<'directory> {
@@ -40,6 +51,7 @@ struct StagingFile<'directory> {
     identity: FileIdentity,
     active: bool,
     cleanup_on_drop: bool,
+    ownership: Option<SnapshotStagingOwnership>,
 }
 
 impl fmt::Debug for StagingFile<'_> {
@@ -107,7 +119,52 @@ impl StagingFile<'_> {
         })?;
         self.active = false;
         self.cleanup_on_drop = false;
+        let _ = self.clear_ownership();
         Ok(())
+    }
+
+    fn record_ownership(&mut self) -> Result<(), SnapshotStagingTrackingError> {
+        let Some(tracker) = &self.destination.tracker else {
+            return Ok(());
+        };
+        let ownership = SnapshotStagingOwnership::new(
+            self.artifact,
+            self.destination.directory_identity.cleanup_identity(),
+            self.name.as_bytes().to_vec(),
+            self.identity.cleanup_identity(),
+        );
+        tracker.record(&ownership)?;
+        self.ownership = Some(ownership);
+        Ok(())
+    }
+
+    fn clear_ownership(&mut self) -> Result<(), SnapshotStagingTrackingError> {
+        let Some(ownership) = self.ownership.as_ref() else {
+            return Ok(());
+        };
+        let tracker = self
+            .destination
+            .tracker
+            .as_ref()
+            .ok_or(SnapshotStagingTrackingError)?;
+        tracker.clear(ownership)?;
+        self.ownership = None;
+        Ok(())
+    }
+
+    fn finish_cleanup(&mut self, cleanup: SnapshotStagingCleanup) -> SnapshotStagingCleanup {
+        if matches!(
+            cleanup,
+            SnapshotStagingCleanup::Removed
+                | SnapshotStagingCleanup::AlreadyAbsent
+                | SnapshotStagingCleanup::ChangedRefused
+        ) {
+            self.active = false;
+            if self.clear_ownership().is_err() {
+                return SnapshotStagingCleanup::Failed(io::ErrorKind::PermissionDenied);
+            }
+        }
+        cleanup
     }
 
     fn cleanup(&mut self) -> Option<SnapshotStagingCleanup> {
@@ -122,62 +179,40 @@ impl StagingFile<'_> {
         if let Err(kind) = enter_publication_stage(stage) {
             return Some(SnapshotStagingCleanup::Failed(kind));
         }
-        Some(clean_staging_entry(
-            &self.destination.directory,
-            &self.name,
-            self.identity,
-        ))
+        let cleanup = clean_staging_entry(&self.destination.directory, &self.name, self.identity);
+        Some(self.finish_cleanup(cleanup))
     }
 }
 
 impl Drop for StagingFile<'_> {
     fn drop(&mut self) {
         if self.active && self.cleanup_on_drop {
-            let _ = clean_staging_entry(&self.destination.directory, &self.name, self.identity);
+            let cleanup =
+                clean_staging_entry(&self.destination.directory, &self.name, self.identity);
+            let _ = self.finish_cleanup(cleanup);
         }
     }
 }
 
 pub(super) fn publish_snapshot_artifacts_macos_with<E, F>(
-    paths: &SnapshotArtifactPaths,
+    outputs: &SnapshotArtifactOutputs,
     producer: F,
 ) -> Result<SnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
 where
     F: FnOnce(SnapshotMemoryStagingWriter) -> Result<SnapshotCommitRecord, E>,
 {
-    enter_publication_stage(SnapshotPublicationStage::StatePathValidation).map_err(|kind| {
-        publication_error(
-            SnapshotPublicationStage::StatePathValidation,
-            SnapshotArtifactVisibility::NoFinalArtifact,
-            SnapshotPublicationFailure::Io(kind),
-        )
-    })?;
-    let state_split =
-        split_final_path(paths.state(), SnapshotArtifactKind::State).map_err(|failure| {
-            publication_error(
-                SnapshotPublicationStage::StatePathValidation,
-                SnapshotArtifactVisibility::NoFinalArtifact,
-                failure,
-            )
-        })?;
-    enter_publication_stage(SnapshotPublicationStage::MemoryPathValidation).map_err(|kind| {
-        publication_error(
-            SnapshotPublicationStage::MemoryPathValidation,
-            SnapshotArtifactVisibility::NoFinalArtifact,
-            SnapshotPublicationFailure::Io(kind),
-        )
-    })?;
-    let memory_split =
-        split_final_path(paths.memory(), SnapshotArtifactKind::Memory).map_err(|failure| {
-            publication_error(
-                SnapshotPublicationStage::MemoryPathValidation,
-                SnapshotArtifactVisibility::NoFinalArtifact,
-                failure,
-            )
-        })?;
-
-    let state = open_final_path(state_split, SnapshotPublicationStage::StateDirectoryOpen)?;
-    let memory_path = open_final_path(memory_split, SnapshotPublicationStage::MemoryDirectoryOpen)?;
+    let state = open_artifact_output(
+        outputs.state(),
+        SnapshotArtifactKind::State,
+        SnapshotPublicationStage::StatePathValidation,
+        SnapshotPublicationStage::StateDirectoryOpen,
+    )?;
+    let memory_path = open_artifact_output(
+        outputs.memory(),
+        SnapshotArtifactKind::Memory,
+        SnapshotPublicationStage::MemoryPathValidation,
+        SnapshotPublicationStage::MemoryDirectoryOpen,
+    )?;
 
     enter_publication_stage(SnapshotPublicationStage::AliasCheck).map_err(|kind| {
         publication_error(
@@ -244,6 +279,114 @@ where
             Err(SnapshotPublicationTransactionError::Producer(error))
         }
     }
+}
+
+fn open_artifact_output(
+    output: &SnapshotArtifactOutput,
+    artifact: SnapshotArtifactKind,
+    validation_stage: SnapshotPublicationStage,
+    directory_stage: SnapshotPublicationStage,
+) -> Result<OpenedFinalPath, SnapshotPublicationError> {
+    stage_io(
+        validation_stage,
+        SnapshotArtifactVisibility::NoFinalArtifact,
+    )?;
+    match &output.location {
+        SnapshotArtifactOutputLocation::Path(path) => {
+            let split = split_final_path(path, artifact).map_err(|failure| {
+                publication_error(
+                    validation_stage,
+                    SnapshotArtifactVisibility::NoFinalArtifact,
+                    failure,
+                )
+            })?;
+            open_final_path(split, directory_stage)
+        }
+        SnapshotArtifactOutputLocation::Anchored {
+            directory,
+            child,
+            tracker,
+        } => {
+            let component = validate_supplied_component(child, artifact).map_err(|failure| {
+                publication_error(
+                    validation_stage,
+                    SnapshotArtifactVisibility::NoFinalArtifact,
+                    failure,
+                )
+            })?;
+            open_anchored_final(directory, component, tracker.clone(), directory_stage)
+        }
+    }
+}
+
+fn validate_supplied_component(
+    component: &[u8],
+    artifact: SnapshotArtifactKind,
+) -> Result<CString, SnapshotPublicationFailure> {
+    if component.is_empty() || component == b"." || component == b".." || component.contains(&b'/')
+    {
+        return Err(SnapshotPublicationFailure::InvalidFinalPath { artifact });
+    }
+    CString::new(component).map_err(|_| SnapshotPublicationFailure::InvalidFinalPath { artifact })
+}
+
+fn open_anchored_final(
+    supplied: &File,
+    component: CString,
+    tracker: Option<Arc<dyn SnapshotStagingTracker>>,
+    stage: SnapshotPublicationStage,
+) -> Result<OpenedFinalPath, SnapshotPublicationError> {
+    stage_io(stage, SnapshotArtifactVisibility::NoFinalArtifact)?;
+    let directory = supplied.try_clone().map_err(|source| {
+        publication_error(
+            stage,
+            SnapshotArtifactVisibility::NoFinalArtifact,
+            SnapshotPublicationFailure::Io(source.kind()),
+        )
+    })?;
+    let metadata = directory.metadata().map_err(|source| {
+        publication_error(
+            stage,
+            SnapshotArtifactVisibility::NoFinalArtifact,
+            SnapshotPublicationFailure::Io(source.kind()),
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(publication_error(
+            stage,
+            SnapshotArtifactVisibility::NoFinalArtifact,
+            SnapshotPublicationFailure::Io(io::ErrorKind::InvalidInput),
+        ));
+    }
+    // SAFETY: the directory remains live and the fixed dot component is NUL-terminated.
+    if unsafe {
+        libc::faccessat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    } != 0
+    {
+        return Err(publication_error(
+            stage,
+            SnapshotArtifactVisibility::NoFinalArtifact,
+            SnapshotPublicationFailure::Io(io::Error::last_os_error().kind()),
+        ));
+    }
+    let directory_identity = file_identity(&directory).map_err(|kind| {
+        publication_error(
+            stage,
+            SnapshotArtifactVisibility::NoFinalArtifact,
+            SnapshotPublicationFailure::Io(kind),
+        )
+    })?;
+    Ok(OpenedFinalPath {
+        directory,
+        directory_identity,
+        component,
+        tracker,
+    })
 }
 
 fn publish_prepared_with<E, F>(
@@ -431,6 +574,7 @@ fn open_final_path(
         directory,
         directory_identity,
         component: split.component,
+        tracker: None,
     })
 }
 
@@ -491,6 +635,7 @@ fn create_staging<'directory>(
                     identity,
                     active: true,
                     cleanup_on_drop: true,
+                    ownership: None,
                 };
                 if let Err(source) = staging
                     .file
@@ -502,6 +647,18 @@ fn create_staging<'directory>(
                         stage,
                         SnapshotArtifactVisibility::NoFinalArtifact,
                         SnapshotPublicationFailure::Io(kind),
+                    );
+                    if let Some(cleanup) = cleanup {
+                        set_staging_cleanup(&mut error, artifact, cleanup);
+                    }
+                    return Err(error);
+                }
+                if staging.record_ownership().is_err() {
+                    let cleanup = staging.cleanup();
+                    let mut error = publication_error(
+                        stage,
+                        SnapshotArtifactVisibility::NoFinalArtifact,
+                        SnapshotPublicationFailure::Io(io::ErrorKind::PermissionDenied),
                     );
                     if let Some(cleanup) = cleanup {
                         set_staging_cleanup(&mut error, artifact, cleanup);
@@ -792,11 +949,44 @@ pub(super) fn load_snapshot_artifacts_macos(
         &state_split.parent,
         SnapshotArtifactLoadStage::StateDirectoryOpen,
     )?;
-    let (mut state_file, state_length) = open_regular_final(
+    let (state_file, _) = open_regular_final(
         &state_directory,
         &state_split.component,
         SnapshotArtifactKind::State,
         SnapshotArtifactLoadStage::StateOpen,
+        SnapshotArtifactLoadStage::StateTypeCheck,
+    )?;
+    let prepared = prepare_snapshot_state_file_macos(state_file)?;
+
+    let memory_split =
+        split_final_path(paths.memory(), SnapshotArtifactKind::Memory).map_err(|_| {
+            load_error(
+                SnapshotArtifactLoadStage::MemoryPathValidation,
+                SnapshotArtifactLoadFailure::InvalidFinalPath {
+                    artifact: SnapshotArtifactKind::Memory,
+                },
+            )
+        })?;
+    let memory_directory = open_load_directory(
+        &memory_split.parent,
+        SnapshotArtifactLoadStage::MemoryDirectoryOpen,
+    )?;
+    let (memory_file, _) = open_regular_final(
+        &memory_directory,
+        &memory_split.component,
+        SnapshotArtifactKind::Memory,
+        SnapshotArtifactLoadStage::MemoryOpen,
+        SnapshotArtifactLoadStage::MemoryTypeCheck,
+    )?;
+    load_prepared_snapshot_memory_file_macos(prepared, memory_file)
+}
+
+pub(super) fn prepare_snapshot_state_file_macos(
+    mut state_file: File,
+) -> Result<PreparedSnapshotState, SnapshotArtifactLoadError> {
+    let state_length = supplied_regular_length(
+        &state_file,
+        SnapshotArtifactKind::State,
         SnapshotArtifactLoadStage::StateTypeCheck,
     )?;
     let maximum = u64::try_from(NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES).map_err(|_| {
@@ -833,6 +1023,12 @@ pub(super) fn load_snapshot_artifacts_macos(
             SnapshotArtifactLoadFailure::LengthOverflow,
         )
     })?;
+    state_file.seek(SeekFrom::Start(0)).map_err(|source| {
+        load_error(
+            SnapshotArtifactLoadStage::StateRead,
+            SnapshotArtifactLoadFailure::Io(source.kind()),
+        )
+    })?;
     Read::by_ref(&mut state_file)
         .take(read_limit)
         .read_to_end(&mut state_bytes)
@@ -857,27 +1053,48 @@ pub(super) fn load_snapshot_artifacts_macos(
             SnapshotArtifactLoadFailure::Commit(source),
         )
     })?;
+    Ok(PreparedSnapshotState { record })
+}
 
-    let memory_split =
-        split_final_path(paths.memory(), SnapshotArtifactKind::Memory).map_err(|_| {
-            load_error(
-                SnapshotArtifactLoadStage::MemoryPathValidation,
-                SnapshotArtifactLoadFailure::InvalidFinalPath {
-                    artifact: SnapshotArtifactKind::Memory,
-                },
-            )
-        })?;
-    let memory_directory = open_load_directory(
-        &memory_split.parent,
-        SnapshotArtifactLoadStage::MemoryDirectoryOpen,
+pub(super) fn prepare_snapshot_state_path_macos(
+    path: &Path,
+) -> Result<PreparedSnapshotState, SnapshotArtifactLoadError> {
+    let split = split_final_path(path, SnapshotArtifactKind::State).map_err(|_| {
+        load_error(
+            SnapshotArtifactLoadStage::StatePathValidation,
+            SnapshotArtifactLoadFailure::InvalidFinalPath {
+                artifact: SnapshotArtifactKind::State,
+            },
+        )
+    })?;
+    let directory =
+        open_load_directory(&split.parent, SnapshotArtifactLoadStage::StateDirectoryOpen)?;
+    let (file, _) = open_regular_final(
+        &directory,
+        &split.component,
+        SnapshotArtifactKind::State,
+        SnapshotArtifactLoadStage::StateOpen,
+        SnapshotArtifactLoadStage::StateTypeCheck,
     )?;
-    let (mut memory_file, _) = open_regular_final(
-        &memory_directory,
-        &memory_split.component,
+    prepare_snapshot_state_file_macos(file)
+}
+
+pub(super) fn load_prepared_snapshot_memory_file_macos(
+    prepared: PreparedSnapshotState,
+    mut memory_file: File,
+) -> Result<LoadedSnapshotArtifacts, SnapshotArtifactLoadError> {
+    supplied_regular_length(
+        &memory_file,
         SnapshotArtifactKind::Memory,
-        SnapshotArtifactLoadStage::MemoryOpen,
         SnapshotArtifactLoadStage::MemoryTypeCheck,
     )?;
+    memory_file.seek(SeekFrom::Start(0)).map_err(|source| {
+        load_error(
+            SnapshotArtifactLoadStage::MemoryLoad,
+            SnapshotArtifactLoadFailure::Io(source.kind()),
+        )
+    })?;
+    let record = prepared.record;
     let memory = load_snapshot_memory_image(record.memory_binding(), &mut memory_file).map_err(
         |source| {
             load_error(
@@ -887,6 +1104,49 @@ pub(super) fn load_snapshot_artifacts_macos(
         },
     )?;
     Ok(LoadedSnapshotArtifacts { record, memory })
+}
+
+pub(super) fn load_prepared_snapshot_memory_path_macos(
+    prepared: PreparedSnapshotState,
+    path: &Path,
+) -> Result<LoadedSnapshotArtifacts, SnapshotArtifactLoadError> {
+    let split = split_final_path(path, SnapshotArtifactKind::Memory).map_err(|_| {
+        load_error(
+            SnapshotArtifactLoadStage::MemoryPathValidation,
+            SnapshotArtifactLoadFailure::InvalidFinalPath {
+                artifact: SnapshotArtifactKind::Memory,
+            },
+        )
+    })?;
+    let directory = open_load_directory(
+        &split.parent,
+        SnapshotArtifactLoadStage::MemoryDirectoryOpen,
+    )?;
+    let (file, _) = open_regular_final(
+        &directory,
+        &split.component,
+        SnapshotArtifactKind::Memory,
+        SnapshotArtifactLoadStage::MemoryOpen,
+        SnapshotArtifactLoadStage::MemoryTypeCheck,
+    )?;
+    load_prepared_snapshot_memory_file_macos(prepared, file)
+}
+
+fn supplied_regular_length(
+    file: &File,
+    artifact: SnapshotArtifactKind,
+    stage: SnapshotArtifactLoadStage,
+) -> Result<u64, SnapshotArtifactLoadError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| load_error(stage, SnapshotArtifactLoadFailure::Io(source.kind())))?;
+    if !metadata.file_type().is_file() {
+        return Err(load_error(
+            stage,
+            SnapshotArtifactLoadFailure::NotRegularFile { artifact },
+        ));
+    }
+    Ok(metadata.len())
 }
 
 fn open_load_directory(

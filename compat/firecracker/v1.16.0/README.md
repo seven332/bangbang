@@ -62,12 +62,12 @@ Each capability has exactly one disposition:
 The initial inventory is deliberately conservative. Existing prose or issue
 closure does not automatically promote a record from `audit-required`.
 
-The #1352 process audit promotes exactly 20 of the 29 process-family records:
-18 complete argument leaves plus the complete CLI/readiness and
-signal/exit/fd/cleanup semantics. Five incomplete argument leaves, the
-snapshot-containing identity/output semantic, the aggregate run operation, and
-both broad source corpora remain `audit-required`. The checked
-[`process-contract.md`](process-contract.md) records those nine handoffs; a
+The #1352 process audit plus #1368 snapshot-description delivery promote exactly
+21 of the 29 process-family records: 19 complete argument leaves plus the
+complete CLI/readiness and signal/exit/fd/cleanup semantics. Four incomplete
+argument leaves, the snapshot-containing identity/output semantic, the
+aggregate run operation, and both broad source corpora remain `audit-required`.
+The checked [`process-contract.md`](process-contract.md) records those eight handoffs; a
 partially implemented composite is not a terminal claim.
 
 The #1354 production-boundary audit moves exactly three composite isolation
@@ -84,9 +84,20 @@ an exact safe-child grammar, same-filesystem anchored exclusive publication,
 strict ownership records, supplied listeners, and one fixed session-bound
 launcher facet for guest-initiated vsock port connections. It adds no worker
 entitlement or steady-state helper and does not terminally promote the three
-composites: snapshot authority, general dynamic brokerage and hard revocation,
+composites; at that point snapshot authority, general dynamic brokerage and hard revocation,
 vmnet policy, Linux outcome classification, and deployment identity still
 remain under #1351.
+
+The #1368 snapshot-resource slice adopts the read-only describe/state/memory
+inputs, any grant-tagged persisted read-only root backing, and repeatable
+snapshot-output directories with bounded UTF-8 children. State preinspection
+does not consume authority; final state/memory/root adoption is atomic. Granted
+publication stays anchor-relative and no-clobber, while strict per-artifact
+ownership records let a surviving launcher clean an exact staging inode after
+worker death without deleting a replacement. The unavoidable create-before-
+record window, simultaneous uncatchable launcher/worker death, broader native
+snapshot profiles, general brokerage/hard revocation, network policy, Linux
+outcome classification, and deployment identity remain outside this slice.
 
 ## Commands
 

@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bangbang_session::{GrantAccess, GrantId, ResourceRole};
@@ -13,6 +14,26 @@ use crate::contained_session::{ContainedSession, ContainedSessionError};
 const OPTION: &str = "--bangbang-internal-grant-probe-v1";
 const READY_LINE: &str = "status: grant integration probe ready";
 const OUTSIDE_FILE: &str = "bangbang-grant-probe-outside";
+const SNAPSHOT_STAGING_HOLD_OPTION: &str = "--bangbang-internal-snapshot-staging-hold-v1";
+static SNAPSHOT_STAGING_HOLD: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn configure_snapshot_staging_hold(args: &mut Vec<OsString>) {
+    if args
+        .first()
+        .is_some_and(|argument| argument == SNAPSHOT_STAGING_HOLD_OPTION)
+    {
+        args.remove(0);
+        SNAPSHOT_STAGING_HOLD.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) fn hold_after_snapshot_staging_record() {
+    if SNAPSHOT_STAGING_HOLD.swap(false, Ordering::AcqRel) {
+        loop {
+            std::thread::park();
+        }
+    }
+}
 
 pub(crate) fn is_requested(args: &[OsString]) -> bool {
     args.first().is_some_and(|argument| argument == OPTION)

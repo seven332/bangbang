@@ -135,6 +135,14 @@ regular-file identity. Snapshot files and guest state are untrusted and
 confidential, so keep artifacts and the API socket in operator-owned private
 directories.
 
+In the production bundle, contained describe/load inputs use exact read-only
+file grants and create outputs use retained `SnapshotOutputDirectory` anchors
+plus bounded UTF-8 child names. Load atomically adopts state, memory, and any
+grant-tagged persisted root backing after bounded state preinspection; no tag is
+reopened as a pathname. Create preserves the same anchor-relative no-clobber
+transaction and repeated output-directory authority. Direct mode keeps ordinary
+path behavior.
+
 This is not Firecracker snapshot-file compatibility or a portable migration
 format. `Diff`, UFFD, dirty tracking, clock adjustment, restore overrides,
 writable or additional drives, optional devices, active SVE/SME/debug state,
@@ -185,7 +193,9 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
   version (`v1.0.0`) and exits before startup.
 - `--describe-snapshot <PATH>` reads a bounded regular native state file,
   validates its complete envelope and CRC, prints its embedded version, and
-  exits before startup. It does not accept Firecracker state files.
+  exits before startup. In contained mode an exact read-only
+  `SnapshotDescribeInput` grant is inspected without reopening its tag. It does
+  not accept Firecracker state files.
 - `--help`, `-h`, `--version`, and `-V` are supported.
 
 The API socket is an unauthenticated local control interface. bangbang restricts
@@ -313,8 +323,10 @@ session-owned one-time typed registry. Closing the launcher's duplicate does
 not revoke an already delivered descriptor; cleanup is cooperative ownership.
 
 Production consumers now adopt read-only startup config, startup metadata,
-kernel, and initrd grants plus repeatable read-only/read-write block and pmem
-backing grants and singleton write-only logger, metrics, and serial sink grants.
+kernel, initrd, snapshot describe/state/memory, and persisted snapshot-root
+grants plus repeatable read-only/read-write block and pmem backing grants,
+singleton write-only logger/metrics/serial sink grants, and repeatable snapshot
+output-directory grants.
 In authenticated contained mode the exact
 case-sensitive private reference `bangbang-grant:<GrantId>` claims one matching
 ID/role/access entry; malformed, missing, mismatched, or consumed claims fail
@@ -352,6 +364,33 @@ after a startup attempt consumes it. Clearing or replacing serial before start
 drops the prepared output. Direct paths retain their existing create, FIFO-like,
 and open-timing behavior.
 
+Snapshot file inputs use the same exact `bangbang-grant:<GrantId>` grammar with
+distinct read-only roles. Describe inspects a duplicate of its exact descriptor.
+Load preinspects state without consuming it, discovers any persisted root grant,
+then atomically takes all tagged state, memory, and read-only root backings and
+finishes from those opened identities. Input authority is one-time after that
+take. The persisted root identity includes file metadata such as `ctime`, so a
+later rename or metadata-changing replacement is correctly rejected even when
+it refers to the same inode.
+
+Create outputs instead use
+`bangbang-grant:<GrantId>/<SnapshotOutputChild>`. The child is one 1–255 byte
+UTF-8 component, contains no NUL or `/`, and is neither `.` nor `..`. One
+retained output grant can serve distinct state/memory children and later create
+requests; distinct or mixed ordinary/granted directories are also supported.
+Staging and exclusive final publication stay relative to the exact retained
+anchors. App Sandbox authorization still requires the granted directory to
+remain reachable at its authorized pathname; moving it after scope activation
+can make descriptor-relative writes fail.
+
+Each active granted staging inode gets one strict private identity record.
+Normal publication or conclusive cleanup clears it; after worker death the
+launcher removes only an exact current-user regular `0600`, single-link match
+through its retained directory anchor and preserves a replacement. A hard death
+between staging creation and record persistence, or simultaneous uncatchable
+launcher/worker death, can still leave residue because Darwin has no
+identity-conditional unlink primitive.
+
 API and vsock directory consumers instead require the exact case-sensitive
 reference `bangbang-grant:<GrantId>/<SocketChild>`. `SocketChild` is one 1–64
 byte ASCII `[A-Za-z0-9._-]` component other than `.` or `..`; direct mode still
@@ -381,14 +420,15 @@ selector. API-only, no-API, and direct-path sessions leave the broker dormant;
 the worker still has exactly App Sandbox and Hypervisor entitlements and steady
 state remains one launcher plus one worker.
 
-Snapshot consumers, general dynamic post-Ready brokerage, hard revocation,
-cross-filesystem socket publication, vmnet provisioning, automatic restart
+General dynamic post-Ready brokerage, hard revocation, cross-filesystem socket
+publication, vmnet provisioning, broader snapshot profiles, automatic restart
 policy, Developer ID possession proof, launch-constraint policy, and
 notarization workflow remain. The session namespace must be empty at the
 `Prepared` gate. Authorized construction may transiently add one fixed
-role-specific staging socket; after publication the namespace may hold at most
-the two fixed socket ownership records containing role, safe child, and socket
-identity, never a path, descriptor, bookmark, grant ID, payload, or session byte.
+role-specific staging socket or one strict record per active snapshot artifact;
+steady state retains no snapshot staging record and at most the two fixed socket
+ownership records. Records never expose a path, descriptor, bookmark, grant ID,
+payload, or session byte.
 Same-identifier workers share one App Sandbox
 container, so namespace locks and identity checks protect cooperative sessions
 and replacements but do not isolate a malicious same-bundle sibling. See
@@ -720,7 +760,9 @@ read-only guest-write rejection, writable block persistence, pmem read/flush,
 guest console output through the transferred serial descriptor, terminal
 metrics, concurrent output-session isolation, preauthorized live block
 replacement, limiter-only backing retention, redacted failure atomicity, and
-real sandboxed HVF guests through `SYSTEM_OFF`. It also proves an
+granted native-v1 create/describe/state-memory-root restore, strict snapshot
+staging cleanup after worker death, and real sandboxed HVF guests through
+`SYSTEM_OFF`. It also proves an
 outside-container client can use a granted API socket, and that a real guest
 can complete deterministic bidirectional and half-close/EOF vsock traffic in
 both initiation directions through the supplied granted listener and fixed

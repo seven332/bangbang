@@ -5,6 +5,8 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -3044,6 +3046,13 @@ pub struct BlockFileBacking {
     file: File,
     len: u64,
     is_read_only: bool,
+    origin: BlockFileBackingOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockFileBackingOrigin {
+    Path,
+    SuppliedFile,
 }
 
 impl fmt::Debug for BlockFileBacking {
@@ -3166,11 +3175,19 @@ impl std::error::Error for SnapshotBlockFileBackingError {}
 impl BlockFileBacking {
     pub fn open(config: &DriveConfig) -> Result<Self, BlockFileBackingError> {
         let file = open_block_file(config.path_on_host(), config.is_read_only())?;
-        Self::from_file(file, config.is_read_only())
+        Self::from_file_with_origin(file, config.is_read_only(), BlockFileBackingOrigin::Path)
     }
 
     /// Adopts an already-opened block backing without resolving its configured path.
     pub fn from_file(file: File, is_read_only: bool) -> Result<Self, BlockFileBackingError> {
+        Self::from_file_with_origin(file, is_read_only, BlockFileBackingOrigin::SuppliedFile)
+    }
+
+    fn from_file_with_origin(
+        file: File,
+        is_read_only: bool,
+        origin: BlockFileBackingOrigin,
+    ) -> Result<Self, BlockFileBackingError> {
         let metadata = file
             .metadata()
             .map_err(|source| BlockFileBackingError::ReadMetadata { source })?;
@@ -3183,6 +3200,7 @@ impl BlockFileBacking {
             file,
             len: metadata.len(),
             is_read_only,
+            origin,
         })
     }
 
@@ -3209,6 +3227,7 @@ impl BlockFileBacking {
                 file,
                 len: metadata.len(),
                 is_read_only: true,
+                origin: BlockFileBackingOrigin::Path,
             };
             Ok((backing, identity))
         }
@@ -3216,6 +3235,40 @@ impl BlockFileBacking {
         #[cfg(not(unix))]
         {
             let _ = path;
+            Err(SnapshotBlockFileBackingError::UnsupportedPlatform)
+        }
+    }
+
+    /// Adopts an already-opened exact read-only snapshot backing.
+    pub fn from_snapshot_read_only_file(
+        file: File,
+    ) -> Result<(Self, BlockFileBackingIdentity), SnapshotBlockFileBackingError> {
+        #[cfg(unix)]
+        {
+            // SAFETY: F_GETFL only inspects the live owned descriptor.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
+                return Err(SnapshotBlockFileBackingError::InvalidMetadata);
+            }
+            let metadata = file
+                .metadata()
+                .map_err(|_| SnapshotBlockFileBackingError::ReadMetadata)?;
+            if !metadata.file_type().is_file() {
+                return Err(SnapshotBlockFileBackingError::NonRegularFile);
+            }
+            let identity = snapshot_block_file_identity(&metadata)?;
+            let backing = Self {
+                file,
+                len: metadata.len(),
+                is_read_only: true,
+                origin: BlockFileBackingOrigin::SuppliedFile,
+            };
+            Ok((backing, identity))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = file;
             Err(SnapshotBlockFileBackingError::UnsupportedPlatform)
         }
     }
@@ -3239,6 +3292,10 @@ impl BlockFileBacking {
         {
             Err(SnapshotBlockFileBackingError::UnsupportedPlatform)
         }
+    }
+
+    pub(crate) const fn uses_supplied_file(&self) -> bool {
+        matches!(self.origin, BlockFileBackingOrigin::SuppliedFile)
     }
 
     pub const fn len(&self) -> u64 {
@@ -4814,7 +4871,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error as _;
     use std::ffi::CString;
-    use std::fs::{self, OpenOptions};
+    use std::fs::{self, File, OpenOptions};
     use std::io::{self, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixListener;
@@ -10369,6 +10426,7 @@ mod tests {
         let (backing, identity) = BlockFileBacking::open_snapshot_read_only(file.as_path())
             .expect("regular snapshot backing should open");
         assert!(backing.is_read_only());
+        assert!(!backing.uses_supplied_file());
         assert_eq!(backing.len(), 512);
         assert_eq!(
             backing
@@ -10376,6 +10434,22 @@ mod tests {
                 .expect("opened descriptor identity should read"),
             identity
         );
+        let supplied_file = File::open(file.as_path()).expect("supplied backing should open");
+        let moved = file.as_path().with_extension("opened");
+        fs::rename(file.as_path(), &moved).expect("opened backing should move");
+        fs::write(file.as_path(), [0xa5; 512]).expect("replacement backing should create");
+        let (supplied, supplied_identity) =
+            BlockFileBacking::from_snapshot_read_only_file(supplied_file)
+                .expect("supplied exact backing should adopt");
+        assert!(supplied.uses_supplied_file());
+        let current_identity = supplied
+            .snapshot_identity()
+            .expect("supplied descriptor identity should read");
+        assert_eq!(supplied_identity, current_identity);
+        assert_eq!(supplied_identity.device(), identity.device());
+        assert_eq!(supplied_identity.inode(), identity.inode());
+        assert_eq!(supplied_identity.len(), identity.len());
+        fs::remove_file(moved).expect("opened backing fixture should clean up");
         assert_eq!(
             BlockFileBacking::open_snapshot_read_only(link.as_path())
                 .expect_err("snapshot backing symlink should reject"),

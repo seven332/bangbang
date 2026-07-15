@@ -86,6 +86,37 @@ const API_SOCKET_CHILD: &str = "api-1365.sock";
 const VSOCK_SOCKET_CHILD: &str = "vsock-1365.sock";
 const API_SOCKET_REF: &str = "bangbang-grant:grant-api-socket-directory-1365/api-1365.sock";
 const VSOCK_SOCKET_REF: &str = "bangbang-grant:grant-vsock-socket-directory-1365/vsock-1365.sock";
+const SNAPSHOT_KERNEL_ID: &str = "grant-snapshot-kernel-1368";
+const SNAPSHOT_ROOT_ID: &str = "grant-snapshot-root-1368";
+const SNAPSHOT_METRICS_ID: &str = "grant-snapshot-metrics-1368";
+const SNAPSHOT_STATE_OUTPUT_ID: &str = "grant-snapshot-state-output-1368";
+const SNAPSHOT_MEMORY_OUTPUT_ID: &str = "grant-snapshot-memory-output-1368";
+const SNAPSHOT_STATE_INPUT_ID: &str = "grant-snapshot-state-input-1368";
+const SNAPSHOT_MEMORY_INPUT_ID: &str = "grant-snapshot-memory-input-1368";
+const SNAPSHOT_DESCRIBE_INPUT_ID: &str = "grant-snapshot-describe-input-1368";
+const SNAPSHOT_KERNEL_REF: &str = "bangbang-grant:grant-snapshot-kernel-1368";
+const SNAPSHOT_ROOT_REF: &str = "bangbang-grant:grant-snapshot-root-1368";
+const SNAPSHOT_METRICS_REF: &str = "bangbang-grant:grant-snapshot-metrics-1368";
+const SNAPSHOT_STATE_OUTPUT_REF: &str =
+    "bangbang-grant:grant-snapshot-state-output-1368/state-1368.snap";
+const SNAPSHOT_MEMORY_OUTPUT_REF: &str =
+    "bangbang-grant:grant-snapshot-memory-output-1368/memory-1368.snap";
+const SNAPSHOT_REPEAT_STATE_OUTPUT_REF: &str =
+    "bangbang-grant:grant-snapshot-state-output-1368/state-repeat-1368.snap";
+const SNAPSHOT_REPEAT_MEMORY_OUTPUT_REF: &str =
+    "bangbang-grant:grant-snapshot-memory-output-1368/memory-repeat-1368.snap";
+const SNAPSHOT_STATE_INPUT_REF: &str = "bangbang-grant:grant-snapshot-state-input-1368";
+const SNAPSHOT_MEMORY_INPUT_REF: &str = "bangbang-grant:grant-snapshot-memory-input-1368";
+const SNAPSHOT_DESCRIBE_INPUT_REF: &str = "bangbang-grant:grant-snapshot-describe-input-1368";
+const SNAPSHOT_STAGING_HOLD_OPTION: &str = "--bangbang-internal-snapshot-staging-hold-v1";
+const SNAPSHOT_STATE_CHILD: &str = "state-1368.snap";
+const SNAPSHOT_MEMORY_CHILD: &str = "memory-1368.snap";
+const SNAPSHOT_REPEAT_STATE_CHILD: &str = "state-repeat-1368.snap";
+const SNAPSHOT_REPEAT_MEMORY_CHILD: &str = "memory-repeat-1368.snap";
+const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
+const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
+const SNAPSHOT_GUEST_UART_ADDRESS: u64 = 0x4000_2000;
+const SNAPSHOT_GUEST_VMGENID_ADDRESS: u64 = 0x801f_eff0;
 const GRANTED_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
 const GRANTED_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_MULTISTREAM_OK";
 const GRANTED_VSOCK_EXCHANGES: &[(u32, &[u8], &[u8])] = &[
@@ -428,6 +459,287 @@ fn normal_bundle_delays_boot_claim_until_api_and_keeps_opened_identity() {
         "guest should reach SYSTEM_OFF: {status:?}"
     );
     assert!(!running.socket.exists());
+}
+
+#[test]
+fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
+    let bundle = production_bundle();
+    initialize_worker_container(&bundle);
+    let baseline_sessions = session_entries();
+    let source_fixture = SnapshotSourceGrantFixture::new("continuity");
+    let mut source = spawn_ready_snapshot_grant_api_launcher(
+        &bundle,
+        &source_fixture.manifest,
+        source_fixture.sensitive_strings(),
+        "snapshot-source",
+        false,
+    );
+    source_fixture.replace_source_file_pathnames();
+    configure_and_pause_snapshot_source(&source, &source_fixture.opened_metrics);
+
+    let create_body = snapshot_create_body();
+    let create = http_put(&source.socket, "/snapshot/create", &create_body);
+    assert_http_status(&create, 204, "create granted snapshot");
+    let artifacts = source_fixture.artifacts();
+    assert!(
+        artifacts.state.is_file(),
+        "granted state output should exist"
+    );
+    assert!(
+        artifacts.memory.is_file(),
+        "granted memory output should exist"
+    );
+    assert_no_snapshot_staging(&source_fixture.state_directory);
+    assert_no_snapshot_staging(&source_fixture.memory_directory);
+    let state_before = fs::read(&artifacts.state).expect("granted state should read");
+    let memory_before = fs::read(&artifacts.memory).expect("granted memory should read");
+
+    let repeated_create = http_put(
+        &source.socket,
+        "/snapshot/create",
+        &repeated_snapshot_create_body(),
+    );
+    assert_http_status(
+        &repeated_create,
+        204,
+        "reuse granted snapshot output directories",
+    );
+    let repeated_artifacts = source_fixture.repeated_artifacts();
+    assert!(
+        repeated_artifacts.state.is_file(),
+        "reused state output grant should publish another child"
+    );
+    assert!(
+        repeated_artifacts.memory.is_file(),
+        "reused memory output grant should publish another child"
+    );
+    assert_no_snapshot_staging(&source_fixture.state_directory);
+    assert_no_snapshot_staging(&source_fixture.memory_directory);
+    let repeated_state_before =
+        fs::read(&repeated_artifacts.state).expect("repeated state should read");
+    let repeated_memory_before =
+        fs::read(&repeated_artifacts.memory).expect("repeated memory should read");
+
+    let collision = http_put(&source.socket, "/snapshot/create", &create_body);
+    assert_http_status(&collision, 400, "colliding granted snapshot create");
+    for private in [
+        SNAPSHOT_STATE_OUTPUT_REF,
+        SNAPSHOT_MEMORY_OUTPUT_REF,
+        SNAPSHOT_REPEAT_STATE_OUTPUT_REF,
+        SNAPSHOT_REPEAT_MEMORY_OUTPUT_REF,
+        SNAPSHOT_STATE_CHILD,
+        SNAPSHOT_MEMORY_CHILD,
+        SNAPSHOT_REPEAT_STATE_CHILD,
+        SNAPSHOT_REPEAT_MEMORY_CHILD,
+    ] {
+        assert!(!collision.contains(private));
+    }
+    assert_eq!(
+        fs::read(&artifacts.state).expect("state should survive collision"),
+        state_before
+    );
+    assert_eq!(
+        fs::read(&artifacts.memory).expect("memory should survive collision"),
+        memory_before
+    );
+    assert_eq!(
+        fs::read(&repeated_artifacts.state).expect("repeated state should survive collision"),
+        repeated_state_before
+    );
+    assert_eq!(
+        fs::read(&repeated_artifacts.memory).expect("repeated memory should survive collision"),
+        repeated_memory_before
+    );
+
+    let peer_fixture = SnapshotSourceGrantFixture::new("concurrent-peer");
+    let mut peer = spawn_ready_snapshot_grant_api_launcher(
+        &bundle,
+        &peer_fixture.manifest,
+        peer_fixture.sensitive_strings(),
+        "snapshot-concurrent-peer",
+        false,
+    );
+    peer_fixture.replace_source_file_pathnames();
+    configure_and_pause_snapshot_source(&peer, &peer_fixture.opened_metrics);
+    let peer_artifacts = peer_fixture.artifacts();
+    assert!(!peer_artifacts.state.exists());
+    assert!(!peer_artifacts.memory.exists());
+    let peer_create = http_put(&peer.socket, "/snapshot/create", &create_body);
+    assert_http_status(&peer_create, 204, "create concurrent granted snapshot");
+    assert!(peer_artifacts.state.is_file());
+    assert!(peer_artifacts.memory.is_file());
+    assert_no_snapshot_staging(&peer_fixture.state_directory);
+    assert_no_snapshot_staging(&peer_fixture.memory_directory);
+    assert_eq!(
+        fs::read(&artifacts.state).expect("peer must not rewrite source state"),
+        state_before
+    );
+    assert_eq!(
+        fs::read(&artifacts.memory).expect("peer must not rewrite source memory"),
+        memory_before
+    );
+    stop_running_launcher(&mut peer, "concurrent granted snapshot peer");
+    stop_running_launcher(&mut source, "granted snapshot source");
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let describe = SnapshotDescribeGrantFixture::new("valid", &artifacts.state, true);
+    let describe_output = run_snapshot_describe(&bundle, &describe);
+    assert_output_success(&describe_output, "granted snapshot description");
+    assert_eq!(
+        String::from_utf8_lossy(&describe_output.stdout).trim(),
+        "v1.0.0"
+    );
+    assert_snapshot_output_redacted(&describe_output, &describe.sensitive_strings());
+
+    let mismatch = SnapshotDescribeGrantFixture::new("wrong-role", &artifacts.state, false);
+    let mismatch_output = run_snapshot_describe(&bundle, &mismatch);
+    assert_eq!(
+        mismatch_output.status.code(),
+        Some(BAD_CONFIGURATION_EXIT_CODE)
+    );
+    assert!(String::from_utf8_lossy(&mismatch_output.stderr).contains("snapshot inspection"));
+    assert_snapshot_output_redacted(&mismatch_output, &mismatch.sensitive_strings());
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let paused_fixture = SnapshotInputGrantFixture::new("paused", artifacts);
+    let mut paused = spawn_ready_snapshot_grant_api_launcher(
+        &bundle,
+        &paused_fixture.manifest,
+        paused_fixture.sensitive_strings(),
+        "snapshot-paused",
+        false,
+    );
+    let next_artifacts = paused_fixture.replace_source_pathnames();
+    let paused_load = http_put(&paused.socket, "/snapshot/load", &snapshot_load_body(false));
+    assert_http_status(&paused_load, 204, "load granted snapshot paused");
+    let paused_state = http_get(&paused.socket, "/");
+    assert_http_status(&paused_state, 200, "read granted paused snapshot state");
+    assert!(paused_state.contains(r#""state":"Paused""#));
+    assert_http_status(
+        &http_request(&paused.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume granted snapshot",
+    );
+    assert!(
+        paused.wait("granted snapshot explicit resume").success(),
+        "explicitly resumed granted snapshot should reach SYSTEM_OFF"
+    );
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let resumed_fixture = SnapshotInputGrantFixture::new("automatic", next_artifacts);
+    let mut resumed = spawn_ready_snapshot_grant_api_launcher(
+        &bundle,
+        &resumed_fixture.manifest,
+        resumed_fixture.sensitive_strings(),
+        "snapshot-automatic",
+        false,
+    );
+    let final_artifacts = resumed_fixture.replace_source_pathnames();
+    let resumed_load = http_put(&resumed.socket, "/snapshot/load", &snapshot_load_body(true));
+    assert_http_status(
+        &resumed_load,
+        204,
+        "load and automatically resume granted snapshot",
+    );
+    assert!(
+        resumed.wait("granted snapshot automatic resume").success(),
+        "automatically resumed granted snapshot should reach SYSTEM_OFF"
+    );
+    assert_eq!(
+        fs::read(&final_artifacts.state).expect("final state should read"),
+        state_before
+    );
+    assert_eq!(
+        fs::read(&final_artifacts.memory).expect("final memory should read"),
+        memory_before
+    );
+    assert_eq!(session_entries(), baseline_sessions);
+}
+
+#[test]
+fn grant_test_bundle_recovers_recorded_snapshot_staging_after_worker_sigkill() {
+    let bundle = grant_test_bundle();
+    initialize_worker_container(&bundle);
+    let baseline_sessions = session_entries();
+
+    for preserve_replacement in [false, true] {
+        let case = if preserve_replacement {
+            "staging-replacement"
+        } else {
+            "staging-exact"
+        };
+        let fixture = SnapshotSourceGrantFixture::new(case);
+        let mut running = spawn_ready_snapshot_grant_api_launcher(
+            &bundle,
+            &fixture.manifest,
+            fixture.sensitive_strings(),
+            case,
+            true,
+        );
+        fixture.replace_source_file_pathnames();
+        configure_and_pause_snapshot_source(&running, &fixture.opened_metrics);
+        let active_session = session_entries()
+            .into_iter()
+            .find(|entry| !baseline_sessions.contains(entry))
+            .expect("snapshot crash session should exist");
+        let watch = DirectoryChangeWatch::new(&fixture.memory_directory);
+        let record_watch = DirectoryChangeWatch::new(&active_session);
+        let request = begin_snapshot_create_request(&running.socket);
+        let staging = watch
+            .wait_for_snapshot_staging(PROCESS_TIMEOUT)
+            .expect("recorded memory staging file should appear");
+        record_watch
+            .wait_for_child(".snapshot-memory-owner", PROCESS_TIMEOUT)
+            .expect("worker must durably record ownership before the test hold");
+
+        let mut moved_owned = None;
+        if preserve_replacement {
+            let moved = fixture
+                .memory_directory
+                .join("moved-recorded-memory-staging");
+            fs::rename(&staging, &moved).expect("recorded staging inode should move");
+            fs::write(&staging, b"replacement staging must survive\n")
+                .expect("replacement staging should write");
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o600))
+                .expect("replacement staging permissions should tighten");
+            moved_owned = Some(moved);
+        }
+
+        let worker_pid = only_worker_pid(&running.child);
+        let worker_exit = ProcessExitWatch::new(worker_pid);
+        // SAFETY: The live worker is the sole child of the retained launcher.
+        assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
+        assert!(
+            worker_exit.wait(PROCESS_TIMEOUT),
+            "snapshot worker should exit after SIGKILL"
+        );
+        drop(request);
+        let status = running.wait("recorded snapshot staging worker SIGKILL");
+        assert_eq!(status.code(), Some(128 + libc::SIGKILL));
+        assert_eq!(session_entries(), baseline_sessions);
+        assert!(!fixture.artifacts().state.exists());
+        assert!(!fixture.artifacts().memory.exists());
+
+        if preserve_replacement {
+            assert_eq!(
+                fs::read(&staging).expect("replacement staging should remain"),
+                b"replacement staging must survive\n"
+            );
+            fs::remove_file(&staging).expect("replacement staging should clean");
+            fs::remove_file(
+                moved_owned
+                    .as_ref()
+                    .expect("moved recorded staging should exist"),
+            )
+            .expect("moved recorded staging should clean");
+        } else {
+            assert!(
+                !staging.exists(),
+                "exact recorded staging should be removed"
+            );
+            assert_no_snapshot_staging(&fixture.memory_directory);
+        }
+    }
 }
 
 #[test]
@@ -2022,6 +2334,332 @@ fn run_graceful_signal_case(signal: i32, name: &str) {
     );
 }
 
+#[derive(Debug, Clone)]
+struct SnapshotArtifactSet {
+    state: PathBuf,
+    memory: PathBuf,
+    root: PathBuf,
+}
+
+#[derive(Debug)]
+struct SnapshotSourceGrantFixture {
+    _root: TestDir,
+    manifest: PathBuf,
+    kernel: PathBuf,
+    root: PathBuf,
+    metrics: PathBuf,
+    state_directory: PathBuf,
+    memory_directory: PathBuf,
+    opened_kernel: PathBuf,
+    opened_root: PathBuf,
+    opened_metrics: PathBuf,
+    opened_state_directory: PathBuf,
+    opened_memory_directory: PathBuf,
+}
+
+impl SnapshotSourceGrantFixture {
+    fn new(case: &str) -> Self {
+        let root = TestDir::new(&format!("snapshot-source-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("snapshot source root should canonicalize");
+        let manifest = canonical_root.join("grant-manifest.json");
+        let kernel = canonical_root.join("snapshot-kernel.image");
+        let root_backing = canonical_root.join("snapshot-root.img");
+        let metrics = canonical_root.join("snapshot.metrics");
+        let state_directory = canonical_root.join("state-output");
+        let memory_directory = canonical_root.join("memory-output");
+        let opened_kernel = canonical_root.join("opened-snapshot-kernel.image");
+        let opened_root = canonical_root.join("opened-snapshot-root.img");
+        let opened_metrics = canonical_root.join("opened-snapshot.metrics");
+        let opened_state_directory = canonical_root.join("opened-state-output");
+        let opened_memory_directory = canonical_root.join("opened-memory-output");
+
+        fs::write(&kernel, snapshot_continuity_guest_image())
+            .expect("snapshot guest image should write");
+        create_sized_file(&root_backing, 512);
+        fs::write(&metrics, b"").expect("snapshot metrics fixture should write");
+        fs::create_dir(&state_directory).expect("state output directory should create");
+        fs::create_dir(&memory_directory).expect("memory output directory should create");
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": SNAPSHOT_KERNEL_ID,
+                    "role": "kernel-image",
+                    "access": "read-only",
+                    "source": path_text(&kernel),
+                },
+                {
+                    "id": SNAPSHOT_ROOT_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&root_backing),
+                },
+                {
+                    "id": SNAPSHOT_METRICS_ID,
+                    "role": "metrics-sink",
+                    "access": "write-only",
+                    "source": path_text(&metrics),
+                },
+                {
+                    "id": SNAPSHOT_STATE_OUTPUT_ID,
+                    "role": "snapshot-output-directory",
+                    "access": "create-children",
+                    "source": path_text(&state_directory),
+                },
+                {
+                    "id": SNAPSHOT_MEMORY_OUTPUT_ID,
+                    "role": "snapshot-output-directory",
+                    "access": "create-children",
+                    "source": path_text(&memory_directory),
+                },
+            ],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("snapshot manifest should serialize"),
+        )
+        .expect("snapshot manifest should write");
+
+        Self {
+            _root: root,
+            manifest,
+            kernel,
+            root: root_backing,
+            metrics,
+            state_directory,
+            memory_directory,
+            opened_kernel,
+            opened_root,
+            opened_metrics,
+            opened_state_directory,
+            opened_memory_directory,
+        }
+    }
+
+    fn replace_source_file_pathnames(&self) {
+        for (source, opened) in [
+            (&self.kernel, &self.opened_kernel),
+            (&self.root, &self.opened_root),
+            (&self.metrics, &self.opened_metrics),
+        ] {
+            fs::rename(source, opened).expect("launcher-opened snapshot file should move");
+        }
+        fs::write(&self.kernel, b"replacement kernel must not boot")
+            .expect("replacement snapshot kernel should write");
+        create_sized_file(&self.root, 512);
+        fs::write(&self.metrics, b"replacement metrics must remain unused\n")
+            .expect("replacement metrics should write");
+    }
+
+    fn artifacts(&self) -> SnapshotArtifactSet {
+        self.artifacts_with_children(SNAPSHOT_STATE_CHILD, SNAPSHOT_MEMORY_CHILD)
+    }
+
+    fn repeated_artifacts(&self) -> SnapshotArtifactSet {
+        self.artifacts_with_children(SNAPSHOT_REPEAT_STATE_CHILD, SNAPSHOT_REPEAT_MEMORY_CHILD)
+    }
+
+    fn artifacts_with_children(
+        &self,
+        state_child: &str,
+        memory_child: &str,
+    ) -> SnapshotArtifactSet {
+        SnapshotArtifactSet {
+            state: self.state_directory.join(state_child),
+            memory: self.memory_directory.join(memory_child),
+            root: self.opened_root.clone(),
+        }
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.manifest),
+            path_text(&self.kernel),
+            path_text(&self.root),
+            path_text(&self.metrics),
+            path_text(&self.state_directory),
+            path_text(&self.memory_directory),
+            path_text(&self.opened_kernel),
+            path_text(&self.opened_root),
+            path_text(&self.opened_metrics),
+            path_text(&self.opened_state_directory),
+            path_text(&self.opened_memory_directory),
+            SNAPSHOT_KERNEL_ID,
+            SNAPSHOT_ROOT_ID,
+            SNAPSHOT_METRICS_ID,
+            SNAPSHOT_STATE_OUTPUT_ID,
+            SNAPSHOT_MEMORY_OUTPUT_ID,
+            SNAPSHOT_KERNEL_REF,
+            SNAPSHOT_ROOT_REF,
+            SNAPSHOT_METRICS_REF,
+            SNAPSHOT_STATE_OUTPUT_REF,
+            SNAPSHOT_MEMORY_OUTPUT_REF,
+            SNAPSHOT_REPEAT_STATE_OUTPUT_REF,
+            SNAPSHOT_REPEAT_MEMORY_OUTPUT_REF,
+            SNAPSHOT_STATE_CHILD,
+            SNAPSHOT_MEMORY_CHILD,
+            SNAPSHOT_REPEAT_STATE_CHILD,
+            SNAPSHOT_REPEAT_MEMORY_CHILD,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
+#[derive(Debug)]
+struct SnapshotInputGrantFixture {
+    _root: TestDir,
+    manifest: PathBuf,
+    sources: SnapshotArtifactSet,
+    opened: SnapshotArtifactSet,
+}
+
+impl SnapshotInputGrantFixture {
+    fn new(case: &str, sources: SnapshotArtifactSet) -> Self {
+        let root = TestDir::new(&format!("snapshot-input-{case}"));
+        let manifest = fs::canonicalize(root.path())
+            .expect("snapshot input root should canonicalize")
+            .join("grant-manifest.json");
+        let opened = SnapshotArtifactSet {
+            state: replacement_opened_path(&sources.state, case),
+            memory: replacement_opened_path(&sources.memory, case),
+            root: sources.root.clone(),
+        };
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": SNAPSHOT_STATE_INPUT_ID,
+                    "role": "snapshot-state-input",
+                    "access": "read-only",
+                    "source": path_text(&sources.state),
+                },
+                {
+                    "id": SNAPSHOT_MEMORY_INPUT_ID,
+                    "role": "snapshot-memory-input",
+                    "access": "read-only",
+                    "source": path_text(&sources.memory),
+                },
+                {
+                    "id": SNAPSHOT_ROOT_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&sources.root),
+                },
+            ],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("snapshot input manifest should serialize"),
+        )
+        .expect("snapshot input manifest should write");
+        Self {
+            _root: root,
+            manifest,
+            sources,
+            opened,
+        }
+    }
+
+    fn replace_source_pathnames(&self) -> SnapshotArtifactSet {
+        for (source, opened) in [
+            (&self.sources.state, &self.opened.state),
+            (&self.sources.memory, &self.opened.memory),
+        ] {
+            fs::rename(source, opened).expect("launcher-opened snapshot input should move");
+        }
+        fs::write(&self.sources.state, b"replacement state must not load")
+            .expect("replacement snapshot state should write");
+        fs::write(&self.sources.memory, b"replacement memory must not load")
+            .expect("replacement snapshot memory should write");
+        self.opened.clone()
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.manifest),
+            path_text(&self.sources.state),
+            path_text(&self.sources.memory),
+            path_text(&self.sources.root),
+            path_text(&self.opened.state),
+            path_text(&self.opened.memory),
+            path_text(&self.opened.root),
+            SNAPSHOT_STATE_INPUT_ID,
+            SNAPSHOT_MEMORY_INPUT_ID,
+            SNAPSHOT_ROOT_ID,
+            SNAPSHOT_STATE_INPUT_REF,
+            SNAPSHOT_MEMORY_INPUT_REF,
+            SNAPSHOT_ROOT_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
+#[derive(Debug)]
+struct SnapshotDescribeGrantFixture {
+    _root: TestDir,
+    manifest: PathBuf,
+    state: PathBuf,
+}
+
+impl SnapshotDescribeGrantFixture {
+    fn new(case: &str, state: &Path, correct_role: bool) -> Self {
+        let root = TestDir::new(&format!("snapshot-describe-{case}"));
+        let manifest = fs::canonicalize(root.path())
+            .expect("snapshot describe root should canonicalize")
+            .join("grant-manifest.json");
+        let role = if correct_role {
+            "snapshot-describe-input"
+        } else {
+            "snapshot-state-input"
+        };
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [{
+                "id": SNAPSHOT_DESCRIBE_INPUT_ID,
+                "role": role,
+                "access": "read-only",
+                "source": path_text(state),
+            }],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json)
+                .expect("snapshot describe manifest should serialize"),
+        )
+        .expect("snapshot describe manifest should write");
+        Self {
+            _root: root,
+            manifest,
+            state: state.to_path_buf(),
+        }
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.manifest),
+            path_text(&self.state),
+            SNAPSHOT_DESCRIBE_INPUT_ID,
+            SNAPSHOT_DESCRIBE_INPUT_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
+fn replacement_opened_path(source: &Path, case: &str) -> PathBuf {
+    let name = source
+        .file_name()
+        .expect("snapshot source should have a file name")
+        .to_string_lossy();
+    source.with_file_name(format!("opened-{case}-{name}"))
+}
+
 #[derive(Debug)]
 struct StartupGrantFixture {
     _root: TestDir,
@@ -3385,6 +4023,217 @@ fn spawn_ready_output_grant_api_launcher(
     }
 }
 
+fn spawn_ready_snapshot_grant_api_launcher(
+    bundle: &Path,
+    manifest: &Path,
+    sensitive: Vec<String>,
+    name: &str,
+    hold_after_staging_record: bool,
+) -> RunningApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket =
+        container_tmp_dir().join(format!("bbsn-{:x}-{test_id:x}.sock", std::process::id()));
+    let mut command = Command::new(launcher(bundle));
+    command.arg(GRANT_MANIFEST_OPTION).arg(manifest).arg("--");
+    if hold_after_staging_record {
+        command.arg(SNAPSHOT_STAGING_HOLD_OPTION);
+    }
+    let mut child = command
+        .args(["--api-sock", path_text(&socket)])
+        .args(["--id", &format!("{name}-{test_id}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("snapshot-grant launcher should start");
+    let (ready, stdout_reader) = read_stdout_until_ready(&mut child);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "snapshot-grant API should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningApiLauncher {
+        child,
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive,
+        completed: false,
+    }
+}
+
+fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_path: &Path) {
+    for (path, body, context) in [
+        (
+            "/machine-config",
+            serde_json::json!({"vcpu_count": 1, "mem_size_mib": 16}),
+            "PUT snapshot machine config",
+        ),
+        (
+            "/metrics",
+            serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}),
+            "PUT snapshot metrics",
+        ),
+        (
+            "/boot-source",
+            serde_json::json!({"kernel_image_path": SNAPSHOT_KERNEL_REF}),
+            "PUT snapshot boot source",
+        ),
+        (
+            "/drives/root",
+            serde_json::json!({
+                "drive_id": "root",
+                "path_on_host": SNAPSHOT_ROOT_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT snapshot root drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("snapshot request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start snapshot source",
+    );
+    wait_for_snapshot_uart_write(&running.socket, metrics_path, PROCESS_TIMEOUT);
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause snapshot source",
+    );
+}
+
+fn wait_for_snapshot_uart_write(socket: &Path, metrics: &Path, timeout: Duration) {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .expect("snapshot metric deadline should fit");
+    loop {
+        assert_http_status(
+            &http_put(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            204,
+            "flush snapshot metrics",
+        );
+        if latest_snapshot_uart_write_count(metrics).is_some_and(|count| count >= 1) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "snapshot guest did not write readiness byte before timeout"
+        );
+        thread::yield_now();
+    }
+}
+
+fn latest_snapshot_uart_write_count(path: &Path) -> Option<u64> {
+    fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .rev()
+        .find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("uart")?
+                .get("write_count")?
+                .as_u64()
+        })
+}
+
+fn snapshot_create_body() -> String {
+    snapshot_create_body_for(SNAPSHOT_STATE_OUTPUT_REF, SNAPSHOT_MEMORY_OUTPUT_REF)
+}
+
+fn repeated_snapshot_create_body() -> String {
+    snapshot_create_body_for(
+        SNAPSHOT_REPEAT_STATE_OUTPUT_REF,
+        SNAPSHOT_REPEAT_MEMORY_OUTPUT_REF,
+    )
+}
+
+fn snapshot_create_body_for(state: &str, memory: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "snapshot_type": "Full",
+        "snapshot_path": state,
+        "mem_file_path": memory,
+    }))
+    .expect("snapshot create body should serialize")
+}
+
+fn snapshot_load_body(resume_vm: bool) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "snapshot_path": SNAPSHOT_STATE_INPUT_REF,
+        "mem_backend": {
+            "backend_path": SNAPSHOT_MEMORY_INPUT_REF,
+            "backend_type": "File",
+        },
+        "resume_vm": resume_vm,
+    }))
+    .expect("snapshot load body should serialize")
+}
+
+fn assert_no_snapshot_staging(directory: &Path) {
+    let staging = fs::read_dir(directory)
+        .expect("snapshot directory should remain readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("snapshot entries should read")
+        .into_iter()
+        .map(|entry| entry.file_name())
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with(".bangbang-snapshot-state-")
+                || name.starts_with(".bangbang-snapshot-memory-")
+        })
+        .collect::<Vec<_>>();
+    assert!(staging.is_empty(), "snapshot staging remains: {staging:?}");
+}
+
+fn run_snapshot_describe(bundle: &Path, fixture: &SnapshotDescribeGrantFixture) -> Output {
+    let mut command = Command::new(launcher(bundle));
+    command
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .args(["--describe-snapshot", SNAPSHOT_DESCRIBE_INPUT_REF]);
+    run_with_timeout(
+        &mut command,
+        PROCESS_TIMEOUT,
+        "granted snapshot description",
+    )
+}
+
+fn assert_snapshot_output_redacted(output: &Output, sensitive: &[String]) {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for value in sensitive {
+        assert!(
+            !combined.contains(value),
+            "snapshot process output leaked private grant data"
+        );
+    }
+}
+
 fn configure_output_grant_session(
     bundle: &Path,
     running: &RunningApiLauncher,
@@ -3511,6 +4360,175 @@ fn child_pids(parent: libc::pid_t) -> Vec<libc::pid_t> {
 struct ProcessExitWatch {
     queue: OwnedFd,
     pid: usize,
+}
+
+#[derive(Debug)]
+struct DirectoryChangeWatch {
+    queue: OwnedFd,
+    _directory: fs::File,
+    path: PathBuf,
+}
+
+impl DirectoryChangeWatch {
+    fn new(path: &Path) -> Self {
+        let directory = fs::File::open(path).expect("watched snapshot directory should open");
+        // SAFETY: `kqueue` returns a fresh descriptor on success.
+        let queue = unsafe { libc::kqueue() };
+        assert!(queue >= 0, "snapshot directory watch kqueue should open");
+        // SAFETY: `queue` is a fresh owned descriptor.
+        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+        let ident = usize::try_from(directory.as_raw_fd())
+            .expect("snapshot directory descriptor should fit usize");
+        let change = libc::kevent {
+            ident,
+            filter: libc::EVFILT_VNODE,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            fflags: libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_RENAME,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            // SAFETY: The queue, directory, and initialized registration remain live.
+            unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    &raw const change,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
+            },
+            0,
+            "snapshot directory watch should register"
+        );
+        Self {
+            queue,
+            _directory: directory,
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn wait_for_snapshot_staging(&self, timeout: Duration) -> Result<PathBuf, String> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "snapshot staging deadline overflowed".to_owned())?;
+        loop {
+            if let Some(staging) = find_snapshot_staging(&self.path)? {
+                return Ok(staging);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for snapshot staging entry".to_owned());
+            }
+            let timeout = libc::timespec {
+                tv_sec: libc::time_t::try_from(remaining.as_secs())
+                    .map_err(|_| "snapshot staging timeout did not fit time_t".to_owned())?,
+                tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+            };
+            let mut event = MaybeUninit::<libc::kevent>::uninit();
+            // SAFETY: The live queue has one writable output event and a live timeout.
+            let count = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    &raw const timeout,
+                )
+            };
+            if count == 1 {
+                continue;
+            }
+            if count == 0 {
+                return Err("timed out waiting for snapshot staging event".to_owned());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(format!("snapshot staging watch failed: {error}"));
+            }
+        }
+    }
+
+    fn wait_for_child(&self, child: &str, timeout: Duration) -> Result<PathBuf, String> {
+        let child = self.path.join(child);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "directory child deadline overflowed".to_owned())?;
+        loop {
+            if child.is_file() {
+                return Ok(child);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for directory child".to_owned());
+            }
+            let timeout = libc::timespec {
+                tv_sec: libc::time_t::try_from(remaining.as_secs())
+                    .map_err(|_| "directory child timeout did not fit time_t".to_owned())?,
+                tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+            };
+            let mut event = MaybeUninit::<libc::kevent>::uninit();
+            // SAFETY: The live queue has one writable output event and a live timeout.
+            let count = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    &raw const timeout,
+                )
+            };
+            if count == 1 {
+                continue;
+            }
+            if count == 0 {
+                return Err("timed out waiting for directory child event".to_owned());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(format!("directory child watch failed: {error}"));
+            }
+        }
+    }
+}
+
+fn find_snapshot_staging(directory: &Path) -> Result<Option<PathBuf>, String> {
+    let mut staging = fs::read_dir(directory)
+        .map_err(|error| format!("snapshot staging directory could not be read: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("snapshot staging entry could not be read: {error}"))?
+        .into_iter()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".bangbang-snapshot-memory-")
+                || name.starts_with(".bangbang-snapshot-state-")
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    staging.sort();
+    if staging.len() > 1 {
+        return Err("multiple snapshot staging entries appeared before the hold".to_owned());
+    }
+    Ok(staging.pop())
+}
+
+fn begin_snapshot_create_request(socket: &Path) -> UnixStream {
+    let body = snapshot_create_body();
+    let mut stream = UnixStream::connect(socket).expect("snapshot API should accept request");
+    write!(
+        stream,
+        "PUT /snapshot/create HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("snapshot create request should write");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("snapshot create request write should close");
+    stream
 }
 
 impl ProcessExitWatch {
@@ -4200,6 +5218,71 @@ fn copy_tree(source: &Path, destination: &Path) {
 
 fn path_text(path: &Path) -> &str {
     path.to_str().expect("test path should be UTF-8")
+}
+
+fn snapshot_continuity_guest_image() -> Vec<u8> {
+    let instructions = [
+        aarch64_movz_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0), 0),
+        aarch64_movk_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 16), 16),
+        aarch64_ldp_x(2, 3, 1),
+        aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
+        aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
+        aarch64_movz_x(7, u16::from(b'R'), 0),
+        aarch64_strb_w(7, 4),
+        aarch64_ldp_x(5, 6, 1),
+        aarch64_cmp_x(5, 2),
+        0x5400_0061,
+        aarch64_cmp_x(6, 3),
+        0x54ff_ff80,
+        aarch64_movz_x(7, u16::from(b'C'), 0),
+        aarch64_strb_w(7, 4),
+        aarch64_movz_x(0, 0x0008, 0),
+        aarch64_movk_x(0, 0x8400, 16),
+        0xd400_0002,
+        0x1400_0000,
+    ];
+    let mut image = vec![0; SNAPSHOT_GUEST_IMAGE_HEADER_SIZE];
+    write_snapshot_test_u32(&mut image, 0, 0x1400_0010);
+    write_snapshot_test_u32(&mut image, 4, 0xd503_201f);
+    write_snapshot_test_u64(&mut image, 8, 0);
+    write_snapshot_test_u32(&mut image, 56, SNAPSHOT_GUEST_IMAGE_MAGIC);
+    image.extend(instructions.into_iter().flat_map(u32::to_le_bytes));
+    let image_size = u64::try_from(image.len()).expect("snapshot guest image length should fit");
+    write_snapshot_test_u64(&mut image, 16, image_size);
+    image
+}
+
+fn aarch64_movz_x(register: u32, immediate: u16, shift: u32) -> u32 {
+    0xd280_0000 | ((shift / 16) << 21) | (u32::from(immediate) << 5) | register
+}
+
+fn aarch64_movk_x(register: u32, immediate: u16, shift: u32) -> u32 {
+    0xf280_0000 | ((shift / 16) << 21) | (u32::from(immediate) << 5) | register
+}
+
+fn aarch64_ldp_x(first: u32, second: u32, base: u32) -> u32 {
+    0xa940_0000 | (second << 10) | (base << 5) | first
+}
+
+fn aarch64_cmp_x(left: u32, right: u32) -> u32 {
+    0xeb00_001f | (right << 16) | (left << 5)
+}
+
+fn aarch64_strb_w(source: u32, base: u32) -> u32 {
+    0x3900_0000 | (base << 5) | source
+}
+
+fn low_u16(value: u64, shift: u32) -> u16 {
+    u16::try_from((value >> shift) & u64::from(u16::MAX))
+        .expect("masked snapshot immediate should fit")
+}
+
+fn write_snapshot_test_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_snapshot_test_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 #[derive(Debug)]

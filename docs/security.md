@@ -67,10 +67,10 @@ cleanup, typed startup grant allow/deny behavior, an outside-container granted
 API socket, both real granted-vsock initiation directions, and a real sandboxed guest.
 The direct CLI remains an ordinary non-sandboxed executable. Production can
 commit typed startup authority, and its config, metadata, kernel, initrd,
-block, pmem, logger, metrics, serial, API-socket, and vsock-socket consumers use
-granted identities without reopening their tagged path strings. Snapshot paths,
-general dynamic post-Ready delivery, and hard revocation still need dedicated
-adoption slices.
+block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket,
+and vsock-socket consumers use granted identities or exact retained anchors
+without reopening their tagged path strings. General dynamic post-Ready
+delivery and hard revocation still need dedicated designs.
 
 ## Platform-Limit Taxonomy
 
@@ -227,7 +227,7 @@ no Hypervisor or App Sandbox entitlement and the worker has exactly both. This
 is a real deployed containment boundary, but it is not Firecracker's Linux
 jailer. It now preauthorizes bounded startup resources; existing public path
 consumers for startup config, startup metadata, kernel, initrd, block, pmem,
-logger, metrics, serial, API sockets, and vsock sockets adopt them.
+logger, metrics, serial, snapshots, API sockets, and vsock sockets adopt them.
 
 Use the following boundaries when designing or reviewing macOS isolation work:
 
@@ -235,7 +235,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | --- | --- | --- |
 | Operator-owned private directories | Required for API sockets, vsock sockets, observability sinks, and other configured paths that should not be shared. Contained API/vsock use requires one exact preauthorized directory and safe child; direct paths remain operator-owned. | Cross-launcher name allocation and sharing policy remain operator responsibilities. |
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
-| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, API-socket, and vsock-socket authority form the current contained mode. | Snapshot adoption, general dynamic delivery, and vmnet authorization require later explicit policy. |
+| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, and vsock-socket authority form the current contained mode. | General dynamic delivery and vmnet authorization require later explicit policy. |
 | Launcher or resource broker | The production launcher validates fixed/live nested code, starts one default-close worker, authenticates lifecycle v2, owns cancellation/status, coordinates the private namespace, atomically transfers a bounded typed startup batch, supports the adopted file/directory consumers, and exposes one dormant fixed vsock connection facet. | Keep that facet fixed to one exact anchor/child and port-only requests; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
 | Firecracker Linux jailer model | Platform-limited unsupported as a direct port. | Keep Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege-drop flags rejected or documented until macOS replacements exist. |
 
@@ -263,9 +263,9 @@ Resource paths are walked from an owned root descriptor with one-component
 a special file cannot stall preparation. Exact fstat type/device/inode and
 F_GETFL access/status flags are recorded. The complete RAII batch is prepared
 before spawn; any failure drops every opened descriptor. Current hard limits are
-256 KiB manifest data, 64 grants, 64 identifier bytes, 4096 source-path bytes,
-512 records, 1024 encoded bytes per datagram, 64 KiB per bookmark, and 256 KiB
-aggregate bookmark material.
+256 KiB manifest data, 64 grants, 64 identifier bytes, 255 UTF-8 bytes per
+snapshot output child, 4096 source-path bytes, 512 records, 1024 encoded bytes
+per datagram, 64 KiB per bookmark, and 256 KiB aggregate bookmark material.
 
 Lifecycle protocol v2 uses descriptor 3. A separate connected unnamed Darwin
 datagram socket at descriptor 4 carries grant-channel v1 records. A third
@@ -374,6 +374,41 @@ existing creation and FIFO-like behavior is unchanged. Pending, replaced, and
 active sink files close through ordinary process/session ownership; descriptor
 delegation remains cooperative rather than hard-revocable.
 
+Snapshot describe/state/memory file references use the exact contained input
+grammar and distinct singleton read-only roles. Description inspects a duplicate
+of the exact descriptor. Load duplicates only state for bounded decode, learns
+any persisted grant-tagged root selector, then atomically takes every tagged
+state, memory, and read-only `DriveBacking` input. Wrong, missing, duplicate,
+cancelled, or mismatched authority consumes nothing. After a successful take,
+the prepared state, anonymous memory, and supplied root backing complete restore
+without reopening any submitted or persisted tag. A later failure retains the
+existing snapshot retryable/terminal classification but does not restore the
+one-time file grants. The root's captured identity includes device, inode,
+length, mode, modification time, and status-change time; a metadata-changing
+rename or replacement is intentionally not treated as unchanged authority.
+
+Snapshot outputs use the separate exact contained reference
+`bangbang-grant:<GrantId>/<SnapshotOutputChild>`. The child is one 1–255 byte
+UTF-8 component, contains no NUL or `/`, and is neither `.` nor `..`.
+`SnapshotOutputDirectory` is repeatable, and a retained anchor can serve
+distinct state/memory children and later create requests. Complete request and
+profile validation precede adoption. Staging creation, verification, barriers,
+and exclusive finals remain relative to the retained anchors. Security-scoped
+authorization remains tied to the directory's granted pathname on macOS;
+moving the directory after scope activation can cause descriptor-relative
+access checks to fail rather than broadening authority.
+
+Each active granted staging file has one strict private record containing only
+artifact kind, directory identity, its bounded random component, and file
+identity. The worker records after create/fstat and before content, then clears
+after publication or conclusive identity-safe cleanup. After worker reap, the
+launcher matches its retained exact anchor and removes only a current-user
+regular `0600`, single-link device/inode match. Missing, changed, or replaced
+entries survive; the record is then cleared so cleanup cannot be retried against
+a later occupant. A SIGKILL between staging creation and durable record, or
+simultaneous uncatchable death of launcher and worker, can leave residue because
+Darwin provides no unlink conditioned on an already-open inode.
+
 API and vsock socket directories use a distinct exact contained reference:
 `bangbang-grant:<GrantId>/<SocketChild>`. `SocketChild` must be one 1–64 byte
 ASCII `[A-Za-z0-9._-]` component other than `.` or `..`; separators, traversal,
@@ -423,9 +458,8 @@ at the same time, the external socket name and private ownership record can
 remain stale because Darwin has no unlink-on-final-close Unix socket; automatic
 later recovery removes only empty session namespaces.
 
-Snapshot inputs/outputs, general dynamic post-Ready delivery, hard revocation,
-and cross-filesystem socket publication do not yet consume or extend their
-declared authority.
+General dynamic post-Ready delivery, hard revocation, and cross-filesystem
+socket publication do not yet consume or extend their declared authority.
 
 ## App Sandbox Validation Boundary
 
@@ -556,10 +590,9 @@ components. API requests, guest data, device input, host path arguments, and
 HVF exits remain untrusted worker inputs. Container/sealed resources plus the
 committed startup registry and fixed vsock connection facet are the current
 contained authority. Granted config, metadata, kernel, initrd, block, pmem,
-logger, metrics, serial, API-socket, and vsock-socket resources are consumed
-through their opened identities or exact retained anchors. vmnet and general
-dynamic resources remain unbrokered; snapshots need later consumer-specific
-registry adoption before the production worker can use their grants.
+logger, metrics, serial, snapshot, API-socket, and vsock-socket resources are
+consumed through their opened identities or exact retained anchors. vmnet and
+general dynamic resources remain unbrokered.
 
 ## vmnet Host Policy Boundary
 
@@ -739,8 +772,11 @@ is resource-specific:
   side-effect-free failed request as configuration. Snapshot execution treats
   paths and restored guest/vCPU/device state as
   untrusted, preserve redaction, and prevent one process from cleaning up or
-  overwriting another process's resources. The current boundary is documented
-  in [Snapshot Feasibility](snapshot-feasibility.md).
+  overwriting another process's resources. In contained mode, state
+  preinspection is non-consuming and the eventual state/memory/persisted-root
+  claim is atomic; create uses only exact retained output anchors and validated
+  children. Direct mode retains ordinary path adapters. The current boundary is
+  documented in [Snapshot Feasibility](snapshot-feasibility.md).
 - Native snapshot inspection treats the entire state file as untrusted binary
   input. The process opens it nonblocking, accepts only a regular file, caps the
   complete read at 16 MiB plus the 40-byte envelope overhead, and rechecks the
@@ -748,7 +784,9 @@ is resource-specific:
   arithmetic, requires exact consumption, validates CRC before semantic
   compatibility, and publishes no payload or metadata until all checks pass.
   Command-path and payload debug output is redacted, and read errors retain only
-  `ErrorKind`, not the host path. CRC-64/Jones detects accidental corruption;
+  `ErrorKind`, not the host path. Contained description applies the same reader
+  to an exact granted descriptor and never falls back from a malformed or
+  mismatched tag to ambient pathname access. CRC-64/Jones detects accidental corruption;
   it is not authentication, and a party that can rewrite the file can recompute
   it. Future payload schemas must therefore stay memory-safe and fail closed
   even for checksum-valid attacker-controlled bytes.
@@ -766,6 +804,8 @@ is resource-specific:
   compose it with either memory-only or composite commit kind. The private
   process create seam composes complete capture with final publication, and the
   admitted public snapshot paths invoke the production create/load transactions.
+  Contained load supplies the exact state/memory handles after one atomic claim;
+  state decode is reused rather than rereading a selector.
 - Internal native snapshot publication treats both final paths and all existing
   directory entries as untrusted. It opens each parent once, anchors later
   operations to that descriptor, rejects exact aliases, preflights final names
@@ -777,7 +817,9 @@ is resource-specific:
   write, truncated, or replaced. A failure after memory publication leaves a
   typed orphan rather than unlinking a final name. A state-directory sync error
   after state rename is a committed, durability-uncertain result and is not safe
-  to retry under unchanged names.
+  to retry under unchanged names. Granted destinations enter through already
+  retained directory anchors and validated children rather than parent-path
+  reopening; each staging inode is recorded for strict launcher recovery.
 - The generic content producer receives only a non-cloneable, pathless staging
   writer. Writer destruction closes its descriptor before publishing a close
   proof; retention or `mem::forget` fails without waiting and before any file
@@ -798,7 +840,11 @@ is resource-specific:
   image IDs detect accidental corruption or mismatched pairs but do not
   authenticate either artifact. Diagnostics retain only typed stages, byte
   counts, and `ErrorKind`; paths, staging names, IDs, checksums, state bytes, and
-  guest bytes remain redacted.
+  guest bytes remain redacted. App Sandbox security scope is still associated
+  with the authorized directory pathname, so moving that directory after scope
+  activation may deny later descriptor-relative writes. Worker-first recovery
+  narrows crash residue after a record is durable, but the create-before-record
+  interval and simultaneous uncatchable launcher/worker death remain.
 - Detached vCPU general-register values, raw SP_EL0, SP_EL1, ELR_EL1, and
   SPSR_EL1 values, raw EL1 AFSR0/AFSR1/ESR/FAR/PAR/VBAR values, raw
   ACTLR_EL1/CPACR_EL1 execution controls, raw CSSELR_EL1 cache selection, raw
@@ -1590,16 +1636,17 @@ external resources or coordinate caller-supplied paths across launchers.
 
 The current scaffold does not implement:
 
-- startup-grant adoption for snapshots; dynamic post-Ready grants; or a
-  complete hard-revocation broker policy
+- dynamic post-Ready grants or a complete hard-revocation broker policy
 - Developer ID possession, notarization, kernel launch constraints, or an
   automatic restart/reconnect policy
 - a Firecracker-jailer replacement
 - privilege dropping
 - general-purpose host resource brokering beyond the fixed granted-vsock
   port-only connection facet
-- full containment for network, guest-visible MMDS, snapshots, or vsock beyond
-  the exact granted Unix-socket subset; the
+- broader snapshot profiles or Firecracker artifact compatibility beyond the
+  exact contained native-v1 describe/create/load resource boundary
+- full containment for network, guest-visible MMDS, or vsock beyond the exact
+  granted Unix-socket subset; the
   current network interface configuration path validates and stores
   configuration strings, and internal
   virtio-net notification dispatch can parse guest TX descriptor metadata and

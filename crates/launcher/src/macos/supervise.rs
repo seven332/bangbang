@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use bangbang_session::macos::grant_transport::{GrantTransportError, send_grant};
 use bangbang_session::macos::runtime::{
-    LauncherNamespace, NamespaceIdentity, RuntimeError, SocketOwnershipRecord,
+    LauncherNamespace, NamespaceIdentity, RuntimeError, SnapshotStagingOwnershipRecord,
+    SocketOwnershipRecord,
 };
 use bangbang_session::{
     CancelSignal, Frame, FrameDecoder, LauncherLifecycle, Message, TerminalCategory, encode_frame,
@@ -225,6 +226,14 @@ fn cleanup_namespace_after_worker(
         namespace.unlink_staged_socket(&record)?;
         namespace.clear_socket_record(&record)?;
     }
+    for record in namespace.snapshot_staging_records()? {
+        let anchor = grants
+            .snapshot_directory_anchor(record.directory_identity())
+            .ok_or(RuntimeError::InvalidEntry)?;
+        debug_assert_eq!(anchor.identity(), record.directory_identity());
+        unlink_owned_snapshot_staging(anchor.descriptor(), &record)?;
+        namespace.clear_snapshot_staging_record(&record)?;
+    }
     namespace.cleanup()
 }
 
@@ -268,6 +277,57 @@ fn unlink_owned_socket(
         return Ok(());
     }
     // SAFETY: The retained directory and bounded child name the identity-checked socket.
+    if unsafe { libc::unlinkat(directory, child.as_ptr(), 0) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(RuntimeError::Filesystem(error.kind()))
+    }
+}
+
+fn unlink_owned_snapshot_staging(
+    directory: RawFd,
+    record: &SnapshotStagingOwnershipRecord,
+) -> Result<(), RuntimeError> {
+    let child = CString::new(record.name().as_bytes()).map_err(|_| RuntimeError::InvalidEntry)?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: The retained anchor and bounded C string remain live; stat is writable.
+    if unsafe {
+        libc::fstatat(
+            directory,
+            child.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(RuntimeError::Filesystem(error.kind()))
+        };
+    }
+    // SAFETY: Successful fstatat initialized the complete result.
+    let stat = unsafe { stat.assume_init() };
+    // SAFETY: `geteuid` has no pointer or ownership contract.
+    let uid = unsafe { libc::geteuid() };
+    let identity = bangbang_session::ObjectIdentity {
+        device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
+        inode: stat.st_ino,
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_mode & 0o7777 != 0o600
+        || stat.st_uid != uid
+        || stat.st_nlink != 1
+        || identity != record.file_identity()
+    {
+        return Ok(());
+    }
+    // SAFETY: The retained directory and bounded child name the identity-checked regular file.
     if unsafe { libc::unlinkat(directory, child.as_ptr(), 0) } == 0 {
         return Ok(());
     }
@@ -888,6 +948,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use bangbang_session::macos::runtime::{SnapshotStagingKind, SnapshotStagingName};
     use bangbang_session::{ObjectIdentity, ResourceRole, SocketChild};
 
     use super::*;
@@ -990,5 +1051,57 @@ mod tests {
         assert!(path.exists());
         drop(replacement_listener);
         fs::remove_file(path).expect("replacement socket should remove");
+    }
+
+    #[test]
+    fn worker_exit_cleanup_removes_only_the_recorded_snapshot_staging_identity() {
+        let root = SocketTestRoot::new();
+        let directory = fs::File::open(root.path()).expect("directory should open");
+        let name = SnapshotStagingName::parse(
+            SnapshotStagingKind::State,
+            ".bangbang-snapshot-state-0123456789abcdef0123456789abcdef",
+        )
+        .expect("staging name should parse");
+        let path = root
+            .path()
+            .join(std::str::from_utf8(name.as_bytes()).expect("name should be UTF-8"));
+        fs::write(&path, b"staging").expect("staging fixture should write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("staging permissions should tighten");
+        let metadata = fs::symlink_metadata(&path).expect("staging metadata should read");
+        let directory_metadata = directory
+            .metadata()
+            .expect("directory metadata should read");
+        let record = SnapshotStagingOwnershipRecord::new(
+            SnapshotStagingKind::State,
+            ObjectIdentity {
+                device: directory_metadata.dev(),
+                inode: directory_metadata.ino(),
+            },
+            name.clone(),
+            ObjectIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+            .expect("staging permissions should change");
+        unlink_owned_snapshot_staging(directory.as_raw_fd(), &record)
+            .expect("mode-mismatched staging file should be preserved");
+        assert!(path.exists());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("staging permissions should restore");
+        unlink_owned_snapshot_staging(directory.as_raw_fd(), &record)
+            .expect("recorded staging file should clean");
+        assert!(!path.exists());
+
+        fs::write(&path, b"replacement").expect("replacement fixture should write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("replacement permissions should tighten");
+        unlink_owned_snapshot_staging(directory.as_raw_fd(), &record)
+            .expect("replacement identity should be preserved");
+        assert!(path.exists());
+        fs::remove_file(path).expect("replacement staging file should remove");
     }
 }

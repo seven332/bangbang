@@ -106,6 +106,10 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
     }
     let raw_args = env::args_os().skip(1).collect::<Vec<_>>();
     #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
+    let mut raw_args = raw_args;
+    #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
+    grant_integration_probe::configure_snapshot_staging_hold(&mut raw_args);
+    #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
     if grant_integration_probe::is_requested(&raw_args) {
         let session = contained.as_mut().ok_or(ProcessError::ContainedSession)?;
         return grant_integration_probe::run(session, &raw_args)
@@ -130,7 +134,11 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             Ok(())
         }
         Command::DescribeSnapshot(path) => {
-            let metadata = describe_snapshot(path.as_str())?;
+            let grant_authority = contained
+                .as_ref()
+                .and_then(ContainedSession::grant_authority);
+            let metadata =
+                describe_snapshot_with_authority(path.as_str(), grant_authority.as_ref())?;
             println!("v{}", metadata.version());
             Ok(())
         }
@@ -950,17 +958,36 @@ fn metadata_content_input_with_authority(
     Ok(MmdsContentInput::new(value))
 }
 
+#[cfg(test)]
 fn describe_snapshot(path: &str) -> Result<SnapshotEnvelopeMetadata, ProcessError> {
-    let contents = read_limited_regular_file(path, NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES)
-        .map_err(|err| match err {
-            StartupFileReadError::Read(kind) => SnapshotInspectionError::Read(kind),
-            StartupFileReadError::NotRegular => SnapshotInspectionError::NotRegular,
-            StartupFileReadError::TooLarge => SnapshotInspectionError::TooLarge,
-            StartupFileReadError::Grant => {
-                SnapshotInspectionError::Read(std::io::ErrorKind::PermissionDenied)
-            }
+    describe_snapshot_with_authority(path, None)
+}
+
+fn describe_snapshot_with_authority(
+    path: &str,
+    grant_authority: Option<&GrantAuthority>,
+) -> Result<SnapshotEnvelopeMetadata, ProcessError> {
+    let file = grant_authority
+        .map(|authority| {
+            authority.claim_read_only_file(
+                std::path::Path::new(path),
+                ResourceRole::SnapshotDescribeInput,
+            )
         })
-        .map_err(ProcessError::SnapshotInspection)?;
+        .transpose()
+        .map_err(|_| ProcessError::SnapshotInspection(SnapshotInspectionError::Grant))?
+        .flatten();
+    let contents = match file {
+        Some(file) => read_limited_regular_open_file(file, NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES),
+        None => read_limited_regular_file(path, NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES),
+    }
+    .map_err(|err| match err {
+        StartupFileReadError::Read(kind) => SnapshotInspectionError::Read(kind),
+        StartupFileReadError::NotRegular => SnapshotInspectionError::NotRegular,
+        StartupFileReadError::TooLarge => SnapshotInspectionError::TooLarge,
+        StartupFileReadError::Grant => SnapshotInspectionError::Grant,
+    })
+    .map_err(ProcessError::SnapshotInspection)?;
 
     inspect_snapshot_envelope(&contents)
         .map_err(SnapshotInspectionError::Format)
@@ -1258,6 +1285,7 @@ enum SnapshotInspectionError {
     Read(std::io::ErrorKind),
     NotRegular,
     TooLarge,
+    Grant,
     Format(SnapshotFormatError),
 }
 
@@ -1270,6 +1298,7 @@ impl fmt::Display for SnapshotInspectionError {
                 f,
                 "snapshot state file exceeds {NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES} byte size limit"
             ),
+            Self::Grant => f.write_str("snapshot state resource grant failed"),
             Self::Format(err) => write!(f, "invalid snapshot state file: {err}"),
         }
     }

@@ -60,6 +60,100 @@ impl fmt::Debug for SnapshotArtifactPaths {
     }
 }
 
+enum SnapshotArtifactOutputLocation {
+    Path(PathBuf),
+    Anchored {
+        directory: File,
+        child: Vec<u8>,
+        tracker: Option<Arc<dyn SnapshotStagingTracker>>,
+    },
+}
+
+/// One native snapshot final destination, either path-based or anchor-relative.
+pub struct SnapshotArtifactOutput {
+    location: SnapshotArtifactOutputLocation,
+}
+
+impl SnapshotArtifactOutput {
+    /// Creates one ordinary path-based final destination.
+    pub fn path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            location: SnapshotArtifactOutputLocation::Path(path.into()),
+        }
+    }
+
+    /// Creates one final destination relative to an already-opened directory.
+    pub fn anchored(directory: File, child: impl Into<Vec<u8>>) -> Self {
+        Self {
+            location: SnapshotArtifactOutputLocation::Anchored {
+                directory,
+                child: child.into(),
+                tracker: None,
+            },
+        }
+    }
+
+    /// Creates an anchored destination with durable worker-first staging evidence.
+    pub fn anchored_tracked(
+        directory: File,
+        child: impl Into<Vec<u8>>,
+        tracker: Arc<dyn SnapshotStagingTracker>,
+    ) -> Self {
+        Self {
+            location: SnapshotArtifactOutputLocation::Anchored {
+                directory,
+                child: child.into(),
+                tracker: Some(tracker),
+            },
+        }
+    }
+}
+
+impl fmt::Debug for SnapshotArtifactOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotArtifactOutput")
+            .field("destination", &REDACTED)
+            .finish()
+    }
+}
+
+/// Independently authorized state and memory final destinations.
+pub struct SnapshotArtifactOutputs {
+    state: SnapshotArtifactOutput,
+    memory: SnapshotArtifactOutput,
+}
+
+impl SnapshotArtifactOutputs {
+    /// Creates one state/memory destination pair.
+    pub const fn new(state: SnapshotArtifactOutput, memory: SnapshotArtifactOutput) -> Self {
+        Self { state, memory }
+    }
+
+    fn from_paths(paths: &SnapshotArtifactPaths) -> Self {
+        Self::new(
+            SnapshotArtifactOutput::path(paths.state()),
+            SnapshotArtifactOutput::path(paths.memory()),
+        )
+    }
+
+    fn state(&self) -> &SnapshotArtifactOutput {
+        &self.state
+    }
+
+    fn memory(&self) -> &SnapshotArtifactOutput {
+        &self.memory
+    }
+}
+
+impl fmt::Debug for SnapshotArtifactOutputs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotArtifactOutputs")
+            .field("state", &REDACTED)
+            .field("memory", &REDACTED)
+            .finish()
+    }
+}
+
 /// A pathless, move-only writer for one private memory staging inode.
 ///
 /// The producer must let this value drop before returning success. Publication
@@ -133,6 +227,111 @@ pub enum SnapshotArtifactKind {
     State,
     /// The guest-memory image.
     Memory,
+}
+
+/// Stable device/inode identity used only by private staging cleanup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotArtifactIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SnapshotArtifactIdentity {
+    /// Creates one exact filesystem identity.
+    pub const fn new(device: u64, inode: u64) -> Self {
+        Self { device, inode }
+    }
+
+    /// Returns the normalized device number.
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    /// Returns the inode number.
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+}
+
+impl fmt::Debug for SnapshotArtifactIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SnapshotArtifactIdentity(<redacted>)")
+    }
+}
+
+/// Private exact ownership evidence for one active staging inode.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotStagingOwnership {
+    artifact: SnapshotArtifactKind,
+    directory_identity: SnapshotArtifactIdentity,
+    component: Vec<u8>,
+    file_identity: SnapshotArtifactIdentity,
+}
+
+impl SnapshotStagingOwnership {
+    fn new(
+        artifact: SnapshotArtifactKind,
+        directory_identity: SnapshotArtifactIdentity,
+        component: Vec<u8>,
+        file_identity: SnapshotArtifactIdentity,
+    ) -> Self {
+        Self {
+            artifact,
+            directory_identity,
+            component,
+            file_identity,
+        }
+    }
+
+    /// Returns the state or memory artifact kind.
+    pub const fn artifact(&self) -> SnapshotArtifactKind {
+        self.artifact
+    }
+
+    /// Returns the exact opened directory identity.
+    pub const fn directory_identity(&self) -> SnapshotArtifactIdentity {
+        self.directory_identity
+    }
+
+    /// Returns the private random staging component.
+    pub fn component(&self) -> &[u8] {
+        &self.component
+    }
+
+    /// Returns the exact staging inode identity.
+    pub const fn file_identity(&self) -> SnapshotArtifactIdentity {
+        self.file_identity
+    }
+}
+
+impl fmt::Debug for SnapshotStagingOwnership {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotStagingOwnership")
+            .field("artifact", &self.artifact)
+            .field("directory_identity", &REDACTED)
+            .field("component", &REDACTED)
+            .field("file_identity", &REDACTED)
+            .finish()
+    }
+}
+
+/// Redacted failure to persist or clear private staging ownership evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotStagingTrackingError;
+
+/// Session-owned durable tracker for granted external staging inodes.
+pub trait SnapshotStagingTracker: fmt::Debug + Send + Sync {
+    /// Persists exact evidence before artifact content is produced.
+    fn record(
+        &self,
+        ownership: &SnapshotStagingOwnership,
+    ) -> Result<(), SnapshotStagingTrackingError>;
+
+    /// Clears only the exact current evidence after conclusive disposition.
+    fn clear(
+        &self,
+        ownership: &SnapshotStagingOwnership,
+    ) -> Result<(), SnapshotStagingTrackingError>;
 }
 
 impl fmt::Display for SnapshotArtifactKind {
@@ -632,6 +831,36 @@ pub struct LoadedSnapshotArtifacts {
     memory: GuestMemory,
 }
 
+/// A bounded, decoded state commit retained for later exact memory adoption.
+pub struct PreparedSnapshotState {
+    record: SnapshotCommitRecord,
+}
+
+impl PreparedSnapshotState {
+    /// Retains an already validated commit record for a later memory load.
+    pub const fn from_record(record: SnapshotCommitRecord) -> Self {
+        Self { record }
+    }
+
+    /// Returns the validated commit record without exposing artifact paths.
+    pub const fn record(&self) -> &SnapshotCommitRecord {
+        &self.record
+    }
+
+    /// Consumes the prepared state into its validated commit record.
+    pub fn into_record(self) -> SnapshotCommitRecord {
+        self.record
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedSnapshotState")
+            .field("record", &REDACTED)
+            .finish()
+    }
+}
+
 impl LoadedSnapshotArtifacts {
     /// Returns the validated commit record.
     pub const fn record(&self) -> &SnapshotCommitRecord {
@@ -697,13 +926,25 @@ pub fn publish_snapshot_artifacts_with<E, F>(
 where
     F: FnOnce(SnapshotMemoryStagingWriter) -> Result<SnapshotCommitRecord, E>,
 {
+    let outputs = SnapshotArtifactOutputs::from_paths(paths);
+    publish_snapshot_artifacts_to_with(&outputs, producer)
+}
+
+/// Publishes through path-based or already-opened directory destinations.
+pub fn publish_snapshot_artifacts_to_with<E, F>(
+    outputs: &SnapshotArtifactOutputs,
+    producer: F,
+) -> Result<SnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<SnapshotCommitRecord, E>,
+{
     #[cfg(target_os = "macos")]
     {
-        publish_snapshot_artifacts_macos_with(paths, producer)
+        publish_snapshot_artifacts_macos_with(outputs, producer)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (paths, producer);
+        let _ = (outputs, producer);
         Err(SnapshotPublicationTransactionError::Publication(
             publication_error(
                 SnapshotPublicationStage::PlatformCheck,
@@ -732,6 +973,89 @@ pub fn load_snapshot_artifacts(
     }
 }
 
+/// Decodes one already-opened regular state artifact without consuming a VM.
+pub fn prepare_snapshot_state_file(
+    file: File,
+) -> Result<PreparedSnapshotState, SnapshotArtifactLoadError> {
+    #[cfg(target_os = "macos")]
+    {
+        prepare_snapshot_state_file_macos(file)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+        Err(load_error(
+            SnapshotArtifactLoadStage::PlatformCheck,
+            SnapshotArtifactLoadFailure::UnsupportedPlatform,
+        ))
+    }
+}
+
+/// Opens and decodes one state artifact path without loading guest memory.
+pub fn prepare_snapshot_state_path(
+    path: &Path,
+) -> Result<PreparedSnapshotState, SnapshotArtifactLoadError> {
+    #[cfg(target_os = "macos")]
+    {
+        prepare_snapshot_state_path_macos(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err(load_error(
+            SnapshotArtifactLoadStage::PlatformCheck,
+            SnapshotArtifactLoadFailure::UnsupportedPlatform,
+        ))
+    }
+}
+
+/// Loads one already-opened memory artifact against a prepared state commit.
+pub fn load_prepared_snapshot_memory_file(
+    prepared: PreparedSnapshotState,
+    file: File,
+) -> Result<LoadedSnapshotArtifacts, SnapshotArtifactLoadError> {
+    #[cfg(target_os = "macos")]
+    {
+        load_prepared_snapshot_memory_file_macos(prepared, file)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (prepared, file);
+        Err(load_error(
+            SnapshotArtifactLoadStage::PlatformCheck,
+            SnapshotArtifactLoadFailure::UnsupportedPlatform,
+        ))
+    }
+}
+
+/// Opens and loads one memory artifact path against a prepared state commit.
+pub fn load_prepared_snapshot_memory_path(
+    prepared: PreparedSnapshotState,
+    path: &Path,
+) -> Result<LoadedSnapshotArtifacts, SnapshotArtifactLoadError> {
+    #[cfg(target_os = "macos")]
+    {
+        load_prepared_snapshot_memory_path_macos(prepared, path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (prepared, path);
+        Err(load_error(
+            SnapshotArtifactLoadStage::PlatformCheck,
+            SnapshotArtifactLoadFailure::UnsupportedPlatform,
+        ))
+    }
+}
+
+/// Loads an already-opened state/memory pair through the ordinary validation path.
+pub fn load_snapshot_artifact_files(
+    state: File,
+    memory: File,
+) -> Result<LoadedSnapshotArtifacts, SnapshotArtifactLoadError> {
+    let prepared = prepare_snapshot_state_file(state)?;
+    load_prepared_snapshot_memory_file(prepared, memory)
+}
+
 fn publication_error(
     stage: SnapshotPublicationStage,
     visibility: SnapshotArtifactVisibility,
@@ -757,7 +1081,11 @@ fn load_error(
 mod macos;
 
 #[cfg(target_os = "macos")]
-use macos::{load_snapshot_artifacts_macos, publish_snapshot_artifacts_macos_with};
+use macos::{
+    load_prepared_snapshot_memory_file_macos, load_prepared_snapshot_memory_path_macos,
+    load_snapshot_artifacts_macos, prepare_snapshot_state_file_macos,
+    prepare_snapshot_state_path_macos, publish_snapshot_artifacts_macos_with,
+};
 
 #[cfg(test)]
 mod tests;

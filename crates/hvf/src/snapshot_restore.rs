@@ -1,15 +1,21 @@
 //! Native-v1 snapshot load preparation and restore orchestration.
 
 use std::fmt;
+use std::fs::File;
+use std::path::Path;
 use std::time::Instant;
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::memory::GuestMemory;
 use bangbang_runtime::rtc::RTC_MMIO_DEVICE_WINDOW_SIZE;
-use bangbang_runtime::snapshot_artifact::LoadedSnapshotArtifacts;
+use bangbang_runtime::snapshot_artifact::{
+    LoadedSnapshotArtifacts, PreparedSnapshotState, SnapshotArtifactLoadError,
+    load_prepared_snapshot_memory_file, load_prepared_snapshot_memory_path,
+};
 use bangbang_runtime::startup::{
     InstallSnapshotV1RuntimeError, InstalledSnapshotV1Runtime, PrepareSnapshotV1DeviceProfileError,
     install_snapshot_v1_runtime, prepare_snapshot_v1_device_profile,
+    prepare_snapshot_v1_device_profile_with_root_backing,
 };
 
 use crate::backend::HvfBackend;
@@ -27,6 +33,119 @@ pub struct PreparedHvfSnapshotV1Load {
     runtime: InstalledSnapshotV1Runtime,
 }
 
+/// Decoded native-v1 state retained before exact memory/root adoption.
+pub struct PreparedHvfSnapshotV1State {
+    record: bangbang_runtime::snapshot_commit::SnapshotCommitRecord,
+    state: HvfSnapshotV1State,
+}
+
+impl PreparedHvfSnapshotV1State {
+    /// Decodes and destination-validates state without loading guest memory.
+    pub fn from_prepared_state(
+        prepared: PreparedSnapshotState,
+    ) -> Result<Self, PrepareHvfSnapshotV1LoadError> {
+        let record = prepared.into_record();
+        let bundle = HvfSnapshotV1Bundle::try_from_commit_record(record.clone())
+            .map_err(PrepareHvfSnapshotV1LoadError::Bundle)?;
+        validate_destination_cache(bundle.state())?;
+        Ok(Self {
+            record,
+            state: bundle.into_state(),
+        })
+    }
+
+    /// Returns the persisted root-backing selector to the authority owner.
+    pub fn root_backing_path(&self) -> &Path {
+        self.state.device().root_block().path()
+    }
+
+    /// Loads exact memory against the retained commit without re-decoding state.
+    pub fn load_memory_file(
+        self,
+        memory: File,
+    ) -> Result<PreparedHvfSnapshotV1Memory, SnapshotArtifactLoadError> {
+        let artifacts = load_prepared_snapshot_memory_file(
+            PreparedSnapshotState::from_record(self.record),
+            memory,
+        )?;
+        let (_, memory) = artifacts.into_parts();
+        Ok(PreparedHvfSnapshotV1Memory {
+            state: self.state,
+            memory,
+        })
+    }
+
+    /// Opens and loads an ordinary memory path against the retained commit.
+    pub fn load_memory_path(
+        self,
+        memory: &Path,
+    ) -> Result<PreparedHvfSnapshotV1Memory, SnapshotArtifactLoadError> {
+        let artifacts = load_prepared_snapshot_memory_path(
+            PreparedSnapshotState::from_record(self.record),
+            memory,
+        )?;
+        let (_, memory) = artifacts.into_parts();
+        Ok(PreparedHvfSnapshotV1Memory {
+            state: self.state,
+            memory,
+        })
+    }
+}
+
+impl fmt::Debug for PreparedHvfSnapshotV1State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedHvfSnapshotV1State")
+            .field("profile", &"native-v1")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Decoded state plus bound anonymous memory awaiting root-backing adoption.
+pub struct PreparedHvfSnapshotV1Memory {
+    state: HvfSnapshotV1State,
+    memory: GuestMemory,
+}
+
+impl PreparedHvfSnapshotV1Memory {
+    /// Completes off-side preparation with an optional exact root backing.
+    pub fn finish(
+        self,
+        root_backing: Option<File>,
+        now: Instant,
+    ) -> Result<PreparedHvfSnapshotV1Load, PrepareHvfSnapshotV1LoadError> {
+        validate_platform_composition(&self.state, &self.memory)
+            .map_err(PrepareHvfSnapshotV1LoadError::Platform)?;
+        let profile = prepare_snapshot_v1_device_profile_with_root_backing(
+            self.state.device(),
+            &self.memory,
+            now,
+            root_backing,
+        )
+        .map_err(PrepareHvfSnapshotV1LoadError::Device)?;
+        let runtime = install_snapshot_v1_runtime(
+            profile,
+            self.state.machine(),
+            self.memory,
+            self.state.compatibility().rtc_mmio_layout(),
+        )
+        .map_err(PrepareHvfSnapshotV1LoadError::Install)?;
+        Ok(PreparedHvfSnapshotV1Load {
+            state: self.state,
+            runtime,
+        })
+    }
+}
+
+impl fmt::Debug for PreparedHvfSnapshotV1Memory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedHvfSnapshotV1Memory")
+            .field("profile", &"native-v1")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
 impl PreparedHvfSnapshotV1Load {
     /// Decode, cross-validate, prepare, and install all off-side load owners.
     pub fn from_loaded_artifacts(
@@ -39,11 +158,7 @@ impl PreparedHvfSnapshotV1Load {
         validate_platform_composition(bundle.state(), &memory)
             .map_err(PrepareHvfSnapshotV1LoadError::Platform)?;
 
-        let destination_cache = HvfBackend::arm64_vcpu_cache_manifest()
-            .map_err(PrepareHvfSnapshotV1LoadError::CacheQuery)?;
-        if destination_cache != bundle.state().compatibility().cache_manifest() {
-            return Err(PrepareHvfSnapshotV1LoadError::CacheMismatch);
-        }
+        validate_destination_cache(bundle.state())?;
 
         let profile = prepare_snapshot_v1_device_profile(bundle.state().device(), &memory, now)
             .map_err(PrepareHvfSnapshotV1LoadError::Device)?;
@@ -70,6 +185,17 @@ impl PreparedHvfSnapshotV1Load {
     pub fn into_parts(self) -> (HvfSnapshotV1State, InstalledSnapshotV1Runtime) {
         (self.state, self.runtime)
     }
+}
+
+fn validate_destination_cache(
+    state: &HvfSnapshotV1State,
+) -> Result<(), PrepareHvfSnapshotV1LoadError> {
+    let destination_cache = HvfBackend::arm64_vcpu_cache_manifest()
+        .map_err(PrepareHvfSnapshotV1LoadError::CacheQuery)?;
+    if destination_cache != state.compatibility().cache_manifest() {
+        return Err(PrepareHvfSnapshotV1LoadError::CacheMismatch);
+    }
+    Ok(())
 }
 
 impl fmt::Debug for PreparedHvfSnapshotV1Load {

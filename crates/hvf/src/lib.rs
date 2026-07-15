@@ -64,7 +64,8 @@ pub use snapshot_bundle::{
 pub use snapshot_restore::{
     HvfSnapshotV1PlatformError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
     HvfSnapshotV1RestoreError, HvfSnapshotV1RestoreFailure, HvfSnapshotV1RestoreStage,
-    PrepareHvfSnapshotV1LoadError, PreparedHvfSnapshotV1Load,
+    PrepareHvfSnapshotV1LoadError, PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1Memory,
+    PreparedHvfSnapshotV1State,
 };
 pub use startup::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootBlockNotificationDispatch,

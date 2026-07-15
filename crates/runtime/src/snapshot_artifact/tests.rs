@@ -14,6 +14,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 #[cfg(target_os = "macos")]
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 const TEST_MEMORY_BYTES: usize = 16 * 1024;
@@ -88,6 +92,252 @@ fn publishes_and_loads_same_directory_pair() {
         .read_slice(&mut actual, GuestAddress::new(0x4000))
         .expect("loaded memory should be readable");
     assert_eq!(actual, test_bytes());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn supplied_files_preserve_opened_identity_after_path_replacement() {
+    let directory = TestDirectory::new("supplied-load");
+    let paths = directory.paths("state.snap", "memory.snap");
+    let outcome = publish_snapshot_artifacts(&paths, &test_memory()).expect("pair should publish");
+    let state = File::open(paths.state()).expect("state should open");
+    let memory = File::open(paths.memory()).expect("memory should open");
+
+    let moved_state = directory.path.join("state-original.snap");
+    fs::rename(paths.state(), &moved_state).expect("state should move after opening");
+    fs::write(paths.state(), b"replacement").expect("replacement state should create");
+    let moved_memory = directory.path.join("memory-original.snap");
+    fs::rename(paths.memory(), &moved_memory).expect("memory should move after opening");
+    fs::write(paths.memory(), b"replacement").expect("replacement memory should create");
+
+    let loaded = load_snapshot_artifact_files(state, memory)
+        .expect("opened exact pair should load after replacement");
+    assert_eq!(loaded.record(), outcome.record());
+    let mut actual = vec![0; TEST_MEMORY_BYTES];
+    loaded
+        .memory()
+        .read_slice(&mut actual, GuestAddress::new(0x4000))
+        .expect("loaded memory should read");
+    assert_eq!(actual, test_bytes());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn supplied_directory_anchors_publish_into_the_opened_identity() {
+    let directory = TestDirectory::new("supplied-output");
+    let state_anchor = File::open(&directory.path).expect("state anchor should open");
+    let memory_anchor = File::open(&directory.path).expect("memory anchor should open");
+    let moved = directory.path.with_extension("opened");
+    fs::rename(&directory.path, &moved).expect("opened directory should move");
+    fs::create_dir(&directory.path).expect("replacement directory should create");
+
+    let outputs = SnapshotArtifactOutputs::new(
+        SnapshotArtifactOutput::anchored(state_anchor, b"state.snap".to_vec()),
+        SnapshotArtifactOutput::anchored(memory_anchor, b"memory.snap".to_vec()),
+    );
+    let debug = format!("{outputs:?}");
+    assert!(!debug.contains("state.snap") && !debug.contains("memory.snap"));
+    publish_snapshot_artifacts_to_with(&outputs, |mut writer| {
+        let binding =
+            write_snapshot_memory_image(&test_memory(), &mut writer).expect("memory should write");
+        Ok::<_, io::Error>(SnapshotCommitRecord::new(binding))
+    })
+    .expect("anchored pair should publish");
+
+    assert!(moved.join("state.snap").is_file());
+    assert!(moved.join("memory.snap").is_file());
+    assert!(!directory.path.join("state.snap").exists());
+    assert!(!directory.path.join("memory.snap").exists());
+    fs::remove_dir_all(moved).expect("opened directory should clean up");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn supplied_directory_children_are_revalidated_before_staging() {
+    for (index, child) in [b"".as_slice(), b".", b"..", b"nested/state", b"nul\0state"]
+        .into_iter()
+        .enumerate()
+    {
+        let directory = TestDirectory::new(&format!("badchild{index}"));
+        let outputs = SnapshotArtifactOutputs::new(
+            SnapshotArtifactOutput::anchored(
+                File::open(&directory.path).expect("state anchor should open"),
+                child.to_vec(),
+            ),
+            SnapshotArtifactOutput::anchored(
+                File::open(&directory.path).expect("memory anchor should open"),
+                b"memory.snap".to_vec(),
+            ),
+        );
+        let error = publish_snapshot_artifacts_to_with::<io::Error, _>(&outputs, |_writer| {
+            panic!("invalid child must fail before producer")
+        })
+        .expect_err("invalid supplied child should fail");
+        let publication = error
+            .publication()
+            .expect("child rejection should be a publication error");
+        assert_eq!(
+            publication.stage(),
+            SnapshotPublicationStage::StatePathValidation
+        );
+        assert!(matches!(
+            publication.failure(),
+            SnapshotPublicationFailure::InvalidFinalPath {
+                artifact: SnapshotArtifactKind::State
+            }
+        ));
+        assert_no_staging(&directory.path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct TestSnapshotStagingTracker {
+    active: Mutex<Vec<SnapshotStagingOwnership>>,
+    records: AtomicUsize,
+    clears: AtomicUsize,
+    reject: Mutex<Option<SnapshotArtifactKind>>,
+}
+
+#[cfg(target_os = "macos")]
+impl TestSnapshotStagingTracker {
+    fn rejecting(artifact: SnapshotArtifactKind) -> Self {
+        Self {
+            reject: Mutex::new(Some(artifact)),
+            ..Self::default()
+        }
+    }
+
+    fn active(&self) -> Vec<SnapshotStagingOwnership> {
+        self.active
+            .lock()
+            .expect("tracker state should lock")
+            .clone()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl SnapshotStagingTracker for TestSnapshotStagingTracker {
+    fn record(
+        &self,
+        ownership: &SnapshotStagingOwnership,
+    ) -> Result<(), SnapshotStagingTrackingError> {
+        if self
+            .reject
+            .lock()
+            .map_err(|_| SnapshotStagingTrackingError)?
+            .as_ref()
+            == Some(&ownership.artifact())
+        {
+            return Err(SnapshotStagingTrackingError);
+        }
+        self.active
+            .lock()
+            .map_err(|_| SnapshotStagingTrackingError)?
+            .push(ownership.clone());
+        self.records.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn clear(
+        &self,
+        ownership: &SnapshotStagingOwnership,
+    ) -> Result<(), SnapshotStagingTrackingError> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| SnapshotStagingTrackingError)?;
+        let index = active
+            .iter()
+            .position(|candidate| candidate == ownership)
+            .ok_or(SnapshotStagingTrackingError)?;
+        active.swap_remove(index);
+        self.clears.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn tracked_outputs(
+    directory: &TestDirectory,
+    tracker: &Arc<TestSnapshotStagingTracker>,
+) -> SnapshotArtifactOutputs {
+    SnapshotArtifactOutputs::new(
+        SnapshotArtifactOutput::anchored_tracked(
+            File::open(&directory.path).expect("state anchor should open"),
+            b"state.snap".to_vec(),
+            tracker.clone(),
+        ),
+        SnapshotArtifactOutput::anchored_tracked(
+            File::open(&directory.path).expect("memory anchor should open"),
+            b"memory.snap".to_vec(),
+            tracker.clone(),
+        ),
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn tracked_outputs_record_both_staging_inodes_before_production_and_clear_on_success() {
+    let directory = TestDirectory::new("tracked-success");
+    let tracker = Arc::new(TestSnapshotStagingTracker::default());
+    let outputs = tracked_outputs(&directory, &tracker);
+
+    publish_snapshot_artifacts_to_with(&outputs, |mut writer| {
+        let active = tracker.active();
+        assert_eq!(active.len(), 2);
+        assert!(
+            active
+                .iter()
+                .any(|ownership| ownership.artifact() == SnapshotArtifactKind::State)
+        );
+        assert!(
+            active
+                .iter()
+                .any(|ownership| ownership.artifact() == SnapshotArtifactKind::Memory)
+        );
+        let binding =
+            write_snapshot_memory_image(&test_memory(), &mut writer).expect("memory should write");
+        Ok::<_, io::Error>(SnapshotCommitRecord::new(binding))
+    })
+    .expect("tracked pair should publish");
+
+    assert!(tracker.active().is_empty());
+    assert_eq!(tracker.records.load(Ordering::Relaxed), 2);
+    assert_eq!(tracker.clears.load(Ordering::Relaxed), 2);
+    assert_no_staging(&directory.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn tracked_outputs_abort_before_production_when_evidence_cannot_be_recorded() {
+    let directory = TestDirectory::new("tracked-reject");
+    let tracker = Arc::new(TestSnapshotStagingTracker::rejecting(
+        SnapshotArtifactKind::State,
+    ));
+    let outputs = tracked_outputs(&directory, &tracker);
+    let called = std::cell::Cell::new(false);
+
+    let error = publish_snapshot_artifacts_to_with::<io::Error, _>(&outputs, |_writer| {
+        called.set(true);
+        Err(io::Error::other(
+            "producer ran without complete durable evidence",
+        ))
+    })
+    .expect_err("record rejection should abort publication");
+
+    assert!(!called.get());
+    assert_eq!(
+        error
+            .publication()
+            .expect("tracking rejection should be a publication failure")
+            .stage(),
+        SnapshotPublicationStage::StateStagingCreate
+    );
+    assert!(tracker.active().is_empty());
+    assert_eq!(tracker.records.load(Ordering::Relaxed), 1);
+    assert_eq!(tracker.clears.load(Ordering::Relaxed), 1);
+    assert_no_staging(&directory.path);
 }
 
 #[cfg(target_os = "macos")]

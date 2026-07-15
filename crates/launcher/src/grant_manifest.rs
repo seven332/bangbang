@@ -244,6 +244,13 @@ pub(crate) struct SocketDirectoryAnchor {
     identity: ObjectIdentity,
 }
 
+/// Borrowed exact anchor metadata for one snapshot-output directory grant.
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotDirectoryAnchor {
+    descriptor: RawFd,
+    identity: ObjectIdentity,
+}
+
 impl std::fmt::Debug for SocketDirectoryAnchor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -255,6 +262,26 @@ impl std::fmt::Debug for SocketDirectoryAnchor {
 }
 
 impl SocketDirectoryAnchor {
+    pub(crate) const fn descriptor(self) -> RawFd {
+        self.descriptor
+    }
+
+    pub(crate) const fn identity(self) -> ObjectIdentity {
+        self.identity
+    }
+}
+
+impl std::fmt::Debug for SnapshotDirectoryAnchor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotDirectoryAnchor")
+            .field("descriptor", &"<borrowed>")
+            .field("identity", &"<redacted>")
+            .finish()
+    }
+}
+
+impl SnapshotDirectoryAnchor {
     pub(crate) const fn descriptor(self) -> RawFd {
         self.descriptor
     }
@@ -432,6 +459,31 @@ impl PreparedGrantBatch {
                     .as_ref()
                     .map(AsRawFd::as_raw_fd)
                     .map(|descriptor| SocketDirectoryAnchor {
+                        descriptor,
+                        identity: *identity,
+                    }),
+                _ => None,
+            })
+    }
+
+    /// Borrows the exact retained snapshot-output anchor for one recorded identity.
+    pub(crate) fn snapshot_directory_anchor(
+        &self,
+        requested_identity: ObjectIdentity,
+    ) -> Option<SnapshotDirectoryAnchor> {
+        self.records
+            .iter()
+            .find_map(|prepared| match &prepared.record {
+                GrantRecord::ScopedDirectory {
+                    role: ResourceRole::SnapshotOutputDirectory,
+                    access: GrantAccess::CreateChildren,
+                    identity,
+                    ..
+                } if *identity == requested_identity => prepared
+                    .descriptor
+                    .as_ref()
+                    .map(AsRawFd::as_raw_fd)
+                    .map(|descriptor| SnapshotDirectoryAnchor {
                         descriptor,
                         identity: *identity,
                     }),
@@ -681,6 +733,57 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_directory_anchor_is_selected_by_exact_granted_identity() {
+        let root = TestDir::new();
+        let state_path = root.path().join("state-output");
+        let memory_path = root.path().join("memory-output");
+        fs::create_dir(&state_path).expect("state output should create");
+        fs::create_dir(&memory_path).expect("memory output should create");
+        let state = manifest_grant(
+            "state-output",
+            ResourceRole::SnapshotOutputDirectory,
+            GrantAccess::CreateChildren,
+            state_path,
+        );
+        let memory = manifest_grant(
+            "memory-output",
+            ResourceRole::SnapshotOutputDirectory,
+            GrantAccess::CreateChildren,
+            memory_path,
+        );
+        let state_identity = open_resource(&state)
+            .expect("state output should inspect")
+            .identity;
+        let memory_identity = open_resource(&memory)
+            .expect("memory output should inspect")
+            .identity;
+        let batch = PreparedGrantBatch::prepare(vec![state, memory])
+            .expect("snapshot outputs should prepare");
+
+        let state_anchor = batch
+            .snapshot_directory_anchor(state_identity)
+            .expect("state anchor should be retained");
+        let memory_anchor = batch
+            .snapshot_directory_anchor(memory_identity)
+            .expect("memory anchor should be retained");
+        assert_eq!(state_anchor.identity(), state_identity);
+        assert_eq!(memory_anchor.identity(), memory_identity);
+        assert_ne!(state_anchor.descriptor(), memory_anchor.descriptor());
+        assert!(
+            batch
+                .snapshot_directory_anchor(ObjectIdentity {
+                    device: u64::MAX,
+                    inode: u64::MAX,
+                })
+                .is_none()
+        );
+        let debug = format!("{state_anchor:?}");
+        assert!(!debug.contains(&state_anchor.descriptor().to_string()));
+        assert!(!debug.contains(&state_identity.device.to_string()));
+        assert!(!debug.contains(&state_identity.inode.to_string()));
+    }
+
+    #[test]
     fn envelope_is_position_one_and_structurally_exact() {
         let input = LaunchInput::parse(vec![
             OsString::from(GRANT_OPTION),
@@ -732,6 +835,32 @@ mod tests {
         }"#;
         assert!(matches!(
             parse_manifest(wrong_access),
+            Err(LauncherError::InvalidGrantInput)
+        ));
+
+        let snapshot_outputs = br#"{
+            "version":1,
+            "grants":[
+                {"id":"state-output","role":"snapshot-output-directory","access":"create-children","source":"/private/tmp/state"},
+                {"id":"memory-output","role":"snapshot-output-directory","access":"create-children","source":"/private/tmp/memory"}
+            ]
+        }"#;
+        assert_eq!(
+            parse_manifest(snapshot_outputs)
+                .expect("snapshot output role should be repeatable")
+                .len(),
+            2
+        );
+
+        let duplicate_snapshot_input = br#"{
+            "version":1,
+            "grants":[
+                {"id":"state-one","role":"snapshot-state-input","access":"read-only","source":"/private/tmp/state-one"},
+                {"id":"state-two","role":"snapshot-state-input","access":"read-only","source":"/private/tmp/state-two"}
+            ]
+        }"#;
+        assert!(matches!(
+            parse_manifest(duplicate_snapshot_input),
             Err(LauncherError::InvalidGrantInput)
         ));
     }
