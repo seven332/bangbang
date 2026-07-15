@@ -728,20 +728,34 @@ may skip execution. On supported Apple Silicon it proves:
 - rejection of the internal grant probe by the normal production worker with no
   resource mutation, proving the exerciser is absent from the shipped build;
 - both the sealed baseline and externally granted startup config, metadata,
-  kernel, and initrd launching real sandboxed HVF guests after committed no-API
-  readiness and ending through PSCI `SYSTEM_OFF`;
+  kernel, initrd, repeatable read-only/read-write drives, and repeatable
+  read-only/read-write pmem launching real sandboxed HVF guests after committed
+  no-API readiness and ending through PSCI `SYSTEM_OFF`;
 - delayed API-time kernel/initrd adoption after metadata readiness, pathname
   replacement after the launcher opened the files, authorized references in
-  `GET /vm/config`, and a real guest boot from the retained identities; and
+  `GET /vm/config`, and a real guest boot from the retained identities;
 - invalid-command-line, wrong-role, and missing boot requests preserving the
   prior public configuration; grant faults stay redacted and the otherwise
-  valid pair remains unconsumed.
+  valid pair remains unconsumed;
+- delayed block/pmem API claims with exact role/access and one-time behavior,
+  same-ID rollback, authorized config tags, source-path replacement after the
+  launcher opened every file, guest-visible writable block persistence, pmem
+  marker read and flush persistence, and path-free block/pmem limiter updates
+  retaining their backing ownership;
+- read-only drive authority reaching a real guest as a failed write while the
+  original opened backing remains unchanged; and
+- preauthorized after-start block replacement synchronized by the guest's
+  virtio-mem ready/grow/shrink markers, proving subsequent guest writes reach
+  the launcher-opened replacement object rather than a planted pathname.
 
-The runner's resource overlays and grant exerciser are internal signed-test
-inputs. `scripts/build-production-bundle.sh` explicitly excludes the feature,
-does not expose an overlay, and places no guest resources in a normal product.
-The all-features development binary is not a shippable bundle. Tests use
-readiness events and bounded deadlines rather than fixed sleeps.
+The production target receives the same generated direct-boot ext4 fixture as
+the signed executable target, but supplies it only as an external drive grant;
+it is never embedded in the worker bundle. The runner's resource overlays and
+grant exerciser are internal signed-test inputs.
+`scripts/build-production-bundle.sh` explicitly excludes the feature, does not
+expose an overlay, and places no guest resources in a normal product. The
+all-features development binary is not a shippable bundle. Tests use readiness
+events and bounded deadlines rather than fixed sleeps.
 
 Portable `bangbang-session` tests exhaustively split and coalesce every v2
 message frame and cover wrong magic/version/reserved data, exact frame/buffer
@@ -941,6 +955,12 @@ It also includes a direct-rootfs pmem scenario that configures `/pmem/pmem0`
 with a valid rate limiter through the public API, applies a live limiter
 replacement, waits for `BANGBANG_PMEM_READ_FLUSH_OK` in a scratch drive, and
 then verifies the guest-written pmem marker in the host backing file.
+The normal production-bundle target repeats the block/pmem guest evidence with
+outside-container files transferred by the launcher. It renames every source
+after API readiness, plants replacement pathnames, and requires writes and pmem
+flushes only in the already-opened objects. A separate read-only block case
+observes `BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL_WRITE`, and a staged virtio-mem
+guest checkpoint proves a live block grant swap receives later guest writes.
 Because every configured network interface is bound to MMDS in these scenarios,
 startup uses the process-local MMDS-only packet path and does not require
 external vmnet packet movement.
@@ -1008,10 +1028,11 @@ misconfigured hosts fail.
 
 ## Guest Boot Artifacts
 
-Guest boot and executable HVF e2e tests use the pinned Firecracker arm64 kernel,
-a deterministic tiny initrd, and rootfs artifacts where their scenarios require
-them. The integration runner prepares the relevant artifacts when `guest_boot`
-or `executable_hvf_e2e` is selected. To prepare only the kernel cache, run:
+Guest boot, executable HVF e2e, and production-bundle tests use the pinned
+Firecracker arm64 kernel, a deterministic tiny initrd, and rootfs artifacts
+where their scenarios require them. The integration runner prepares the
+relevant artifacts when `guest_boot`, `executable_hvf_e2e`, or
+`production_bundle` is selected. To prepare only the kernel cache, run:
 
 ```sh
 scripts/fetch-firecracker-kernel.sh
@@ -1254,7 +1275,10 @@ network snapshot state.
 For block specifically, this evidence validates the supported file-backed
 virtio-MMIO subset, including initial attachment, guest I/O, root/data ordering,
 cache/flush behavior, runtime refresh and limiter updates, and stable rejected
-runtime PUT/DELETE and vhost-user paths. It does not execute Firecracker
+runtime PUT/DELETE and vhost-user paths. Normal production-bundle evidence also
+validates exact read-only/read-write drive-grant adoption, one-time identity,
+failure-atomic public state, and preauthorized live refresh without ambient
+path reopening. It does not execute Firecracker
 v1.16.0's optional PCI hotplug/hot-unplug flow or an external vhost-user backend.
 
 bangbang appends Firecracker-style root-drive command-line arguments during

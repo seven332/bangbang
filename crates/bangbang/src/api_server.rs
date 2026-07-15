@@ -2219,9 +2219,9 @@ mod tests {
 
     use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
-        InstanceStartExecutor, NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
-        NativeV1SnapshotPublicationProducerError, ProcessSessionDiagnostics,
-        ProcessSessionExitStatus, ProcessVmm, SnapshotV1LoadSuccess,
+        BlockBackingUpdate, InstanceStartExecutor, NativeV1SnapshotLoadError,
+        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, SnapshotV1LoadSuccess,
     };
 
     use super::*;
@@ -2313,7 +2313,7 @@ mod tests {
         fn update_block_device(
             &mut self,
             _config: &DriveConfig,
-            _refresh_backing: bool,
+            _backing_update: BlockBackingUpdate,
             _rate_limiter_update: Option<DriveRateLimiterConfig>,
         ) -> Result<(), DriveUpdateError> {
             match self.drive_update_result.clone() {

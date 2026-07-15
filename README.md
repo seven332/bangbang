@@ -311,8 +311,9 @@ bookmark fragmentation, SCM_RIGHTS, one five-second absolute deadline, and a
 session-owned one-time typed registry. Closing the launcher's duplicate does
 not revoke an already delivered descriptor; cleanup is cooperative ownership.
 
-The first production consumers now adopt read-only startup config, startup
-metadata, kernel, and initrd grants. In authenticated contained mode the exact
+Production consumers now adopt read-only startup config, startup metadata,
+kernel, and initrd grants plus repeatable read-only/read-write block and pmem
+backing grants. In authenticated contained mode the exact
 case-sensitive private reference `bangbang-grant:<GrantId>` claims one matching
 ID/role/access entry; malformed, missing, mismatched, or consumed claims fail
 without pathname or singleton fallback. Direct mode treats the same bytes as an
@@ -324,10 +325,25 @@ their referenced members and leave ordinary members on deferred pathname
 opening. Submitted boot references remain visible through the owner-authorized
 VM configuration response but never appear in diagnostics. A
 descriptor-consuming boot failure requires a fresh contained launch for
-grant-backed retry because those roles are singleton. Block/pmem,
-socket, observability, and snapshot consumers, dynamic post-Ready brokerage,
-vmnet provisioning, automatic restart policy, Developer ID possession proof,
-launch-constraint policy, and notarization workflow remain. The session
+grant-backed retry because those roles are singleton.
+
+Block and pmem `PUT` claims validate complete device state before consuming the
+exact grant, retain the opened backing by device ID, and move it into startup
+without reopening the tag. Access must match `is_read_only`/`read_only`.
+Same-ID pre-boot `PUT` replaces the retained authority atomically; ordinary
+paths preserve deferred opening. A path-changing live block `PATCH` may consume
+one still-unused startup-batch drive grant and swaps the opened backing before
+public configuration commits. Path-free block limiter and pmem limiter updates
+retain the active backing. A grant consumed by startup or a live block swap is
+one-time even if a later consumer step fails; retry requires a fresh same-ID
+configuration with unused authority. Authorized configuration responses may
+return submitted tags, while logs, faults, errors, and derived debug output stay
+value-redacted.
+
+API/vsock directories, observability and snapshot consumers, dynamic
+post-Ready brokerage, vmnet provisioning, automatic restart policy, Developer
+ID possession proof, launch-constraint policy, and notarization workflow
+remain. The session
 namespace stays empty and stores no path, descriptor, bookmark, or grant bytes.
 Same-identifier workers share one App Sandbox
 container, so namespace locks and identity checks protect cooperative sessions
@@ -652,9 +668,11 @@ cleanup, mandatory empty-grant startup, typed read-only/write-only/directory
 grants, mismatch rollback, grant-phase cancellation/deadline behavior,
 grant-bearing crash/concurrency isolation, absence of the test exerciser from
 the normal production build, exact external config/metadata/kernel/initrd
-adoption by the normal worker, delayed API boot claims, pathname-replacement
-identity, redacted failure-atomic wrong/missing claims, and real sandboxed HVF
-guests through `SYSTEM_OFF`.
+adoption by the normal worker, config-file and delayed API block/pmem adoption,
+pathname-replacement identity, exact role/access and one-time failures,
+read-only guest-write rejection, writable block persistence, pmem read/flush,
+preauthorized live block replacement, limiter-only backing retention, redacted
+failure atomicity, and real sandboxed HVF guests through `SYSTEM_OFF`.
 
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
 validation work:

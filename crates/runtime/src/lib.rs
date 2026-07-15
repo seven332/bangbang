@@ -674,6 +674,27 @@ impl VmmController {
             .map_err(VmmActionError::DriveUpdate)
     }
 
+    pub fn prepare_drive_config(
+        &self,
+        input: block::DriveConfigInput,
+    ) -> Result<block::DriveConfig, VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutDrive",
+                state: self.instance_info.state,
+            });
+        }
+
+        self.drive_configs
+            .validate_insert(input)
+            .map_err(VmmActionError::DriveConfig)
+    }
+
+    pub fn commit_drive_config(&mut self, config: block::DriveConfig) {
+        self.drive_configs.commit_insert(config);
+        self.snapshot_load_history_fresh = false;
+    }
+
     pub fn commit_drive_update(
         &mut self,
         config: block::DriveConfig,
@@ -714,6 +735,25 @@ impl VmmController {
         self.pmem_configs
             .prepare_update(input)
             .map_err(VmmActionError::PmemUpdate)
+    }
+
+    pub fn prepare_pmem_config(
+        &self,
+        input: pmem::PmemConfigInput,
+    ) -> Result<pmem::PmemConfig, VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutPmem",
+                state: self.instance_info.state,
+            });
+        }
+
+        input.try_into().map_err(VmmActionError::PmemConfig)
+    }
+
+    pub fn commit_pmem_config(&mut self, config: pmem::PmemConfig) {
+        self.pmem_configs.upsert(config);
+        self.snapshot_load_history_fresh = false;
     }
 
     pub fn commit_pmem_update(&mut self, config: pmem::PmemConfig) -> Result<(), VmmActionError> {
@@ -1395,14 +1435,8 @@ impl VmmController {
                 Ok(VmmData::Empty)
             }
             VmmAction::PutPmem(config) => {
-                if self.instance_info.state != InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-                self.pmem_configs
-                    .upsert(config.try_into().map_err(VmmActionError::PmemConfig)?);
+                let config = self.prepare_pmem_config(config)?;
+                self.commit_pmem_config(config);
                 Ok(VmmData::Empty)
             }
             VmmAction::PatchPmem(input) => {
@@ -1566,16 +1600,8 @@ impl VmmController {
                 Ok(VmmData::Empty)
             }
             VmmAction::PutDrive(config) => {
-                if self.instance_info.state != InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
-                self.drive_configs
-                    .insert(config)
-                    .map_err(VmmActionError::DriveConfig)?;
+                let config = self.prepare_drive_config(config)?;
+                self.commit_drive_config(config);
 
                 Ok(VmmData::Empty)
             }

@@ -32,6 +32,7 @@ use bangbang_session::{
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
 const GRANT_TEST_BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH";
+const GUEST_EXT4_ROOTFS_ENV: &str = "BANGBANG_GUEST_EXT4_ROOTFS_PATH";
 const GRANT_MANIFEST_OPTION: &str = "--bangbang-grant-manifest";
 const GRANT_PROBE_OPTION: &str = "--bangbang-internal-grant-probe-v1";
 const GRANT_PROBE_READY: &str = "status: grant integration probe ready";
@@ -47,6 +48,36 @@ const STARTUP_CONFIG_REF: &str = "bangbang-grant:grant-config-1360";
 const STARTUP_METADATA_REF: &str = "bangbang-grant:grant-metadata-1360";
 const KERNEL_REF: &str = "bangbang-grant:grant-kernel-1360";
 const INITRD_REF: &str = "bangbang-grant:grant-initrd-1360";
+const STARTUP_DRIVE_RO_ID: &str = "grant-startup-drive-ro-1362";
+const STARTUP_DRIVE_RW_ID: &str = "grant-startup-drive-rw-1362";
+const STARTUP_PMEM_RO_ID: &str = "grant-startup-pmem-ro-1362";
+const STARTUP_PMEM_RW_ID: &str = "grant-startup-pmem-rw-1362";
+const STARTUP_DRIVE_RO_REF: &str = "bangbang-grant:grant-startup-drive-ro-1362";
+const STARTUP_DRIVE_RW_REF: &str = "bangbang-grant:grant-startup-drive-rw-1362";
+const STARTUP_PMEM_RO_REF: &str = "bangbang-grant:grant-startup-pmem-ro-1362";
+const STARTUP_PMEM_RW_REF: &str = "bangbang-grant:grant-startup-pmem-rw-1362";
+const GUEST_ROOTFS_ID: &str = "grant-guest-rootfs-1362";
+const GUEST_DATA_ID: &str = "grant-guest-data-1362";
+const GUEST_REPLACEMENT_ID: &str = "grant-guest-replacement-1362";
+const GUEST_PMEM_ID: &str = "grant-guest-pmem-1362";
+const GUEST_READ_ONLY_DATA_ID: &str = "grant-guest-read-only-data-1362";
+const GUEST_ROOTFS_REF: &str = "bangbang-grant:grant-guest-rootfs-1362";
+const GUEST_DATA_REF: &str = "bangbang-grant:grant-guest-data-1362";
+const GUEST_REPLACEMENT_REF: &str = "bangbang-grant:grant-guest-replacement-1362";
+const GUEST_PMEM_REF: &str = "bangbang-grant:grant-guest-pmem-1362";
+const GUEST_READ_ONLY_DATA_REF: &str = "bangbang-grant:grant-guest-read-only-data-1362";
+const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
+const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
+const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
+const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
+const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
+const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
+const PMEM_BACKING_LEN: u64 = 2 * 1024 * 1024;
+const PMEM_RESULT_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
+const MEMORY_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_READY";
+const MEMORY_HOTPLUG_GROWN_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_GROWN";
+const MEMORY_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK";
+const READ_ONLY_BLOCK_FAILURE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL_WRITE";
 const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 const PROCESS_FAILURE_EXIT_CODE: i32 = 1;
@@ -75,6 +106,15 @@ fn grant_test_bundle() -> PathBuf {
             .is_file(),
         "grant exerciser bundle must carry a visible test-only marker"
     );
+    path
+}
+
+fn guest_ext4_rootfs() -> PathBuf {
+    let path = std::env::var_os(GUEST_EXT4_ROOTFS_ENV)
+        .filter(|value| !value.is_empty())
+        .expect("signed runner must provide the direct-rootfs fixture path");
+    let path = PathBuf::from(path);
+    assert!(path.is_file(), "direct-rootfs fixture must be a file");
     path
 }
 
@@ -434,6 +474,501 @@ fn normal_bundle_rejects_wrong_and_missing_boot_claims_without_consuming_pair() 
     let status = running.wait("grant mismatch graceful stop");
     assert!(status.success());
     assert!(!running.socket.exists());
+}
+
+#[test]
+fn normal_bundle_adopts_delayed_block_and_pmem_grants_by_descriptor_identity() {
+    let bundle = production_bundle();
+    let fixture = GuestDeviceGrantFixture::new("delayed-pmem");
+    let mut running = spawn_ready_device_grant_api_launcher(&bundle, &fixture, "delayed-pmem");
+    fixture.replace_source_pathnames();
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT /machine-config for delayed pmem grants",
+    );
+
+    let sealed_kernel = worker_bundle(&bundle).join("Contents/Resources/guest-kernel");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&sealed_kernel),
+        "boot_args": DIRECT_ROOTFS_PMEM_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot request should serialize"),
+        ),
+        204,
+        "PUT /boot-source for delayed pmem grants",
+    );
+
+    let prior_path = "/sealed/prior-data";
+    let prior_data = serde_json::json!({
+        "drive_id": "data",
+        "path_on_host": prior_path,
+        "is_root_device": false,
+        "is_read_only": false,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/data",
+            &serde_json::to_string(&prior_data).expect("prior drive should serialize"),
+        ),
+        204,
+        "PUT prior /drives/data",
+    );
+
+    let wrong_role = serde_json::json!({
+        "drive_id": "data",
+        "path_on_host": GUEST_PMEM_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+    });
+    let wrong_role_response = http_put(
+        &running.socket,
+        "/drives/data",
+        &serde_json::to_string(&wrong_role).expect("wrong-role drive should serialize"),
+    );
+    assert_device_private_grant_fault(&wrong_role_response, &fixture);
+    let unchanged = http_get(&running.socket, "/vm/config");
+    assert_http_status(&unchanged, 200, "GET /vm/config after wrong role");
+    assert!(unchanged.contains(prior_path));
+    assert!(!unchanged.contains(GUEST_PMEM_REF));
+
+    let wrong_access = serde_json::json!({
+        "drive_id": "data",
+        "path_on_host": GUEST_ROOTFS_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+    });
+    let wrong_access_response = http_put(
+        &running.socket,
+        "/drives/data",
+        &serde_json::to_string(&wrong_access).expect("wrong-access drive should serialize"),
+    );
+    assert_device_private_grant_fault(&wrong_access_response, &fixture);
+
+    let malformed = serde_json::json!({
+        "drive_id": "data",
+        "path_on_host": "bangbang-grant:",
+        "is_root_device": false,
+        "is_read_only": false,
+    });
+    let malformed_response = http_put(
+        &running.socket,
+        "/drives/data",
+        &serde_json::to_string(&malformed).expect("malformed drive should serialize"),
+    );
+    assert_device_private_grant_fault(&malformed_response, &fixture);
+
+    let rootfs = serde_json::json!({
+        "drive_id": "rootfs",
+        "path_on_host": GUEST_ROOTFS_REF,
+        "is_root_device": true,
+        "is_read_only": true,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/rootfs",
+            &serde_json::to_string(&rootfs).expect("rootfs drive should serialize"),
+        ),
+        204,
+        "PUT granted rootfs",
+    );
+
+    let data = serde_json::json!({
+        "drive_id": "data",
+        "path_on_host": GUEST_DATA_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/data",
+            &serde_json::to_string(&data).expect("data drive should serialize"),
+        ),
+        204,
+        "PUT granted data drive",
+    );
+
+    let duplicate = serde_json::json!({
+        "drive_id": "duplicate",
+        "path_on_host": GUEST_DATA_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+    });
+    let duplicate_response = http_put(
+        &running.socket,
+        "/drives/duplicate",
+        &serde_json::to_string(&duplicate).expect("duplicate drive should serialize"),
+    );
+    assert_device_private_grant_fault(&duplicate_response, &fixture);
+
+    let pmem = serde_json::json!({
+        "id": "pmem0",
+        "path_on_host": GUEST_PMEM_REF,
+        "read_only": false,
+        "rate_limiter": {
+            "bandwidth": {"size": PMEM_BACKING_LEN, "refill_time": 1000},
+            "ops": {"size": 1, "refill_time": 1000},
+        },
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/pmem/pmem0",
+            &serde_json::to_string(&pmem).expect("pmem request should serialize"),
+        ),
+        204,
+        "PUT granted pmem",
+    );
+
+    let config = http_get(&running.socket, "/vm/config");
+    assert_http_status(&config, 200, "GET /vm/config for device grants");
+    for reference in [GUEST_ROOTFS_REF, GUEST_DATA_REF, GUEST_PMEM_REF] {
+        assert!(
+            config.contains(reference),
+            "authorized config response should retain {reference:?}: {config}"
+        );
+    }
+    assert!(!config.contains(prior_path));
+    assert!(!config.contains(r#""drive_id":"duplicate""#));
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start delayed block and pmem guest",
+    );
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/drives/data",
+            r#"{"drive_id":"data","rate_limiter":{"bandwidth":{"size":1000,"one_time_burst":1000,"refill_time":100}}}"#,
+        ),
+        204,
+        "path-free live block update",
+    );
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/pmem/pmem0",
+            r#"{"id":"pmem0","rate_limiter":{"bandwidth":null,"ops":null}}"#,
+        ),
+        204,
+        "live pmem rate-limiter update",
+    );
+
+    wait_for_file_prefix(&fixture.opened_data, PMEM_RESULT_MARKER, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| panic!("guest should report pmem success: {error}"));
+    assert_eq!(
+        file_bytes_at(
+            &fixture.opened_pmem,
+            PMEM_GUEST_FLUSH_OFFSET,
+            PMEM_GUEST_FLUSH_MARKER.len(),
+        ),
+        PMEM_GUEST_FLUSH_MARKER,
+        "guest pmem flush should update the launcher-opened object"
+    );
+    assert_eq!(
+        file_bytes_at(&fixture.data, 0, PMEM_RESULT_MARKER.len()),
+        vec![0; PMEM_RESULT_MARKER.len()],
+        "replacement source pathname must not receive guest block writes"
+    );
+    assert_eq!(
+        file_bytes_at(
+            &fixture.pmem,
+            PMEM_GUEST_FLUSH_OFFSET,
+            PMEM_GUEST_FLUSH_MARKER.len(),
+        ),
+        vec![0; PMEM_GUEST_FLUSH_MARKER.len()],
+        "replacement pmem pathname must not receive guest flushes"
+    );
+
+    stop_running_launcher(&mut running, "delayed block and pmem grant guest");
+}
+
+#[test]
+fn normal_bundle_live_block_grant_swap_uses_preauthorized_open_file() {
+    let bundle = production_bundle();
+    let fixture = GuestDeviceGrantFixture::new("live-block");
+    let mut running = spawn_ready_device_grant_api_launcher(&bundle, &fixture, "live-block");
+    fixture.replace_source_pathnames();
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT live-block machine config",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/hotplug/memory",
+            r#"{"total_size_mib":128,"block_size_mib":2,"slot_size_mib":128}"#,
+        ),
+        204,
+        "PUT live-block memory hotplug config",
+    );
+    let sealed_kernel = worker_bundle(&bundle).join("Contents/Resources/guest-kernel");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&sealed_kernel),
+        "boot_args": DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot request should serialize"),
+        ),
+        204,
+        "PUT live-block boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": GUEST_ROOTFS_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT live-block rootfs",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": GUEST_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+            }),
+            "PUT live-block data",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("drive should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start live-block guest",
+    );
+    wait_for_file_prefix(
+        &fixture.opened_data,
+        MEMORY_HOTPLUG_READY_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("guest should reach live-update checkpoint: {error}"));
+
+    let replacement = serde_json::json!({
+        "drive_id": "data",
+        "path_on_host": GUEST_REPLACEMENT_REF,
+    });
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/drives/data",
+            &serde_json::to_string(&replacement).expect("replacement should serialize"),
+        ),
+        204,
+        "PATCH live block grant replacement",
+    );
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/drives/data",
+            r#"{"drive_id":"data","rate_limiter":{"ops":{"size":2,"one_time_burst":1,"refill_time":100}}}"#,
+        ),
+        204,
+        "PATCH live block limiter without replacing backing",
+    );
+    let config = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &config,
+        200,
+        "GET config after live block grant replacement",
+    );
+    assert!(config.contains(GUEST_REPLACEMENT_REF));
+    assert!(!config.contains(GUEST_DATA_REF));
+
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":128}"#,
+        ),
+        204,
+        "grow memory after live block swap",
+    );
+    wait_for_file_prefix(
+        &fixture.opened_replacement,
+        MEMORY_HOTPLUG_GROWN_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("replacement backing should receive grown marker: {error}"));
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":0}"#,
+        ),
+        204,
+        "shrink memory after live block swap",
+    );
+    wait_for_file_prefix(
+        &fixture.opened_replacement,
+        MEMORY_HOTPLUG_SUCCESS_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("replacement backing should receive success marker: {error}"));
+    assert_eq!(
+        file_bytes_at(&fixture.replacement, 0, MEMORY_HOTPLUG_SUCCESS_MARKER.len(),),
+        vec![0; MEMORY_HOTPLUG_SUCCESS_MARKER.len()],
+        "planted replacement pathname must remain unused"
+    );
+
+    stop_running_launcher(&mut running, "live block grant guest");
+}
+
+#[test]
+fn normal_bundle_enforces_read_only_drive_grant_against_guest_writes() {
+    let bundle = production_bundle();
+    let fixture = GuestDeviceGrantFixture::new("read-only-block");
+    let mut running = spawn_ready_device_grant_api_launcher(&bundle, &fixture, "read-only-block");
+    fixture.replace_source_pathnames();
+    let serial_path = container_tmp_dir().join(format!(
+        "bb-read-only-{:x}-{}.serial",
+        std::process::id(),
+        NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst)
+    ));
+    running.sensitive.push(path_text(&serial_path).to_owned());
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT read-only machine config",
+    );
+    let sealed_kernel = worker_bundle(&bundle).join("Contents/Resources/guest-kernel");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&sealed_kernel),
+        "boot_args": DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot request should serialize"),
+        ),
+        204,
+        "PUT read-only boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": GUEST_ROOTFS_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT read-only rootfs",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": GUEST_READ_ONLY_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": true,
+                "cache_type": "Writeback",
+            }),
+            "PUT read-only data drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("drive should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    let serial = serde_json::json!({"serial_out_path": path_text(&serial_path)});
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/serial",
+            &serde_json::to_string(&serial).expect("serial config should serialize"),
+        ),
+        204,
+        "PUT contained serial output",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start read-only block guest",
+    );
+    wait_for_file_contains(
+        &serial_path,
+        READ_ONLY_BLOCK_FAILURE_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("guest should report read-only write rejection: {error}"));
+    assert_eq!(
+        file_bytes_at(
+            &fixture.opened_read_only_data,
+            0,
+            READ_ONLY_BLOCK_FAILURE_MARKER.len(),
+        ),
+        vec![0; READ_ONLY_BLOCK_FAILURE_MARKER.len()],
+        "read-only granted backing must remain unchanged"
+    );
+
+    stop_running_launcher(&mut running, "read-only block grant guest");
+    let _ = fs::remove_file(serial_path);
 }
 
 #[test]
@@ -819,6 +1354,10 @@ struct StartupGrantFixture {
     metadata: PathBuf,
     kernel: PathBuf,
     initrd: PathBuf,
+    drive_read_only: PathBuf,
+    drive_read_write: PathBuf,
+    pmem_read_only: PathBuf,
+    pmem_read_write: PathBuf,
     manifest: PathBuf,
     metadata_marker: String,
 }
@@ -832,6 +1371,10 @@ impl StartupGrantFixture {
         let metadata = canonical_root.join("external-metadata.json");
         let kernel = canonical_root.join("external-kernel");
         let initrd = canonical_root.join("external-initrd");
+        let drive_read_only = canonical_root.join("external-drive-read-only.img");
+        let drive_read_write = canonical_root.join("external-drive-read-write.img");
+        let pmem_read_only = canonical_root.join("external-pmem-read-only.img");
+        let pmem_read_write = canonical_root.join("external-pmem-read-write.img");
         let manifest = canonical_root.join("grant-manifest.json");
         let metadata_marker = format!("startup-grant-metadata-{case}");
         let resources = worker_bundle(bundle).join("Contents/Resources");
@@ -839,6 +1382,10 @@ impl StartupGrantFixture {
             .expect("external kernel fixture should copy");
         fs::copy(resources.join("guest-initrd"), &initrd)
             .expect("external initrd fixture should copy");
+        create_sized_file(&drive_read_only, 512);
+        create_sized_file(&drive_read_write, 512);
+        create_sized_file(&pmem_read_only, PMEM_BACKING_LEN);
+        create_sized_file(&pmem_read_write, PMEM_BACKING_LEN);
         fs::write(
             &metadata,
             serde_json::to_vec(&serde_json::json!({"grant-proof": metadata_marker}))
@@ -854,6 +1401,32 @@ impl StartupGrantFixture {
                     "initrd_path": INITRD_REF,
                     "boot_args": "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init",
                 },
+                "drives": [
+                    {
+                        "drive_id": "grant_ro",
+                        "path_on_host": STARTUP_DRIVE_RO_REF,
+                        "is_root_device": false,
+                        "is_read_only": true,
+                    },
+                    {
+                        "drive_id": "grant_rw",
+                        "path_on_host": STARTUP_DRIVE_RW_REF,
+                        "is_root_device": false,
+                        "is_read_only": false,
+                    },
+                ],
+                "pmem": [
+                    {
+                        "id": "grant_pmem_ro",
+                        "path_on_host": STARTUP_PMEM_RO_REF,
+                        "read_only": true,
+                    },
+                    {
+                        "id": "grant_pmem_rw",
+                        "path_on_host": STARTUP_PMEM_RW_REF,
+                        "read_only": false,
+                    },
+                ],
             }))
             .expect("config fixture should serialize"),
         )
@@ -885,6 +1458,30 @@ impl StartupGrantFixture {
                     "access": "read-only",
                     "source": path_text(&initrd),
                 },
+                {
+                    "id": STARTUP_DRIVE_RO_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&drive_read_only),
+                },
+                {
+                    "id": STARTUP_DRIVE_RW_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&drive_read_write),
+                },
+                {
+                    "id": STARTUP_PMEM_RO_ID,
+                    "role": "pmem-backing",
+                    "access": "read-only",
+                    "source": path_text(&pmem_read_only),
+                },
+                {
+                    "id": STARTUP_PMEM_RW_ID,
+                    "role": "pmem-backing",
+                    "access": "read-write",
+                    "source": path_text(&pmem_read_write),
+                },
             ],
         });
         fs::write(
@@ -899,6 +1496,10 @@ impl StartupGrantFixture {
             metadata,
             kernel,
             initrd,
+            drive_read_only,
+            drive_read_write,
+            pmem_read_only,
+            pmem_read_write,
             manifest,
             metadata_marker,
         }
@@ -929,15 +1530,27 @@ impl StartupGrantFixture {
             path_text(&self.metadata),
             path_text(&self.kernel),
             path_text(&self.initrd),
+            path_text(&self.drive_read_only),
+            path_text(&self.drive_read_write),
+            path_text(&self.pmem_read_only),
+            path_text(&self.pmem_read_write),
             path_text(&self.manifest),
             STARTUP_CONFIG_ID,
             STARTUP_METADATA_ID,
             KERNEL_ID,
             INITRD_ID,
+            STARTUP_DRIVE_RO_ID,
+            STARTUP_DRIVE_RW_ID,
+            STARTUP_PMEM_RO_ID,
+            STARTUP_PMEM_RW_ID,
             STARTUP_CONFIG_REF,
             STARTUP_METADATA_REF,
             KERNEL_REF,
             INITRD_REF,
+            STARTUP_DRIVE_RO_REF,
+            STARTUP_DRIVE_RW_REF,
+            STARTUP_PMEM_RO_REF,
+            STARTUP_PMEM_RW_REF,
             &self.metadata_marker,
         ]
         .into_iter()
@@ -961,19 +1574,174 @@ impl StartupGrantFixture {
     }
 }
 
+#[derive(Debug)]
+struct GuestDeviceGrantFixture {
+    _root: TestDir,
+    rootfs: PathBuf,
+    data: PathBuf,
+    replacement: PathBuf,
+    pmem: PathBuf,
+    read_only_data: PathBuf,
+    opened_rootfs: PathBuf,
+    opened_data: PathBuf,
+    opened_replacement: PathBuf,
+    opened_pmem: PathBuf,
+    opened_read_only_data: PathBuf,
+    manifest: PathBuf,
+}
+
+impl GuestDeviceGrantFixture {
+    fn new(case: &str) -> Self {
+        let root = TestDir::new(&format!("device-grant-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("device grant root should canonicalize");
+        let rootfs = canonical_root.join("external-rootfs.ext4");
+        let data = canonical_root.join("external-data.img");
+        let replacement = canonical_root.join("external-replacement.img");
+        let pmem = canonical_root.join("external-pmem.img");
+        let read_only_data = canonical_root.join("external-read-only-data.img");
+        let opened_rootfs = canonical_root.join("opened-rootfs.ext4");
+        let opened_data = canonical_root.join("opened-data.img");
+        let opened_replacement = canonical_root.join("opened-replacement.img");
+        let opened_pmem = canonical_root.join("opened-pmem.img");
+        let opened_read_only_data = canonical_root.join("opened-read-only-data.img");
+        let manifest = canonical_root.join("grant-manifest.json");
+
+        fs::copy(guest_ext4_rootfs(), &rootfs).expect("external rootfs fixture should copy");
+        create_sized_file(&data, 512);
+        create_sized_file(&replacement, 512);
+        create_pmem_file(&pmem, PMEM_HOST_MARKER);
+        create_sized_file(&read_only_data, 512);
+
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": GUEST_ROOTFS_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&rootfs),
+                },
+                {
+                    "id": GUEST_DATA_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&data),
+                },
+                {
+                    "id": GUEST_REPLACEMENT_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&replacement),
+                },
+                {
+                    "id": GUEST_PMEM_ID,
+                    "role": "pmem-backing",
+                    "access": "read-write",
+                    "source": path_text(&pmem),
+                },
+                {
+                    "id": GUEST_READ_ONLY_DATA_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&read_only_data),
+                },
+            ],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("device grant manifest should serialize"),
+        )
+        .expect("device grant manifest should write");
+
+        Self {
+            _root: root,
+            rootfs,
+            data,
+            replacement,
+            pmem,
+            read_only_data,
+            opened_rootfs,
+            opened_data,
+            opened_replacement,
+            opened_pmem,
+            opened_read_only_data,
+            manifest,
+        }
+    }
+
+    fn replace_source_pathnames(&self) {
+        for (source, opened) in [
+            (&self.rootfs, &self.opened_rootfs),
+            (&self.data, &self.opened_data),
+            (&self.replacement, &self.opened_replacement),
+            (&self.pmem, &self.opened_pmem),
+            (&self.read_only_data, &self.opened_read_only_data),
+        ] {
+            fs::rename(source, opened).expect("launcher-opened source should move");
+        }
+        create_sized_file(&self.rootfs, 512);
+        create_sized_file(&self.data, 512);
+        create_sized_file(&self.replacement, 512);
+        create_sized_file(&self.pmem, PMEM_BACKING_LEN);
+        create_sized_file(&self.read_only_data, 512);
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.rootfs),
+            path_text(&self.data),
+            path_text(&self.replacement),
+            path_text(&self.pmem),
+            path_text(&self.read_only_data),
+            path_text(&self.opened_rootfs),
+            path_text(&self.opened_data),
+            path_text(&self.opened_replacement),
+            path_text(&self.opened_pmem),
+            path_text(&self.opened_read_only_data),
+            path_text(&self.manifest),
+            GUEST_ROOTFS_ID,
+            GUEST_DATA_ID,
+            GUEST_REPLACEMENT_ID,
+            GUEST_PMEM_ID,
+            GUEST_READ_ONLY_DATA_ID,
+            GUEST_ROOTFS_REF,
+            GUEST_DATA_REF,
+            GUEST_REPLACEMENT_REF,
+            GUEST_PMEM_REF,
+            GUEST_READ_ONLY_DATA_REF,
+            std::str::from_utf8(PMEM_HOST_MARKER).expect("pmem marker should be UTF-8"),
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
 fn assert_private_grant_fault(response: &str, fixture: &StartupGrantFixture) {
+    assert_redacted_private_grant_fault(response, fixture.sensitive_strings());
+    assert!(!response.contains("bangbang-grant:missing"));
+}
+
+fn assert_device_private_grant_fault(response: &str, fixture: &GuestDeviceGrantFixture) {
+    assert_redacted_private_grant_fault(response, fixture.sensitive_strings());
+}
+
+fn assert_redacted_private_grant_fault(
+    response: &str,
+    sensitive_strings: impl IntoIterator<Item = String>,
+) {
     assert!(
         response.starts_with("HTTP/1.1 400 "),
         "response:\n{response}"
     );
     assert!(response.contains(r#"{"fault_message":"private resource grant failed"}"#));
-    for sensitive in fixture.sensitive_strings() {
+    for sensitive in sensitive_strings {
         assert!(
             !response.contains(&sensitive),
             "grant fault leaked private data"
         );
     }
-    assert!(!response.contains("bangbang-grant:missing"));
 }
 
 #[derive(Debug)]
@@ -1417,6 +2185,47 @@ fn spawn_ready_startup_grant_api_launcher(
     }
 }
 
+fn spawn_ready_device_grant_api_launcher(
+    bundle: &Path,
+    fixture: &GuestDeviceGrantFixture,
+    name: &str,
+) -> RunningApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket =
+        container_tmp_dir().join(format!("bbd-{:x}-{test_id:x}.sock", std::process::id(),));
+    let mut child = Command::new(launcher(bundle))
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .args(["--api-sock", path_text(&socket)])
+        .args(["--id", &format!("{name}-{test_id}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("device-grant launcher should start");
+    let (ready, stdout_reader) = read_stdout_until_ready(&mut child);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "device-grant API should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningApiLauncher {
+        child,
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive: fixture.sensitive_strings(),
+        completed: false,
+    }
+}
+
 fn recover_session_root(bundle: &Path) {
     let output = run_launcher(bundle, &[OsStr::new("--help")]);
     assert_output_success(&output, "session-root recovery");
@@ -1718,6 +2527,88 @@ fn kill_child_group(child: &mut Child) {
     let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
 }
 
+fn stop_running_launcher(running: &mut RunningApiLauncher, context: &str) {
+    let pid = i32::try_from(running.child.id()).expect("launcher PID should fit");
+    // SAFETY: `pid` is the live unreaped launcher owned by `running`.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let status = running.wait(context);
+    assert!(
+        status.success(),
+        "{context} should stop cleanly: {status:?}"
+    );
+    assert!(
+        !running.socket.exists(),
+        "{context} should remove the API socket"
+    );
+}
+
+fn create_sized_file(path: &Path, len: u64) {
+    assert!(len > 0, "test backing length must be nonzero");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("test backing should create");
+    file.set_len(len).expect("test backing length should set");
+}
+
+fn create_pmem_file(path: &Path, marker: &[u8]) {
+    create_sized_file(path, PMEM_BACKING_LEN);
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("pmem backing should reopen")
+        .write_all(marker)
+        .expect("pmem host marker should write");
+}
+
+fn file_bytes_at(path: &Path, offset: u64, len: usize) -> Vec<u8> {
+    let mut file = fs::File::open(path).expect("test backing should open");
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+        .expect("test backing should seek");
+    let mut bytes = vec![0_u8; len];
+    file.read_exact(&mut bytes)
+        .expect("test backing bytes should read");
+    bytes
+}
+
+fn wait_for_file_prefix(path: &Path, marker: &[u8], timeout: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        if fs::metadata(path).is_ok() && file_bytes_at(path, 0, marker.len()) == marker {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "timed out after {timeout:?} waiting for marker {:?}",
+                String::from_utf8_lossy(marker)
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_file_contains(path: &Path, marker: &[u8], timeout: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        if fs::read(path).is_ok_and(|contents| {
+            contents
+                .windows(marker.len())
+                .any(|window| window == marker)
+        }) {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "timed out after {timeout:?} waiting for output marker {:?}",
+                String::from_utf8_lossy(marker)
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn http_get(socket: &Path, path: &str) -> String {
     http_request(socket, "GET", path, "")
 }
@@ -1745,6 +2636,13 @@ fn http_request(socket: &Path, method: &str, path: &str, body: &str) -> String {
         .read_to_string(&mut response)
         .expect("HTTP response should be read");
     response
+}
+
+fn assert_http_status(response: &str, expected: u16, context: &str) {
+    assert!(
+        response.starts_with(&format!("HTTP/1.1 {expected} ")),
+        "{context} returned an unexpected response:\n{response}"
+    );
 }
 
 fn assert_invalid_bundle(output: Output) {

@@ -408,7 +408,9 @@ if [[ "$hv_disable" == "1" ]]; then
   finish_unsupported "Hypervisor.framework is disabled on this host"
 fi
 
-if contains guest_boot "${selected_tests[@]}" || contains executable_hvf_e2e "${selected_tests[@]}"; then
+if contains guest_boot "${selected_tests[@]}" \
+  || contains executable_hvf_e2e "${selected_tests[@]}" \
+  || contains production_bundle "${selected_tests[@]}"; then
   guest_ext4_rootfs_path="$(scripts/fetch-firecracker-rootfs.sh \
     --format ext4 \
     --ext4-size 512M \
@@ -484,6 +486,7 @@ if contains production_bundle "${selected_tests[@]}"; then
   if [[ "${#test_args[@]}" -eq 0 ]]; then
     BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
       BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH="$production_grant_test_bundle_path" \
+      BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \
       cargo test \
         -p bangbang-launcher \
         --test production_bundle_e2e \
@@ -495,6 +498,7 @@ if contains production_bundle "${selected_tests[@]}"; then
   else
     BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
       BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH="$production_grant_test_bundle_path" \
+      BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \
       cargo test \
         -p bangbang-launcher \
         --test production_bundle_e2e \
