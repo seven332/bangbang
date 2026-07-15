@@ -1,9 +1,13 @@
 use std::fmt;
 #[cfg(not(target_os = "macos"))]
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 
+use bangbang_session::GrantId;
 #[cfg(not(target_os = "macos"))]
 use bangbang_session::{Readiness, TerminalCategory};
+
+const GRANT_REFERENCE_PREFIX: &str = "bangbang-grant:";
 
 /// Stable private bootstrap failure that never includes identity or path data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,30 +21,108 @@ impl fmt::Display for ContainedSessionError {
 
 impl std::error::Error for ContainedSessionError {}
 
+/// Stable failure for an explicit contained resource claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GrantClaimError;
+
+impl fmt::Display for GrantClaimError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("private resource grant failed")
+    }
+}
+
+impl std::error::Error for GrantClaimError {}
+
+fn grant_reference_id(reference: &Path) -> Result<Option<GrantId>, GrantClaimError> {
+    let Some(reference) = reference.to_str() else {
+        return Ok(None);
+    };
+    let Some(id) = reference.strip_prefix(GRANT_REFERENCE_PREFIX) else {
+        return Ok(None);
+    };
+    GrantId::parse(id).map(Some).map_err(|_| GrantClaimError)
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use std::path::Path;
+
+    use bangbang_session::MAX_GRANT_ID_BYTES;
+
+    use super::{GrantClaimError, grant_reference_id};
+
+    #[test]
+    fn grant_references_use_one_exact_case_sensitive_bounded_grammar() {
+        for ordinary in [
+            "ordinary-path",
+            "Bangbang-grant:kernel",
+            "bangbang-grants:kernel",
+            "bangbang-grant",
+        ] {
+            assert!(
+                grant_reference_id(Path::new(ordinary))
+                    .expect("ordinary paths should classify")
+                    .is_none()
+            );
+        }
+
+        for invalid in [
+            "bangbang-grant:",
+            "bangbang-grant:with/slash",
+            "bangbang-grant:unicode-☃",
+        ] {
+            assert_eq!(
+                grant_reference_id(Path::new(invalid))
+                    .expect_err("reserved malformed references must fail closed"),
+                GrantClaimError
+            );
+        }
+        let too_long = format!("bangbang-grant:{}", "a".repeat(MAX_GRANT_ID_BYTES + 1));
+        assert_eq!(
+            grant_reference_id(Path::new(&too_long))
+                .expect_err("overlong references must fail closed"),
+            GrantClaimError
+        );
+
+        let maximum = "a".repeat(MAX_GRANT_ID_BYTES);
+        let reference = format!("bangbang-grant:{maximum}");
+        let id = grant_reference_id(Path::new(&reference))
+            .expect("maximum reference should classify")
+            .expect("maximum reference should contain an ID");
+        assert_eq!(id.as_bytes(), maximum.as_bytes());
+        assert_eq!(GrantClaimError.to_string(), "private resource grant failed");
+        assert!(!format!("{id:?} {GrantClaimError:?}").contains(&maximum));
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use std::env;
     use std::ffi::OsStr;
+    use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
+    use bangbang_runtime::boot::BootSourceFiles;
     use bangbang_session::macos::grant_registry::{
-        CommittedGrantBatch, GrantRegistry, StagedGrantBatch,
+        CommittedGrantBatch, FileGrantRegistry, GrantRegistry, StagedGrantBatch,
     };
     use bangbang_session::macos::grant_transport::receive_grant;
     use bangbang_session::macos::runtime::WorkerNamespace;
     use bangbang_session::macos::{set_cloexec, verify_peer, verify_peer_pid};
     use bangbang_session::{
-        Frame, FrameDecoder, GRANT_FD, Message, Readiness, SESSION_ENV_KEY, SESSION_ENV_VALUE,
-        SESSION_FD, TerminalCategory, WorkerLifecycle, encode_frame,
+        Frame, FrameDecoder, GRANT_FD, GrantAccess, Message, Readiness, ResourceRole,
+        SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, TerminalCategory, WorkerLifecycle,
+        encode_frame,
     };
 
-    use super::ContainedSessionError;
+    use super::{ContainedSessionError, GrantClaimError, grant_reference_id};
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     #[cfg(feature = "grant-integration-probe")]
@@ -86,6 +168,107 @@ mod platform {
         }
     }
 
+    /// Shared one-time authority for exact contained resource claims.
+    #[derive(Clone)]
+    pub(crate) struct GrantAuthority {
+        registry: Arc<Mutex<Option<FileGrantRegistry>>>,
+    }
+
+    impl std::fmt::Debug for GrantAuthority {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("GrantAuthority")
+                .field("registry", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl GrantAuthority {
+        fn new(registry: FileGrantRegistry) -> Self {
+            Self {
+                registry: Arc::new(Mutex::new(Some(registry))),
+            }
+        }
+
+        pub(crate) fn claim_read_only_file(
+            &self,
+            reference: &Path,
+            role: ResourceRole,
+        ) -> Result<Option<File>, GrantClaimError> {
+            let Some(id) = grant_reference_id(reference)? else {
+                return Ok(None);
+            };
+            let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            let grant = registry
+                .as_mut()
+                .ok_or(GrantClaimError)?
+                .take_file(&id, role, GrantAccess::ReadOnly)
+                .map_err(|_| GrantClaimError)?;
+            Ok(Some(File::from(grant.into_owned_fd())))
+        }
+
+        pub(crate) fn claim_boot_files(
+            &self,
+            kernel_reference: &Path,
+            initrd_reference: Option<&Path>,
+        ) -> Result<BootSourceFiles, GrantClaimError> {
+            let kernel_id = grant_reference_id(kernel_reference)?;
+            let initrd_id = initrd_reference
+                .map(grant_reference_id)
+                .transpose()?
+                .flatten();
+            let mut requests = Vec::with_capacity(2);
+            if let Some(id) = &kernel_id {
+                requests.push((id.clone(), ResourceRole::KernelImage, GrantAccess::ReadOnly));
+            }
+            if let Some(id) = &initrd_id {
+                requests.push((id.clone(), ResourceRole::InitrdImage, GrantAccess::ReadOnly));
+            }
+            if requests.is_empty() {
+                return Ok(BootSourceFiles::default());
+            }
+
+            let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            let files = registry
+                .as_mut()
+                .ok_or(GrantClaimError)?
+                .take_files(&requests)
+                .map_err(|_| GrantClaimError)?;
+            let mut files = files.into_iter();
+            let kernel = match kernel_id {
+                Some(_) => Some(File::from(
+                    files.next().ok_or(GrantClaimError)?.into_owned_fd(),
+                )),
+                None => None,
+            };
+            let initrd = match initrd_id {
+                Some(_) => Some(File::from(
+                    files.next().ok_or(GrantClaimError)?.into_owned_fd(),
+                )),
+                None => None,
+            };
+            debug_assert!(files.next().is_none());
+            Ok(BootSourceFiles::new(kernel, initrd))
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        pub(crate) fn with_registry<T>(
+            &self,
+            consumer: impl FnOnce(&mut FileGrantRegistry) -> Result<T, ContainedSessionError>,
+        ) -> Result<T, ContainedSessionError> {
+            let mut registry = self.registry.lock().map_err(|_| ContainedSessionError)?;
+            consumer(registry.as_mut().ok_or(ContainedSessionError)?)
+        }
+
+        fn invalidate(&self) {
+            let mut registry = match self.registry.lock() {
+                Ok(registry) => registry,
+                Err(error) => error.into_inner(),
+            };
+            registry.take();
+        }
+    }
+
     pub(crate) struct ContainedSession {
         stream: UnixStream,
         lifecycle: Arc<Mutex<WorkerLifecycle>>,
@@ -94,7 +277,8 @@ mod platform {
         wakeup_reader: Option<UnixStream>,
         wakeup_writer: Option<UnixStream>,
         reader: Option<JoinHandle<()>>,
-        grants: Option<GrantRegistry>,
+        grants: GrantAuthority,
+        directory_grants: Option<GrantRegistry>,
         started: bool,
         closed: bool,
     }
@@ -184,7 +368,7 @@ mod platform {
                 receive_grants,
             )?;
             drop(grant_socket);
-            let (grants, cancelled) = match grant_outcome {
+            let (mut grants, cancelled) = match grant_outcome {
                 GrantPhaseOutcome::Committed(committed) => {
                     let accepted = lifecycle
                         .grants_accepted(
@@ -228,6 +412,7 @@ mod platform {
                 ControlState::Cancelled
             };
             let control = Arc::new(SharedControl::new(initial_state));
+            let file_grants = GrantAuthority::new(grants.take_file_registry());
             let lifecycle = Arc::new(Mutex::new(lifecycle));
             let namespace = Arc::new(Mutex::new(Some(namespace)));
             let (wakeup_reader, mut wakeup_writer) =
@@ -243,6 +428,7 @@ mod platform {
                     Arc::clone(&lifecycle),
                     Arc::clone(&namespace),
                     Arc::clone(&control),
+                    file_grants.clone(),
                     reader_wakeup,
                 )?)
             } else {
@@ -259,7 +445,8 @@ mod platform {
                 wakeup_reader: Some(wakeup_reader),
                 wakeup_writer: Some(wakeup_writer),
                 reader,
-                grants: Some(grants),
+                grants: file_grants,
+                directory_grants: Some(grants),
                 started,
                 closed: false,
             }))
@@ -288,11 +475,20 @@ mod platform {
             self.control.state().ok() == Some(ControlState::Cancelled)
         }
 
+        pub(crate) fn grant_authority(&self) -> Option<GrantAuthority> {
+            self.started.then(|| self.grants.clone())
+        }
+
         #[cfg(feature = "grant-integration-probe")]
-        pub(crate) fn grant_registry_mut(
+        pub(crate) fn with_directory_grants<T>(
             &mut self,
-        ) -> Result<&mut GrantRegistry, ContainedSessionError> {
-            self.grants.as_mut().ok_or(ContainedSessionError)
+            consumer: impl FnOnce(&mut GrantRegistry) -> Result<T, ContainedSessionError>,
+        ) -> Result<T, ContainedSessionError> {
+            consumer(
+                self.directory_grants
+                    .as_mut()
+                    .ok_or(ContainedSessionError)?,
+            )
         }
 
         pub(crate) fn send_ready(
@@ -340,7 +536,8 @@ mod platform {
             }
             self.closed = true;
             self.control.closing.store(true, Ordering::Release);
-            self.grants.take();
+            self.grants.invalidate();
+            self.directory_grants.take();
             let _ = self.stream.shutdown(std::net::Shutdown::Both);
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
@@ -457,6 +654,7 @@ mod platform {
         lifecycle: Arc<Mutex<WorkerLifecycle>>,
         namespace: Arc<Mutex<Option<WorkerNamespace>>>,
         control: Arc<SharedControl>,
+        grants: GrantAuthority,
         mut wakeup: UnixStream,
     ) -> Result<JoinHandle<()>, ContainedSessionError> {
         thread::Builder::new()
@@ -464,6 +662,7 @@ mod platform {
             .spawn(move || {
                 let state = reader_loop(&mut stream, &mut decoder, &lifecycle);
                 if !control.closing.load(Ordering::Acquire) {
+                    grants.invalidate();
                     if state == ControlState::Disconnected {
                         cleanup_namespace(&namespace);
                     }
@@ -569,11 +768,347 @@ mod platform {
             let _ = namespace.cleanup();
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::fs::File;
+        use std::io::Read as _;
+        use std::mem::MaybeUninit;
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::path::Path;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        use bangbang_session::macos::grant_registry::{GrantRegistry, StagedGrantBatch};
+        use bangbang_session::macos::grant_transport::ReceivedGrant;
+        use bangbang_session::{
+            BatchId, GrantAccess, GrantFrame, GrantId, GrantObjectKind, GrantRecord,
+            ObjectIdentity, ResourceRole, SessionId,
+        };
+
+        use super::{GrantAuthority, GrantClaimError};
+
+        fn received(
+            session: SessionId,
+            batch: BatchId,
+            sequence: u64,
+            record: GrantRecord,
+            descriptor: Option<OwnedFd>,
+        ) -> ReceivedGrant {
+            ReceivedGrant {
+                frame: GrantFrame {
+                    session,
+                    batch,
+                    sequence,
+                    descriptor_count: record.descriptor_count(),
+                    record,
+                },
+                descriptor,
+            }
+        }
+
+        fn file_record(id: &str, role: ResourceRole, path: &Path) -> (GrantRecord, OwnedFd) {
+            let file = File::open(path).expect("grant fixture should open");
+            let descriptor: OwnedFd = file.into();
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(
+                // SAFETY: stat points to writable storage and descriptor is live.
+                unsafe { libc::fstat(descriptor.as_raw_fd(), stat.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: successful fstat initialized the complete structure.
+            let stat = unsafe { stat.assume_init() };
+            // SAFETY: F_GETFL only inspects the live descriptor.
+            let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            (
+                GrantRecord::Descriptor {
+                    id: GrantId::parse(id).expect("grant ID should parse"),
+                    role,
+                    access: GrantAccess::ReadOnly,
+                    kind: GrantObjectKind::RegularFile,
+                    identity: ObjectIdentity {
+                        device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
+                        inode: stat.st_ino,
+                    },
+                    status_flags: u32::try_from(flags).expect("status flags should fit"),
+                },
+                descriptor,
+            )
+        }
+
+        fn file_registry() -> GrantRegistry {
+            let session = SessionId::from_bytes([31; 32]);
+            let batch = BatchId::from_bytes([32; 16]);
+            let mut staged = StagedGrantBatch::new(session);
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    0,
+                    GrantRecord::Begin {
+                        grant_count: 3,
+                        record_count: 5,
+                        bookmark_bytes: 0,
+                    },
+                    None,
+                ))
+                .expect("begin should stage");
+            for (sequence, (id, role, path)) in [
+                (
+                    "kernel",
+                    ResourceRole::KernelImage,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+                ),
+                (
+                    "initrd",
+                    ResourceRole::InitrdImage,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api_server.rs"),
+                ),
+                (
+                    "metadata",
+                    ResourceRole::StartupMetadata,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (record, descriptor) = file_record(id, role, &path);
+                staged
+                    .accept(received(
+                        session,
+                        batch,
+                        u64::try_from(sequence + 1).expect("sequence should fit"),
+                        record,
+                        Some(descriptor),
+                    ))
+                    .expect("descriptor should stage");
+            }
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    4,
+                    GrantRecord::Commit {
+                        grant_count: 3,
+                        record_count: 5,
+                        bookmark_bytes: 0,
+                    },
+                    None,
+                ))
+                .expect("commit should validate")
+                .expect("commit should return registry")
+                .registry
+        }
+
+        #[test]
+        fn file_authority_is_send_sync_and_claims_fail_closed_atomically() {
+            fn assert_send_sync<T: Send + Sync>() {}
+            assert_send_sync::<GrantAuthority>();
+
+            let mut registry = file_registry();
+            let authority = GrantAuthority::new(registry.take_file_registry());
+            assert!(registry.is_empty());
+            let wrong_pair = authority.claim_boot_files(
+                Path::new("bangbang-grant:kernel"),
+                Some(Path::new("bangbang-grant:metadata")),
+            );
+            assert_eq!(
+                wrong_pair.expect_err("wrong role should fail"),
+                GrantClaimError
+            );
+            let duplicate_pair = authority.claim_boot_files(
+                Path::new("bangbang-grant:kernel"),
+                Some(Path::new("bangbang-grant:kernel")),
+            );
+            assert_eq!(
+                duplicate_pair.expect_err("duplicate IDs should fail"),
+                GrantClaimError
+            );
+
+            let mut kernel = authority
+                .claim_read_only_file(
+                    Path::new("bangbang-grant:kernel"),
+                    ResourceRole::KernelImage,
+                )
+                .expect("kernel claim should validate")
+                .expect("kernel reference should claim a file");
+            let mut kernel_contents = String::new();
+            kernel
+                .read_to_string(&mut kernel_contents)
+                .expect("claimed kernel fixture should read");
+            assert!(kernel_contents.contains("name = \"bangbang\""));
+
+            assert!(
+                authority
+                    .claim_read_only_file(
+                        Path::new("bangbang-grant:kernel"),
+                        ResourceRole::KernelImage,
+                    )
+                    .is_err()
+            );
+            assert!(
+                authority
+                    .claim_read_only_file(
+                        Path::new("bangbang-grant:"),
+                        ResourceRole::StartupMetadata,
+                    )
+                    .is_err()
+            );
+            assert!(
+                authority
+                    .claim_read_only_file(
+                        Path::new("ordinary-path"),
+                        ResourceRole::StartupMetadata,
+                    )
+                    .expect("ordinary path should not claim")
+                    .is_none()
+            );
+
+            let mut mixed_registry = file_registry();
+            let mixed_authority = GrantAuthority::new(mixed_registry.take_file_registry());
+            let kernel_only = mixed_authority
+                .claim_boot_files(
+                    Path::new("bangbang-grant:kernel"),
+                    Some(Path::new("ordinary-initrd")),
+                )
+                .expect("provided kernel with ordinary initrd should claim");
+            assert!(!kernel_only.is_empty());
+            assert!(
+                mixed_authority
+                    .claim_read_only_file(
+                        Path::new("bangbang-grant:initrd"),
+                        ResourceRole::InitrdImage,
+                    )
+                    .expect("unclaimed initrd should remain available")
+                    .is_some()
+            );
+
+            let mut reverse_mixed_registry = file_registry();
+            let reverse_mixed_authority =
+                GrantAuthority::new(reverse_mixed_registry.take_file_registry());
+            let initrd_only = reverse_mixed_authority
+                .claim_boot_files(
+                    Path::new("ordinary-kernel"),
+                    Some(Path::new("bangbang-grant:initrd")),
+                )
+                .expect("ordinary kernel with provided initrd should claim");
+            assert!(!initrd_only.is_empty());
+            assert!(
+                reverse_mixed_authority
+                    .claim_read_only_file(
+                        Path::new("bangbang-grant:kernel"),
+                        ResourceRole::KernelImage,
+                    )
+                    .expect("unclaimed kernel should remain available")
+                    .is_some()
+            );
+
+            authority.invalidate();
+            assert!(
+                authority
+                    .claim_read_only_file(
+                        Path::new("bangbang-grant:metadata"),
+                        ResourceRole::StartupMetadata,
+                    )
+                    .is_err()
+            );
+            assert!(
+                authority
+                    .claim_read_only_file(
+                        Path::new("ordinary-path"),
+                        ResourceRole::StartupMetadata,
+                    )
+                    .expect("ordinary path remains outside grant authority")
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn file_authority_invalidation_serializes_with_a_claim() {
+            let mut registry = file_registry();
+            let authority = GrantAuthority::new(registry.take_file_registry());
+            let barrier = Arc::new(Barrier::new(3));
+
+            let claiming_authority = authority.clone();
+            let claiming_barrier = Arc::clone(&barrier);
+            let claim = thread::spawn(move || {
+                claiming_barrier.wait();
+                claiming_authority.claim_read_only_file(
+                    Path::new("bangbang-grant:kernel"),
+                    ResourceRole::KernelImage,
+                )
+            });
+            let invalidating_authority = authority.clone();
+            let invalidating_barrier = Arc::clone(&barrier);
+            let invalidate = thread::spawn(move || {
+                invalidating_barrier.wait();
+                invalidating_authority.invalidate();
+            });
+            barrier.wait();
+
+            match claim.join().expect("claim thread should join") {
+                Ok(Some(_)) | Err(GrantClaimError) => {}
+                Ok(None) => panic!("an explicit reference must not become an ordinary path"),
+            }
+            invalidate.join().expect("invalidation thread should join");
+            assert!(
+                authority
+                    .claim_read_only_file(
+                        Path::new("bangbang-grant:metadata"),
+                        ResourceRole::StartupMetadata,
+                    )
+                    .is_err()
+            );
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    use super::{ContainedSessionError, Readiness, TerminalCategory, UnixStream};
+    use std::path::Path;
+
+    use bangbang_runtime::boot::BootSourceFiles;
+    use bangbang_session::ResourceRole;
+
+    use super::{
+        ContainedSessionError, GrantClaimError, Readiness, TerminalCategory, UnixStream,
+        grant_reference_id,
+    };
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct GrantAuthority;
+
+    impl GrantAuthority {
+        pub(crate) fn claim_read_only_file(
+            &self,
+            reference: &Path,
+            _role: ResourceRole,
+        ) -> Result<Option<std::fs::File>, GrantClaimError> {
+            match grant_reference_id(reference)? {
+                Some(_) => Err(GrantClaimError),
+                None => Ok(None),
+            }
+        }
+
+        pub(crate) fn claim_boot_files(
+            &self,
+            kernel_reference: &Path,
+            initrd_reference: Option<&Path>,
+        ) -> Result<BootSourceFiles, GrantClaimError> {
+            let kernel = grant_reference_id(kernel_reference)?;
+            let initrd = initrd_reference
+                .map(grant_reference_id)
+                .transpose()?
+                .flatten();
+            if kernel.is_some() || initrd.is_some() {
+                Err(GrantClaimError)
+            } else {
+                Ok(BootSourceFiles::default())
+            }
+        }
+    }
 
     #[derive(Debug)]
     pub(crate) struct ContainedSession;
@@ -597,6 +1132,10 @@ mod platform {
             false
         }
 
+        pub(crate) fn grant_authority(&self) -> Option<GrantAuthority> {
+            None
+        }
+
         pub(crate) fn send_ready(
             &mut self,
             _readiness: Readiness,
@@ -614,4 +1153,4 @@ mod platform {
     }
 }
 
-pub(crate) use platform::ContainedSession;
+pub(crate) use platform::{ContainedSession, GrantAuthority};

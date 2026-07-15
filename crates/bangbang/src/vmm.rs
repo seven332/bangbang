@@ -33,7 +33,7 @@ use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveRateLimiterConfig,
     DriveUpdateError, DriveUpdateInput,
 };
-use bangbang_runtime::boot::BootSourceConfigInput;
+use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
 use bangbang_runtime::boot_timer::BootTimerMmioLayout;
 use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::EntropyMmioLayout;
@@ -92,6 +92,7 @@ use bangbang_runtime::startup::{
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
 
+use crate::contained_session::GrantAuthority;
 use crate::host_network::virtio_vmnet::{
     MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError,
     MmdsOnlyVirtioNetworkPacketIoProvider, MmdsOnlyVirtioNetworkPacketIoProviderBuildError,
@@ -140,6 +141,19 @@ pub(crate) trait InstanceStartExecutor {
     type Session: ProcessSessionDiagnostics;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError>;
+
+    fn start_with_boot_files(
+        &mut self,
+        controller: &VmmController,
+        boot_files: BootSourceFiles,
+    ) -> Result<Self::Session, BackendError> {
+        if !boot_files.is_empty() {
+            return Err(BackendError::Unsupported(
+                "startup executor cannot consume provided boot files",
+            ));
+        }
+        self.start(controller)
+    }
 
     fn publish_snapshot_v1(
         &mut self,
@@ -1167,6 +1181,13 @@ pub(crate) trait VmmRequestHandler {
 }
 
 #[derive(Debug)]
+enum BootGrantState {
+    PathBased,
+    Prepared(BootSourceFiles),
+    Consumed,
+}
+
+#[derive(Debug)]
 pub(crate) struct ProcessVmm<S>
 where
     S: InstanceStartExecutor,
@@ -1180,6 +1201,8 @@ where
     process_metrics_diagnostics: MetricsDiagnostics,
     process_signal_metrics: Option<SharedSignalMetrics>,
     terminal_snapshot_load_failure: bool,
+    grant_authority: Option<GrantAuthority>,
+    boot_grant_state: BootGrantState,
 }
 
 impl ProcessVmm<HvfInstanceStartExecutor> {
@@ -1246,6 +1269,8 @@ where
             process_metrics_diagnostics: MetricsDiagnostics::default(),
             process_signal_metrics: None,
             terminal_snapshot_load_failure: false,
+            grant_authority: None,
+            boot_grant_state: BootGrantState::PathBased,
         }
     }
 
@@ -1259,6 +1284,11 @@ where
 
     pub(crate) fn with_process_signal_metrics(mut self, metrics: SharedSignalMetrics) -> Self {
         self.process_signal_metrics = Some(metrics);
+        self
+    }
+
+    pub(crate) fn with_grant_authority(mut self, authority: Option<GrantAuthority>) -> Self {
+        self.grant_authority = authority;
         self
     }
 
@@ -1309,6 +1339,7 @@ where
         let had_started_session = self.has_started_session();
         let result = match action {
             VmmAction::InstanceStart => self.start_instance(),
+            VmmAction::PutBootSource(input) => self.put_boot_source(input),
             VmmAction::Pause => self.pause_instance(),
             VmmAction::Resume => self.resume_instance(),
             VmmAction::CreateSnapshot(input) => self.create_snapshot(input),
@@ -1415,12 +1446,22 @@ where
     }
 
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
+        self.controller.preflight_instance_start()?;
+        let boot_files =
+            match std::mem::replace(&mut self.boot_grant_state, BootGrantState::Consumed) {
+                BootGrantState::PathBased => {
+                    self.boot_grant_state = BootGrantState::PathBased;
+                    BootSourceFiles::default()
+                }
+                BootGrantState::Prepared(files) => files,
+                BootGrantState::Consumed => return Err(VmmActionError::ResourceGrant),
+            };
         let controller = &mut self.controller;
         let starter = &mut self.starter;
         let mut started_session = None;
 
         let result = controller.start_instance_with(|controller| {
-            started_session = Some(starter.start(controller)?);
+            started_session = Some(starter.start_with_boot_files(controller, boot_files)?);
             Ok(())
         });
 
@@ -1436,6 +1477,25 @@ where
             },
             Err(err) => Err(err),
         }
+    }
+
+    fn put_boot_source(&mut self, input: BootSourceConfigInput) -> Result<VmmData, VmmActionError> {
+        let config = self.controller.prepare_boot_source_config(input)?;
+        let boot_files = match &self.grant_authority {
+            Some(authority) => authority
+                .claim_boot_files(config.kernel_image_path(), config.initrd_path())
+                .map_err(|_| VmmActionError::ResourceGrant)?,
+            None => BootSourceFiles::default(),
+        };
+        let grant_state = if boot_files.is_empty() {
+            BootGrantState::PathBased
+        } else {
+            BootGrantState::Prepared(boot_files)
+        };
+
+        self.controller.commit_boot_source_config(config);
+        self.boot_grant_state = grant_state;
+        Ok(VmmData::Empty)
     }
 
     fn flush_metrics(&mut self) -> Result<VmmData, VmmActionError> {
@@ -2096,6 +2156,14 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
+        self.start_with_boot_files(controller, BootSourceFiles::default())
+    }
+
+    fn start_with_boot_files(
+        &mut self,
+        controller: &VmmController,
+        boot_files: BootSourceFiles,
+    ) -> Result<Self::Session, BackendError> {
         let serial_output = self
             .serial_output_for_controller(controller)
             .map_err(|err| {
@@ -2111,8 +2179,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                     "failed to build network packet I/O provider: {err}"
                 ))
             })?;
-        let session = OwnedHvfArm64BootSession::new(controller, boot_session_config)
-            .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
+        let session = OwnedHvfArm64BootSession::new_with_boot_files(
+            controller,
+            boot_session_config,
+            boot_files,
+        )
+        .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
         let session = ProcessHvfBootSession::new(session, packet_io, mmds_metrics);
         let supervisor =
             HvfBootRunLoopSupervisor::start(session, default_hvf_boot_run_loop_step_limit())?;
@@ -5249,7 +5321,7 @@ fn default_hvf_boot_session_config(serial_output: SharedSerialOutput) -> HvfArm6
 mod tests {
     use std::collections::VecDeque;
     use std::fmt;
-    use std::fs::{self, remove_file};
+    use std::fs::{self, File, remove_file};
     use std::io::{Cursor, Seek, SeekFrom, Write};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
@@ -5266,7 +5338,7 @@ mod tests {
         BlockMmioLayout, DriveConfig, DriveConfigInput, DriveConfigs, DriveRateLimiterConfig,
         DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput, PreparedBlockDevices,
     };
-    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
     use bangbang_runtime::cpu::{CpuConfigInput, CpuConfigTemplateCategory};
     use bangbang_runtime::entropy::EntropyConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
@@ -5336,7 +5408,7 @@ mod tests {
     };
 
     use super::{
-        BootRunLoopBlockDeviceUpdater, BootRunLoopCommandAdmission,
+        BootGrantState, BootRunLoopBlockDeviceUpdater, BootRunLoopCommandAdmission,
         BootRunLoopCommandAdmissionState, BootRunLoopCommandError,
         BootRunLoopCommandSubmissionError, BootRunLoopControl, BootRunLoopNetworkInterfaceUpdater,
         BootRunLoopPmemDeviceUpdater, BootRunLoopSession, BootRunLoopSupervisor,
@@ -6177,6 +6249,7 @@ mod tests {
     struct FakeStarter {
         result: FakeStartResult,
         calls: usize,
+        provided_boot_file_calls: usize,
         snapshot_publication_failure: bool,
     }
 
@@ -6189,6 +6262,7 @@ mod tests {
             Self {
                 result: FakeStartResult::Success(Box::new(session)),
                 calls: 0,
+                provided_boot_file_calls: 0,
                 snapshot_publication_failure: false,
             }
         }
@@ -6202,6 +6276,7 @@ mod tests {
             Self {
                 result: FakeStartResult::Failure(source),
                 calls: 0,
+                provided_boot_file_calls: 0,
                 snapshot_publication_failure: false,
             }
         }
@@ -6219,6 +6294,17 @@ mod tests {
                 FakeStartResult::Success(session) => Ok((**session).clone()),
                 FakeStartResult::Failure(source) => Err(source.clone()),
             }
+        }
+
+        fn start_with_boot_files(
+            &mut self,
+            controller: &bangbang_runtime::VmmController,
+            boot_files: BootSourceFiles,
+        ) -> Result<Self::Session, BackendError> {
+            if !boot_files.is_empty() {
+                self.provided_boot_file_calls += 1;
+            }
+            self.start(controller)
         }
 
         fn publish_snapshot_v1(
@@ -8398,6 +8484,7 @@ mod tests {
             | VmmActionError::EntropyUnsupported
             | VmmActionError::Lifecycle(_)
             | VmmActionError::MissingBootSource
+            | VmmActionError::ResourceGrant
             | VmmActionError::BootSourceConfig(_)
             | VmmActionError::CpuConfig(_)
             | VmmActionError::DriveConfig(_)
@@ -12827,6 +12914,49 @@ mod tests {
         assert_eq!(vmm.starter.calls, 1);
         assert!(!vmm.has_started_session());
         assert_eq!(vmm.metrics_session_epoch(), None);
+    }
+
+    #[test]
+    fn consumed_grant_boot_files_require_successful_reconfiguration_before_retry() {
+        let source = BackendError::InvalidState("provided boot startup failed");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            FakeStarter::failure(source.clone()),
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "bangbang-grant:kernel",
+        )))
+        .expect("tagged boot source should store in direct test mode");
+        let file = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("provided boot fixture should open");
+        vmm.boot_grant_state = BootGrantState::Prepared(BootSourceFiles::new(Some(file), None));
+
+        let first = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("provided-file startup failure should propagate");
+        assert_eq!(first, VmmActionError::InstanceStart(source.clone()));
+        assert_eq!(vmm.starter.calls, 1);
+        assert_eq!(vmm.starter.provided_boot_file_calls, 1);
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+
+        let retry = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("consumed provided files must not be reused");
+        assert_eq!(retry, VmmActionError::ResourceGrant);
+        assert_eq!(vmm.starter.calls, 1);
+
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/reconfigured-vmlinux",
+        )))
+        .expect("ordinary boot source replacement should reset consumed state");
+        let reconfigured = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("fake starter should still fail after reconfiguration");
+        assert_eq!(reconfigured, VmmActionError::InstanceStart(source));
+        assert_eq!(vmm.starter.calls, 2);
+        assert_eq!(vmm.starter.provided_boot_file_calls, 1);
     }
 
     #[test]

@@ -49,7 +49,8 @@ pub struct CommittedGrantBatch {
 /// One-time session-owned resource registry.
 #[derive(Default)]
 pub struct GrantRegistry {
-    entries: HashMap<GrantId, GrantedResource>,
+    files: HashMap<GrantId, GrantedFile>,
+    directories: HashMap<GrantId, GrantedDirectory>,
 }
 
 impl fmt::Debug for GrantRegistry {
@@ -65,10 +66,84 @@ impl GrantRegistry {
     /// Returns the number of unadopted grants.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.files.len() + self.directories.len()
     }
 
     /// Returns whether no unadopted authority remains.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.directories.is_empty()
+    }
+
+    /// Adopts one exact existing-file descriptor once.
+    pub fn take_file(
+        &mut self,
+        id: &GrantId,
+        role: ResourceRole,
+        access: GrantAccess,
+    ) -> Result<GrantedFile, GrantRegistryError> {
+        take_file(&mut self.files, id, role, access)
+    }
+
+    /// Atomically adopts an ordered set of exact existing-file descriptors.
+    ///
+    /// Every request is validated, including duplicate IDs, before any entry is
+    /// removed. A failed request therefore leaves the complete registry intact.
+    pub fn take_files(
+        &mut self,
+        requests: &[(GrantId, ResourceRole, GrantAccess)],
+    ) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+        take_files(&mut self.files, requests)
+    }
+
+    /// Moves all regular-file grants into a sendable one-time registry.
+    pub fn take_file_registry(&mut self) -> FileGrantRegistry {
+        FileGrantRegistry {
+            entries: std::mem::take(&mut self.files),
+        }
+    }
+
+    /// Adopts one exact active directory scope once.
+    pub fn take_scoped_directory(
+        &mut self,
+        id: &GrantId,
+        role: ResourceRole,
+    ) -> Result<GrantedDirectory, GrantRegistryError> {
+        let matches = matches!(
+            self.directories.get(id),
+            Some(directory)
+                if directory.role == role && directory.access == GrantAccess::CreateChildren
+        );
+        if !matches {
+            return Err(GrantRegistryError);
+        }
+        self.directories.remove(id).ok_or(GrantRegistryError)
+    }
+}
+
+/// One-time registry containing only thread-transferable existing-file grants.
+#[derive(Default)]
+pub struct FileGrantRegistry {
+    entries: HashMap<GrantId, GrantedFile>,
+}
+
+impl fmt::Debug for FileGrantRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileGrantRegistry")
+            .field("entries", &"<redacted>")
+            .finish()
+    }
+}
+
+impl FileGrantRegistry {
+    /// Returns the number of unadopted file grants.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether no unadopted file authority remains.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -81,43 +156,68 @@ impl GrantRegistry {
         role: ResourceRole,
         access: GrantAccess,
     ) -> Result<GrantedFile, GrantRegistryError> {
-        let matches = matches!(
-            self.entries.get(id),
-            Some(GrantedResource::File(file)) if file.role == role && file.access == access
-        );
-        if !matches {
-            return Err(GrantRegistryError);
-        }
-        match self.entries.remove(id) {
-            Some(GrantedResource::File(file)) => Ok(file),
-            Some(GrantedResource::Directory(_)) | None => Err(GrantRegistryError),
-        }
+        take_file(&mut self.entries, id, role, access)
     }
 
-    /// Adopts one exact active directory scope once.
-    pub fn take_scoped_directory(
+    /// Atomically adopts an ordered set of exact existing-file descriptors.
+    pub fn take_files(
         &mut self,
-        id: &GrantId,
-        role: ResourceRole,
-    ) -> Result<GrantedDirectory, GrantRegistryError> {
-        let matches = matches!(
-            self.entries.get(id),
-            Some(GrantedResource::Directory(directory))
-                if directory.role == role && directory.access == GrantAccess::CreateChildren
-        );
-        if !matches {
-            return Err(GrantRegistryError);
-        }
-        match self.entries.remove(id) {
-            Some(GrantedResource::Directory(directory)) => Ok(directory),
-            Some(GrantedResource::File(_)) | None => Err(GrantRegistryError),
-        }
+        requests: &[(GrantId, ResourceRole, GrantAccess)],
+    ) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+        take_files(&mut self.entries, requests)
     }
 }
 
-enum GrantedResource {
-    File(GrantedFile),
-    Directory(GrantedDirectory),
+fn take_file(
+    entries: &mut HashMap<GrantId, GrantedFile>,
+    id: &GrantId,
+    role: ResourceRole,
+    access: GrantAccess,
+) -> Result<GrantedFile, GrantRegistryError> {
+    let matches = matches!(
+        entries.get(id),
+        Some(file) if file.role == role && file.access == access
+    );
+    if !matches {
+        return Err(GrantRegistryError);
+    }
+    entries.remove(id).ok_or(GrantRegistryError)
+}
+
+fn take_files(
+    entries: &mut HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess)],
+) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+    let mut ids = HashSet::with_capacity(requests.len());
+    for (id, role, access) in requests {
+        if !ids.insert(id)
+            || !matches!(
+                entries.get(id),
+                Some(file) if file.role == *role && file.access == *access
+            )
+        {
+            return Err(GrantRegistryError);
+        }
+    }
+
+    let mut files = Vec::new();
+    files
+        .try_reserve_exact(requests.len())
+        .map_err(|_| GrantRegistryError)?;
+    for (id, _, _) in requests {
+        let Some(file) = entries.remove(id) else {
+            for (restored_id, restored_file) in requests
+                .iter()
+                .zip(files.drain(..))
+                .map(|((restored_id, _, _), restored_file)| (restored_id.clone(), restored_file))
+            {
+                entries.insert(restored_id, restored_file);
+            }
+            return Err(GrantRegistryError);
+        };
+        files.push(file);
+    }
+    Ok(files)
 }
 
 /// Adopted existing-file capability.
@@ -504,20 +604,26 @@ impl StagedGrantBatch {
         }
 
         let staged = std::mem::take(&mut self.entries);
-        let mut entries = HashMap::with_capacity(staged.len());
+        let mut files = HashMap::with_capacity(staged.len());
+        let mut directories = HashMap::new();
         for (id, resource) in staged {
-            let granted = match resource {
+            match resource {
                 StagedResource::File {
                     role,
                     access,
                     identity,
                     descriptor,
-                } => GrantedResource::File(GrantedFile {
-                    role,
-                    access,
-                    identity,
-                    descriptor,
-                }),
+                } => {
+                    files.insert(
+                        id,
+                        GrantedFile {
+                            role,
+                            access,
+                            identity,
+                            descriptor,
+                        },
+                    );
+                }
                 StagedResource::Directory {
                     role,
                     access,
@@ -531,19 +637,21 @@ impl StagedGrantBatch {
                     // Observe the private bit without logging or making it a verdict.
                     let _ = scope.is_stale();
                     validate_scoped_path(scope.path(), identity)?;
-                    GrantedResource::Directory(GrantedDirectory {
-                        role,
-                        access,
-                        identity,
-                        anchor,
-                        scope,
-                    })
+                    directories.insert(
+                        id,
+                        GrantedDirectory {
+                            role,
+                            access,
+                            identity,
+                            anchor,
+                            scope,
+                        },
+                    );
                 }
-            };
-            entries.insert(id, granted);
+            }
         }
         Ok(CommittedGrantBatch {
-            registry: GrantRegistry { entries },
+            registry: GrantRegistry { files, directories },
             batch: self.batch.ok_or(GrantRegistryError)?,
             grant_count: declaration.grant_count,
             final_sequence,
@@ -872,6 +980,133 @@ mod tests {
         assert!(
             registry
                 .take_file(&id, ResourceRole::KernelImage, GrantAccess::ReadOnly)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn file_registry_batch_adoption_is_failure_atomic() {
+        let kernel_id = GrantId::parse("kernel").expect("kernel ID should parse");
+        let initrd_id = GrantId::parse("initrd").expect("initrd ID should parse");
+        let kernel = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("kernel fixture should open");
+        let initrd = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
+            .expect("initrd fixture should open");
+        let kernel_descriptor = duplicate(&kernel);
+        let initrd_descriptor = duplicate(&initrd);
+        let kernel_stat =
+            descriptor_stat(kernel_descriptor.as_raw_fd()).expect("kernel stat should read");
+        let initrd_stat =
+            descriptor_stat(initrd_descriptor.as_raw_fd()).expect("initrd stat should read");
+        let mut registry = GrantRegistry {
+            files: HashMap::from([
+                (
+                    kernel_id.clone(),
+                    GrantedFile {
+                        role: ResourceRole::KernelImage,
+                        access: GrantAccess::ReadOnly,
+                        identity: ObjectIdentity {
+                            device: normalized_device(kernel_stat.st_dev),
+                            inode: kernel_stat.st_ino,
+                        },
+                        descriptor: kernel_descriptor,
+                    },
+                ),
+                (
+                    initrd_id.clone(),
+                    GrantedFile {
+                        role: ResourceRole::InitrdImage,
+                        access: GrantAccess::ReadOnly,
+                        identity: ObjectIdentity {
+                            device: normalized_device(initrd_stat.st_dev),
+                            inode: initrd_stat.st_ino,
+                        },
+                        descriptor: initrd_descriptor,
+                    },
+                ),
+            ]),
+            directories: HashMap::new(),
+        };
+        let mut files = registry.take_file_registry();
+        assert!(registry.is_empty());
+        assert_eq!(
+            format!("{files:?}"),
+            "FileGrantRegistry { entries: \"<redacted>\" }"
+        );
+        assert!(
+            files
+                .take_files(&[])
+                .expect("empty adoption should succeed")
+                .is_empty()
+        );
+        assert_eq!(files.len(), 2);
+        assert!(
+            files
+                .take_file(
+                    &kernel_id,
+                    ResourceRole::KernelImage,
+                    GrantAccess::WriteOnly,
+                )
+                .is_err()
+        );
+        assert_eq!(files.len(), 2);
+
+        let wrong_second = [
+            (
+                kernel_id.clone(),
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+            ),
+            (
+                initrd_id.clone(),
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+            ),
+        ];
+        assert!(files.take_files(&wrong_second).is_err());
+        assert_eq!(files.len(), 2);
+
+        let duplicate = [
+            (
+                kernel_id.clone(),
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+            ),
+            (
+                kernel_id.clone(),
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+            ),
+        ];
+        assert!(files.take_files(&duplicate).is_err());
+        assert_eq!(files.len(), 2);
+
+        let adopted = files
+            .take_files(&[
+                (
+                    initrd_id.clone(),
+                    ResourceRole::InitrdImage,
+                    GrantAccess::ReadOnly,
+                ),
+                (
+                    kernel_id.clone(),
+                    ResourceRole::KernelImage,
+                    GrantAccess::ReadOnly,
+                ),
+            ])
+            .expect("matching reverse-order pair should adopt");
+        assert_eq!(adopted.len(), 2);
+        assert_eq!(adopted[0].role, ResourceRole::InitrdImage);
+        assert_eq!(adopted[1].role, ResourceRole::KernelImage);
+        assert!(files.is_empty());
+        assert!(
+            files
+                .take_file(&kernel_id, ResourceRole::KernelImage, GrantAccess::ReadOnly,)
+                .is_err()
+        );
+        assert!(
+            files
+                .take_file(&initrd_id, ResourceRole::InitrdImage, GrantAccess::ReadOnly,)
                 .is_err()
         );
     }

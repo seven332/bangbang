@@ -49,9 +49,10 @@ map to the current macOS/HVF scaffold:
 bangbang currently rejects Linux-specific Firecracker process options rather
 than silently accepting them. The production bundle supplies a macOS App
 Sandbox launcher/worker boundary plus bounded per-VM lifecycle and startup-grant
-channels. Existing VM resource consumers have not adopted that grant registry,
-and exact seccomp/jailer outcome replacement and complete distribution-signing
-policy remain absent.
+channels. Contained startup config, startup metadata, kernel, and initrd inputs
+adopt exact read-only grants; other host-path consumers have not yet adopted the
+registry. Exact seccomp/jailer outcome replacement and complete
+distribution-signing policy remain absent.
 
 Apple App Sandbox is a supportable containment building block, not a direct
 jailer port. The lower-level signed target packages real binaries as minimal
@@ -62,8 +63,10 @@ bounded protocol rejection, signal cancellation, both surviving-process cleanup
 directions, both-killed recovery, concurrent namespace isolation, owned socket
 cleanup, typed startup grant allow/deny behavior, and a real sandboxed guest.
 The direct CLI remains an ordinary non-sandboxed executable. Production can
-commit typed startup authority, but current Firecracker path consumers still use
-only container or sealed resources until their dedicated adoption slices land.
+commit typed startup authority, and its config, metadata, kernel, and initrd
+consumers use granted descriptors without reopening their tagged path strings.
+Drives, pmem, snapshot paths, API/vsock directories, observability sinks, and
+dynamic post-Ready resources still need dedicated adoption slices.
 
 ## Platform-Limit Taxonomy
 
@@ -94,8 +97,9 @@ changes Firecracker-facing behavior or security posture:
   when the public process boundary is affected.
 - Operator-owned policy: socket-directory permissions, host-path ownership, and
   current resource-sharing rules remain deployment assumptions. Startup grants
-  now preauthorize closed roles, but each existing consumer still needs an
-  explicit one-time adoption and resource-specific mutation/cleanup policy.
+  now preauthorize closed roles. Config, metadata, kernel, and initrd have
+  explicit one-time adoption; each remaining consumer still needs its own
+  resource-specific mutation and cleanup policy.
   Document the assumption and test that one `bangbang` process does not clean
   up resources it no longer owns.
 
@@ -113,8 +117,8 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
 | Network and vmnet | Implemented virtio-MMIO/MMDS-only subset; direct vmnet conditional | Keep supported `host_dev_name` forms, startup validation, MMDS-only behavior, entitlement requirements, and non-goals documented when network behavior changes. |
-| macOS App Sandbox | Production nested worker implemented for container/sealed resources and explicit startup grants | Keep the ordinary CLI explicitly uncontained and prove package identity plus real ungranted denial and granted operation behavior. |
-| Launcher and resource broker | Authenticated lifecycle v2 plus bounded atomic startup grants implemented; consumer adoption and dynamic brokerage missing | Require exact role/access/identity checks, one-time registry adoption, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
+| macOS App Sandbox | Production nested worker implemented for container/sealed resources plus granted config, metadata, kernel, and initrd inputs | Keep the ordinary CLI explicitly uncontained and prove package identity plus real ungranted denial and granted operation behavior. |
+| Launcher and resource broker | Authenticated lifecycle v2, bounded atomic startup grants, and four startup-input consumers implemented; remaining consumers and dynamic brokerage missing | Require exact role/access/identity checks, one-time registry adoption, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
 
 ## Native Snapshot Composite and Device Boundary
 
@@ -217,7 +221,7 @@ separately signed nested VMM worker constrained by App Sandbox. The launcher has
 no Hypervisor or App Sandbox entitlement and the worker has exactly both. This
 is a real deployed containment boundary, but it is not Firecracker's Linux
 jailer. It now preauthorizes bounded startup resources; existing public path
-consumers do not adopt them yet.
+consumers for startup config, startup metadata, kernel, and initrd adopt them.
 
 Use the following boundaries when designing or reviewing macOS isolation work:
 
@@ -225,8 +229,8 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | --- | --- | --- |
 | Operator-owned private directories | Required for API sockets, vsock sockets, observability sinks, and other configured paths that should not be shared. | A launcher or broker could create and own these directories before starting a VM process. |
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
-| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources and a closed startup grant batch are the current contained-mode authority. | Existing consumers, dynamic delivery, and vmnet authorization require later explicit policy. |
-| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one default-close worker, authenticates lifecycle v2, owns cancellation/status, coordinates an empty namespace, and atomically transfers a bounded typed startup batch. | Add consumer-specific one-time adoption and cleanup, or a separately challenged dynamic broker; never infer hard revocation from closing a duplicate descriptor. |
+| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, and initrd descriptors are the current contained-mode authority. | Remaining consumers, dynamic delivery, and vmnet authorization require later explicit policy. |
+| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one default-close worker, authenticates lifecycle v2, owns cancellation/status, coordinates an empty namespace, atomically transfers a bounded typed startup batch, and supports one-time adoption by four startup-input consumers. | Add adoption and cleanup for the remaining consumers, or a separately challenged dynamic broker; never infer hard revocation from closing a duplicate descriptor. |
 | Firecracker Linux jailer model | Platform-limited unsupported as a direct port. | Keep Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege-drop flags rejected or documented until macOS replacements exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
@@ -292,8 +296,34 @@ never falls back to an ambient path. Unadopted values drop on cancellation,
 terminal exit, disconnect, bootstrap failure, or process exit. SCM_RIGHTS creates
 an independent descriptor reference, so closing the launcher's copy is cleanup,
 not revocation. Dynamic post-Ready delivery and hard revocation require a later
-broker design. Existing Firecracker path consumers are intentionally unchanged
-in this foundation slice.
+broker design.
+
+Contained mode recognizes only the exact, case-sensitive
+`bangbang-grant:<GrantId>` form. The direct CLI treats the same text as an
+ordinary pathname. Config and metadata claims must match their singleton role
+and read-only access, then use the existing bounded regular-file readers on the
+adopted descriptors. Kernel and optional initrd claims are validated and removed
+from the registry as one failure-atomic batch when boot-source configuration is
+applied. A malformed, missing, mismatched, or already-consumed tagged claim
+fails without changing public VM configuration and never falls back to the tag
+as a pathname. Mixed boot sources claim only their tagged members; ordinary
+members retain their prior deferred-path behavior.
+
+Prepared kernel and initrd descriptors are stored beside the public boot-source
+configuration and consumed once by `InstanceStart`; the loader never reopens the
+tag strings. `GET /vm/config` may return those references as authorized
+configuration output, while errors and logs remain redacted. Preflight failures
+before descriptor consumption remain retryable. Once boot consumes a singleton
+grant, a later boot failure requires a fresh contained launch and grant batch,
+unless the boot source is successfully replaced with ordinary paths. The
+session's file authority is synchronized across the control reader and API
+worker so cancellation, terminal exit, or disconnect invalidates every pending
+file claim. Already adopted descriptors are cooperatively owned resources, not
+hard-revocable handles.
+
+Drive and pmem backing, snapshot inputs/outputs, API and vsock directories,
+observability sinks, and dynamic post-Ready resources do not yet consume their
+declared grant roles.
 
 ## App Sandbox Validation Boundary
 
@@ -318,8 +348,9 @@ access or security-scoped URLs/bookmarks for many external files; a production
 sandboxed VMM therefore needs either container/sealed resources or a separately
 designed launcher/broker that transfers authorized resources. The production
 bundle now includes the bounded startup transfer described above; the public
-build wrapper still embeds no guest resources, current path consumers do not
-adopt the registry, and no dynamic broker or hard revocation is claimed.
+build wrapper still embeds no guest resources. The production worker adopts
+grants for config, metadata, kernel, and initrd; remaining path consumers have
+not adopted the registry, and no dynamic broker or hard revocation is claimed.
 
 ## Production Bundle and Signed Worker Boundary
 
@@ -416,10 +447,11 @@ restart or reconnect.
 The outer launcher, fixed metadata, and signed nested code are trusted package
 components. API requests, guest data, device input, host path arguments, and
 HVF exits remain untrusted worker inputs. Container/sealed resources plus the
-committed startup registry are the current contained authority. vmnet and
-dynamic resources remain unbrokered; snapshots, vsock paths, observability
-sinks, and arbitrary kernel/disk/config paths need later consumer-specific
-registry adoption before the production worker can use their grants.
+committed startup registry are the current contained authority. Granted config,
+metadata, kernel, and initrd files are consumed through their opened identities.
+vmnet and dynamic resources remain unbrokered; drives, pmem, snapshots, API and
+vsock paths, and observability sinks need later consumer-specific registry
+adoption before the production worker can use their grants.
 
 ## vmnet Host Policy Boundary
 
@@ -1432,8 +1464,9 @@ external resources or coordinate caller-supplied paths across launchers.
 
 The current scaffold does not implement:
 
-- adoption of startup grants by existing Firecracker path consumers, dynamic
-  post-Ready grants, or a complete hard-revocation broker policy
+- startup-grant adoption for drives, pmem, snapshots, API/vsock paths, or
+  observability sinks; dynamic post-Ready grants; or a complete hard-revocation
+  broker policy
 - Developer ID possession, notarization, kernel launch constraints, or an
   automatic restart/reconnect policy
 - a Firecracker-jailer replacement

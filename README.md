@@ -311,11 +311,22 @@ bookmark fragmentation, SCM_RIGHTS, one five-second absolute deadline, and a
 session-owned one-time typed registry. Closing the launcher's duplicate does
 not revoke an already delivered descriptor; cleanup is cooperative ownership.
 
-This release provides the authorization foundation only. Existing
-Firecracker-facing path consumers do not adopt these grants yet, so the
-manifest does not make external kernel, disk, socket, telemetry, or snapshot
-paths usable by those consumers. Dynamic post-Ready brokerage, vmnet
-provisioning, automatic restart policy, Developer ID possession proof,
+The first production consumers now adopt read-only startup config, startup
+metadata, kernel, and initrd grants. In authenticated contained mode the exact
+case-sensitive private reference `bangbang-grant:<GrantId>` claims one matching
+ID/role/access entry; malformed, missing, mismatched, or consumed claims fail
+without pathname or singleton fallback. Direct mode treats the same bytes as an
+ordinary pathname. Config and metadata read the transferred descriptor, while
+explicit kernel/initrd references are claimed atomically when boot-source
+configuration is applied, retained across API readiness, and consumed once by
+boot loading without reopening the reference. Mixed boot sources claim only
+their referenced members and leave ordinary members on deferred pathname
+opening. Submitted boot references remain visible through the owner-authorized
+VM configuration response but never appear in diagnostics. A
+descriptor-consuming boot failure requires a fresh contained launch for
+grant-backed retry because those roles are singleton. Block/pmem,
+socket, observability, and snapshot consumers, dynamic post-Ready brokerage,
+vmnet provisioning, automatic restart policy, Developer ID possession proof,
 launch-constraint policy, and notarization workflow remain. The session
 namespace stays empty and stores no path, descriptor, bookmark, or grant bytes.
 Same-identifier workers share one App Sandbox
@@ -640,8 +651,10 @@ both-killed namespace cleanup, concurrent-session isolation, owned-socket
 cleanup, mandatory empty-grant startup, typed read-only/write-only/directory
 grants, mismatch rollback, grant-phase cancellation/deadline behavior,
 grant-bearing crash/concurrency isolation, absence of the test exerciser from
-the normal production build, and a real sandboxed HVF guest through
-`SYSTEM_OFF`.
+the normal production build, exact external config/metadata/kernel/initrd
+adoption by the normal worker, delayed API boot claims, pathname-replacement
+identity, redacted failure-atomic wrong/missing claims, and real sandboxed HVF
+guests through `SYSTEM_OFF`.
 
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
 validation work:

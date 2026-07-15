@@ -389,14 +389,19 @@ are monotonic and sequence-checked. A surviving side performs exact-inode
 cleanup, and a later worker performs bounded unlocked-empty recovery after both
 sides are killed. Signed Apple Silicon evidence covers malformed bootstrap and
 fd closure, worker-first/launcher-first/both-killed cases, concurrent-session
-isolation, both graceful signals, container API service, and a real sandboxed
-HVF guest ending through PSCI `SYSTEM_OFF`.
+isolation, both graceful signals, container API service, exact external startup
+config/metadata/kernel/initrd grants, delayed atomic boot claims that retain the
+opened identities after pathname replacement, failure-atomic mismatch handling,
+and real sandboxed HVF guests ending through PSCI `SYSTEM_OFF`.
 
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
-empty session namespace grants no host resource. Security-scoped bookmarks,
-external descriptor/resource authority, vmnet provisioning and policy, jailer
-limits/credentials, seccomp outcomes, launch constraints, Developer ID
-possession, automatic restart, and notarization remain later work.
+session namespace itself grants no host resource. The bounded startup channel
+provides external descriptor authority, and contained config, metadata, kernel,
+and initrd consumers adopt exact read-only grants without reopening tagged path
+strings. Drives, pmem, snapshots, sockets, observability outputs, dynamic
+post-Ready brokerage, vmnet provisioning and policy, jailer limits/credentials,
+seccomp outcomes, launch constraints, Developer ID possession, automatic
+restart, and notarization remain later work.
 
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current
@@ -3000,11 +3005,13 @@ signature and entitlement split, tamper gate, container denial/redaction,
 signal/exit forwarding, mandatory lifecycle-v2 grant acknowledgment, typed
 SCM_RIGHTS file authority, one-session directory bookmark scope, atomic
 rollback, grant-bearing crash/concurrency behavior, socket cleanup, and real HVF
-guest lifecycle. The ordinary CLI remains uncontained. This is a startup grant
-foundation: existing config/metadata/kernel/initrd, block/pmem, socket,
-observability, and snapshot path consumers do not adopt the registry yet.
-Dynamic brokerage, vmnet provisioning, Linux seccomp outcome classification,
-and deployment signing policy remain later #1351 work.
+guest lifecycle. The ordinary CLI remains uncontained. Contained startup config,
+metadata, kernel, and initrd consumers now adopt exact, one-time read-only
+grants; the signed normal bundle proves no-API and delayed API use, retained
+opened identity, redacted failure-atomic mismatch handling, and real guest boot.
+Block/pmem, socket, observability, and snapshot path consumers, dynamic
+brokerage, vmnet provisioning, Linux seccomp outcome classification, and
+deployment signing policy remain later #1351 work.
 
 ## Validation Expectations
 

@@ -3300,7 +3300,7 @@
     {
       "id": "semantic.isolation:host-resource-authority-and-brokerage",
       "family": "isolation",
-      "summary": "Lifecycle v2 now gates Proceed on an atomic bounded startup batch: strict no-follow manifests, typed SCM_RIGHTS file descriptors, anchored one-session mutable-directory bookmarks, exact session/batch/sequence/identity/access validation, and one-time redacted registry ownership are implemented with signed allow/deny proof. Existing Firecracker consumer adoption, dynamic brokerage/hard revocation, vmnet authority, and resource-specific mutation/cleanup remain feasible under #1351.",
+      "summary": "Lifecycle v2 gates Proceed on an atomic bounded startup batch with strict no-follow manifests, typed SCM_RIGHTS file descriptors, anchored one-session mutable-directory bookmarks, exact session/batch/sequence/identity/access validation, and one-time redacted registry ownership. Contained config, metadata, kernel, and initrd consumers adopt exact read-only descriptors without reopening tagged paths; signed normal-bundle proof covers no-API/API use, pathname replacement, failure-atomic claims, redaction, and real guest boot. Remaining consumers, dynamic brokerage/hard revocation, vmnet authority, and resource-specific mutation/cleanup remain feasible under #1351.",
       "source_refs": [
         "corpus:jailer",
         "corpus:network-setup",
@@ -3312,7 +3312,7 @@
     {
       "id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
       "family": "isolation",
-      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker now has a default-close standard/lifecycle/grant descriptor allowlist, authenticated lifecycle v2, mandatory atomic startup-grant acknowledgment, and locked private namespace; remaining jailer limits, credentials, daemonization, seccomp, consumer resource, network, and deployment outcomes require explicit macOS equivalents under #1351.",
+      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a default-close standard/lifecycle/grant descriptor allowlist, authenticated lifecycle v2, mandatory atomic startup-grant acknowledgment, a locked private namespace, and exact contained consumption of granted startup config, metadata, kernel, and initrd files. Remaining jailer limits, credentials, daemonization, seccomp, other consumer resources, network, and deployment outcomes require explicit macOS equivalents under #1351.",
       "source_refs": [
         "corpus:jailer",
         "corpus:production-host",
@@ -3325,7 +3325,7 @@
     {
       "id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
       "family": "isolation",
-      "summary": "The fixed launcher owns one dynamically validated worker through exact-sequence lifecycle and grant channels with nonblocking signal/child observation, one absolute grant deadline, failure-atomic staging, structured readiness/cancellation/terminal state, replacement-safe namespaces, both grant-bearing crash-order cleanup, bounded both-killed recovery, redaction, and signed noninterchangeable concurrent authority. Dynamic-resource races and malicious same-container sibling isolation remain feasible under #1351.",
+      "summary": "The fixed launcher owns one dynamically validated worker through exact-sequence lifecycle and grant channels with nonblocking signal/child observation, one absolute grant deadline, failure-atomic staging and exact multi-file claims, synchronized pending-authority invalidation on cancellation/disconnect, structured readiness/terminal state, replacement-safe namespaces, both grant-bearing crash-order cleanup, bounded both-killed recovery, redaction, and signed noninterchangeable concurrent authority. Dynamic-resource races and malicious same-container sibling isolation remain feasible under #1351.",
       "source_refs": [
         "corpus:design",
         "corpus:production-host"

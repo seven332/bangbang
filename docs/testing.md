@@ -727,9 +727,15 @@ may skip execution. On supported Apple Silicon it proves:
   distinct grant authority cannot be interchanged;
 - rejection of the internal grant probe by the normal production worker with no
   resource mutation, proving the exerciser is absent from the shipped build;
-  and
-- a sealed test-only kernel/initrd/config launching a real sandboxed HVF guest
-  after committed no-API readiness and ending through PSCI `SYSTEM_OFF`.
+- both the sealed baseline and externally granted startup config, metadata,
+  kernel, and initrd launching real sandboxed HVF guests after committed no-API
+  readiness and ending through PSCI `SYSTEM_OFF`;
+- delayed API-time kernel/initrd adoption after metadata readiness, pathname
+  replacement after the launcher opened the files, authorized references in
+  `GET /vm/config`, and a real guest boot from the retained identities; and
+- invalid-command-line, wrong-role, and missing boot requests preserving the
+  prior public configuration; grant faults stay redacted and the otherwise
+  valid pair remains unconsumed.
 
 The runner's resource overlays and grant exerciser are internal signed-test
 inputs. `scripts/build-production-bundle.sh` explicitly excludes the feature,

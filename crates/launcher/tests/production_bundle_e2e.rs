@@ -39,6 +39,14 @@ const GRANT_DELAY_OPTION: &str = "--bangbang-internal-grant-delay-v1";
 const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
 const GRANT_PROBE_MARKER: &str = "grant-integration-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
+const STARTUP_CONFIG_ID: &str = "grant-config-1360";
+const STARTUP_METADATA_ID: &str = "grant-metadata-1360";
+const KERNEL_ID: &str = "grant-kernel-1360";
+const INITRD_ID: &str = "grant-initrd-1360";
+const STARTUP_CONFIG_REF: &str = "bangbang-grant:grant-config-1360";
+const STARTUP_METADATA_REF: &str = "bangbang-grant:grant-metadata-1360";
+const KERNEL_REF: &str = "bangbang-grant:grant-kernel-1360";
+const INITRD_REF: &str = "bangbang-grant:grant-initrd-1360";
 const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 const PROCESS_FAILURE_EXIT_CODE: i32 = 1;
@@ -264,6 +272,168 @@ fn launcher_preserves_sandbox_outside_path_denial_and_redaction() {
     let denied = denied.to_string_lossy();
     assert!(!stdout.contains(denied.as_ref()) && !stderr.contains(denied.as_ref()));
     assert!(!stdout.contains("status: VM running without API"));
+}
+
+#[test]
+fn normal_bundle_grants_external_config_metadata_and_boot_inputs_to_real_guest() {
+    let bundle = production_bundle();
+    let fixture = StartupGrantFixture::new(&bundle, "no-api");
+    let output = run_with_timeout(
+        Command::new(launcher(&bundle))
+            .arg(GRANT_MANIFEST_OPTION)
+            .arg(&fixture.manifest)
+            .arg("--")
+            .args(["--config-file", STARTUP_CONFIG_REF])
+            .args(["--metadata", STARTUP_METADATA_REF])
+            .arg("--no-api"),
+        PROCESS_TIMEOUT,
+        "external startup-grant guest SYSTEM_OFF",
+    );
+
+    assert_output_success(&output, "external startup-grant guest SYSTEM_OFF");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status: VM running without API"));
+    assert!(!stdout.contains("status: API server listening"));
+    fixture.assert_output_redacted(&output);
+}
+
+#[test]
+fn normal_bundle_delays_boot_claim_until_api_and_keeps_opened_identity() {
+    let bundle = production_bundle();
+    let mut fixture = StartupGrantFixture::new(&bundle, "api-identity");
+    let mut running = spawn_ready_startup_grant_api_launcher(&bundle, &fixture, true);
+
+    let metadata = http_get(&running.socket, "/mmds");
+    assert!(
+        metadata.starts_with("HTTP/1.1 200 "),
+        "response:\n{metadata}"
+    );
+    assert!(metadata.contains(&fixture.metadata_marker));
+
+    fixture.replace_boot_pathnames();
+    let boot_source = serde_json::json!({
+        "kernel_image_path": KERNEL_REF,
+        "initrd_path": INITRD_REF,
+        "boot_args": "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init",
+    });
+    let boot_response = http_put(
+        &running.socket,
+        "/boot-source",
+        &serde_json::to_string(&boot_source).expect("boot request should serialize"),
+    );
+    assert!(
+        boot_response.starts_with("HTTP/1.1 204 "),
+        "response:\n{boot_response}"
+    );
+    let config = http_get(&running.socket, "/vm/config");
+    assert!(config.starts_with("HTTP/1.1 200 "), "response:\n{config}");
+    assert!(config.contains(KERNEL_REF));
+    assert!(config.contains(INITRD_REF));
+
+    let start_response = http_put(
+        &running.socket,
+        "/actions",
+        r#"{"action_type":"InstanceStart"}"#,
+    );
+    assert!(
+        start_response.starts_with("HTTP/1.1 204 "),
+        "response:\n{start_response}"
+    );
+    let status = running.wait("external delayed-grant guest SYSTEM_OFF");
+    assert!(
+        status.success(),
+        "guest should reach SYSTEM_OFF: {status:?}"
+    );
+    assert!(!running.socket.exists());
+}
+
+#[test]
+fn normal_bundle_rejects_wrong_and_missing_boot_claims_without_consuming_pair() {
+    let bundle = production_bundle();
+    let fixture = StartupGrantFixture::new(&bundle, "api-mismatch");
+    let mut running = spawn_ready_startup_grant_api_launcher(&bundle, &fixture, false);
+
+    let prior_kernel = "/sealed/prior-kernel";
+    let prior = serde_json::json!({"kernel_image_path": prior_kernel});
+    let prior_response = http_put(
+        &running.socket,
+        "/boot-source",
+        &serde_json::to_string(&prior).expect("prior request should serialize"),
+    );
+    assert!(
+        prior_response.starts_with("HTTP/1.1 204 "),
+        "response:\n{prior_response}"
+    );
+
+    let invalid_command_line = serde_json::json!({
+        "kernel_image_path": KERNEL_REF,
+        "initrd_path": INITRD_REF,
+        "boot_args": "invalid\0command-line",
+    });
+    let invalid_response = http_put(
+        &running.socket,
+        "/boot-source",
+        &serde_json::to_string(&invalid_command_line)
+            .expect("invalid command-line request should serialize"),
+    );
+    assert!(
+        invalid_response.starts_with("HTTP/1.1 400 "),
+        "response:\n{invalid_response}"
+    );
+    assert!(invalid_response.contains("kernel command line is invalid"));
+    for sensitive in fixture.sensitive_strings() {
+        assert!(!invalid_response.contains(&sensitive));
+    }
+    let unchanged = http_get(&running.socket, "/vm/config");
+    assert!(unchanged.contains(prior_kernel));
+
+    let wrong_role = serde_json::json!({
+        "kernel_image_path": KERNEL_REF,
+        "initrd_path": STARTUP_METADATA_REF,
+    });
+    let wrong_response = http_put(
+        &running.socket,
+        "/boot-source",
+        &serde_json::to_string(&wrong_role).expect("wrong-role request should serialize"),
+    );
+    assert_private_grant_fault(&wrong_response, &fixture);
+    let unchanged = http_get(&running.socket, "/vm/config");
+    assert!(unchanged.contains(prior_kernel));
+    assert!(!unchanged.contains(KERNEL_REF));
+
+    let missing = serde_json::json!({
+        "kernel_image_path": "bangbang-grant:missing",
+        "initrd_path": INITRD_REF,
+    });
+    let missing_response = http_put(
+        &running.socket,
+        "/boot-source",
+        &serde_json::to_string(&missing).expect("missing request should serialize"),
+    );
+    assert_private_grant_fault(&missing_response, &fixture);
+    let unchanged = http_get(&running.socket, "/vm/config");
+    assert!(unchanged.contains(prior_kernel));
+
+    let valid = serde_json::json!({
+        "kernel_image_path": KERNEL_REF,
+        "initrd_path": INITRD_REF,
+    });
+    let valid_response = http_put(
+        &running.socket,
+        "/boot-source",
+        &serde_json::to_string(&valid).expect("valid request should serialize"),
+    );
+    assert!(
+        valid_response.starts_with("HTTP/1.1 204 "),
+        "response:\n{valid_response}"
+    );
+
+    let pid = i32::try_from(running.child.id()).expect("launcher PID should fit");
+    // SAFETY: `pid` is the live unreaped launcher owned by this test.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let status = running.wait("grant mismatch graceful stop");
+    assert!(status.success());
+    assert!(!running.socket.exists());
 }
 
 #[test]
@@ -643,6 +813,170 @@ fn run_graceful_signal_case(signal: i32, name: &str) {
 }
 
 #[derive(Debug)]
+struct StartupGrantFixture {
+    _root: TestDir,
+    config: PathBuf,
+    metadata: PathBuf,
+    kernel: PathBuf,
+    initrd: PathBuf,
+    manifest: PathBuf,
+    metadata_marker: String,
+}
+
+impl StartupGrantFixture {
+    fn new(bundle: &Path, case: &str) -> Self {
+        let root = TestDir::new(&format!("startup-grant-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("startup grant root should canonicalize");
+        let config = canonical_root.join("external-config.json");
+        let metadata = canonical_root.join("external-metadata.json");
+        let kernel = canonical_root.join("external-kernel");
+        let initrd = canonical_root.join("external-initrd");
+        let manifest = canonical_root.join("grant-manifest.json");
+        let metadata_marker = format!("startup-grant-metadata-{case}");
+        let resources = worker_bundle(bundle).join("Contents/Resources");
+        fs::copy(resources.join("guest-kernel"), &kernel)
+            .expect("external kernel fixture should copy");
+        fs::copy(resources.join("guest-initrd"), &initrd)
+            .expect("external initrd fixture should copy");
+        fs::write(
+            &metadata,
+            serde_json::to_vec(&serde_json::json!({"grant-proof": metadata_marker}))
+                .expect("metadata fixture should serialize"),
+        )
+        .expect("external metadata fixture should write");
+        fs::write(
+            &config,
+            serde_json::to_vec(&serde_json::json!({
+                "machine-config": {"vcpu_count": 1, "mem_size_mib": 256},
+                "boot-source": {
+                    "kernel_image_path": KERNEL_REF,
+                    "initrd_path": INITRD_REF,
+                    "boot_args": "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init",
+                },
+            }))
+            .expect("config fixture should serialize"),
+        )
+        .expect("external config fixture should write");
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": STARTUP_CONFIG_ID,
+                    "role": "startup-config",
+                    "access": "read-only",
+                    "source": path_text(&config),
+                },
+                {
+                    "id": STARTUP_METADATA_ID,
+                    "role": "startup-metadata",
+                    "access": "read-only",
+                    "source": path_text(&metadata),
+                },
+                {
+                    "id": KERNEL_ID,
+                    "role": "kernel-image",
+                    "access": "read-only",
+                    "source": path_text(&kernel),
+                },
+                {
+                    "id": INITRD_ID,
+                    "role": "initrd-image",
+                    "access": "read-only",
+                    "source": path_text(&initrd),
+                },
+            ],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("grant manifest should serialize"),
+        )
+        .expect("startup grant manifest should write");
+
+        Self {
+            _root: root,
+            config,
+            metadata,
+            kernel,
+            initrd,
+            manifest,
+            metadata_marker,
+        }
+    }
+
+    fn replace_boot_pathnames(&mut self) {
+        let kernel_original = self
+            .kernel
+            .parent()
+            .expect("kernel path should have parent")
+            .join("opened-kernel");
+        let initrd_original = self
+            .initrd
+            .parent()
+            .expect("initrd path should have parent")
+            .join("opened-initrd");
+        fs::rename(&self.kernel, kernel_original).expect("opened kernel path should move");
+        fs::rename(&self.initrd, initrd_original).expect("opened initrd path should move");
+        fs::write(&self.kernel, b"replacement kernel must not boot")
+            .expect("replacement kernel should write");
+        fs::write(&self.initrd, b"replacement initrd must not boot")
+            .expect("replacement initrd should write");
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.config),
+            path_text(&self.metadata),
+            path_text(&self.kernel),
+            path_text(&self.initrd),
+            path_text(&self.manifest),
+            STARTUP_CONFIG_ID,
+            STARTUP_METADATA_ID,
+            KERNEL_ID,
+            INITRD_ID,
+            STARTUP_CONFIG_REF,
+            STARTUP_METADATA_REF,
+            KERNEL_REF,
+            INITRD_REF,
+            &self.metadata_marker,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn assert_output_redacted(&self, output: &Output) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for sensitive in self.sensitive_strings() {
+            assert!(
+                !stdout.contains(&sensitive),
+                "stdout leaked startup grant data"
+            );
+            assert!(
+                !stderr.contains(&sensitive),
+                "stderr leaked startup grant data"
+            );
+        }
+    }
+}
+
+fn assert_private_grant_fault(response: &str, fixture: &StartupGrantFixture) {
+    assert!(
+        response.starts_with("HTTP/1.1 400 "),
+        "response:\n{response}"
+    );
+    assert!(response.contains(r#"{"fault_message":"private resource grant failed"}"#));
+    for sensitive in fixture.sensitive_strings() {
+        assert!(
+            !response.contains(&sensitive),
+            "grant fault leaked private data"
+        );
+    }
+    assert!(!response.contains("bangbang-grant:missing"));
+}
+
+#[derive(Debug)]
 struct GrantProbeFixture {
     _root: TestDir,
     read: PathBuf,
@@ -952,6 +1286,7 @@ struct RunningApiLauncher {
     socket: PathBuf,
     stdout_reader: Option<JoinHandle<String>>,
     stderr_reader: Option<JoinHandle<String>>,
+    sensitive: Vec<String>,
     completed: bool,
 }
 
@@ -981,6 +1316,16 @@ impl RunningApiLauncher {
             !stderr.contains("session-debug"),
             "private diagnostics must stay absent\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
+        for sensitive in &self.sensitive {
+            assert!(
+                !stdout.contains(sensitive),
+                "stdout leaked startup grant data"
+            );
+            assert!(
+                !stderr.contains(sensitive),
+                "stderr leaked startup grant data"
+            );
+        }
         status
     }
 }
@@ -1021,6 +1366,53 @@ fn spawn_ready_api_launcher(bundle: &Path, name: &str) -> RunningApiLauncher {
         socket,
         stdout_reader: Some(stdout_reader),
         stderr_reader: Some(stderr_reader),
+        sensitive: Vec::new(),
+        completed: false,
+    }
+}
+
+fn spawn_ready_startup_grant_api_launcher(
+    bundle: &Path,
+    fixture: &StartupGrantFixture,
+    consume_metadata: bool,
+) -> RunningApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket =
+        container_tmp_dir().join(format!("bbg-{:x}-{test_id:x}.sock", std::process::id(),));
+    let mut command = Command::new(launcher(bundle));
+    command
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .args(["--api-sock", path_text(&socket)])
+        .args(["--id", &format!("grant-{test_id}")]);
+    if consume_metadata {
+        command.args(["--metadata", STARTUP_METADATA_REF]);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("startup-grant launcher should start");
+    let (ready, stdout_reader) = read_stdout_until_ready(&mut child);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "startup-grant API should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningApiLauncher {
+        child,
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive: fixture.sensitive_strings(),
         completed: false,
     }
 }
@@ -1327,12 +1719,24 @@ fn kill_child_group(child: &mut Child) {
 }
 
 fn http_get(socket: &Path, path: &str) -> String {
+    http_request(socket, "GET", path, "")
+}
+
+fn http_put(socket: &Path, path: &str, body: &str) -> String {
+    http_request(socket, "PUT", path, body)
+}
+
+fn http_request(socket: &Path, method: &str, path: &str, body: &str) -> String {
     let mut stream = UnixStream::connect(socket).expect("API socket should accept connections");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("API read timeout should be configured");
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .expect("HTTP request should be written");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("HTTP request should be written");
     stream
         .shutdown(std::net::Shutdown::Write)
         .expect("HTTP request write should close");

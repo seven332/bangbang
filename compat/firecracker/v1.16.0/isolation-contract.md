@@ -137,16 +137,34 @@ one-time by exact ID, role, and access. Mismatch never falls back to an ambient
 path. Unadopted authority drops on cancellation, terminal, disconnect,
 bootstrap failure, or process exit. SCM_RIGHTS duplicates kernel references, so
 closing the launcher's copy is cleanup rather than revocation. The empty private
-namespace still stores no resource data. Existing Firecracker path consumers
-remain unchanged in this foundation slice and therefore cannot yet use these
-grants. Operators may still use the direct uncontained executable for the
-existing host-path surface, but that mode is not evidence for the production
-containment records.
+namespace still stores no resource data.
+
+Contained mode recognizes only the exact, case-sensitive
+`bangbang-grant:<GrantId>` form. Startup config and metadata claim their
+singleton read-only descriptors before bounded parsing. Kernel and optional
+initrd claims are validated and removed together when boot-source configuration
+is applied, stored beside the public configuration, and consumed once during
+boot without reopening their tag strings. Malformed, missing, mismatched,
+or already-consumed tagged claims fail without changing VM configuration and
+without path or role fallback. Mixed boot sources claim only tagged members and
+leave ordinary members on deferred pathname opening. `GET /vm/config` may
+return the authorized references; diagnostics remain redacted. Direct mode
+treats the same text as an ordinary pathname.
+
+Preflight failures before boot descriptor consumption remain retryable. Once
+boot consumes a singleton grant, a later boot failure requires a fresh
+contained launch and grant batch unless the boot source is successfully
+replaced with ordinary paths. Cancellation, terminal exit, and disconnect
+synchronize with the file authority and invalidate pending claims; already
+adopted descriptor references remain cooperatively owned rather than
+hard-revocable. Operators may still use the direct uncontained executable for
+the broader existing host-path surface, but that mode is not evidence for the
+production containment records.
 
 The following remain feasible work owned by #1351:
 
-- consumer adoption for config/metadata/kernel/initrd, block/pmem,
-  API/vsock/observability, and snapshot resources;
+- consumer adoption for block/pmem, API/vsock/observability, and snapshot
+  resources;
 - dynamic post-Ready delivery and any hard-revocation broker;
 - vmnet entitlement/provisioning and per-VM network policy;
 - automatic restart/reconnect and any long-lived broker/service policy;
@@ -186,9 +204,16 @@ execution proves:
   normal bundle contains no test exerciser;
 - worker-first and launcher-first namespace cleanup, both-killed bounded stale
   recovery, and two concurrent API sessions remaining independent when one
-  worker dies; and
-- a test-only sealed kernel/initrd/config starting a real sandboxed HVF guest
-  through the launcher and ending successfully through PSCI `SYSTEM_OFF`.
+  worker dies;
+- both sealed and external-grant config/metadata/kernel/initrd inputs starting
+  real sandboxed HVF guests through no-API production launches and ending
+  successfully through PSCI `SYSTEM_OFF`;
+- delayed API-time atomic boot adoption retaining the opened file identities
+  after pathname replacement and returning the authorized references from
+  `GET /vm/config`; and
+- invalid-command-line, wrong-role, and missing boot requests preserving the
+  prior public configuration, with redacted grant faults and no consumption of
+  the valid pair.
 
 Readiness events and bounded deadlines replace fixed sleeps. Destructive cases
 operate on private copies, so later checks continue to use the canonical signed
@@ -204,9 +229,10 @@ work:
 - `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`
 - `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
 
-The delivered package/session/grant/fd/crash subset above is real but does not
-complete any of those composite records because consumer, dynamic-broker,
-network, Linux-outcome, and deployment work remains. The broad `jailer`, `seccomp`,
+The delivered package/session/grant/fd/crash subset, including exact adoption by
+the four startup-input consumers, is real but does not complete any of those
+composite records because remaining consumers, dynamic-broker, network,
+Linux-outcome, and deployment work remains. The broad `jailer`, `seccomp`,
 `seccompiler`, and `production-host` corpus records remain `audit-required`.
 Neither this audit nor the executable evidence is direct Firecracker jailer
 parity.

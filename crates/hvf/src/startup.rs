@@ -15,6 +15,7 @@ use bangbang_runtime::balloon::{
     BalloonMmioLayout, BalloonUpdateError, VirtioBalloonDeviceNotificationError,
 };
 use bangbang_runtime::block::{BlockMmioLayout, DriveConfig};
+use bangbang_runtime::boot::BootSourceFiles;
 use bangbang_runtime::boot_timer::{
     BootTimerMmioLayout, BootTimerMmioRegistrationError, register_boot_timer_mmio,
 };
@@ -2619,9 +2620,18 @@ impl OwnedHvfArm64BootSession {
         controller: &VmmController,
         config: HvfArm64BootSessionConfig,
     ) -> Result<Self, HvfArm64BootSessionError> {
+        Self::new_with_boot_files(controller, config, BootSourceFiles::default())
+    }
+
+    /// Constructs a session while consuming already-opened boot payload files.
+    pub fn new_with_boot_files(
+        controller: &VmmController,
+        config: HvfArm64BootSessionConfig,
+        boot_files: BootSourceFiles,
+    ) -> Result<Self, HvfArm64BootSessionError> {
         let mut backend = HvfBackend::new();
         let prepared: PreparedHvfArm64BootSession<'static> =
-            match prepare_arm64_boot_session_parts(&mut backend, controller, config) {
+            match prepare_arm64_boot_session_parts(&mut backend, controller, config, boot_files) {
                 Ok(prepared) => prepared,
                 Err(err) => {
                     let _ = <HvfBackend as VmBackend>::destroy_vm(&mut backend);
@@ -7766,7 +7776,12 @@ impl HvfBackend {
             return Err(HvfArm64BootSessionError::BackendAlreadyInitialized);
         }
 
-        let prepared = match prepare_arm64_boot_session_parts(self, controller, config) {
+        let prepared = match prepare_arm64_boot_session_parts(
+            self,
+            controller,
+            config,
+            BootSourceFiles::default(),
+        ) {
             Ok(prepared) => prepared,
             Err(err) => {
                 let _ = <Self as VmBackend>::destroy_vm(self);
@@ -7816,6 +7831,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
     backend: &mut HvfBackend,
     controller: &VmmController,
     config: HvfArm64BootSessionConfig,
+    boot_files: BootSourceFiles,
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
     <HvfBackend as VmBackend>::create_vm(backend)
         .map_err(|source| HvfArm64BootSessionError::CreateVm { source })?;
@@ -7859,7 +7875,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         .memory_hotplug_device
         .zip(interrupt_lines.memory_hotplug)
         .map(|(memory_hotplug, interrupt_line)| memory_hotplug.into_runtime(interrupt_line));
-    let resources = Arm64BootResources::assemble_from_controller(
+    let resources = Arm64BootResources::assemble_from_controller_with_boot_files(
         controller,
         Arm64BootResourceConfig {
             vcpu_mpidrs: &mpidrs,
@@ -7887,6 +7903,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
             memory_hotplug_device: runtime_memory_hotplug,
             entropy_device: runtime_entropy,
         },
+        boot_files,
     )
     .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
     let boot_registers = HvfArm64BootRegisters {

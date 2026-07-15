@@ -23,13 +23,28 @@ pub(crate) fn run(
     args: &[OsString],
 ) -> Result<(), ContainedSessionError> {
     let probe = ProbeCase::parse(args)?;
-    let registry = session.grant_registry_mut()?;
+    let authority = session.grant_authority().ok_or(ContainedSessionError)?;
 
     let read_id =
         GrantId::parse(&format!("probe-read-{}", probe.name)).map_err(|_| ContainedSessionError)?;
-    let read = registry
-        .take_file(&read_id, ResourceRole::KernelImage, GrantAccess::ReadOnly)
+    let write_id = GrantId::parse(&format!("probe-write-{}", probe.name))
         .map_err(|_| ContainedSessionError)?;
+    let directory_id =
+        GrantId::parse(&format!("probe-dir-{}", probe.name)).map_err(|_| ContainedSessionError)?;
+    let (read, write) = authority.with_registry(|registry| {
+        let read = registry
+            .take_file(&read_id, ResourceRole::KernelImage, GrantAccess::ReadOnly)
+            .map_err(|_| ContainedSessionError)?;
+        let write = registry
+            .take_file(&write_id, ResourceRole::LoggerSink, GrantAccess::WriteOnly)
+            .map_err(|_| ContainedSessionError)?;
+        Ok((read, write))
+    })?;
+    let directory = session.with_directory_grants(|registry| {
+        registry
+            .take_scoped_directory(&directory_id, ResourceRole::ApiSocketDirectory)
+            .map_err(|_| ContainedSessionError)
+    })?;
     let expected_read = format!("bangbang-grant-read-{}\n", probe.name);
     let mut actual_read = vec![0_u8; expected_read.len()];
     // SAFETY: The buffer is writable for its exact length and the registry owns
@@ -54,11 +69,6 @@ pub(crate) fn run(
         return Err(ContainedSessionError);
     }
 
-    let write_id = GrantId::parse(&format!("probe-write-{}", probe.name))
-        .map_err(|_| ContainedSessionError)?;
-    let write = registry
-        .take_file(&write_id, ResourceRole::LoggerSink, GrantAccess::WriteOnly)
-        .map_err(|_| ContainedSessionError)?;
     let expected_write = format!("bangbang-grant-write-{}\n", probe.name);
     // SAFETY: The source bytes remain live and the registry owns the exact
     // write-only descriptor for the synchronous fixed-offset write.
@@ -82,11 +92,6 @@ pub(crate) fn run(
         return Err(ContainedSessionError);
     }
 
-    let directory_id =
-        GrantId::parse(&format!("probe-dir-{}", probe.name)).map_err(|_| ContainedSessionError)?;
-    let directory = registry
-        .take_scoped_directory(&directory_id, ResourceRole::ApiSocketDirectory)
-        .map_err(|_| ContainedSessionError)?;
     let parent = directory.path().parent().ok_or(ContainedSessionError)?;
     match File::open(parent.join(OUTSIDE_FILE)) {
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
