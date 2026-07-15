@@ -282,6 +282,7 @@ PY
     --worker "$repo_root/target/$target_triple/release/bangbang" \
     --output "$production_bundle_path" \
     --signing-identity - \
+    --worker-profile networkless \
     --test-worker-resources "$production_resources"
 
   cargo build \
@@ -307,6 +308,7 @@ PY
     --worker "$repo_root/target/$target_triple/release/bangbang" \
     --output "$production_grant_test_bundle_path" \
     --signing-identity - \
+    --worker-profile networkless \
     --test-worker-resources "$production_grant_test_resources"
 
   cargo test \

@@ -100,10 +100,15 @@ to deny and can contain independent host/shared bits, at most four exact
 through 4. Contained InstanceStart validates the complete non-MMDS-only network
 set after controller preflight and before any grant or backend is consumed;
 all-MMDS needs no vmnet authority. Direct mode remains outside this production
-policy. Static/live code validation currently exposes only the exact
-networkless App Sandbox plus Hypervisor profile, which rejects every positive
-authority before worker spawn/resume. No restricted vmnet entitlement or real
-production connectivity is claimed by this contract revision.
+policy. Static/live code validation accepts only two exact profiles. The
+profile-absent App Sandbox plus Hypervisor `Networkless` shape rejects every
+positive authority. The profile-present five-key `Vmnet` shape adds documented
+Boolean `com.apple.vm.networking` plus bounded application/team identifiers and
+rejects denied authority. Vmnet publication additionally requires a bounded
+caller profile, profile-listed signing leaf, exact final inspection, and a
+successful disposable current-host authorization launch. This contract does
+not claim repository-owned Apple credentials, `vmnet_start_interface` success,
+or real production connectivity.
 
 Grant-channel v1 uses one complete AF_UNIX datagram per record with a 1024-byte
 application cap, independent random 128-bit BatchId, exact lifecycle SessionId
@@ -333,7 +338,8 @@ The following remain feasible work owned by #1351:
 
 - general dynamic post-Ready delivery and any hard-revocation broker;
 - cross-filesystem socket publication;
-- vmnet entitlement/provisioning and per-VM network policy;
+- real vmnet start/connectivity/cleanup evidence and broader per-VM network
+  policy beyond the authenticated mode/bridge/count authority;
 - automatic restart/reconnect and any long-lived broker/service policy;
 - arbitrary uid/gid transition, configurable chroot ownership, and any
   installer-owned or elevated service needed to support them;

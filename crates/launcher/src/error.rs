@@ -110,12 +110,16 @@ pub enum PackageError {
     InvalidInputEntry,
     /// The optional repository-test resource tree is invalid or too large.
     InvalidTestResources,
+    /// A vmnet provisioning profile is missing, malformed, mismatched, or unsafe.
+    InvalidProvisioningProfile,
     /// A private staging operation failed.
     Staging(io::ErrorKind),
     /// A fixed platform signing or metadata tool failed.
     ToolFailure(&'static str),
     /// Inspection found an unexpected identity, entitlement, or runtime flag.
     InspectionFailure,
+    /// The current host rejected or could not execute the vmnet authorization probe.
+    AuthorizationBlocked,
     /// The final bundle already exists.
     OutputAlreadyExists,
     /// Exclusive final publication failed.
@@ -132,6 +136,9 @@ impl fmt::Display for PackageError {
             Self::InvalidTestResources => {
                 formatter.write_str("invalid production bundle test resources")
             }
+            Self::InvalidProvisioningProfile => {
+                formatter.write_str("invalid production vmnet provisioning profile")
+            }
             Self::Staging(kind) => {
                 write!(formatter, "failed to stage production bundle: {kind:?}")
             }
@@ -139,6 +146,9 @@ impl fmt::Display for PackageError {
                 write!(formatter, "production bundle {tool} failed")
             }
             Self::InspectionFailure => formatter.write_str("production bundle inspection failed"),
+            Self::AuthorizationBlocked => {
+                formatter.write_str("production vmnet authorization blocked")
+            }
             Self::OutputAlreadyExists => {
                 formatter.write_str("production bundle output already exists")
             }

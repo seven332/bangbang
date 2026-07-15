@@ -498,6 +498,13 @@ mod tests {
         crate::macos::code_sign::WorkerProfile::Networkless
     }
 
+    fn vmnet_profile() -> crate::macos::code_sign::WorkerProfile {
+        crate::macos::code_sign::WorkerProfile::Vmnet {
+            application_identifier: "APPID12345.dev.bangbang.worker".to_owned(),
+            team_identifier: "TEAM123456".to_owned(),
+        }
+    }
+
     fn base(worker: &Path) -> Vec<OsString> {
         let (uid, gid) = current_credentials().expect("test credentials should be ordinary");
         vec![
@@ -608,6 +615,24 @@ mod tests {
     }
 
     #[test]
+    fn vmnet_profile_rejects_denied_policy_before_spawn() {
+        let LaunchCommand::Run(request) =
+            LaunchCommand::parse(Vec::new()).expect("legacy arguments should parse")
+        else {
+            panic!("run command expected");
+        };
+        assert!(matches!(
+            request.prepare(
+                Path::new("/fixed/worker"),
+                LaunchTiming::sample().expect("timing should sample"),
+                false,
+                vmnet_profile(),
+            ),
+            Err(LauncherError::InvalidLaunchPolicy)
+        ));
+    }
+
+    #[test]
     fn parses_exact_vmnet_authority_and_preserves_daemon_reparse_bytes() {
         let worker = Path::new("/fixed/BangbangWorker");
         let mut args = base(worker);
@@ -666,6 +691,21 @@ mod tests {
             ),
             Err(LauncherError::InvalidLaunchPolicy)
         ));
+
+        let LaunchCommand::Run(vmnet_request) =
+            LaunchCommand::parse(args).expect("vmnet policy should reparse")
+        else {
+            panic!("run command expected");
+        };
+        let prepared = vmnet_request
+            .prepare(
+                worker,
+                LaunchTiming::sample().expect("timing should sample"),
+                true,
+                vmnet_profile(),
+            )
+            .expect("vmnet profile should admit nonempty authority");
+        assert_eq!(prepared.worker_policy.vmnet_authority(), authority);
     }
 
     #[test]

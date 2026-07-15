@@ -701,7 +701,8 @@ disabled-by-default `production_bundle_e2e` target before an unsupported runner
 may skip execution. On supported Apple Silicon it proves:
 
 - exact launcher and worker identifiers, Hardened Runtime on both, no launcher
-  App Sandbox/Hypervisor authority, and exactly those two worker entitlements;
+  App Sandbox/Hypervisor authority, and exactly those two worker entitlements
+  with no embedded profile in the default networkless artifact;
 - unchanged help/output and representative nonzero worker exit forwarding
   through the structured lifecycle session;
 - exact early jailer help/version output and closed policy parsing, including
@@ -709,7 +710,10 @@ may skip execution. On supported Apple Silicon it proves:
   forwarded-singleton rejection, last-value resource limits, canonical
   default-denied vmnet grammar, and redacted failure;
 - rejection of every positive host/shared/bridge/count vmnet authority by the
-  current exact two-entitlement networkless profile before worker execution;
+  exact two-entitlement networkless profile before worker execution, plus
+  negative private-copy coverage for an unexpected networkless profile, a
+  missing profile on the five-key shape, a developer-prefixed extra claim, and
+  a five-key profile paired with denied policy;
 - a marker-only worker exec environment, absent caller/loader/debug variables,
   current credentials/session identity, descriptor-entered private cwd, exact
   default/explicit limits, real `EMFILE` exhaustion, and kernel `SIGXFSZ` at the
@@ -849,6 +853,28 @@ scripts/build-production-bundle.sh --output /path/to/Bangbang.app
 The destination must be absent and named `Bangbang.app`. The wrapper builds for
 `aarch64-apple-darwin`, uses ad-hoc signing by default, and accepts one optional
 signing identity for both independently signed code objects.
+
+The default path is the profile-absent two-entitlement `networkless` worker. A
+caller with an Apple-approved profile can exercise the same nonpublishing
+assembly, signing, exact entitlement/profile/certificate inspection, and
+current-host authorization gate with:
+
+```sh
+scripts/preflight-production-vmnet.sh \
+  --output /path/to/Bangbang.app \
+  --signing-identity "Developer ID Application: Example (TEAMID)" \
+  --provisioning-profile /private/path/vmnet.provisionprofile
+```
+
+Success is exactly `bangbang vmnet preflight: ready` and exit 0; any runtime
+credential/profile/signing/authorization failure is exactly
+`bangbang vmnet preflight: blocked` and exit 3. CI deliberately supplies no
+credential and asserts the blocked contract. Unit tests use synthetic decoded
+profiles and signing tools to prove bounds, ordering, leaf matching,
+nonpublication on authorization failure, cleanup, and that the disposable
+probe—not the supplied worker—is the only executable handed to the
+authorization runner. None of those tests claim `vmnet_start_interface` or
+packet connectivity; that positive signed matrix remains #1378.
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
