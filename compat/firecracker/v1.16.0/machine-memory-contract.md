@@ -1,4 +1,4 @@
-# Firecracker v1.16 machine sizing and 2M page contract
+# Firecracker v1.16 machine memory and dirty-epoch contract
 
 This contract fixes Bangbang's Apple Silicon/HVF interpretation of the pinned
 Firecracker v1.16.0 machine fields `vcpu_count`, `mem_size_mib`, `smt`,

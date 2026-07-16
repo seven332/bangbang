@@ -1528,9 +1528,10 @@ The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
 The allocation model creates one anonymous read/write private host memory
 mapping for each validated guest RAM range and releases the mappings with
 runtime ownership cleanup. It preserves each guest range with its host mapping
-for HVF map/unmap work. It does not use Firecracker's `vm-memory` crate; future
-device-memory, dirty-tracking, snapshot, or file-backed-memory work should
-evaluate the right abstraction from its concrete requirements.
+for HVF map/unmap work. It does not use Firecracker's `vm-memory` crate.
+`GuestMemory` now also owns the shared dirty bitmap used by bounded writes and
+native snapshot epochs; future direct file-backed guest RAM or new device-memory
+classes should evaluate the right abstraction from their concrete requirements.
 
 Guest memory byte access validates the whole requested guest address range
 before copying. Overflow, unmapped holes, and the aarch64 MMIO64 gap fail
