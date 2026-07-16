@@ -2684,6 +2684,314 @@ fn concurrently_runs_and_batch_cancels_two_vcpus() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation() {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    use bangbang_hvf::{
+        HvfArm64BootRegisters, HvfBackend, HvfDirtyWriteTrackerStopError, HvfMemoryPermissions,
+        HvfVcpuRunControlReason, HvfVcpuRunEvent, HvfVcpuRunMemberOutcome, HvfVcpuRunStepOutcome,
+    };
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+    use bangbang_runtime::mmio::MmioDispatcher;
+
+    const SECOND_ENTRY_OFFSET: u64 = 0x100;
+    const TARGET_START_PAGE: u64 = 2;
+    const VCPU0_VALUE: u16 = 0x11;
+    const VCPU1_VALUE: u16 = 0x22;
+    const STR_W1_X0: u32 = 0xb900_0001;
+    const STR_W1_X2: u32 = 0xb900_0041;
+    const DMB_ISH: u32 = 0xd503_3bbf;
+    const HVC_ZERO: u32 = 0xd400_0002;
+    const SPIN_FOREVER: u32 = 0x1400_0000;
+    const MAX_MEMBER_EVENTS: usize = 16;
+    const DIRTY_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn mov_w1(value: u16) -> u32 {
+        0x5280_0001 | (u32::from(value) << 5)
+    }
+
+    fn add_x2_x0_page_offset(host_page_size: u64, pages: u64) -> u32 {
+        const ADD_X2_X0_SHIFT_12: u32 = 0x9140_0002;
+        const ARM64_IMMEDIATE_PAGE_SIZE: u64 = 0x1000;
+
+        assert!(host_page_size.is_multiple_of(ARM64_IMMEDIATE_PAGE_SIZE));
+        let immediate = host_page_size
+            .checked_div(ARM64_IMMEDIATE_PAGE_SIZE)
+            .and_then(|units| units.checked_mul(pages))
+            .and_then(|units| u32::try_from(units).ok())
+            .expect("guest page offset should fit the ADD immediate");
+        assert!(immediate <= 0xfff);
+        ADD_X2_X0_SHIFT_12 | (immediate << 10)
+    }
+
+    fn guest_code(host_page_size: u64, value: u16, first_page: u64) -> Vec<u8> {
+        [
+            mov_w1(value),
+            STR_W1_X0,
+            add_x2_x0_page_offset(host_page_size, first_page),
+            STR_W1_X2,
+            add_x2_x0_page_offset(host_page_size, first_page + 1),
+            STR_W1_X2,
+            DMB_ISH,
+            HVC_ZERO,
+            SPIN_FOREVER,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect()
+    }
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let page_size = host_page_size().expect("host page size should be valid");
+    let layout = aarch64::dram_layout(page_size * 8)
+        .expect("dirty-write guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("dirty-write guest memory allocation should succeed");
+    let first_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let second_entry = first_entry
+        .checked_add(SECOND_ENTRY_OFFSET)
+        .expect("second guest entry should fit");
+    let shared_page = first_entry
+        .checked_add(page_size * TARGET_START_PAGE)
+        .expect("shared dirty page should fit");
+    let vcpu0_pages = [
+        shared_page
+            .checked_add(page_size)
+            .expect("first vCPU0 page should fit"),
+        shared_page
+            .checked_add(page_size * 2)
+            .expect("second vCPU0 page should fit"),
+    ];
+    let vcpu1_pages = [
+        shared_page
+            .checked_add(page_size * 3)
+            .expect("first vCPU1 page should fit"),
+        shared_page
+            .checked_add(page_size * 4)
+            .expect("second vCPU1 page should fit"),
+    ];
+    memory
+        .write_slice(&guest_code(page_size, VCPU0_VALUE, 1), first_entry)
+        .expect("first dirty-write guest code should be written");
+    memory
+        .write_slice(&guest_code(page_size, VCPU1_VALUE, 3), second_entry)
+        .expect("second dirty-write guest code should be written");
+    for page in [
+        shared_page,
+        vcpu0_pages[0],
+        vcpu0_pages[1],
+        vcpu1_pages[0],
+        vcpu1_pages[1],
+    ] {
+        memory
+            .write_slice(&0_u32.to_le_bytes(), page)
+            .expect("dirty-write target should be zeroed");
+    }
+    let dram_region = memory
+        .regions()
+        .first()
+        .expect("dirty-write guest DRAM should contain one region");
+    let target_host_pointer = |address: GuestAddress| {
+        let offset = address
+            .raw_value()
+            .checked_sub(dram_region.range().start().raw_value())
+            .and_then(|offset| usize::try_from(offset).ok())
+            .expect("dirty-write target offset should fit this host");
+        dram_region
+            .host_address()
+            .as_ptr()
+            .cast::<u8>()
+            .wrapping_add(offset)
+            .cast::<u32>()
+    };
+    let shared_host = target_host_pointer(shared_page);
+    let vcpu0_hosts = vcpu0_pages.map(target_host_pointer);
+    let vcpu1_hosts = vcpu1_pages.map(target_host_pointer);
+
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("dirty-write guest memory should be mapped");
+    let tracker = backend
+        .start_dirty_write_tracking()
+        .expect("dirty-write tracking should start before vCPU ownership");
+    backend
+        .create_gic()
+        .expect("GIC should be created before the tracked vCPU topology");
+    {
+        let topology = backend
+            .start_vcpu_topology(2)
+            .expect("host should support a tracked two-vCPU topology");
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let mut coordinator = topology
+            .into_run_coordinator(dispatcher, &[0, 1])
+            .expect("tracked two-vCPU coordinator should start");
+        for (index, entry) in [first_entry, second_entry].into_iter().enumerate() {
+            coordinator
+                .configure_arm64_boot_registers(
+                    index,
+                    HvfArm64BootRegisters {
+                        kernel_entry: entry,
+                        fdt_address: shared_page,
+                    },
+                )
+                .expect("tracked guest entry should be configured");
+        }
+        assert_eq!(coordinator.dispatch_online(), Ok(2));
+        let watchdog_control = coordinator.control();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if progress_receiver
+                .recv_timeout(DIRTY_PROGRESS_TIMEOUT)
+                .is_err()
+            {
+                let _ = watchdog_control.request_stop();
+            }
+        });
+
+        let expected_pages = [
+            shared_page,
+            vcpu0_pages[0],
+            vcpu0_pages[1],
+            vcpu1_pages[0],
+            vcpu1_pages[1],
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let expected_vcpu0_pages = vcpu0_pages.into_iter().collect::<BTreeSet<_>>();
+        let expected_vcpu1_pages = vcpu1_pages.into_iter().collect::<BTreeSet<_>>();
+        let mut first_write_pages = BTreeSet::new();
+        let mut vcpu0_first_write_pages = BTreeSet::new();
+        let mut vcpu1_first_write_pages = BTreeSet::new();
+        let mut stale_shared_faults = 0usize;
+        let mut reached_hvc = [false; 2];
+
+        for _ in 0..MAX_MEMBER_EVENTS {
+            let event = coordinator
+                .receive_event()
+                .expect("tracked member event should be received");
+            let HvfVcpuRunEvent::Member(result) = event else {
+                panic!("tracked guest should not terminate before cancellation: {event:?}");
+            };
+            match result.result() {
+                Ok(HvfVcpuRunMemberOutcome::Handled(HvfVcpuRunStepOutcome::DirtyWrite {
+                    page,
+                    first_write,
+                })) => {
+                    assert!(expected_pages.contains(page));
+                    if *first_write {
+                        assert!(first_write_pages.insert(*page));
+                        match result.index() {
+                            0 => {
+                                vcpu0_first_write_pages.insert(*page);
+                            }
+                            1 => {
+                                vcpu1_first_write_pages.insert(*page);
+                            }
+                            index => panic!("unexpected tracked member index {index}"),
+                        }
+                    } else {
+                        assert_eq!(*page, shared_page);
+                        stale_shared_faults += 1;
+                        assert!(stale_shared_faults <= 1);
+                    }
+                }
+                Ok(HvfVcpuRunMemberOutcome::Handled(HvfVcpuRunStepOutcome::Hvc { .. })) => {
+                    reached_hvc[result.index()] = true;
+                }
+                outcome => panic!("unexpected tracked member outcome: {outcome:?}"),
+            }
+            assert_eq!(
+                coordinator.dispatch_online(),
+                Ok(1),
+                "the completed member should be explicitly retried exactly once"
+            );
+            if reached_hvc == [true, true] {
+                break;
+            }
+        }
+
+        assert_eq!(reached_hvc, [true, true]);
+        progress_sender
+            .send(())
+            .expect("dirty progress watchdog should be released");
+        watchdog
+            .join()
+            .expect("dirty progress watchdog should join");
+        assert_eq!(first_write_pages, expected_pages);
+        assert!(expected_vcpu0_pages.is_subset(&vcpu0_first_write_pages));
+        assert!(expected_vcpu1_pages.is_subset(&vcpu1_first_write_pages));
+        assert_eq!(
+            tracker
+                .dirty_pages()
+                .expect("active tracker query should succeed")
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            expected_pages
+        );
+        // SAFETY: these aligned pointers remain inside the live mapped DRAM
+        // region owned by `backend`; both HVC exits occur after the guest DMB.
+        let (shared_value, vcpu0_values, vcpu1_values) = unsafe {
+            (
+                std::ptr::read_volatile(shared_host),
+                vcpu0_hosts.map(|pointer| std::ptr::read_volatile(pointer)),
+                vcpu1_hosts.map(|pointer| std::ptr::read_volatile(pointer)),
+            )
+        };
+        assert!([u32::from(VCPU0_VALUE), u32::from(VCPU1_VALUE)].contains(&shared_value));
+        assert_eq!(vcpu0_values, [u32::from(VCPU0_VALUE); 2]);
+        assert_eq!(vcpu1_values, [u32::from(VCPU1_VALUE); 2]);
+        assert_eq!(
+            tracker.stop(),
+            Err(HvfDirtyWriteTrackerStopError::OwnersActive { count: 2 })
+        );
+
+        let waiter = coordinator
+            .control()
+            .request_stop()
+            .expect("tracked active runs should accept aggregate cancellation");
+        let event = coordinator
+            .receive_event()
+            .expect("tracked cancellation barrier should drain");
+        let HvfVcpuRunEvent::Barrier(report) = event else {
+            panic!("tracked cancellation should complete a barrier: {event:?}");
+        };
+        assert_eq!(report.reason(), HvfVcpuRunControlReason::Stop);
+        assert!(report.acknowledgements().iter().all(|result| matches!(
+            result.result(),
+            Ok(HvfVcpuRunMemberOutcome::Handled(
+                HvfVcpuRunStepOutcome::Canceled
+            ))
+        )));
+        assert_eq!(waiter.wait(), Ok(report));
+        assert_eq!(
+            tracker.stop(),
+            Err(HvfDirtyWriteTrackerStopError::OwnersActive { count: 2 })
+        );
+
+        coordinator
+            .shutdown()
+            .expect("tracked coordinator should shut down every owner");
+        tracker
+            .stop()
+            .expect("owner-free tracker should restore remaining clean ranges");
+    }
+    backend
+        .stop_dirty_write_tracking()
+        .expect("backend tracker retention should clear idempotently");
+    backend
+        .destroy_vm()
+        .expect("tracked VM should unmap after owner shutdown");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_arm64_physical_timer_tval_on_idle_runner_thread() {
     use bangbang_hvf::HvfBackend;
     use bangbang_runtime::VmBackend;

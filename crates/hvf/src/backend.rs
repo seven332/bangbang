@@ -6,6 +6,9 @@ use bangbang_runtime::memory::{GuestMemory, GuestMemoryLayout, GuestMemoryRange}
 use bangbang_runtime::pmem::PreparedPmemDevice;
 use bangbang_runtime::{BackendError, VmBackend};
 
+use crate::dirty::{
+    HvfDirtyWriteTracker, HvfDirtyWriteTrackerStartError, HvfDirtyWriteTrackerStopError,
+};
 use crate::gic::{HvfGicCreator, HvfGicError, HvfGicMetadata, RealHvfGicCreator};
 use crate::memory::{
     HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping, HvfMemoryMapper,
@@ -94,6 +97,45 @@ impl HvfBackend {
 
         self.guest_memory = None;
         Ok(())
+    }
+
+    /// Write-protect every currently mapped writable guest-memory range for
+    /// guest-CPU dirty observation.
+    ///
+    /// This low-level primitive must start before any vCPU owner is created.
+    /// It does not enable Firecracker's public dirty-tracking flags or account
+    /// for VMM/device writes; those complete epoch semantics are owned by the
+    /// higher-level snapshot transaction.
+    pub fn start_dirty_write_tracking(
+        &mut self,
+    ) -> Result<Arc<HvfDirtyWriteTracker>, HvfDirtyWriteTrackerStartError> {
+        if !Self::is_supported_target() {
+            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        }
+        if !self.vm_created {
+            return Err(HvfDirtyWriteTrackerStartError::InvalidState(
+                "VM must be created before dirty-write tracking starts",
+            ));
+        }
+        if self.vcpu_topology_started {
+            return Err(HvfDirtyWriteTrackerStartError::InvalidState(
+                "dirty-write tracking must start before vCPU ownership",
+            ));
+        }
+        self.guest_memory
+            .as_mut()
+            .ok_or(HvfDirtyWriteTrackerStartError::InvalidState(
+                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+            ))?
+            .start_dirty_write_tracking()
+    }
+
+    /// Restore write permission after every vCPU owner has shut down.
+    pub fn stop_dirty_write_tracking(&mut self) -> Result<(), HvfDirtyWriteTrackerStopError> {
+        let Some(mapping) = self.guest_memory.as_mut() else {
+            return Ok(());
+        };
+        mapping.stop_dirty_write_tracking()
     }
 
     pub(crate) fn mapped_guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
@@ -231,6 +273,11 @@ impl HvfBackend {
                 "VM must be created before creating a vCPU",
             ));
         }
+        if self.active_dirty_write_tracker()?.is_some() {
+            return Err(BackendError::InvalidState(
+                "raw vCPU ownership is unavailable while dirty-write tracking is active",
+            ));
+        }
 
         let vcpu = HvfVcpu::new()?;
         self.vcpu_topology_started = true;
@@ -240,7 +287,13 @@ impl HvfBackend {
     pub fn start_vcpu_runner(&mut self) -> Result<HvfVcpuRunner<'_>, HvfVcpuRunnerError> {
         self.validate_vcpu_runner_start()?;
 
-        let runner = HvfVcpuRunner::new()?;
+        let tracker = self
+            .active_dirty_write_tracker()
+            .map_err(HvfVcpuRunnerError::Backend)?;
+        let runner = match tracker {
+            Some(tracker) => HvfVcpuRunner::new_with_dirty_write_tracker(0, Some(tracker))?,
+            None => HvfVcpuRunner::new()?,
+        };
         self.vcpu_topology_started = true;
         Ok(runner)
     }
@@ -252,7 +305,13 @@ impl HvfBackend {
         // constructor crate-private so arbitrary callers cannot outlive the VM.
         self.validate_vcpu_runner_start()?;
 
-        let runner = HvfVcpuRunner::new()?;
+        let tracker = self
+            .active_dirty_write_tracker()
+            .map_err(HvfVcpuRunnerError::Backend)?;
+        let runner = match tracker {
+            Some(tracker) => HvfVcpuRunner::new_with_dirty_write_tracker(0, Some(tracker))?,
+            None => HvfVcpuRunner::new()?,
+        };
         self.vcpu_topology_started = true;
         Ok(runner)
     }
@@ -265,7 +324,8 @@ impl HvfBackend {
         // constructor crate-private so arbitrary callers cannot outlive the VM.
         self.validate_vcpu_topology_start()?;
 
-        let topology = HvfVcpuTopology::create(vcpu_count)?;
+        let tracker = self.active_dirty_write_tracker()?;
+        let topology = HvfVcpuTopology::create(vcpu_count, tracker)?;
         self.vcpu_topology_started = true;
         Ok(topology)
     }
@@ -280,7 +340,8 @@ impl HvfBackend {
     ) -> Result<HvfVcpuTopology<'_>, HvfVcpuTopologyError> {
         self.validate_vcpu_topology_start()?;
 
-        let topology = HvfVcpuTopology::create(vcpu_count)?;
+        let tracker = self.active_dirty_write_tracker()?;
+        let topology = HvfVcpuTopology::create(vcpu_count, tracker)?;
         self.vcpu_topology_started = true;
         Ok(topology)
     }
@@ -298,6 +359,14 @@ impl HvfBackend {
         }
 
         Ok(())
+    }
+
+    fn active_dirty_write_tracker(
+        &self,
+    ) -> Result<Option<Arc<HvfDirtyWriteTracker>>, BackendError> {
+        self.guest_memory
+            .as_ref()
+            .map_or(Ok(None), HvfGuestMemoryMapping::active_dirty_write_tracker)
     }
 
     fn validate_vcpu_topology_start(&self) -> Result<(), HvfVcpuTopologyError> {
@@ -761,6 +830,97 @@ mod tests {
             HvfBackend::is_supported_target(),
             cfg!(all(target_os = "macos", target_arch = "aarch64"))
         );
+    }
+
+    #[test]
+    fn dirty_write_tracking_before_vm_reports_state_or_target_error() {
+        let mut backend = HvfBackend::new();
+        let error = backend
+            .start_dirty_write_tracking()
+            .expect_err("dirty-write tracking should require a supported live VM");
+
+        if HvfBackend::is_supported_target() {
+            assert_eq!(
+                error,
+                crate::dirty::HvfDirtyWriteTrackerStartError::InvalidState(
+                    "VM must be created before dirty-write tracking starts"
+                )
+            );
+        } else {
+            assert_eq!(
+                error,
+                crate::dirty::HvfDirtyWriteTrackerStartError::Backend(BackendError::Unsupported(
+                    crate::ffi::UNSUPPORTED_TARGET_MESSAGE
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_write_tracking_requires_mapping_and_precedes_vcpu_ownership() {
+        if !HvfBackend::is_supported_target() {
+            return;
+        }
+
+        let mut backend = HvfBackend::new();
+        backend.vm_created = true;
+        assert_eq!(
+            backend
+                .start_dirty_write_tracking()
+                .expect_err("dirty-write tracking should require mapped RAM"),
+            crate::dirty::HvfDirtyWriteTrackerStartError::InvalidState(
+                super::GUEST_MEMORY_NOT_MAPPED_MESSAGE
+            )
+        );
+
+        backend.vcpu_topology_started = true;
+        assert_eq!(
+            backend
+                .start_dirty_write_tracking()
+                .expect_err("vCPU ownership should fail before mapping lookup"),
+            crate::dirty::HvfDirtyWriteTrackerStartError::InvalidState(
+                "dirty-write tracking must start before vCPU ownership"
+            )
+        );
+    }
+
+    #[test]
+    fn active_dirty_write_tracking_blocks_raw_vcpu_and_stops_idempotently() {
+        if !HvfBackend::is_supported_target() {
+            return;
+        }
+
+        let page_size = page_size();
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper);
+        backend.vm_created = true;
+        backend
+            .map_guest_memory_with_configured_mapper(
+                memory_for_ranges(vec![range(0, page_size)]),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("test RAM should map");
+        let tracker = backend
+            .start_dirty_write_tracking()
+            .expect("tracker should start before vCPU ownership");
+
+        assert!(tracker.is_active().expect("tracker query should succeed"));
+        assert_eq!(
+            backend
+                .create_vcpu()
+                .expect_err("raw vCPU must not bypass an active tracker"),
+            BackendError::InvalidState(
+                "raw vCPU ownership is unavailable while dirty-write tracking is active"
+            )
+        );
+        backend
+            .stop_dirty_write_tracking()
+            .expect("owner-free tracker should stop");
+        backend
+            .stop_dirty_write_tracking()
+            .expect("tracker stop should be idempotent");
+        assert!(!tracker.is_active().expect("stopped tracker should query"));
+        backend.unmap_guest_memory().expect("test RAM should unmap");
     }
 
     #[test]
@@ -1636,6 +1796,14 @@ mod tests {
                 ));
             }
 
+            Ok(())
+        }
+
+        fn protect_region(
+            &self,
+            _: GuestMemoryRange,
+            _: HvfMemoryPermissions,
+        ) -> Result<(), BackendError> {
             Ok(())
         }
     }

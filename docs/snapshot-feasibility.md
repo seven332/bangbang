@@ -961,10 +961,28 @@ some of the required state:
   device except separately captured CPU system registers.
 
 The inspected headers do not expose a KVM-style dirty log or dirty-page tracking
-API. Firecracker-style diff snapshot parity is therefore not a direct HVF API
-mapping. Later work must either prove another supported macOS mechanism, choose
-software tracking for specific memory ranges, or document diff snapshots as a
-platform-limited feature.
+API, so Firecracker-style diff snapshot parity is not a direct HVF API mapping.
+The implemented low-level guest-CPU primitive instead removes WRITE from every
+mapped writable guest-RAM range with `hv_vm_protect`, records the first owned
+page exit, restores that page's original permission, and leaves the same store
+for the caller's next bounded run. Signed Apple Silicon evidence observes EC
+`0x24`, WnR set, CM/S1PTW clear, and exact DFSC `0x07` at the protected IPA.
+That DFSC is an empirical Hypervisor.framework contract, not an encoding Apple
+documents; any drift is declined and follows the existing MMIO/error path.
+
+The primitive starts only after memory mapping and before any vCPU owner, and it
+stops only after every owner has joined. Activation protects complete ranges
+transactionally; an incomplete rollback, a page-unprotect failure, or an
+incomplete stop blocks further execution/mapping mutation until cleanup or VM
+unmap. One shared bitmap serializes first writers, and a different vCPU may
+consume only one stale exit already raised for the same page. Dirty handling
+does not advance PC, dispatch MMIO, or run the guest again internally.
+
+This is not yet a public dirty-tracking epoch. It observes guest-CPU writes only;
+boot-loader, VMM, device, pmem, balloon, and other userspace writes still need
+the separate bitmap union, epoch reset/commit, and live dynamic-range semantics.
+Machine/load `track_dirty_pages = true`, `Diff` artifacts, merging, and broader
+snapshot compatibility therefore remain rejected pending that integration.
 
 ### Implemented public native-v1 restore order
 
@@ -1231,6 +1249,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | --- | --- | --- |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence and complete publication transaction (implemented for native-v1 baseline) | #1162 introduced acknowledged RAII quiescence for block and entropy; #1389 added the topology-wide SMP pause barrier and PMEM guard; #1390 includes network, acquires all four failure-atomically, drains tokens only after complete acknowledgement, preserves in-flight/deferred/deadline work, and holds the worker lease through commit plus the post-publication hook. Process API/MMDS/controller and periodic work are serialized by the synchronous owner borrow. | Deterministic scheduler, supervisor, cancellation/seal, publication-visibility, process/API serialization, and fresh-retry tests plus combined signed SMP pause and one-vCPU baseline publication evidence. |
+| HVF guest-CPU dirty-write primitive (implemented, not a public epoch) | #1395 transactionally write-protects mapped guest RAM before vCPU ownership, handles only the signed-observed exact DFSC `0x07` write exit at a tracker-owned IPA, restores permission before publishing one bitmap bit, and requires owner shutdown before cleanup. Public flags, userspace/device marks, epoch reset/commit, and diff artifacts remain deferred. | Range/rollback/poisoning, exact classifier, unowned-MMIO, race, no-PC/no-hidden-run, cancellation, and cleanup unit evidence plus signed two-vCPU shared/distinct-page value and progress proofs. |
 | Runner general-register capture and restore (first bidirectional subset implemented) | #1164 adds a typed immutable X0-X30, PC, and CPSR value plus one failure-atomic owner-thread capture. #1228 adds ordered owner-thread restore of that complete typed value and generalizes the shared admission name from capture to operation. Hypervisor.framework does not make the 33 writes transactional: typed failure context identifies the failed register and completed prefix, and callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore, but the snapshot lease invokes neither. Core system, exception, execution-control, identification, translation, baseline SIMD/FP, schema, validation, rollback, wider ordering, and multi-vCPU coordination remain separate or deferred. | Exact 33-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed same-vCPU idle capture/restore/recapture without guest execution or value logging. |
 | Runner core system-register capture and restore (second bidirectional subset implemented) | #1170 adds a typed immutable raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 value plus one owner-thread capture. #1230 adds ordered owner-thread restore of that complete value and a reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the four writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. Exception, execution-control, identification, translation, broader system state, validation, schema, rollback, wider ordering, orchestration, and multi-vCPU coordination remain separate or deferred. | Exact four-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written known-value capture/restore/recapture without post-restore guest execution or value logging. |
 | Runner EL1 exception-register capture and restore (third bidirectional subset implemented) | #1184 adds typed immutable raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 state plus one owner-thread capture. #1232 adds ordered owner-thread restore of that complete value through the reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the six writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. Vector-table memory, coherent exception semantics, destination validation, persistence, schema, rollback, wider ordering, orchestration, and multi-vCPU coordination remain deferred. | Exact six-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written capture/restore/recapture preserving implementation-defined AFSR readback without post-restore guest execution or value logging. |

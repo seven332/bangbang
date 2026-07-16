@@ -212,9 +212,13 @@ one-vCPU baseline; optional devices and multi-vCPU snapshot artifacts are still
 outside this format.
 
 This is not Firecracker snapshot-file compatibility or a portable migration
-format. `Diff`, UFFD, dirty tracking, clock adjustment, restore overrides,
-writable or additional drives, optional devices, active SVE/SME/debug state,
-EL2 GIC CPU-interface state, and cross-host portability remain unsupported.
+format. The HVF layer has a signed, fail-closed guest-CPU dirty-write primitive
+that write-protects mapped guest RAM and reports exact first-written pages, but
+it is not a public tracking epoch: device and other userspace writes are not yet
+merged or reset transactionally. `Diff`, UFFD, public dirty-tracking flags,
+clock adjustment, restore overrides, writable or additional drives, optional
+devices, active SVE/SME/debug state, EL2 GIC CPU-interface state, and cross-host
+portability remain unsupported.
 
 ## Process CLI
 

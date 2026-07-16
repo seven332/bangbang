@@ -4,6 +4,7 @@ mod backend;
 mod cache;
 mod coordinator;
 mod cpu_template;
+mod dirty;
 mod exit;
 mod ffi;
 mod gic;
@@ -29,6 +30,10 @@ pub use coordinator::{
     HvfVcpuRunMemberOutcome, HvfVcpuRunMemberResult, HvfVcpuRunTerminalReport,
 };
 pub use cpu_template::{HvfArm64CpuTemplateError, HvfArm64CpuTemplateVcpuError};
+pub use dirty::{
+    HvfDirtyWriteFaultError, HvfDirtyWriteProtectionFailure, HvfDirtyWriteTracker,
+    HvfDirtyWriteTrackerQueryError, HvfDirtyWriteTrackerStartError, HvfDirtyWriteTrackerStopError,
+};
 pub use exit::{
     HvfExceptionExit, HvfHvcDecodeError, HvfHvcExit, HvfMmioAccess, HvfMmioAccessSize,
     HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth,

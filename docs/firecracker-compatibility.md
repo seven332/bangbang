@@ -1043,14 +1043,14 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /machine-config` | `mem_size_mib` | required | Representable JSON reaches VMM validation. Bangbang accepts `1..=1046528` MiB and rejects a larger value before storage, while pinned Firecracker stores/echoes it and later truncates realized aarch64 memory to the same 1022-GiB maximum. Bangbang's accepted GET value therefore remains identical to balloon, allocation, FDT, HVF mapping, and snapshot memory. A configured balloon target must fit or the previous machine and balloon state is preserved. Dynamic host-free-memory preflight is not promised. |
 | `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false`; the Apple Silicon target accepts explicit no-SMT config and returns `machine smt is not supported` when enabled. On combined-invalid aarch64 candidates this check precedes vCPU and memory. |
 | `PUT /machine-config` | `cpu_template` | omitted/`null` preserves; `None` clears; `V1N1` retained pending; x86 names rejected | Explicit `None` transactionally clears static or custom selection. `V1N1` replaces custom state, remains visible through machine/VM GET, and can be replaced by a later custom PUT; if still effective, `InstanceStart` fails before its executor or HVF VM because the documented Neoverse V1 source model is unavailable on Apple Silicon. `C3`, `T2`, `T2S`, `T2CL`, and `T2A` remain foreign AWS/Linux policies rejected before mutation. Deprecated-field metrics retain their existing provenance rules. |
-| `PUT /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support and currently returns `machine track_dirty_pages is not supported`. |
+| `PUT /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Explicit `false` matches Firecracker's default; enabling the public epoch currently returns `machine track_dirty_pages is not supported`. The internal HVF primitive observes signed-proven guest-CPU writes only and does not yet merge boot-loader, VMM, device, pmem, balloon, or other userspace writes. |
 | `PUT /machine-config` | `huge_pages` | optional when `None`; exact `2M` platform-limited | Explicit `None` matches Firecracker's default. `2M` means exact Linux hugetlbfs backing, not alignment or an IPA granule. Odd MiB returns `machine mem_size_mib must be an even value when huge_pages is 2M`; an otherwise valid candidate returns `machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF`. Both are transactional and precede allocation/HVF construction. |
 | `PUT /machine-config` | unknown or duplicate fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /machine-config` | `vcpu_count` | optional | When present, updates the stored vCPU count with the same `1..=32` bounds as `PUT`; omitted fields keep their current values. Startup applies the same runtime host-capacity bound as `PUT`. |
 | `PATCH /machine-config` | `mem_size_mib` | optional | When present, updates the stored memory size with the same `1..=1046528` MiB target bound and configured-equals-realized policy as PUT; omitted/null fields keep their current values. A configured balloon target must fit or the previous machine and balloon state is preserved. |
 | `PATCH /machine-config` | `smt` | optional when `false`; rejected when `true` | Matches the current `PUT` policy for the Apple Silicon target and currently returns `machine smt is not supported` when SMT is enabled. |
 | `PATCH /machine-config` | `cpu_template` | same transactional preserve/clear/pending policy as PUT | Omitted/`null` preserves static or custom state, explicit `None` clears it, and `V1N1` replaces custom state but remains subject to the pre-backend start gate. X86 names and any invalid combined candidate preserve the previous selection. |
-| `PATCH /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Matches the current `PUT` dirty-tracking policy. |
+| `PATCH /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Matches the current `PUT` public dirty-tracking policy. |
 | `PATCH /machine-config` | `huge_pages` | optional when `None`; exact `2M` platform-limited | Matches PUT's even-MiB validation and exact hugetlbfs platform result without mutating the current machine or balloon state. |
 | `PATCH /machine-config` | unknown or duplicate fields; empty patch | rejected | Unknown/duplicate fields remain strict JSON faults. `{}` and null-only candidates return Firecracker's stable `Empty PATCH request.` fault and do not silently succeed. |
 | `PUT /snapshot/create` | `snapshot_type` | optional; `Full` supported, `Diff` rejected | Accepts `Full` and `Diff`, defaulting to `Full`. Only `Full` passes the native-v1 gate; `Diff` returns the snapshot-specific unsupported fault before namespace or capture work. |
@@ -1217,9 +1217,12 @@ can enable KVM dirty-page tracking for diff snapshots, and can apply
 network/vsock restore overrides before optionally resuming the VM. bangbang
 supports only its one-vCPU/read-only-root native-v1 baseline, including public
 paused handoff, optional resume, and recoverable-versus-terminal cleanup
-evidence. Optional resources and overrides, dirty tracking, and broader
-portability remain deferred; unknown HVF feasibility should not be reported as
-a platform limit by default. The baseline excludes network/vsock devices and
+evidence. Its internal HVF layer can transactionally write-protect mapped guest
+RAM and report signed-proven guest-CPU first writes without advancing PC or
+dispatching MMIO, but it does not yet define a public epoch or merge userspace
+and device writes. Optional resources and overrides, public dirty tracking, and
+broader portability remain deferred; unknown HVF feasibility should not be
+reported as a platform limit by default. The baseline excludes network/vsock devices and
 joins transient vsock polling before the pause boundary. Bangbang therefore
 quiesces its own access but neither freezes nor persists vmnet/vsock peer-owned
 host or kernel buffers. bangbang has a native
