@@ -19,17 +19,21 @@ clears a stored static template. An empty or null-only candidate returns
 representation, strict fields, and enum names, but sends representable semantic
 candidates such as vCPU 0 or 33 and memory 0 to VMM validation.
 
-On aarch64, the owned candidate checks run in this order:
+Bangbang selects pre-boot machine-candidate faults in this order:
 
 1. SMT must remain false;
 2. vCPU count must be in `1..=32`;
-3. memory must be nonzero and compatible with the selected page size; and
-4. a configured balloon target must not exceed candidate memory.
+3. memory must be in `1..=1,046,528` MiB;
+4. a `2M` candidate must use an even MiB value;
+5. the existing CPU-template policy is applied;
+6. the existing dirty-tracking policy is applied; and
+7. an otherwise valid exact `2M` candidate receives the platform result.
 
-Bangbang keeps that SMT/vCPU/memory ordering and adds its target architecture
-maximum to the memory check. A `2M` candidate must use an even MiB value before
-the platform result is selected. CPU-template and dirty-policy errors follow
-the owned sizing checks until their separate issues complete.
+This preserves the pinned aarch64 SMT/vCPU/memory/page ordering while adding
+Bangbang's realized-memory maximum. Only a valid complete machine candidate is
+then checked against the configured balloon target, so cross-configuration
+compatibility cannot mask a machine-field fault. CPU-template and dirty-policy
+delivery remain owned by their separate issues.
 
 Rejected numeric candidates use unit-like errors and do not retain or echo the
 submitted value. PUT and PATCH validate a complete candidate before changing
