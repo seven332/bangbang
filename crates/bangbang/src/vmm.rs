@@ -2859,6 +2859,13 @@ impl HvfInstanceStartExecutor {
     }
 }
 
+fn snapshot_destination_machine_config(
+    source: bangbang_runtime::machine::MachineConfig,
+    track_dirty_pages: bool,
+) -> bangbang_runtime::machine::MachineConfig {
+    source.with_track_dirty_pages(track_dirty_pages)
+}
+
 impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
@@ -2948,10 +2955,10 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         prepared: PreparedHvfSnapshotV1Load,
     ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
         let restored_drive_config = prepared.runtime().drive_config.clone();
-        let restored_machine = prepared
-            .state()
-            .machine()
-            .with_track_dirty_pages(input.track_dirty_pages());
+        let restored_machine = snapshot_destination_machine_config(
+            prepared.state().machine(),
+            input.track_dirty_pages(),
+        );
         let controller_commit = SnapshotV1ControllerCommit::try_new(
             restored_machine,
             restored_drive_config.clone(),
@@ -6553,7 +6560,7 @@ mod tests {
         ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
         SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
-        require_native_v1_composite_record,
+        require_native_v1_composite_record, snapshot_destination_machine_config,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -8584,6 +8591,15 @@ mod tests {
             SnapshotMemoryBackend::new("/private/memory", SnapshotMemoryBackendType::File),
         )
         .with_resume_vm(resume_vm)
+    }
+
+    #[test]
+    fn snapshot_destination_tracking_overrides_the_source_in_both_directions() {
+        let untracked = MachineConfig::default();
+        let tracked = untracked.with_track_dirty_pages(true);
+
+        assert!(snapshot_destination_machine_config(untracked, true).track_dirty_pages());
+        assert!(!snapshot_destination_machine_config(tracked, false).track_dirty_pages());
     }
 
     #[test]
