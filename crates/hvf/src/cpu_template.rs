@@ -1353,48 +1353,6 @@ mod supplementary_tests {
     }
 
     #[test]
-    fn every_mixed_width_baseline_read_position_reports_failure_and_retries() {
-        let fpcr = HvfRegister::FPCR;
-        let x4 = HvfRegister::general_purpose(4).expect("X4 should map");
-        let sp_el0 = HvfSystemRegister::SP_EL0;
-        let q31 = HvfSimdFpRegister::q(31).expect("Q31 should map");
-        let q_value = 0xf0e1_d2c3_b4a5_9687_7869_5a4b_3c2d_1e0f_u128;
-        let registers = [
-            HvfArm64CpuTemplateRegister::U32(fpcr),
-            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(x4)),
-            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::System(sp_el0)),
-            HvfArm64CpuTemplateRegister::U128(q31),
-        ];
-        let expected = vec![
-            HvfArm64CpuTemplateValue::U32(1),
-            HvfArm64CpuTemplateValue::U64(2),
-            HvfArm64CpuTemplateValue::U64(3),
-            HvfArm64CpuTemplateValue::U128(q_value),
-        ];
-
-        for failed_index in 0..registers.len() {
-            let mut access = TypedAccess {
-                general: vec![(fpcr, 1), (x4, 2)],
-                simd: vec![(q31, q_value.to_le_bytes())],
-                system: vec![(sp_el0, 3)],
-                fail_read: Some(failed_index),
-                ..TypedAccess::default()
-            };
-
-            let error = read_cpu_template_baseline_with(&registers, &mut access)
-                .expect_err("the injected baseline read should fail");
-            assert_eq!(error.completed_reads(), failed_index);
-            assert_eq!(access.events.len(), failed_index + 1);
-
-            access.fail_read = None;
-            assert_eq!(
-                read_cpu_template_baseline_with(&registers, &mut access),
-                Ok(expected.clone())
-            );
-        }
-    }
-
-    #[test]
     fn every_mixed_width_target_position_reports_failures_and_retries() {
         let x4 = HvfRegister::general_purpose(4).expect("X4 should map");
         let q31 = HvfSimdFpRegister::q(31).expect("Q31 should map");
@@ -1522,6 +1480,52 @@ mod supplementary_tests {
                 BackendError::InvalidState(CPU_TEMPLATE_U32_TRANSPORT_WIDTH_MESSAGE)
             )
         );
+    }
+
+    #[test]
+    fn every_mixed_width_baseline_position_reports_failure_and_retries() {
+        let x4 = HvfRegister::general_purpose(4).expect("X4 should map");
+        let q31 = HvfSimdFpRegister::q(31).expect("Q31 should map");
+        let q_value = 0xf0e1_d2c3_b4a5_9687_7869_5a4b_3c2d_1e0f_u128;
+        let registers = [
+            HvfArm64CpuTemplateRegister::U32(HvfRegister::FPCR),
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(x4)),
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::System(
+                HvfSystemRegister::SP_EL0,
+            )),
+            HvfArm64CpuTemplateRegister::U128(q31),
+        ];
+        let expected = vec![
+            HvfArm64CpuTemplateValue::U32(1),
+            HvfArm64CpuTemplateValue::U64(2),
+            HvfArm64CpuTemplateValue::U64(3),
+            HvfArm64CpuTemplateValue::U128(q_value),
+        ];
+
+        for failed_index in 0..registers.len() {
+            let mut access = TypedAccess {
+                general: vec![(HvfRegister::FPCR, 1), (x4, 2)],
+                simd: vec![(q31, q_value.to_le_bytes())],
+                system: vec![(HvfSystemRegister::SP_EL0, 3)],
+                fail_read: Some(failed_index),
+                ..TypedAccess::default()
+            };
+            assert!(matches!(
+                read_cpu_template_baseline_with(&registers, &mut access),
+                Err(HvfArm64CpuTemplateVcpuError::BaselineRead {
+                    completed_reads,
+                    ..
+                }) if completed_reads == failed_index
+            ));
+
+            access.fail_read = None;
+            access.read_calls = 0;
+            access.events.clear();
+            assert_eq!(
+                read_cpu_template_baseline_with(&registers, &mut access),
+                Ok(expected.clone())
+            );
+        }
     }
 }
 

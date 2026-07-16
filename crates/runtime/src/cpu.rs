@@ -1048,77 +1048,129 @@ mod tests {
     }
 
     #[test]
-    fn rejects_boot_reserved_banked_reserved_wrong_width_and_alias_core_shapes() {
-        for index in 1..=3 {
-            assert_eq!(
-                executable_modifier(
-                    kvm_reg_arm64_core_x(index).expect("boot X register should have an ID"),
-                    CpuConfigArmRegisterWidth::U64,
-                    1,
-                    1,
-                ),
-                Err(CpuConfigError::BootReservedRegister)
+    fn exhausts_core_layout_rejections_wrong_widths_and_system_aliases() {
+        for index in 0..=213 {
+            let u32_result = executable_modifier(
+                KVM_REG_ARM64_CORE_U32_BASE | index,
+                CpuConfigArmRegisterWidth::U32,
+                1,
+                1,
             );
-        }
-        for id in [
-            KVM_REG_ARM64_CORE_SPSR_ABT,
-            KVM_REG_ARM64_CORE_SPSR_UND,
-            KVM_REG_ARM64_CORE_SPSR_IRQ,
-            KVM_REG_ARM64_CORE_SPSR_FIQ,
-        ] {
-            assert_eq!(
-                executable_modifier(id, CpuConfigArmRegisterWidth::U64, 1, 1),
-                Err(CpuConfigError::Aarch32BankedRegisterUnavailable)
+            if matches!(index, 212 | 213) {
+                assert!(u32_result.is_ok(), "reviewed U32 core index should map");
+            } else {
+                assert_eq!(u32_result, Err(CpuConfigError::UnsupportedRegister));
+            }
+
+            let expected_u64_error = match index {
+                0..=60 if index % 2 == 0 => {
+                    if matches!(index, 2 | 4 | 6) {
+                        Some(CpuConfigError::BootReservedRegister)
+                    } else {
+                        None
+                    }
+                }
+                62 | 64 | 66 | 68 | 70 | 72 => None,
+                74 | 76 | 78 | 80 => Some(CpuConfigError::Aarch32BankedRegisterUnavailable),
+                _ => Some(CpuConfigError::UnsupportedRegister),
+            };
+            let u64_result = executable_modifier(
+                KVM_REG_ARM64_CORE_U64_BASE | index,
+                CpuConfigArmRegisterWidth::U64,
+                1,
+                1,
             );
+            if let Some(error) = expected_u64_error {
+                assert_eq!(u64_result, Err(error));
+            } else {
+                assert!(u64_result.is_ok(), "reviewed U64 core index should map");
+            }
+
+            let u128_result = executable_modifier(
+                KVM_REG_ARM64_CORE_U128_BASE | index,
+                CpuConfigArmRegisterWidth::U128,
+                1,
+                1,
+            );
+            if (84..=208).contains(&index) && (index - 84) % 4 == 0 {
+                assert!(u128_result.is_ok(), "reviewed U128 core index should map");
+            } else {
+                assert_eq!(u128_result, Err(CpuConfigError::UnsupportedRegister));
+            }
         }
 
         for (id, width) in [
-            (
-                KVM_REG_ARM64_CORE_U64_BASE | 1,
-                CpuConfigArmRegisterWidth::U64,
-            ),
-            (
-                KVM_REG_ARM64_CORE_U64_BASE | 61,
-                CpuConfigArmRegisterWidth::U64,
-            ),
-            (
-                KVM_REG_ARM64_CORE_U64_BASE | 63,
-                CpuConfigArmRegisterWidth::U64,
-            ),
-            (
-                KVM_REG_ARM64_CORE_U64_BASE | 82,
-                CpuConfigArmRegisterWidth::U64,
-            ),
-            (
-                KVM_REG_ARM64_CORE_U64_BASE | 84,
-                CpuConfigArmRegisterWidth::U64,
-            ),
-            (
-                KVM_REG_ARM64_CORE_U32_BASE | 211,
-                CpuConfigArmRegisterWidth::U32,
-            ),
             (
                 KVM_REG_ARM64_CORE_U32_BASE | 214,
                 CpuConfigArmRegisterWidth::U32,
             ),
             (
-                KVM_REG_ARM64_CORE_U128_BASE | 83,
-                CpuConfigArmRegisterWidth::U128,
+                KVM_REG_ARM64_CORE_U64_BASE | 214,
+                CpuConfigArmRegisterWidth::U64,
             ),
             (
-                KVM_REG_ARM64_CORE_U128_BASE | 85,
+                KVM_REG_ARM64_CORE_U128_BASE | 214,
                 CpuConfigArmRegisterWidth::U128,
             ),
-            (
-                KVM_REG_ARM64_CORE_U128_BASE | 209,
-                CpuConfigArmRegisterWidth::U128,
-            ),
-            (0x6030_0000_0013_c208, CpuConfigArmRegisterWidth::U64),
+            (0x6020_0000_0011_00d5, CpuConfigArmRegisterWidth::U32),
+            (0x6030_0000_0011_0008, CpuConfigArmRegisterWidth::U64),
+            (0x6040_0000_0011_0054, CpuConfigArmRegisterWidth::U128),
         ] {
             assert_eq!(
                 executable_modifier(id, width, 1, 1),
                 Err(CpuConfigError::UnsupportedRegister)
             );
+        }
+
+        // Architectural system encodings of the four accepted core-system
+        // fields must not create a second route to the same HVF target.
+        for alias in [
+            0x6030_0000_0013_c208, // SP_EL0
+            0x6030_0000_0013_e208, // SP_EL1
+            0x6030_0000_0013_c201, // ELR_EL1
+            0x6030_0000_0013_c200, // SPSR_EL1
+        ] {
+            assert_eq!(
+                executable_modifier(alias, CpuConfigArmRegisterWidth::U64, 1, 1),
+                Err(CpuConfigError::UnsupportedRegister)
+            );
+        }
+
+        let mut accepted = vec![
+            (KVM_REG_ARM64_CORE_FPCR, CpuConfigArmRegisterWidth::U32),
+            (KVM_REG_ARM64_CORE_FPSR, CpuConfigArmRegisterWidth::U32),
+            (KVM_REG_ARM64_CORE_SP_EL0, CpuConfigArmRegisterWidth::U64),
+            (KVM_REG_ARM64_CORE_PC, CpuConfigArmRegisterWidth::U64),
+            (KVM_REG_ARM64_CORE_PSTATE, CpuConfigArmRegisterWidth::U64),
+            (KVM_REG_ARM64_CORE_SP_EL1, CpuConfigArmRegisterWidth::U64),
+            (KVM_REG_ARM64_CORE_ELR_EL1, CpuConfigArmRegisterWidth::U64),
+            (KVM_REG_ARM64_CORE_SPSR_EL1, CpuConfigArmRegisterWidth::U64),
+        ];
+        accepted.extend([0_u8].into_iter().chain(4..=30).map(|index| {
+            (
+                kvm_reg_arm64_core_x(index).expect("reviewed X index should map"),
+                CpuConfigArmRegisterWidth::U64,
+            )
+        }));
+        accepted.extend((0..=31).map(|index| {
+            (
+                kvm_reg_arm64_core_q(index).expect("reviewed Q index should map"),
+                CpuConfigArmRegisterWidth::U128,
+            )
+        }));
+        for (id, correct_width) in accepted {
+            for wrong_width in [
+                CpuConfigArmRegisterWidth::U32,
+                CpuConfigArmRegisterWidth::U64,
+                CpuConfigArmRegisterWidth::U128,
+            ] {
+                if wrong_width != correct_width {
+                    assert_eq!(
+                        executable_modifier(id, wrong_width, 1, 1),
+                        Err(CpuConfigError::InvalidRegisterWidth)
+                    );
+                }
+            }
         }
     }
 
