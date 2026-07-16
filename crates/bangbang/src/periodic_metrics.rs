@@ -23,7 +23,7 @@ impl PeriodicMetricsScheduler {
     }
 
     #[cfg(test)]
-    fn with_period(now: Instant, period: Duration) -> Self {
+    pub(crate) fn with_period(now: Instant, period: Duration) -> Self {
         Self {
             deadline: Some(PeriodicDeadline::new(now, period)),
         }

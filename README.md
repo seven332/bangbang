@@ -139,13 +139,21 @@ serial, and no optional devices or MMDS. It writes a bounded kind-2
 `BANGCMT\0` pair whose state file binds the complete memory image to an exact
 five-component `BANGHVF\0` payload and nested `BANGDEV\0` device profile.
 
-Create preflights both final namespaces, streams the paused aggregate capture
-directly into an owner-only staging inode, and publishes memory durable first
-and state last as the commit marker without replacing existing entries. A
-successful request returns `204 No Content` and leaves the source paused and
-usable. Failures clean private staging where safe; a late failure can leave a
-typed memory-only orphan, and a state-directory sync failure after publication
-is treated as committed but durability-uncertain.
+Create reserves one FIFO boot-worker transaction, then failure-atomically
+quiesces the block, PMEM, network, and entropy retry publishers. The same lease
+preflights both final namespaces, streams the paused aggregate capture into an
+owner-only staging inode, verifies and synchronizes it, publishes memory first
+and state last as the commit marker without replacing existing entries, and
+runs a currently no-op post-publication hook before reopening ordinary command
+admission. The synchronous process borrow also serializes API/MMDS/controller
+mutation and periodic callbacks until this transaction returns.
+
+SIGINT/SIGTERM cancellation wins only before the atomic commit seal. Once
+sealed, publication finishes and preserves its exact durable,
+durability-uncertain, memory-orphan, or other typed visibility result before
+orderly shutdown continues. A successful request returns `204 No Content` and
+leaves the source paused and usable. Earlier failures clean only private staging
+where safe and release every scheduler without losing deferred wakeups.
 
 `PUT /snapshot/load` accepts the matching committed pair only in a pristine
 fresh process, except that logger and metrics configuration are allowed. It
@@ -165,6 +173,13 @@ grant-tagged persisted root backing after bounded state preinspection; no tag is
 reopened as a pathname. Create preserves the same anchor-relative no-clobber
 transaction and repeated output-directory authority. Direct mode keeps ordinary
 path behavior.
+
+The transaction stops bangbang-owned packet and stream access because the
+accepted profile excludes network and vsock devices and the transient vsock
+poller is joined before pause acknowledgement. It does not freeze or persist
+vmnet peers, vsock peers, or their host/kernel buffers. Native-v1 remains a
+one-vCPU baseline; optional devices and multi-vCPU snapshot artifacts are still
+outside this format.
 
 This is not Firecracker snapshot-file compatibility or a portable migration
 format. `Diff`, UFFD, dirty tracking, clock adjustment, restore overrides,

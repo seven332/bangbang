@@ -9,7 +9,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "macos")]
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -80,9 +80,9 @@ use bangbang_runtime::snapshot::{
 use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
 use bangbang_runtime::snapshot_artifact::{
     SnapshotArtifactLoadError, SnapshotArtifactOutput, SnapshotArtifactOutputs,
-    SnapshotArtifactPaths, SnapshotCommitDurability, SnapshotPublicationOutcome,
-    SnapshotPublicationTransactionError, load_snapshot_artifacts, prepare_snapshot_state_file,
-    prepare_snapshot_state_path, publish_snapshot_artifacts_to_with,
+    SnapshotArtifactPaths, SnapshotCommitDurability, SnapshotMemoryStagingWriter,
+    SnapshotPublicationOutcome, SnapshotPublicationTransactionError, load_snapshot_artifacts,
+    prepare_snapshot_state_file, prepare_snapshot_state_path, publish_snapshot_artifacts_to_with,
     publish_snapshot_artifacts_with,
 };
 use bangbang_runtime::snapshot_commit::{SnapshotCommitKind, SnapshotCommitRecord};
@@ -186,6 +186,7 @@ pub(crate) trait InstanceStartExecutor {
         drive_config: &DriveConfig,
         serial_config: &SerialConfig,
         paths: &SnapshotArtifactPaths,
+        cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError>;
 
     fn publish_snapshot_v1_to(
@@ -193,7 +194,8 @@ pub(crate) trait InstanceStartExecutor {
         _session: &mut Self::Session,
         _drive_config: &DriveConfig,
         _serial_config: &SerialConfig,
-        _outputs: &SnapshotArtifactOutputs,
+        _outputs: SnapshotArtifactOutputs,
+        _cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
         Err(NativeV1SnapshotPublicationError::ConfigurationUnavailable)
     }
@@ -225,11 +227,29 @@ pub(crate) trait SnapshotCreateSession: ProcessSessionDiagnostics {
         drive_config: &DriveConfig,
         serial_config: &SerialConfig,
         paths: &SnapshotArtifactPaths,
+        cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>>;
 }
 
 type NativeV1SnapshotPublicationTransactionError =
     SnapshotPublicationTransactionError<NativeV1SnapshotPublicationProducerError>;
+
+enum NativeV1SnapshotPublicationDestination {
+    Paths(SnapshotArtifactPaths),
+    Outputs(SnapshotArtifactOutputs),
+}
+
+impl NativeV1SnapshotPublicationDestination {
+    fn publish<E>(
+        self,
+        producer: impl FnOnce(SnapshotMemoryStagingWriter) -> Result<SnapshotCommitRecord, E>,
+    ) -> Result<SnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>> {
+        match self {
+            Self::Paths(paths) => publish_snapshot_artifacts_with(&paths, producer),
+            Self::Outputs(outputs) => publish_snapshot_artifacts_to_with(&outputs, producer),
+        }
+    }
+}
 
 pub(crate) enum NativeV1SnapshotPublicationProducerError {
     Capture(NativeV1SnapshotCaptureError),
@@ -1341,6 +1361,7 @@ where
     terminal_metrics_attempted: bool,
     process_metrics_diagnostics: MetricsDiagnostics,
     process_signal_metrics: Option<SharedSignalMetrics>,
+    snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation,
     terminal_snapshot_load_failure: bool,
     vmnet_authority: ProcessVmnetAuthority,
     grant_authority: Option<GrantAuthority>,
@@ -1421,6 +1442,7 @@ where
             terminal_metrics_attempted: false,
             process_metrics_diagnostics: MetricsDiagnostics::default(),
             process_signal_metrics: None,
+            snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation::default(),
             terminal_snapshot_load_failure: false,
             vmnet_authority: ProcessVmnetAuthority::Direct,
             grant_authority: None,
@@ -1449,6 +1471,14 @@ where
 
     pub(crate) fn with_process_signal_metrics(mut self, metrics: SharedSignalMetrics) -> Self {
         self.process_signal_metrics = Some(metrics);
+        self
+    }
+
+    pub(crate) fn with_snapshot_capture_cancellation(
+        mut self,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Self {
+        self.snapshot_capture_cancellation = cancellation;
         self
     }
 
@@ -2613,6 +2643,7 @@ where
             return Err(NativeV1SnapshotPublicationError::SessionUnavailable);
         }
         let outputs = self.prepare_contained_snapshot_v1_outputs(input)?;
+        let cancellation = self.snapshot_capture_cancellation.clone();
         let session = self
             .started_session
             .as_mut()
@@ -2623,12 +2654,16 @@ where
                 session,
                 &drive_config,
                 &serial_config,
-                &outputs,
+                outputs,
+                cancellation,
             )?,
-            None => {
-                self.starter
-                    .publish_snapshot_v1(session, &drive_config, &serial_config, &paths)?
-            }
+            None => self.starter.publish_snapshot_v1(
+                session,
+                &drive_config,
+                &serial_config,
+                &paths,
+                cancellation,
+            )?,
         };
         debug_assert_eq!(
             self.controller.instance_info().state,
@@ -2867,9 +2902,10 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         drive_config: &DriveConfig,
         serial_config: &SerialConfig,
         paths: &SnapshotArtifactPaths,
+        cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
         session
-            .publish_native_v1_snapshot(drive_config, serial_config, paths)
+            .publish_native_v1_snapshot(drive_config, serial_config, paths, cancellation)
             .map_err(NativeV1SnapshotPublicationError::Transaction)
     }
 
@@ -2878,10 +2914,11 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         session: &mut Self::Session,
         drive_config: &DriveConfig,
         serial_config: &SerialConfig,
-        outputs: &SnapshotArtifactOutputs,
+        outputs: SnapshotArtifactOutputs,
+        cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
         session
-            .publish_native_v1_snapshot_to(drive_config, serial_config, outputs)
+            .publish_native_v1_snapshot_to(drive_config, serial_config, outputs, cancellation)
             .map_err(NativeV1SnapshotPublicationError::Transaction)
     }
 
@@ -2968,22 +3005,90 @@ impl<T> NativeV1SnapshotMemoryOutput for T where T: std::io::Write + Seek + Send
 
 type BoxedNativeV1SnapshotMemoryOutput = Box<dyn NativeV1SnapshotMemoryOutput>;
 
+const NATIVE_V1_SNAPSHOT_OPERATION_ACTIVE: u8 = 0;
+const NATIVE_V1_SNAPSHOT_OPERATION_CANCELLED: u8 = 1;
+const NATIVE_V1_SNAPSHOT_OPERATION_COMMIT_SEALED: u8 = 2;
+
+#[derive(Debug)]
+struct NativeV1SnapshotCaptureCancellationState {
+    operation: AtomicU8,
+    shutdown_requested: AtomicBool,
+}
+
+impl Default for NativeV1SnapshotCaptureCancellationState {
+    fn default() -> Self {
+        Self {
+            operation: AtomicU8::new(NATIVE_V1_SNAPSHOT_OPERATION_ACTIVE),
+            shutdown_requested: AtomicBool::new(false),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct NativeV1SnapshotCaptureCancellation {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<NativeV1SnapshotCaptureCancellationState>,
 }
 
 impl NativeV1SnapshotCaptureCancellation {
-    pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+    fn begin_operation(&self) -> bool {
+        if self.state.shutdown_requested.load(Ordering::Acquire) {
+            self.cancel_active_operation();
+            return false;
+        }
+
+        match self.state.operation.compare_exchange(
+            NATIVE_V1_SNAPSHOT_OPERATION_COMMIT_SEALED,
+            NATIVE_V1_SNAPSHOT_OPERATION_ACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(NATIVE_V1_SNAPSHOT_OPERATION_ACTIVE) => {}
+            Err(NATIVE_V1_SNAPSHOT_OPERATION_CANCELLED) => return false,
+            Err(_) => return false,
+        }
+
+        if self.state.shutdown_requested.load(Ordering::Acquire) {
+            self.cancel_active_operation();
+        }
+        !self.is_cancelled()
     }
 
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+    pub(crate) fn cancel(&self) {
+        self.state.shutdown_requested.store(true, Ordering::Release);
+        self.cancel_active_operation();
+    }
+
+    fn cancel_active_operation(&self) {
+        let _ = self.state.operation.compare_exchange(
+            NATIVE_V1_SNAPSHOT_OPERATION_ACTIVE,
+            NATIVE_V1_SNAPSHOT_OPERATION_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.operation.load(Ordering::Acquire) == NATIVE_V1_SNAPSHOT_OPERATION_CANCELLED
+    }
+
+    fn try_seal_commit(&self) -> bool {
+        self.state
+            .operation
+            .compare_exchange(
+                NATIVE_V1_SNAPSHOT_OPERATION_ACTIVE,
+                NATIVE_V1_SNAPSHOT_OPERATION_COMMIT_SEALED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn is_commit_sealed(&self) -> bool {
+        self.state.operation.load(Ordering::Acquire) == NATIVE_V1_SNAPSHOT_OPERATION_COMMIT_SEALED
     }
 
     fn same_operation(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+        Arc::ptr_eq(&self.state, &other.state)
     }
 }
 
@@ -2991,6 +3096,11 @@ impl fmt::Debug for NativeV1SnapshotCaptureCancellation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativeV1SnapshotCaptureCancellation")
             .field("cancelled", &self.is_cancelled())
+            .field("commit_sealed", &self.is_commit_sealed())
+            .field(
+                "shutdown_requested",
+                &self.state.shutdown_requested.load(Ordering::Acquire),
+            )
             .finish()
     }
 }
@@ -3000,6 +3110,7 @@ pub(crate) enum NativeV1SnapshotCaptureStage {
     State(HvfArm64BootSnapshotV1CaptureStage),
     Memory(SnapshotMemoryIoStage),
     Bundle,
+    CommitSeal,
 }
 
 impl fmt::Display for NativeV1SnapshotCaptureStage {
@@ -3008,6 +3119,7 @@ impl fmt::Display for NativeV1SnapshotCaptureStage {
             Self::State(stage) => write!(f, "state/{stage}"),
             Self::Memory(stage) => write!(f, "memory/{stage}"),
             Self::Bundle => f.write_str("bundle"),
+            Self::CommitSeal => f.write_str("commit seal"),
         }
     }
 }
@@ -3099,6 +3211,8 @@ pub(crate) trait NativeV1SnapshotCaptureSession: BootRunLoopSession {
     ) -> Result<Self::SnapshotBundle, NativeV1SnapshotCaptureError>;
 
     fn native_v1_snapshot_commit_record(bundle: Self::SnapshotBundle) -> SnapshotCommitRecord;
+
+    fn native_v1_snapshot_published(&mut self, _outcome: &SnapshotPublicationOutcome) {}
 }
 
 impl<S, P> ProcessHvfBootSession<S, P> {
@@ -5032,6 +5146,18 @@ where
         R: Send + 'static,
         E: Send + 'static,
     {
+        self.run_snapshot_quiesced_preserving_result_if(command, || false)
+    }
+
+    fn run_snapshot_quiesced_preserving_result_if<R, E>(
+        &self,
+        command: impl FnOnce(&mut S) -> Result<R, E> + Send + 'static,
+        preserve_result: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<R, BootRunLoopCommandError<<S::Control as BootRunLoopControl>::Error, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
         // Caller and worker both observe status before taking admission. Keep
         // that lock order aligned with pause, resume, and shutdown paths.
         if !matches!(self.status.snapshot(), BootRunLoopWorkerStatus::Paused) {
@@ -5057,7 +5183,8 @@ where
             };
 
             let result = command(session);
-            let response = if guard.release() {
+            let preserve_result = preserve_result();
+            let response = if guard.release() || preserve_result {
                 BootRunLoopSnapshotCommandResponse::Complete(result)
             } else {
                 BootRunLoopSnapshotCommandResponse::AdmissionInvalidated
@@ -5406,6 +5533,19 @@ where
         self.command_handle.run_snapshot_quiesced(command)
     }
 
+    fn run_snapshot_quiesced_preserving_result_if<R, E>(
+        &self,
+        command: impl FnOnce(&mut S) -> Result<R, E> + Send + 'static,
+        preserve_result: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<R, BootRunLoopCommandError<<S::Control as BootRunLoopControl>::Error, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.command_handle
+            .run_snapshot_quiesced_preserving_result_if(command, preserve_result)
+    }
+
     fn register_snapshot_capture(
         &self,
         cancellation: NativeV1SnapshotCaptureCancellation,
@@ -5541,68 +5681,91 @@ impl<S> BootRunLoopSupervisor<S>
 where
     S: NativeV1SnapshotCaptureSession,
 {
+    fn capture_native_v1_snapshot_with_guard(
+        session: &S,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        guard: &S::SnapshotAuxiliaryQuiescenceGuard,
+        mut output: BoxedNativeV1SnapshotMemoryOutput,
+        cancellation: &NativeV1SnapshotCaptureCancellation,
+    ) -> Result<S::SnapshotBundle, NativeV1SnapshotCaptureError> {
+        let result = (|| {
+            if cancellation.is_cancelled() {
+                return Err(native_v1_snapshot_cancelled(
+                    NativeV1SnapshotCaptureStage::State(
+                        HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
+                    ),
+                ));
+            }
+            let state = session.capture_native_v1_state(
+                drive_config,
+                serial_config,
+                guard,
+                Instant::now(),
+                cancellation,
+            )?;
+            let memory = session.native_v1_guest_memory()?;
+            let binding = write_snapshot_memory_image_with_cancel(memory, &mut output, |_stage| {
+                cancellation.is_cancelled()
+            })
+            .map_err(|source| match source {
+                SnapshotMemoryWriteError::Cancelled { stage } => {
+                    native_v1_snapshot_cancelled(NativeV1SnapshotCaptureStage::Memory(stage))
+                }
+                source => NativeV1SnapshotCaptureError::MemoryWrite { source },
+            })?;
+            if cancellation.is_cancelled() {
+                return Err(native_v1_snapshot_cancelled(
+                    NativeV1SnapshotCaptureStage::Bundle,
+                ));
+            }
+            let bundle = session.bind_native_v1_snapshot(binding, state)?;
+            if cancellation.is_cancelled() {
+                return Err(native_v1_snapshot_cancelled(
+                    NativeV1SnapshotCaptureStage::Bundle,
+                ));
+            }
+            Ok(bundle)
+        })();
+        // The consumed output must be closed before retry publication is
+        // re-enabled, on both success and every recoverable failure.
+        drop(output);
+        result
+    }
+
     fn capture_native_v1_snapshot(
         &self,
         drive_config: &DriveConfig,
         serial_config: &SerialConfig,
-        mut output: BoxedNativeV1SnapshotMemoryOutput,
+        output: BoxedNativeV1SnapshotMemoryOutput,
         cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<S::SnapshotBundle, NativeV1SnapshotCaptureError> {
         let drive_config = drive_config.clone();
         let serial_config = serial_config.clone();
         let active_capture = self.register_snapshot_capture(cancellation.clone())?;
+        if !cancellation.begin_operation() {
+            return Err(native_v1_snapshot_cancelled(
+                NativeV1SnapshotCaptureStage::State(
+                    HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
+                ),
+            ));
+        }
 
         self.run_snapshot_quiesced(move |session| {
             // Keep shutdown cancellation registered with the worker-owned
             // operation even if the synchronous response receiver is dropped.
             let _active_capture = active_capture;
-            if cancellation.is_cancelled() {
-                return Err(NativeV1SnapshotCaptureError::Cancelled {
-                    stage: NativeV1SnapshotCaptureStage::State(
-                        HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
-                    ),
-                });
-            }
             let guard = session
                 .quiesce_snapshot_auxiliary_work()
                 .map_err(|source| NativeV1SnapshotCaptureError::Auxiliary { source })?;
-            let result = (|| {
-                let state = session.capture_native_v1_state(
-                    &drive_config,
-                    &serial_config,
-                    &guard,
-                    Instant::now(),
-                    &cancellation,
-                )?;
-                let memory = session.native_v1_guest_memory()?;
-                let binding =
-                    write_snapshot_memory_image_with_cancel(memory, &mut output, |_stage| {
-                        cancellation.is_cancelled()
-                    })
-                    .map_err(|source| match source {
-                        SnapshotMemoryWriteError::Cancelled { stage } => {
-                            NativeV1SnapshotCaptureError::Cancelled {
-                                stage: NativeV1SnapshotCaptureStage::Memory(stage),
-                            }
-                        }
-                        source => NativeV1SnapshotCaptureError::MemoryWrite { source },
-                    })?;
-                if cancellation.is_cancelled() {
-                    return Err(NativeV1SnapshotCaptureError::Cancelled {
-                        stage: NativeV1SnapshotCaptureStage::Bundle,
-                    });
-                }
-                let bundle = session.bind_native_v1_snapshot(binding, state)?;
-                if cancellation.is_cancelled() {
-                    return Err(NativeV1SnapshotCaptureError::Cancelled {
-                        stage: NativeV1SnapshotCaptureStage::Bundle,
-                    });
-                }
-                Ok(bundle)
-            })();
-            // The consumed output must be closed before retry publication is
-            // re-enabled, on both success and every recoverable failure.
-            drop(output);
+            let result = Self::capture_native_v1_snapshot_with_guard(
+                session,
+                &drive_config,
+                &serial_config,
+                &guard,
+                output,
+                &cancellation,
+            );
             drop(guard);
             result
         })
@@ -5616,39 +5779,106 @@ where
         paths: &SnapshotArtifactPaths,
         cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>> {
-        publish_snapshot_artifacts_with(paths, |writer| {
-            let bundle = self
-                .capture_native_v1_snapshot(
-                    drive_config,
-                    serial_config,
-                    Box::new(writer),
-                    cancellation,
-                )
-                .map_err(NativeV1SnapshotPublicationProducerError::Capture)?;
-            require_native_v1_composite_record(S::native_v1_snapshot_commit_record(bundle))
-        })
-        .map_err(Box::new)
+        self.publish_native_v1_snapshot_to_destination(
+            drive_config,
+            serial_config,
+            NativeV1SnapshotPublicationDestination::Paths(paths.clone()),
+            cancellation,
+        )
     }
 
     fn publish_native_v1_snapshot_to(
         &self,
         drive_config: &DriveConfig,
         serial_config: &SerialConfig,
-        outputs: &SnapshotArtifactOutputs,
+        outputs: SnapshotArtifactOutputs,
+        cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>> {
-        publish_snapshot_artifacts_to_with(outputs, |writer| {
-            let bundle = self
-                .capture_native_v1_snapshot(
-                    drive_config,
-                    serial_config,
-                    Box::new(writer),
-                    NativeV1SnapshotCaptureCancellation::default(),
-                )
-                .map_err(NativeV1SnapshotPublicationProducerError::Capture)?;
-            require_native_v1_composite_record(S::native_v1_snapshot_commit_record(bundle))
-        })
-        .map_err(Box::new)
+        self.publish_native_v1_snapshot_to_destination(
+            drive_config,
+            serial_config,
+            NativeV1SnapshotPublicationDestination::Outputs(outputs),
+            cancellation,
+        )
     }
+
+    fn publish_native_v1_snapshot_to_destination(
+        &self,
+        drive_config: &DriveConfig,
+        serial_config: &SerialConfig,
+        destination: NativeV1SnapshotPublicationDestination,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>> {
+        let drive_config = drive_config.clone();
+        let serial_config = serial_config.clone();
+        let active_capture = self
+            .register_snapshot_capture(cancellation.clone())
+            .map_err(native_v1_snapshot_transaction_error_before_staging)?;
+        if !cancellation.begin_operation() {
+            return Err(native_v1_snapshot_transaction_error_before_staging(
+                native_v1_snapshot_cancelled(NativeV1SnapshotCaptureStage::State(
+                    HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
+                )),
+            ));
+        }
+        let completion_cancellation = cancellation.clone();
+
+        self.run_snapshot_quiesced_preserving_result_if(
+            move |session| {
+                // Keep shutdown cancellation registered with every publication
+                // phase even if the synchronous response receiver is dropped.
+                let _active_capture = active_capture;
+                let guard = session
+                    .quiesce_snapshot_auxiliary_work()
+                    .map_err(|source| {
+                        native_v1_snapshot_transaction_error_before_staging(
+                            NativeV1SnapshotCaptureError::Auxiliary { source },
+                        )
+                    })?;
+                let result = destination.publish(|writer| {
+                    let bundle = Self::capture_native_v1_snapshot_with_guard(
+                        session,
+                        &drive_config,
+                        &serial_config,
+                        &guard,
+                        Box::new(writer),
+                        &cancellation,
+                    )
+                    .map_err(NativeV1SnapshotPublicationProducerError::Capture)?;
+                    let record = require_native_v1_composite_record(
+                        S::native_v1_snapshot_commit_record(bundle),
+                    )?;
+                    if !cancellation.try_seal_commit() {
+                        return Err(NativeV1SnapshotPublicationProducerError::Capture(
+                            native_v1_snapshot_cancelled(NativeV1SnapshotCaptureStage::CommitSeal),
+                        ));
+                    }
+                    Ok(record)
+                });
+                if let Ok(outcome) = &result {
+                    session.native_v1_snapshot_published(outcome);
+                }
+                drop(guard);
+                result.map_err(Box::new)
+            },
+            move || completion_cancellation.is_commit_sealed(),
+        )
+        .map_err(native_snapshot_publication_error_from_boot_run_loop_command)
+    }
+}
+
+fn native_v1_snapshot_cancelled(
+    stage: NativeV1SnapshotCaptureStage,
+) -> NativeV1SnapshotCaptureError {
+    NativeV1SnapshotCaptureError::Cancelled { stage }
+}
+
+fn native_v1_snapshot_transaction_error_before_staging(
+    source: NativeV1SnapshotCaptureError,
+) -> Box<NativeV1SnapshotPublicationTransactionError> {
+    Box::new(SnapshotPublicationTransactionError::from_producer(
+        NativeV1SnapshotPublicationProducerError::Capture(source),
+    ))
 }
 
 fn require_native_v1_composite_record(
@@ -5711,13 +5941,14 @@ impl SnapshotCreateSession for HvfBootRunLoopSupervisor {
         drive_config: &DriveConfig,
         serial_config: &SerialConfig,
         paths: &SnapshotArtifactPaths,
+        cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>> {
         BootRunLoopSupervisor::publish_native_v1_snapshot(
             self,
             drive_config,
             serial_config,
             paths,
-            NativeV1SnapshotCaptureCancellation::default(),
+            cancellation,
         )
     }
 }
@@ -5750,6 +5981,38 @@ where
         )),
     };
     NativeV1SnapshotCaptureError::Supervisor { source }
+}
+
+fn native_snapshot_publication_error_from_boot_run_loop_command<C>(
+    error: BootRunLoopCommandError<C, Box<NativeV1SnapshotPublicationTransactionError>>,
+) -> Box<NativeV1SnapshotPublicationTransactionError>
+where
+    C: fmt::Display,
+{
+    let source = match error {
+        BootRunLoopCommandError::Command { source } => return source,
+        BootRunLoopCommandError::WorkerNotPaused => {
+            BackendError::InvalidState("boot run loop worker is not paused")
+        }
+        BootRunLoopCommandError::SnapshotQuiescenceActive => {
+            BackendError::InvalidState("boot run loop snapshot quiescence is active")
+        }
+        BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::AdmissionClosed
+        | BootRunLoopCommandError::QueueClosed
+        | BootRunLoopCommandError::ResponseClosed => {
+            BackendError::InvalidState("boot run loop worker is not running")
+        }
+        BootRunLoopCommandError::QueueFull => {
+            BackendError::Hypervisor("boot run loop command queue is full".to_string())
+        }
+        BootRunLoopCommandError::Wakeup { source } => BackendError::Hypervisor(format!(
+            "failed to wake boot run loop for native-v1 publication: {source}"
+        )),
+    };
+    native_v1_snapshot_transaction_error_before_staging(NativeV1SnapshotCaptureError::Supervisor {
+        source,
+    })
 }
 
 impl<S> ProcessSessionDiagnostics for BootRunLoopSupervisor<S>
@@ -6188,11 +6451,14 @@ mod tests {
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
         SnapshotType, SnapshotV1ControllerCommit,
     };
+    #[cfg(target_os = "macos")]
+    use bangbang_runtime::snapshot_artifact::{
+        SnapshotArtifactOutput, SnapshotArtifactOutputs, SnapshotCommitDurability,
+        load_snapshot_artifacts,
+    };
     use bangbang_runtime::snapshot_artifact::{
         SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
-    #[cfg(target_os = "macos")]
-    use bangbang_runtime::snapshot_artifact::{SnapshotCommitDurability, load_snapshot_artifacts};
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_commit::SnapshotCommitKind;
     use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
@@ -6261,6 +6527,19 @@ mod tests {
         cancellation: Option<NativeV1SnapshotCaptureCancellation>,
         cancel_after_write: Option<usize>,
         write_count: usize,
+    }
+
+    struct FakeNativeV1SnapshotBundle {
+        binding: SnapshotMemoryBinding,
+        cancel_before_seal: Option<NativeV1SnapshotCaptureCancellation>,
+    }
+
+    impl std::ops::Deref for FakeNativeV1SnapshotBundle {
+        type Target = SnapshotMemoryBinding;
+
+        fn deref(&self) -> &Self::Target {
+            &self.binding
+        }
     }
 
     impl RecordingSnapshotWriter {
@@ -6942,6 +7221,7 @@ mod tests {
             _drive_config: &DriveConfig,
             _serial_config: &bangbang_runtime::serial::SerialConfig,
             paths: &SnapshotArtifactPaths,
+            _cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Result<SnapshotPublicationOutcome, Box<NativeV1SnapshotPublicationTransactionError>>
         {
             self.native_snapshot_publication_count += 1;
@@ -7032,6 +7312,7 @@ mod tests {
             _drive_config: &DriveConfig,
             _serial_config: &SerialConfig,
             _paths: &SnapshotArtifactPaths,
+            _cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
             Err(NativeV1SnapshotPublicationError::SessionUnavailable)
         }
@@ -7133,12 +7414,13 @@ mod tests {
             drive_config: &DriveConfig,
             serial_config: &SerialConfig,
             paths: &SnapshotArtifactPaths,
+            cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
             if self.snapshot_publication_failure {
                 return Err(NativeV1SnapshotPublicationError::ConfigurationUnavailable);
             }
             session
-                .publish_native_v1_snapshot(drive_config, serial_config, paths)
+                .publish_native_v1_snapshot(drive_config, serial_config, paths, cancellation)
                 .map_err(NativeV1SnapshotPublicationError::Transaction)
         }
 
@@ -7192,6 +7474,7 @@ mod tests {
             _drive_config: &DriveConfig,
             _serial_config: &SerialConfig,
             _paths: &SnapshotArtifactPaths,
+            _cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
             Err(NativeV1SnapshotPublicationError::SessionUnavailable)
         }
@@ -7496,6 +7779,7 @@ mod tests {
         native_snapshot_memory: Option<GuestMemory>,
         native_snapshot_events: Arc<Mutex<Vec<&'static str>>>,
         native_snapshot_panic: bool,
+        native_snapshot_cancel_before_seal: Option<NativeV1SnapshotCaptureCancellation>,
     }
 
     impl FakeRunLoopSession {
@@ -7534,6 +7818,7 @@ mod tests {
                 native_snapshot_memory: None,
                 native_snapshot_events: Arc::default(),
                 native_snapshot_panic: false,
+                native_snapshot_cancel_before_seal: None,
             }
         }
 
@@ -7581,6 +7866,15 @@ mod tests {
         #[cfg(target_os = "macos")]
         const fn with_native_snapshot_panic(mut self) -> Self {
             self.native_snapshot_panic = true;
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        fn with_native_snapshot_cancel_before_seal(
+            mut self,
+            cancellation: NativeV1SnapshotCaptureCancellation,
+        ) -> Self {
+            self.native_snapshot_cancel_before_seal = Some(cancellation);
             self
         }
 
@@ -7867,7 +8161,7 @@ mod tests {
 
     impl NativeV1SnapshotCaptureSession for FakeRunLoopSession {
         type DetachedState = ();
-        type SnapshotBundle = SnapshotMemoryBinding;
+        type SnapshotBundle = FakeNativeV1SnapshotBundle;
 
         fn capture_native_v1_state(
             &self,
@@ -7917,12 +8211,28 @@ mod tests {
                 .lock()
                 .expect("fake native snapshot events should lock")
                 .push("bundle");
-            Ok(binding)
+            Ok(FakeNativeV1SnapshotBundle {
+                binding,
+                cancel_before_seal: self.native_snapshot_cancel_before_seal.clone(),
+            })
         }
 
         fn native_v1_snapshot_commit_record(bundle: Self::SnapshotBundle) -> SnapshotCommitRecord {
-            SnapshotCommitRecord::try_new_composite(bundle, b"fake-native-v1-state".to_vec())
-                .expect("fake native-v1 commit should validate")
+            if let Some(cancellation) = bundle.cancel_before_seal {
+                cancellation.cancel();
+            }
+            SnapshotCommitRecord::try_new_composite(
+                bundle.binding,
+                b"fake-native-v1-state".to_vec(),
+            )
+            .expect("fake native-v1 commit should validate")
+        }
+
+        fn native_v1_snapshot_published(&mut self, _outcome: &SnapshotPublicationOutcome) {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("published");
         }
     }
 
@@ -10607,6 +10917,90 @@ mod tests {
         );
         assert_eq!(control.request_stop_count(), 1);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_shutdown_preserves_sealed_snapshot_result() {
+        for return_error in [false, true] {
+            let control = FakeRunLoopControl::default();
+            let drop_count = Arc::new(AtomicU64::new(0));
+            let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+            let session =
+                FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                    .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                    .with_wait_for_stop(false)
+                    .with_wait_for_wakeup(true);
+            let supervisor = BootRunLoopSupervisor::start(
+                session,
+                NonZeroUsize::new(20).expect("non-zero limit"),
+            )
+            .expect("supervisor should start");
+            assert_eq!(
+                max_steps_receiver
+                    .recv()
+                    .expect("worker should enter first run loop"),
+                20
+            );
+            supervisor.pause().expect("supervisor should pause");
+            let snapshot_handle = supervisor.command_handle();
+            let admission = Arc::clone(&supervisor.admission);
+            let (entered_sender, entered_receiver) = mpsc::channel();
+            let (release_sender, release_receiver) = mpsc::channel();
+
+            std::thread::scope(|scope| {
+                let snapshot_caller = scope.spawn(move || {
+                    snapshot_handle.run_snapshot_quiesced_preserving_result_if(
+                        move |_| {
+                            entered_sender
+                                .send(())
+                                .expect("test should observe sealed worker command");
+                            release_receiver
+                                .recv()
+                                .expect("test should release sealed worker command");
+                            if return_error {
+                                Err(FakeRunLoopCommandError)
+                            } else {
+                                Ok("committed")
+                            }
+                        },
+                        || true,
+                    )
+                });
+                entered_receiver
+                    .recv()
+                    .expect("sealed snapshot command should enter lease scope");
+                admission.wait_for_state(BootRunLoopCommandAdmissionState::SnapshotLeased);
+
+                let shutdown_caller = scope.spawn(move || drop(supervisor));
+                admission.wait_for_state(BootRunLoopCommandAdmissionState::Shutdown);
+                release_sender
+                    .send(())
+                    .expect("sealed snapshot operation should finish after invalidation");
+                let result = snapshot_caller
+                    .join()
+                    .expect("snapshot caller should not panic");
+                if return_error {
+                    assert_eq!(
+                        result,
+                        Err(BootRunLoopCommandError::Command {
+                            source: FakeRunLoopCommandError,
+                        })
+                    );
+                } else {
+                    assert_eq!(result, Ok("committed"));
+                }
+                shutdown_caller
+                    .join()
+                    .expect("supervisor shutdown should not panic");
+            });
+
+            assert_eq!(
+                admission.snapshot(),
+                BootRunLoopCommandAdmissionState::Shutdown
+            );
+            assert_eq!(control.request_stop_count(), 1);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
@@ -14393,6 +14787,42 @@ mod tests {
         assert_eq!(vmm.metrics_session_epoch(), Some(session_epoch));
     }
 
+    #[test]
+    fn native_v1_cancellation_and_commit_seal_have_one_winner() {
+        let cancellation = NativeV1SnapshotCaptureCancellation::default();
+        assert!(cancellation.begin_operation());
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+        assert!(!cancellation.try_seal_commit());
+
+        let sealed = NativeV1SnapshotCaptureCancellation::default();
+        assert!(sealed.begin_operation());
+        assert!(sealed.try_seal_commit());
+        sealed.cancel();
+        assert!(sealed.is_commit_sealed());
+        assert!(!sealed.is_cancelled());
+        assert!(!sealed.begin_operation());
+    }
+
+    #[test]
+    fn native_v1_sealed_operation_resets_only_without_shutdown() {
+        let cancellation = NativeV1SnapshotCaptureCancellation::default();
+        assert!(cancellation.begin_operation());
+        assert!(cancellation.try_seal_commit());
+
+        assert!(cancellation.begin_operation());
+        assert!(!cancellation.is_commit_sealed());
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+
+        let signal_before_reset = NativeV1SnapshotCaptureCancellation::default();
+        assert!(signal_before_reset.begin_operation());
+        assert!(signal_before_reset.try_seal_commit());
+        signal_before_reset.cancel();
+        assert!(!signal_before_reset.begin_operation());
+        assert!(signal_before_reset.is_commit_sealed());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn native_v1_supervisor_publishes_one_exact_composite_pair() {
@@ -14434,20 +14864,73 @@ mod tests {
             Some(b"fake-native-v1-state".as_slice())
         );
         assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
-        let events = events
+        let event_snapshot = events
             .lock()
             .expect("native publication events should lock")
             .clone();
-        let bundle = events
+        let bundle = event_snapshot
             .iter()
             .position(|event| *event == "bundle")
             .expect("bundle event should exist");
-        let auxiliary_drop = events
+        let published = event_snapshot
+            .iter()
+            .position(|event| *event == "published")
+            .expect("post-publication hook event should exist");
+        let auxiliary_drop = event_snapshot
             .iter()
             .position(|event| *event == "aux-drop")
             .expect("auxiliary drop should exist");
-        assert!(bundle < auxiliary_drop);
+        assert!(bundle < published);
+        assert!(published < auxiliary_drop);
         directory.assert_no_staging();
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        supervisor
+            .run_command(|session| {
+                session
+                    .native_snapshot_events
+                    .lock()
+                    .expect("later command events should lock")
+                    .push("later-command");
+                Ok::<_, FakeRunLoopCommandError>(())
+            })
+            .expect("ordinary command should run only after publication releases admission");
+        let released_events = events
+            .lock()
+            .expect("released publication events should lock");
+        let auxiliary_drop = released_events
+            .iter()
+            .position(|event| *event == "aux-drop")
+            .expect("auxiliary drop should remain recorded");
+        let later_command = released_events
+            .iter()
+            .position(|event| *event == "later-command")
+            .expect("later ordinary command should be recorded");
+        assert!(auxiliary_drop < later_command);
+        drop(released_events);
+
+        let output_directory = TempSnapshotDirectory::new("supervisor-move-only-outputs");
+        let output_paths = output_directory.paths();
+        let outputs = SnapshotArtifactOutputs::new(
+            SnapshotArtifactOutput::path(output_paths.state()),
+            SnapshotArtifactOutput::path(output_paths.memory()),
+        );
+        let output_outcome = supervisor
+            .publish_native_v1_snapshot_to(
+                &drive,
+                &serial,
+                outputs,
+                NativeV1SnapshotCaptureCancellation::default(),
+            )
+            .expect("move-only publication outputs should remain inside the worker transaction");
+        assert_eq!(
+            output_outcome.durability(),
+            SnapshotCommitDurability::Durable
+        );
+        load_snapshot_artifacts(&output_paths).expect("move-only output pair should load");
+        output_directory.assert_no_staging();
 
         drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
@@ -14512,6 +14995,74 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn native_v1_publication_cancellation_wins_immediately_before_commit_seal() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let cancellation = NativeV1SnapshotCaptureCancellation::default();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_snapshot_cancel_before_seal(cancellation.clone())
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let auxiliary = session.snapshot_auxiliary_quiescence();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(59).expect("non-zero limit"))
+                .expect("native publication supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 59);
+        supervisor.pause().expect("supervisor should pause");
+
+        let backing = TempFilePath::create_with_bytes("seal-cancel-root", &[0; 512]);
+        let drive = drive_config("root", backing.path());
+        let serial = bangbang_runtime::serial::SerialConfig::default();
+        let directory = TempSnapshotDirectory::new("seal-cancel-publication");
+        let paths = directory.paths();
+        let error = supervisor
+            .publish_native_v1_snapshot(&drive, &serial, &paths, cancellation)
+            .expect_err("cancellation should win before commit seal");
+        let producer = error
+            .producer()
+            .expect("seal cancellation should remain a producer failure");
+        assert!(matches!(
+            producer.source(),
+            NativeV1SnapshotPublicationProducerError::Capture(
+                NativeV1SnapshotCaptureError::Cancelled {
+                    stage: NativeV1SnapshotCaptureStage::CommitSeal,
+                }
+            )
+        ));
+        assert!(!paths.state().exists());
+        assert!(!paths.memory().exists());
+        directory.assert_no_staging();
+        assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 1);
+        assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            !events
+                .lock()
+                .expect("seal cancellation events should lock")
+                .contains(&"published")
+        );
+
+        supervisor
+            .publish_native_v1_snapshot(
+                &drive,
+                &serial,
+                &paths,
+                NativeV1SnapshotCaptureCancellation::default(),
+            )
+            .expect("fresh operation should publish after seal cancellation");
+        assert!(paths.state().is_file());
+        assert!(paths.memory().is_file());
+        directory.assert_no_staging();
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn native_v1_publication_preflight_skips_capture_and_worker_panic_is_terminal() {
         let collision_control = FakeRunLoopControl::default();
         let collision_drops = Arc::new(AtomicU64::new(0));
@@ -14550,11 +15101,11 @@ mod tests {
                 NativeV1SnapshotCaptureCancellation::default(),
             )
             .expect_err("existing final should fail before capture");
-        assert!(
-            collision_events
+        assert_eq!(
+            *collision_events
                 .lock()
-                .expect("collision events should lock")
-                .is_empty()
+                .expect("collision events should lock"),
+            ["aux-acquire", "aux-drop"]
         );
         assert_eq!(
             fs::read(collision_paths.state()).expect("existing final should remain"),

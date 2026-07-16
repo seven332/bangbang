@@ -39,7 +39,10 @@ use signal_hook::consts::signal::SIGTERM;
 use signal_hook::consts::signal::{SIGBUS, SIGHUP, SIGILL, SIGINT, SIGPIPE, SIGSEGV, SIGSYS};
 use signal_hook::consts::signal::{SIGXCPU, SIGXFSZ};
 use signal_hook::{SigId, low_level};
-use vmm::{ProcessSessionExitDecision, ProcessVmm, ProcessVmnetAuthority, VmmRequestHandler};
+use vmm::{
+    NativeV1SnapshotCaptureCancellation, ProcessSessionExitDecision, ProcessVmm,
+    ProcessVmnetAuthority, VmmRequestHandler,
+};
 
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics, SharedSignalMetrics};
@@ -93,11 +96,16 @@ fn main() -> ExitCode {
 }
 
 fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
+    let snapshot_cancellation = NativeV1SnapshotCaptureCancellation::default();
     let mut contained_shutdown = if let Some(session) = contained.as_mut() {
         let (reader, writer) = session
             .take_wakeup_pair()
             .map_err(|_| ProcessError::ContainedSession)?;
-        Some(ShutdownSignal::install_with_pair(reader, writer)?)
+        Some(ShutdownSignal::install_with_pair(
+            reader,
+            writer,
+            snapshot_cancellation.clone(),
+        )?)
     } else {
         None
     };
@@ -208,6 +216,7 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             .with_boot_timer_enabled(boot_timer)
             .with_process_metrics_diagnostics(process_metrics_diagnostics)
             .with_process_signal_metrics(signal_metrics.clone())
+            .with_snapshot_capture_cancellation(snapshot_cancellation.clone())
             .with_grant_authority(grant_authority.clone())
             .with_vmnet_authority(vmnet_authority);
             #[cfg(target_os = "macos")]
@@ -247,7 +256,7 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             let result = (|| {
                 let mut shutdown_signal = match contained_shutdown.take() {
                     Some(signal) => signal,
-                    None => ShutdownSignal::install()?,
+                    None => ShutdownSignal::install(snapshot_cancellation.clone())?,
                 };
                 if contained_shutdown_requested(contained)? {
                     return Ok(());
@@ -1401,7 +1410,7 @@ impl std::error::Error for MetadataFileError {}
 #[derive(Debug)]
 struct ShutdownSignal {
     wakeup_reader: UnixStream,
-    signal_ids: [SigId; 2],
+    signal_ids: Vec<SigId>,
 }
 
 const FATAL_SIGNAL_EXITS: &[(i32, ProcessExitCode)] = &[
@@ -1495,28 +1504,30 @@ fn register_fatal_signal_exit(
 }
 
 impl ShutdownSignal {
-    fn install() -> Result<Self, ProcessError> {
+    fn install(
+        snapshot_cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<Self, ProcessError> {
         let (wakeup_reader, wakeup_writer) =
             UnixStream::pair().map_err(|err| ProcessError::SignalHandler(err.kind()))?;
-        Self::install_with_pair(wakeup_reader, wakeup_writer)
+        Self::install_with_pair(wakeup_reader, wakeup_writer, snapshot_cancellation)
     }
 
     fn install_with_pair(
         wakeup_reader: UnixStream,
         wakeup_writer: UnixStream,
+        snapshot_cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<Self, ProcessError> {
-        let sigint = register_signal_wakeup(SIGINT, &wakeup_writer)?;
-        let sigterm = match register_signal_wakeup(SIGTERM, &wakeup_writer) {
-            Ok(sigterm) => sigterm,
-            Err(err) => {
-                low_level::unregister(sigint);
-                return Err(err);
-            }
-        };
+        let signal_ids = register_shutdown_signal_actions_with(
+            |signal| register_signal_wakeup(signal, &wakeup_writer),
+            |signal| register_snapshot_cancellation(signal, snapshot_cancellation.clone()),
+            |signal_id| {
+                low_level::unregister(signal_id);
+            },
+        )?;
 
         Ok(Self {
             wakeup_reader,
-            signal_ids: [sigint, sigterm],
+            signal_ids,
         })
     }
 
@@ -1633,11 +1644,64 @@ fn register_signal_wakeup(signal: i32, wakeup_writer: &UnixStream) -> Result<Sig
     }
 }
 
+fn register_snapshot_cancellation(
+    signal: i32,
+    cancellation: NativeV1SnapshotCaptureCancellation,
+) -> Result<SigId, ProcessError> {
+    // SAFETY: The registered action only performs lock-free atomic stores and
+    // compare/exchange operations through a retained process-local allocation.
+    // It does not allocate, lock, perform I/O, or run snapshot cleanup in the
+    // signal context.
+    unsafe {
+        low_level::register(signal, move || {
+            cancellation.cancel();
+        })
+    }
+    .map_err(|err| ProcessError::SignalHandler(err.kind()))
+}
+
+fn register_shutdown_signal_actions_with<T>(
+    mut register_wakeup: impl FnMut(i32) -> Result<T, ProcessError>,
+    mut register_cancellation: impl FnMut(i32) -> Result<T, ProcessError>,
+    mut unregister: impl FnMut(T),
+) -> Result<Vec<T>, ProcessError> {
+    let mut signal_ids = Vec::with_capacity(4);
+    for signal in [SIGINT, SIGTERM] {
+        let wakeup_id = match register_wakeup(signal) {
+            Ok(signal_id) => signal_id,
+            Err(err) => {
+                unregister_signal_ids_with(&mut signal_ids, &mut unregister);
+                return Err(err);
+            }
+        };
+        signal_ids.push(wakeup_id);
+        let cancellation_id = match register_cancellation(signal) {
+            Ok(signal_id) => signal_id,
+            Err(err) => {
+                unregister_signal_ids_with(&mut signal_ids, &mut unregister);
+                return Err(err);
+            }
+        };
+        signal_ids.push(cancellation_id);
+    }
+    Ok(signal_ids)
+}
+
+fn unregister_signal_ids_with<T>(signal_ids: &mut Vec<T>, mut unregister: impl FnMut(T)) {
+    for signal_id in signal_ids.drain(..) {
+        unregister(signal_id);
+    }
+}
+
+fn unregister_signal_ids(signal_ids: &mut Vec<SigId>) {
+    unregister_signal_ids_with(signal_ids, |signal_id| {
+        low_level::unregister(signal_id);
+    });
+}
+
 impl Drop for ShutdownSignal {
     fn drop(&mut self) {
-        for signal_id in self.signal_ids {
-            low_level::unregister(signal_id);
-        }
+        unregister_signal_ids(&mut self.signal_ids);
     }
 }
 
@@ -2419,6 +2483,7 @@ fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::ffi::{CString, OsString};
     use std::fs;
     use std::io::{ErrorKind, Read, Write};
@@ -2456,9 +2521,10 @@ mod tests {
     use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
         ApiRequestMetricParseFailure, GetApiRequest, InstanceStartExecutor,
-        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError, PatchApiRequest,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, PutApiRequest,
-        SnapshotV1LoadSuccess, VmmRequestHandler,
+        NativeV1SnapshotCaptureCancellation, NativeV1SnapshotLoadError,
+        NativeV1SnapshotPublicationError, PatchApiRequest, ProcessSessionDiagnostics,
+        ProcessSessionExitStatus, ProcessVmm, PutApiRequest, SnapshotV1LoadSuccess,
+        VmmRequestHandler,
     };
 
     use super::{
@@ -2487,6 +2553,7 @@ mod tests {
             _drive_config: &DriveConfig,
             _serial_config: &SerialConfig,
             _paths: &SnapshotArtifactPaths,
+            _cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
             Err(NativeV1SnapshotPublicationError::SessionUnavailable)
         }
@@ -2528,6 +2595,7 @@ mod tests {
             _drive_config: &DriveConfig,
             _serial_config: &SerialConfig,
             _paths: &SnapshotArtifactPaths,
+            _cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
             Err(NativeV1SnapshotPublicationError::SessionUnavailable)
         }
@@ -2625,6 +2693,7 @@ mod tests {
             _drive_config: &DriveConfig,
             _serial_config: &SerialConfig,
             _paths: &SnapshotArtifactPaths,
+            _cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
             Err(NativeV1SnapshotPublicationError::SessionUnavailable)
         }
@@ -2972,7 +3041,60 @@ mod tests {
     }
 
     fn test_shutdown_signal() -> super::ShutdownSignal {
-        super::ShutdownSignal::install().expect("test shutdown signal should install")
+        super::ShutdownSignal::install(NativeV1SnapshotCaptureCancellation::default())
+            .expect("test shutdown signal should install")
+    }
+
+    #[test]
+    fn snapshot_cancellation_signal_action_is_observable_out_of_band() {
+        let cancellation = NativeV1SnapshotCaptureCancellation::default();
+        let signal_id = super::register_snapshot_cancellation(libc::SIGUSR1, cancellation.clone())
+            .expect("test snapshot cancellation action should register");
+
+        // SAFETY: SIGUSR1 has the just-installed process-local test action for
+        // the duration of this synchronous raise.
+        let raise_result = unsafe { libc::raise(libc::SIGUSR1) };
+        signal_hook::low_level::unregister(signal_id);
+
+        assert_eq!(raise_result, 0);
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn shutdown_signal_registration_rolls_back_and_drop_helper_removes_every_id() {
+        let next_id = Cell::new(1usize);
+        let unregistered = RefCell::new(Vec::new());
+        let allocate_id = || {
+            let id = next_id.get();
+            next_id.set(id + 1);
+            id
+        };
+
+        let error = super::register_shutdown_signal_actions_with(
+            |_| Ok(allocate_id()),
+            |signal| {
+                if signal == libc::SIGTERM {
+                    Err(ProcessError::SignalHandler(ErrorKind::Other))
+                } else {
+                    Ok(allocate_id())
+                }
+            },
+            |signal_id| unregistered.borrow_mut().push(signal_id),
+        )
+        .expect_err("second cancellation registration should fail deterministically");
+
+        assert!(matches!(
+            error,
+            ProcessError::SignalHandler(ErrorKind::Other)
+        ));
+        assert_eq!(*unregistered.borrow(), [1, 2, 3]);
+
+        let mut successful_ids = vec![4, 5, 6, 7];
+        super::unregister_signal_ids_with(&mut successful_ids, |signal_id| {
+            unregistered.borrow_mut().push(signal_id);
+        });
+        assert!(successful_ids.is_empty());
+        assert_eq!(*unregistered.borrow(), [1, 2, 3, 4, 5, 6, 7]);
     }
 
     fn unique_serial_path(name: &str) -> PathBuf {

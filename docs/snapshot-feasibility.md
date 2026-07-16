@@ -22,12 +22,14 @@ path.
 - Create is paused-state-only and supports only `Full` for one vCPU, exactly
   one regular read-only root drive, default serial, and no optional devices or
   MMDS. Unsupported modes and profiles fail before artifact or capture work.
-- An admitted create preflights both final namespaces, then holds scoped
-  supervisor admission plus block/entropy retry quiescence through aggregate
-  state capture and complete memory streaming. The publisher requires writer
-  closure and exact output/binding agreement before its exclusive
-  memory-first/state-last commit. Success returns `204 No Content` and leaves
-  the source paused and usable.
+- An admitted create holds one scoped supervisor transaction from FIFO
+  admission through publication. It failure-atomically quiesces block, PMEM,
+  network, and entropy retry schedulers, preflights both final namespaces,
+  captures aggregate state, streams complete memory, verifies and synchronizes
+  the artifacts, commits memory first and state last, and invokes the explicit
+  successful-publication hook before releasing auxiliary ownership and command
+  admission. Success returns `204 No Content` and leaves the source paused and
+  usable.
 - Load is pre-boot-only and requires a pristine process except logger/metrics.
   Successful-action history catches explicit-default/no-op configuration, and
   a live view catches residual state such as MMDS left by a failed patch.
@@ -296,26 +298,31 @@ register or alarm continuity is encoded.
 
 The supervisor command detaches the accepted machine/drive/serial
 configuration, reserves FIFO snapshot admission on a paused worker, and
-quiesces block and entropy retry schedulers. One aggregate runner command then
-atomically reserves metadata, core, timer, and interrupt operation domains and
-captures its fixed state order. The boot session captures the atomic cache
-manifest and baseline device state, validates and encodes all non-memory state,
-then streams the exact guest-memory image to a consumed controlled `Write +
-Seek + Send` output in 1 MiB chunks. Only a complete binding permits final
-bundle construction.
+failure-atomically quiesces block, PMEM, network, and entropy retry schedulers.
+Only after all four acknowledge does it drain already-published tokens into
+deferred work. One aggregate runner command then atomically reserves metadata,
+core, timer, and interrupt operation domains and captures its fixed state order.
+The boot session captures the atomic cache manifest and baseline device state,
+validates and encodes all non-memory state, then streams the exact guest-memory
+image to a consumed controlled `Write + Seek + Send` output in 1 MiB chunks.
+Only a complete binding permits final bundle construction.
 
 Cancellation is cooperative before each fixed stage, each memory chunk, the
-trailer, and final-length validation. Cancellation or any recoverable failure
-returns no binding or bundle, drops the output and auxiliary guard before
-releasing snapshot admission, and leaves the source paused for retry or resume.
-Supervisor shutdown signals cancellation before joining the worker. An
-individual blocking OS write cannot be forcibly preempted, so the public API
+trailer, final-length validation, and one atomic commit seal. Cancellation wins
+before the seal and returns through normal producer cleanup. Once the seal wins,
+shutdown remains pending while the worker completes verification, state
+encoding, file and directory synchronization, the exclusive memory-first/
+state-last commit, and the successful-publication hook. This preserves the
+publisher's exact durable, durability-uncertain, orphan-visible, or other typed
+result instead of replacing it with a generic admission failure.
+
+Any recoverable failure drops the consumed writer and auxiliary guards before
+releasing snapshot admission and leaves the source paused for retry or resume.
+An individual blocking OS write cannot be forcibly preempted, so the public API
 never supplies an arbitrary writer: the publisher owns a controlled regular
-staging file. The capture operation does not itself open request paths or mutate
-the source session. The public process create path composes it synchronously
-inside the publisher callback;
-the worker consumes and drops the staging writer before releasing its guard or
-replying, so no writer alias remains when publication verification begins.
+staging file. The complete public publisher now runs synchronously inside the
+worker command; no writer alias, retry publisher, or ordinary worker command can
+outlive or interleave with the transaction.
 
 ## Current Ownership and Pause Boundary
 
@@ -325,9 +332,9 @@ ownership on separate threads:
 | Owner | Live resources and responsibilities |
 | --- | --- |
 | Process owner | `ProcessVmm` owns the VMM controller, startup executor, and active `BootRunLoopSupervisor` handle. It serves API requests and commits public instance-state transitions, but it does not own the live boot session after startup. |
-| Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy state, and block and entropy retry schedulers. Device-update commands execute here. |
+| Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy state, and block, PMEM, network, and entropy retry schedulers. Device-update commands and the complete native-v1 publisher execute here under snapshot admission. |
 | vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes HVF operations through commands and can return immutable X0-X30, PC, and CPSR values; guest-visible MIDR, MPIDR, and baseline PFR/DFR/ISAR/MMFR compatibility metadata; optional macOS 15.2 ZFR0/SMFR0 SVE/SME compatibility metadata; mutable macOS 15.2 SME `PSTATE.SM`/`PSTATE.ZA` controls; conditional maximum-width macOS 15.2 streaming Z0-Z31 bytes, maximum-derived P0-P15 predicate bytes, a maximum-SVL-square ZA matrix, and fixed 64-byte SME2 ZT0 contents in separate debug-redacted values; raw macOS 15.2 SMCR_EL1, SMPRI_EL1, and TPIDR2_EL0 values in a debug-redacted value; raw macOS 15.2 SCXTNUM_EL0 and SCXTNUM_EL1 software context numbers in a debug-redacted value with paired ordered restore; raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values with paired ordered restore; raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 values; raw ACTLR_EL1 and CPACR_EL1 values; raw CSSELR_EL1 cache-selection state with paired ordered restore; every DFR0-reported raw DBGBVR/DBGBCR hardware-breakpoint pair; every DFR0-reported raw DBGWVR/DBGWCR hardware-watchpoint pair; raw MDCCINT_EL1 and MDSCR_EL1 debug controls with paired ordered restore; raw Hypervisor.framework debug-exception and debug-register-access trap policy with paired ordered restore; raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1, TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 values with paired ordered restore; raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values with paired ordered restore; raw baseline Q0-Q31, FPCR, and FPSR values with paired ordered restore; raw APIA, APIB, APDA, APDB, and APGA pointer-authentication keys in a debug-redacted value with paired ordered restore; raw physical/virtual timers plus a normalized freeze-downtime timer value with paired never-run restore; CPU-level IRQ/FIQ pending values with paired ordered restore; Hypervisor.framework's opaque GIC device-state bytes with paired pre-first-run apply; or raw EL1 GIC ICC CPU-interface values with paired owner-thread capture and pre-first-run restore of nine mutable registers plus derived-RPR validation. The public native-v1 path captures and restores its fixed baseline subset through aggregate commands that hold metadata, core, timer, and interrupt admission until completion. |
-| Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. The private native-v1 capture temporarily quiesces the block and entropy schedulers for state and memory capture. The vmnet interface, vsock listener, retained streams, and their host/kernel buffers remain open for the lifetime of the boot session and therefore remain outside the accepted baseline profile. A transient vsock polling thread is joined at the end of each vCPU run step. |
+| Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. Native-v1 temporarily quiesces all four current retry schedulers through artifact commit and the post-publication hook. The synchronous process owner cannot dispatch another API/MMDS/controller mutation or periodic callback until publication returns. The vmnet interface, vsock listener, retained streams, peers, and their host/kernel buffers remain outside snapshot state; the accepted profile has no network/vsock device, and a transient vsock polling thread is joined at the end of each vCPU run step. |
 
 A successful public pause has a narrower boundary than a snapshot needs:
 
@@ -347,8 +354,8 @@ this is not a frozen runtime boundary. In particular:
 - memory-hotplug updates and status queries can execute on the boot worker while
   paused, and updates can mutate mapped guest memory and device state;
 - MMDS put and patch actions can mutate process-owned shared state;
-- block and entropy retry schedulers retain their deadlines and can set wakeup
-  tokens or attempt vCPU cancellation;
+- block, PMEM, network, and entropy retry schedulers retain their deadlines and
+  can set wakeup tokens or attempt vCPU cancellation;
 - explicit paused commands remain admissible even though periodic metrics and
   balloon-stat scheduling are suppressed; and
 - vmnet packet queues and vsock connections can change in host or kernel buffers
@@ -858,19 +865,29 @@ separate admission cell atomically reserves snapshot preparation
 and submits an exclusive FIFO command. Commands admitted earlier execute first;
 later ordinary commands, device updates, memory-hotplug mutations, and resume
 reject before enqueue. The boot worker revalidates `Paused`, enters the scoped
-lease, and acquires acknowledged quiescence guards from both limiter retry
-schedulers. Acquisition waits for an already-started wakeup publication and
-vCPU-cancel attempt to finish. Only after both schedulers acknowledge does the
-worker drain any pending block or entropy retry token into deferred work. While
-the guards are held, neither scheduler can publish another token or cancel
-attempt. Native-v1 capture keeps the guards and supervisor lease through
-non-memory state capture and complete memory streaming into the
-publisher-owned staging writer. The guards are dropped before the supervisor
-lease releases; the publisher then verifies, syncs, and exclusively commits the
-pair. Success returns `204 No Content` with the controller still `Paused`.
-Operation errors, queue/response closure, unwind, and repeated release restore
-admission when recoverable. Shutdown invalidates it through the existing
-out-of-band stop and pause-gate path.
+lease, and acquires acknowledged quiescence guards from the block, PMEM,
+network, and entropy limiter retry schedulers in that order. Acquisition waits
+for an already-started wakeup publication and vCPU-cancel attempt to finish.
+Only after all four acknowledge does the worker drain pending tokens into
+deferred work. Partial acquisition rolls back the earlier guards; while the
+complete aggregate guard is held, no scheduler can publish another token or
+cancel attempt.
+
+Native-v1 keeps the guards and supervisor lease through non-memory state
+capture, complete memory streaming, publisher verification and encoding,
+durability barriers, exclusive memory-first/state-last publication, and a
+successful-publication hook that is intentionally a no-op in this slice. The
+guards drop before the supervisor lease reopens ordinary admission. Success
+returns `204 No Content` with the controller still `Paused`. The synchronous
+`&mut ProcessVmm` call also prevents API/MMDS/controller and periodic work from
+interleaving; cancellation remains the sole out-of-band process mutation.
+
+Cancellation before the commit seal cleans only owned staging and returns the
+typed producer failure. A signal after the seal cannot interrupt the publisher;
+the exact artifact-visibility result and hook decision are delivered before
+shutdown consumes the pending wakeup. Queue/response closure, worker terminal
+status, unwind, panic, and repeated release leave no active registration or
+lease and restore admission only when the source remains recoverable.
 
 Limiter deadlines remain absolute while quiesced. A due deadline or drained
 token is republished asynchronously after guard release, duplicate immediate
@@ -977,8 +994,8 @@ auxiliary quiescence boundaries.
 | --- | --- |
 | Ordinary `Paused` | Today's pause acknowledgement has completed. Paused commands and the mutations listed above can still occur. |
 | Supervisor preparing | Implemented for admitted native-v1 create. Admission reservation and nonblocking FIFO submission share one lock, so earlier commands precede capture and later ordinary commands reject. The public controller remains `Paused`. |
-| Supervisor leased | Implemented after worker-side pause revalidation. It closes ordinary supervisor command admission and acknowledges block and entropy limiter retry quiescence; the fixed baseline keeps this scope through aggregate state capture and memory streaming. |
-| Snapshot-ready | Implemented for the admitted native-v1 baseline: fixed-profile validation, aggregate state capture, and complete guest-memory streaming occur while the lease remains held and the public controller stays `Paused`. |
+| Supervisor leased | Implemented after worker-side pause revalidation. It closes ordinary supervisor command admission and failure-atomically acknowledges block, PMEM, network, and entropy limiter retry quiescence; tokens are drained only after all four acknowledge. |
+| Snapshot-ready | Implemented for the admitted native-v1 baseline: fixed-profile validation, aggregate state capture, complete guest-memory streaming, artifact verification/synchronization, exclusive commit, and the post-publication hook occur while the lease remains held and the public controller stays `Paused`. |
 | Supervisor releasing | Implemented for scoped success, operation error, response closure, unwind, and shutdown invalidation. Recoverable release restores ordinary paused admission exactly once. |
 
 The implemented native-v1 path acknowledges the following invariants for its
@@ -994,10 +1011,9 @@ owners before admission:
 - process-owner mutations that can affect captured state, including MMDS
   changes, are rejected or deferred; future work must classify genuinely
   read-only requests separately;
-- periodic work is stopped and each retry scheduler has acknowledged quiescence,
-  with no deadline thread able to publish another wakeup token; the baseline
-  has only the block and entropy limiter retry schedulers covered by these
-  guards;
+- periodic work cannot re-enter the synchronously borrowed process, and each of
+  the four current retry schedulers has acknowledged quiescence, with no
+  deadline thread able to publish another wakeup token;
 - no VMM thread is reading or writing vmnet packets or vsock streams, and the
   transient vsock poller has joined;
 - lease acquisition and capture are bounded or observe an out-of-band stop
@@ -1192,7 +1208,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Slice | Scope | Minimum validation |
 | --- | --- | --- |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
-| Auxiliary quiescence (block and entropy implemented) | #1162 adds acknowledged RAII quiescence for the existing block and entropy limiter retry schedulers, waits for in-flight publication, preserves absolute deadlines, drains and defers pending tokens, and keeps stop terminal. Periodic work and any later wakeup scheduler remain deferred. | Deterministic scheduler concurrency tests and supervisor lease-order tests; signed lifecycle coverage remains follow-up work. |
+| Auxiliary quiescence and complete publication transaction (implemented for native-v1 baseline) | #1162 introduced acknowledged RAII quiescence for block and entropy; #1389 added the topology-wide SMP pause barrier and PMEM guard; #1390 includes network, acquires all four failure-atomically, drains tokens only after complete acknowledgement, preserves in-flight/deferred/deadline work, and holds the worker lease through commit plus the post-publication hook. Process API/MMDS/controller and periodic work are serialized by the synchronous owner borrow. | Deterministic scheduler, supervisor, cancellation/seal, publication-visibility, process/API serialization, and fresh-retry tests plus combined signed SMP pause and one-vCPU baseline publication evidence. |
 | Runner general-register capture and restore (first bidirectional subset implemented) | #1164 adds a typed immutable X0-X30, PC, and CPSR value plus one failure-atomic owner-thread capture. #1228 adds ordered owner-thread restore of that complete typed value and generalizes the shared admission name from capture to operation. Hypervisor.framework does not make the 33 writes transactional: typed failure context identifies the failed register and completed prefix, and callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore, but the snapshot lease invokes neither. Core system, exception, execution-control, identification, translation, baseline SIMD/FP, schema, validation, rollback, wider ordering, and multi-vCPU coordination remain separate or deferred. | Exact 33-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed same-vCPU idle capture/restore/recapture without guest execution or value logging. |
 | Runner core system-register capture and restore (second bidirectional subset implemented) | #1170 adds a typed immutable raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 value plus one owner-thread capture. #1230 adds ordered owner-thread restore of that complete value and a reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the four writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. Exception, execution-control, identification, translation, broader system state, validation, schema, rollback, wider ordering, orchestration, and multi-vCPU coordination remain separate or deferred. | Exact four-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written known-value capture/restore/recapture without post-restore guest execution or value logging. |
 | Runner EL1 exception-register capture and restore (third bidirectional subset implemented) | #1184 adds typed immutable raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 state plus one owner-thread capture. #1232 adds ordered owner-thread restore of that complete value through the reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the six writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. Vector-table memory, coherent exception semantics, destination validation, persistence, schema, rollback, wider ordering, orchestration, and multi-vCPU coordination remain deferred. | Exact six-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written capture/restore/recapture preserving implementation-defined AFSR readback without post-restore guest execution or value logging. |
@@ -1230,7 +1246,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | No-clobber artifact commit boundary (internal primitive implemented) | #1264 adds the fixed memory-only commit record, directory-fd-anchored macOS staging, exclusive memory-first/state-last publication with file and directory barriers, typed orphan and committed-uncertain outcomes, and the inverse state-first committed-pair loader. #1270 preserves kind 1 exactly and adds bounded kind 2 for binding plus opaque complete state. #1274 adds a generic typed producer over a pathless staging writer, enforced writer-close proof, and fixed-size record/output matching while preserving kind 1. Destination directories are trusted; published finals are never cleanup targets; no public VMM/API path invokes the publisher. | Exact codec bytes and malformed inputs for both kinds; callback ordering/skip/panic/error/retention/forget and retry; output mismatch; same/cross-directory success; all final file types and aliases; ordered failure injection; late collisions; observed staging replacement; cleanup failure; corruption; redaction; and coordinated multiprocess contention. |
 | Native-v1 composite bundle and private capture (internal implemented) | #1270 added the exact five-component `BANGHVF\0` profile, atomic default-vCPU cache manifest, bounded GIC capture, one aggregate four-domain runner command, explicit fresh-RTC policy, and a supervisor-owned capture that holds paused admission and auxiliary quiescence through encoding and cancellable memory streaming. It returns a detached kind-2 bundle, publishes no final path, and leaves recoverable source sessions paused, retryable, and resumable. At that slice's landing public activation and optional devices were deferred; #1276 later activated this baseline. | Kind-1 preservation and kind-2/component golden/malformed/cross-validation/redaction tests; exact runner capture order, conflicts, abandonment, and cleanup; supervisor order/cancellation/retry/drop tests; full memory decode plus real signed capture and retained source-owner reuse. |
 | Native-v1 private load and paused restore (internal implemented) | #1272 added committed-pair load, fixed platform/cache validation, baseline installation without boot writes, fresh VM/GIC/runner construction, aggregate architecture/GIC/ICC/timer/pending restore, VMGenID replacement, initially paused worker handoff, and value-free retryable/terminal cleanup evidence. At that slice's landing public `LoadSnapshot` was deferred; #1276 later routed the same transaction and applied resume only after paused commit. | Platform/install unit tests; exact aggregate validation/restore order, source/destination optional-state rejection, sticky never-run admission, paused worker start, controller intent/terminal tests, strict redaction/lints, and a signed disk-artifact distinct-destination continuation with VMGenID replacement. |
-| Native-v1 private composite publication (internal implemented) | #1274 added the process create seam that derives both final paths after paused/profile preflight and streams complete capture directly into publisher-owned staging for a required kind-2 record. Capture failure/cancellation removes only private staging and leaves recoverable sources paused; worker panic remains terminal. At that slice's landing public create still returned unsupported; #1276 later routed this exact transaction. | Runtime callback/close/output/ordering/failure tests; ProcessVmm preflight/config/no-mutation tests; supervisor collision/cancellation/retry/panic tests; and signed production publication followed by distinct-destination load/restore/continuation. |
+| Native-v1 composite publication transaction (implemented) | #1274 added the process create seam and #1276 activated it. #1390 moves the entire direct or anchored publisher under the paused worker lease, seals cancellation before commit, preserves post-seal typed visibility through shutdown, and invokes the explicit no-op post-publication hook before releasing all four retry guards and admission. Capture failure/cancellation removes only private staging and leaves recoverable sources paused; worker panic remains terminal. | Runtime callback/close/output/ordering/failure tests; ProcessVmm preflight/config/no-mutation tests; supervisor collision/cancellation/seal/shutdown/retry/panic tests; synchronous API/MMDS/periodic serialization; and signed production publication followed by distinct-destination load/restore/continuation. |
 | External resource policy | Define disk, vmnet, and vsock metadata, buffering boundary, disconnect/reconnect behavior, and restore overrides. | Resource-policy unit/process tests and focused signed network/vsock coverage. |
 | Public snapshot endpoint activation (implemented) | #1276 routes create and load only for the admitted native-v1 profile, preserves Firecracker-shaped response/latency/deprecation behavior, commits load as `Paused` before applying `resume_vm`, and exposes typed redacted execution faults. | Runtime/process/API tests plus signed fresh-process public create, no-clobber, retryable load, explicit resume, automatic resume, guest-observed VMGenID replacement, and continuation coverage. |
 

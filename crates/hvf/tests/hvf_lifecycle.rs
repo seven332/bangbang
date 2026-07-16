@@ -4508,10 +4508,10 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
     let artifact_pair = TempSnapshotArtifacts::new("native-v1-composite")
         .expect("snapshot artifact directory should create");
     let artifact_paths = artifact_pair.paths();
+    let guard = session
+        .quiesce_limiter_retry_wakeups()
+        .expect("snapshot device retry work should quiesce");
     let publication = publish_snapshot_artifacts_with(&artifact_paths, |mut writer| {
-        let guard = session
-            .quiesce_limiter_retry_wakeups()
-            .expect("snapshot device retry work should quiesce");
         let state = session
             .capture_snapshot_v1_state_at(
                 &controller.drive_configs()[0],
@@ -4530,10 +4530,12 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         let bundle = HvfSnapshotV1Bundle::try_new(binding, state)
             .expect("complete state and memory should form one bundle");
         drop(writer);
-        drop(guard);
         Ok::<_, std::convert::Infallible>(bundle.into_commit_record())
     })
     .expect("production publisher should commit complete native-v1 capture");
+    // Keep all block, PMEM, network, and entropy retry schedulers quiesced
+    // through validation, durability barriers, and the no-clobber commit.
+    drop(guard);
     assert_eq!(publication.durability(), SnapshotCommitDurability::Durable);
     assert_eq!(publication.record().kind(), SnapshotCommitKind::Composite);
     artifact_pair

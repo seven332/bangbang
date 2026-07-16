@@ -275,15 +275,21 @@ failure at every stage, and proves a complete fresh retry. It must exercise
 metadata/core/timer/interrupt conflicts in both directions and exactly-once
 release after response abandonment, channel closure, queued destruction,
 unwind, panic, and shutdown. The process-level fake capture session proves the
-outer order from auxiliary quiescence through state preflight, chunked memory,
-bundle construction, writer drop, auxiliary release, and admission release.
-It also proves cancellation emits no bundle, leaves `Paused`, and permits a
-fresh capture and resume. Process/supervisor publication tests additionally
-prove path/profile preflight before content capture, direct staging-writer
-streaming, required kind 2, writer closure before commit, cancellation cleanup
-and fresh retry, terminal worker panic, unchanged paused controller state,
-public create publication/collision behavior, public load paused/resume
-ordering, and retryable versus terminal failures. Run these focused surfaces with
+outer order from four-scheduler auxiliary quiescence through state preflight,
+chunked memory, bundle construction, writer drop, artifact verification and
+commit, the successful-publication hook, auxiliary release, and admission
+release. It also proves pre-seal cancellation emits no commit, leaves `Paused`,
+and permits a fresh capture and resume; post-seal shutdown preserves the exact
+publisher success or visibility error. Process/supervisor publication tests
+additionally prove path/profile preflight before content capture, direct and
+anchored move-only staging publication, required kind 2, writer closure before
+commit, cancellation cleanup and fresh retry, terminal worker panic, unchanged
+paused controller state, public create publication/collision behavior, public
+load paused/resume ordering, and retryable versus terminal failures. A real API
+loop test queues MMDS and controller mutations and advances a short periodic
+metrics interval while snapshot publication is blocked: none can enter until
+release, while the shared atomic cancellation source remains observable out of
+band. Run these focused surfaces with
 `cargo test -p bangbang-hvf snapshot_v1 --lib --locked` and
 `cargo test -p bangbang native_v1_ --locked`.
 
@@ -912,9 +918,10 @@ packet connectivity; that positive signed matrix remains #1378.
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
 absent final paths. Its producer captures the complete non-memory state and
-streams memory directly to the publisher staging writer under limiter
-quiescence, returns kind 2, and proves durable memory-first/state-last commit
-with no staging residue. The test loads that pair through the production loader,
+streams memory directly to the publisher staging writer while block, PMEM,
+network, and entropy retry schedulers remain quiesced through the publisher's
+durable memory-first/state-last commit, returns kind 2, and leaves no staging
+residue. The test loads that pair through the production loader,
 decodes and validates the bundle and nested device state without logging raw
 values, and repeats capture with a fresh image identity. The guest first leaves
 non-default serial scratch state;
@@ -926,6 +933,10 @@ timer equivalence, VMGenID replacement, absent boot-origin metadata, and
 continuation from the captured PC. Opaque GIC bytes are asserted nonempty and
 bounded after recapture rather than byte-equal because Hypervisor.framework's
 stable versioned serialization is not a canonical encoding.
+This one-vCPU artifact transaction combines with the signed executable's exact
+two-vCPU topology-wide pause/resume barrier as the SMP barrier evidence. It does
+not claim an SMP native-v1 artifact. External vmnet/vsock peer and host/kernel
+buffers remain outside both tests' snapshot-state claims.
 Run the repository command without `--allow-unsupported`; this evidence must
 execute on supported Apple Silicon hosts.
 

@@ -3703,12 +3703,56 @@
     {
       "id": "semantic.lifecycle:pause-resume-quiescence-and-failure",
       "family": "boot-and-lifecycle",
-      "summary": "Audit pause/resume, snapshot-ready quiescence, auxiliary work ownership, state admission, and fine-grained failure behavior.",
+      "summary": "Bangbang provides topology-wide pause/resume acknowledgement and a native-v1 FIFO snapshot transaction that excludes later worker mutation/resume, failure-atomically quiesces block, PMEM, network, and entropy retry publishers, drains tokens only after complete acknowledgement, and retains deferred work. Aggregate capture, full memory streaming, artifact verification/synchronization, exclusive memory-first/state-last commit, and the post-publication hook remain under that lease. Synchronous API/MMDS/controller and periodic work cannot interleave; pre-seal signal cancellation cleans owned staging, while post-seal shutdown preserves exact typed artifact visibility. Combined signed evidence covers the SMP pause barrier and a separate real one-vCPU baseline publication. Peer-owned vmnet/vsock host/kernel buffers are neither frozen nor persisted, and optional-device or multi-vCPU native-v1 artifacts remain deferred.",
       "source_refs": [
         "corpus:design",
         "corpus:snapshot-support"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "SIGINT/SIGTERM snapshot cancellation registration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "BootRunLoopSupervisor native-v1 publication transaction and commit-sealed cancellation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "four-scheduler limiter retry quiescence guard"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "synchronous_snapshot_serializes_api_mmds_and_periodic_work_but_observes_cancellation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native-v1 transaction ordering, cancellation seal, visibility, shutdown, panic, and retry tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed dual-process SMP pause/resume barrier scenario"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "limiter retry aggregate quiescence and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "captures_native_v1_composite_and_keeps_source_session_usable"
+        }
+      ]
     },
     {
       "id": "semantic.lifecycle:smp-psci-and-vcpu-ownership",
