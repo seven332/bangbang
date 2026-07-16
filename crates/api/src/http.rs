@@ -13,7 +13,6 @@ const RATE_LIMITER_OPS_FIELD: &str = "ops";
 const TOKEN_BUCKET_SIZE_FIELD: &str = "size";
 const TOKEN_BUCKET_ONE_TIME_BURST_FIELD: &str = "one_time_burst";
 const TOKEN_BUCKET_REFILL_TIME_FIELD: &str = "refill_time";
-const MAX_MACHINE_CONFIG_VCPUS: u8 = 32;
 const ARM64_KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
 const ARM64_KVM_REG_SIZE_SHIFT: u32 = 52;
 const SNAPSHOT_VALUE_REDACTED: &str = "<redacted>";
@@ -3560,8 +3559,6 @@ fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
     let body = serde_json::from_slice::<MachineConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
 
-    validate_machine_config_request(&body)?;
-
     Ok(ApiRequest::PutMachineConfig(Box::new(
         MachineConfigRequest {
             vcpu_count: body.vcpu_count,
@@ -3648,29 +3645,11 @@ fn parse_vsock_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     })))
 }
 
-fn validate_machine_config_request(body: &MachineConfigRequestBody) -> Result<(), RequestError> {
-    if body.vcpu_count == 0 || body.vcpu_count > MAX_MACHINE_CONFIG_VCPUS {
-        return Err(RequestError::MalformedRequest);
-    }
-    if body.mem_size_mib == 0 {
-        return Err(RequestError::MalformedRequest);
-    }
-    Ok(())
-}
-
 fn validate_machine_config_patch_request(
     body: &MachineConfigPatchRequestBody,
 ) -> Result<(), RequestError> {
     if body.is_empty() {
-        return Err(RequestError::MalformedRequest);
-    }
-    if let Some(vcpu_count) = body.vcpu_count
-        && (vcpu_count == 0 || vcpu_count > MAX_MACHINE_CONFIG_VCPUS)
-    {
-        return Err(RequestError::MalformedRequest);
-    }
-    if body.mem_size_mib == Some(0) {
-        return Err(RequestError::MalformedRequest);
+        return Err(RequestError::EmptyPatchRequest);
     }
     Ok(())
 }
@@ -4862,6 +4841,12 @@ mod tests {
     fn rejects_put_machine_config_invalid_field_type() {
         for body in [
             r#"{"vcpu_count":"1","mem_size_mib":128}"#,
+            r#"{"vcpu_count":256,"mem_size_mib":128}"#,
+            r#"{"vcpu_count":-1,"mem_size_mib":128}"#,
+            r#"{"vcpu_count":1.5,"mem_size_mib":128}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":-1}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":1.5}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":18446744073709551616}"#,
             r#"{"vcpu_count":1,"mem_size_mib":128,"smt":"true"}"#,
             r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":2}"#,
         ] {
@@ -4874,16 +4859,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_put_machine_config_invalid_numeric_bounds() {
-        for body in [
-            r#"{"vcpu_count":0,"mem_size_mib":128}"#,
-            r#"{"vcpu_count":33,"mem_size_mib":128}"#,
-            r#"{"vcpu_count":1,"mem_size_mib":0}"#,
+    fn parses_put_machine_config_semantically_invalid_numeric_values() {
+        for (body, expected_vcpu_count, expected_mem_size_mib) in [
+            (r#"{"vcpu_count":0,"mem_size_mib":128}"#, 0, 128),
+            (r#"{"vcpu_count":33,"mem_size_mib":128}"#, 33, 128),
+            (r#"{"vcpu_count":1,"mem_size_mib":0}"#, 1, 0),
         ] {
-            assert_eq!(
-                parse_request(&request_with_body("PUT", "/machine-config", body)),
-                Err(RequestError::MalformedRequest)
-            );
+            let parsed = parse_request(&request_with_body("PUT", "/machine-config", body))
+                .expect("representable machine values should reach VMM validation");
+
+            let ApiRequest::PutMachineConfig(config) = parsed else {
+                panic!("expected machine-config request");
+            };
+            assert_eq!(config.vcpu_count(), expected_vcpu_count, "{body}");
+            assert_eq!(config.mem_size_mib(), expected_mem_size_mib, "{body}");
         }
     }
 
@@ -5023,10 +5012,20 @@ mod tests {
 
     #[test]
     fn rejects_patch_machine_config_empty_body() {
-        for body in [r#"{}"#, r#"{"smt":null}"#, r#"{"cpu_template":null}"#] {
+        for body in [
+            r#"{}"#,
+            r#"{"vcpu_count":null}"#,
+            r#"{"mem_size_mib":null}"#,
+            r#"{"smt":null}"#,
+            r#"{"cpu_template":null}"#,
+            r#"{"track_dirty_pages":null}"#,
+            r#"{"huge_pages":null}"#,
+            r#"{"vcpu_count":null,"mem_size_mib":null,"huge_pages":null}"#,
+        ] {
             assert_eq!(
                 parse_request(&request_with_body("PATCH", "/machine-config", body)),
-                Err(RequestError::MalformedRequest)
+                Err(RequestError::EmptyPatchRequest),
+                "{body}"
             );
         }
     }
@@ -5058,22 +5057,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_patch_machine_config_invalid_numeric_bounds() {
-        for body in [
-            r#"{"vcpu_count":0}"#,
-            r#"{"vcpu_count":33}"#,
-            r#"{"mem_size_mib":0}"#,
+    fn parses_patch_machine_config_semantically_invalid_numeric_values() {
+        for (body, expected_vcpu_count, expected_mem_size_mib) in [
+            (r#"{"vcpu_count":0}"#, Some(0), None),
+            (r#"{"vcpu_count":33}"#, Some(33), None),
+            (r#"{"mem_size_mib":0}"#, None, Some(0)),
         ] {
-            assert_eq!(
-                parse_request(&request_with_body("PATCH", "/machine-config", body)),
-                Err(RequestError::MalformedRequest)
-            );
+            let parsed = parse_request(&request_with_body("PATCH", "/machine-config", body))
+                .expect("representable machine values should reach VMM validation");
+
+            let ApiRequest::PatchMachineConfig(config) = parsed else {
+                panic!("expected machine-config patch request");
+            };
+            assert_eq!(config.vcpu_count(), expected_vcpu_count, "{body}");
+            assert_eq!(config.mem_size_mib(), expected_mem_size_mib, "{body}");
         }
     }
 
     #[test]
     fn rejects_patch_machine_config_invalid_field_type() {
-        for body in [r#"{"smt":"true"}"#, r#"{"huge_pages":2}"#] {
+        for body in [
+            r#"{"vcpu_count":256}"#,
+            r#"{"vcpu_count":-1}"#,
+            r#"{"vcpu_count":1.5}"#,
+            r#"{"mem_size_mib":-1}"#,
+            r#"{"mem_size_mib":1.5}"#,
+            r#"{"mem_size_mib":18446744073709551616}"#,
+            r#"{"smt":"true"}"#,
+            r#"{"huge_pages":2}"#,
+        ] {
             assert_eq!(
                 parse_request(&request_with_body("PATCH", "/machine-config", body)),
                 Err(RequestError::MalformedRequest),

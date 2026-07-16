@@ -208,14 +208,18 @@ impl TryFrom<MachineConfigInput> for MachineConfig {
     type Error = MachineConfigError;
 
     fn try_from(input: MachineConfigInput) -> Result<Self, Self::Error> {
+        if input.smt {
+            return Err(MachineConfigError::SmtNotSupported);
+        }
         if input.vcpu_count == 0 || input.vcpu_count > MAX_SUPPORTED_VCPUS {
             return Err(MachineConfigError::InvalidVcpuCount);
         }
         if input.mem_size_mib == 0 || input.mem_size_mib > MAX_MEM_SIZE_MIB {
             return Err(MachineConfigError::InvalidMemorySize);
         }
-        if input.smt {
-            return Err(MachineConfigError::SmtNotSupported);
+        if input.huge_pages == MachineConfigHugePages::TwoM && !input.mem_size_mib.is_multiple_of(2)
+        {
+            return Err(MachineConfigError::InvalidHugePages2MMemorySize);
         }
         if let Some(cpu_template) = input.cpu_template
             && cpu_template != MachineConfigCpuTemplate::None
@@ -225,8 +229,8 @@ impl TryFrom<MachineConfigInput> for MachineConfig {
         if input.track_dirty_pages {
             return Err(MachineConfigError::DirtyPageTrackingNotSupported);
         }
-        if input.huge_pages != MachineConfigHugePages::None {
-            return Err(MachineConfigError::HugePagesNotSupported);
+        if input.huge_pages == MachineConfigHugePages::TwoM {
+            return Err(MachineConfigError::HugePages2MPlatformLimited);
         }
 
         Ok(Self {
@@ -278,12 +282,13 @@ pub enum MachineConfigError {
     IncompatibleBalloonSize,
     InvalidVcpuCount,
     InvalidMemorySize,
+    InvalidHugePages2MMemorySize,
     SmtNotSupported,
     UnsupportedCpuTemplate {
         cpu_template: MachineConfigCpuTemplate,
     },
     DirtyPageTrackingNotSupported,
-    HugePagesNotSupported,
+    HugePages2MPlatformLimited,
 }
 
 impl fmt::Display for MachineConfigError {
@@ -299,6 +304,9 @@ impl fmt::Display for MachineConfigError {
             Self::InvalidMemorySize => {
                 write!(f, "machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}")
             }
+            Self::InvalidHugePages2MMemorySize => {
+                f.write_str("machine mem_size_mib must be an even value when huge_pages is 2M")
+            }
             Self::SmtNotSupported => f.write_str("machine smt is not supported"),
             Self::UnsupportedCpuTemplate { cpu_template } => {
                 write!(
@@ -309,7 +317,9 @@ impl fmt::Display for MachineConfigError {
             Self::DirtyPageTrackingNotSupported => {
                 f.write_str("machine track_dirty_pages is not supported")
             }
-            Self::HugePagesNotSupported => f.write_str("machine huge_pages is not supported"),
+            Self::HugePages2MPlatformLimited => f.write_str(
+                "machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF",
+            ),
         }
     }
 }
@@ -347,12 +357,17 @@ mod tests {
     }
 
     #[test]
-    fn accepts_maximum_machine_memory_size() {
-        let config = MachineConfigInput::new(1, MAX_MEM_SIZE_MIB)
-            .validate()
-            .expect("maximum memory size should validate");
+    fn accepts_machine_configuration_bounds_and_ordinary_odd_memory() {
+        for (vcpu_count, mem_size_mib) in
+            [(1, 1), (1, 127), (MAX_SUPPORTED_VCPUS, MAX_MEM_SIZE_MIB)]
+        {
+            let config = MachineConfigInput::new(vcpu_count, mem_size_mib)
+                .validate()
+                .expect("in-range ordinary-page machine config should validate");
 
-        assert_eq!(config.mem_size_mib(), MAX_MEM_SIZE_MIB);
+            assert_eq!(config.vcpu_count(), vcpu_count);
+            assert_eq!(config.mem_size_mib(), mem_size_mib);
+        }
     }
 
     #[test]
@@ -393,12 +408,64 @@ mod tests {
                 MachineConfigError::DirtyPageTrackingNotSupported,
             ),
             (
+                MachineConfigInput::new(1, 127).with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::InvalidHugePages2MMemorySize,
+            ),
+            (
                 MachineConfigInput::new(1, 128).with_huge_pages(MachineConfigHugePages::TwoM),
-                MachineConfigError::HugePagesNotSupported,
+                MachineConfigError::HugePages2MPlatformLimited,
             ),
         ] {
             assert_eq!(
                 input.validate().expect_err("input should be invalid"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn machine_validation_matches_firecracker_aarch64_precedence() {
+        for (input, expected) in [
+            (
+                MachineConfigInput::new(0, 0)
+                    .with_smt(true)
+                    .with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::SmtNotSupported,
+            ),
+            (
+                MachineConfigInput::new(0, 0).with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::InvalidVcpuCount,
+            ),
+            (
+                MachineConfigInput::new(1, 0).with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::InvalidMemorySize,
+            ),
+            (
+                MachineConfigInput::new(1, 127).with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::InvalidHugePages2MMemorySize,
+            ),
+            (
+                MachineConfigInput::new(1, 128)
+                    .with_cpu_template(MachineConfigCpuTemplate::V1N1)
+                    .with_track_dirty_pages(true)
+                    .with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::UnsupportedCpuTemplate {
+                    cpu_template: MachineConfigCpuTemplate::V1N1,
+                },
+            ),
+            (
+                MachineConfigInput::new(1, 128)
+                    .with_track_dirty_pages(true)
+                    .with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::DirtyPageTrackingNotSupported,
+            ),
+            (
+                MachineConfigInput::new(1, 128).with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::HugePages2MPlatformLimited,
+            ),
+        ] {
+            assert_eq!(
+                input.validate().expect_err("candidate should be invalid"),
                 expected
             );
         }
@@ -490,8 +557,14 @@ mod tests {
                 MachineConfigError::DirtyPageTrackingNotSupported,
             ),
             (
+                MachineConfigPatchInput::new()
+                    .with_mem_size_mib(127)
+                    .with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::InvalidHugePages2MMemorySize,
+            ),
+            (
                 MachineConfigPatchInput::new().with_huge_pages(MachineConfigHugePages::TwoM),
-                MachineConfigError::HugePagesNotSupported,
+                MachineConfigError::HugePages2MPlatformLimited,
             ),
         ] {
             assert_eq!(
@@ -537,8 +610,12 @@ mod tests {
             "machine track_dirty_pages is not supported"
         );
         assert_eq!(
-            MachineConfigError::HugePagesNotSupported.to_string(),
-            "machine huge_pages is not supported"
+            MachineConfigError::InvalidHugePages2MMemorySize.to_string(),
+            "machine mem_size_mib must be an even value when huge_pages is 2M"
+        );
+        assert_eq!(
+            MachineConfigError::HugePages2MPlatformLimited.to_string(),
+            "machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF"
         );
     }
 }

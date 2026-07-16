@@ -141,6 +141,16 @@ delivery inventory is now 33 `implemented-and-verified`, 373 `audit-required`,
 three `missing-platform-feasible`, and eight
 `proven-platform-impossible` records.
 
+#1389 and #1390 subsequently promote the topology-wide pause/resume and complete
+snapshot-quiescence lifecycle records. #1391 promotes the individual
+MachineConfiguration vCPU, target-bounded memory, and aarch64 SMT leaves and
+certifies the exact `2M` property plus pinned hugepages corpus as public arm64
+macOS/XNU/HVF platform exclusions. The current 417-record delivery inventory is
+38 `implemented-and-verified`, 366 `audit-required`, three
+`missing-platform-feasible`, and ten `proven-platform-impossible` records.
+Aggregate machine operations/schema remain open for CPU-template and dirty
+siblings.
+
 ## Commands
 
 Validate checked-in delivery state without an upstream checkout:

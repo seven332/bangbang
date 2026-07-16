@@ -75,7 +75,7 @@
     {
       "id": "api-operation:GET /machine-config",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation GET /machine-config.",
+      "summary": "GET returns Firecracker-shaped stored/default machine state with completed vCPU, target-bounded configured-equals-realized memory, aarch64 SMT, and default-None/exact-2M platform policy; keep the aggregate operation open for CPU-template and dirty-tracking siblings.",
       "source_refs": [
         "api-operation:GET /machine-config"
       ],
@@ -165,7 +165,7 @@
     {
       "id": "api-operation:PATCH /machine-config",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /machine-config.",
+      "summary": "PATCH implements partial/null-preserving machine updates, explicit None clearing, stable empty-candidate and typed sizing/page faults, and machine/balloon failure atomicity; keep the aggregate operation open for CPU-template and dirty-tracking siblings.",
       "source_refs": [
         "api-operation:PATCH /machine-config"
       ],
@@ -345,7 +345,7 @@
     {
       "id": "api-operation:PUT /machine-config",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /machine-config.",
+      "summary": "PUT implements Firecracker-shaped required/default replacement plus typed vCPU, target-bounded configured-equals-realized memory, aarch64 SMT, and exact-2M platform policy; keep the aggregate operation open for CPU-template and dirty-tracking siblings.",
       "source_refs": [
         "api-operation:PUT /machine-config"
       ],
@@ -1407,29 +1407,205 @@
     {
       "id": "api-property:MachineConfiguration.huge_pages",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.huge_pages.",
+      "summary": "Accept Firecracker's default None page policy and return a stable pre-allocation platform fault for exact Linux hugetlbfs-backed 2M after matching its even-MiB rule; public arm64 macOS/XNU/HVF has no exact backing equivalent.",
       "source_refs": [
         "api-property:MachineConfiguration.huge_pages"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/hugepages.md"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/vmm_config/machine_config.rs#L36-L88"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_ipa_granule_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vm_config_set_ipa_granule%28_%3A_%3A%29"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/arm/pmap/pmap.h#L2398-L2400"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/arm64/sptm/pmap/pmap.h#L2062-L2064"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/tools/tests/superpages/testsp.c"
+          }
+        ],
+        "alternatives": [
+          "16-KiB host pages or HVF IPA granules affect different translation layers and are not 2-MiB hugetlbfs backing.",
+          "2-MiB virtual alignment or batched map/protect operations preserve ordinary host backing and change the observable contract.",
+          "A Linux VM or sidecar would back a different process and abandon bangbang's native Apple-Silicon/HVF product boundary.",
+          "Private memory APIs are unsupported and violate the repository's public-API and production-signing boundary.",
+          "Root-only host changes would add a privileged deployment and security contract absent from the accepted target."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/machine.rs",
+            "anchor": "MachineConfigError::HugePages2MPlatformLimited"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/api/src/http.rs",
+            "anchor": "machine configuration parser tests"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/api_server.rs",
+            "anchor": "machine_config_semantic_faults_follow_aarch64_precedence_without_mutating"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/process_e2e.rs",
+            "anchor": "executable_machine_config_bounds_and_fault_precedence_are_transactional"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/machine.rs",
+            "anchor": "machine_validation_matches_firecracker_aarch64_precedence"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/machine-memory-contract.md",
+            "anchor": "Exact huge_pages = 2M meaning"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Initial Field Handling Policy"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Machine Memory and Exact 2M Boundary"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1391#issuecomment-4989883731"
+        }
+      }
     },
     {
       "id": "api-property:MachineConfiguration.mem_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.mem_size_mib.",
+      "summary": "Accept and realize 1 through 1,046,528 MiB transactionally with typed value-redacted faults, exact GET/balloon/FDT/HVF/snapshot sizing, and a documented reject-before-storage difference from Firecracker's unrealizable oversized echo-and-truncate behavior.",
       "source_refs": [
         "api-property:MachineConfiguration.mem_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MachineConfigRequestBody and MachineConfigPatchRequestBody"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "MAX_MEM_SIZE_MIB and MachineConfig candidate validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "memory_size_bytes"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "machine configuration parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "machine_config_semantic_faults_follow_aarch64_precedence_without_mutating"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_machine_config_bounds_and_fault_precedence_are_transactional"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "machine config and balloon failure-atomic tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "machine configuration bounds and precedence tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "memory_size_bytes_rejects_oversized_unchecked_config"
+        }
+      ]
     },
     {
       "id": "api-property:MachineConfiguration.smt",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.smt.",
+      "summary": "Match pinned Firecracker aarch64 machine semantics by defaulting and accepting SMT false, rejecting true before vCPU and memory checks, and preserving prior machine and balloon state.",
       "source_refs": [
         "api-property:MachineConfiguration.smt"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MachineConfigRequestBody and MachineConfigPatchRequestBody"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "MachineConfig candidate validation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "machine configuration parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "machine_config_semantic_faults_follow_aarch64_precedence_without_mutating"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_machine_config_bounds_and_fault_precedence_are_transactional"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "machine_validation_matches_firecracker_aarch64_precedence"
+        }
+      ]
     },
     {
       "id": "api-property:MachineConfiguration.track_dirty_pages",
@@ -1443,11 +1619,65 @@
     {
       "id": "api-property:MachineConfiguration.vcpu_count",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.vcpu_count.",
+      "summary": "Accept Firecracker's 1-through-32 configured vCPU range with typed value-redacted faults, then admit 1 through min(32, host_max) before HVF topology owner creation or session retention.",
       "source_refs": [
         "api-property:MachineConfiguration.vcpu_count"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MachineConfigRequestBody and MachineConfigPatchRequestBody"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/topology.rs",
+          "anchor": "validate_host_capacity and create_ordered_topology_with"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "MAX_SUPPORTED_VCPUS and MachineConfig candidate validation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "machine configuration parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "returns_stable_multi_vcpu_capacity_fault_without_partial_commit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed public SMP guest execution and hotplug tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_machine_config_bounds_and_fault_precedence_are_transactional"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/topology.rs",
+          "anchor": "capacity_query_failure_and_host_limit_precede_allocation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed ordered two-vCPU topology lifecycle"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "machine configuration bounds and precedence tests"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryBackend.backend_path",
@@ -2217,7 +2447,7 @@
     {
       "id": "api-schema:MachineConfiguration",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema MachineConfiguration.",
+      "summary": "The strict schema, defaults, vCPU, target-bounded memory, aarch64 SMT, and exact-2M platform behavior are classified; keep the aggregate schema open for CPU-template and dirty-tracking siblings.",
       "source_refs": [
         "api-schema:MachineConfiguration"
       ],
@@ -2559,11 +2789,104 @@
     {
       "id": "corpus:hugepages",
       "family": "machine-memory",
-      "summary": "Audit all applicable capability claims owned by the pinned hugepages source corpus.",
+      "summary": "Classify pinned Linux hugetlbfs-backed 2M allocation, pool/failure, restore, balloon, and dirty semantics as unavailable through supported public arm64 macOS/XNU/HVF while retaining ordinary None-backed memory.",
       "source_refs": [
         "corpus:hugepages"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/hugepages.md"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/vmm_config/machine_config.rs#L36-L88"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_ipa_granule_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vm_config_set_ipa_granule%28_%3A_%3A%29"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/arm/pmap/pmap.h#L2398-L2400"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/arm64/sptm/pmap/pmap.h#L2062-L2064"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/tools/tests/superpages/testsp.c"
+          }
+        ],
+        "alternatives": [
+          "16-KiB host pages or HVF IPA granules affect different translation layers and are not 2-MiB hugetlbfs backing.",
+          "2-MiB virtual alignment or batched map/protect operations preserve ordinary host backing and change the observable contract.",
+          "A Linux VM or sidecar would back a different process and abandon bangbang's native Apple-Silicon/HVF product boundary.",
+          "Private memory APIs are unsupported and violate the repository's public-API and production-signing boundary.",
+          "Root-only host changes would add a privileged deployment and security contract absent from the accepted target."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/machine.rs",
+            "anchor": "MachineConfigError::HugePages2MPlatformLimited"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/api/src/http.rs",
+            "anchor": "machine configuration parser tests"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/api_server.rs",
+            "anchor": "machine_config_semantic_faults_follow_aarch64_precedence_without_mutating"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/process_e2e.rs",
+            "anchor": "executable_machine_config_bounds_and_fault_precedence_are_transactional"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/machine.rs",
+            "anchor": "machine_validation_matches_firecracker_aarch64_precedence"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/machine-memory-contract.md",
+            "anchor": "Exact huge_pages = 2M meaning"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Initial Field Handling Policy"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Machine Memory and Exact 2M Boundary"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1391#issuecomment-4989883731"
+        }
+      }
     },
     {
       "id": "corpus:jailer",
@@ -3785,7 +4108,7 @@
     {
       "id": "semantic.memory:machine-sizing-hugepages-and-dirty-tracking",
       "family": "machine-memory",
-      "summary": "Audit machine memory sizing, huge-page policy, mapping/protection, dirty tracking, bounds, and failure atomicity.",
+      "summary": "Machine sizing, bounds, configured-equals-realized state, host vCPU admission, failure atomicity, and exact hugetlbfs 2M platform exclusion are classified; continue auditing ordinary mapping/protection plus dirty primitives, permission, and epochs.",
       "source_refs": [
         "corpus:hugepages",
         "corpus:specification"

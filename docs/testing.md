@@ -182,6 +182,19 @@ For CLI and API changes, cover successful requests, unknown options or fields,
 empty values, duplicate values, malformed inputs, exit codes, HTTP status codes,
 and Firecracker-shaped response bodies.
 
+For machine configuration changes, keep syntax and semantic evidence separate.
+Parser tests cover required/default/null fields, strict unknown/duplicate
+fields, integer representation, enum names, and `Empty PATCH request.`.
+Runtime/API/process tables cover default GET, PUT replacement, PATCH
+preservation/clear, vCPU 0/1/32/33, memory 0/1/1,046,528/1,046,529, combined
+aarch64 SMT-vCPU-memory precedence, odd/even `2M`, balloon compatibility,
+value-redacted typed faults, and GET/state atomicity after failure. Maximum
+memory is a configuration-only process test; do not allocate a 1022-GiB test
+VM. Host admission uses deterministic injected topology tests plus practical
+signed two-vCPU HVF/executable evidence. Exact `2M` uses stable rejection tests
+and the authoritative platform evidence in the checked machine-memory contract;
+do not relabel alignment or a 16-KiB IPA granule as signed success.
+
 For host filesystem paths, cover missing paths, directories, unsupported file
 types, redacted error messages, cleanup ownership, and failure atomicity. A
 failed operation should not partially mutate accepted configuration, guest
@@ -625,9 +638,11 @@ The current main-process audit has 21 `implemented-and-verified`, two
 `proven-platform-impossible`, and six nonterminal process-family records. #1383
 separately promotes seven offline-seccompiler records; #1384 certifies the two
 runtime seccomp leaves, five jailer leaves, and `corpus:seccomp` as exact macOS
-platform exclusions. The complete 417-record delivery inventory is therefore
-33 implemented-and-verified, 373 audit-required, three
-missing-platform-feasible, and eight proven-platform-impossible. Delivery
+platform exclusions. #1389/#1390 promote two lifecycle records, and #1391
+promotes the vCPU/memory/SMT leaves while certifying exact `2M` and its pinned
+hugepages corpus. The complete 417-record delivery inventory is therefore 38
+implemented-and-verified, 366 audit-required, three missing-platform-feasible,
+and ten proven-platform-impossible. Delivery
 validation permits the explicit handoffs, while final validation continues to
 reject them. Parser recognition or native snapshot output is not sufficient
 evidence for a Firecracker runtime or artifact claim.
