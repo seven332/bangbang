@@ -132,7 +132,9 @@ fn publish_with_faults(
         match stage_artifact(&directory_fd, artifact, original, &reserved_names) {
             Ok(entry) => staged.push(entry),
             Err(error) => {
-                return if cleanup_stages(&directory_fd, &staged).is_ok() {
+                return if cleanup_stages(&directory_fd, &staged).is_ok()
+                    && fsync(&directory_fd).is_ok()
+                {
                     Err(error)
                 } else {
                     Err(PublicationError::PrecommitCleanupUncertain)
@@ -228,7 +230,9 @@ fn probe_rename_capabilities<Fd: std::os::fd::AsFd>(
     let second = match create_private(directory_fd, "probe", b"b", reserved_names) {
         Ok(second) => second,
         Err(error) => {
-            return if unlink_if_identity(directory_fd, &first.0, first.1).is_ok() {
+            return if unlink_if_identity(directory_fd, &first.0, first.1).is_ok()
+                && fsync(directory_fd).is_ok()
+            {
                 Err(map_private_error(error, PublicationError::Staging))
             } else {
                 Err(PublicationError::PrecommitCleanupUncertain)
@@ -285,6 +289,9 @@ fn probe_rename_capabilities<Fd: std::os::fd::AsFd>(
     let first_cleanup = unlink_if_known_identity(directory_fd, &first.0, &[first.1, second.1]);
     let second_cleanup = unlink_if_known_identity(directory_fd, &second.0, &[first.1, second.1]);
     if first_cleanup.is_err() || second_cleanup.is_err() {
+        return Err(PublicationError::PrecommitCleanupUncertain);
+    }
+    if fsync(directory_fd).is_err() {
         return Err(PublicationError::PrecommitCleanupUncertain);
     }
     if !supported {
