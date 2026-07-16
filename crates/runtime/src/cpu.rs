@@ -13,6 +13,8 @@ pub const KVM_REG_ARM64_ID_AA64MMFR2_EL1: u64 = 0x6030_0000_0013_c03a;
 
 const ARM64_KVM_REG_ARCH_MASK: u64 = 0xff00_0000_0000_0000;
 const ARM64_KVM_REG_ARCH: u64 = 0x6000_0000_0000_0000;
+const ARM64_KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
+const ARM64_KVM_REG_SIZE_SHIFT: u32 = 52;
 const CPU_CONFIG_VALUE_REDACTED: &str = "<redacted>";
 
 #[derive(Clone, PartialEq, Eq)]
@@ -255,6 +257,9 @@ impl CpuConfigArmRegisterModifier {
         if self.id & ARM64_KVM_REG_ARCH_MASK != ARM64_KVM_REG_ARCH {
             return Err(CpuConfigError::InvalidRegisterArchitecture);
         }
+        if arm64_register_width(self.id) != Some(self.width) {
+            return Err(CpuConfigError::InvalidRegisterWidth);
+        }
         if self.value & !self.filter != 0 {
             return Err(CpuConfigError::ValueOutsideFilter {
                 collection: CpuConfigCollection::RegisterModifiers,
@@ -431,6 +436,7 @@ pub enum CpuConfigError {
     DuplicateIdentity { collection: CpuConfigCollection },
     FeatureIndexOutOfRange,
     InvalidRegisterArchitecture,
+    InvalidRegisterWidth,
     ValueOutsideFilter { collection: CpuConfigCollection },
     ValueOutsideRegisterWidth,
     KvmCapabilitiesUnsupported,
@@ -455,6 +461,9 @@ impl fmt::Display for CpuConfigError {
             }
             Self::InvalidRegisterArchitecture => f.write_str(
                 "cpu-config reg_modifiers contains a non-arm64 register identity",
+            ),
+            Self::InvalidRegisterWidth => f.write_str(
+                "cpu-config reg_modifiers contains an invalid register-width encoding",
             ),
             Self::ValueOutsideFilter { collection } => write!(
                 f,
@@ -497,6 +506,15 @@ const fn width_limit(width: CpuConfigArmRegisterWidth) -> Option<u128> {
         CpuConfigArmRegisterWidth::U32 => Some(u32::MAX as u128),
         CpuConfigArmRegisterWidth::U64 => Some(u64::MAX as u128),
         CpuConfigArmRegisterWidth::U128 => None,
+    }
+}
+
+const fn arm64_register_width(id: u64) -> Option<CpuConfigArmRegisterWidth> {
+    match (id & ARM64_KVM_REG_SIZE_MASK) >> ARM64_KVM_REG_SIZE_SHIFT {
+        2 => Some(CpuConfigArmRegisterWidth::U32),
+        3 => Some(CpuConfigArmRegisterWidth::U64),
+        4 => Some(CpuConfigArmRegisterWidth::U128),
+        _ => None,
     }
 }
 
@@ -665,6 +683,36 @@ mod tests {
         );
         assert!(!error.to_string().contains("dead"));
         assert!(!format!("{error:?}").contains("dead"));
+
+        let mismatched_width = CpuConfigInput::new(
+            Vec::new(),
+            vec![modifier(
+                KVM_REG_ARM64_ID_AA64PFR0_EL1,
+                CpuConfigArmRegisterWidth::U32,
+                1,
+                1,
+            )],
+            Vec::new(),
+        );
+        assert_eq!(
+            mismatched_width.into_custom_template(),
+            Err(CpuConfigError::InvalidRegisterWidth)
+        );
+
+        let invalid_width_encoding = CpuConfigInput::new(
+            Vec::new(),
+            vec![modifier(
+                0x6010_0000_0013_c020,
+                CpuConfigArmRegisterWidth::U64,
+                1,
+                1,
+            )],
+            Vec::new(),
+        );
+        assert_eq!(
+            invalid_width_encoding.into_custom_template(),
+            Err(CpuConfigError::InvalidRegisterWidth)
+        );
     }
 
     #[test]

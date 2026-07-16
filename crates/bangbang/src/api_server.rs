@@ -4184,6 +4184,13 @@ mod tests {
         );
         assert!(machine.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(machine.contains(r#""cpu_template":"V1N1""#));
+        let vm_config = request_over_socket(
+            &mut vmm,
+            "mct-vm-get",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(vm_config.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(vm_config.contains(r#""cpu_template":"V1N1""#));
 
         let boot_body = r#"{"kernel_image_path":"/tmp/vmlinux"}"#;
         let boot_request = request_with_body("PUT", "/boot-source", boot_body);
@@ -7514,12 +7521,45 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert!(supported.has_custom_cpu_template());
         assert_eq!(supported.machine_config().cpu_template(), None);
+        for (socket_name, method, body) in [
+            ("ccr-put-o", "PUT", r#"{"vcpu_count":1,"mem_size_mib":128}"#),
+            (
+                "ccr-put-n",
+                "PUT",
+                r#"{"vcpu_count":1,"mem_size_mib":128,"cpu_template":null}"#,
+            ),
+            ("ccr-patch-o", "PATCH", r#"{"mem_size_mib":192}"#),
+            (
+                "ccr-patch-n",
+                "PATCH",
+                r#"{"mem_size_mib":128,"cpu_template":null}"#,
+            ),
+        ] {
+            assert!(
+                request_over_socket(
+                    &mut supported,
+                    socket_name,
+                    &request_with_body(method, "/machine-config", body),
+                )
+                .starts_with("HTTP/1.1 204 No Content\r\n"),
+                "{method} with an omitted/null static template should succeed"
+            );
+            assert!(
+                supported.has_custom_cpu_template(),
+                "{method} with an omitted/null static template should preserve custom state"
+            );
+            assert_eq!(supported.machine_config().cpu_template(), None);
+        }
         let vm_config = request_over_socket(
             &mut supported,
             "ccr-supported-vm",
             "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
         );
         assert!(vm_config.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(
+            !vm_config.contains(r#""cpu_template""#),
+            "custom template contents should serialize as no static selection"
+        );
         for raw_value in ["0x603000000013c020", "0b10100101"] {
             assert!(!response.contains(raw_value));
             assert!(!vm_config.contains(raw_value));
