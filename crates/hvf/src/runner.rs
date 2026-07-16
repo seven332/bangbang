@@ -36458,151 +36458,6 @@ pub(crate) mod tests {
         runner.shutdown().expect("runner should shut down");
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum MixedCpuTemplateRunnerEvent {
-        ReadGeneral(HvfRegister),
-        WriteGeneral(HvfRegister, u64),
-        ReadSimdFp(HvfSimdFpRegister),
-        WriteSimdFp(HvfSimdFpRegister, [u8; 16]),
-        ReadSystem(HvfSystemRegister),
-        WriteSystem(HvfSystemRegister, u64),
-    }
-
-    struct MixedCpuTemplateRunnerTestVcpu {
-        general_values: Vec<(HvfRegister, u64)>,
-        simd_fp_values: Vec<(HvfSimdFpRegister, [u8; 16])>,
-        system_values: Vec<(HvfSystemRegister, u64)>,
-        events_sender: mpsc::Sender<MixedCpuTemplateRunnerEvent>,
-    }
-
-    impl RunnerVcpu for MixedCpuTemplateRunnerTestVcpu {
-        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
-            Ok(72)
-        }
-
-        fn configure_arm64_boot_registers(
-            &mut self,
-            _registers: HvfArm64BootRegisters,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-
-        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
-            Ok(HvfVcpuExit::Canceled)
-        }
-
-        fn dispatch_mmio_access(
-            &mut self,
-            _access: HvfResolvedMmioAccess,
-            _dispatcher: &mut MmioDispatcher,
-        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
-            unsupported_mmio_dispatch()
-        }
-
-        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
-            let _ = self
-                .events_sender
-                .send(MixedCpuTemplateRunnerEvent::ReadGeneral(register));
-            self.general_values
-                .iter()
-                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
-                .ok_or(BackendError::InvalidState(
-                    "mixed CPU-template general register is unset",
-                ))
-        }
-
-        fn write_register(
-            &mut self,
-            register: HvfRegister,
-            value: u64,
-        ) -> Result<(), BackendError> {
-            let _ = self
-                .events_sender
-                .send(MixedCpuTemplateRunnerEvent::WriteGeneral(register, value));
-            let destination = self
-                .general_values
-                .iter_mut()
-                .find_map(|(candidate, current)| (*candidate == register).then_some(current))
-                .ok_or(BackendError::InvalidState(
-                    "mixed CPU-template general register is unset",
-                ))?;
-            *destination = value;
-            Ok(())
-        }
-
-        fn read_simd_fp_register(
-            &mut self,
-            register: HvfSimdFpRegister,
-        ) -> Result<[u8; 16], BackendError> {
-            let _ = self
-                .events_sender
-                .send(MixedCpuTemplateRunnerEvent::ReadSimdFp(register));
-            self.simd_fp_values
-                .iter()
-                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
-                .ok_or(BackendError::InvalidState(
-                    "mixed CPU-template SIMD/FP register is unset",
-                ))
-        }
-
-        fn write_simd_fp_register(
-            &mut self,
-            register: HvfSimdFpRegister,
-            value: [u8; 16],
-        ) -> Result<(), BackendError> {
-            let _ = self
-                .events_sender
-                .send(MixedCpuTemplateRunnerEvent::WriteSimdFp(register, value));
-            let destination = self
-                .simd_fp_values
-                .iter_mut()
-                .find_map(|(candidate, current)| (*candidate == register).then_some(current))
-                .ok_or(BackendError::InvalidState(
-                    "mixed CPU-template SIMD/FP register is unset",
-                ))?;
-            *destination = value;
-            Ok(())
-        }
-
-        fn read_system_register(
-            &mut self,
-            register: HvfSystemRegister,
-        ) -> Result<u64, BackendError> {
-            let _ = self
-                .events_sender
-                .send(MixedCpuTemplateRunnerEvent::ReadSystem(register));
-            self.system_values
-                .iter()
-                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
-                .ok_or(BackendError::InvalidState(
-                    "mixed CPU-template system register is unset",
-                ))
-        }
-
-        fn write_system_register(
-            &mut self,
-            register: HvfSystemRegister,
-            value: u64,
-        ) -> Result<(), BackendError> {
-            let _ = self
-                .events_sender
-                .send(MixedCpuTemplateRunnerEvent::WriteSystem(register, value));
-            let destination = self
-                .system_values
-                .iter_mut()
-                .find_map(|(candidate, current)| (*candidate == register).then_some(current))
-                .ok_or(BackendError::InvalidState(
-                    "mixed CPU-template system register is unset",
-                ))?;
-            *destination = value;
-            Ok(())
-        }
-
-        fn destroy(&mut self) -> Result<(), BackendError> {
-            Ok(())
-        }
-    }
-
     #[test]
     fn cpu_template_runner_dispatches_mixed_width_targets_in_order() {
         let fpcr = HvfRegister::FPCR;
@@ -36612,12 +36467,11 @@ pub(crate) mod tests {
         let q_baseline = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff_u128;
         let q_target = 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100_u128;
         let (events_sender, events_receiver) = mpsc::channel();
-        let runner = start_cpu_template_test_runner(MixedCpuTemplateRunnerTestVcpu {
-            general_values: vec![(fpcr, 0x12), (x4, 0x1234_5678_9abc_def0)],
-            simd_fp_values: vec![(q31, q_baseline.to_le_bytes())],
-            system_values: vec![(sp_el0, 0xfedc_ba98_7654_3210)],
-            events_sender,
-        });
+        let mut vcpu = cpu_template_test_vcpu(events_sender);
+        vcpu.general_values = vec![(fpcr, 0x12), (x4, 0x1234_5678_9abc_def0)];
+        vcpu.simd_fp_values = vec![(q31, q_baseline.to_le_bytes())];
+        vcpu.system_values = vec![(sp_el0, 0xfedc_ba98_7654_3210)];
+        let runner = start_cpu_template_test_runner(vcpu);
         let registers = [
             HvfArm64CpuTemplateRegister::U32(fpcr),
             HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(x4)),
@@ -36656,18 +36510,27 @@ pub(crate) mod tests {
         assert_eq!(
             events_receiver.try_iter().collect::<Vec<_>>(),
             [
-                MixedCpuTemplateRunnerEvent::ReadGeneral(fpcr),
-                MixedCpuTemplateRunnerEvent::ReadGeneral(x4),
-                MixedCpuTemplateRunnerEvent::ReadSystem(sp_el0),
-                MixedCpuTemplateRunnerEvent::ReadSimdFp(q31),
-                MixedCpuTemplateRunnerEvent::WriteGeneral(fpcr, u64::from(u32::MAX)),
-                MixedCpuTemplateRunnerEvent::ReadGeneral(fpcr),
-                MixedCpuTemplateRunnerEvent::WriteGeneral(x4, u64::MAX),
-                MixedCpuTemplateRunnerEvent::ReadGeneral(x4),
-                MixedCpuTemplateRunnerEvent::WriteSystem(sp_el0, 0x0f0e_0d0c_0b0a_0908),
-                MixedCpuTemplateRunnerEvent::ReadSystem(sp_el0),
-                MixedCpuTemplateRunnerEvent::WriteSimdFp(q31, q_target.to_le_bytes()),
-                MixedCpuTemplateRunnerEvent::ReadSimdFp(q31),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::General(fpcr)),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::General(x4)),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::System(sp_el0)),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::SimdFp(q31)),
+                CpuTemplateRunnerEvent::WriteScalar(
+                    CpuTemplateRunnerRegister::General(fpcr),
+                    u64::from(u32::MAX),
+                ),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::General(fpcr)),
+                CpuTemplateRunnerEvent::WriteScalar(
+                    CpuTemplateRunnerRegister::General(x4),
+                    u64::MAX,
+                ),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::General(x4)),
+                CpuTemplateRunnerEvent::WriteScalar(
+                    CpuTemplateRunnerRegister::System(sp_el0),
+                    0x0f0e_0d0c_0b0a_0908,
+                ),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::System(sp_el0)),
+                CpuTemplateRunnerEvent::WriteSimdFp(q31, q_target.to_le_bytes()),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::SimdFp(q31)),
             ]
         );
         runner.shutdown().expect("runner should shut down");
