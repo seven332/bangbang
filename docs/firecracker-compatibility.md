@@ -499,6 +499,52 @@ supported subset documented above. Public serial RX/streaming/default stdout,
 process-global panic/fatal durability, and production telemetry facilities are
 explicit boundaries rather than unqualified future “full” observability work.
 
+## Offline Seccompiler Compatibility
+
+The workspace provides a `seccompiler-bin` host tool with Firecracker v1.16's
+five public argument names and short aliases. It accepts `x86_64` and
+`aarch64`, the required JSON input, Firecracker's default
+`seccomp_binary_filter.out`, deprecated `--basic`, and long-only
+`--split-output`. Help and version identify this as bangbang's offline
+compatibility tool. Invalid invocation exits 2; compilation or artifact I/O
+failure exits 1. Non-help diagnostics are fixed categories that retain no
+argument, path, policy, syscall, or OS-error value.
+
+The compiler accepts exactly the pinned `vmm`, `api`, and `vcpu` policy shape,
+resolves syscalls against the checked libseccomp v2.6.0 tables, preserves all
+v1.16 actions and argument operators, and emits the same bad-architecture
+`KILL_THREAD` behavior as v1.16's default libseccomp context. It caps input at
+1 MiB, each thread at 1,024 rules, each rule at six conditions, and each
+classic-BPF program at Linux's 4,096-instruction limit. The independent pure
+Rust lowering may use a different instruction layout from libseccomp, but its
+actions are the compatibility contract; implementation-time comparison against
+the pinned aarch64 tool covered the shipped policy and 433,440 independent
+syscall/architecture/argument cases.
+
+Combined output serializes the ordered map with the exact pinned bitcode 0.6.9
+Serde format and rejects output above Firecracker's 100,000-byte consumer cap.
+Firecracker can deserialize it as `HashMap<String, Vec<u64>>`. Split output is
+the raw little-endian `sock_filter` word stream in exactly `vmm.bpf`, `api.bpf`,
+and `vcpu.bpf`; the requested output basename selects only their parent.
+
+Input opens its final component no-follow, nonblocking, and close-on-exec,
+requires a regular file, and performs one bounded UTF-8 read. Output retains a
+no-follow directory descriptor, refuses symlink/directory/FIFO/socket targets,
+stages complete owner-only synced files, probes required no-replace/exchange
+rename flags before final mutation, and checks device/inode identities through
+publication, rollback, and cleanup. Pre-completion observed failures restore
+prior entries where identity proof remains available. Errors distinguish
+rollback uncertainty from an already committed result whose directory sync or
+private cleanup is uncertain. Each visible file is complete, but POSIX has no
+single transaction spanning the three split names, so crash-atomic three-file
+publication is not claimed.
+
+This capability ends at offline artifact creation. macOS/HVF cannot install or
+enforce Linux seccomp. Firecracker v1.16's current filter reader and process
+flags belong to the separate `corpus:seccomp` runtime work under #1384; the
+older install-helper wording in pinned `docs/seccompiler.md` does not expand
+the host tool into a runtime API.
+
 ## Process Startup CLI
 
 The current `bangbang` executable has a checked Firecracker v1.16.0 process

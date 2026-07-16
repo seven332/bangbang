@@ -39,9 +39,28 @@ crates/launcher   Production app bundle, nested-worker validation, and supervisi
 crates/session    Private launcher-worker protocol and runtime namespace ownership
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
-tools/seccompiler Offline Firecracker v1.16 Linux-target seccomp compiler core;
-                  it cannot install or enforce filters on macOS
+tools/seccompiler Firecracker v1.16-compatible offline seccompiler CLI and
+                  reusable Linux-target compiler core; neither installs nor
+                  enforces filters on macOS
 ```
+
+Build or run the offline tool with the public Firecracker argument names:
+
+```sh
+cargo run -p bangbang-seccompiler --bin seccompiler-bin --locked -- \
+  --target-arch aarch64 \
+  --input-file policy.json \
+  --output-file seccomp_binary_filter.out
+```
+
+`--split-output` writes `vmm.bpf`, `api.bpf`, and `vcpu.bpf` in the selected
+output parent; `--basic` retains Firecracker v1.16's deprecated
+condition-dropping mode. Combined output uses the pinned v1.16 bitcode format
+and Firecracker's 100,000-byte consumer limit. The tool reads one bounded
+regular UTF-8 policy, rejects symlink and special-file endpoints, stages
+owner-only complete outputs, and publishes through checked atomic rename
+operations. It is an artifact compiler only: macOS cannot install or enforce
+Linux seccomp filters, and runtime filter loading remains a separate capability.
 
 On supported macOS Apple Silicon hosts, the public machine configuration accepts
 `vcpu_count` from 1 through 32 and HVF startup admits the host-limited subset

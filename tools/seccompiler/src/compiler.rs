@@ -19,9 +19,9 @@ use crate::{CompileError, CompileOptions, CompiledFilters, TargetArch};
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
-// Deliberately retain the former Firecracker backend's stronger process-wide
-// response instead of libseccomp's legacy default bad-architecture thread kill.
-const BAD_ARCH_ACTION: u32 = 0x8000_0000;
+// Firecracker v1.16 leaves libseccomp's bad-architecture action at its
+// default, which is SCMP_ACT_KILL_THREAD.
+const BAD_ARCH_ACTION: u32 = 0x0000_0000;
 
 #[derive(Debug)]
 struct CompiledRule {

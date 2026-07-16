@@ -4,8 +4,8 @@ mod support;
 
 use bangbang_seccompiler::{CompileOptions, MAX_BPF_INSTRUCTIONS, TargetArch, compile_json};
 use support::{
-    ACTION_ALLOW, ACTION_KILL_PROCESS, ACTION_TRAP, AUDIT_ARCH_AARCH64, AUDIT_ARCH_X86_64,
-    SeccompData, execute, filter, policy, program,
+    ACTION_ALLOW, ACTION_KILL_PROCESS, ACTION_KILL_THREAD, ACTION_TRAP, AUDIT_ARCH_AARCH64,
+    AUDIT_ARCH_X86_64, SeccompData, execute, filter, policy, program,
 };
 
 fn compile_condition(operator: &str, value_type: &str, value: u64) -> Vec<u64> {
@@ -240,11 +240,11 @@ fn rejects_wrong_architecture_and_x32_but_allows_tracing_sentinel() {
     let bpf = program(&x86, "vmm");
     assert_eq!(
         execute(bpf, SeccompData::new(0, AUDIT_ARCH_AARCH64)),
-        ACTION_KILL_PROCESS
+        ACTION_KILL_THREAD
     );
     assert_eq!(
         execute(bpf, SeccompData::new(0x4000_0000, AUDIT_ARCH_X86_64)),
-        ACTION_KILL_PROCESS
+        ACTION_KILL_THREAD
     );
     assert_eq!(
         execute(bpf, SeccompData::new(u32::MAX, AUDIT_ARCH_X86_64)),

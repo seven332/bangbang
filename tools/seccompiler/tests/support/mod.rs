@@ -1,4 +1,5 @@
 #![allow(
+    dead_code,
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
@@ -11,6 +12,7 @@ pub const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 pub const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 
 pub const ACTION_ALLOW: u32 = 0x7fff_0000;
+pub const ACTION_KILL_THREAD: u32 = 0x0000_0000;
 pub const ACTION_KILL_PROCESS: u32 = 0x8000_0000;
 pub const ACTION_TRAP: u32 = 0x0003_0000;
 

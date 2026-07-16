@@ -344,7 +344,8 @@ The following remain feasible work owned by #1351:
 - arbitrary uid/gid transition, configurable chroot ownership, and any
   installer-owned or elevated service needed to support them;
 - exact macOS outcome mapping for remaining jailer cgroup/network/PID-namespace
-  arguments, seccomp/seccompiler, and production-host requirements;
+  arguments, runtime seccomp and seccompiler-to-VMM handoff, and
+  production-host requirements; the offline compiler itself is complete;
 - Developer ID/team possession, notarization, launch constraints, and release
   policy.
 
@@ -459,7 +460,17 @@ Five jailer leaf records are now `implemented-and-verified`:
 `daemonize`, and `version`. Their local implementation and signed validation
 references are machine-checked in the inventory. This moves the 417-record
 delivery inventory to 26 implemented-and-verified, 388 audit-required, and
-three missing-platform-feasible records.
+three missing-platform-feasible records at the #1370 checkpoint.
+
+#1383 additionally promotes the complete offline `seccompiler` corpus, its
+compile operation, and five public arguments. The production code is a
+host-side artifact compiler with bounded redacted input and descriptor-anchored
+transactional output; it neither enters the launcher/worker boundary nor
+installs seccomp. The pinned documentation's stale install-helper wording is
+classified with the current Linux VMM consumer and `corpus:seccomp`, which
+remains under #1384. The current 417-record inventory therefore contains 33
+implemented-and-verified, 381 audit-required, and three
+missing-platform-feasible records.
 
 The delivered package/session/policy/grant/fd/crash subset, including exact adoption by
 the singleton startup inputs/outputs, repeatable block/pmem consumers, and
@@ -470,7 +481,8 @@ dynamic brokerage/hard revocation, network,
 Linux-outcome, arbitrary credential/root authority, and deployment work remains.
 The jailer `uid`, `gid`, `chroot-base-dir`, cgroup, network/PID-namespace,
 parent-cgroup, aggregate operation, and broad corpus records remain
-`audit-required`, as do the broad `seccomp`, `seccompiler`, and
-`production-host` corpus records.
+`audit-required`, as do the broad `seccomp` and `production-host` corpus
+records. The offline `seccompiler` corpus is complete without implying runtime
+filter enforcement.
 This audit certifies only the named observable macOS outcomes, not direct Linux
 jailer mechanism parity.

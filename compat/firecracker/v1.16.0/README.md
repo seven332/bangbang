@@ -113,6 +113,18 @@ therefore 26 `implemented-and-verified`, 388 `audit-required`, and three
 network/PID namespaces, seccomp, aggregate jailer operation/corpus, general
 brokerage, vmnet, and deployment identity remain nonterminal under #1351.
 
+The #1383 offline-seccompiler slice promotes exactly seven isolation records:
+the complete pinned `seccompiler` corpus, its `compile` operation, and the
+`basic`, `input-file`, `output-file`, `split-output`, and `target-arch`
+arguments. The host-side tool preserves the v1.16 policy transform, bad-
+architecture action, bitcode 0.6.9 combined format, raw split files, default
+name, size cap, and public argument spellings while adding bounded redacted I/O
+and transactional publication. It does not install a filter. The install-helper
+language in pinned `docs/seccompiler.md` describes the current Linux VMM
+consumer owned by `corpus:seccomp`; that runtime work remains with #1384.
+The 417-record delivery inventory is now 33 `implemented-and-verified`, 381
+`audit-required`, and three `missing-platform-feasible` records.
+
 ## Commands
 
 Validate checked-in delivery state without an upstream checkout:

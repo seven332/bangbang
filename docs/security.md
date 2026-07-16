@@ -1359,6 +1359,39 @@ Error messages for host file open failures should not echo configured host
 paths. Tests already cover this for several path surfaces, and new host path
 features should add resource-specific redaction and file-type tests.
 
+## Offline Seccompiler Artifact Boundary
+
+`seccompiler-bin` is an offline host utility, not part of the production
+launcher/worker boundary. It does not expose a filter-install API, call Linux
+seccomp, or change macOS process containment. The policy and paths are
+untrusted inputs even though the resulting artifact is intended for a Linux
+Firecracker consumer.
+
+The input is opened once with close-on-exec, nonblocking, and final-component
+no-follow flags. It must be a regular file and is read through a 1 MiB plus one
+byte bound before UTF-8/schema validation. Errors retain only static categories;
+they never embed a path, policy value, syscall name, target string, or raw OS
+error.
+
+For output, the tool opens and retains the selected parent directory with
+no-follow semantics. It accepts only absent or regular final entries and never
+opens a final target for truncation. Complete bytes are written to unique
+owner-only same-directory staging files and synced before publication. A
+private preflight proves the filesystem's no-replace and exchange rename flags;
+unsupported filesystems fail before final mutation. Each rename and cleanup is
+checked against recorded device/inode identities so an observed racing
+replacement is preserved rather than deliberately deleted. This is not a claim
+of atomic source identity against a hostile writer that controls the directory.
+
+Observed failures before all outputs publish reverse committed renames in
+reverse order when current identities prove that operation safe. A failed proof
+reports rollback uncertainty and retains recovery objects. Once every final
+name is visible, directory-sync failure is reported as committed with durability
+uncertain; later old-inode cleanup or cleanup-sync failure is reported as
+committed with cleanup uncertain. No claim is made that three split filenames
+are one crash-atomic transaction. Normal success leaves only complete final
+files and no private stages.
+
 ## HVF Entitlements
 
 Real Hypervisor.framework execution requires macOS support, Apple Silicon, and

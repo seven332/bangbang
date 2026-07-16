@@ -93,3 +93,43 @@ The repository validates overlay structure and tracked references with
 validates the exact pinned identity set with `compare --firecracker <checkout>`.
 The final parent gate intentionally continues to fail while these and other
 families contain nonterminal records.
+
+## Offline seccompiler public tool
+
+The separate `seccompiler-bin` executable implements the five pinned public
+seccompiler arguments and the aggregate compile operation; it does not alter
+the 29 main-process records above.
+
+- `-t`/`--target-arch` requires `x86_64` or `aarch64`; `-i`/`--input-file`
+  requires one policy path; and `-o`/`--output-file` defaults to
+  `seccomp_binary_filter.out`. Short options accept attached values. Missing,
+  duplicate, positional, unknown, and invalid-UTF-8 invocations emit one fixed
+  value-redacted diagnostic and exit 2. Help and the bangbang-branded
+  Firecracker-format version exit 0.
+- `-b`/`--basic` retains Firecracker v1.16's deprecated behavior of dropping
+  argument conditions and rule-level distinctions. `--split-output` treats the
+  selected output basename only as a parent selector and writes exactly
+  `vmm.bpf`, `api.bpf`, and `vcpu.bpf`; otherwise the selected path receives one
+  bitcode 0.6.9 map that Firecracker deserializes as
+  `HashMap<String, Vec<u64>>`.
+- Runtime input, compilation, serialization, and publication failures exit 1
+  with static value-redacted categories. The input is one no-follow,
+  nonblocking, regular UTF-8 file capped at 1 MiB. Normal output is checked
+  against Firecracker's 100,000-byte consumer limit before filesystem mutation.
+- Output publication retains one no-follow directory descriptor, accepts only
+  absent or regular final entries, stages synced owner-only complete files,
+  requires no-replace/exchange rename support, and identity-checks publication,
+  rollback, and cleanup. Observed failures before complete publication restore
+  prior entries when identities still match; uncertain rollback and
+  post-commit durability/cleanup use distinct errors. Three visible split names
+  are not falsely described as one crash-atomic POSIX transaction.
+
+Implementation is in [`src/bin.rs`](../../../tools/seccompiler/src/bin.rs),
+[`src/tool.rs`](../../../tools/seccompiler/src/tool.rs), and
+[`src/artifact.rs`](../../../tools/seccompiler/src/artifact.rs). Process
+validation is in [`tests/cli.rs`](../../../tools/seccompiler/tests/cli.rs),
+with independent classic-BPF semantics in
+[`tests/semantics.rs`](../../../tools/seccompiler/tests/semantics.rs). The
+pinned documentation's install-helper prose maps to the Linux VMM filter
+consumer, not this offline tool; `corpus:seccomp` and runtime adoption remain
+nonterminal under #1384.
