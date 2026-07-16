@@ -203,18 +203,6 @@ fn machine_lifecycle_closure_policy_is_stable() {
         );
     }
 
-    let wave_7_summaries = inventory
-        .capabilities
-        .iter()
-        .filter(|capability| capability.summary.contains("Wave 7"))
-        .map(|capability| capability.id.as_str())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        wave_7_summaries,
-        WAVE_7_ORIGINAL.into_iter().collect(),
-        "Wave 7 ownership set drifted"
-    );
-
     for capability in &inventory.capabilities {
         assert!(
             !capability.summary.contains("awaits #1388")

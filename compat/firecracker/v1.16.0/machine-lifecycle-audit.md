@@ -84,7 +84,8 @@ terminal. The directly reviewed identities that do not change disposition are:
 | Snapshot API aggregates | `api-operation:PUT /snapshot/create`; `api-operation:PUT /snapshot/load`; `api-path:/snapshot/create`; `api-path:/snapshot/load`; `api-schema:SnapshotCreateParams`; `api-schema:SnapshotLoadParams` | `audit-required`; Wave 6 owns generalized Full/Diff artifacts, merge/restore, overrides, backends, and portability beyond the native-v1 baseline. |
 | Snapshot semantics | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `semantic.snapshot:full-create-load-and-public-lifecycle`; `semantic.snapshot:multi-vcpu-drives-devices-and-mmds`; `semantic.snapshot:network-vsock-overrides-portability-and-clones` | `audit-required`; Wave 6 owns their incomplete generalized artifact and profile outcomes. |
 | Snapshot tracking leaves | `api-property:SnapshotLoadParams.enable_diff_snapshots`; `api-property:SnapshotLoadParams.track_dirty_pages` | Already `implemented-and-verified`; they select complete destination dirty tracking but do not imply Diff artifact support. |
-| Broad specifications | `corpus:specification`; `semantic.specification:api-availability-stability-and-failure-information`; `semantic.specification:performance-resource-and-telemetry-outcomes`; `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | `audit-required`; applicable repository-wide outcomes remain Wave 7 work after their producers stabilize. |
+| Broad specifications | `corpus:specification`; `semantic.specification:api-availability-stability-and-failure-information`; `semantic.specification:performance-resource-and-telemetry-outcomes` | `audit-required`; applicable repository-wide outcomes remain Wave 7 work after their producers stabilize. |
+| Cross-capability certification | `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | `audit-required`; Wave 8 owns the final interaction audit after the individual lifecycle, error, telemetry, security, device, network, and snapshot producers stabilize. |
 | External isolation gates | `semantic.isolation:host-resource-authority-and-brokerage`; `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`; `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity` | Unchanged `missing-platform-feasible`; #1351 retains its independent external root, vmnet, credential, and deployment evidence gates. |
 
 Those exact identities establish the following non-overlapping handoffs:
@@ -99,7 +100,9 @@ Those exact identities establish the following non-overlapping handoffs:
   specification outcomes after producers stabilize.
 - Wave 8 owns final cross-capability certification of `GET /vm/config`,
   `api-path:/vm/config`, and `api-schema:FullVmConfiguration`. Their terminal
-  boot, machine, and CPU properties do not certify unrelated device fields.
+  boot, machine, and CPU properties do not certify unrelated device fields;
+  `semantic.cross-capability:state-errors-metrics-security-and-snapshots`
+  remains part of the same final interaction gate.
 - #1351 retains only its independent external root/vmnet evidence gates. This
   audit does not change those records or their public behavior.
 
