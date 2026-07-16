@@ -17,10 +17,11 @@ The implementation deliberately separates three outcomes:
   writes. `V1N1` remains pending configuration but cannot execute because its
   documented Neoverse V1 source-model contract is not true on Apple Silicon.
 
-The ARM modifier properties and schemas now have a complete finite policy.
-Multi-architecture operation/path aggregates, CPU-template corpora, and helper
-tools remain nonterminal because their x86 and public dump/strip/verify/
-fingerprint contracts are independent Wave 7 work.
+The Firecracker-shaped arm64 `CpuConfig` schema, PUT operation/path, startup
+property, and ARM modifier properties now have a complete finite policy. The
+x86 CPUID/MSR leaves, whole CPU-template corpora, heterogeneous-fleet outcomes,
+and public dump/strip/verify/fingerprint helper remain nonterminal Wave 7 work;
+terminal arm64 request handling does not claim those independent contracts.
 
 ## Request model and bounds
 

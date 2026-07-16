@@ -724,6 +724,17 @@ validation permits the explicit handoffs, while final validation continues to
 reject them. Parser recognition or native snapshot output is not sufficient
 evidence for a Firecracker runtime or artifact claim.
 
+After the remaining #1388 slices and the #1408 closure audit, the generated
+manifest contains 381 identities and the 418-record overlay contains 70
+`implemented-and-verified`, 328 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. The
+checked `machine_lifecycle_closure_policy_is_stable` integration test pins the
+original 28-record split, all 22 Wave 7 handoffs, the 18 directly promoted API
+identities, count arithmetic, and removal of stale future-#1388 summaries. The
+[closure ledger](../compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
+records the corresponding evidence and later-wave boundaries. Generic source,
+reference, and disposition invariants remain owned by the validator itself.
+
 Run the offline compiler's focused surface with:
 
 ```sh

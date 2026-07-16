@@ -214,4 +214,7 @@ Diff snapshot serialization and dynamic CPU topology remain separate work.
 #1392's cache presentation consumes the configured vCPU count but neither
 changes these machine/memory bounds nor caps that count to one matched host
 performance level. The exact 2M exclusion does not by itself certify the
-remaining aggregate machine schema complete.
+aggregate machine schema; #1408 certifies that schema and its GET/PUT/PATCH
+surface only after combining every terminal machine field, transactional
+controller behavior, startup realization, and signed evidence. Generalized
+snapshot artifacts remain separate Wave 6 work.
