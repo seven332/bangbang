@@ -75,11 +75,55 @@
     {
       "id": "api-operation:GET /machine-config",
       "family": "api-contract",
-      "summary": "GET returns Firecracker-shaped stored/default machine state with terminal field-level behavior for vCPU, target-bounded configured-equals-realized memory, aarch64 SMT, CPU templates, dirty tracking, and exact-2M platform policy; the aggregate operation awaits the #1388 parent reconciliation.",
+      "summary": "Return the complete stored/default Firecracker-shaped machine configuration with terminal aarch64 behavior for vCPU count, target-bounded configured-equals-realized memory, SMT, CPU-template selection, dirty tracking, and exact-2M page policy.",
       "source_refs": [
         "api-operation:GET /machine-config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "machine configuration response model and GET route"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "GetMachineConfig dispatch and response"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm effective machine configuration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "MachineConfig defaults and retained terminal policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "machine configuration response tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "GET machine configuration socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "machine configuration process API coverage"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "machine defaults and terminal field policy tests"
+        }
+      ]
     },
     {
       "id": "api-operation:GET /mmds",
@@ -165,11 +209,55 @@
     {
       "id": "api-operation:PATCH /machine-config",
       "family": "api-contract",
-      "summary": "PATCH implements partial/null-preserving machine updates, explicit None clearing, stable empty-candidate and typed sizing/page faults, CPU-template and dirty-tracking policy, and machine/balloon failure atomicity; the aggregate operation awaits the #1388 parent reconciliation.",
+      "summary": "Apply complete Firecracker-shaped partial/null-preserving machine updates with explicit None clearing, stable empty-candidate and typed sizing/page faults, CPU-template and dirty-tracking policy, and machine/balloon failure atomicity.",
       "source_refs": [
         "api-operation:PATCH /machine-config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PatchMachineConfig strict request model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PatchMachineConfig dispatch and failure-atomic response"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm transactional partial machine update"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "MachineConfig candidate validation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict machine PATCH parsing tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "machine PATCH success, empty, fault, and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "machine PATCH process API coverage"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "machine update bounds and transactional tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /mmds",
@@ -291,20 +379,138 @@
     {
       "id": "api-operation:PUT /boot-source",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /boot-source.",
+      "summary": "Store a strict Firecracker-shaped kernel, optional initrd, and optional boot-argument configuration before start, then consume that exact accepted state during failure-atomic signed guest startup.",
       "source_refs": [
         "api-operation:PUT /boot-source"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "BootSourceRequestBody and PUT route"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PutBootSource dispatch and retained configuration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm boot-source storage and startup consumption"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "public boot-source startup preparation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "kernel and initrd payload loading"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "prepare_boot_resources"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict boot-source request tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "boot-source socket storage and state tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed public kernel and rootfs boot scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed Firecracker kernel and rootfs boot scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "kernel initrd and payload-range tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "boot-resource preparation tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /cpu-config",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /cpu-config.",
+      "summary": "Store the complete bounded Firecracker-shaped arm64 CPU configuration before start, execute the reviewed modifier profile on every fresh vCPU, and return stable value-redacted platform or safety outcomes for every non-executable category.",
       "source_refs": [
         "api-operation:PUT /cpu-config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "CpuConfigRequestBody strict bounded arm64 schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PutCpuConfig dispatch and effective configuration behavior"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "prepared profile availability and all-vCPU execution"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "CpuConfigInput validation and closed executable template"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete CPU-config parsing, bounds, and malformed input tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "socket success, terminal category, replacement, state, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup configuration CPU-template tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "optional availability and exhaustive transaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed two-vCPU complete reviewed profile evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "complete accepted and rejected arm64 CPU configuration tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /drives/{drive_id}",
@@ -345,11 +551,60 @@
     {
       "id": "api-operation:PUT /machine-config",
       "family": "api-contract",
-      "summary": "PUT implements Firecracker-shaped required/default replacement plus typed vCPU, target-bounded configured-equals-realized memory, aarch64 SMT, CPU-template and dirty-tracking policy, and exact-2M platform behavior; the aggregate operation awaits the #1388 parent reconciliation.",
+      "summary": "Replace the complete Firecracker-shaped machine configuration with typed vCPU, target-bounded configured-equals-realized memory, aarch64 SMT, CPU-template, dirty-tracking, balloon-compatibility, and exact-2M platform behavior.",
       "source_refs": [
         "api-operation:PUT /machine-config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MachineConfigRequestBody strict replacement model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PutMachineConfig dispatch and failure-atomic response"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm transactional machine replacement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "MachineConfig validation and terminal field policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict machine PUT parsing tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "machine PUT success, fault, replacement, and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "machine PUT process API coverage"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed realized machine sizing and startup policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "machine replacement bounds and transactional tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /metrics",
@@ -498,20 +753,108 @@
     {
       "id": "api-path:/boot-source",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /boot-source.",
+      "summary": "Provide the single Firecracker-shaped PUT /boot-source surface from strict request parsing through retained configuration and failure-atomic signed guest startup.",
       "source_refs": [
         "api-path:/boot-source"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "boot-source route and request model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PUT /boot-source dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "public boot-source startup consumption"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "boot-source resource preparation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "boot-source route and parsing tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "boot-source socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed public boot-source scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed Firecracker boot scenarios"
+        }
+      ]
     },
     {
       "id": "api-path:/cpu-config",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /cpu-config.",
+      "summary": "Provide the single Firecracker-shaped PUT /cpu-config surface for the complete bounded arm64 schema, reviewed modifier execution, transactional replacement, and stable outcomes for non-executable categories.",
       "source_refs": [
         "api-path:/cpu-config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "CPU-config route and bounded arm64 request model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PUT /cpu-config dispatch and replacement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "reviewed all-vCPU modifier execution"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "closed arm64 CPU configuration policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete CPU-config request tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "CPU-config socket and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed two-vCPU reviewed profile evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "complete accepted and rejected arm64 configuration tests"
+        }
+      ]
     },
     {
       "id": "api-path:/drives/{drive_id}",
@@ -552,11 +895,55 @@
     {
       "id": "api-path:/machine-config",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /machine-config.",
+      "summary": "Provide complete Firecracker-shaped GET, PUT, and PATCH machine-configuration behavior with terminal field policy, state admission, value-redacted faults, and failure-atomic machine/balloon mutation.",
       "source_refs": [
         "api-path:/machine-config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "machine configuration routes and request models"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "machine configuration dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm machine configuration transactions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "terminal machine policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "machine route and strict request tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "machine GET PUT PATCH and rollback socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "machine configuration process API coverage"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "complete machine policy tests"
+        }
+      ]
     },
     {
       "id": "api-path:/metrics",
@@ -642,11 +1029,60 @@
     {
       "id": "api-path:/vm",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /vm.",
+      "summary": "Provide the single Firecracker-shaped PATCH /vm state-transition surface for Paused and Resumed, including successful idempotent same-state requests and topology-wide process-session ordering.",
       "source_refs": [
         "api-path:/vm"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "VM state route and strict request model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PatchVmState request dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm pause_instance and resume_instance"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "VmStateTransition and VmmController lifecycle admission"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "VM state route and parsing tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "VM state update and idempotent latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "runtime idempotent pause/resume session tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed single-process and dual-process SMP lifecycle scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "pause_and_resume_are_idempotent_without_mutating_other_state"
+        }
+      ]
     },
     {
       "id": "api-path:/vm/config",
@@ -1045,29 +1481,146 @@
     {
       "id": "api-property:BootSource.boot_args",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BootSource.boot_args.",
+      "summary": "Accept an optional Firecracker-shaped kernel command line, retain it transactionally, and publish the exact accepted value through the guest FDT chosen node without exposing it in failure text.",
       "source_refs": [
         "api-property:BootSource.boot_args"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "BootSourceRequestBody boot_args"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/fdt.rs",
+          "anchor": "chosen bootargs publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "retained boot arguments in startup resources"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "boot_args request parsing tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed Linux boot-argument scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/fdt.rs",
+          "anchor": "chosen bootargs tests"
+        }
+      ]
     },
     {
       "id": "api-property:BootSource.initrd_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BootSource.initrd_path.",
+      "summary": "Accept an optional initrd source, retain its authority transactionally, load it into the validated arm64 guest range, and publish its exact bounds in the FDT before startup.",
       "source_refs": [
         "api-property:BootSource.initrd_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "BootSourceRequestBody initrd_path"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "initrd loading and range validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/fdt.rs",
+          "anchor": "initrd chosen-node bounds"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "initrd startup preparation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "initrd_path request tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed public initrd boot scenario"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed initrd guest boot scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "initrd placement and failure tests"
+        }
+      ]
     },
     {
       "id": "api-property:BootSource.kernel_image_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BootSource.kernel_image_path.",
+      "summary": "Require one kernel image source, retain its authority transactionally, validate and load the arm64 Linux Image into guest memory, and start at its resolved entry without leaking the submitted path in failures.",
       "source_refs": [
         "api-property:BootSource.kernel_image_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "BootSourceRequestBody kernel_image_path"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "arm64 Linux Image parsing and loading"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "kernel startup preparation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "kernel_image_path required and strict request tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed public kernel and rootfs boot scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed Firecracker kernel boot scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "kernel parse, placement, and failure tests"
+        }
+      ]
     },
     {
       "id": "api-property:CpuConfig.cpuid_modifiers",
@@ -1493,11 +2046,55 @@
     {
       "id": "api-property:FullVmConfiguration.boot-source",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.boot-source.",
+      "summary": "Accept and report the complete Firecracker-shaped boot-source section in startup configuration, then consume the same kernel, optional initrd, and boot arguments during failure-atomic signed startup.",
       "source_refs": [
         "api-property:FullVmConfiguration.boot-source"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "FullVmConfiguration boot-source model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup configuration boot-source application"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "public boot-source startup consumption"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "boot-source resource preparation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup configuration boot-source tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed startup-configuration boot scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed Firecracker boot-source scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "boot-resource preparation tests"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.cpu-config",
@@ -1572,11 +2169,45 @@
     {
       "id": "api-property:FullVmConfiguration.machine-config",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.machine-config.",
+      "summary": "Accept, report, and apply the complete Firecracker-shaped machine-config startup section with the same terminal field policy, transactional ordering, and startup admission as the machine API.",
       "source_refs": [
         "api-property:FullVmConfiguration.machine-config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "FullVmConfiguration machine-config model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup configuration machine ordering"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "terminal MachineConfig policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup machine configuration ordering and rejection tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed public realized machine configuration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "complete machine field policy tests"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.memory-hotplug",
@@ -2891,11 +3522,50 @@
     {
       "id": "api-property:Vm.state",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Vm.state.",
+      "summary": "Accept exactly the Firecracker-shaped Paused and Resumed state values, including idempotent same-state success, with process-session ownership and topology-wide transition ordering.",
       "source_refs": [
         "api-property:Vm.state"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Vm state request enum and strict parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PatchVmState dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "VmStateTransition lifecycle admission"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "VM state strict request tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "VM state update and idempotent latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed single-process and dual-process SMP lifecycle scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "pause_and_resume_are_idempotent_without_mutating_other_state"
+        }
+      ]
     },
     {
       "id": "api-property:Vsock.guest_cid",
@@ -3038,11 +3708,55 @@
     {
       "id": "api-schema:BootSource",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema BootSource.",
+      "summary": "Implement the complete strict Firecracker-shaped boot-source schema: required kernel image, optional initrd, optional boot arguments, transactional retention, value-redacted failures, and exact signed startup consumption.",
       "source_refs": [
         "api-schema:BootSource"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "BootSourceRequestBody strict schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "kernel and initrd loading contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/fdt.rs",
+          "anchor": "boot arguments and initrd FDT publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "complete boot-source startup preparation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete strict boot-source schema tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed kernel initrd rootfs and boot-argument scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "boot payload and failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "boot-source startup tests"
+        }
+      ]
     },
     {
       "id": "api-schema:CpuConfig",
@@ -3283,11 +3997,50 @@
     {
       "id": "api-schema:MachineConfiguration",
       "family": "api-contract",
-      "summary": "The strict schema, defaults, vCPU, target-bounded memory, aarch64 SMT, CPU-template, dirty-tracking, and exact-2M platform behavior are all classified; the aggregate schema awaits the #1388 parent reconciliation.",
+      "summary": "Implement the complete strict Firecracker-shaped machine schema with defaults and terminal aarch64 behavior for vCPU count, target-bounded configured-equals-realized memory, SMT, CPU-template selection, dirty tracking, and exact-2M page policy.",
       "source_refs": [
         "api-schema:MachineConfiguration"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MachineConfig request and response schemas"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "complete machine configuration dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "MachineConfig defaults validation and terminal field policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict complete machine schema tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "machine schema success, fault, replacement, and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed realized machine and dirty-tracking behavior"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "complete machine field policy tests"
+        }
+      ]
     },
     {
       "id": "api-schema:MemoryBackend",
@@ -3550,11 +4303,55 @@
     {
       "id": "api-schema:Vm",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema Vm.",
+      "summary": "Implement the complete strict Firecracker-shaped VM state schema with exactly Paused and Resumed transitions, idempotent same-state success, and topology-wide process-session ordering.",
       "source_refs": [
         "api-schema:Vm"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Vm state request schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PatchVmState dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm pause_instance and resume_instance"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "VmStateTransition and VmmController lifecycle admission"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict VM state schema tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "VM state update and idempotent latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed single-process and dual-process SMP lifecycle scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "pause_and_resume_are_idempotent_without_mutating_other_state"
+        }
+      ]
     },
     {
       "id": "api-schema:Vsock",
@@ -3622,16 +4419,60 @@
     {
       "id": "corpus:cpu-boot-protocol",
       "family": "cpu-and-machine",
-      "summary": "Audit all applicable capability claims owned by the pinned cpu-boot-protocol source corpus.",
+      "summary": "Implement every applicable arm64 claim in the pinned CPU boot protocol: apply CPU-template modifiers first, then set the Firecracker PSTATE value on every vCPU and override PC/X0 on vCPU0 with the kernel/FDT addresses. The separate x86_64-only MSR section is architecture-inapplicable to the supported Apple Silicon guest target.",
       "source_refs": [
         "corpus:cpu-boot-protocol"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "prepared CPU-template application before boot overrides"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "CPU configuration then arm64 boot-register startup ordering"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/vcpu.rs",
+          "anchor": "primary and secondary arm64 boot-register setup"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "Arm64BootRegisters kernel entry FDT address and PSTATE"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/vcpu.rs",
+          "anchor": "primary secondary and publication-order boot-register tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed Firecracker arm64 boot-register scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed CPU-template boot-override precedence on two vCPUs"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "arm64 boot-origin and register tests"
+        }
+      ]
     },
     {
       "id": "corpus:cpu-template-helper",
       "family": "cpu-and-machine",
-      "summary": "Audit all applicable capability claims owned by the pinned cpu-template-helper source corpus.",
+      "summary": "Wave 7 owns the complete public cpu-template-helper executable, artifact formats, dump, verify, strip, fingerprint, and comparison behavior. It consumes Wave 2's bounded CPU model and paused capture/apply primitives without treating those foundations as helper delivery.",
       "source_refs": [
         "corpus:cpu-template-helper"
       ],
@@ -3640,7 +4481,7 @@
     {
       "id": "corpus:cpu-templates",
       "family": "cpu-and-machine",
-      "summary": "Audit all applicable capability claims owned by the pinned cpu-templates source corpus.",
+      "summary": "Wave 7 owns the final pinned CPU-template corpus audit across heterogeneous-fleet outcomes, helper integration, expert security guidance, and architecture-wide static/custom behavior after consuming Wave 6 portability evidence. Wave 2 supplies only the terminal bounded arm64 runtime policy.",
       "source_refs": [
         "corpus:cpu-templates"
       ],
@@ -3922,7 +4763,7 @@
     {
       "id": "corpus:rootfs-and-kernel",
       "family": "boot-and-lifecycle",
-      "summary": "Audit all applicable capability claims owned by the pinned rootfs-and-kernel source corpus.",
+      "summary": "Wave 7 owns the remaining pinned host-artifact and applicable specification audit for Linux kernel/rootfs construction recipes, other-architecture guidance, and the FreeBSD flow. Wave 2 supplies verified public arm64 kernel/initrd/rootfs loading and signed boot, not those construction workflows.",
       "source_refs": [
         "corpus:rootfs-and-kernel"
       ],
@@ -4892,17 +5733,86 @@
     {
       "id": "semantic.boot:kernel-rootfs-fdt-and-cache",
       "family": "boot-and-lifecycle",
-      "summary": "Audit kernel/initrd/rootfs loading, boot arguments, DeviceTree construction, boot cache behavior, and startup failure ordering.",
+      "summary": "Consume the public kernel, optional initrd, root drive, and boot arguments during failure-atomic startup; validate and load arm64 payloads, construct the complete guest FDT including admitted cache topology, apply template-before-boot register precedence, and reject any preparation failure before publishing a VM session.",
       "source_refs": [
         "corpus:cpu-boot-protocol",
         "corpus:rootfs-and-kernel"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public boot-source and root-drive startup consumption"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cache.rs",
+          "anchor": "strict arm64 cache topology admission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "failure-atomic boot cache CPU and VM startup ordering"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "arm64 kernel and initrd loading"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/fdt.rs",
+          "anchor": "complete arm64 guest DeviceTree construction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "boot resource preparation and register origin"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed public kernel rootfs cache and startup scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cache.rs",
+          "anchor": "cache topology admission and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed direct and ext4 rootfs SMP cache and boot tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed CPU-template boot precedence and retained boot origin"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot.rs",
+          "anchor": "kernel initrd and failure-order tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/fdt.rs",
+          "anchor": "parsed complete FDT tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "boot resource and failure-atomic preparation tests"
+        }
+      ]
     },
     {
       "id": "semantic.cpu:configuration-templates-and-feature-state",
       "family": "cpu-and-machine",
-      "summary": "Audit arm CPU configuration, templates, feature state, modifier behavior, and applicable helper operations.",
+      "summary": "Wave 7 owns the aggregate CPU configuration/template/feature claim because it explicitly includes applicable helper operations plus fleet and persisted-artifact outcomes. It consumes Wave 2's terminal bounded arm64 schema, modifier policy, boot precedence, and capture/apply primitives and Wave 6 portability evidence.",
       "source_refs": [
         "corpus:cpu-template-helper",
         "corpus:cpu-templates"
@@ -5051,12 +5961,76 @@
     {
       "id": "semantic.lifecycle:smp-psci-and-vcpu-ownership",
       "family": "boot-and-lifecycle",
-      "summary": "Audit multi-vCPU creation, owner-thread execution, PSCI power transitions, interrupts, timers, and terminal guest outcomes.",
+      "summary": "Provide fixed host-admitted SMP with one owning thread per vCPU, all-MPIDR FDT input, indexed PSCI CPU_ON/CPU_OFF/timer-backed CPU_SUSPEND and affinity state, per-vCPU interrupt/timer routing, topology-wide pause ordering, and stable SYSTEM_OFF, SYSTEM_RESET, failure, and cleanup outcomes. Dynamic topology, non-timer suspend wake, optional-device snapshot multiplicity, and finer exit parity remain later capabilities rather than part of this bounded semantic.",
       "source_refs": [
         "corpus:cpu-boot-protocol",
         "corpus:specification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/coordinator.rs",
+          "anchor": "topology-wide lifecycle coordination"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/psci.rs",
+          "anchor": "indexed PSCI and SMCCC power-state model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/runner.rs",
+          "anchor": "owner-thread PSCI timer interrupt and terminal dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "host-admitted SMP startup and owning boot session"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/topology.rs",
+          "anchor": "fixed owner-thread vCPU topology"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/fdt.rs",
+          "anchor": "all-MPIDR CPU and interrupt topology publication"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed public SMP pause offline online shutdown and reset scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/coordinator.rs",
+          "anchor": "topology-wide coordination and terminal precedence tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/psci.rs",
+          "anchor": "PSCI transition and affinity tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/topology.rs",
+          "anchor": "owner-thread topology tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed two-vCPU Linux execution and cache topology"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed PSCI CPU power timer suspend and terminal outcomes"
+        }
+      ]
     },
     {
       "id": "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
@@ -5388,7 +6362,7 @@
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/compare/curr",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/compare/curr.",
+      "summary": "Wave 7 owns the public cpu-template-helper fingerprint compare curr argument and its persisted-artifact semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/compare/curr"
       ],
@@ -5397,7 +6371,7 @@
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/compare/filters",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/compare/filters.",
+      "summary": "Wave 7 owns the public cpu-template-helper fingerprint compare filters argument and its filtering semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/compare/filters"
       ],
@@ -5406,7 +6380,7 @@
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/compare/prev",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/compare/prev.",
+      "summary": "Wave 7 owns the public cpu-template-helper fingerprint compare prev argument and its persisted-artifact semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/compare/prev"
       ],
@@ -5415,7 +6389,7 @@
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/dump/config",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/dump/config.",
+      "summary": "Wave 7 owns the public cpu-template-helper fingerprint dump config argument and its preboot configuration semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/dump/config"
       ],
@@ -5424,7 +6398,7 @@
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/dump/output",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/dump/output.",
+      "summary": "Wave 7 owns the public cpu-template-helper fingerprint dump output argument and its artifact-publication semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/dump/output"
       ],
@@ -5433,7 +6407,7 @@
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/dump/template",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/fingerprint/dump/template.",
+      "summary": "Wave 7 owns the public cpu-template-helper fingerprint dump template argument and its template-application semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/dump/template"
       ],
@@ -5442,7 +6416,7 @@
     {
       "id": "tool-argument:cpu-template-helper/template/dump/config",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/dump/config.",
+      "summary": "Wave 7 owns the public cpu-template-helper template dump config argument and its preboot configuration semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/dump/config"
       ],
@@ -5451,7 +6425,7 @@
     {
       "id": "tool-argument:cpu-template-helper/template/dump/output",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/dump/output.",
+      "summary": "Wave 7 owns the public cpu-template-helper template dump output argument and its artifact-publication semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/dump/output"
       ],
@@ -5460,7 +6434,7 @@
     {
       "id": "tool-argument:cpu-template-helper/template/dump/template",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/dump/template.",
+      "summary": "Wave 7 owns the public cpu-template-helper template dump template argument and its template-selection semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/dump/template"
       ],
@@ -5469,7 +6443,7 @@
     {
       "id": "tool-argument:cpu-template-helper/template/strip/paths",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/strip/paths.",
+      "summary": "Wave 7 owns the public cpu-template-helper template strip paths argument and its persisted-JSON path semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/strip/paths"
       ],
@@ -5478,7 +6452,7 @@
     {
       "id": "tool-argument:cpu-template-helper/template/strip/suffix",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/strip/suffix.",
+      "summary": "Wave 7 owns the public cpu-template-helper template strip suffix argument and its output-naming semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/strip/suffix"
       ],
@@ -5487,7 +6461,7 @@
     {
       "id": "tool-argument:cpu-template-helper/template/verify/config",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/verify/config.",
+      "summary": "Wave 7 owns the public cpu-template-helper template verify config argument and its preboot configuration semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/verify/config"
       ],
@@ -5496,7 +6470,7 @@
     {
       "id": "tool-argument:cpu-template-helper/template/verify/template",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool argument cpu-template-helper/template/verify/template.",
+      "summary": "Wave 7 owns the public cpu-template-helper template verify template argument and its verification semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/verify/template"
       ],
@@ -6396,7 +7370,7 @@
     {
       "id": "tool-operation:cpu-template-helper/fingerprint/compare",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/fingerprint/compare.",
+      "summary": "Wave 7 owns the public cpu-template-helper fingerprint compare operation, filters, persisted inputs, and deterministic comparison output; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-operation:cpu-template-helper/fingerprint/compare"
       ],
@@ -6405,7 +7379,7 @@
     {
       "id": "tool-operation:cpu-template-helper/fingerprint/dump",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/fingerprint/dump.",
+      "summary": "Wave 7 owns the public cpu-template-helper fingerprint dump operation, preboot capture, template application, and output artifact; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-operation:cpu-template-helper/fingerprint/dump"
       ],
@@ -6414,7 +7388,7 @@
     {
       "id": "tool-operation:cpu-template-helper/template/dump",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/template/dump.",
+      "summary": "Wave 7 owns the public cpu-template-helper template dump operation, preboot CPU view, template selection, and output artifact; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-operation:cpu-template-helper/template/dump"
       ],
@@ -6423,7 +7397,7 @@
     {
       "id": "tool-operation:cpu-template-helper/template/strip",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/template/strip.",
+      "summary": "Wave 7 owns the public cpu-template-helper template strip operation and persisted-JSON path/suffix transformation; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-operation:cpu-template-helper/template/strip"
       ],
@@ -6432,7 +7406,7 @@
     {
       "id": "tool-operation:cpu-template-helper/template/verify",
       "family": "cpu-and-machine",
-      "summary": "Audit the Firecracker v1.16 public tool operation cpu-template-helper/template/verify.",
+      "summary": "Wave 7 owns the public cpu-template-helper template verify operation and its preboot apply/capture comparison contract; Wave 2 supplies only the consumed CPU model and capture primitives.",
       "source_refs": [
         "tool-operation:cpu-template-helper/template/verify"
       ],

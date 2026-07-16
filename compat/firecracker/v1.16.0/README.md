@@ -36,6 +36,10 @@ claims mechanically visible.
   selection, strict KVM/static execution exclusions, public OS availability,
   startup/readback/boot-precedence/cleanup order, snapshot boundary, and Wave 7
   helper/portability handoffs.
+- [`machine-lifecycle-audit.md`](machine-lifecycle-audit.md) is the #1388
+  closure ledger. It accounts for the original 28 Wave 2 records, directly
+  related API aggregates, exact evidence, count arithmetic, and explicit Wave
+  6/7/8 ownership without changing the generated source manifest.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -146,8 +150,8 @@ delivery inventory is now 33 `implemented-and-verified`, 373 `audit-required`,
 three `missing-platform-feasible`, and eight
 `proven-platform-impossible` records.
 
-#1389 and #1390 subsequently promote the topology-wide pause/resume and complete
-snapshot-quiescence lifecycle records. #1391 promotes the individual
+Issues #1389 and #1390 subsequently promote the topology-wide pause/resume and
+complete snapshot-quiescence lifecycle records. #1391 promotes the individual
 MachineConfiguration vCPU, target-bounded memory, and aarch64 SMT leaves and
 certifies the exact `2M` property plus pinned hugepages corpus as public arm64
 macOS/XNU/HVF platform exclusions. #1392 adds the verified arm64 cache
@@ -163,12 +167,17 @@ records: both `ArmRegisterModifier` properties, `CpuConfig.reg_modifiers`,
 `FullVmConfiguration.cpu-config`, and the `ArmRegisterModifier` and `CpuConfig`
 schemas. #1395 and #1396 add the signed HVF first-write primitive and complete
 shared dirty epochs, including public machine/load activation and Full commit
-reset. The current 418-record delivery inventory is therefore 49
-`implemented-and-verified`, 349 `audit-required`, three
-`missing-platform-feasible`, and 17 `proven-platform-impossible` records.
-Multi-architecture operation/path aggregates, CPU corpora, public
-`cpu-template-helper` operations and arguments, portability, and Diff snapshot
-artifacts retain their later #1388/Wave owners.
+reset. #1408 then performs the final #1388 audit: it promotes the three
+remaining bounded boot/lifecycle records and 18 single-purpose boot-source,
+machine, CPU, and VM-state API identities. The generated manifest remains 381
+identities; with 37 local semantic records, the current 418-record delivery
+overlay is 70 `implemented-and-verified`, 328 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` records. Wave
+6 retains generalized snapshots and portability, Wave 7 retains the broad
+CPU/rootfs corpora, public `cpu-template-helper`, and applicable specification
+outcomes, and Wave 8 retains final cross-capability/export certification. The
+exact identities and boundaries are recorded in the
+[`machine-lifecycle-audit.md`](machine-lifecycle-audit.md) ledger.
 
 ## Commands
 

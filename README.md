@@ -915,12 +915,14 @@ the full endpoint matrix, implemented behavior, and deferred Firecracker
 features. See [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md)
 for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
-mechanically checked scope authority for exhaustive compatibility work. Its 418
-records currently contain 39 implemented-and-verified, 366 audit-required,
-three missing-platform-feasible, and ten proven-platform-impossible outcomes.
-The ten comprise the runtime seccomp corpus/two executable inputs, five jailer
-isolation inputs, and the exact `MachineConfiguration.huge_pages`/hugepages-
-corpus 2M hugetlbfs boundary. Nonterminal entries do not make new runtime claims.
+mechanically checked scope authority for exhaustive compatibility work. Its 381
+generated source identities and 37 local semantic identities form a 418-record
+delivery overlay with 70 implemented-and-verified, 328 audit-required, three
+missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
+[machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
+records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
+tooling/specification, and Wave 8 final-certification handoffs. Nonterminal
+entries do not make new runtime claims.
 
 ## Build And Test
 

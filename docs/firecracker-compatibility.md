@@ -552,6 +552,17 @@ cgroup/network/PID-namespace leaves; the other two are the exact machine `2M`
 property and pinned hugepages corpus. Broad aggregates retain independent
 handoffs.
 
+Following the remaining #1388 slices and the #1408 closure audit, the generated
+source manifest has 381 identities and the delivery overlay adds 37 local
+semantic identities. The current 418 records contain 70
+`implemented-and-verified`, 328 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. The
+[machine and lifecycle closure ledger](../compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
+accounts for the original 28 records and the directly related boot-source,
+machine, CPU, and VM-state aggregates. Generalized snapshots remain with Wave
+6, public tools and applicable broad specifications with Wave 7, and final
+cross-capability/export certification with Wave 8.
+
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, `GET /hotplug/memory`, pre-boot
@@ -1548,14 +1559,17 @@ initrd placement is page-aligned immediately before the FDT window when it fits.
 A zero-byte initrd resolves to the FDT address, matching Firecracker's helper
 behavior.
 
-## Internal Boot Source and Payload Loading
+## Boot Source and Payload Loading
 
-The runtime crate has an internal, Firecracker-shaped boot-source model with a
-required kernel image path, optional initrd path, and optional boot arguments.
-The public `PUT /boot-source` API stores a separate validated configuration
-shape; it is not wired to payload loading or startup yet. Later startup work can
-convert the stored configuration into this internal loader boundary when it is
-ready to open files and load payloads.
+The public `PUT /boot-source` API accepts a strict Firecracker-shaped model with
+a required kernel image path, optional initrd path, and optional boot arguments.
+The API converts it into the runtime-owned configuration transaction; successful
+pre-boot replacement is reported through `GET /vm/config`, and public
+`InstanceStart` consumes that exact retained state. Direct mode opens the
+configured payloads during startup. Contained mode consumes the matching
+launcher-authorized descriptors without reopening submitted paths. A validation,
+open, load, placement, FDT, CPU/cache admission, or later construction failure
+does not publish a partial VM session.
 
 When boot arguments are omitted, the runtime uses Firecracker's default aarch64
 kernel command line. Custom boot arguments follow Firecracker's `linux-loader`
@@ -1563,9 +1577,9 @@ command-line parsing shape: leading and trailing boot/init-argument whitespace
 is trimmed, the first unquoted ` -- ` separates init args, and the normalized
 bytes must fit in the 2048-byte aarch64 command-line capacity including the
 trailing NUL byte. Embedded NUL bytes and init args without boot args are
-rejected. The validated command-line text is now available to the internal FDT
-builder as the `chosen.bootargs` property, but this remains internal and is not
-wired to public API behavior yet.
+rejected. The validated command-line text is published by the startup FDT
+builder as `chosen.bootargs`; signed public executable tests exercise custom
+initrd and direct-rootfs command lines through the API.
 
 The internal loader supports the arm64 Linux `Image` header shape used by
 Firecracker's aarch64 boot path. It validates the Image magic, text offset, and
@@ -1576,8 +1590,8 @@ fully backed by guest memory and must not overlap the reserved FDT address.
 An explicitly configured initrd must be a non-empty regular file. It is placed
 with the aarch64 initrd helper immediately before the FDT reservation, must be
 fully backed by guest memory, and must not overlap the loaded kernel range.
-Host path and file errors stay structured so future API code can redact paths
-from user-facing messages.
+Host path and file errors stay structured and public failures redact submitted
+paths.
 
 The loader intentionally uses bangbang's safe `GuestMemory::write_slice` API and
 does not expose new raw host-memory pointers. Direct `linux-loader`/`vm-memory`
