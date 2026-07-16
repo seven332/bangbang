@@ -102,23 +102,24 @@ and cross-host CPU portability remain unsupported. The native-v1 snapshot
 profile below remains restricted to exactly one vCPU and no effective custom
 template.
 
-Firecracker-shaped `PUT /cpu-config` now retains bounded ordered values and
-applies exact expert-controlled masks for four reviewed arm64 identification
-registers plus the reviewed X/core/SIMD/FP profile on every owner-thread vCPU
-before boot overrides. The profile admits U64 X0 and X4-X30 plus the reviewed
-SP/PC/PSTATE fields, U128 Q0-Q31 with explicit little-endian conversion, and
-U32 FPCR/FPSR with fail-closed HVF transport conversion. X1-X3 and unavailable
-AArch32 banked state receive explicit value-redacted faults. All requested
-baselines are read and compared before the first write; every write is
-immediately reread, and any failure destroys the unpublished VM. KVM capability
-numbers, KVM vCPU-init feature words, remaining system registers, and mixed
-KVM-only inputs receive distinct value-redacted platform faults. Empty custom
-input clears the selection. Machine `V1N1` remains GET-visible pending
-configuration and can be
-replaced by custom or `None`, but if still effective it fails before VM
-construction because Apple Silicon cannot truthfully provide Firecracker's
-documented Neoverse V1 source model. Custom contents remain omitted from GET
-and native-v1 snapshots. See the checked
+Firecracker-shaped `PUT /cpu-config` retains bounded ordered values and applies
+exact expert-controlled masks for eleven U64 arm64 identification registers,
+ACTLR.EnTSO, and the reviewed X/core/SIMD/FP profile on every owner-thread vCPU
+before boot overrides. ZFR0/SMFR0 have a public macOS 15.2 pre-VM availability
+gate; ACTLR accepts only filter bit 1. The profile also admits U64 X0 and
+X4-X30 plus the reviewed SP/PC/PSTATE fields, U128 Q0-Q31 with explicit
+little-endian conversion, and U32 FPCR/FPSR with fail-closed HVF transport
+conversion. Every other KVM class and named public-HVF system family receives a
+stable value-free topology, lifecycle, security, time, ownership, dependency,
+disabled-feature, or platform reason; there is no raw system-register escape
+hatch. All requested baselines are read and compared before the first write;
+every write is immediately reread, and any failure destroys the unpublished
+VM. Empty custom input clears the selection. Machine `V1N1` remains GET-visible
+pending configuration and can be replaced by custom or `None`, but if still
+effective it fails before VM construction because Apple Silicon cannot
+truthfully provide Firecracker's documented Neoverse V1 source model. Custom
+contents remain omitted from GET and native-v1 snapshots, and exact readback is
+not a cross-host portability or feature-coherence guarantee. See the checked
 [CPU-template contract](compat/firecracker/v1.16.0/cpu-template-contract.md).
 
 The HVF runner currently exposes owner-thread capture building blocks for

@@ -6043,7 +6043,7 @@ mod tests {
         let config_path = unique_config_path("cpu-config");
         fs::write(
             &config_path,
-            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":6,"bitmap":"0b11010011"}]}}"#,
+            r#"{"machine-config":{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"},"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":6,"bitmap":"0b11010011"}]}}"#,
         )
         .expect("config file should be written");
         let mut vmm = ProcessVmm::with_starter(
@@ -6078,6 +6078,64 @@ mod tests {
         }
         assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
         assert!(!vmm.has_started_session());
+        assert_eq!(
+            vmm.machine_config().cpu_template(),
+            Some(bangbang_runtime::machine::MachineConfigCpuTemplate::V1N1)
+        );
+        assert!(!vmm.has_custom_cpu_template());
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_forbidden_actlr_filter_preserves_static_template() {
+        let config_path = unique_config_path("actlr-filter");
+        fs::write(
+            &config_path,
+            r#"{
+                "machine-config":{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"},
+                "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+                "cpu-config":{"reg_modifiers":[{"addr":"0x603000000013c081","bitmap":"0b1"}]}
+            }"#,
+        )
+        .expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("forbidden ACTLR filter should fail before startup");
+
+        assert!(matches!(
+            &err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                bangbang_runtime::VmmActionError::CpuConfig(
+                    bangbang_runtime::cpu::CpuConfigError::ActlrFilterUnsupported
+                )
+            ))
+        ));
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(display.contains(
+            "cpu-config reg_modifiers contains ACTLR bits outside the public EnTSO boundary"
+        ));
+        for raw_value in ["0x603000000013c081", "0b1"] {
+            assert!(!display.contains(raw_value));
+            assert!(!debug.contains(raw_value));
+        }
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(
+            vmm.machine_config().cpu_template(),
+            Some(bangbang_runtime::machine::MachineConfigCpuTemplate::V1N1)
+        );
+        assert!(!vmm.has_custom_cpu_template());
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }
@@ -6230,7 +6288,7 @@ mod tests {
             r#"{
                 "machine-config":{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"},
                 "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
-                "cpu-config":{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"}]}
+                "cpu-config":{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"},{"addr":"0x603000000013c021","bitmap":"0bx"},{"addr":"0x603000000013c028","bitmap":"0bx"},{"addr":"0x603000000013c029","bitmap":"0bx"},{"addr":"0x603000000013c030","bitmap":"0bx"},{"addr":"0x603000000013c031","bitmap":"0bx"},{"addr":"0x603000000013c038","bitmap":"0bx"},{"addr":"0x603000000013c039","bitmap":"0bx"},{"addr":"0x603000000013c03a","bitmap":"0bx"},{"addr":"0x603000000013c024","bitmap":"0bx"},{"addr":"0x603000000013c025","bitmap":"0bx"},{"addr":"0x603000000013c081","bitmap":"0b1x"}]}
             }"#,
         )
         .expect("config file should be written");

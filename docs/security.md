@@ -1184,16 +1184,22 @@ is resource-specific:
   control-plane boundary. The HTTP/config-file parser retains bounded ordered
   KVM capability, KVM vCPU-init feature, and 32/64/128-bit arm one-register
   values, but every aggregate has manual value-redacted `Debug`. Executable
-  state is limited to four reviewed 64-bit identification registers, reviewed
-  U64 X/core fields, U128 Q0-Q31, and U32 FPCR/FPSR. X1-X3 are boot-reserved;
-  AArch32 banked SPSRs and the remaining system-register universe are not an
-  escape hatch. Q values cross the HVF boundary only through explicit
-  little-endian conversion, and nonzero FP transport bits above U32 fail before
-  mutation. All requested typed baselines are read on every vCPU before the
-  first write; targets are computed once, then every owner writes and
-  immediately rereads each one. Boot setup subsequently overwrites the admitted
-  X0/PC/PSTATE targets. Any mapping/read/write/mismatch failure destroys the
-  complete unpublished VM because live register mutation is not rollback-safe.
+  state is limited to eleven reviewed U64 identification registers,
+  ACTLR.EnTSO, reviewed U64 X/core fields, U128 Q0-Q31, and U32 FPCR/FPSR.
+  ZFR0/SMFR0 require a public macOS 15.2 pre-VM check, and ACTLR filters may
+  select only bit 1. X1-X3 are boot-reserved; AArch32 banked state, topology
+  identity, boot/dependency controls, translation/exception/thread/context,
+  cache, pointer-authentication, debug/trap, timer, GIC/ICC, mutable SME, and
+  disabled EL2 state each fail with a distinct value-free policy category.
+  KVM-only classes, aliases, invalid fields, and unnamed encodings also fail
+  closed. There is no generic raw system-register constructor. Q values cross
+  the HVF boundary only through explicit little-endian conversion, and nonzero
+  FP transport bits above U32 fail before mutation. All requested typed
+  baselines are read on every vCPU before the first write; targets are computed
+  once, then every owner writes and immediately rereads each one. Boot setup
+  subsequently overwrites the admitted X0/PC/PSTATE targets. Any mapping,
+  availability, read, write, or mismatch failure destroys the complete
+  unpublished VM because live register mutation is not rollback-safe.
   The allowlist and exact readback do not make an arbitrary mask safe: a custom
   view can still crash a guest or create an incoherent/insecure instruction
   contract. Raw capability numbers, indexes, register identities, masks,

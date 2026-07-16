@@ -359,6 +359,7 @@ mod imp {
             reg: HvSimdFpReg,
             value: *const u8,
         ) -> HvReturn;
+        fn bangbang_macos_15_2_system_registers_available() -> u8;
     }
 
     unsafe extern "C" {
@@ -374,6 +375,12 @@ mod imp {
         // SAFETY: `mach_absolute_time` takes no arguments and returns the
         // current monotonic counter without retaining caller-owned state.
         Ok(unsafe { mach_absolute_time() })
+    }
+
+    pub fn macos_15_2_system_registers_available() -> bool {
+        // SAFETY: The target-gated C shim takes no arguments, retains no
+        // caller-owned state, and returns one integer availability flag.
+        unsafe { bangbang_macos_15_2_system_registers_available() != 0 }
     }
 
     pub fn timebase_info() -> Result<MachTimebaseInfo, BackendError> {
@@ -2532,6 +2539,10 @@ mod imp {
 
     pub fn set_simd_fp_reg(_: HvVcpu, _: HvSimdFpReg, _: [u8; 16]) -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub const fn macos_15_2_system_registers_available() -> bool {
+        false
     }
 
     pub fn get_sys_reg(_: HvVcpu, _: HvSysReg) -> Result<u64, BackendError> {

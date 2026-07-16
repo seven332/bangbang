@@ -32,10 +32,10 @@ claims mechanically visible.
   #1351 isolation/resource/seccomp outcomes without treating them as direct
   Linux jailer parity.
 - [`cpu-template-contract.md`](cpu-template-contract.md) records the bounded
-  reviewed ID/core/SIMD/FP custom subset, transactional static/custom
-  selection, strict KVM/static execution exclusions,
-  startup/readback/boot-precedence/cleanup order, snapshot boundary, and
-  #1403/Wave handoffs.
+  reviewed ID/ACTLR/core/SIMD/FP custom profile, transactional static/custom
+  selection, strict KVM/static execution exclusions, public OS availability,
+  startup/readback/boot-precedence/cleanup order, snapshot boundary, and Wave 7
+  helper/portability handoffs.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -154,15 +154,19 @@ macOS/XNU/HVF platform exclusions. #1392 adds the verified arm64 cache
 presentation record. #1393 implements the bounded four-ID-register custom
 template subset and certifies exactly seven narrow KVM/static schema leaves as
 platform-impossible: machine `cpu_template`, `CpuTemplate`, KVM capabilities,
-KVM vCPU-init features, both `VcpuFeatures` properties, and its schema. The
-current 418-record delivery inventory is 39 `implemented-and-verified`, 359
-`audit-required`, three `missing-platform-feasible`, and 17
-`proven-platform-impossible` records. Aggregate CPU operations/schema,
-register-modifier leaves, corpora, and helper tools remain open for #1394 and
-Wave 7; dirty siblings remain with the later #1388 slices. #1402 expands the
-executable partial profile to the reviewed U64 core, U128 Q, and U32 FP
-registers without promoting terminal inventory states; #1403 owns the remaining
-system-register policy and final #1394 closure.
+KVM vCPU-init features, both `VcpuFeatures` properties, and its schema. #1402
+adds the width-exact U64 core, U128 Q, and U32 FP transaction. #1403 completes
+the finite arm64 system policy with eleven ID registers, ACTLR.EnTSO, a public
+macOS 15.2 preflight for ZFR0/SMFR0, and terminal value-free classification for
+every other KVM/public-HVF family. It promotes exactly six parent-owned ARM
+records: both `ArmRegisterModifier` properties, `CpuConfig.reg_modifiers`,
+`FullVmConfiguration.cpu-config`, and the `ArmRegisterModifier` and `CpuConfig`
+schemas. The current 418-record delivery inventory is therefore 45
+`implemented-and-verified`, 353 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` records.
+Multi-architecture operation/path aggregates, CPU corpora, public
+`cpu-template-helper` operations and arguments, portability, and dirty
+snapshot siblings retain their later #1388/Wave 7 owners.
 
 ## Commands
 

@@ -7,9 +7,19 @@ pub const CPU_CONFIG_MAX_ENTRIES_PER_ARRAY: usize = 256;
 pub const CPU_CONFIG_KVM_VCPU_FEATURE_WORDS: u32 = 7;
 
 pub const KVM_REG_ARM64_ID_AA64PFR0_EL1: u64 = 0x6030_0000_0013_c020;
+pub const KVM_REG_ARM64_ID_AA64PFR1_EL1: u64 = 0x6030_0000_0013_c021;
+pub const KVM_REG_ARM64_ID_AA64ZFR0_EL1: u64 = 0x6030_0000_0013_c024;
+pub const KVM_REG_ARM64_ID_AA64SMFR0_EL1: u64 = 0x6030_0000_0013_c025;
+pub const KVM_REG_ARM64_ID_AA64DFR0_EL1: u64 = 0x6030_0000_0013_c028;
+pub const KVM_REG_ARM64_ID_AA64DFR1_EL1: u64 = 0x6030_0000_0013_c029;
 pub const KVM_REG_ARM64_ID_AA64ISAR0_EL1: u64 = 0x6030_0000_0013_c030;
 pub const KVM_REG_ARM64_ID_AA64ISAR1_EL1: u64 = 0x6030_0000_0013_c031;
+pub const KVM_REG_ARM64_ID_AA64MMFR0_EL1: u64 = 0x6030_0000_0013_c038;
+pub const KVM_REG_ARM64_ID_AA64MMFR1_EL1: u64 = 0x6030_0000_0013_c039;
 pub const KVM_REG_ARM64_ID_AA64MMFR2_EL1: u64 = 0x6030_0000_0013_c03a;
+pub const KVM_REG_ARM64_ACTLR_EL1: u64 = 0x6030_0000_0013_c081;
+
+const ARM64_ACTLR_ENTSO_MASK: u64 = 1 << 1;
 
 const KVM_REG_ARM64_CORE_U32_BASE: u64 = 0x6020_0000_0010_0000;
 const KVM_REG_ARM64_CORE_U64_BASE: u64 = 0x6030_0000_0010_0000;
@@ -52,6 +62,18 @@ const ARM64_KVM_REG_ARCH_MASK: u64 = 0xff00_0000_0000_0000;
 const ARM64_KVM_REG_ARCH: u64 = 0x6000_0000_0000_0000;
 const ARM64_KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
 const ARM64_KVM_REG_SIZE_SHIFT: u32 = 52;
+const ARM64_KVM_REG_COPROC_MASK: u64 = 0x0000_0000_0fff_0000;
+const ARM64_KVM_REG_CORE: u64 = 0x0000_0000_0010_0000;
+const ARM64_KVM_REG_DEMUX: u64 = 0x0000_0000_0011_0000;
+const ARM64_KVM_REG_SYSTEM: u64 = 0x0000_0000_0013_0000;
+const ARM64_KVM_REG_FIRMWARE: u64 = 0x0000_0000_0014_0000;
+const ARM64_KVM_REG_SVE: u64 = 0x0000_0000_0015_0000;
+const ARM64_KVM_REG_FIRMWARE_FEATURE: u64 = 0x0000_0000_0016_0000;
+const ARM64_KVM_REG_PAYLOAD_MASK: u64 = 0xffff;
+const ARM64_KVM_REG_CANONICAL_MASK: u64 = ARM64_KVM_REG_ARCH_MASK
+    | ARM64_KVM_REG_SIZE_MASK
+    | ARM64_KVM_REG_COPROC_MASK
+    | ARM64_KVM_REG_PAYLOAD_MASK;
 const CPU_CONFIG_VALUE_REDACTED: &str = "<redacted>";
 
 #[derive(Clone, PartialEq, Eq)]
@@ -305,6 +327,9 @@ impl CpuConfigArmRegisterModifier {
         if arm64_register_width(self.id) != Some(self.width) {
             return Err(CpuConfigError::InvalidRegisterWidth);
         }
+        if self.id & !ARM64_KVM_REG_CANONICAL_MASK != 0 {
+            return Err(CpuConfigError::InvalidRegisterIdentity);
+        }
         if self.value & !self.filter != 0 {
             return Err(CpuConfigError::ValueOutsideFilter {
                 collection: CpuConfigCollection::RegisterModifiers,
@@ -321,10 +346,14 @@ impl CpuConfigArmRegisterModifier {
     fn into_executable(self) -> Result<ArmRegisterModifier, CpuConfigError> {
         match self.width {
             CpuConfigArmRegisterWidth::U32 => {
-                let register = match self.id {
-                    KVM_REG_ARM64_CORE_FPCR => ArmRegister32::Fpcr,
-                    KVM_REG_ARM64_CORE_FPSR => ArmRegister32::Fpsr,
-                    _ => return Err(CpuConfigError::UnsupportedRegister),
+                let register = match core_class_index(self.id) {
+                    Some(212) => ArmRegister32::Fpsr,
+                    Some(213) => ArmRegister32::Fpcr,
+                    Some(index) if expected_core_width(index).is_some() => {
+                        return Err(CpuConfigError::InvalidRegisterWidth);
+                    }
+                    Some(_) => return Err(CpuConfigError::InvalidRegisterIdentity),
+                    None => return Err(classify_unaccepted_register(self.id)),
                 };
                 Ok(ArmRegisterModifier::U32 {
                     register,
@@ -336,20 +365,30 @@ impl CpuConfigArmRegisterModifier {
             }
             CpuConfigArmRegisterWidth::U64 => {
                 let register = classify_u64_register(self.id)?;
+                let filter = u64::try_from(self.filter)
+                    .map_err(|_| CpuConfigError::ValueOutsideRegisterWidth)?;
+                if accepted_system_register(self.id)
+                    .is_some_and(|entry| filter & !entry.allowed_filter != 0)
+                {
+                    return Err(CpuConfigError::ActlrFilterUnsupported);
+                }
                 Ok(ArmRegisterModifier::U64 {
                     register,
-                    filter: u64::try_from(self.filter)
-                        .map_err(|_| CpuConfigError::ValueOutsideRegisterWidth)?,
+                    filter,
                     value: u64::try_from(self.value)
                         .map_err(|_| CpuConfigError::ValueOutsideRegisterWidth)?,
                 })
             }
             CpuConfigArmRegisterWidth::U128 => {
-                let Some(index) = core_index(self.id, KVM_REG_ARM64_CORE_U128_BASE) else {
-                    return Err(CpuConfigError::UnsupportedRegister);
+                let Some(index) = core_class_index(self.id) else {
+                    return Err(classify_unaccepted_register(self.id));
                 };
-                if !(84..=208).contains(&index) || (index - 84) % 4 != 0 {
-                    return Err(CpuConfigError::UnsupportedRegister);
+                if !(84..=208).contains(&index) || !(index - 84).is_multiple_of(4) {
+                    return if expected_core_width(index).is_some() {
+                        Err(CpuConfigError::InvalidRegisterWidth)
+                    } else {
+                        Err(CpuConfigError::InvalidRegisterIdentity)
+                    };
                 }
                 Ok(ArmRegisterModifier::U128 {
                     register: ArmRegister128::Q(ArmQRegister(((index - 84) / 4) as u8)),
@@ -449,8 +488,15 @@ impl fmt::Debug for CustomCpuTemplate {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ArmIdRegister {
     Pfr0,
+    Pfr1,
+    Zfr0,
+    Smfr0,
+    Dfr0,
+    Dfr1,
     Isar0,
     Isar1,
+    Mmfr0,
+    Mmfr1,
     Mmfr2,
 }
 
@@ -498,6 +544,7 @@ pub enum ArmRegister64 {
     ElrEl1,
     SpsrEl1,
     Id(ArmIdRegister),
+    Actlr,
 }
 
 impl ArmRegister64 {
@@ -507,9 +554,32 @@ impl ArmRegister64 {
                 ArmRegisterBootDisposition::AppliedThenBootOverridden
             }
             Self::Pc | Self::Pstate => ArmRegisterBootDisposition::AppliedThenBootOverridden,
-            Self::X(_) | Self::SpEl0 | Self::SpEl1 | Self::ElrEl1 | Self::SpsrEl1 | Self::Id(_) => {
-                ArmRegisterBootDisposition::Retained
+            Self::X(_)
+            | Self::SpEl0
+            | Self::SpEl1
+            | Self::ElrEl1
+            | Self::SpsrEl1
+            | Self::Id(_)
+            | Self::Actlr => ArmRegisterBootDisposition::Retained,
+        }
+    }
+
+    /// Return the public Hypervisor.framework availability tier required by
+    /// this closed register target.
+    pub const fn availability(self) -> ArmRegisterAvailability {
+        match self {
+            Self::Id(ArmIdRegister::Zfr0 | ArmIdRegister::Smfr0) => {
+                ArmRegisterAvailability::MacOs15_2
             }
+            Self::Actlr => ArmRegisterAvailability::MacOs15_0,
+            Self::X(_)
+            | Self::Pc
+            | Self::Pstate
+            | Self::SpEl0
+            | Self::SpEl1
+            | Self::ElrEl1
+            | Self::SpsrEl1
+            | Self::Id(_) => ArmRegisterAvailability::Baseline,
         }
     }
 }
@@ -551,6 +621,16 @@ impl fmt::Debug for ArmRegister128 {
 pub enum ArmRegisterBootDisposition {
     Retained,
     AppliedThenBootOverridden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArmRegisterAvailability {
+    /// Available at the baseline public Hypervisor.framework register boundary.
+    Baseline,
+    /// Requires the repository's existing public macOS 15 VM boundary.
+    MacOs15_0,
+    /// Requires the public macOS 15.2 system-register boundary.
+    MacOs15_2,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -631,7 +711,22 @@ pub enum CpuConfigError {
     MixedUnsupported,
     BootReservedRegister,
     Aarch32BankedRegisterUnavailable,
-    UnsupportedRegister,
+    InvalidRegisterIdentity,
+    KvmDemuxRegisterUnsupported,
+    KvmFirmwareRegisterUnsupported,
+    KvmFirmwareFeatureRegisterUnsupported,
+    KvmSveRegisterUnsupported,
+    UnknownKvmRegisterClass,
+    TopologyRegisterUnsupported,
+    RegisterAliasUnsupported,
+    LifecycleRegisterUnsupported,
+    SecuritySensitiveRegisterUnsupported,
+    TimeDependentRegisterUnsupported,
+    SeparatelyOwnedRegisterUnsupported,
+    MutableSmeRegisterUnsupported,
+    DisabledEl2RegisterUnsupported,
+    UnnamedSystemRegisterUnsupported,
+    ActlrFilterUnsupported,
 }
 
 impl fmt::Display for CpuConfigError {
@@ -675,8 +770,53 @@ impl fmt::Display for CpuConfigError {
             Self::Aarch32BankedRegisterUnavailable => f.write_str(
                 "cpu-config reg_modifiers contains AArch32 banked state unavailable through public arm64 HVF",
             ),
-            Self::UnsupportedRegister => f.write_str(
-                "cpu-config reg_modifiers contains a register outside the supported arm64 HVF CPU-template profile",
+            Self::InvalidRegisterIdentity => f.write_str(
+                "cpu-config reg_modifiers contains a noncanonical arm64 register identity",
+            ),
+            Self::KvmDemuxRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains KVM demultiplexed cache state without a public HVF CPU-template equivalent",
+            ),
+            Self::KvmFirmwareRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains KVM firmware pseudo-register state without a public HVF equivalent",
+            ),
+            Self::KvmFirmwareFeatureRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains KVM firmware-feature state without a public HVF equivalent",
+            ),
+            Self::KvmSveRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains KVM SVE state owned by a separate arm64 HVF interface",
+            ),
+            Self::UnknownKvmRegisterClass => f.write_str(
+                "cpu-config reg_modifiers contains an unknown arm64 KVM register class",
+            ),
+            Self::TopologyRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains host identity or per-vCPU topology state",
+            ),
+            Self::RegisterAliasUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains an alias of an existing typed arm64 register target",
+            ),
+            Self::LifecycleRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains arm64 boot or lifecycle-dependent system state",
+            ),
+            Self::SecuritySensitiveRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains security-sensitive arm64 system state",
+            ),
+            Self::TimeDependentRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains time-dependent arm64 system state",
+            ),
+            Self::SeparatelyOwnedRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains arm64 state owned by a separate device or lifecycle interface",
+            ),
+            Self::MutableSmeRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains mutable SME state outside the static CPU-template profile",
+            ),
+            Self::DisabledEl2RegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains EL2 state while the VM feature is disabled",
+            ),
+            Self::UnnamedSystemRegisterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains an arm64 system encoding outside the finite public HVF profile",
+            ),
+            Self::ActlrFilterUnsupported => f.write_str(
+                "cpu-config reg_modifiers contains ACTLR bits outside the public EnTSO boundary",
             ),
         }
     }
@@ -684,16 +824,105 @@ impl fmt::Display for CpuConfigError {
 
 impl std::error::Error for CpuConfigError {}
 
+#[derive(Clone, Copy)]
+struct Arm64SystemRegisterProfile {
+    identity: u64,
+    register: ArmRegister64,
+    width: CpuConfigArmRegisterWidth,
+    boot_disposition: ArmRegisterBootDisposition,
+    availability: ArmRegisterAvailability,
+    allowed_filter: u64,
+}
+
+impl Arm64SystemRegisterProfile {
+    const fn accepted(identity: u64, register: ArmRegister64, allowed_filter: u64) -> Self {
+        Self {
+            identity,
+            register,
+            width: CpuConfigArmRegisterWidth::U64,
+            boot_disposition: register.boot_disposition(),
+            availability: register.availability(),
+            allowed_filter,
+        }
+    }
+}
+
+const ARM64_SYSTEM_REGISTER_PROFILE: [Arm64SystemRegisterProfile; 12] = [
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64PFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Pfr0),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64PFR1_EL1,
+        ArmRegister64::Id(ArmIdRegister::Pfr1),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64DFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Dfr0),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64DFR1_EL1,
+        ArmRegister64::Id(ArmIdRegister::Dfr1),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64ISAR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Isar0),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+        ArmRegister64::Id(ArmIdRegister::Isar1),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64MMFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Mmfr0),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64MMFR1_EL1,
+        ArmRegister64::Id(ArmIdRegister::Mmfr1),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64MMFR2_EL1,
+        ArmRegister64::Id(ArmIdRegister::Mmfr2),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64ZFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Zfr0),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ID_AA64SMFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Smfr0),
+        u64::MAX,
+    ),
+    Arm64SystemRegisterProfile::accepted(
+        KVM_REG_ARM64_ACTLR_EL1,
+        ArmRegister64::Actlr,
+        ARM64_ACTLR_ENTSO_MASK,
+    ),
+];
+
+fn accepted_system_register(id: u64) -> Option<Arm64SystemRegisterProfile> {
+    ARM64_SYSTEM_REGISTER_PROFILE
+        .iter()
+        .copied()
+        .find(|entry| entry.identity == id)
+}
+
 fn classify_u64_register(id: u64) -> Result<ArmRegister64, CpuConfigError> {
-    let id_register = match id {
-        KVM_REG_ARM64_ID_AA64PFR0_EL1 => Some(ArmIdRegister::Pfr0),
-        KVM_REG_ARM64_ID_AA64ISAR0_EL1 => Some(ArmIdRegister::Isar0),
-        KVM_REG_ARM64_ID_AA64ISAR1_EL1 => Some(ArmIdRegister::Isar1),
-        KVM_REG_ARM64_ID_AA64MMFR2_EL1 => Some(ArmIdRegister::Mmfr2),
-        _ => None,
-    };
-    if let Some(register) = id_register {
-        return Ok(ArmRegister64::Id(register));
+    if let Some(entry) = accepted_system_register(id) {
+        debug_assert_eq!(entry.width, CpuConfigArmRegisterWidth::U64);
+        debug_assert_eq!(entry.boot_disposition, entry.register.boot_disposition());
+        debug_assert_eq!(entry.availability, entry.register.availability());
+        return Ok(entry.register);
     }
     if matches!(
         id,
@@ -706,10 +935,10 @@ fn classify_u64_register(id: u64) -> Result<ArmRegister64, CpuConfigError> {
     }
 
     let Some(index) = core_index(id, KVM_REG_ARM64_CORE_U64_BASE) else {
-        return Err(CpuConfigError::UnsupportedRegister);
+        return Err(classify_unaccepted_register(id));
     };
     match index {
-        0..=60 if index % 2 == 0 => {
+        0..=60 if index.is_multiple_of(2) => {
             let register_index = (index / 2) as u8;
             if (1..=3).contains(&register_index) {
                 Err(CpuConfigError::BootReservedRegister)
@@ -723,7 +952,118 @@ fn classify_u64_register(id: u64) -> Result<ArmRegister64, CpuConfigError> {
         68 => Ok(ArmRegister64::SpEl1),
         70 => Ok(ArmRegister64::ElrEl1),
         72 => Ok(ArmRegister64::SpsrEl1),
-        _ => Err(CpuConfigError::UnsupportedRegister),
+        _ if expected_core_width(index).is_some() => Err(CpuConfigError::InvalidRegisterWidth),
+        _ => Err(CpuConfigError::InvalidRegisterIdentity),
+    }
+}
+
+fn classify_unaccepted_register(id: u64) -> CpuConfigError {
+    if id & !ARM64_KVM_REG_CANONICAL_MASK != 0 {
+        return CpuConfigError::InvalidRegisterIdentity;
+    }
+
+    match id & ARM64_KVM_REG_COPROC_MASK {
+        ARM64_KVM_REG_CORE => match core_class_index(id) {
+            Some(index) if expected_core_width(index).is_some() => {
+                CpuConfigError::InvalidRegisterWidth
+            }
+            _ => CpuConfigError::InvalidRegisterIdentity,
+        },
+        ARM64_KVM_REG_DEMUX => {
+            if id & ARM64_KVM_REG_PAYLOAD_MASK > 0xff {
+                CpuConfigError::InvalidRegisterIdentity
+            } else if arm64_register_width(id) != Some(CpuConfigArmRegisterWidth::U32) {
+                CpuConfigError::InvalidRegisterWidth
+            } else {
+                CpuConfigError::KvmDemuxRegisterUnsupported
+            }
+        }
+        ARM64_KVM_REG_SYSTEM => {
+            if arm64_register_width(id) != Some(CpuConfigArmRegisterWidth::U64) {
+                CpuConfigError::InvalidRegisterWidth
+            } else {
+                classify_unaccepted_system_register(id as u16)
+            }
+        }
+        ARM64_KVM_REG_FIRMWARE => {
+            if arm64_register_width(id) != Some(CpuConfigArmRegisterWidth::U64) {
+                CpuConfigError::InvalidRegisterWidth
+            } else {
+                CpuConfigError::KvmFirmwareRegisterUnsupported
+            }
+        }
+        ARM64_KVM_REG_SVE => CpuConfigError::KvmSveRegisterUnsupported,
+        ARM64_KVM_REG_FIRMWARE_FEATURE => {
+            if arm64_register_width(id) != Some(CpuConfigArmRegisterWidth::U64) {
+                CpuConfigError::InvalidRegisterWidth
+            } else {
+                CpuConfigError::KvmFirmwareFeatureRegisterUnsupported
+            }
+        }
+        _ => CpuConfigError::UnknownKvmRegisterClass,
+    }
+}
+
+fn classify_unaccepted_system_register(register: u16) -> CpuConfigError {
+    if ARM64_SYSTEM_REGISTER_PROFILE
+        .iter()
+        .any(|entry| entry.identity as u16 == register)
+    {
+        return CpuConfigError::InvalidRegisterWidth;
+    }
+    if is_debug_system_register(register) || is_pointer_authentication_key(register) {
+        return CpuConfigError::SecuritySensitiveRegisterUnsupported;
+    }
+
+    match register {
+        0xc000 | 0xc005 => CpuConfigError::TopologyRegisterUnsupported,
+        0xc200 | 0xc201 | 0xc208 | 0xe208 => CpuConfigError::RegisterAliasUnsupported,
+        0xc094 | 0xc096 | 0xda12 | 0xde85 => CpuConfigError::MutableSmeRegisterUnsupported,
+        0xc080 | 0xc082 | 0xc100 | 0xc101 | 0xc102 | 0xc288 | 0xc289 | 0xc290 | 0xc300 | 0xc3a0
+        | 0xc510 | 0xc518 | 0xc600 | 0xc681 | 0xc684 | 0xc687 | 0xde82 | 0xde83 | 0xde87 => {
+            CpuConfigError::LifecycleRegisterUnsupported
+        }
+        0xc708 | 0xdf00 | 0xdf01 | 0xdf02 | 0xdf10 | 0xdf11 | 0xdf12 | 0xdf18 | 0xdf19 | 0xdf1a => {
+            CpuConfigError::TimeDependentRegisterUnsupported
+        }
+        0xd000 | 0xc230 | 0xc643 | 0xc644..=0xc64b | 0xc663..=0xc667 => {
+            CpuConfigError::SeparatelyOwnedRegisterUnsupported
+        }
+        0xe000 | 0xe005 | 0xe080 | 0xe088 | 0xe089 | 0xe08a | 0xe100 | 0xe101 | 0xe102 | 0xe108
+        | 0xe10a | 0xe200 | 0xe201 | 0xe290 | 0xe300 | 0xe304 | 0xe510 | 0xe600 | 0xe682
+        | 0xe703 | 0xe708 | 0xe710 | 0xe711 | 0xe712 | 0xf208 => {
+            CpuConfigError::DisabledEl2RegisterUnsupported
+        }
+        _ => CpuConfigError::UnnamedSystemRegisterUnsupported,
+    }
+}
+
+fn is_debug_system_register(register: u16) -> bool {
+    matches!(register, 0x8010 | 0x8012)
+        || ((0x8004..=0x807f).contains(&register) && (4..=7).contains(&(register & 7)))
+}
+
+fn is_pointer_authentication_key(register: u16) -> bool {
+    matches!(
+        register,
+        0xc108 | 0xc109 | 0xc10a | 0xc10b | 0xc110 | 0xc111 | 0xc112 | 0xc113 | 0xc118 | 0xc119
+    )
+}
+
+const fn core_class_index(id: u64) -> Option<u64> {
+    if id & ARM64_KVM_REG_COPROC_MASK == ARM64_KVM_REG_CORE {
+        Some(id & KVM_REG_ARM64_CORE_INDEX_MASK)
+    } else {
+        None
+    }
+}
+
+const fn expected_core_width(index: u64) -> Option<CpuConfigArmRegisterWidth> {
+    match index {
+        0..=80 if index.is_multiple_of(2) => Some(CpuConfigArmRegisterWidth::U64),
+        84..=208 if (index - 84).is_multiple_of(4) => Some(CpuConfigArmRegisterWidth::U128),
+        212 | 213 => Some(CpuConfigArmRegisterWidth::U32),
+        _ => None,
     }
 }
 
@@ -779,6 +1119,10 @@ mod tests {
 
     const fn arm_q(index: u8) -> ArmRegister128 {
         ArmRegister128::Q(ArmQRegister(index))
+    }
+
+    const fn system_register(raw: u16) -> u64 {
+        0x6030_0000_0013_0000 | raw as u64
     }
 
     fn u32_modifier_parts(modifier: ArmRegisterModifier) -> (ArmRegister32, u32, u32) {
@@ -841,35 +1185,20 @@ mod tests {
     }
 
     #[test]
-    fn prepares_the_four_supported_id_registers_in_order() {
+    fn prepares_the_complete_system_register_profile_in_order() {
         let input = CpuConfigInput::new(
             Vec::new(),
-            vec![
-                modifier(
-                    KVM_REG_ARM64_ID_AA64PFR0_EL1,
-                    CpuConfigArmRegisterWidth::U64,
-                    0x000f_000f_0000_0000,
-                    0,
-                ),
-                modifier(
-                    KVM_REG_ARM64_ID_AA64ISAR0_EL1,
-                    CpuConfigArmRegisterWidth::U64,
-                    0xf0ff_0fff_0000_f000,
-                    0x1000,
-                ),
-                modifier(
-                    KVM_REG_ARM64_ID_AA64ISAR1_EL1,
-                    CpuConfigArmRegisterWidth::U64,
-                    0x00ff_f000_00ff_f00f,
-                    0x0010_0001,
-                ),
-                modifier(
-                    KVM_REG_ARM64_ID_AA64MMFR2_EL1,
-                    CpuConfigArmRegisterWidth::U64,
-                    0x0000_000f_0000_0000,
-                    0,
-                ),
-            ],
+            ARM64_SYSTEM_REGISTER_PROFILE
+                .iter()
+                .map(|entry| {
+                    modifier(
+                        entry.identity,
+                        CpuConfigArmRegisterWidth::U64,
+                        entry.allowed_filter.into(),
+                        0,
+                    )
+                })
+                .collect(),
             Vec::new(),
         );
 
@@ -877,26 +1206,238 @@ mod tests {
             .into_custom_template()
             .expect("supported template should validate")
             .expect("nonempty template should be retained");
-        assert_eq!(template.modifiers().len(), 4);
+        assert_eq!(template.modifiers().len(), 12);
+        for (modifier, entry) in template
+            .modifiers()
+            .iter()
+            .copied()
+            .zip(ARM64_SYSTEM_REGISTER_PROFILE)
+        {
+            let (register, filter, value) = u64_modifier_parts(modifier);
+            assert_eq!(register, entry.register);
+            assert_eq!(filter, entry.allowed_filter);
+            assert_eq!(value, 0);
+            assert_eq!(entry.width, CpuConfigArmRegisterWidth::U64);
+            assert_eq!(entry.boot_disposition, ArmRegisterBootDisposition::Retained);
+            assert_eq!(register.boot_disposition(), entry.boot_disposition);
+            assert_eq!(register.availability(), entry.availability);
+        }
+
         assert_eq!(
-            u64_modifier_parts(template.modifiers()[0]).0,
-            ArmRegister64::Id(ArmIdRegister::Pfr0)
+            ArmRegister64::Id(ArmIdRegister::Zfr0).availability(),
+            ArmRegisterAvailability::MacOs15_2
         );
         assert_eq!(
-            u64_modifier_parts(template.modifiers()[1]).0,
-            ArmRegister64::Id(ArmIdRegister::Isar0)
+            ArmRegister64::Id(ArmIdRegister::Smfr0).availability(),
+            ArmRegisterAvailability::MacOs15_2
         );
         assert_eq!(
-            u64_modifier_parts(template.modifiers()[2]).0,
-            ArmRegister64::Id(ArmIdRegister::Isar1)
+            ArmRegister64::Actlr.availability(),
+            ArmRegisterAvailability::MacOs15_0
+        );
+        for register in [
+            ArmIdRegister::Pfr0,
+            ArmIdRegister::Pfr1,
+            ArmIdRegister::Dfr0,
+            ArmIdRegister::Dfr1,
+            ArmIdRegister::Isar0,
+            ArmIdRegister::Isar1,
+            ArmIdRegister::Mmfr0,
+            ArmIdRegister::Mmfr1,
+            ArmIdRegister::Mmfr2,
+        ] {
+            assert_eq!(
+                ArmRegister64::Id(register).availability(),
+                ArmRegisterAvailability::Baseline
+            );
+        }
+
+        for (index, left) in ARM64_SYSTEM_REGISTER_PROFILE.iter().enumerate() {
+            for right in &ARM64_SYSTEM_REGISTER_PROFILE[index + 1..] {
+                assert_ne!(left.identity, right.identity);
+                assert_ne!(left.register, right.register);
+            }
+        }
+    }
+
+    #[test]
+    fn actlr_accepts_only_the_public_entso_filter() {
+        for (filter, value) in [(0, 0), (ARM64_ACTLR_ENTSO_MASK, 0), (2, 2)] {
+            assert_eq!(
+                u64_modifier_parts(
+                    executable_modifier(
+                        KVM_REG_ARM64_ACTLR_EL1,
+                        CpuConfigArmRegisterWidth::U64,
+                        filter.into(),
+                        value.into(),
+                    )
+                    .expect("public ACTLR.EnTSO operation should execute")
+                ),
+                (ArmRegister64::Actlr, filter, value)
+            );
+        }
+
+        for bit in 0..u64::BITS {
+            if bit == 1 {
+                continue;
+            }
+            let filter = 1_u64 << bit;
+            assert_eq!(
+                executable_modifier(
+                    KVM_REG_ARM64_ACTLR_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    filter.into(),
+                    0,
+                ),
+                Err(CpuConfigError::ActlrFilterUnsupported)
+            );
+        }
+        assert_eq!(
+            executable_modifier(
+                KVM_REG_ARM64_ACTLR_EL1,
+                CpuConfigArmRegisterWidth::U64,
+                u128::from(u64::MAX),
+                ARM64_ACTLR_ENTSO_MASK.into(),
+            ),
+            Err(CpuConfigError::ActlrFilterUnsupported)
         );
         assert_eq!(
-            u64_modifier_parts(template.modifiers()[3]).0,
-            ArmRegister64::Id(ArmIdRegister::Mmfr2)
+            executable_modifier(
+                KVM_REG_ARM64_ACTLR_EL1,
+                CpuConfigArmRegisterWidth::U64,
+                0,
+                ARM64_ACTLR_ENTSO_MASK.into(),
+            ),
+            Err(CpuConfigError::ValueOutsideFilter {
+                collection: CpuConfigCollection::RegisterModifiers,
+            })
         );
-        let (_, filter, value) = u64_modifier_parts(template.modifiers()[1]);
-        let baseline = u64::MAX;
-        assert_eq!((baseline & !filter) | value, 0x0f00_f000_ffff_1fff);
+    }
+
+    #[test]
+    fn terminally_classifies_kvm_classes_and_public_hvf_system_families() {
+        for (id, width, error) in [
+            (
+                0x6020_0000_0011_0000,
+                CpuConfigArmRegisterWidth::U32,
+                CpuConfigError::KvmDemuxRegisterUnsupported,
+            ),
+            (
+                0x6030_0000_0014_0000,
+                CpuConfigArmRegisterWidth::U64,
+                CpuConfigError::KvmFirmwareRegisterUnsupported,
+            ),
+            (
+                0x6030_0000_0015_0000,
+                CpuConfigArmRegisterWidth::U64,
+                CpuConfigError::KvmSveRegisterUnsupported,
+            ),
+            (
+                0x6030_0000_0016_0000,
+                CpuConfigArmRegisterWidth::U64,
+                CpuConfigError::KvmFirmwareFeatureRegisterUnsupported,
+            ),
+            (
+                0x6030_0000_0012_0000,
+                CpuConfigArmRegisterWidth::U64,
+                CpuConfigError::UnknownKvmRegisterClass,
+            ),
+            (
+                0x6030_0001_0013_c020,
+                CpuConfigArmRegisterWidth::U64,
+                CpuConfigError::InvalidRegisterIdentity,
+            ),
+        ] {
+            assert_eq!(executable_modifier(id, width, 0, 0), Err(error));
+        }
+
+        let public_families: &[(&[u16], CpuConfigError)] = &[
+            (
+                &[0xc000, 0xc005],
+                CpuConfigError::TopologyRegisterUnsupported,
+            ),
+            (
+                &[0xc200, 0xc201, 0xc208, 0xe208],
+                CpuConfigError::RegisterAliasUnsupported,
+            ),
+            (
+                &[
+                    0xc080, 0xc082, 0xc100, 0xc101, 0xc102, 0xc288, 0xc289, 0xc290, 0xc300, 0xc3a0,
+                    0xc510, 0xc518, 0xc600, 0xc681, 0xc684, 0xc687, 0xde82, 0xde83, 0xde87,
+                ],
+                CpuConfigError::LifecycleRegisterUnsupported,
+            ),
+            (
+                &[
+                    0xc108, 0xc109, 0xc10a, 0xc10b, 0xc110, 0xc111, 0xc112, 0xc113, 0xc118, 0xc119,
+                ],
+                CpuConfigError::SecuritySensitiveRegisterUnsupported,
+            ),
+            (
+                &[
+                    0xc708, 0xdf00, 0xdf01, 0xdf02, 0xdf10, 0xdf11, 0xdf12, 0xdf18, 0xdf19, 0xdf1a,
+                ],
+                CpuConfigError::TimeDependentRegisterUnsupported,
+            ),
+            (
+                &[
+                    0xd000, 0xc230, 0xc643, 0xc644, 0xc645, 0xc646, 0xc647, 0xc648, 0xc649, 0xc64a,
+                    0xc64b, 0xc663, 0xc664, 0xc665, 0xc666, 0xc667,
+                ],
+                CpuConfigError::SeparatelyOwnedRegisterUnsupported,
+            ),
+            (
+                &[0xc094, 0xc096, 0xda12, 0xde85],
+                CpuConfigError::MutableSmeRegisterUnsupported,
+            ),
+            (
+                &[
+                    0xe000, 0xe005, 0xe080, 0xe088, 0xe089, 0xe08a, 0xe100, 0xe101, 0xe102, 0xe108,
+                    0xe10a, 0xe200, 0xe201, 0xe290, 0xe300, 0xe304, 0xe510, 0xe600, 0xe682, 0xe703,
+                    0xe708, 0xe710, 0xe711, 0xe712, 0xf208,
+                ],
+                CpuConfigError::DisabledEl2RegisterUnsupported,
+            ),
+            (&[0xc0ff], CpuConfigError::UnnamedSystemRegisterUnsupported),
+        ];
+        for (registers, expected) in public_families {
+            for register in *registers {
+                assert_eq!(
+                    executable_modifier(
+                        system_register(*register),
+                        CpuConfigArmRegisterWidth::U64,
+                        0,
+                        0,
+                    ),
+                    Err(*expected)
+                );
+            }
+        }
+
+        for index in 0_u16..16 {
+            for field in 4_u16..=7 {
+                assert_eq!(
+                    executable_modifier(
+                        system_register(0x8000 + index * 8 + field),
+                        CpuConfigArmRegisterWidth::U64,
+                        0,
+                        0,
+                    ),
+                    Err(CpuConfigError::SecuritySensitiveRegisterUnsupported)
+                );
+            }
+        }
+        for register in [0x8010, 0x8012] {
+            assert_eq!(
+                executable_modifier(
+                    system_register(register),
+                    CpuConfigArmRegisterWidth::U64,
+                    0,
+                    0,
+                ),
+                Err(CpuConfigError::SecuritySensitiveRegisterUnsupported)
+            );
+        }
     }
 
     #[test]
@@ -941,7 +1482,7 @@ mod tests {
                 Vec::new(),
             )
             .into_custom_template(),
-            Err(CpuConfigError::UnsupportedRegister)
+            Err(CpuConfigError::InvalidRegisterWidth)
         );
         assert_eq!(
             CpuConfigInput::new(
@@ -955,7 +1496,7 @@ mod tests {
                 Vec::new(),
             )
             .into_custom_template(),
-            Err(CpuConfigError::UnsupportedRegister)
+            Err(CpuConfigError::InvalidRegisterIdentity)
         );
     }
 
@@ -1056,14 +1597,16 @@ mod tests {
                 1,
                 1,
             );
-            if matches!(index, 212 | 213) {
-                assert!(u32_result.is_ok(), "reviewed U32 core index should map");
-            } else {
-                assert_eq!(u32_result, Err(CpuConfigError::UnsupportedRegister));
+            match expected_core_width(index) {
+                Some(CpuConfigArmRegisterWidth::U32) => {
+                    assert!(u32_result.is_ok(), "reviewed U32 core index should map");
+                }
+                Some(_) => assert_eq!(u32_result, Err(CpuConfigError::InvalidRegisterWidth)),
+                None => assert_eq!(u32_result, Err(CpuConfigError::InvalidRegisterIdentity)),
             }
 
             let expected_u64_error = match index {
-                0..=60 if index % 2 == 0 => {
+                0..=60 if index.is_multiple_of(2) => {
                     if matches!(index, 2 | 4 | 6) {
                         Some(CpuConfigError::BootReservedRegister)
                     } else {
@@ -1072,7 +1615,10 @@ mod tests {
                 }
                 62 | 64 | 66 | 68 | 70 | 72 => None,
                 74 | 76 | 78 | 80 => Some(CpuConfigError::Aarch32BankedRegisterUnavailable),
-                _ => Some(CpuConfigError::UnsupportedRegister),
+                _ if expected_core_width(index).is_some() => {
+                    Some(CpuConfigError::InvalidRegisterWidth)
+                }
+                _ => Some(CpuConfigError::InvalidRegisterIdentity),
             };
             let u64_result = executable_modifier(
                 KVM_REG_ARM64_CORE_U64_BASE | index,
@@ -1092,10 +1638,12 @@ mod tests {
                 1,
                 1,
             );
-            if (84..=208).contains(&index) && (index - 84) % 4 == 0 {
-                assert!(u128_result.is_ok(), "reviewed U128 core index should map");
-            } else {
-                assert_eq!(u128_result, Err(CpuConfigError::UnsupportedRegister));
+            match expected_core_width(index) {
+                Some(CpuConfigArmRegisterWidth::U128) => {
+                    assert!(u128_result.is_ok(), "reviewed U128 core index should map");
+                }
+                Some(_) => assert_eq!(u128_result, Err(CpuConfigError::InvalidRegisterWidth)),
+                None => assert_eq!(u128_result, Err(CpuConfigError::InvalidRegisterIdentity)),
             }
         }
 
@@ -1112,14 +1660,35 @@ mod tests {
                 KVM_REG_ARM64_CORE_U128_BASE | 214,
                 CpuConfigArmRegisterWidth::U128,
             ),
-            (0x6020_0000_0011_00d5, CpuConfigArmRegisterWidth::U32),
-            (0x6030_0000_0011_0008, CpuConfigArmRegisterWidth::U64),
-            (0x6040_0000_0011_0054, CpuConfigArmRegisterWidth::U128),
         ] {
             assert_eq!(
                 executable_modifier(id, width, 1, 1),
-                Err(CpuConfigError::UnsupportedRegister)
+                Err(CpuConfigError::InvalidRegisterIdentity)
             );
+        }
+        for (id, width, error) in [
+            (
+                0x6020_0000_0011_00d5,
+                CpuConfigArmRegisterWidth::U32,
+                CpuConfigError::KvmDemuxRegisterUnsupported,
+            ),
+            (
+                0x6020_0000_0011_0100,
+                CpuConfigArmRegisterWidth::U32,
+                CpuConfigError::InvalidRegisterIdentity,
+            ),
+            (
+                0x6030_0000_0011_0008,
+                CpuConfigArmRegisterWidth::U64,
+                CpuConfigError::InvalidRegisterWidth,
+            ),
+            (
+                0x6040_0000_0011_0054,
+                CpuConfigArmRegisterWidth::U128,
+                CpuConfigError::InvalidRegisterWidth,
+            ),
+        ] {
+            assert_eq!(executable_modifier(id, width, 1, 1), Err(error));
         }
 
         // Architectural system encodings of the four accepted core-system
@@ -1132,7 +1701,7 @@ mod tests {
         ] {
             assert_eq!(
                 executable_modifier(alias, CpuConfigArmRegisterWidth::U64, 1, 1),
-                Err(CpuConfigError::UnsupportedRegister)
+                Err(CpuConfigError::RegisterAliasUnsupported)
             );
         }
 
@@ -1158,6 +1727,11 @@ mod tests {
                 CpuConfigArmRegisterWidth::U128,
             )
         }));
+        accepted.extend(
+            ARM64_SYSTEM_REGISTER_PROFILE
+                .iter()
+                .map(|entry| (entry.identity, CpuConfigArmRegisterWidth::U64)),
+        );
         for (id, correct_width) in accepted {
             for wrong_width in [
                 CpuConfigArmRegisterWidth::U32,

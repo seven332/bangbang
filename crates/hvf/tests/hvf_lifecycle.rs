@@ -4726,11 +4726,15 @@ fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus() {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::cpu::{
         CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigInput,
-        KVM_REG_ARM64_CORE_ELR_EL1, KVM_REG_ARM64_CORE_FPCR, KVM_REG_ARM64_CORE_FPSR,
-        KVM_REG_ARM64_CORE_PC, KVM_REG_ARM64_CORE_PSTATE, KVM_REG_ARM64_CORE_SP_EL0,
-        KVM_REG_ARM64_CORE_SP_EL1, KVM_REG_ARM64_CORE_SPSR_EL1, KVM_REG_ARM64_ID_AA64ISAR0_EL1,
-        KVM_REG_ARM64_ID_AA64ISAR1_EL1, KVM_REG_ARM64_ID_AA64MMFR2_EL1,
-        KVM_REG_ARM64_ID_AA64PFR0_EL1, kvm_reg_arm64_core_q, kvm_reg_arm64_core_x,
+        KVM_REG_ARM64_ACTLR_EL1, KVM_REG_ARM64_CORE_ELR_EL1, KVM_REG_ARM64_CORE_FPCR,
+        KVM_REG_ARM64_CORE_FPSR, KVM_REG_ARM64_CORE_PC, KVM_REG_ARM64_CORE_PSTATE,
+        KVM_REG_ARM64_CORE_SP_EL0, KVM_REG_ARM64_CORE_SP_EL1, KVM_REG_ARM64_CORE_SPSR_EL1,
+        KVM_REG_ARM64_ID_AA64DFR0_EL1, KVM_REG_ARM64_ID_AA64DFR1_EL1,
+        KVM_REG_ARM64_ID_AA64ISAR0_EL1, KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+        KVM_REG_ARM64_ID_AA64MMFR0_EL1, KVM_REG_ARM64_ID_AA64MMFR1_EL1,
+        KVM_REG_ARM64_ID_AA64MMFR2_EL1, KVM_REG_ARM64_ID_AA64PFR0_EL1,
+        KVM_REG_ARM64_ID_AA64PFR1_EL1, KVM_REG_ARM64_ID_AA64SMFR0_EL1,
+        KVM_REG_ARM64_ID_AA64ZFR0_EL1, kvm_reg_arm64_core_q, kvm_reg_arm64_core_x,
     };
     use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::GuestAddress;
@@ -4768,6 +4772,28 @@ fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus() {
             kernel.path(),
         )))
         .expect("boot source config should store");
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    );
+    let mut baseline_session = OwnedHvfArm64BootSession::new(&controller, config.clone())
+        .expect("disposable two-vCPU baseline session should prepare");
+    let baseline_identification = baseline_session
+        .capture_arm64_identification_register_state()
+        .expect("baseline identification state should capture without logging values");
+    let baseline_optional_identification = baseline_session
+        .capture_arm64_sve_sme_identification_register_state()
+        .expect("baseline optional identification state should capture without logging values");
+    let baseline_execution = baseline_session
+        .capture_arm64_execution_control_register_state()
+        .expect("baseline execution-control state should capture without logging values");
+    baseline_session
+        .shutdown()
+        .expect("disposable baseline session should shut down cleanly");
+
     controller
         .handle_action(VmmAction::PutCpuConfig(CpuConfigInput::new(
             Vec::new(),
@@ -4874,17 +4900,58 @@ fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus() {
                     0x0000_000f_0000_0000,
                     0,
                 ),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64PFR1_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    baseline_identification.id_aa64pfr1_el1().into(),
+                ),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64DFR0_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    baseline_identification.id_aa64dfr0_el1().into(),
+                ),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64DFR1_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    baseline_identification.id_aa64dfr1_el1().into(),
+                ),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64MMFR0_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    baseline_identification.id_aa64mmfr0_el1().into(),
+                ),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64MMFR1_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    baseline_identification.id_aa64mmfr1_el1().into(),
+                ),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64ZFR0_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    baseline_optional_identification.id_aa64zfr0_el1().into(),
+                ),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64SMFR0_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    baseline_optional_identification.id_aa64smfr0_el1().into(),
+                ),
+                modifier(
+                    KVM_REG_ARM64_ACTLR_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    2,
+                    2,
+                ),
             ],
             Vec::new(),
         )))
         .expect("mixed-width CPU template should store");
-    let config = HvfArm64BootSessionConfig::new(
-        BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
-        PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
-        NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
-        VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
-        test_rtc_mmio_layout(),
-    );
 
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
         .expect("mixed-width template should write and read back on both HVF vCPUs");
@@ -4951,6 +5018,45 @@ fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus() {
     assert!(
         simd_fp.fpsr() == u64::try_from(fpsr_target).expect("target should fit U64"),
         "FPSR must retain the zero-extended U32 CPU-template target"
+    );
+    let identification = session
+        .capture_arm64_identification_register_state()
+        .expect("complete CPU-template identification state should capture");
+    let identification_again = session
+        .capture_arm64_identification_register_state()
+        .expect("complete CPU-template identification state should recapture");
+    assert!(
+        identification == identification_again,
+        "baseline-preserving ID targets must remain stable after exact transaction readback"
+    );
+    assert!(
+        identification.id_aa64pfr1_el1() == baseline_identification.id_aa64pfr1_el1()
+            && identification.id_aa64dfr0_el1() == baseline_identification.id_aa64dfr0_el1()
+            && identification.id_aa64dfr1_el1() == baseline_identification.id_aa64dfr1_el1()
+            && identification.id_aa64mmfr0_el1() == baseline_identification.id_aa64mmfr0_el1()
+            && identification.id_aa64mmfr1_el1() == baseline_identification.id_aa64mmfr1_el1(),
+        "all five new baseline-tier ID targets must match the disposable host baseline"
+    );
+    let optional_identification = session
+        .capture_arm64_sve_sme_identification_register_state()
+        .expect("optional CPU-template identification state should capture");
+    let optional_identification_again = session
+        .capture_arm64_sve_sme_identification_register_state()
+        .expect("optional CPU-template identification state should recapture");
+    assert!(
+        optional_identification == optional_identification_again,
+        "baseline-preserving ZFR0/SMFR0 targets must remain stable after exact readback"
+    );
+    assert!(
+        optional_identification == baseline_optional_identification,
+        "both optional ID targets must match the disposable host baseline"
+    );
+    let execution = session
+        .capture_arm64_execution_control_register_state()
+        .expect("CPU-template ACTLR state should capture");
+    assert!(
+        execution.actlr_el1() == (baseline_execution.actlr_el1() | 2),
+        "ACTLR.EnTSO must retain the exact documented CPU-template target"
     );
     session
         .shutdown()

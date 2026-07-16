@@ -1,24 +1,26 @@
 # Firecracker v1.16.0 CPU-template contract
 
-This document is the human-owned contract for the CPU-template subset delivered
-by issues #1393 and #1402. It is pinned to Firecracker v1.16.0 commit
+This document is the human-owned contract for the reviewed arm64 CPU-template
+profile delivered by issues #1393, #1402, and #1403. It is pinned to
+Firecracker v1.16.0 commit
 `d83d72b710361a10294480131377b1b00b163af8` and to the public
 Hypervisor.framework surface available to the macOS Apple Silicon backend.
 
 The implementation deliberately separates three outcomes:
 
-- exact expert-controlled masks are implemented and verified for four reviewed
-  arm64 identification registers plus the reviewed core and SIMD/FP profile;
+- exact expert-controlled masks are implemented and verified for eleven arm64
+  identification registers, ACTLR.EnTSO, and the reviewed core and SIMD/FP
+  profile;
 - KVM capability numbers and `kvm_vcpu_init.features` words have no
   identity-preserving HVF namespace and receive stable platform faults; and
 - static CPU names are configuration policy, not aliases for arbitrary live
   writes. `V1N1` remains pending configuration but cannot execute because its
   documented Neoverse V1 source-model contract is not true on Apple Silicon.
 
-The broad `/cpu-config` operation, general register-modifier schema, CPU
-template corpora, and helper tools remain nonterminal. #1403 owns the remaining
-system/KVM register policy and final #1394 inventory closure; Wave 7 owns the
-helper surface.
+The ARM modifier properties and schemas now have a complete finite policy.
+Multi-architecture operation/path aggregates, CPU-template corpora, and helper
+tools remain nonterminal because their x86 and public dump/strip/verify/
+fingerprint contracts are independent Wave 7 work.
 
 ## Request model and bounds
 
@@ -68,21 +70,40 @@ are X0/X4-X30 at `0` and `8..=60` with stride 2, SP_EL0/PC/PSTATE at
 stride 4, and FPSR/FPCR at `212/213`. No padding or intervening index inherits
 the policy of a neighboring field.
 
-The original four U64 identification registers remain supported:
+The U64 system-register profile is closed and exact:
 
 - `ID_AA64PFR0_EL1`;
+- `ID_AA64PFR1_EL1`;
+- `ID_AA64DFR0_EL1`;
+- `ID_AA64DFR1_EL1`;
 - `ID_AA64ISAR0_EL1`;
-- `ID_AA64ISAR1_EL1`; and
-- `ID_AA64MMFR2_EL1`.
+- `ID_AA64ISAR1_EL1`;
+- `ID_AA64MMFR0_EL1`;
+- `ID_AA64MMFR1_EL1`;
+- `ID_AA64MMFR2_EL1`;
+- `ID_AA64ZFR0_EL1`;
+- `ID_AA64SMFR0_EL1`; and
+- `ACTLR_EL1`, only when the modifier filter is a subset of EnTSO bit 1.
 
-Any ordered combination of those distinct identities is accepted, including a
+ZFR0 and SMFR0 require the public macOS 15.2 register boundary. A tiny
+target-only C `__builtin_available` query runs while the complete typed template
+is prepared, before VM or topology creation; absence produces one stable
+value-free fault and no member access or write. ACTLR is an explicit macOS 15
+tier and admits only the public SDK-documented EnTSO bit. A zero filter remains
+a valid observable no-op for every accepted identity.
+
+Any ordered combination of distinct accepted identities is valid, including a
 single-register or mixed-width template. X1-X3 receive a boot-reserved fault;
 the AArch32 banked SPSR_ABT/UND/IRQ/FIQ fields receive an unavailable-state
-fault. Padding, reserved or misaligned core offsets, noncanonical widths,
-aliases, and identities outside this partial profile fail before effective
-state replacement. KVM capabilities, KVM vCPU-init feature words, and a mixed
-category receive separate value-free faults. #1403 owns the remaining
-system-register universe and final terminal classifications.
+fault. MIDR and MPIDR/topology state, CPACR and boot/dependency controls,
+translation and exception state, thread/context and cache selection, pointer
+authentication keys, debug/trap state, timers, GIC/ICC state, optional mutable
+SME state, and disabled EL2 state each have a stable category-only safety
+fault. KVM demux/CCSIDR, firmware, firmware-feature, canonical SVE, and unknown
+coprocessor classes have distinct platform classifications. Padding, reserved
+or invalid class fields, wrong widths, semantic aliases, and unnamed system
+encodings fail before effective state replacement. No raw `hv_sys_reg_t`
+constructor or catch-all system-register path exists.
 
 Each width computes the mask relation in its own integer type. Q reads use
 `u128::from_le_bytes` and writes use `u128::to_le_bytes`; host-native byte
@@ -167,9 +188,8 @@ Pending `V1N1` cannot reach a running or paused snapshot source because its
 start gate fires before backend construction. Empty custom or explicit `None`
 leaves the ordinary no-template snapshot profile unchanged.
 
-Wave 6 retains ownership of broader snapshot profiles, multi-vCPU/device
-schemas, and portability policy. #1403 owns the remaining system-register
-policy and final #1394 inventory closure. Wave 7 owns the five public
+Wave 6 retains ownership of broader snapshot profiles and multi-vCPU/device
+schemas. Wave 7 owns cross-host portability and the five public
 `cpu-template-helper` commands and arguments.
 
 ## Security and signed evidence
@@ -182,21 +202,26 @@ no private Apple API, new entitlement, root requirement, scheduler-affinity
 inference, or physical-host model table.
 
 Unit and failure-injection coverage proves bounded/lossless parsing,
-replacement atomicity, mixed-width requested-set read-before-write ordering,
-unrelated-register non-access, no-write baseline or width mismatch, exact
-little-endian Q conversion, fail-closed FP transport, every write/readback
-failure position, redaction, retry, and cleanup. A separately signed two-vCPU
-lifecycle test applies the mixed ID/core/Q/FP profile, relies on mandatory
-all-member readback, captures the primary pre-run state to prove boot
-precedence and retained targets, and shuts down cleanly. A signed Linux SMP
-test applies X0/PC/PSTATE modifiers and reaches userspace on the PSCI-started
-secondary, proving that its boot setup also supersedes those targets. The
+replacement atomicity, every accepted identity and terminal family, the 15.2
+availability outcomes, every forbidden ACTLR bit, mixed-width requested-set
+read-before-write ordering, unrelated-register non-access, no-write baseline or
+width mismatch, exact little-endian Q conversion, fail-closed FP transport,
+every baseline/write/readback failure position, redaction, retry, and cleanup.
+A separately signed two-vCPU lifecycle test captures a disposable in-memory
+baseline, applies the seven additional ID registers plus ACTLR.EnTSO together
+with the mixed ID/core/Q/FP profile, relies on mandatory all-member readback,
+captures the primary pre-run state to prove boot precedence and retained
+targets, and shuts both sessions down without emitting raw values. A signed
+Linux SMP test applies X0/PC/PSTATE modifiers and reaches userspace on the
+PSCI-started secondary, proving that its boot setup also supersedes those
+targets. The
 existing signed two-vCPU Linux test boots one baseline VM and one canonical
 custom ID-register VM, pins a no-stdlib EL0 helper to each CPU, writes bounded
 reports only to a scratch block device, and verifies the exact baseline mask
 result. Serial receives fixed success/failure markers only.
 
 The strict platform-exclusion evidence and alternatives for the seven narrow
-KVM/static inventory leaves are recorded in `capabilities.json`. #1402 expands
-the executable partial profile without changing terminal inventory states;
-#1403 owns that final audit.
+KVM/static inventory leaves, plus the implementation and validation evidence
+for the six completed ARM records, are recorded in `capabilities.json`.
+Mechanical write/readback establishes routing, not a portable or coherent CPU
+feature model; helper capture and comparison remain Wave 7 work.
