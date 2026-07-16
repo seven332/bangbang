@@ -102,7 +102,9 @@ use bangbang_runtime::startup::{
 #[cfg(target_os = "macos")]
 use bangbang_runtime::vsock::SuppliedVsockListener;
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
-use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
+use bangbang_runtime::{
+    BackendError, VmStateTransition, VmmAction, VmmActionError, VmmController, VmmData,
+};
 #[cfg(target_os = "macos")]
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
 use bangbang_session::{GrantAccess, ResourceRole, VmnetAuthority};
@@ -1942,25 +1944,31 @@ where
     }
 
     fn pause_instance(&mut self) -> Result<VmmData, VmmActionError> {
-        self.controller.preflight_pause_instance()?;
+        let transition = self.controller.preflight_pause_instance()?;
         let Some(session) = self.started_session.as_mut() else {
             return Err(VmmActionError::Lifecycle(BackendError::InvalidState(
                 "active session unavailable",
             )));
         };
 
+        if transition == VmStateTransition::AlreadyInTargetState {
+            return Ok(VmmData::Empty);
+        }
         session.pause().map_err(VmmActionError::Lifecycle)?;
         self.controller.pause_instance()
     }
 
     fn resume_instance(&mut self) -> Result<VmmData, VmmActionError> {
-        self.controller.preflight_resume_instance()?;
+        let transition = self.controller.preflight_resume_instance()?;
         let Some(session) = self.started_session.as_mut() else {
             return Err(VmmActionError::Lifecycle(BackendError::InvalidState(
                 "active session unavailable",
             )));
         };
 
+        if transition == VmStateTransition::AlreadyInTargetState {
+            return Ok(VmmData::Empty);
+        }
         session.resume().map_err(VmmActionError::Lifecycle)?;
         self.controller.resume_instance()
     }
@@ -12117,22 +12125,23 @@ mod tests {
     }
 
     #[test]
-    fn runtime_pause_and_resume_reject_invalid_transitions_without_session_call() {
+    fn runtime_pause_and_resume_are_idempotent_without_session_call() {
         let mut vmm = configured_vmm(FakeStarter::success(12));
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
 
-        let err = vmm
+        let session = vmm
+            .started_session
+            .as_mut()
+            .expect("started session should remain available");
+        session.resume_result = Some(BackendError::Hypervisor(
+            "duplicate resume must not reach the session".to_string(),
+        ));
+        let data = vmm
             .handle_action(VmmAction::Resume)
-            .expect_err("running instance should not resume again");
+            .expect("running instance should acknowledge resume");
 
-        assert_eq!(
-            err,
-            VmmActionError::UnsupportedState {
-                action: VmmAction::Resume.name(),
-                state: InstanceState::Running,
-            }
-        );
+        assert_eq!(data, VmmData::Empty);
         assert_eq!(vmm.instance_info().state, InstanceState::Running);
         let session = vmm
             .started_session
@@ -12141,19 +12150,24 @@ mod tests {
         assert_eq!(session.pause_count, 0);
         assert_eq!(session.resume_count, 0);
 
+        vmm.started_session
+            .as_mut()
+            .expect("started session should remain available")
+            .resume_result = None;
         vmm.handle_action(VmmAction::Pause)
             .expect("running instance should pause");
-        let err = vmm
+        let session = vmm
+            .started_session
+            .as_mut()
+            .expect("started session should remain available");
+        session.pause_result = Some(BackendError::Hypervisor(
+            "duplicate pause must not reach the session".to_string(),
+        ));
+        let data = vmm
             .handle_action(VmmAction::Pause)
-            .expect_err("paused instance should not pause again");
+            .expect("paused instance should acknowledge pause");
 
-        assert_eq!(
-            err,
-            VmmActionError::UnsupportedState {
-                action: VmmAction::Pause.name(),
-                state: InstanceState::Paused,
-            }
-        );
+        assert_eq!(data, VmmData::Empty);
         assert_eq!(vmm.instance_info().state, InstanceState::Paused);
         let session = vmm
             .started_session
@@ -12161,6 +12175,29 @@ mod tests {
             .expect("started session should remain available");
         assert_eq!(session.pause_count, 1);
         assert_eq!(session.resume_count, 0);
+    }
+
+    #[test]
+    fn runtime_idempotent_state_update_still_requires_owned_session() {
+        for action in [VmmAction::Resume, VmmAction::Pause] {
+            let mut vmm = configured_vmm(FakeStarter::success(13));
+            vmm.handle_action(VmmAction::InstanceStart)
+                .expect("startup should succeed");
+            if action == VmmAction::Pause {
+                vmm.handle_action(VmmAction::Pause)
+                    .expect("running instance should pause before losing its session");
+            }
+            vmm.started_session = None;
+
+            let err = vmm
+                .handle_action(action)
+                .expect_err("same-state update without a session should fail");
+
+            assert_eq!(
+                err,
+                VmmActionError::Lifecycle(BackendError::InvalidState("active session unavailable"))
+            );
+        }
     }
 
     #[test]

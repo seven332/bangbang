@@ -357,21 +357,16 @@ mod macos_arm64 {
 
         let duplicate_pause_response =
             http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#);
-        assert_bad_request_response(&duplicate_pause_response, "PATCH /vm Paused while paused");
-        assert_response_contains(
-            &duplicate_pause_response,
-            r#"{"fault_message":"The requested operation is not supported in Paused state: Pause"}"#,
-            "PATCH /vm Paused while paused",
-        );
+        assert_no_content_response(&duplicate_pause_response, "PATCH /vm Paused while paused");
         let paused_after_duplicate_pause = http_get(&socket_path, "/");
         assert_ok_response(
             &paused_after_duplicate_pause,
-            "GET / after rejected duplicate PATCH /vm Paused",
+            "GET / after idempotent duplicate PATCH /vm Paused",
         );
         assert_response_contains(
             &paused_after_duplicate_pause,
             r#""state":"Paused""#,
-            "GET / after rejected duplicate PATCH /vm Paused",
+            "GET / after idempotent duplicate PATCH /vm Paused",
         );
 
         let resume_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
@@ -386,24 +381,19 @@ mod macos_arm64 {
 
         let duplicate_resume_response =
             http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
-        assert_bad_request_response(
+        assert_no_content_response(
             &duplicate_resume_response,
-            "PATCH /vm Resumed while running",
-        );
-        assert_response_contains(
-            &duplicate_resume_response,
-            r#"{"fault_message":"The requested operation is not supported in Running state: Resume"}"#,
             "PATCH /vm Resumed while running",
         );
         let running_after_duplicate_resume = http_get(&socket_path, "/");
         assert_ok_response(
             &running_after_duplicate_resume,
-            "GET / after rejected duplicate PATCH /vm Resumed",
+            "GET / after idempotent duplicate PATCH /vm Resumed",
         );
         assert_response_contains(
             &running_after_duplicate_resume,
             r#""state":"Running""#,
-            "GET / after rejected duplicate PATCH /vm Resumed",
+            "GET / after idempotent duplicate PATCH /vm Resumed",
         );
 
         for (request_context, path, expected_fault, private_id) in [
@@ -1074,12 +1064,7 @@ mod macos_arm64 {
         let pause = http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Paused"}"#);
         assert_no_content_response(&pause, "PATCH process A /vm Paused");
         let duplicate_pause = http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Paused"}"#);
-        assert_bad_request_response(&duplicate_pause, "duplicate process A pause");
-        assert_response_contains(
-            &duplicate_pause,
-            r#"{"fault_message":"The requested operation is not supported in Paused state: Pause"}"#,
-            "duplicate process A pause",
-        );
+        assert_no_content_response(&duplicate_pause, "duplicate process A pause");
         let paused_state = http_get(&socket_a, "/");
         assert_response_contains(
             &paused_state,
@@ -1118,12 +1103,7 @@ mod macos_arm64 {
         let resume = http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
         assert_no_content_response(&resume, "PATCH process A /vm Resumed");
         let duplicate_resume = http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
-        assert_bad_request_response(&duplicate_resume, "duplicate process A resume");
-        assert_response_contains(
-            &duplicate_resume,
-            r#"{"fault_message":"The requested operation is not supported in Running state: Resume"}"#,
-            "duplicate process A resume",
-        );
+        assert_no_content_response(&duplicate_resume, "duplicate process A resume");
         let resumed_target = SmpProgressCounts {
             cpu0: paused_counts.cpu0 + 2,
             cpu1: paused_counts.cpu1 + 2,

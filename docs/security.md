@@ -1531,6 +1531,12 @@ all converge on the same aggregate stop/join and reverse owner teardown. Signed
 dual-process tests keep sockets, serial paths, and lifecycle controls isolated;
 faults continue to redact host paths and guest/HVF values.
 
+Same-state public pause/resume acknowledgements are controller no-ops, not
+ownership bypasses: the process must still retain its started session, no second
+backend command or generation is issued, and state remains unchanged. Their
+latency field measures the successful API request, so recording it does not
+claim that a backend transition occurred.
+
 Online peers may hold the shared MMIO dispatcher while the boot worker handles
 another member's completed step. Runtime notification dispatch therefore waits
 for that short owner critical section under the existing guest-memory then
