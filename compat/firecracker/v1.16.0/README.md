@@ -32,9 +32,10 @@ claims mechanically visible.
   #1351 isolation/resource/seccomp outcomes without treating them as direct
   Linux jailer parity.
 - [`cpu-template-contract.md`](cpu-template-contract.md) records the bounded
-  custom four-register subset, transactional static/custom selection, strict
-  KVM/static execution exclusions, startup/readback/cleanup order, snapshot
-  boundary, and #1394/Wave handoffs.
+  reviewed ID/core/SIMD/FP custom subset, transactional static/custom
+  selection, strict KVM/static execution exclusions,
+  startup/readback/boot-precedence/cleanup order, snapshot boundary, and
+  #1403/Wave handoffs.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -158,7 +159,10 @@ current 418-record delivery inventory is 39 `implemented-and-verified`, 359
 `audit-required`, three `missing-platform-feasible`, and 17
 `proven-platform-impossible` records. Aggregate CPU operations/schema,
 register-modifier leaves, corpora, and helper tools remain open for #1394 and
-Wave 7; dirty siblings remain with the later #1388 slices.
+Wave 7; dirty siblings remain with the later #1388 slices. #1402 expands the
+executable partial profile to the reviewed U64 core, U128 Q, and U32 FP
+registers without promoting terminal inventory states; #1403 owns the remaining
+system-register policy and final #1394 closure.
 
 ## Commands
 

@@ -8023,7 +8023,9 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
     let cpu_template = controller
         .custom_cpu_template()
-        .map(crate::cpu_template::PreparedHvfArm64CpuTemplate::from_runtime);
+        .map(crate::cpu_template::PreparedHvfArm64CpuTemplate::from_runtime)
+        .transpose()
+        .map_err(|source| HvfArm64BootSessionError::CpuTemplate { source })?;
     let prepared_cache = prepare_cache(controller.machine_config().vcpu_count())
         .map_err(|source| HvfArm64BootSessionError::CacheTopology { source })?;
     let (cache_source, cache_hierarchy) = prepared_cache.into_parts();

@@ -115,6 +115,10 @@ fn boots_firecracker_kernel_to_guest_marker() {
 #[test]
 fn boots_firecracker_kernel_and_executes_userspace_on_secondary_cpu() {
     use bangbang_runtime::VmmAction;
+    use bangbang_runtime::cpu::{
+        CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigInput,
+        KVM_REG_ARM64_CORE_PC, KVM_REG_ARM64_CORE_PSTATE, kvm_reg_arm64_core_x,
+    };
     use bangbang_runtime::machine::MachineConfigInput;
 
     let _test_lock = GUEST_BOOT_TEST_LOCK
@@ -130,6 +134,32 @@ fn boots_firecracker_kernel_and_executes_userspace_on_secondary_cpu() {
             controller
                 .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 128)))
                 .expect("two-vCPU guest machine config should store");
+            controller
+                .handle_action(VmmAction::PutCpuConfig(CpuConfigInput::new(
+                    Vec::new(),
+                    vec![
+                        CpuConfigArmRegisterModifier::new(
+                            kvm_reg_arm64_core_x(0).expect("X0 should have a KVM identity"),
+                            CpuConfigArmRegisterWidth::U64,
+                            u64::MAX.into(),
+                            0x1111_2222_3333_4444,
+                        ),
+                        CpuConfigArmRegisterModifier::new(
+                            KVM_REG_ARM64_CORE_PC,
+                            CpuConfigArmRegisterWidth::U64,
+                            u64::MAX.into(),
+                            0x2000,
+                        ),
+                        CpuConfigArmRegisterModifier::new(
+                            KVM_REG_ARM64_CORE_PSTATE,
+                            CpuConfigArmRegisterWidth::U64,
+                            0xf000_0000,
+                            0xa000_0000,
+                        ),
+                    ],
+                    Vec::new(),
+                )))
+                .expect("boot-owned CPU-template modifiers should store");
         },
     );
 

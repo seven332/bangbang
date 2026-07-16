@@ -441,13 +441,21 @@ owner-thread getter. They must not hard-code one Apple MIDR/feature model,
 include availability-gated or beta-only IDs, or claim that equal raw values are
 a sufficient destination compatibility policy.
 CPU-template tests add a separate mutation boundary. Unit/failure-injection
-coverage must prove that every requested baseline on every member precedes the
-first write, unrelated allowlisted identities are untouched, cross-vCPU
-baseline mismatch performs no writes, targets are computed once, and every
-write is immediately reread. Every failure position must retain only redacted
-member/completed-count context and destroy an unpublished startup topology.
-Signed lifecycle coverage must apply the canonical four-register custom
-template to two real HVF vCPUs and shut down cleanly. Signed Linux coverage must
+coverage must prove exact core identity/width classification, boot-reserved and
+banked-state rejection, mixed U32/U64/U128 input order, explicit little-endian
+Q conversion, fail-closed U32 scalar transport, that every requested typed
+baseline on every member precedes the first write, unrelated allowlisted
+identities are untouched, cross-vCPU baseline/width mismatch performs no
+writes, targets are computed once, and every write is immediately reread. Every
+failure position must retain only redacted member/completed-count context and
+destroy an unpublished startup topology. Signed lifecycle coverage must apply
+one mixed ID/X/core/Q/FP custom template to two real HVF vCPUs, then capture the
+primary pre-run state to prove X0/PC/PSTATE boot precedence and all retained
+targets before clean shutdown. Startup success includes mandatory exact
+readback on both owners. The signed two-vCPU Linux SMP path must apply
+boot-owned X0/PC/PSTATE modifiers and reach userspace on the PSCI-started
+secondary, proving that secondary boot setup supersedes them. Signed Linux
+ID-register coverage must
 boot separate two-vCPU baseline and custom sessions, online and pin a no-stdlib
 EL0 reporter to each CPU, write bounded raw reports only to a scratch block
 device, and verify `custom == (baseline & !filter) | value` for every CPU and
