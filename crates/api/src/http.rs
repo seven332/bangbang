@@ -7268,6 +7268,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_complete_arm64_system_register_profile_exactly() {
+        let body = r#"{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0bx"},{"addr":"0x603000000013c021","bitmap":"0bx"},{"addr":"0x603000000013c028","bitmap":"0bx"},{"addr":"0x603000000013c029","bitmap":"0bx"},{"addr":"0x603000000013c030","bitmap":"0bx"},{"addr":"0x603000000013c031","bitmap":"0bx"},{"addr":"0x603000000013c038","bitmap":"0bx"},{"addr":"0x603000000013c039","bitmap":"0bx"},{"addr":"0x603000000013c03a","bitmap":"0bx"},{"addr":"0x603000000013c024","bitmap":"0bx"},{"addr":"0x603000000013c025","bitmap":"0bx"},{"addr":"0x603000000013c081","bitmap":"0b1x"}]}"#;
+        let expected = [
+            (0x6030_0000_0013_c020, 0, 0),
+            (0x6030_0000_0013_c021, 0, 0),
+            (0x6030_0000_0013_c028, 0, 0),
+            (0x6030_0000_0013_c029, 0, 0),
+            (0x6030_0000_0013_c030, 0, 0),
+            (0x6030_0000_0013_c031, 0, 0),
+            (0x6030_0000_0013_c038, 0, 0),
+            (0x6030_0000_0013_c039, 0, 0),
+            (0x6030_0000_0013_c03a, 0, 0),
+            (0x6030_0000_0013_c024, 0, 0),
+            (0x6030_0000_0013_c025, 0, 0),
+            (0x6030_0000_0013_c081, 2, 2),
+        ];
+
+        let parsed = parse_request(&request_with_body("PUT", "/cpu-config", body))
+            .expect("complete arm64 system register profile should parse");
+        let ApiRequest::PutCpuConfig(config) = parsed else {
+            panic!("expected cpu-config request");
+        };
+
+        assert_eq!(config.reg_modifiers().len(), expected.len());
+        for (modifier, (id, filter, value)) in config.reg_modifiers().iter().zip(expected) {
+            assert_eq!(modifier.id(), id);
+            assert_eq!(modifier.width(), CpuConfigArmRegisterWidth::U64);
+            assert_eq!(modifier.filter(), filter);
+            assert_eq!(modifier.value(), value);
+        }
+    }
+
+    #[test]
     fn enforces_cpu_config_collection_and_feature_bounds() {
         let capabilities = (0..CPU_CONFIG_MAX_ENTRIES_PER_ARRAY)
             .map(|index| format!("\"{}\"", 1_000_000_000_u32 + index as u32))

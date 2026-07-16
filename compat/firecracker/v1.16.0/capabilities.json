@@ -669,20 +669,108 @@
     {
       "id": "api-property:ArmRegisterModifier.addr",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property ArmRegisterModifier.addr.",
+      "summary": "Parse and retain exact canonical aarch64 U32/U64/U128 KVM one-register identities, execute the finite reviewed core/SIMD/system profile, and classify every other KVM class, public-HVF family, alias, width, and field with a stable value-free outcome.",
       "source_refs": [
         "api-property:ArmRegisterModifier.addr"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "CpuConfigArmRegisterModifierBody exact identity and width parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "PreparedHvfArm64CpuTemplate closed typed target mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "ARM64_SYSTEM_REGISTER_PROFILE and KVM one-register classification"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete arm64 system-register profile and malformed identity tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "socket CPU-template classification, replacement, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "complete runtime profile mapping and transaction failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed two-vCPU mixed-width and final system-profile evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "exhaustive accepted identity and terminal rejection matrix tests"
+        }
+      ]
     },
     {
       "id": "api-property:ArmRegisterModifier.bitmap",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property ArmRegisterModifier.bitmap.",
+      "summary": "Parse exact width-bounded ARM preserve/set/clear bitmaps, retain full U32/U64/U128 filter and value masks, apply exact common-baseline targets with immediate readback, and constrain ACTLR_EL1 to EnTSO bit 1.",
       "source_refs": [
         "api-property:ArmRegisterModifier.bitmap"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "CpuConfigArmRegisterModifierBody exact bitmap parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "typed common-baseline target calculation and immediate readback"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "width-specific modifier construction and ACTLR EnTSO filter policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "U32 U64 U128 bitmap boundary and complete profile parsing tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "socket replacement atomicity and raw-value redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "mixed-width exact target, failure-position, mismatch, and retry tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed exact mixed-width and ACTLR EnTSO readback evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "every forbidden ACTLR bit and width-exact mask tests"
+        }
+      ]
     },
     {
       "id": "api-property:Balloon.amount_mib",
@@ -1089,11 +1177,60 @@
     {
       "id": "api-property:CpuConfig.reg_modifiers",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuConfig.reg_modifiers.",
+      "summary": "Implement bounded ordered aarch64 register modifiers for the complete reviewed U32/U64/U128 profile, including eleven ID registers, ACTLR.EnTSO, core and SIMD/FP state, with exhaustive terminal classification outside that finite policy.",
       "source_refs": [
         "api-property:CpuConfig.reg_modifiers"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "CpuConfigRequestBody bounded ordered reg_modifiers"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "prepared typed profile and all-vCPU CPU-template transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "CpuConfigInput executable profile validation and classification"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "bounded lossless CPU-config parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "complete socket classification and replacement atomicity tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "config-file CPU-template success and rejection atomicity tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "all-member barrier, availability, every-position failure, cleanup, and retry tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed two-vCPU complete reviewed profile evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "complete accepted and terminal rejection policy tests"
+        }
+      ]
     },
     {
       "id": "api-property:CpuConfig.vcpu_features",
@@ -1365,11 +1502,45 @@
     {
       "id": "api-property:FullVmConfiguration.cpu-config",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.cpu-config.",
+      "summary": "Apply the Firecracker-shaped arm64 CpuConfig section from bounded startup configuration in machine-then-custom order, preserving static/custom replacement atomicity and preventing startup after any rejected register family.",
       "source_refs": [
         "api-property:FullVmConfiguration.cpu-config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "CpuConfig request model shared by API and startup configuration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "config_file_actions and apply_startup_config_file CPU-config ordering"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "transactional custom CPU-template candidate validation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "complete config-file CPU-template profile, ordering, and rejection tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed startup application on two HVF vCPUs"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "candidate rejection leaves effective selection unchanged"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.drives",
@@ -2653,11 +2824,50 @@
     {
       "id": "api-schema:ArmRegisterModifier",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema ArmRegisterModifier.",
+      "summary": "Implement the strict two-field aarch64 modifier schema with exact 64-bit identity parsing, width-derived masks through 128 bits, duplicate rejection, value redaction, a finite executable profile, and exhaustive terminal policy outside it.",
       "source_refs": [
         "api-schema:ArmRegisterModifier"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "CpuConfigArmRegisterModifierBody strict schema and conversion"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "closed typed ARM modifier execution"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "CpuConfigArmRegisterModifier and finite ARM profile"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "ARM modifier schema, exact width, duplicate, and malformed input tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "ARM modifier socket semantics and value-redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "typed modifier mapping and transaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "complete ARM profile and classification tests"
+        }
+      ]
     },
     {
       "id": "api-schema:Balloon",
@@ -2725,11 +2935,65 @@
     {
       "id": "api-schema:CpuConfig",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema CpuConfig.",
+      "summary": "Implement the complete Firecracker-shaped arm64 CPU configuration schema: bounded KVM capabilities, register modifiers, and vCPU features; exact reviewed modifier execution; transactional replacement; and stable platform or safety outcomes for every non-executable category.",
       "source_refs": [
         "api-schema:CpuConfig"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "CpuConfigRequestBody strict bounded arm64 schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PutCpuConfig dispatch and effective configuration behavior"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "prepared profile availability and all-vCPU execution"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "CpuConfigInput validation and closed executable template"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete CPU-config parsing, bounds, and malformed input tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "socket success, terminal category, replacement, state, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup configuration CPU-template tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "optional availability and exhaustive transaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed two-vCPU complete reviewed profile evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "complete accepted and rejected arm64 CPU configuration tests"
+        }
+      ]
     },
     {
       "id": "api-schema:CpuTemplate",

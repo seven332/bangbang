@@ -4,8 +4,8 @@ use std::fmt;
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::cpu::{
-    ArmIdRegister, ArmRegister32, ArmRegister64, ArmRegister128, ArmRegisterModifier,
-    CustomCpuTemplate,
+    ArmIdRegister, ArmRegister32, ArmRegister64, ArmRegister128, ArmRegisterAvailability,
+    ArmRegisterModifier, CustomCpuTemplate,
 };
 
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
@@ -167,7 +167,18 @@ impl PreparedHvfArm64CpuTemplate {
     pub(crate) fn from_runtime(
         template: &CustomCpuTemplate,
     ) -> Result<Self, HvfArm64CpuTemplateError> {
+        Self::from_runtime_with_macos_15_2_availability(
+            template,
+            crate::ffi::macos_15_2_system_registers_available,
+        )
+    }
+
+    fn from_runtime_with_macos_15_2_availability(
+        template: &CustomCpuTemplate,
+        macos_15_2_available: impl FnOnce() -> bool,
+    ) -> Result<Self, HvfArm64CpuTemplateError> {
         let mut modifiers = Vec::with_capacity(template.modifiers().len());
+        let mut requires_macos_15_2 = false;
         for modifier in template.modifiers().iter().copied() {
             let modifier = match modifier {
                 ArmRegisterModifier::U32 {
@@ -186,11 +197,15 @@ impl PreparedHvfArm64CpuTemplate {
                     register,
                     filter,
                     value,
-                } => MappedModifier::U64 {
-                    register: map_u64_register(register)?,
-                    filter,
-                    value,
-                },
+                } => {
+                    requires_macos_15_2 |=
+                        register.availability() == ArmRegisterAvailability::MacOs15_2;
+                    MappedModifier::U64 {
+                        register: map_u64_register(register)?,
+                        filter,
+                        value,
+                    }
+                }
                 ArmRegisterModifier::U128 {
                     register: ArmRegister128::Q(register),
                     filter,
@@ -203,6 +218,9 @@ impl PreparedHvfArm64CpuTemplate {
                 },
             };
             modifiers.push(modifier);
+        }
+        if requires_macos_15_2 && !macos_15_2_available() {
+            return Err(HvfArm64CpuTemplateError::OptionalSystemRegisterUnavailable);
         }
         Ok(Self { modifiers })
     }
@@ -287,10 +305,18 @@ fn map_u64_register(
         }
         ArmRegister64::Id(register) => HvfArm64CpuTemplateRegister64::System(match register {
             ArmIdRegister::Pfr0 => HvfSystemRegister::ID_AA64PFR0_EL1,
+            ArmIdRegister::Pfr1 => HvfSystemRegister::ID_AA64PFR1_EL1,
+            ArmIdRegister::Zfr0 => HvfSystemRegister::ID_AA64ZFR0_EL1,
+            ArmIdRegister::Smfr0 => HvfSystemRegister::ID_AA64SMFR0_EL1,
+            ArmIdRegister::Dfr0 => HvfSystemRegister::ID_AA64DFR0_EL1,
+            ArmIdRegister::Dfr1 => HvfSystemRegister::ID_AA64DFR1_EL1,
             ArmIdRegister::Isar0 => HvfSystemRegister::ID_AA64ISAR0_EL1,
             ArmIdRegister::Isar1 => HvfSystemRegister::ID_AA64ISAR1_EL1,
+            ArmIdRegister::Mmfr0 => HvfSystemRegister::ID_AA64MMFR0_EL1,
+            ArmIdRegister::Mmfr1 => HvfSystemRegister::ID_AA64MMFR1_EL1,
             ArmIdRegister::Mmfr2 => HvfSystemRegister::ID_AA64MMFR2_EL1,
         }),
+        ArmRegister64::Actlr => HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ACTLR_EL1),
     })
 }
 
@@ -395,6 +421,7 @@ impl std::error::Error for HvfArm64CpuTemplateVcpuError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfArm64CpuTemplateError {
     InvalidRuntimeRegister,
+    OptionalSystemRegisterUnavailable,
     InvalidTopology {
         member_count: usize,
         mpidr_count: usize,
@@ -437,6 +464,9 @@ impl fmt::Display for HvfArm64CpuTemplateError {
         match self {
             Self::InvalidRuntimeRegister => f.write_str(
                 "arm64 CPU-template runtime register was outside its validated finite profile",
+            ),
+            Self::OptionalSystemRegisterUnavailable => f.write_str(
+                "arm64 CPU-template optional system registers require macOS 15.2 or newer",
             ),
             Self::InvalidTopology {
                 member_count,
@@ -500,6 +530,7 @@ impl std::error::Error for HvfArm64CpuTemplateError {
         match self {
             Self::BaselineRead { source, .. } | Self::Apply { source, .. } => Some(source.as_ref()),
             Self::InvalidRuntimeRegister
+            | Self::OptionalSystemRegisterUnavailable
             | Self::InvalidTopology { .. }
             | Self::BaselineLength { .. }
             | Self::BaselineMismatch { .. }
@@ -1091,7 +1122,7 @@ mod supplementary_tests {
         }
     }
 
-    fn targets() -> [HvfArm64CpuTemplateTarget; 3] {
+    fn targets() -> [HvfArm64CpuTemplateTarget; 12] {
         [
             HvfArm64CpuTemplateTarget::new(
                 HvfArm64CpuTemplateRegister::from_system_register(
@@ -1101,15 +1132,67 @@ mod supplementary_tests {
             ),
             HvfArm64CpuTemplateTarget::new(
                 HvfArm64CpuTemplateRegister::from_system_register(
-                    HvfSystemRegister::ID_AA64ISAR1_EL1,
+                    HvfSystemRegister::ID_AA64PFR1_EL1,
                 ),
                 0x22,
             ),
             HvfArm64CpuTemplateTarget::new(
                 HvfArm64CpuTemplateRegister::from_system_register(
-                    HvfSystemRegister::ID_AA64MMFR2_EL1,
+                    HvfSystemRegister::ID_AA64DFR0_EL1,
                 ),
                 0x33,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64DFR1_EL1,
+                ),
+                0x44,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64ISAR0_EL1,
+                ),
+                0x55,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64ISAR1_EL1,
+                ),
+                0x66,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64MMFR0_EL1,
+                ),
+                0x77,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64MMFR1_EL1,
+                ),
+                0x88,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64MMFR2_EL1,
+                ),
+                0x99,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64ZFR0_EL1,
+                ),
+                0xaa,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64SMFR0_EL1,
+                ),
+                0xbb,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(HvfSystemRegister::ACTLR_EL1),
+                0x2,
             ),
         ]
     }
@@ -1527,20 +1610,73 @@ mod supplementary_tests {
             );
         }
     }
+
+    #[test]
+    fn every_final_system_profile_baseline_position_fails_before_retry() {
+        let registers: Vec<_> = targets()
+            .into_iter()
+            .map(HvfArm64CpuTemplateTarget::register)
+            .collect();
+        let system: Vec<_> = registers
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, register)| {
+                let HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::System(
+                    register,
+                )) = register
+                else {
+                    panic!("final system profile should contain only U64 system registers")
+                };
+                (register, index as u64 + 1)
+            })
+            .collect();
+        let expected: Vec<_> = system
+            .iter()
+            .map(|(_, value)| HvfArm64CpuTemplateValue::U64(*value))
+            .collect();
+
+        for failed_index in 0..registers.len() {
+            let mut access = TypedAccess {
+                system: system.clone(),
+                fail_read: Some(failed_index),
+                ..TypedAccess::default()
+            };
+            assert!(matches!(
+                read_cpu_template_baseline_with(&registers, &mut access),
+                Err(HvfArm64CpuTemplateVcpuError::BaselineRead {
+                    completed_reads,
+                    ..
+                }) if completed_reads == failed_index
+            ));
+
+            access.fail_read = None;
+            access.read_calls = 0;
+            access.events.clear();
+            assert_eq!(
+                read_cpu_template_baseline_with(&registers, &mut access),
+                Ok(expected.clone())
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use bangbang_runtime::cpu::{
         CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigInput,
-        KVM_REG_ARM64_CORE_ELR_EL1, KVM_REG_ARM64_CORE_FPCR, KVM_REG_ARM64_CORE_FPSR,
-        KVM_REG_ARM64_CORE_PC, KVM_REG_ARM64_CORE_PSTATE, KVM_REG_ARM64_CORE_SP_EL0,
-        KVM_REG_ARM64_CORE_SP_EL1, KVM_REG_ARM64_CORE_SPSR_EL1, KVM_REG_ARM64_ID_AA64ISAR0_EL1,
-        KVM_REG_ARM64_ID_AA64ISAR1_EL1, KVM_REG_ARM64_ID_AA64MMFR2_EL1,
-        KVM_REG_ARM64_ID_AA64PFR0_EL1, kvm_reg_arm64_core_q, kvm_reg_arm64_core_x,
+        KVM_REG_ARM64_ACTLR_EL1, KVM_REG_ARM64_CORE_ELR_EL1, KVM_REG_ARM64_CORE_FPCR,
+        KVM_REG_ARM64_CORE_FPSR, KVM_REG_ARM64_CORE_PC, KVM_REG_ARM64_CORE_PSTATE,
+        KVM_REG_ARM64_CORE_SP_EL0, KVM_REG_ARM64_CORE_SP_EL1, KVM_REG_ARM64_CORE_SPSR_EL1,
+        KVM_REG_ARM64_ID_AA64DFR0_EL1, KVM_REG_ARM64_ID_AA64DFR1_EL1,
+        KVM_REG_ARM64_ID_AA64ISAR0_EL1, KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+        KVM_REG_ARM64_ID_AA64MMFR0_EL1, KVM_REG_ARM64_ID_AA64MMFR1_EL1,
+        KVM_REG_ARM64_ID_AA64MMFR2_EL1, KVM_REG_ARM64_ID_AA64PFR0_EL1,
+        KVM_REG_ARM64_ID_AA64PFR1_EL1, KVM_REG_ARM64_ID_AA64SMFR0_EL1,
+        KVM_REG_ARM64_ID_AA64ZFR0_EL1, kvm_reg_arm64_core_q, kvm_reg_arm64_core_x,
     };
 
     use super::*;
@@ -1627,12 +1763,22 @@ mod tests {
     }
 
     fn prepare(modifiers: Vec<CpuConfigArmRegisterModifier>) -> PreparedHvfArm64CpuTemplate {
+        prepare_with_macos_15_2_availability(modifiers, true)
+            .expect("validated test CPU template should map to HVF")
+    }
+
+    fn prepare_with_macos_15_2_availability(
+        modifiers: Vec<CpuConfigArmRegisterModifier>,
+        macos_15_2_available: bool,
+    ) -> Result<PreparedHvfArm64CpuTemplate, HvfArm64CpuTemplateError> {
         let template = CpuConfigInput::new(Vec::new(), modifiers, Vec::new())
             .into_custom_template()
             .expect("test template should validate")
             .expect("test template should be nonempty");
-        PreparedHvfArm64CpuTemplate::from_runtime(&template)
-            .expect("validated test CPU template should map to HVF")
+        PreparedHvfArm64CpuTemplate::from_runtime_with_macos_15_2_availability(
+            &template,
+            move || macos_15_2_available,
+        )
     }
 
     fn canonical_template() -> PreparedHvfArm64CpuTemplate {
@@ -1745,6 +1891,142 @@ mod tests {
         }
     }
 
+    #[test]
+    fn maps_the_complete_runtime_system_profile_to_exact_hvf_registers() {
+        for (id, register) in [
+            (
+                KVM_REG_ARM64_ID_AA64PFR0_EL1,
+                HvfSystemRegister::ID_AA64PFR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64PFR1_EL1,
+                HvfSystemRegister::ID_AA64PFR1_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64DFR0_EL1,
+                HvfSystemRegister::ID_AA64DFR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64DFR1_EL1,
+                HvfSystemRegister::ID_AA64DFR1_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64ISAR0_EL1,
+                HvfSystemRegister::ID_AA64ISAR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+                HvfSystemRegister::ID_AA64ISAR1_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64MMFR0_EL1,
+                HvfSystemRegister::ID_AA64MMFR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64MMFR1_EL1,
+                HvfSystemRegister::ID_AA64MMFR1_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64MMFR2_EL1,
+                HvfSystemRegister::ID_AA64MMFR2_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64ZFR0_EL1,
+                HvfSystemRegister::ID_AA64ZFR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64SMFR0_EL1,
+                HvfSystemRegister::ID_AA64SMFR0_EL1,
+            ),
+            (KVM_REG_ARM64_ACTLR_EL1, HvfSystemRegister::ACTLR_EL1),
+        ] {
+            assert_eq!(
+                prepare(vec![modifier(id, 0, 0)]).modifiers,
+                [MappedModifier::U64 {
+                    register: HvfArm64CpuTemplateRegister64::System(register),
+                    filter: 0,
+                    value: 0,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn optional_system_register_availability_fails_during_preparation() {
+        for id in [
+            KVM_REG_ARM64_ID_AA64ZFR0_EL1,
+            KVM_REG_ARM64_ID_AA64SMFR0_EL1,
+        ] {
+            let error = prepare_with_macos_15_2_availability(vec![modifier(id, 0, 0)], false)
+                .expect_err("optional system register must honor the public OS boundary");
+            assert_eq!(
+                error,
+                HvfArm64CpuTemplateError::OptionalSystemRegisterUnavailable
+            );
+            let display = error.to_string();
+            assert!(display.contains("macOS 15.2"));
+            for secret in ["c024", "c025", "filter", "value", "baseline"] {
+                assert!(!display.contains(secret));
+            }
+            assert!(std::error::Error::source(&error).is_none());
+        }
+
+        for id in [KVM_REG_ARM64_ID_AA64PFR1_EL1, KVM_REG_ARM64_ACTLR_EL1] {
+            prepare_with_macos_15_2_availability(vec![modifier(id, 0, 0)], false)
+                .expect("baseline and macOS-15-tier registers must not use the 15.2 gate");
+        }
+
+        assert_eq!(
+            prepare_with_macos_15_2_availability(
+                vec![
+                    modifier(KVM_REG_ARM64_ID_AA64PFR0_EL1, 0, 0),
+                    modifier(KVM_REG_ARM64_ID_AA64ZFR0_EL1, 0, 0),
+                ],
+                false,
+            )
+            .expect_err("mixed template must fail during static availability preflight"),
+            HvfArm64CpuTemplateError::OptionalSystemRegisterUnavailable
+        );
+
+        let ordinary = CpuConfigInput::new(
+            Vec::new(),
+            vec![
+                modifier(KVM_REG_ARM64_ID_AA64PFR1_EL1, 0, 0),
+                modifier(KVM_REG_ARM64_ACTLR_EL1, 0, 0),
+            ],
+            Vec::new(),
+        )
+        .into_custom_template()
+        .expect("ordinary template should validate")
+        .expect("ordinary template should be nonempty");
+        let calls = Cell::new(0);
+        PreparedHvfArm64CpuTemplate::from_runtime_with_macos_15_2_availability(&ordinary, || {
+            calls.set(calls.get() + 1);
+            false
+        })
+        .expect("ordinary targets must not acquire a macOS 15.2 dependency");
+        assert_eq!(calls.get(), 0);
+
+        let optional = CpuConfigInput::new(
+            Vec::new(),
+            vec![
+                modifier(KVM_REG_ARM64_ID_AA64ZFR0_EL1, 0, 0),
+                modifier(KVM_REG_ARM64_ID_AA64SMFR0_EL1, 0, 0),
+            ],
+            Vec::new(),
+        )
+        .into_custom_template()
+        .expect("optional template should validate")
+        .expect("optional template should be nonempty");
+        let calls = Cell::new(0);
+        PreparedHvfArm64CpuTemplate::from_runtime_with_macos_15_2_availability(&optional, || {
+            calls.set(calls.get() + 1);
+            true
+        })
+        .expect("available optional targets should prepare");
+        assert_eq!(calls.get(), 1);
+    }
+
     fn system_register(register: HvfSystemRegister) -> HvfArm64CpuTemplateRegister {
         HvfArm64CpuTemplateRegister::from_system_register(register)
     }
@@ -1822,6 +2104,105 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn final_system_profile_reads_both_members_before_any_target() {
+        let entries = [
+            (
+                KVM_REG_ARM64_ID_AA64PFR0_EL1,
+                HvfSystemRegister::ID_AA64PFR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64PFR1_EL1,
+                HvfSystemRegister::ID_AA64PFR1_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64DFR0_EL1,
+                HvfSystemRegister::ID_AA64DFR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64DFR1_EL1,
+                HvfSystemRegister::ID_AA64DFR1_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64ISAR0_EL1,
+                HvfSystemRegister::ID_AA64ISAR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+                HvfSystemRegister::ID_AA64ISAR1_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64MMFR0_EL1,
+                HvfSystemRegister::ID_AA64MMFR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64MMFR1_EL1,
+                HvfSystemRegister::ID_AA64MMFR1_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64MMFR2_EL1,
+                HvfSystemRegister::ID_AA64MMFR2_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64ZFR0_EL1,
+                HvfSystemRegister::ID_AA64ZFR0_EL1,
+            ),
+            (
+                KVM_REG_ARM64_ID_AA64SMFR0_EL1,
+                HvfSystemRegister::ID_AA64SMFR0_EL1,
+            ),
+            (KVM_REG_ARM64_ACTLR_EL1, HvfSystemRegister::ACTLR_EL1),
+        ];
+        let template = prepare(entries.iter().map(|(id, _)| modifier(*id, 0, 0)).collect());
+        let baseline: Vec<_> = (1..=entries.len() as u64)
+            .map(HvfArm64CpuTemplateValue::U64)
+            .collect();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let members = [0, 1].map(|index| FakeMember {
+            index,
+            baseline: baseline.clone(),
+            fail_read: false,
+            fail_apply: false,
+            events: Rc::clone(&events),
+        });
+
+        apply_custom_cpu_template_with(&members, &[0, 1], &template)
+            .expect("matching final-profile baselines should apply");
+
+        let expected_registers: Vec<_> = entries
+            .iter()
+            .map(|(_, register)| system_register(*register))
+            .collect();
+        let recorded = events.borrow();
+        assert_eq!(recorded.len(), 4);
+        for (position, member) in [0, 1].into_iter().enumerate() {
+            assert_eq!(
+                recorded[position],
+                Event::Read {
+                    member,
+                    registers: expected_registers.clone(),
+                }
+            );
+        }
+        for (position, member) in [0, 1].into_iter().enumerate() {
+            let Event::Apply {
+                member: actual_member,
+                targets,
+            } = &recorded[position + 2]
+            else {
+                panic!("all member reads must precede final-profile targets")
+            };
+            assert_eq!(*actual_member, member);
+            assert_eq!(targets.len(), entries.len());
+            for ((_, register), (target, baseline)) in
+                entries.iter().zip(targets.iter().zip(&baseline))
+            {
+                assert_eq!(target.register(), system_register(*register));
+                assert_eq!(target.value(), *baseline);
+            }
+        }
     }
 
     #[test]

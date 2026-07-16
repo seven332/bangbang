@@ -7510,7 +7510,7 @@ mod tests {
 
     #[test]
     fn not_started_state_stores_supported_cpu_config_and_redacts_unsupported_inputs() {
-        let supported_body = r#"{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"},{"addr":"0x6030000000100008","bitmap":"0b1"},{"addr":"0x60400000001000d0","bitmap":"0b1"},{"addr":"0x60200000001000d5","bitmap":"0b1"}]}"#;
+        let supported_body = r#"{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"},{"addr":"0x603000000013c021","bitmap":"0bx"},{"addr":"0x603000000013c028","bitmap":"0bx"},{"addr":"0x603000000013c029","bitmap":"0bx"},{"addr":"0x603000000013c030","bitmap":"0bx"},{"addr":"0x603000000013c031","bitmap":"0bx"},{"addr":"0x603000000013c038","bitmap":"0bx"},{"addr":"0x603000000013c039","bitmap":"0bx"},{"addr":"0x603000000013c03a","bitmap":"0bx"},{"addr":"0x603000000013c024","bitmap":"0bx"},{"addr":"0x603000000013c025","bitmap":"0bx"},{"addr":"0x603000000013c081","bitmap":"0b1x"},{"addr":"0x6030000000100008","bitmap":"0b1"},{"addr":"0x60400000001000d0","bitmap":"0b1"},{"addr":"0x60200000001000d5","bitmap":"0b1"}]}"#;
         let mut supported = test_controller();
         let response = request_over_socket(
             &mut supported,
@@ -7561,6 +7561,17 @@ mod tests {
         );
         for raw_value in [
             "0x603000000013c020",
+            "0x603000000013c021",
+            "0x603000000013c028",
+            "0x603000000013c029",
+            "0x603000000013c030",
+            "0x603000000013c031",
+            "0x603000000013c038",
+            "0x603000000013c039",
+            "0x603000000013c03a",
+            "0x603000000013c024",
+            "0x603000000013c025",
+            "0x603000000013c081",
             "0x6030000000100008",
             "0x60400000001000d0",
             "0x60200000001000d5",
@@ -7604,7 +7615,7 @@ mod tests {
         assert!(!supported.has_custom_cpu_template());
         assert_eq!(supported.machine_config().cpu_template(), None);
 
-        for (socket_name, body, expected_fault, raw_values) in [
+        for (case_index, (socket_name, body, expected_fault, raw_values)) in [
             (
                 "cck",
                 r#"{"kvm_capabilities":["4294967295"]}"#,
@@ -7612,10 +7623,106 @@ mod tests {
                 &["4294967295"][..],
             ),
             (
-                "ccr",
-                r#"{"reg_modifiers":[{"addr":"0x603000000013c021","bitmap":"0b10100101"}]}"#,
-                r#"{"fault_message":"cpu-config reg_modifiers contains a register outside the supported arm64 HVF CPU-template profile"}"#,
-                &["0x603000000013c021", "0b10100101"][..],
+                "ccr-topology",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c000","bitmap":"0b10100101"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains host identity or per-vCPU topology state"}"#,
+                &["0x603000000013c000", "0b10100101"][..],
+            ),
+            (
+                "ccr-alias",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c208","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains an alias of an existing typed arm64 register target"}"#,
+                &["0x603000000013c208"][..],
+            ),
+            (
+                "ccr-lifecycle",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c080","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains arm64 boot or lifecycle-dependent system state"}"#,
+                &["0x603000000013c080"][..],
+            ),
+            (
+                "ccr-security",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c108","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains security-sensitive arm64 system state"}"#,
+                &["0x603000000013c108"][..],
+            ),
+            (
+                "ccr-time",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013df01","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains time-dependent arm64 system state"}"#,
+                &["0x603000000013df01"][..],
+            ),
+            (
+                "ccr-owned",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c230","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains arm64 state owned by a separate device or lifecycle interface"}"#,
+                &["0x603000000013c230"][..],
+            ),
+            (
+                "ccr-sme",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c094","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains mutable SME state outside the static CPU-template profile"}"#,
+                &["0x603000000013c094"][..],
+            ),
+            (
+                "ccr-el2",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013e080","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains EL2 state while the VM feature is disabled"}"#,
+                &["0x603000000013e080"][..],
+            ),
+            (
+                "ccr-unnamed",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c0ff","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains an arm64 system encoding outside the finite public HVF profile"}"#,
+                &["0x603000000013c0ff"][..],
+            ),
+            (
+                "ccr-actlr",
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c081","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains ACTLR bits outside the public EnTSO boundary"}"#,
+                &["0x603000000013c081"][..],
+            ),
+            (
+                "ccr-demux",
+                r#"{"reg_modifiers":[{"addr":"0x6020000000110000","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains KVM demultiplexed cache state without a public HVF CPU-template equivalent"}"#,
+                &["0x6020000000110000"][..],
+            ),
+            (
+                "ccr-firmware",
+                r#"{"reg_modifiers":[{"addr":"0x6030000000140000","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains KVM firmware pseudo-register state without a public HVF equivalent"}"#,
+                &["0x6030000000140000"][..],
+            ),
+            (
+                "ccr-firmware-feature",
+                r#"{"reg_modifiers":[{"addr":"0x6030000000160000","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains KVM firmware-feature state without a public HVF equivalent"}"#,
+                &["0x6030000000160000"][..],
+            ),
+            (
+                "ccr-sve",
+                r#"{"reg_modifiers":[{"addr":"0x6030000000150000","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains KVM SVE state owned by a separate arm64 HVF interface"}"#,
+                &["0x6030000000150000"][..],
+            ),
+            (
+                "ccr-class",
+                r#"{"reg_modifiers":[{"addr":"0x6030000000120000","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains an unknown arm64 KVM register class"}"#,
+                &["0x6030000000120000"][..],
+            ),
+            (
+                "ccr-noncanonical",
+                r#"{"reg_modifiers":[{"addr":"0x603000010013c020","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains a noncanonical arm64 register identity"}"#,
+                &["0x603000010013c020"][..],
+            ),
+            (
+                "ccr-width",
+                r#"{"reg_modifiers":[{"addr":"0x602000000013c021","bitmap":"0b1"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains an invalid register-width encoding"}"#,
+                &["0x602000000013c021"][..],
             ),
             (
                 "ccf",
@@ -7629,11 +7736,25 @@ mod tests {
                 r#"{"fault_message":"mixed cpu-config categories include KVM-specific or unsupported inputs on arm64 HVF"}"#,
                 &["4294967295", "0b11010011"][..],
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut vmm = test_controller();
+            let seed = request_over_socket(
+                &mut vmm,
+                &format!("ccs{case_index}"),
+                &request_with_body("PUT", "/cpu-config", supported_body),
+            );
+            assert!(
+                seed.starts_with("HTTP/1.1 204 No Content\r\n"),
+                "{socket_name}: {seed}"
+            );
+            assert!(vmm.has_custom_cpu_template());
             let request = request_with_body("PUT", "/cpu-config", body);
 
-            let response = request_over_socket(&mut vmm, socket_name, &request);
+            let response =
+                request_over_socket(&mut vmm, &format!("ccr{case_index}"), &request);
 
             assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
             assert!(
@@ -7647,10 +7768,15 @@ mod tests {
                 vmm.instance_info().state,
                 bangbang_runtime::InstanceState::NotStarted
             );
+            assert!(
+                vmm.has_custom_cpu_template(),
+                "{socket_name}: rejection must preserve the prior custom template"
+            );
+            assert_eq!(vmm.machine_config().cpu_template(), None);
 
             let vm_config = request_over_socket(
                 &mut vmm,
-                &format!("{socket_name}v"),
+                &format!("ccv{case_index}"),
                 "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
             );
             assert!(vm_config.starts_with("HTTP/1.1 200 OK\r\n"));
