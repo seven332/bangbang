@@ -10,8 +10,9 @@ use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
 
 use crate::backend::HvfBackend;
 use crate::cpu_template::{
-    HvfArm64CpuTemplateRegister, HvfArm64CpuTemplateTarget, HvfArm64CpuTemplateVcpuError,
-    apply_cpu_template_targets_with, read_cpu_template_baseline_with,
+    HvfArm64CpuTemplateAccess, HvfArm64CpuTemplateRegister, HvfArm64CpuTemplateTarget,
+    HvfArm64CpuTemplateValue, HvfArm64CpuTemplateVcpuError, apply_cpu_template_targets_with,
+    read_cpu_template_baseline_with,
 };
 use crate::exit::{
     HvfHvcExit, HvfResolvedMmioAccess, HvfSys64Direction, HvfSys64Exit, HvfSys64Register,
@@ -1153,7 +1154,7 @@ enum RunnerCommand {
     ReadArm64CpuTemplateBaseline {
         admission: InFlightCoreRegisterOperation,
         registers: Vec<HvfArm64CpuTemplateRegister>,
-        response_sender: mpsc::Sender<Result<Vec<u64>, HvfVcpuRunnerError>>,
+        response_sender: mpsc::Sender<Result<Vec<HvfArm64CpuTemplateValue>, HvfVcpuRunnerError>>,
     },
     ApplyArm64CpuTemplateTargets {
         admission: InFlightCoreRegisterOperation,
@@ -2424,6 +2425,47 @@ trait RunnerVcpu {
     fn destroy(&mut self) -> Result<(), BackendError>;
 }
 
+impl<T: RunnerVcpu + ?Sized> HvfArm64CpuTemplateAccess for T {
+    fn read_general_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+        self.read_register(register)
+    }
+
+    fn write_general_register(
+        &mut self,
+        register: HvfRegister,
+        value: u64,
+    ) -> Result<(), BackendError> {
+        self.write_register(register, value)
+    }
+
+    fn read_simd_fp_register(
+        &mut self,
+        register: HvfSimdFpRegister,
+    ) -> Result<[u8; 16], BackendError> {
+        RunnerVcpu::read_simd_fp_register(self, register)
+    }
+
+    fn write_simd_fp_register(
+        &mut self,
+        register: HvfSimdFpRegister,
+        value: [u8; 16],
+    ) -> Result<(), BackendError> {
+        RunnerVcpu::write_simd_fp_register(self, register, value)
+    }
+
+    fn read_system_register(&mut self, register: HvfSystemRegister) -> Result<u64, BackendError> {
+        RunnerVcpu::read_system_register(self, register)
+    }
+
+    fn write_system_register(
+        &mut self,
+        register: HvfSystemRegister,
+        value: u64,
+    ) -> Result<(), BackendError> {
+        RunnerVcpu::write_system_register(self, register, value)
+    }
+}
+
 fn capture_stage<T>(
     stage: HvfArm64SnapshotV1CaptureStage,
     result: Result<T, HvfVcpuRunnerError>,
@@ -3101,7 +3143,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
     pub(crate) fn read_arm64_cpu_template_baseline(
         &self,
         registers: &[HvfArm64CpuTemplateRegister],
-    ) -> Result<Vec<u64>, HvfVcpuRunnerError> {
+    ) -> Result<Vec<HvfArm64CpuTemplateValue>, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         self.start_arm64_cpu_template_baseline_read(registers.to_vec(), response_sender)?;
 
@@ -4965,7 +5007,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
     fn start_arm64_cpu_template_baseline_read(
         &self,
         registers: Vec<HvfArm64CpuTemplateRegister>,
-        response_sender: mpsc::Sender<Result<Vec<u64>, HvfVcpuRunnerError>>,
+        response_sender: mpsc::Sender<Result<Vec<HvfArm64CpuTemplateValue>, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
         self.start_cpu_template_operation(
             |admission, response_sender| RunnerCommand::ReadArm64CpuTemplateBaseline {
@@ -6943,10 +6985,8 @@ fn run_runner_thread<C, V>(
                 registers,
                 response_sender,
             } => {
-                let result = read_cpu_template_baseline_with(&registers, |register| {
-                    vcpu.read_system_register(register)
-                })
-                .map_err(HvfVcpuRunnerError::CpuTemplate);
+                let result = read_cpu_template_baseline_with(&registers, &mut vcpu)
+                    .map_err(HvfVcpuRunnerError::CpuTemplate);
                 admission.release();
                 let _ = response_sender.send(result);
             }
@@ -6955,13 +6995,8 @@ fn run_runner_thread<C, V>(
                 targets,
                 response_sender,
             } => {
-                let result = apply_cpu_template_targets_with(
-                    &targets,
-                    &mut vcpu,
-                    |vcpu, register, value| vcpu.write_system_register(register, value),
-                    |vcpu, register| vcpu.read_system_register(register),
-                )
-                .map_err(HvfVcpuRunnerError::CpuTemplate);
+                let result = apply_cpu_template_targets_with(&targets, &mut vcpu)
+                    .map_err(HvfVcpuRunnerError::CpuTemplate);
                 admission.release();
                 let _ = response_sender.send(result);
             }
@@ -8252,6 +8287,10 @@ pub(crate) mod tests {
         HvfVcpuMpidrAffinityStage, HvfVcpuPsciCallToken, HvfVcpuRunCompletion,
         HvfVcpuRunStepOutcome, HvfVcpuRunToken, HvfVcpuRunner, HvfVcpuRunnerError, RunnerVcpu,
         cancel_vcpu_run_batch_with, spawn_runner_thread,
+    };
+    use crate::cpu_template::{
+        HvfArm64CpuTemplateRegister, HvfArm64CpuTemplateRegister64, HvfArm64CpuTemplateTarget,
+        HvfArm64CpuTemplateValue,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -36120,21 +36159,88 @@ pub(crate) mod tests {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CpuTemplateRunnerRegister {
+        General(HvfRegister),
+        SimdFp(HvfSimdFpRegister),
+        System(HvfSystemRegister),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum CpuTemplateRunnerEvent {
-        Read(HvfSystemRegister),
-        Write(HvfSystemRegister, u64),
+        Read(CpuTemplateRunnerRegister),
+        WriteScalar(CpuTemplateRunnerRegister, u64),
+        WriteSimdFp(HvfSimdFpRegister, [u8; 16]),
     }
 
     struct CpuTemplateRunnerTestVcpu {
         raw_vcpu: crate::ffi::HvVcpu,
-        values: Vec<(HvfSystemRegister, u64)>,
+        general_values: Vec<(HvfRegister, u64)>,
+        simd_fp_values: Vec<(HvfSimdFpRegister, [u8; 16])>,
+        system_values: Vec<(HvfSystemRegister, u64)>,
         events_sender: mpsc::Sender<CpuTemplateRunnerEvent>,
         fail_next_write: bool,
         mismatch_next_readback: bool,
-        last_write: Option<HvfSystemRegister>,
+        last_write: Option<CpuTemplateRunnerRegister>,
         block_next_read: bool,
         read_entered_sender: Option<mpsc::Sender<()>>,
         read_release_receiver: Option<mpsc::Receiver<()>>,
+    }
+
+    impl CpuTemplateRunnerTestVcpu {
+        fn begin_read(&mut self, register: CpuTemplateRunnerRegister) -> Result<(), BackendError> {
+            let _ = self
+                .events_sender
+                .send(CpuTemplateRunnerEvent::Read(register));
+            if self.block_next_read {
+                self.block_next_read = false;
+                if let Some(sender) = &self.read_entered_sender {
+                    let _ = sender.send(());
+                }
+                if let Some(receiver) = &self.read_release_receiver {
+                    receiver.recv().map_err(|_| {
+                        BackendError::InvalidState("test CPU-template read release closed")
+                    })?;
+                }
+            }
+            Ok(())
+        }
+
+        fn finish_scalar_read(&mut self, register: CpuTemplateRunnerRegister, value: u64) -> u64 {
+            if self.mismatch_next_readback && self.last_write == Some(register) {
+                self.mismatch_next_readback = false;
+                self.last_write = None;
+                value ^ 1
+            } else {
+                self.last_write = None;
+                value
+            }
+        }
+
+        fn finish_simd_fp_read(
+            &mut self,
+            register: HvfSimdFpRegister,
+            mut value: [u8; 16],
+        ) -> [u8; 16] {
+            if self.mismatch_next_readback
+                && self.last_write == Some(CpuTemplateRunnerRegister::SimdFp(register))
+            {
+                self.mismatch_next_readback = false;
+                value[0] ^= 1;
+            }
+            self.last_write = None;
+            value
+        }
+
+        fn begin_write(&mut self, event: CpuTemplateRunnerEvent) -> Result<(), BackendError> {
+            let _ = self.events_sender.send(event);
+            if self.fail_next_write {
+                self.fail_next_write = false;
+                return Err(BackendError::InvalidState(
+                    "injected CPU-template write failure",
+                ));
+            }
+            Ok(())
+        }
     }
 
     impl RunnerVcpu for CpuTemplateRunnerTestVcpu {
@@ -36161,39 +36267,85 @@ pub(crate) mod tests {
             unsupported_mmio_dispatch()
         }
 
-        fn read_system_register(
-            &mut self,
-            register: HvfSystemRegister,
-        ) -> Result<u64, BackendError> {
-            let _ = self
-                .events_sender
-                .send(CpuTemplateRunnerEvent::Read(register));
-            if self.block_next_read {
-                self.block_next_read = false;
-                if let Some(sender) = &self.read_entered_sender {
-                    let _ = sender.send(());
-                }
-                if let Some(receiver) = &self.read_release_receiver {
-                    receiver.recv().map_err(|_| {
-                        BackendError::InvalidState("test CPU-template read release closed")
-                    })?;
-                }
-            }
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            let typed_register = CpuTemplateRunnerRegister::General(register);
+            self.begin_read(typed_register)?;
             let value = self
-                .values
+                .general_values
                 .iter()
                 .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
                 .ok_or(BackendError::InvalidState(
                     "test CPU-template register is unset",
                 ))?;
-            if self.mismatch_next_readback && self.last_write == Some(register) {
-                self.mismatch_next_readback = false;
-                self.last_write = None;
-                Ok(value ^ 1)
-            } else {
-                self.last_write = None;
-                Ok(value)
-            }
+            Ok(self.finish_scalar_read(typed_register, value))
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            let typed_register = CpuTemplateRunnerRegister::General(register);
+            self.begin_write(CpuTemplateRunnerEvent::WriteScalar(typed_register, value))?;
+            let destination = self
+                .general_values
+                .iter_mut()
+                .find_map(|(candidate, current)| (*candidate == register).then_some(current))
+                .ok_or(BackendError::InvalidState(
+                    "test CPU-template register is unset",
+                ))?;
+            *destination = value;
+            self.last_write = Some(typed_register);
+            Ok(())
+        }
+
+        fn read_simd_fp_register(
+            &mut self,
+            register: HvfSimdFpRegister,
+        ) -> Result<[u8; 16], BackendError> {
+            self.begin_read(CpuTemplateRunnerRegister::SimdFp(register))?;
+            let value = self
+                .simd_fp_values
+                .iter()
+                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
+                .ok_or(BackendError::InvalidState(
+                    "test CPU-template register is unset",
+                ))?;
+            Ok(self.finish_simd_fp_read(register, value))
+        }
+
+        fn write_simd_fp_register(
+            &mut self,
+            register: HvfSimdFpRegister,
+            value: [u8; 16],
+        ) -> Result<(), BackendError> {
+            self.begin_write(CpuTemplateRunnerEvent::WriteSimdFp(register, value))?;
+            let destination = self
+                .simd_fp_values
+                .iter_mut()
+                .find_map(|(candidate, current)| (*candidate == register).then_some(current))
+                .ok_or(BackendError::InvalidState(
+                    "test CPU-template register is unset",
+                ))?;
+            *destination = value;
+            self.last_write = Some(CpuTemplateRunnerRegister::SimdFp(register));
+            Ok(())
+        }
+
+        fn read_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+        ) -> Result<u64, BackendError> {
+            let typed_register = CpuTemplateRunnerRegister::System(register);
+            self.begin_read(typed_register)?;
+            let value = self
+                .system_values
+                .iter()
+                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
+                .ok_or(BackendError::InvalidState(
+                    "test CPU-template register is unset",
+                ))?;
+            Ok(self.finish_scalar_read(typed_register, value))
         }
 
         fn write_system_register(
@@ -36201,24 +36353,17 @@ pub(crate) mod tests {
             register: HvfSystemRegister,
             value: u64,
         ) -> Result<(), BackendError> {
-            let _ = self
-                .events_sender
-                .send(CpuTemplateRunnerEvent::Write(register, value));
-            if self.fail_next_write {
-                self.fail_next_write = false;
-                return Err(BackendError::InvalidState(
-                    "injected CPU-template write failure",
-                ));
-            }
+            let typed_register = CpuTemplateRunnerRegister::System(register);
+            self.begin_write(CpuTemplateRunnerEvent::WriteScalar(typed_register, value))?;
             let destination = self
-                .values
+                .system_values
                 .iter_mut()
                 .find_map(|(candidate, current)| (*candidate == register).then_some(current))
                 .ok_or(BackendError::InvalidState(
                     "test CPU-template register is unset",
                 ))?;
             *destination = value;
-            self.last_write = Some(register);
+            self.last_write = Some(typed_register);
             Ok(())
         }
 
@@ -36227,7 +36372,10 @@ pub(crate) mod tests {
         }
     }
 
-    fn start_cpu_template_test_runner(vcpu: CpuTemplateRunnerTestVcpu) -> HvfVcpuRunner<'static> {
+    fn start_cpu_template_test_runner<V>(vcpu: V) -> HvfVcpuRunner<'static>
+    where
+        V: RunnerVcpu + Send + 'static,
+    {
         let started = spawn_runner_thread(move || Ok::<_, BackendError>(vcpu))
             .expect("CPU-template test runner should start");
         HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
@@ -36252,7 +36400,18 @@ pub(crate) mod tests {
     ) -> CpuTemplateRunnerTestVcpu {
         CpuTemplateRunnerTestVcpu {
             raw_vcpu: 71,
-            values: vec![
+            general_values: vec![
+                (HvfRegister::FPCR, 0x11),
+                (
+                    HvfRegister::general_purpose(4).expect("X4 should map"),
+                    0x4444,
+                ),
+            ],
+            simd_fp_values: vec![(
+                HvfSimdFpRegister::q(31).expect("Q31 should map"),
+                0xf0e1_d2c3_b4a5_9687_7869_5a4b_3c2d_1e0f_u128.to_le_bytes(),
+            )],
+            system_values: vec![
                 (HvfSystemRegister::ID_AA64PFR0_EL1, 0x1111),
                 (HvfSystemRegister::ID_AA64ISAR1_EL1, 0x2222),
             ],
@@ -36278,15 +36437,100 @@ pub(crate) mod tests {
 
         assert_eq!(
             runner.read_arm64_cpu_template_baseline(&registers),
-            Ok(vec![0x2222])
+            Ok(vec![HvfArm64CpuTemplateValue::U64(0x2222)])
         );
         assert_eq!(runner.apply_arm64_cpu_template_targets(&targets), Ok(()));
         assert_eq!(
             events_receiver.try_iter().collect::<Vec<_>>(),
             [
-                CpuTemplateRunnerEvent::Read(HvfSystemRegister::ID_AA64ISAR1_EL1),
-                CpuTemplateRunnerEvent::Write(HvfSystemRegister::ID_AA64ISAR1_EL1, 0x3333),
-                CpuTemplateRunnerEvent::Read(HvfSystemRegister::ID_AA64ISAR1_EL1),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::System(
+                    HvfSystemRegister::ID_AA64ISAR1_EL1,
+                )),
+                CpuTemplateRunnerEvent::WriteScalar(
+                    CpuTemplateRunnerRegister::System(HvfSystemRegister::ID_AA64ISAR1_EL1),
+                    0x3333,
+                ),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::System(
+                    HvfSystemRegister::ID_AA64ISAR1_EL1,
+                )),
+            ]
+        );
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn cpu_template_runner_dispatches_mixed_width_targets_in_order() {
+        let fpcr = HvfRegister::FPCR;
+        let x4 = HvfRegister::general_purpose(4).expect("X4 should be available");
+        let sp_el0 = HvfSystemRegister::SP_EL0;
+        let q31 = HvfSimdFpRegister::q(31).expect("Q31 should be available");
+        let q_baseline = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff_u128;
+        let q_target = 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100_u128;
+        let (events_sender, events_receiver) = mpsc::channel();
+        let mut vcpu = cpu_template_test_vcpu(events_sender);
+        vcpu.general_values = vec![(fpcr, 0x12), (x4, 0x1234_5678_9abc_def0)];
+        vcpu.simd_fp_values = vec![(q31, q_baseline.to_le_bytes())];
+        vcpu.system_values = vec![(sp_el0, 0xfedc_ba98_7654_3210)];
+        let runner = start_cpu_template_test_runner(vcpu);
+        let registers = [
+            HvfArm64CpuTemplateRegister::U32(fpcr),
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(x4)),
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::System(sp_el0)),
+            HvfArm64CpuTemplateRegister::U128(q31),
+        ];
+        let targets = [
+            HvfArm64CpuTemplateTarget::U32 {
+                register: fpcr,
+                value: u32::MAX,
+            },
+            HvfArm64CpuTemplateTarget::U64 {
+                register: HvfArm64CpuTemplateRegister64::General(x4),
+                value: u64::MAX,
+            },
+            HvfArm64CpuTemplateTarget::U64 {
+                register: HvfArm64CpuTemplateRegister64::System(sp_el0),
+                value: 0x0f0e_0d0c_0b0a_0908,
+            },
+            HvfArm64CpuTemplateTarget::U128 {
+                register: q31,
+                value: q_target,
+            },
+        ];
+
+        assert_eq!(
+            runner.read_arm64_cpu_template_baseline(&registers),
+            Ok(vec![
+                HvfArm64CpuTemplateValue::U32(0x12),
+                HvfArm64CpuTemplateValue::U64(0x1234_5678_9abc_def0),
+                HvfArm64CpuTemplateValue::U64(0xfedc_ba98_7654_3210),
+                HvfArm64CpuTemplateValue::U128(q_baseline),
+            ])
+        );
+        assert_eq!(runner.apply_arm64_cpu_template_targets(&targets), Ok(()));
+        assert_eq!(
+            events_receiver.try_iter().collect::<Vec<_>>(),
+            [
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::General(fpcr)),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::General(x4)),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::System(sp_el0)),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::SimdFp(q31)),
+                CpuTemplateRunnerEvent::WriteScalar(
+                    CpuTemplateRunnerRegister::General(fpcr),
+                    u64::from(u32::MAX),
+                ),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::General(fpcr)),
+                CpuTemplateRunnerEvent::WriteScalar(
+                    CpuTemplateRunnerRegister::General(x4),
+                    u64::MAX,
+                ),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::General(x4)),
+                CpuTemplateRunnerEvent::WriteScalar(
+                    CpuTemplateRunnerRegister::System(sp_el0),
+                    0x0f0e_0d0c_0b0a_0908,
+                ),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::System(sp_el0)),
+                CpuTemplateRunnerEvent::WriteSimdFp(q31, q_target.to_le_bytes()),
+                CpuTemplateRunnerEvent::Read(CpuTemplateRunnerRegister::SimdFp(q31)),
             ]
         );
         runner.shutdown().expect("runner should shut down");
@@ -36357,7 +36601,7 @@ pub(crate) mod tests {
                 .expect("blocked baseline read should release");
             assert_eq!(
                 read.join().expect("baseline caller should not panic"),
-                Ok(vec![0x1111])
+                Ok(vec![HvfArm64CpuTemplateValue::U64(0x1111)])
             );
         });
         assert_eq!(runner.apply_arm64_cpu_template_targets(&[target]), Ok(()));

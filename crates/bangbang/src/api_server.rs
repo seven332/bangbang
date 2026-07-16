@@ -7510,8 +7510,7 @@ mod tests {
 
     #[test]
     fn not_started_state_stores_supported_cpu_config_and_redacts_unsupported_inputs() {
-        let supported_body =
-            r#"{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"}]}"#;
+        let supported_body = r#"{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"},{"addr":"0x6030000000100008","bitmap":"0b1"},{"addr":"0x60400000001000d0","bitmap":"0b1"},{"addr":"0x60200000001000d5","bitmap":"0b1"}]}"#;
         let mut supported = test_controller();
         let response = request_over_socket(
             &mut supported,
@@ -7560,7 +7559,13 @@ mod tests {
             !vm_config.contains(r#""cpu_template""#),
             "custom template contents should serialize as no static selection"
         );
-        for raw_value in ["0x603000000013c020", "0b10100101"] {
+        for raw_value in [
+            "0x603000000013c020",
+            "0x6030000000100008",
+            "0x60400000001000d0",
+            "0x60200000001000d5",
+            "0b10100101",
+        ] {
             assert!(!response.contains(raw_value));
             assert!(!vm_config.contains(raw_value));
         }
@@ -7609,7 +7614,7 @@ mod tests {
             (
                 "ccr",
                 r#"{"reg_modifiers":[{"addr":"0x603000000013c021","bitmap":"0b10100101"}]}"#,
-                r#"{"fault_message":"cpu-config reg_modifiers contains a register outside the supported arm64 HVF identification-register profile"}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains a register outside the supported arm64 HVF CPU-template profile"}"#,
                 &["0x603000000013c021", "0b10100101"][..],
             ),
             (

@@ -3,24 +3,41 @@
 use std::fmt;
 
 use bangbang_runtime::BackendError;
-use bangbang_runtime::cpu::{ArmIdRegister, CustomCpuTemplate};
+use bangbang_runtime::cpu::{
+    ArmIdRegister, ArmRegister32, ArmRegister64, ArmRegister128, ArmRegisterModifier,
+    CustomCpuTemplate,
+};
 
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
-use crate::vcpu::HvfSystemRegister;
+use crate::vcpu::{HvfRegister, HvfSimdFpRegister, HvfSystemRegister};
 
 const CPU_TEMPLATE_VALUE_REDACTED: &str = "<redacted>";
+const CPU_TEMPLATE_U32_TRANSPORT_WIDTH_MESSAGE: &str =
+    "arm64 CPU-template U32 register returned bits outside its architectural width";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HvfArm64CpuTemplateRegister(HvfSystemRegister);
+pub(crate) enum HvfArm64CpuTemplateRegister64 {
+    General(HvfRegister),
+    System(HvfSystemRegister),
+}
+
+impl fmt::Debug for HvfArm64CpuTemplateRegister64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(CPU_TEMPLATE_VALUE_REDACTED)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HvfArm64CpuTemplateRegister {
+    U32(HvfRegister),
+    U64(HvfArm64CpuTemplateRegister64),
+    U128(HvfSimdFpRegister),
+}
 
 impl HvfArm64CpuTemplateRegister {
-    pub(crate) const fn system_register(self) -> HvfSystemRegister {
-        self.0
-    }
-
     #[cfg(test)]
     pub(crate) const fn from_system_register(register: HvfSystemRegister) -> Self {
-        Self(register)
+        Self::U64(HvfArm64CpuTemplateRegister64::System(register))
     }
 }
 
@@ -31,28 +48,113 @@ impl fmt::Debug for HvfArm64CpuTemplateRegister {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct MappedModifier {
-    register: HvfArm64CpuTemplateRegister,
-    filter: u64,
-    value: u64,
+pub(crate) enum HvfArm64CpuTemplateValue {
+    U32(u32),
+    U64(u64),
+    U128(u128),
+}
+
+impl fmt::Debug for HvfArm64CpuTemplateValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(CPU_TEMPLATE_VALUE_REDACTED)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MappedModifier {
+    U32 {
+        register: HvfRegister,
+        filter: u32,
+        value: u32,
+    },
+    U64 {
+        register: HvfArm64CpuTemplateRegister64,
+        filter: u64,
+        value: u64,
+    },
+    U128 {
+        register: HvfSimdFpRegister,
+        filter: u128,
+        value: u128,
+    },
 }
 
 impl MappedModifier {
-    const fn apply(self, baseline: u64) -> HvfArm64CpuTemplateTarget {
-        HvfArm64CpuTemplateTarget {
-            register: self.register,
-            value: (baseline & !self.filter) | self.value,
+    const fn register(self) -> HvfArm64CpuTemplateRegister {
+        match self {
+            Self::U32 { register, .. } => HvfArm64CpuTemplateRegister::U32(register),
+            Self::U64 { register, .. } => HvfArm64CpuTemplateRegister::U64(register),
+            Self::U128 { register, .. } => HvfArm64CpuTemplateRegister::U128(register),
         }
+    }
+
+    const fn apply(self, baseline: HvfArm64CpuTemplateValue) -> Option<HvfArm64CpuTemplateTarget> {
+        match (self, baseline) {
+            (
+                Self::U32 {
+                    register,
+                    filter,
+                    value,
+                },
+                HvfArm64CpuTemplateValue::U32(baseline),
+            ) => Some(HvfArm64CpuTemplateTarget::U32 {
+                register,
+                value: (baseline & !filter) | value,
+            }),
+            (
+                Self::U64 {
+                    register,
+                    filter,
+                    value,
+                },
+                HvfArm64CpuTemplateValue::U64(baseline),
+            ) => Some(HvfArm64CpuTemplateTarget::U64 {
+                register,
+                value: (baseline & !filter) | value,
+            }),
+            (
+                Self::U128 {
+                    register,
+                    filter,
+                    value,
+                },
+                HvfArm64CpuTemplateValue::U128(baseline),
+            ) => Some(HvfArm64CpuTemplateTarget::U128 {
+                register,
+                value: (baseline & !filter) | value,
+            }),
+            _ => None,
+        }
+    }
+
+    const fn accepts_baseline(self, baseline: HvfArm64CpuTemplateValue) -> bool {
+        matches!(
+            (self, baseline),
+            (Self::U32 { .. }, HvfArm64CpuTemplateValue::U32(_))
+                | (Self::U64 { .. }, HvfArm64CpuTemplateValue::U64(_))
+                | (Self::U128 { .. }, HvfArm64CpuTemplateValue::U128(_))
+        )
     }
 }
 
 impl fmt::Debug for MappedModifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MappedModifier")
+            .field("width", &self.register_width())
             .field("register", &CPU_TEMPLATE_VALUE_REDACTED)
             .field("filter", &CPU_TEMPLATE_VALUE_REDACTED)
             .field("value", &CPU_TEMPLATE_VALUE_REDACTED)
             .finish()
+    }
+}
+
+impl MappedModifier {
+    const fn register_width(self) -> &'static str {
+        match self {
+            Self::U32 { .. } => "U32",
+            Self::U64 { .. } => "U64",
+            Self::U128 { .. } => "U128",
+        }
     }
 }
 
@@ -62,23 +164,47 @@ pub(crate) struct PreparedHvfArm64CpuTemplate {
 }
 
 impl PreparedHvfArm64CpuTemplate {
-    pub(crate) fn from_runtime(template: &CustomCpuTemplate) -> Self {
-        let modifiers = template
-            .modifiers()
-            .iter()
-            .copied()
-            .map(|modifier| MappedModifier {
-                register: HvfArm64CpuTemplateRegister(match modifier.register() {
-                    ArmIdRegister::Pfr0 => HvfSystemRegister::ID_AA64PFR0_EL1,
-                    ArmIdRegister::Isar0 => HvfSystemRegister::ID_AA64ISAR0_EL1,
-                    ArmIdRegister::Isar1 => HvfSystemRegister::ID_AA64ISAR1_EL1,
-                    ArmIdRegister::Mmfr2 => HvfSystemRegister::ID_AA64MMFR2_EL1,
-                }),
-                filter: modifier.filter(),
-                value: modifier.value(),
-            })
-            .collect();
-        Self { modifiers }
+    pub(crate) fn from_runtime(
+        template: &CustomCpuTemplate,
+    ) -> Result<Self, HvfArm64CpuTemplateError> {
+        let mut modifiers = Vec::with_capacity(template.modifiers().len());
+        for modifier in template.modifiers().iter().copied() {
+            let modifier = match modifier {
+                ArmRegisterModifier::U32 {
+                    register,
+                    filter,
+                    value,
+                } => MappedModifier::U32 {
+                    register: match register {
+                        ArmRegister32::Fpcr => HvfRegister::FPCR,
+                        ArmRegister32::Fpsr => HvfRegister::FPSR,
+                    },
+                    filter,
+                    value,
+                },
+                ArmRegisterModifier::U64 {
+                    register,
+                    filter,
+                    value,
+                } => MappedModifier::U64 {
+                    register: map_u64_register(register)?,
+                    filter,
+                    value,
+                },
+                ArmRegisterModifier::U128 {
+                    register: ArmRegister128::Q(register),
+                    filter,
+                    value,
+                } => MappedModifier::U128 {
+                    register: HvfSimdFpRegister::q(register.index())
+                        .ok_or(HvfArm64CpuTemplateError::InvalidRuntimeRegister)?,
+                    filter,
+                    value,
+                },
+            };
+            modifiers.push(modifier);
+        }
+        Ok(Self { modifiers })
     }
 }
 
@@ -91,23 +217,46 @@ impl fmt::Debug for PreparedHvfArm64CpuTemplate {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HvfArm64CpuTemplateTarget {
-    register: HvfArm64CpuTemplateRegister,
-    value: u64,
+pub(crate) enum HvfArm64CpuTemplateTarget {
+    U32 {
+        register: HvfRegister,
+        value: u32,
+    },
+    U64 {
+        register: HvfArm64CpuTemplateRegister64,
+        value: u64,
+    },
+    U128 {
+        register: HvfSimdFpRegister,
+        value: u128,
+    },
 }
 
 impl HvfArm64CpuTemplateTarget {
     #[cfg(test)]
     pub(crate) const fn new(register: HvfArm64CpuTemplateRegister, value: u64) -> Self {
-        Self { register, value }
+        match register {
+            HvfArm64CpuTemplateRegister::U64(register) => Self::U64 { register, value },
+            HvfArm64CpuTemplateRegister::U32(_) | HvfArm64CpuTemplateRegister::U128(_) => {
+                panic!("U64 CPU-template target constructor received another width")
+            }
+        }
     }
 
     pub(crate) const fn register(self) -> HvfArm64CpuTemplateRegister {
-        self.register
+        match self {
+            Self::U32 { register, .. } => HvfArm64CpuTemplateRegister::U32(register),
+            Self::U64 { register, .. } => HvfArm64CpuTemplateRegister::U64(register),
+            Self::U128 { register, .. } => HvfArm64CpuTemplateRegister::U128(register),
+        }
     }
 
-    pub(crate) const fn value(self) -> u64 {
-        self.value
+    const fn value(self) -> HvfArm64CpuTemplateValue {
+        match self {
+            Self::U32 { value, .. } => HvfArm64CpuTemplateValue::U32(value),
+            Self::U64 { value, .. } => HvfArm64CpuTemplateValue::U64(value),
+            Self::U128 { value, .. } => HvfArm64CpuTemplateValue::U128(value),
+        }
     }
 }
 
@@ -118,6 +267,31 @@ impl fmt::Debug for HvfArm64CpuTemplateTarget {
             .field("value", &CPU_TEMPLATE_VALUE_REDACTED)
             .finish()
     }
+}
+
+fn map_u64_register(
+    register: ArmRegister64,
+) -> Result<HvfArm64CpuTemplateRegister64, HvfArm64CpuTemplateError> {
+    Ok(match register {
+        ArmRegister64::X(register) => HvfArm64CpuTemplateRegister64::General(
+            HvfRegister::general_purpose(register.index())
+                .ok_or(HvfArm64CpuTemplateError::InvalidRuntimeRegister)?,
+        ),
+        ArmRegister64::Pc => HvfArm64CpuTemplateRegister64::General(HvfRegister::PC),
+        ArmRegister64::Pstate => HvfArm64CpuTemplateRegister64::General(HvfRegister::CPSR),
+        ArmRegister64::SpEl0 => HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SP_EL0),
+        ArmRegister64::SpEl1 => HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SP_EL1),
+        ArmRegister64::ElrEl1 => HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ELR_EL1),
+        ArmRegister64::SpsrEl1 => {
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SPSR_EL1)
+        }
+        ArmRegister64::Id(register) => HvfArm64CpuTemplateRegister64::System(match register {
+            ArmIdRegister::Pfr0 => HvfSystemRegister::ID_AA64PFR0_EL1,
+            ArmIdRegister::Isar0 => HvfSystemRegister::ID_AA64ISAR0_EL1,
+            ArmIdRegister::Isar1 => HvfSystemRegister::ID_AA64ISAR1_EL1,
+            ArmIdRegister::Mmfr2 => HvfSystemRegister::ID_AA64MMFR2_EL1,
+        }),
+    })
 }
 
 /// Failure while one vCPU owner thread reads or applies a custom CPU template.
@@ -220,6 +394,7 @@ impl std::error::Error for HvfArm64CpuTemplateVcpuError {
 /// Failure while coordinating one custom CPU template across an HVF topology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfArm64CpuTemplateError {
+    InvalidRuntimeRegister,
     InvalidTopology {
         member_count: usize,
         mpidr_count: usize,
@@ -243,6 +418,12 @@ pub enum HvfArm64CpuTemplateError {
         completed_members: usize,
         completed_modifiers: usize,
     },
+    BaselineWidth {
+        member_index: usize,
+        mpidr: u64,
+        completed_members: usize,
+        completed_modifiers: usize,
+    },
     Apply {
         member_index: usize,
         mpidr: u64,
@@ -254,6 +435,9 @@ pub enum HvfArm64CpuTemplateError {
 impl fmt::Display for HvfArm64CpuTemplateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidRuntimeRegister => f.write_str(
+                "arm64 CPU-template runtime register was outside its validated finite profile",
+            ),
             Self::InvalidTopology {
                 member_count,
                 mpidr_count,
@@ -289,6 +473,15 @@ impl fmt::Display for HvfArm64CpuTemplateError {
                 f,
                 "arm64 CPU-template baseline differs after {completed_modifiers} matched modifier(s) for vCPU {member_index} (MPIDR 0x{mpidr:x}); all {completed_members} member(s) were read"
             ),
+            Self::BaselineWidth {
+                member_index,
+                mpidr,
+                completed_members,
+                completed_modifiers,
+            } => write!(
+                f,
+                "arm64 CPU-template baseline width differs from its mapped register after {completed_modifiers} matched modifier(s) for vCPU {member_index} (MPIDR 0x{mpidr:x}); all {completed_members} member(s) were read"
+            ),
             Self::Apply {
                 member_index,
                 mpidr,
@@ -306,9 +499,11 @@ impl std::error::Error for HvfArm64CpuTemplateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::BaselineRead { source, .. } | Self::Apply { source, .. } => Some(source.as_ref()),
-            Self::InvalidTopology { .. }
+            Self::InvalidRuntimeRegister
+            | Self::InvalidTopology { .. }
             | Self::BaselineLength { .. }
-            | Self::BaselineMismatch { .. } => None,
+            | Self::BaselineMismatch { .. }
+            | Self::BaselineWidth { .. } => None,
         }
     }
 }
@@ -317,7 +512,7 @@ trait CpuTemplateMember {
     fn read_cpu_template_baseline(
         &self,
         registers: &[HvfArm64CpuTemplateRegister],
-    ) -> Result<Vec<u64>, HvfVcpuRunnerError>;
+    ) -> Result<Vec<HvfArm64CpuTemplateValue>, HvfVcpuRunnerError>;
 
     fn apply_cpu_template_targets(
         &self,
@@ -329,7 +524,7 @@ impl CpuTemplateMember for HvfVcpuRunner<'_> {
     fn read_cpu_template_baseline(
         &self,
         registers: &[HvfArm64CpuTemplateRegister],
-    ) -> Result<Vec<u64>, HvfVcpuRunnerError> {
+    ) -> Result<Vec<HvfArm64CpuTemplateValue>, HvfVcpuRunnerError> {
         HvfVcpuRunner::read_arm64_cpu_template_baseline(self, registers)
     }
 
@@ -368,7 +563,8 @@ fn apply_custom_cpu_template_with<M: CpuTemplateMember>(
 
     let registers = modifiers
         .iter()
-        .map(|modifier| modifier.register)
+        .copied()
+        .map(MappedModifier::register)
         .collect::<Vec<_>>();
     let mut baselines = Vec::with_capacity(members.len());
     for (member_index, (member, &mpidr)) in members.iter().zip(mpidrs).enumerate() {
@@ -395,6 +591,27 @@ fn apply_custom_cpu_template_with<M: CpuTemplateMember>(
     let Some(common_baseline) = baselines.first() else {
         return Ok(());
     };
+    let Some(&common_mpidr) = mpidrs.first() else {
+        return Err(HvfArm64CpuTemplateError::InvalidTopology {
+            member_count: members.len(),
+            mpidr_count: mpidrs.len(),
+        });
+    };
+    for (member_index, (baseline, &mpidr)) in baselines.iter().zip(mpidrs).enumerate() {
+        if let Some(completed_modifiers) = modifiers
+            .iter()
+            .copied()
+            .zip(baseline.iter().copied())
+            .position(|(modifier, value)| !modifier.accepts_baseline(value))
+        {
+            return Err(HvfArm64CpuTemplateError::BaselineWidth {
+                member_index,
+                mpidr,
+                completed_members: baselines.len(),
+                completed_modifiers,
+            });
+        }
+    }
     for (member_index, (baseline, &mpidr)) in baselines.iter().zip(mpidrs).enumerate().skip(1) {
         if let Some(completed_modifiers) = baseline
             .iter()
@@ -410,12 +627,22 @@ fn apply_custom_cpu_template_with<M: CpuTemplateMember>(
         }
     }
 
-    let targets = modifiers
+    let mut targets = Vec::with_capacity(modifiers.len());
+    for (modifier, baseline) in modifiers
         .iter()
         .copied()
         .zip(common_baseline.iter().copied())
-        .map(|(modifier, baseline)| modifier.apply(baseline))
-        .collect::<Vec<_>>();
+    {
+        let Some(target) = modifier.apply(baseline) else {
+            return Err(HvfArm64CpuTemplateError::BaselineWidth {
+                member_index: 0,
+                mpidr: common_mpidr,
+                completed_members: baselines.len(),
+                completed_modifiers: targets.len(),
+            });
+        };
+        targets.push(target);
+    }
     for (member_index, (member, &mpidr)) in members.iter().zip(mpidrs).enumerate() {
         member
             .apply_cpu_template_targets(&targets)
@@ -430,13 +657,42 @@ fn apply_custom_cpu_template_with<M: CpuTemplateMember>(
     Ok(())
 }
 
-pub(crate) fn read_cpu_template_baseline_with(
+pub(crate) trait HvfArm64CpuTemplateAccess {
+    fn read_general_register(&mut self, register: HvfRegister) -> Result<u64, BackendError>;
+
+    fn write_general_register(
+        &mut self,
+        register: HvfRegister,
+        value: u64,
+    ) -> Result<(), BackendError>;
+
+    fn read_simd_fp_register(
+        &mut self,
+        register: HvfSimdFpRegister,
+    ) -> Result<[u8; 16], BackendError>;
+
+    fn write_simd_fp_register(
+        &mut self,
+        register: HvfSimdFpRegister,
+        value: [u8; 16],
+    ) -> Result<(), BackendError>;
+
+    fn read_system_register(&mut self, register: HvfSystemRegister) -> Result<u64, BackendError>;
+
+    fn write_system_register(
+        &mut self,
+        register: HvfSystemRegister,
+        value: u64,
+    ) -> Result<(), BackendError>;
+}
+
+pub(crate) fn read_cpu_template_baseline_with<A: HvfArm64CpuTemplateAccess + ?Sized>(
     registers: &[HvfArm64CpuTemplateRegister],
-    mut read: impl FnMut(HvfSystemRegister) -> Result<u64, BackendError>,
-) -> Result<Vec<u64>, HvfArm64CpuTemplateVcpuError> {
+    access: &mut A,
+) -> Result<Vec<HvfArm64CpuTemplateValue>, HvfArm64CpuTemplateVcpuError> {
     let mut baseline = Vec::with_capacity(registers.len());
-    for register in registers {
-        let value = read(register.system_register()).map_err(|source| {
+    for register in registers.iter().copied() {
+        let value = read_cpu_template_register(access, register).map_err(|source| {
             HvfArm64CpuTemplateVcpuError::BaselineRead {
                 completed_reads: baseline.len(),
                 source,
@@ -447,21 +703,18 @@ pub(crate) fn read_cpu_template_baseline_with(
     Ok(baseline)
 }
 
-pub(crate) fn apply_cpu_template_targets_with<V>(
+pub(crate) fn apply_cpu_template_targets_with<A: HvfArm64CpuTemplateAccess + ?Sized>(
     targets: &[HvfArm64CpuTemplateTarget],
-    vcpu: &mut V,
-    mut write: impl FnMut(&mut V, HvfSystemRegister, u64) -> Result<(), BackendError>,
-    mut read: impl FnMut(&mut V, HvfSystemRegister) -> Result<u64, BackendError>,
+    access: &mut A,
 ) -> Result<(), HvfArm64CpuTemplateVcpuError> {
     for (completed_modifiers, target) in targets.iter().copied().enumerate() {
-        let register = target.register().system_register();
-        write(vcpu, register, target.value()).map_err(|source| {
+        write_cpu_template_target(access, target).map_err(|source| {
             HvfArm64CpuTemplateVcpuError::RegisterWrite {
                 completed_modifiers,
                 source,
             }
         })?;
-        let actual = read(vcpu, register).map_err(|source| {
+        let actual = read_cpu_template_register(access, target.register()).map_err(|source| {
             HvfArm64CpuTemplateVcpuError::RegisterReadback {
                 completed_modifiers,
                 source,
@@ -474,6 +727,56 @@ pub(crate) fn apply_cpu_template_targets_with<V>(
         }
     }
     Ok(())
+}
+
+fn read_cpu_template_register<A: HvfArm64CpuTemplateAccess + ?Sized>(
+    access: &mut A,
+    register: HvfArm64CpuTemplateRegister,
+) -> Result<HvfArm64CpuTemplateValue, BackendError> {
+    match register {
+        HvfArm64CpuTemplateRegister::U32(register) => access
+            .read_general_register(register)
+            .and_then(|value| {
+                u32::try_from(value).map_err(|_| {
+                    BackendError::InvalidState(CPU_TEMPLATE_U32_TRANSPORT_WIDTH_MESSAGE)
+                })
+            })
+            .map(HvfArm64CpuTemplateValue::U32),
+        HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(register)) => {
+            access
+                .read_general_register(register)
+                .map(HvfArm64CpuTemplateValue::U64)
+        }
+        HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::System(register)) => access
+            .read_system_register(register)
+            .map(HvfArm64CpuTemplateValue::U64),
+        HvfArm64CpuTemplateRegister::U128(register) => access
+            .read_simd_fp_register(register)
+            .map(u128::from_le_bytes)
+            .map(HvfArm64CpuTemplateValue::U128),
+    }
+}
+
+fn write_cpu_template_target<A: HvfArm64CpuTemplateAccess + ?Sized>(
+    access: &mut A,
+    target: HvfArm64CpuTemplateTarget,
+) -> Result<(), BackendError> {
+    match target {
+        HvfArm64CpuTemplateTarget::U32 { register, value } => {
+            access.write_general_register(register, u64::from(value))
+        }
+        HvfArm64CpuTemplateTarget::U64 {
+            register: HvfArm64CpuTemplateRegister64::General(register),
+            value,
+        } => access.write_general_register(register, value),
+        HvfArm64CpuTemplateTarget::U64 {
+            register: HvfArm64CpuTemplateRegister64::System(register),
+            value,
+        } => access.write_system_register(register, value),
+        HvfArm64CpuTemplateTarget::U128 { register, value } => {
+            access.write_simd_fp_register(register, value.to_le_bytes())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -493,17 +796,17 @@ mod supplementary_tests {
     enum MemberEvent {
         Read {
             member: usize,
-            registers: Vec<HvfSystemRegister>,
+            registers: Vec<HvfArm64CpuTemplateRegister>,
         },
         Apply {
             member: usize,
-            targets: Vec<(HvfSystemRegister, u64)>,
+            targets: Vec<HvfArm64CpuTemplateTarget>,
         },
     }
 
     struct RecordingMember {
         index: usize,
-        baseline: Vec<u64>,
+        baseline: Vec<HvfArm64CpuTemplateValue>,
         events: Rc<RefCell<Vec<MemberEvent>>>,
         read_error: bool,
         apply_error: bool,
@@ -513,13 +816,10 @@ mod supplementary_tests {
         fn read_cpu_template_baseline(
             &self,
             registers: &[HvfArm64CpuTemplateRegister],
-        ) -> Result<Vec<u64>, HvfVcpuRunnerError> {
+        ) -> Result<Vec<HvfArm64CpuTemplateValue>, HvfVcpuRunnerError> {
             self.events.borrow_mut().push(MemberEvent::Read {
                 member: self.index,
-                registers: registers
-                    .iter()
-                    .map(|register| register.system_register())
-                    .collect(),
+                registers: registers.to_vec(),
             });
             if self.read_error {
                 Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
@@ -536,10 +836,7 @@ mod supplementary_tests {
         ) -> Result<(), HvfVcpuRunnerError> {
             self.events.borrow_mut().push(MemberEvent::Apply {
                 member: self.index,
-                targets: targets
-                    .iter()
-                    .map(|target| (target.register().system_register(), target.value()))
-                    .collect(),
+                targets: targets.to_vec(),
             });
             if self.apply_error {
                 Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
@@ -559,6 +856,7 @@ mod supplementary_tests {
             .expect("test CPU-template input should validate")
             .expect("nonempty modifiers should produce a template");
         PreparedHvfArm64CpuTemplate::from_runtime(&template)
+            .expect("validated test CPU template should map to HVF")
     }
 
     #[test]
@@ -581,14 +879,20 @@ mod supplementary_tests {
         let members = [
             RecordingMember {
                 index: 0,
-                baseline: vec![0xf0f0, 0xaaaa],
+                baseline: vec![
+                    HvfArm64CpuTemplateValue::U64(0xf0f0),
+                    HvfArm64CpuTemplateValue::U64(0xaaaa),
+                ],
                 events: Rc::clone(&events),
                 read_error: false,
                 apply_error: false,
             },
             RecordingMember {
                 index: 1,
-                baseline: vec![0xf0f0, 0xaaaa],
+                baseline: vec![
+                    HvfArm64CpuTemplateValue::U64(0xf0f0),
+                    HvfArm64CpuTemplateValue::U64(0xaaaa),
+                ],
                 events: Rc::clone(&events),
                 read_error: false,
                 apply_error: false,
@@ -604,29 +908,57 @@ mod supplementary_tests {
                 MemberEvent::Read {
                     member: 0,
                     registers: vec![
-                        HvfSystemRegister::ID_AA64ISAR1_EL1,
-                        HvfSystemRegister::ID_AA64PFR0_EL1,
+                        HvfArm64CpuTemplateRegister::from_system_register(
+                            HvfSystemRegister::ID_AA64ISAR1_EL1,
+                        ),
+                        HvfArm64CpuTemplateRegister::from_system_register(
+                            HvfSystemRegister::ID_AA64PFR0_EL1,
+                        ),
                     ],
                 },
                 MemberEvent::Read {
                     member: 1,
                     registers: vec![
-                        HvfSystemRegister::ID_AA64ISAR1_EL1,
-                        HvfSystemRegister::ID_AA64PFR0_EL1,
+                        HvfArm64CpuTemplateRegister::from_system_register(
+                            HvfSystemRegister::ID_AA64ISAR1_EL1,
+                        ),
+                        HvfArm64CpuTemplateRegister::from_system_register(
+                            HvfSystemRegister::ID_AA64PFR0_EL1,
+                        ),
                     ],
                 },
                 MemberEvent::Apply {
                     member: 0,
                     targets: vec![
-                        (HvfSystemRegister::ID_AA64ISAR1_EL1, 0xf005),
-                        (HvfSystemRegister::ID_AA64PFR0_EL1, 0x2aaa),
+                        HvfArm64CpuTemplateTarget::new(
+                            HvfArm64CpuTemplateRegister::from_system_register(
+                                HvfSystemRegister::ID_AA64ISAR1_EL1,
+                            ),
+                            0xf005,
+                        ),
+                        HvfArm64CpuTemplateTarget::new(
+                            HvfArm64CpuTemplateRegister::from_system_register(
+                                HvfSystemRegister::ID_AA64PFR0_EL1,
+                            ),
+                            0x2aaa,
+                        ),
                     ],
                 },
                 MemberEvent::Apply {
                     member: 1,
                     targets: vec![
-                        (HvfSystemRegister::ID_AA64ISAR1_EL1, 0xf005),
-                        (HvfSystemRegister::ID_AA64PFR0_EL1, 0x2aaa),
+                        HvfArm64CpuTemplateTarget::new(
+                            HvfArm64CpuTemplateRegister::from_system_register(
+                                HvfSystemRegister::ID_AA64ISAR1_EL1,
+                            ),
+                            0xf005,
+                        ),
+                        HvfArm64CpuTemplateTarget::new(
+                            HvfArm64CpuTemplateRegister::from_system_register(
+                                HvfSystemRegister::ID_AA64PFR0_EL1,
+                            ),
+                            0x2aaa,
+                        ),
                     ],
                 },
             ]
@@ -645,14 +977,14 @@ mod supplementary_tests {
         let members = [
             RecordingMember {
                 index: 0,
-                baseline: vec![0x10],
+                baseline: vec![HvfArm64CpuTemplateValue::U64(0x10)],
                 events: Rc::clone(&events),
                 read_error: false,
                 apply_error: false,
             },
             RecordingMember {
                 index: 1,
-                baseline: vec![0x11],
+                baseline: vec![HvfArm64CpuTemplateValue::U64(0x11)],
                 events: Rc::clone(&events),
                 read_error: false,
                 apply_error: false,
@@ -686,59 +1018,104 @@ mod supplementary_tests {
         ignore_write: Option<usize>,
     }
 
+    impl HvfArm64CpuTemplateAccess for RegisterAccess {
+        fn read_general_register(&mut self, _register: HvfRegister) -> Result<u64, BackendError> {
+            Err(BackendError::InvalidState(
+                "unexpected general register read",
+            ))
+        }
+
+        fn write_general_register(
+            &mut self,
+            _register: HvfRegister,
+            _value: u64,
+        ) -> Result<(), BackendError> {
+            Err(BackendError::InvalidState(
+                "unexpected general register write",
+            ))
+        }
+
+        fn read_simd_fp_register(
+            &mut self,
+            _register: HvfSimdFpRegister,
+        ) -> Result<[u8; 16], BackendError> {
+            Err(BackendError::InvalidState("unexpected SIMD register read"))
+        }
+
+        fn write_simd_fp_register(
+            &mut self,
+            _register: HvfSimdFpRegister,
+            _value: [u8; 16],
+        ) -> Result<(), BackendError> {
+            Err(BackendError::InvalidState("unexpected SIMD register write"))
+        }
+
+        fn read_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+        ) -> Result<u64, BackendError> {
+            let call = self.read_calls;
+            self.read_calls += 1;
+            if self.fail_read == Some(call) {
+                return Err(BackendError::InvalidState("injected readback failure"));
+            }
+            Ok(self
+                .values
+                .iter()
+                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
+                .unwrap_or_default())
+        }
+
+        fn write_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            let call = self.write_calls;
+            self.write_calls += 1;
+            if self.fail_write == Some(call) {
+                return Err(BackendError::InvalidState("injected write failure"));
+            }
+            if self.ignore_write != Some(call) {
+                if let Some((_, current)) = self
+                    .values
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == register)
+                {
+                    *current = value;
+                } else {
+                    self.values.push((register, value));
+                }
+            }
+            Ok(())
+        }
+    }
+
     fn targets() -> [HvfArm64CpuTemplateTarget; 3] {
         [
-            HvfArm64CpuTemplateTarget {
-                register: HvfArm64CpuTemplateRegister(HvfSystemRegister::ID_AA64PFR0_EL1),
-                value: 0x11,
-            },
-            HvfArm64CpuTemplateTarget {
-                register: HvfArm64CpuTemplateRegister(HvfSystemRegister::ID_AA64ISAR1_EL1),
-                value: 0x22,
-            },
-            HvfArm64CpuTemplateTarget {
-                register: HvfArm64CpuTemplateRegister(HvfSystemRegister::ID_AA64MMFR2_EL1),
-                value: 0x33,
-            },
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64PFR0_EL1,
+                ),
+                0x11,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64ISAR1_EL1,
+                ),
+                0x22,
+            ),
+            HvfArm64CpuTemplateTarget::new(
+                HvfArm64CpuTemplateRegister::from_system_register(
+                    HvfSystemRegister::ID_AA64MMFR2_EL1,
+                ),
+                0x33,
+            ),
         ]
     }
 
     fn apply_targets(access: &mut RegisterAccess) -> Result<(), HvfArm64CpuTemplateVcpuError> {
-        apply_cpu_template_targets_with(
-            &targets(),
-            access,
-            |access, register, value| {
-                let call = access.write_calls;
-                access.write_calls += 1;
-                if access.fail_write == Some(call) {
-                    return Err(BackendError::InvalidState("injected write failure"));
-                }
-                if access.ignore_write != Some(call) {
-                    if let Some((_, current)) = access
-                        .values
-                        .iter_mut()
-                        .find(|(candidate, _)| *candidate == register)
-                    {
-                        *current = value;
-                    } else {
-                        access.values.push((register, value));
-                    }
-                }
-                Ok(())
-            },
-            |access, register| {
-                let call = access.read_calls;
-                access.read_calls += 1;
-                if access.fail_read == Some(call) {
-                    return Err(BackendError::InvalidState("injected readback failure"));
-                }
-                Ok(access
-                    .values
-                    .iter()
-                    .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
-                    .unwrap_or_default())
-            },
-        )
+        apply_cpu_template_targets_with(&targets(), access)
     }
 
     #[test]
@@ -783,18 +1160,371 @@ mod supplementary_tests {
 
     #[test]
     fn target_and_modifier_debug_output_redacts_registers_masks_and_values() {
-        let modifier = MappedModifier {
-            register: HvfArm64CpuTemplateRegister(HvfSystemRegister::ID_AA64PFR0_EL1),
+        let modifier = MappedModifier::U64 {
+            register: HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64PFR0_EL1),
             filter: 0xdead_beef,
             value: 0x1234,
         };
-        let target = modifier.apply(0xfeed_face);
+        let target = modifier.apply(HvfArm64CpuTemplateValue::U64(0xfeed_face));
 
         for debug in [format!("{modifier:?}"), format!("{target:?}")] {
             assert!(debug.contains(CPU_TEMPLATE_VALUE_REDACTED));
             for secret in ["deadbeef", "1234", "feedface"] {
                 assert!(!debug.contains(secret));
             }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TypedAccessEvent {
+        ReadGeneral(HvfRegister),
+        WriteGeneral(HvfRegister, u64),
+        ReadSimd(HvfSimdFpRegister),
+        WriteSimd(HvfSimdFpRegister, [u8; 16]),
+        ReadSystem(HvfSystemRegister),
+        WriteSystem(HvfSystemRegister, u64),
+    }
+
+    #[derive(Default)]
+    struct TypedAccess {
+        general: Vec<(HvfRegister, u64)>,
+        simd: Vec<(HvfSimdFpRegister, [u8; 16])>,
+        system: Vec<(HvfSystemRegister, u64)>,
+        events: Vec<TypedAccessEvent>,
+        write_calls: usize,
+        read_calls: usize,
+        fail_write: Option<usize>,
+        fail_read: Option<usize>,
+        ignore_write: Option<usize>,
+    }
+
+    impl TypedAccess {
+        fn begin_read(&mut self) -> Result<(), BackendError> {
+            let call = self.read_calls;
+            self.read_calls += 1;
+            if self.fail_read == Some(call) {
+                Err(BackendError::InvalidState(
+                    "injected typed CPU-template read failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn begin_write(&mut self) -> Result<bool, BackendError> {
+            let call = self.write_calls;
+            self.write_calls += 1;
+            if self.fail_write == Some(call) {
+                Err(BackendError::InvalidState(
+                    "injected typed CPU-template write failure",
+                ))
+            } else {
+                Ok(self.ignore_write != Some(call))
+            }
+        }
+    }
+
+    impl HvfArm64CpuTemplateAccess for TypedAccess {
+        fn read_general_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            self.events.push(TypedAccessEvent::ReadGeneral(register));
+            self.begin_read()?;
+            self.general
+                .iter()
+                .rev()
+                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
+                .ok_or(BackendError::InvalidState(
+                    "typed general register is unset",
+                ))
+        }
+
+        fn write_general_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            self.events
+                .push(TypedAccessEvent::WriteGeneral(register, value));
+            if self.begin_write()? {
+                self.general.push((register, value));
+            }
+            Ok(())
+        }
+
+        fn read_simd_fp_register(
+            &mut self,
+            register: HvfSimdFpRegister,
+        ) -> Result<[u8; 16], BackendError> {
+            self.events.push(TypedAccessEvent::ReadSimd(register));
+            self.begin_read()?;
+            self.simd
+                .iter()
+                .rev()
+                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
+                .ok_or(BackendError::InvalidState("typed SIMD register is unset"))
+        }
+
+        fn write_simd_fp_register(
+            &mut self,
+            register: HvfSimdFpRegister,
+            value: [u8; 16],
+        ) -> Result<(), BackendError> {
+            self.events
+                .push(TypedAccessEvent::WriteSimd(register, value));
+            if self.begin_write()? {
+                self.simd.push((register, value));
+            }
+            Ok(())
+        }
+
+        fn read_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+        ) -> Result<u64, BackendError> {
+            self.events.push(TypedAccessEvent::ReadSystem(register));
+            self.begin_read()?;
+            self.system
+                .iter()
+                .rev()
+                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
+                .ok_or(BackendError::InvalidState("typed system register is unset"))
+        }
+
+        fn write_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            self.events
+                .push(TypedAccessEvent::WriteSystem(register, value));
+            if self.begin_write()? {
+                self.system.push((register, value));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mixed_width_access_is_ordered_exact_and_little_endian() {
+        let q31 = HvfSimdFpRegister::q(31).expect("Q31 should map");
+        let q_value = 0xf0e1_d2c3_b4a5_9687_7869_5a4b_3c2d_1e0f_u128;
+        let targets = [
+            HvfArm64CpuTemplateTarget::U32 {
+                register: HvfRegister::FPCR,
+                value: 0x8000_0001,
+            },
+            HvfArm64CpuTemplateTarget::U64 {
+                register: HvfArm64CpuTemplateRegister64::General(
+                    HvfRegister::general_purpose(4).expect("X4 should map"),
+                ),
+                value: 0x8000_0000_0000_0001,
+            },
+            HvfArm64CpuTemplateTarget::U64 {
+                register: HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SP_EL0),
+                value: 0x1234_5678_9abc_def0,
+            },
+            HvfArm64CpuTemplateTarget::U128 {
+                register: q31,
+                value: q_value,
+            },
+        ];
+        let mut access = TypedAccess::default();
+
+        apply_cpu_template_targets_with(&targets, &mut access)
+            .expect("mixed-width exact readback should succeed");
+
+        assert_eq!(
+            access.events,
+            [
+                TypedAccessEvent::WriteGeneral(HvfRegister::FPCR, 0x8000_0001),
+                TypedAccessEvent::ReadGeneral(HvfRegister::FPCR),
+                TypedAccessEvent::WriteGeneral(
+                    HvfRegister::general_purpose(4).expect("X4 should map"),
+                    0x8000_0000_0000_0001,
+                ),
+                TypedAccessEvent::ReadGeneral(
+                    HvfRegister::general_purpose(4).expect("X4 should map"),
+                ),
+                TypedAccessEvent::WriteSystem(HvfSystemRegister::SP_EL0, 0x1234_5678_9abc_def0,),
+                TypedAccessEvent::ReadSystem(HvfSystemRegister::SP_EL0),
+                TypedAccessEvent::WriteSimd(q31, q_value.to_le_bytes()),
+                TypedAccessEvent::ReadSimd(q31),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_mixed_width_target_position_reports_failures_and_retries() {
+        let x4 = HvfRegister::general_purpose(4).expect("X4 should map");
+        let q31 = HvfSimdFpRegister::q(31).expect("Q31 should map");
+        let q_value = 0xf0e1_d2c3_b4a5_9687_7869_5a4b_3c2d_1e0f_u128;
+        let targets = [
+            HvfArm64CpuTemplateTarget::U32 {
+                register: HvfRegister::FPCR,
+                value: 1,
+            },
+            HvfArm64CpuTemplateTarget::U64 {
+                register: HvfArm64CpuTemplateRegister64::General(x4),
+                value: 2,
+            },
+            HvfArm64CpuTemplateTarget::U64 {
+                register: HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SP_EL0),
+                value: 3,
+            },
+            HvfArm64CpuTemplateTarget::U128 {
+                register: q31,
+                value: q_value,
+            },
+        ];
+        let initialized_access = || TypedAccess {
+            general: vec![(HvfRegister::FPCR, 0), (x4, 0)],
+            simd: vec![(q31, [0; 16])],
+            system: vec![(HvfSystemRegister::SP_EL0, 0)],
+            ..TypedAccess::default()
+        };
+
+        for failed_index in 0..targets.len() {
+            let mut write_failure = TypedAccess {
+                fail_write: Some(failed_index),
+                ..initialized_access()
+            };
+            assert!(matches!(
+                apply_cpu_template_targets_with(&targets, &mut write_failure),
+                Err(HvfArm64CpuTemplateVcpuError::RegisterWrite {
+                    completed_modifiers,
+                    ..
+                }) if completed_modifiers == failed_index
+            ));
+            write_failure.fail_write = None;
+            apply_cpu_template_targets_with(&targets, &mut write_failure)
+                .expect("a complete retry after a typed write failure should succeed");
+
+            let mut read_failure = TypedAccess {
+                fail_read: Some(failed_index),
+                ..initialized_access()
+            };
+            assert!(matches!(
+                apply_cpu_template_targets_with(&targets, &mut read_failure),
+                Err(HvfArm64CpuTemplateVcpuError::RegisterReadback {
+                    completed_modifiers,
+                    ..
+                }) if completed_modifiers == failed_index
+            ));
+            read_failure.fail_read = None;
+            apply_cpu_template_targets_with(&targets, &mut read_failure)
+                .expect("a complete retry after a typed readback failure should succeed");
+
+            let mut mismatch = TypedAccess {
+                ignore_write: Some(failed_index),
+                ..initialized_access()
+            };
+            assert_eq!(
+                apply_cpu_template_targets_with(&targets, &mut mismatch),
+                Err(HvfArm64CpuTemplateVcpuError::RegisterReadbackMismatch {
+                    completed_modifiers: failed_index,
+                })
+            );
+            mismatch.ignore_write = None;
+            apply_cpu_template_targets_with(&targets, &mut mismatch)
+                .expect("a complete retry after a typed mismatch should succeed");
+        }
+    }
+
+    #[test]
+    fn mixed_width_baseline_preserves_values_and_rejects_u32_transport_upper_bits() {
+        let q0 = HvfSimdFpRegister::q(0).expect("Q0 should map");
+        let q_value = 0x8070_6050_4030_2010_0f1e_2d3c_4b5a_6978_u128;
+        let registers = [
+            HvfArm64CpuTemplateRegister::U32(HvfRegister::FPSR),
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(
+                HvfRegister::PC,
+            )),
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::System(
+                HvfSystemRegister::SPSR_EL1,
+            )),
+            HvfArm64CpuTemplateRegister::U128(q0),
+        ];
+        let mut access = TypedAccess {
+            general: vec![
+                (HvfRegister::FPSR, u32::MAX.into()),
+                (HvfRegister::PC, 0x55aa),
+            ],
+            simd: vec![(q0, q_value.to_le_bytes())],
+            system: vec![(HvfSystemRegister::SPSR_EL1, 0xaa55)],
+            ..TypedAccess::default()
+        };
+
+        assert_eq!(
+            read_cpu_template_baseline_with(&registers, &mut access),
+            Ok(vec![
+                HvfArm64CpuTemplateValue::U32(u32::MAX),
+                HvfArm64CpuTemplateValue::U64(0x55aa),
+                HvfArm64CpuTemplateValue::U64(0xaa55),
+                HvfArm64CpuTemplateValue::U128(q_value),
+            ])
+        );
+
+        let mut invalid = TypedAccess {
+            general: vec![(HvfRegister::FPCR, 1_u64 << 32)],
+            ..TypedAccess::default()
+        };
+        let error = read_cpu_template_baseline_with(
+            &[HvfArm64CpuTemplateRegister::U32(HvfRegister::FPCR)],
+            &mut invalid,
+        )
+        .expect_err("U32 transport upper bits must fail closed");
+        assert_eq!(error.completed_reads(), 0);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "arm64 CPU-template baseline read failed after 0 successful reads: {}",
+                BackendError::InvalidState(CPU_TEMPLATE_U32_TRANSPORT_WIDTH_MESSAGE)
+            )
+        );
+    }
+
+    #[test]
+    fn every_mixed_width_baseline_position_reports_failure_and_retries() {
+        let x4 = HvfRegister::general_purpose(4).expect("X4 should map");
+        let q31 = HvfSimdFpRegister::q(31).expect("Q31 should map");
+        let q_value = 0xf0e1_d2c3_b4a5_9687_7869_5a4b_3c2d_1e0f_u128;
+        let registers = [
+            HvfArm64CpuTemplateRegister::U32(HvfRegister::FPCR),
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(x4)),
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::System(
+                HvfSystemRegister::SP_EL0,
+            )),
+            HvfArm64CpuTemplateRegister::U128(q31),
+        ];
+        let expected = vec![
+            HvfArm64CpuTemplateValue::U32(1),
+            HvfArm64CpuTemplateValue::U64(2),
+            HvfArm64CpuTemplateValue::U64(3),
+            HvfArm64CpuTemplateValue::U128(q_value),
+        ];
+
+        for failed_index in 0..registers.len() {
+            let mut access = TypedAccess {
+                general: vec![(HvfRegister::FPCR, 1), (x4, 2)],
+                simd: vec![(q31, q_value.to_le_bytes())],
+                system: vec![(HvfSystemRegister::SP_EL0, 3)],
+                fail_read: Some(failed_index),
+                ..TypedAccess::default()
+            };
+            assert!(matches!(
+                read_cpu_template_baseline_with(&registers, &mut access),
+                Err(HvfArm64CpuTemplateVcpuError::BaselineRead {
+                    completed_reads,
+                    ..
+                }) if completed_reads == failed_index
+            ));
+
+            access.fail_read = None;
+            access.read_calls = 0;
+            access.events.clear();
+            assert_eq!(
+                read_cpu_template_baseline_with(&registers, &mut access),
+                Ok(expected.clone())
+            );
         }
     }
 }
@@ -806,8 +1536,11 @@ mod tests {
 
     use bangbang_runtime::cpu::{
         CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigInput,
-        KVM_REG_ARM64_ID_AA64ISAR0_EL1, KVM_REG_ARM64_ID_AA64ISAR1_EL1,
-        KVM_REG_ARM64_ID_AA64MMFR2_EL1, KVM_REG_ARM64_ID_AA64PFR0_EL1,
+        KVM_REG_ARM64_CORE_ELR_EL1, KVM_REG_ARM64_CORE_FPCR, KVM_REG_ARM64_CORE_FPSR,
+        KVM_REG_ARM64_CORE_PC, KVM_REG_ARM64_CORE_PSTATE, KVM_REG_ARM64_CORE_SP_EL0,
+        KVM_REG_ARM64_CORE_SP_EL1, KVM_REG_ARM64_CORE_SPSR_EL1, KVM_REG_ARM64_ID_AA64ISAR0_EL1,
+        KVM_REG_ARM64_ID_AA64ISAR1_EL1, KVM_REG_ARM64_ID_AA64MMFR2_EL1,
+        KVM_REG_ARM64_ID_AA64PFR0_EL1, kvm_reg_arm64_core_q, kvm_reg_arm64_core_x,
     };
 
     use super::*;
@@ -823,17 +1556,17 @@ mod tests {
     enum Event {
         Read {
             member: usize,
-            registers: Vec<HvfSystemRegister>,
+            registers: Vec<HvfArm64CpuTemplateRegister>,
         },
         Apply {
             member: usize,
-            targets: Vec<(HvfSystemRegister, u64)>,
+            targets: Vec<HvfArm64CpuTemplateTarget>,
         },
     }
 
     struct FakeMember {
         index: usize,
-        baseline: Vec<u64>,
+        baseline: Vec<HvfArm64CpuTemplateValue>,
         fail_read: bool,
         fail_apply: bool,
         events: Rc<RefCell<Vec<Event>>>,
@@ -843,13 +1576,10 @@ mod tests {
         fn read_cpu_template_baseline(
             &self,
             registers: &[HvfArm64CpuTemplateRegister],
-        ) -> Result<Vec<u64>, HvfVcpuRunnerError> {
+        ) -> Result<Vec<HvfArm64CpuTemplateValue>, HvfVcpuRunnerError> {
             self.events.borrow_mut().push(Event::Read {
                 member: self.index,
-                registers: registers
-                    .iter()
-                    .map(|register| register.system_register())
-                    .collect(),
+                registers: registers.to_vec(),
             });
             if self.fail_read {
                 Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
@@ -866,10 +1596,7 @@ mod tests {
         ) -> Result<(), HvfVcpuRunnerError> {
             self.events.borrow_mut().push(Event::Apply {
                 member: self.index,
-                targets: targets
-                    .iter()
-                    .map(|target| (target.register().system_register(), target.value()))
-                    .collect(),
+                targets: targets.to_vec(),
             });
             if self.fail_apply {
                 Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
@@ -890,12 +1617,22 @@ mod tests {
         )
     }
 
+    fn typed_modifier(
+        id: u64,
+        width: CpuConfigArmRegisterWidth,
+        filter: u128,
+        value: u128,
+    ) -> CpuConfigArmRegisterModifier {
+        CpuConfigArmRegisterModifier::new(id, width, filter, value)
+    }
+
     fn prepare(modifiers: Vec<CpuConfigArmRegisterModifier>) -> PreparedHvfArm64CpuTemplate {
         let template = CpuConfigInput::new(Vec::new(), modifiers, Vec::new())
             .into_custom_template()
             .expect("test template should validate")
             .expect("test template should be nonempty");
         PreparedHvfArm64CpuTemplate::from_runtime(&template)
+            .expect("validated test CPU template should map to HVF")
     }
 
     fn canonical_template() -> PreparedHvfArm64CpuTemplate {
@@ -905,6 +1642,115 @@ mod tests {
             modifier(KVM_REG_ARM64_ID_AA64ISAR1_EL1, ISAR1_FILTER, ISAR1_VALUE),
             modifier(KVM_REG_ARM64_ID_AA64MMFR2_EL1, MMFR2_FILTER, 0),
         ])
+    }
+
+    #[test]
+    fn maps_every_reviewed_core_identity_to_its_exact_hvf_operation() {
+        for index in [0_u8].into_iter().chain(4..=30) {
+            let prepared = prepare(vec![typed_modifier(
+                kvm_reg_arm64_core_x(index).expect("reviewed X index should map"),
+                CpuConfigArmRegisterWidth::U64,
+                u64::MAX.into(),
+                1,
+            )]);
+            assert_eq!(
+                prepared.modifiers,
+                [MappedModifier::U64 {
+                    register: HvfArm64CpuTemplateRegister64::General(
+                        HvfRegister::general_purpose(index).expect("reviewed X index should map"),
+                    ),
+                    filter: u64::MAX,
+                    value: 1,
+                }]
+            );
+        }
+
+        for (id, register) in [
+            (
+                KVM_REG_ARM64_CORE_PC,
+                HvfArm64CpuTemplateRegister64::General(HvfRegister::PC),
+            ),
+            (
+                KVM_REG_ARM64_CORE_PSTATE,
+                HvfArm64CpuTemplateRegister64::General(HvfRegister::CPSR),
+            ),
+            (
+                KVM_REG_ARM64_CORE_SP_EL0,
+                HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SP_EL0),
+            ),
+            (
+                KVM_REG_ARM64_CORE_SP_EL1,
+                HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SP_EL1),
+            ),
+            (
+                KVM_REG_ARM64_CORE_ELR_EL1,
+                HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ELR_EL1),
+            ),
+            (
+                KVM_REG_ARM64_CORE_SPSR_EL1,
+                HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SPSR_EL1),
+            ),
+        ] {
+            let prepared = prepare(vec![typed_modifier(
+                id,
+                CpuConfigArmRegisterWidth::U64,
+                u64::MAX.into(),
+                1,
+            )]);
+            assert_eq!(
+                prepared.modifiers,
+                [MappedModifier::U64 {
+                    register,
+                    filter: u64::MAX,
+                    value: 1,
+                }]
+            );
+        }
+
+        for (id, register) in [
+            (KVM_REG_ARM64_CORE_FPCR, HvfRegister::FPCR),
+            (KVM_REG_ARM64_CORE_FPSR, HvfRegister::FPSR),
+        ] {
+            let prepared = prepare(vec![typed_modifier(
+                id,
+                CpuConfigArmRegisterWidth::U32,
+                u32::MAX.into(),
+                1,
+            )]);
+            assert_eq!(
+                prepared.modifiers,
+                [MappedModifier::U32 {
+                    register,
+                    filter: u32::MAX,
+                    value: 1,
+                }]
+            );
+        }
+
+        for index in 0..=31 {
+            let prepared = prepare(vec![typed_modifier(
+                kvm_reg_arm64_core_q(index).expect("reviewed Q index should map"),
+                CpuConfigArmRegisterWidth::U128,
+                u128::MAX,
+                1 << 127,
+            )]);
+            assert_eq!(
+                prepared.modifiers,
+                [MappedModifier::U128 {
+                    register: HvfSimdFpRegister::q(index).expect("reviewed Q index should map"),
+                    filter: u128::MAX,
+                    value: 1 << 127,
+                }]
+            );
+        }
+    }
+
+    fn system_register(register: HvfSystemRegister) -> HvfArm64CpuTemplateRegister {
+        HvfArm64CpuTemplateRegister::from_system_register(register)
+    }
+
+    fn system_target(register: HvfSystemRegister, value: u64) -> HvfArm64CpuTemplateTarget {
+        HvfArm64CpuTemplateTarget::new(system_register(register), value)
     }
 
     #[test]
@@ -919,7 +1765,10 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let members = [0, 1].map(|index| FakeMember {
             index,
-            baseline: baseline.to_vec(),
+            baseline: baseline
+                .into_iter()
+                .map(HvfArm64CpuTemplateValue::U64)
+                .collect(),
             fail_read: false,
             fail_apply: false,
             events: Rc::clone(&events),
@@ -929,25 +1778,25 @@ mod tests {
             .expect("matching topology should accept the template");
 
         let expected_registers = vec![
-            HvfSystemRegister::ID_AA64PFR0_EL1,
-            HvfSystemRegister::ID_AA64ISAR0_EL1,
-            HvfSystemRegister::ID_AA64ISAR1_EL1,
-            HvfSystemRegister::ID_AA64MMFR2_EL1,
+            system_register(HvfSystemRegister::ID_AA64PFR0_EL1),
+            system_register(HvfSystemRegister::ID_AA64ISAR0_EL1),
+            system_register(HvfSystemRegister::ID_AA64ISAR1_EL1),
+            system_register(HvfSystemRegister::ID_AA64MMFR2_EL1),
         ];
         let expected_targets = vec![
-            (
+            system_target(
                 HvfSystemRegister::ID_AA64PFR0_EL1,
                 baseline[0] & !PFR0_FILTER,
             ),
-            (
+            system_target(
                 HvfSystemRegister::ID_AA64ISAR0_EL1,
                 (baseline[1] & !ISAR0_FILTER) | ISAR0_VALUE,
             ),
-            (
+            system_target(
                 HvfSystemRegister::ID_AA64ISAR1_EL1,
                 (baseline[2] & !ISAR1_FILTER) | ISAR1_VALUE,
             ),
-            (
+            system_target(
                 HvfSystemRegister::ID_AA64MMFR2_EL1,
                 baseline[3] & !MMFR2_FILTER,
             ),
@@ -976,6 +1825,86 @@ mod tests {
     }
 
     #[test]
+    fn mixed_width_topology_reads_every_member_before_ordered_targets() {
+        let x4 = HvfRegister::general_purpose(4).expect("X4 should map");
+        let q31 = HvfSimdFpRegister::q(31).expect("Q31 should map");
+        let template = prepare(vec![
+            typed_modifier(
+                KVM_REG_ARM64_CORE_FPCR,
+                CpuConfigArmRegisterWidth::U32,
+                u32::MAX.into(),
+                0x8000_0001,
+            ),
+            typed_modifier(
+                kvm_reg_arm64_core_x(4).expect("X4 should have a KVM identity"),
+                CpuConfigArmRegisterWidth::U64,
+                u64::MAX.into(),
+                0x8000_0000_0000_0001,
+            ),
+            typed_modifier(
+                kvm_reg_arm64_core_q(31).expect("Q31 should have a KVM identity"),
+                CpuConfigArmRegisterWidth::U128,
+                u128::MAX,
+                (1 << 127) | 1,
+            ),
+        ]);
+        let baseline = vec![
+            HvfArm64CpuTemplateValue::U32(0),
+            HvfArm64CpuTemplateValue::U64(0),
+            HvfArm64CpuTemplateValue::U128(0),
+        ];
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let members = [0, 1].map(|index| FakeMember {
+            index,
+            baseline: baseline.clone(),
+            fail_read: false,
+            fail_apply: false,
+            events: Rc::clone(&events),
+        });
+
+        apply_custom_cpu_template_with(&members, &[4, 5], &template)
+            .expect("matching mixed-width baselines should apply");
+
+        let registers = vec![
+            HvfArm64CpuTemplateRegister::U32(HvfRegister::FPCR),
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(x4)),
+            HvfArm64CpuTemplateRegister::U128(q31),
+        ];
+        let targets = vec![
+            HvfArm64CpuTemplateTarget::U32 {
+                register: HvfRegister::FPCR,
+                value: 0x8000_0001,
+            },
+            HvfArm64CpuTemplateTarget::U64 {
+                register: HvfArm64CpuTemplateRegister64::General(x4),
+                value: 0x8000_0000_0000_0001,
+            },
+            HvfArm64CpuTemplateTarget::U128 {
+                register: q31,
+                value: (1 << 127) | 1,
+            },
+        ];
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                Event::Read {
+                    member: 0,
+                    registers: registers.clone(),
+                },
+                Event::Read {
+                    member: 1,
+                    registers,
+                },
+                Event::Apply {
+                    member: 0,
+                    targets: targets.clone(),
+                },
+                Event::Apply { member: 1, targets },
+            ]
+        );
+    }
+
+    #[test]
     fn reads_only_requested_registers() {
         let template = prepare(vec![modifier(
             KVM_REG_ARM64_ID_AA64ISAR1_EL1,
@@ -985,7 +1914,7 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let members = [FakeMember {
             index: 0,
-            baseline: vec![ISAR1_VALUE],
+            baseline: vec![HvfArm64CpuTemplateValue::U64(ISAR1_VALUE)],
             fail_read: false,
             fail_apply: false,
             events: Rc::clone(&events),
@@ -998,7 +1927,7 @@ mod tests {
             events.borrow()[0],
             Event::Read {
                 member: 0,
-                registers: vec![HvfSystemRegister::ID_AA64ISAR1_EL1],
+                registers: vec![system_register(HvfSystemRegister::ID_AA64ISAR1_EL1)],
             }
         );
     }
@@ -1014,21 +1943,21 @@ mod tests {
         let members = [
             FakeMember {
                 index: 0,
-                baseline: vec![1],
+                baseline: vec![HvfArm64CpuTemplateValue::U64(1)],
                 fail_read: false,
                 fail_apply: false,
                 events: Rc::clone(&events),
             },
             FakeMember {
                 index: 1,
-                baseline: vec![2],
+                baseline: vec![HvfArm64CpuTemplateValue::U64(2)],
                 fail_read: false,
                 fail_apply: false,
                 events: Rc::clone(&events),
             },
             FakeMember {
                 index: 2,
-                baseline: vec![1],
+                baseline: vec![HvfArm64CpuTemplateValue::U64(1)],
                 fail_read: false,
                 fail_apply: false,
                 events: Rc::clone(&events),
@@ -1057,6 +1986,49 @@ mod tests {
     }
 
     #[test]
+    fn baseline_width_mismatch_fails_before_every_write() {
+        let template = prepare(vec![modifier(
+            KVM_REG_ARM64_ID_AA64PFR0_EL1,
+            PFR0_FILTER,
+            0,
+        )]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let members = [
+            FakeMember {
+                index: 0,
+                baseline: vec![HvfArm64CpuTemplateValue::U64(1)],
+                fail_read: false,
+                fail_apply: false,
+                events: Rc::clone(&events),
+            },
+            FakeMember {
+                index: 1,
+                baseline: vec![HvfArm64CpuTemplateValue::U32(1)],
+                fail_read: false,
+                fail_apply: false,
+                events: Rc::clone(&events),
+            },
+        ];
+
+        assert_eq!(
+            apply_custom_cpu_template_with(&members, &[7, 8], &template),
+            Err(HvfArm64CpuTemplateError::BaselineWidth {
+                member_index: 1,
+                mpidr: 8,
+                completed_members: 2,
+                completed_modifiers: 0,
+            })
+        );
+        assert_eq!(events.borrow().len(), 2);
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .all(|event| matches!(event, Event::Read { .. }))
+        );
+    }
+
+    #[test]
     fn apply_failure_reports_completed_members_after_full_preflight() {
         let template = prepare(vec![modifier(
             KVM_REG_ARM64_ID_AA64PFR0_EL1,
@@ -1067,21 +2039,21 @@ mod tests {
         let members = [
             FakeMember {
                 index: 0,
-                baseline: vec![1],
+                baseline: vec![HvfArm64CpuTemplateValue::U64(1)],
                 fail_read: false,
                 fail_apply: false,
                 events: Rc::clone(&events),
             },
             FakeMember {
                 index: 1,
-                baseline: vec![1],
+                baseline: vec![HvfArm64CpuTemplateValue::U64(1)],
                 fail_read: false,
                 fail_apply: true,
                 events: Rc::clone(&events),
             },
             FakeMember {
                 index: 2,
-                baseline: vec![1],
+                baseline: vec![HvfArm64CpuTemplateValue::U64(1)],
                 fail_read: false,
                 fail_apply: false,
                 events: Rc::clone(&events),
@@ -1128,40 +2100,77 @@ mod tests {
     struct FakeVcpu {
         events: Vec<RegisterEvent>,
         values: Vec<(HvfSystemRegister, u64)>,
+        read_override: Option<u64>,
+    }
+
+    impl HvfArm64CpuTemplateAccess for FakeVcpu {
+        fn read_general_register(&mut self, _register: HvfRegister) -> Result<u64, BackendError> {
+            Err(BackendError::InvalidState(
+                "unexpected general register read",
+            ))
+        }
+
+        fn write_general_register(
+            &mut self,
+            _register: HvfRegister,
+            _value: u64,
+        ) -> Result<(), BackendError> {
+            Err(BackendError::InvalidState(
+                "unexpected general register write",
+            ))
+        }
+
+        fn read_simd_fp_register(
+            &mut self,
+            _register: HvfSimdFpRegister,
+        ) -> Result<[u8; 16], BackendError> {
+            Err(BackendError::InvalidState("unexpected SIMD register read"))
+        }
+
+        fn write_simd_fp_register(
+            &mut self,
+            _register: HvfSimdFpRegister,
+            _value: [u8; 16],
+        ) -> Result<(), BackendError> {
+            Err(BackendError::InvalidState("unexpected SIMD register write"))
+        }
+
+        fn read_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+        ) -> Result<u64, BackendError> {
+            self.events.push(RegisterEvent::Read(register));
+            if let Some(value) = self.read_override {
+                return Ok(value);
+            }
+            self.values
+                .iter()
+                .rev()
+                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
+                .ok_or(BackendError::InvalidState("test register is unset"))
+        }
+
+        fn write_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            self.events.push(RegisterEvent::Write(register, value));
+            self.values.push((register, value));
+            Ok(())
+        }
     }
 
     #[test]
     fn owner_thread_apply_writes_then_immediately_reads_each_target() {
         let targets = [
-            HvfArm64CpuTemplateTarget {
-                register: HvfArm64CpuTemplateRegister(HvfSystemRegister::ID_AA64PFR0_EL1),
-                value: 0x1111,
-            },
-            HvfArm64CpuTemplateTarget {
-                register: HvfArm64CpuTemplateRegister(HvfSystemRegister::ID_AA64ISAR0_EL1),
-                value: 0x2222,
-            },
+            system_target(HvfSystemRegister::ID_AA64PFR0_EL1, 0x1111),
+            system_target(HvfSystemRegister::ID_AA64ISAR0_EL1, 0x2222),
         ];
         let mut vcpu = FakeVcpu::default();
 
-        apply_cpu_template_targets_with(
-            &targets,
-            &mut vcpu,
-            |vcpu, register, value| {
-                vcpu.events.push(RegisterEvent::Write(register, value));
-                vcpu.values.push((register, value));
-                Ok(())
-            },
-            |vcpu, register| {
-                vcpu.events.push(RegisterEvent::Read(register));
-                vcpu.values
-                    .iter()
-                    .rev()
-                    .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
-                    .ok_or(BackendError::InvalidState("test register is unset"))
-            },
-        )
-        .expect("exact readback should succeed");
+        apply_cpu_template_targets_with(&targets, &mut vcpu)
+            .expect("exact readback should succeed");
 
         assert_eq!(
             vcpu.events,
@@ -1176,18 +2185,14 @@ mod tests {
 
     #[test]
     fn owner_thread_readback_mismatch_reports_completed_modifier_count() {
-        let target = HvfArm64CpuTemplateTarget {
-            register: HvfArm64CpuTemplateRegister(HvfSystemRegister::ID_AA64PFR0_EL1),
-            value: 0x1111,
+        let target = system_target(HvfSystemRegister::ID_AA64PFR0_EL1, 0x1111);
+        let mut vcpu = FakeVcpu {
+            read_override: Some(0x2222),
+            ..FakeVcpu::default()
         };
 
-        let error = apply_cpu_template_targets_with(
-            &[target],
-            &mut (),
-            |_, _, _| Ok(()),
-            |_, _| Ok(0x2222),
-        )
-        .expect_err("non-exact readback must fail");
+        let error = apply_cpu_template_targets_with(&[target], &mut vcpu)
+            .expect_err("non-exact readback must fail");
 
         assert_eq!(
             error,
@@ -1200,10 +2205,7 @@ mod tests {
     #[test]
     fn debug_output_redacts_registers_masks_targets_and_readbacks() {
         let template = canonical_template();
-        let target = HvfArm64CpuTemplateTarget {
-            register: HvfArm64CpuTemplateRegister(HvfSystemRegister::ID_AA64PFR0_EL1),
-            value: 0xfeed_face_dead_beef,
-        };
+        let target = system_target(HvfSystemRegister::ID_AA64PFR0_EL1, 0xfeed_face_dead_beef);
         let prepared_debug = format!("{template:?}");
         let target_debug = format!("{target:?}");
         let error_debug = format!(

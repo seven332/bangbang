@@ -4717,15 +4717,20 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn applies_and_verifies_canonical_arm64_cpu_template_on_two_hvf_vcpus() {
-    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus() {
+    use bangbang_hvf::{
+        ARM64_LINUX_BOOT_CPSR, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+    };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::BlockMmioLayout;
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::cpu::{
         CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigInput,
-        KVM_REG_ARM64_ID_AA64ISAR0_EL1, KVM_REG_ARM64_ID_AA64ISAR1_EL1,
-        KVM_REG_ARM64_ID_AA64MMFR2_EL1, KVM_REG_ARM64_ID_AA64PFR0_EL1,
+        KVM_REG_ARM64_CORE_ELR_EL1, KVM_REG_ARM64_CORE_FPCR, KVM_REG_ARM64_CORE_FPSR,
+        KVM_REG_ARM64_CORE_PC, KVM_REG_ARM64_CORE_PSTATE, KVM_REG_ARM64_CORE_SP_EL0,
+        KVM_REG_ARM64_CORE_SP_EL1, KVM_REG_ARM64_CORE_SPSR_EL1, KVM_REG_ARM64_ID_AA64ISAR0_EL1,
+        KVM_REG_ARM64_ID_AA64ISAR1_EL1, KVM_REG_ARM64_ID_AA64MMFR2_EL1,
+        KVM_REG_ARM64_ID_AA64PFR0_EL1, kvm_reg_arm64_core_q, kvm_reg_arm64_core_x,
     };
     use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::GuestAddress;
@@ -4740,9 +4745,20 @@ fn applies_and_verifies_canonical_arm64_cpu_template_on_two_hvf_vcpus() {
     let image = arm64_image().expect("test arm64 image should build");
     let kernel = TempFile::new("cpu-template-kernel", &image)
         .expect("temporary CPU-template kernel should be created");
-    let modifier = |id, filter, value| {
-        CpuConfigArmRegisterModifier::new(id, CpuConfigArmRegisterWidth::U64, filter, value)
-    };
+    let modifier = CpuConfigArmRegisterModifier::new;
+    let x0_target = 0x1111_2222_3333_4444_u128;
+    let x4_target = 0xffff_eeee_dddd_cccc_u128;
+    let x30_target = 0x0123_4567_89ab_cdef_u128;
+    let pc_target = 0x2000_u128;
+    let pstate_target = 0xa000_0000_u128;
+    let sp_el0_target = 0x7777_0000_u128;
+    let sp_el1_target = 0x8888_0000_u128;
+    let elr_el1_target = 0x9999_0000_u128;
+    let spsr_el1_target = u128::from(ARM64_LINUX_BOOT_CPSR);
+    let q0_target = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff_u128;
+    let q31_target = 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100_u128;
+    let fpcr_target = 1_u128 << 22;
+    let fpsr_target = 0x11_u128;
     let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
     controller
         .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 16)))
@@ -4756,22 +4772,112 @@ fn applies_and_verifies_canonical_arm64_cpu_template_on_two_hvf_vcpus() {
         .handle_action(VmmAction::PutCpuConfig(CpuConfigInput::new(
             Vec::new(),
             vec![
-                modifier(KVM_REG_ARM64_ID_AA64PFR0_EL1, 0x000f_000f_0000_0000, 0),
+                modifier(
+                    kvm_reg_arm64_core_x(0).expect("X0 should have a KVM identity"),
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    x0_target,
+                ),
+                modifier(
+                    kvm_reg_arm64_core_x(4).expect("X4 should have a KVM identity"),
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    x4_target,
+                ),
+                modifier(
+                    kvm_reg_arm64_core_x(30).expect("X30 should have a KVM identity"),
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    x30_target,
+                ),
+                modifier(
+                    KVM_REG_ARM64_CORE_PC,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    pc_target,
+                ),
+                modifier(
+                    KVM_REG_ARM64_CORE_PSTATE,
+                    CpuConfigArmRegisterWidth::U64,
+                    0xf000_0000,
+                    pstate_target,
+                ),
+                modifier(
+                    KVM_REG_ARM64_CORE_SP_EL0,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    sp_el0_target,
+                ),
+                modifier(
+                    KVM_REG_ARM64_CORE_SP_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    sp_el1_target,
+                ),
+                modifier(
+                    KVM_REG_ARM64_CORE_ELR_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    elr_el1_target,
+                ),
+                modifier(
+                    KVM_REG_ARM64_CORE_SPSR_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    u64::MAX.into(),
+                    spsr_el1_target,
+                ),
+                modifier(
+                    kvm_reg_arm64_core_q(0).expect("Q0 should have a KVM identity"),
+                    CpuConfigArmRegisterWidth::U128,
+                    u128::MAX,
+                    q0_target,
+                ),
+                modifier(
+                    kvm_reg_arm64_core_q(31).expect("Q31 should have a KVM identity"),
+                    CpuConfigArmRegisterWidth::U128,
+                    u128::MAX,
+                    q31_target,
+                ),
+                modifier(
+                    KVM_REG_ARM64_CORE_FPCR,
+                    CpuConfigArmRegisterWidth::U32,
+                    0x00c0_0000,
+                    fpcr_target,
+                ),
+                modifier(
+                    KVM_REG_ARM64_CORE_FPSR,
+                    CpuConfigArmRegisterWidth::U32,
+                    0x1f,
+                    fpsr_target,
+                ),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64PFR0_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    0x000f_000f_0000_0000,
+                    0,
+                ),
                 modifier(
                     KVM_REG_ARM64_ID_AA64ISAR0_EL1,
+                    CpuConfigArmRegisterWidth::U64,
                     0xf0ff_0fff_0000_f000,
                     0x1000,
                 ),
                 modifier(
                     KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+                    CpuConfigArmRegisterWidth::U64,
                     0x00ff_f000_00ff_f00f,
                     0x0010_0001,
                 ),
-                modifier(KVM_REG_ARM64_ID_AA64MMFR2_EL1, 0x0000_000f_0000_0000, 0),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64MMFR2_EL1,
+                    CpuConfigArmRegisterWidth::U64,
+                    0x0000_000f_0000_0000,
+                    0,
+                ),
             ],
             Vec::new(),
         )))
-        .expect("canonical CPU template should store");
+        .expect("mixed-width CPU template should store");
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
         PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
@@ -4781,7 +4887,71 @@ fn applies_and_verifies_canonical_arm64_cpu_template_on_two_hvf_vcpus() {
     );
 
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
-        .expect("canonical template should write and read back on both HVF vCPUs");
+        .expect("mixed-width template should write and read back on both HVF vCPUs");
+    let boot_registers = session
+        .boot_registers()
+        .expect("ordinary CPU-template session should retain boot registers");
+    let general = session
+        .capture_arm64_general_register_state()
+        .expect("mixed-width CPU-template general state should capture");
+    assert!(
+        general.general_purpose_register(0) == Some(boot_registers.fdt_address.raw_value()),
+        "Linux boot setup must override the template's X0 value"
+    );
+    assert!(
+        general.general_purpose_register(4) == u64::try_from(x4_target).ok(),
+        "X4 must retain the exact mixed-width CPU-template target"
+    );
+    assert!(
+        general.general_purpose_register(30) == u64::try_from(x30_target).ok(),
+        "X30 must retain the exact mixed-width CPU-template target"
+    );
+    assert!(
+        general.pc() == boot_registers.kernel_entry.raw_value(),
+        "Linux boot setup must override the template's PC value"
+    );
+    assert!(
+        general.cpsr() == ARM64_LINUX_BOOT_CPSR,
+        "Linux boot setup must override the template's PSTATE value"
+    );
+    let core_system = session
+        .capture_arm64_core_system_register_state()
+        .expect("mixed-width CPU-template core system state should capture");
+    assert!(
+        core_system.sp_el0() == u64::try_from(sp_el0_target).expect("target should fit U64"),
+        "SP_EL0 must retain the exact CPU-template target"
+    );
+    assert!(
+        core_system.sp_el1() == u64::try_from(sp_el1_target).expect("target should fit U64"),
+        "SP_EL1 must retain the exact CPU-template target"
+    );
+    assert!(
+        core_system.elr_el1() == u64::try_from(elr_el1_target).expect("target should fit U64"),
+        "ELR_EL1 must retain the exact CPU-template target"
+    );
+    assert!(
+        core_system.spsr_el1() == u64::try_from(spsr_el1_target).expect("target should fit U64"),
+        "SPSR_EL1 must retain the exact CPU-template target"
+    );
+    let simd_fp = session
+        .capture_arm64_simd_fp_state()
+        .expect("mixed-width CPU-template SIMD/FP state should capture");
+    assert!(
+        simd_fp.q_register(0) == Some(q0_target.to_le_bytes()),
+        "Q0 must retain the exact little-endian CPU-template target"
+    );
+    assert!(
+        simd_fp.q_register(31) == Some(q31_target.to_le_bytes()),
+        "Q31 must retain the exact little-endian CPU-template target"
+    );
+    assert!(
+        simd_fp.fpcr() == u64::try_from(fpcr_target).expect("target should fit U64"),
+        "FPCR must retain the zero-extended U32 CPU-template target"
+    );
+    assert!(
+        simd_fp.fpsr() == u64::try_from(fpsr_target).expect("target should fit U64"),
+        "FPSR must retain the zero-extended U32 CPU-template target"
+    );
     session
         .shutdown()
         .expect("CPU-template session should shut down cleanly");
