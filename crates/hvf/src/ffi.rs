@@ -304,6 +304,7 @@ mod imp {
             size: usize,
             flags: HvMemoryFlags,
         ) -> HvReturn;
+        pub fn hv_vm_protect(ipa: u64, size: usize, flags: HvMemoryFlags) -> HvReturn;
         pub fn hv_vm_unmap(ipa: u64, size: usize) -> HvReturn;
         pub fn hv_vcpu_config_create() -> HvVcpuConfig;
         pub fn hv_vcpu_config_get_ccsidr_el1_sys_reg_values(
@@ -905,6 +906,16 @@ mod imp {
         // SAFETY: The caller owns a previously mapped guest physical range for the live
         // process-local HVF VM and guarantees the range is page aligned.
         unsafe { check(hv_vm_unmap(guest_address, size), "hv_vm_unmap") }
+    }
+
+    pub fn protect_memory(
+        guest_address: u64,
+        size: usize,
+        flags: HvMemoryFlags,
+    ) -> Result<(), BackendError> {
+        // SAFETY: The caller owns a previously mapped guest physical range for the live
+        // process-local HVF VM and validates page alignment, size, and permissions.
+        unsafe { check(hv_vm_protect(guest_address, size, flags), "hv_vm_protect") }
     }
 
     pub fn create_vcpu() -> Result<CreatedVcpu, BackendError> {
@@ -2438,6 +2449,10 @@ mod imp {
     }
 
     pub fn unmap_memory(_: u64, _: usize) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn protect_memory(_: u64, _: usize, _: HvMemoryFlags) -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 

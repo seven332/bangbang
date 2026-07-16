@@ -36,6 +36,11 @@ const ESR_ISS_SF: u64 = 1 << 15;
 const ESR_ISS_CM: u64 = 1 << 8;
 const ESR_ISS_S1PTW: u64 = 1 << 7;
 const ESR_ISS_WNR: u64 = 1 << 6;
+const ESR_ISS_DFSC_MASK: u64 = 0x3f;
+// Signed Apple Silicon evidence shows that denying WRITE with `hv_vm_protect`
+// exits as a level-three translation fault, not an architectural permission
+// fault. This is an empirical HVF contract and must remain exact.
+const ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION: u64 = 0x07;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfExceptionExit {
@@ -45,6 +50,17 @@ pub struct HvfExceptionExit {
 }
 
 impl HvfExceptionExit {
+    /// Match only the syndrome observed for an HVF-protected write.
+    ///
+    /// This predicate is not ownership evidence. The dirty tracker must also
+    /// prove that `physical_address` identifies one of its protected RAM pages.
+    pub(crate) fn matches_observed_hvf_protected_write_syndrome(self) -> bool {
+        exception_class(self.syndrome) == ESR_EC_DATA_ABORT_LOWER_EL
+            && self.syndrome & ESR_ISS_WNR != 0
+            && self.syndrome & (ESR_ISS_CM | ESR_ISS_S1PTW) == 0
+            && self.syndrome & ESR_ISS_DFSC_MASK == ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION
+    }
+
     pub fn decode_hvc(self) -> Result<HvfHvcExit, HvfHvcDecodeError> {
         let exception_class = exception_class(self.syndrome);
         if exception_class != ESR_EC_HVC {
@@ -651,13 +667,14 @@ mod tests {
 
     use super::{
         ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_HVC, ESR_EC_SHIFT, ESR_EC_SYS64, ESR_ISS_CM,
-        ESR_ISS_ISV, ESR_ISS_S1PTW, ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE,
-        ESR_ISS_SYS64_CRM_SHIFT, ESR_ISS_SYS64_CRN_SHIFT, ESR_ISS_SYS64_DIRECTION,
-        ESR_ISS_SYS64_OP0_SHIFT, ESR_ISS_SYS64_OP1_SHIFT, ESR_ISS_SYS64_OP2_SHIFT,
-        ESR_ISS_SYS64_RT_SHIFT, ESR_ISS_WNR, HvfExceptionExit, HvfHvcDecodeError,
-        HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister,
-        HvfMmioRegisterWidth, HvfMmioResolveError, HvfResolvedVcpuExit, HvfSys64DecodeError,
-        HvfSys64Direction, HvfSys64Register, HvfVcpuExit, HvfVcpuExitResolveError,
+        ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION, ESR_ISS_DFSC_MASK, ESR_ISS_ISV, ESR_ISS_S1PTW,
+        ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_SYS64_CRM_SHIFT,
+        ESR_ISS_SYS64_CRN_SHIFT, ESR_ISS_SYS64_DIRECTION, ESR_ISS_SYS64_OP0_SHIFT,
+        ESR_ISS_SYS64_OP1_SHIFT, ESR_ISS_SYS64_OP2_SHIFT, ESR_ISS_SYS64_RT_SHIFT, ESR_ISS_WNR,
+        HvfExceptionExit, HvfHvcDecodeError, HvfMmioAccessSize, HvfMmioDecodeError,
+        HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth, HvfMmioResolveError,
+        HvfResolvedVcpuExit, HvfSys64DecodeError, HvfSys64Direction, HvfSys64Register, HvfVcpuExit,
+        HvfVcpuExitResolveError,
     };
     use bangbang_runtime::{
         memory::{GuestAddress, GuestMemoryError, GuestMemoryRange},
@@ -741,6 +758,44 @@ mod tests {
     fn insert_region(bus: &mut MmioBus, id: u64, start: u64, size: u64) -> MmioRegion {
         bus.insert(region_id(id), GuestAddress::new(start), size)
             .expect("test MMIO region should insert")
+    }
+
+    #[test]
+    fn classifies_signed_observed_lower_el_write_level_three_translation_fault() {
+        let syndrome = (u64::from(ESR_EC_DATA_ABORT_LOWER_EL) << ESR_EC_SHIFT)
+            | ESR_ISS_WNR
+            | ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION;
+
+        assert!(exception_exit(syndrome, 0x4123).matches_observed_hvf_protected_write_syndrome());
+    }
+
+    #[test]
+    fn dirty_write_classifier_rejects_every_neighboring_abort_class() {
+        let candidate = (u64::from(ESR_EC_DATA_ABORT_LOWER_EL) << ESR_EC_SHIFT)
+            | ESR_ISS_WNR
+            | ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION;
+        let same_el_data_abort =
+            (0x25_u64 << ESR_EC_SHIFT) | ESR_ISS_WNR | ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION;
+        let instruction_abort =
+            (0x20_u64 << ESR_EC_SHIFT) | ESR_ISS_WNR | ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION;
+        let rejected = [
+            candidate & !ESR_ISS_WNR,
+            candidate | ESR_ISS_CM,
+            candidate | ESR_ISS_S1PTW,
+            (candidate & !ESR_ISS_DFSC_MASK) | 0x04,
+            (candidate & !ESR_ISS_DFSC_MASK) | 0x05,
+            (candidate & !ESR_ISS_DFSC_MASK) | 0x06,
+            (candidate & !ESR_ISS_DFSC_MASK) | 0x0c,
+            (candidate & !ESR_ISS_DFSC_MASK) | 0x0f,
+            same_el_data_abort,
+            instruction_abort,
+        ];
+
+        for syndrome in rejected {
+            assert!(
+                !exception_exit(syndrome, 0x4123).matches_observed_hvf_protected_write_syndrome()
+            );
+        }
     }
 
     #[test]

@@ -1389,6 +1389,7 @@ struct GuestBootRunDiagnostics {
     raw_steps: usize,
     completed_steps: usize,
     resumable_outcomes: usize,
+    dirty_write_steps: usize,
     hvc_steps: usize,
     cpu_off_steps: usize,
     cpu_suspend_steps: usize,
@@ -1416,6 +1417,9 @@ impl GuestBootRunDiagnostics {
         match step {
             bangbang_hvf::HvfVcpuRunStepOutcome::Canceled => {
                 self.canceled_steps += 1;
+            }
+            bangbang_hvf::HvfVcpuRunStepOutcome::DirtyWrite { .. } => {
+                self.dirty_write_steps += 1;
             }
             bangbang_hvf::HvfVcpuRunStepOutcome::Hvc { .. } => {
                 self.hvc_steps += 1;
@@ -1548,7 +1552,8 @@ impl std::fmt::Display for GuestBootFailureReport<'_> {
         writeln!(f, "  resumable outcomes: {}", self.run.resumable_outcomes)?;
         writeln!(
             f,
-            "  raw step counts: hvc={}, cpu_off={}, cpu_suspend={}, sys64={}, mmio={}, vtimer={}, canceled={}, unknown={}",
+            "  raw step counts: dirty_write={}, hvc={}, cpu_off={}, cpu_suspend={}, sys64={}, mmio={}, vtimer={}, canceled={}, unknown={}",
+            self.run.dirty_write_steps,
             self.run.hvc_steps,
             self.run.cpu_off_steps,
             self.run.cpu_suspend_steps,

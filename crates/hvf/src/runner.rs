@@ -1,11 +1,13 @@
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use bangbang_runtime::BackendError;
+use bangbang_runtime::memory::GuestAddress;
 use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
 
 use crate::backend::HvfBackend;
@@ -14,6 +16,7 @@ use crate::cpu_template::{
     HvfArm64CpuTemplateValue, HvfArm64CpuTemplateVcpuError, apply_cpu_template_targets_with,
     read_cpu_template_baseline_with,
 };
+use crate::dirty::{HvfDirtyWriteFaultError, HvfDirtyWriteTracker};
 use crate::exit::{
     HvfHvcExit, HvfResolvedMmioAccess, HvfSys64Direction, HvfSys64Exit, HvfSys64Register,
     HvfVcpuExit, HvfVcpuExitResolveError,
@@ -102,6 +105,8 @@ const BOOT_REGISTER_SETUP_FAILED_MESSAGE: &str =
 const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
     "vCPU runner boot registers are already configured";
 const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
+const RAW_RUN_WITH_DIRTY_TRACKING_MESSAGE: &str =
+    "raw vCPU run is unavailable while dirty-write tracking is active";
 const METADATA_READ_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has metadata read in flight";
 const MPIDR_ALREADY_CONFIGURED_MESSAGE: &str = "vCPU runner MPIDR affinity is already configured";
 const MPIDR_CONFIGURATION_FAILED_MESSAGE: &str =
@@ -183,6 +188,7 @@ pub enum HvfVcpuRunnerError {
         source: Box<HvfVcpuRunnerError>,
     },
     VcpuExitResolve(HvfVcpuExitResolveError),
+    DirtyWriteFault(HvfDirtyWriteFaultError),
     MmioDispatch(HvfMmioDispatchError),
     RetainedVtimerWait {
         stage: HvfVcpuRetainedVtimerWaitStage,
@@ -552,6 +558,10 @@ pub enum HvfVcpuRunStepOutcome {
         access: HvfResolvedMmioAccess,
         outcome: MmioDispatchOutcome,
     },
+    DirtyWrite {
+        page: GuestAddress,
+        first_write: bool,
+    },
     VtimerActivated,
     Unknown {
         reason: u32,
@@ -671,6 +681,7 @@ impl fmt::Display for HvfVcpuRunnerError {
                 )
             }
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
+            Self::DirtyWriteFault(err) => write!(f, "{err}"),
             Self::MmioDispatch(err) => write!(f, "{err}"),
             Self::RetainedVtimerWait { stage, source } => {
                 write!(f, "retained virtual-timer wait {stage} failed: {source}")
@@ -737,6 +748,7 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::SnapshotCapture { source, .. } => Some(source.as_ref()),
             Self::SnapshotRestore { source, .. } => Some(source.as_ref()),
             Self::VcpuExitResolve(err) => Some(err),
+            Self::DirtyWriteFault(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
             Self::RetainedVtimerWait { source, .. } => Some(source.as_ref()),
             Self::MpidrAffinity {
@@ -849,6 +861,12 @@ impl From<HvfVcpuExitResolveError> for HvfVcpuRunnerError {
     }
 }
 
+impl From<HvfDirtyWriteFaultError> for HvfVcpuRunnerError {
+    fn from(err: HvfDirtyWriteFaultError) -> Self {
+        Self::DirtyWriteFault(err)
+    }
+}
+
 impl From<HvfMmioDispatchError> for HvfVcpuRunnerError {
     fn from(err: HvfMmioDispatchError) -> Self {
         Self::MmioDispatch(err)
@@ -860,6 +878,9 @@ pub struct HvfVcpuRunner<'vm> {
     vcpu: crate::ffi::HvVcpu,
     cancel_vcpu: CancelVcpu,
     state: RunnerState,
+    dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+    dirty_write_member_index: usize,
+    dirty_write_owner_registered: AtomicBool,
     _vm: PhantomData<&'vm HvfBackend>,
 }
 
@@ -1107,6 +1128,8 @@ enum RunnerCommand {
     },
     RunOnceAndHandleMmio {
         dispatcher: SharedMmioDispatcher,
+        dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+        dirty_write_member_index: usize,
         response_sender: mpsc::Sender<Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>>,
     },
     RunOnceAndHandleMmioCoordinated {
@@ -1114,6 +1137,8 @@ enum RunnerCommand {
         state: RunnerState,
         token: HvfVcpuRunToken,
         dispatcher: SharedMmioDispatcher,
+        dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+        dirty_write_member_index: usize,
         completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
     },
     WaitForRetainedVtimer {
@@ -2850,6 +2875,48 @@ impl<'vm> HvfVcpuRunner<'vm> {
         )
     }
 
+    pub(crate) fn new_with_dirty_write_tracker(
+        member_index: usize,
+        dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+    ) -> Result<Self, HvfVcpuRunnerError> {
+        let runner =
+            Self::new_unconfigured_with_dirty_write_tracker(member_index, dirty_write_tracker)?;
+        match runner.configure_mpidr_el1(0) {
+            Ok(_) => Ok(runner),
+            Err(source) => match runner.shutdown() {
+                Ok(()) => Err(source),
+                Err(cleanup) => Err(HvfVcpuRunnerError::MpidrAffinityCleanup {
+                    source: Box::new(source),
+                    cleanup: Box::new(cleanup),
+                }),
+            },
+        }
+    }
+
+    pub(crate) fn new_unconfigured_with_dirty_write_tracker(
+        member_index: usize,
+        dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+    ) -> Result<Self, HvfVcpuRunnerError> {
+        if let Some(tracker) = dirty_write_tracker.as_ref() {
+            tracker.register_owner(member_index)?;
+        }
+        let mut runner = match Self::new_unconfigured() {
+            Ok(runner) => runner,
+            Err(source) => {
+                if let Some(tracker) = dirty_write_tracker.as_ref() {
+                    tracker.unregister_owner();
+                }
+                return Err(source);
+            }
+        };
+        runner
+            .dirty_write_owner_registered
+            .store(dirty_write_tracker.is_some(), Ordering::Release);
+        runner.dirty_write_tracker = dirty_write_tracker;
+        runner.dirty_write_member_index = member_index;
+        Ok(runner)
+    }
+
     pub(crate) fn configure_mpidr_el1(&self, expected: u64) -> Result<u64, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         let _in_flight_read = self.start_mpidr_el1_configuration(expected, response_sender)?;
@@ -4192,6 +4259,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 boot_registers_configured: false,
                 run_started: false,
             })),
+            dirty_write_tracker: None,
+            dirty_write_member_index: 0,
+            dirty_write_owner_registered: AtomicBool::new(false),
             _vm: PhantomData,
         })
     }
@@ -4307,6 +4377,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<HvfVcpuExit, HvfVcpuRunnerError>>,
     ) -> Result<InFlightRun, HvfVcpuRunnerError> {
+        if self.dirty_write_tracker.is_some() {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RAW_RUN_WITH_DIRTY_TRACKING_MESSAGE,
+            ));
+        }
         let mut state = self.lock_state()?;
         if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -4436,6 +4511,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .command_sender
             .send(RunnerCommand::RunOnceAndHandleMmio {
                 dispatcher,
+                dirty_write_tracker: self.dirty_write_tracker.as_ref().map(Arc::clone),
+                dirty_write_member_index: self.dirty_write_member_index,
                 response_sender,
             })
             .is_err()
@@ -4514,6 +4591,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
             state: Arc::clone(&self.state),
             token,
             dispatcher,
+            dirty_write_tracker: self.dirty_write_tracker.as_ref().map(Arc::clone),
+            dirty_write_member_index: self.dirty_write_member_index,
             completion_sender,
         };
         if let Err(err) = self.command_sender.send(command) {
@@ -6289,6 +6368,13 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if let Ok(mut state) = self.state.lock() {
             state.shutting_down = false;
         }
+        if self
+            .dirty_write_owner_registered
+            .swap(false, Ordering::AcqRel)
+            && let Some(tracker) = self.dirty_write_tracker.as_ref()
+        {
+            tracker.unregister_owner();
+        }
     }
 
     fn cancel_vcpu(&self) -> Result<(), HvfVcpuRunnerError> {
@@ -6861,9 +6947,16 @@ fn run_runner_thread<C, V>(
             }
             RunnerCommand::RunOnceAndHandleMmio {
                 dispatcher,
+                dirty_write_tracker,
+                dirty_write_member_index,
                 response_sender,
             } => {
-                let result = run_once_and_handle_mmio_on_runner_thread(&mut vcpu, &dispatcher);
+                let result = run_once_and_handle_mmio_on_runner_thread(
+                    &mut vcpu,
+                    &dispatcher,
+                    dirty_write_tracker.as_deref(),
+                    dirty_write_member_index,
+                );
                 let _ = response_sender.send(result);
             }
             RunnerCommand::RunOnceAndHandleMmioCoordinated {
@@ -6871,6 +6964,8 @@ fn run_runner_thread<C, V>(
                 state,
                 token,
                 dispatcher,
+                dirty_write_tracker,
+                dirty_write_member_index,
                 completion_sender,
             } => {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6878,6 +6973,8 @@ fn run_runner_thread<C, V>(
                         &mut vcpu,
                         &dispatcher,
                         &mut psci_state,
+                        dirty_write_tracker.as_deref(),
+                        dirty_write_member_index,
                     );
                     record_coordinated_psci_pending(&state, result)
                 }));
@@ -7915,6 +8012,8 @@ fn retained_vtimer_wait_error(
 fn run_once_and_handle_mmio_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     dispatcher: &SharedMmioDispatcher,
+    dirty_write_tracker: Option<&HvfDirtyWriteTracker>,
+    dirty_write_member_index: usize,
 ) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
     match vcpu.run_once().map_err(HvfVcpuRunnerError::Backend)? {
         HvfVcpuExit::Canceled => Ok(HvfVcpuRunStepOutcome::Canceled),
@@ -7927,7 +8026,14 @@ fn run_once_and_handle_mmio_on_runner_thread(
             if let Ok(sys64) = exit.decode_sys64() {
                 return handle_sys64_on_runner_thread(vcpu, sys64);
             }
-
+            if let Some(tracker) = dirty_write_tracker
+                && let Some(handled) = tracker.handle_exception(dirty_write_member_index, exit)?
+            {
+                return Ok(HvfVcpuRunStepOutcome::DirtyWrite {
+                    page: handled.page(),
+                    first_write: handled.first_write(),
+                });
+            }
             let access = exit
                 .decode_mmio_access()
                 .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
@@ -7947,6 +8053,8 @@ fn run_once_and_handle_mmio_coordinated_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     dispatcher: &SharedMmioDispatcher,
     psci_state: &mut RunnerThreadPsciState,
+    dirty_write_tracker: Option<&HvfDirtyWriteTracker>,
+    dirty_write_member_index: usize,
 ) -> Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError> {
     let outcome = match vcpu.run_once().map_err(HvfVcpuRunnerError::Backend)? {
         HvfVcpuExit::Canceled => HvfVcpuRunStepOutcome::Canceled,
@@ -7960,7 +8068,16 @@ fn run_once_and_handle_mmio_coordinated_on_runner_thread(
                 return handle_sys64_on_runner_thread(vcpu, sys64)
                     .map(HvfVcpuCoordinatedRunStepOutcome::Handled);
             }
-
+            if let Some(tracker) = dirty_write_tracker
+                && let Some(handled) = tracker.handle_exception(dirty_write_member_index, exit)?
+            {
+                return Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                    HvfVcpuRunStepOutcome::DirtyWrite {
+                        page: handled.page(),
+                        first_write: handled.first_write(),
+                    },
+                ));
+            }
             let access = exit
                 .decode_mmio_access()
                 .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
@@ -8278,7 +8395,7 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use bangbang_runtime::BackendError;
-    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
     use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher, MmioRegionId};
 
     use super::{
@@ -8292,6 +8409,9 @@ pub(crate) mod tests {
         HvfArm64CpuTemplateRegister, HvfArm64CpuTemplateRegister64, HvfArm64CpuTemplateTarget,
         HvfArm64CpuTemplateValue,
     };
+    use crate::dirty::{
+        HvfDirtyWriteFaultError, HvfDirtyWriteTracker, HvfDirtyWriteTrackerStopError,
+    };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
         HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfSys64Direction, HvfSys64Exit,
@@ -8301,6 +8421,9 @@ pub(crate) mod tests {
         HvfArm64GicIccRegister, HvfArm64GicIccRegisterRestoreError,
         HvfArm64GicIccRegisterRestoreOperation, HvfArm64GicIccRegisterState, HvfGicDeviceState,
         HvfGicError, restore_arm64_gic_icc_register_state_with,
+    };
+    use crate::memory::{
+        HvfMappedGuestMemoryRegion, HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions,
     };
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
     use crate::psci::{
@@ -10007,6 +10130,73 @@ pub(crate) mod tests {
         dispatch_result: Result<MmioDispatchOutcome, HvfVcpuRunnerError>,
         pc: u64,
         register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RunnerProtectionMapper {
+        state: Mutex<RunnerProtectionMapperState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RunnerProtectionMapperState {
+        calls: Vec<(GuestMemoryRange, HvfMemoryPermissions)>,
+        failing_call_index: Option<usize>,
+    }
+
+    impl RunnerProtectionMapper {
+        fn failing_on(call_index: usize) -> Self {
+            Self {
+                state: Mutex::new(RunnerProtectionMapperState {
+                    calls: Vec::new(),
+                    failing_call_index: Some(call_index),
+                }),
+            }
+        }
+
+        fn calls(&self) -> Vec<(GuestMemoryRange, HvfMemoryPermissions)> {
+            self.state
+                .lock()
+                .expect("runner protection mapper lock should be available")
+                .calls
+                .clone()
+        }
+    }
+
+    impl HvfMemoryMapper for RunnerProtectionMapper {
+        fn map_region(
+            &self,
+            _request: HvfMemoryMapRequest,
+            _permissions: HvfMemoryPermissions,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn unmap_region(
+            &self,
+            _mapped_region: HvfMappedGuestMemoryRegion,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn protect_region(
+            &self,
+            range: GuestMemoryRange,
+            permissions: HvfMemoryPermissions,
+        ) -> Result<(), BackendError> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("runner protection mapper lock should be available");
+            let call_index = state.calls.len();
+            state.calls.push((range, permissions));
+            if state.failing_call_index == Some(call_index) {
+                Err(BackendError::Hypervisor(
+                    "injected runner protection failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     struct PsciRunStepRecordingVcpu {
@@ -16928,6 +17118,14 @@ pub(crate) mod tests {
         })
     }
 
+    fn dirty_write_exception_exit(physical_address: u64) -> HvfVcpuExit {
+        HvfVcpuExit::Exception(HvfExceptionExit {
+            syndrome: (ESR_EC_DATA_ABORT_LOWER_EL << ESR_EC_SHIFT) | ESR_ISS_WNR | 0x07,
+            virtual_address: 0x2000,
+            physical_address,
+        })
+    }
+
     fn hvc_exception_exit(immediate: u16) -> HvfVcpuExit {
         HvfVcpuExit::Exception(HvfExceptionExit {
             syndrome: hvc_syndrome(immediate),
@@ -18281,6 +18479,37 @@ pub(crate) mod tests {
 
         HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
             .expect("runner should be created")
+    }
+
+    fn attach_dirty_write_tracker(
+        runner: &mut HvfVcpuRunner<'static>,
+        member_index: usize,
+        mapper: Arc<RunnerProtectionMapper>,
+        start: u64,
+        page_count: u64,
+    ) -> Arc<HvfDirtyWriteTracker> {
+        let size = page_count
+            .checked_mul(0x1000)
+            .expect("test tracked mapping size should not overflow");
+        let range = GuestMemoryRange::new(GuestAddress::new(start), size)
+            .expect("test tracked mapping should be valid");
+        let mapped_region = HvfMappedGuestMemoryRegion {
+            range,
+            guest_address: start,
+            size: usize::try_from(size).expect("test tracked mapping should fit this host"),
+            permissions: HvfMemoryPermissions::GUEST_RAM,
+        };
+        let tracker = HvfDirtyWriteTracker::start(&[mapped_region], mapper, 0x1000)
+            .expect("test dirty-write tracker should start");
+        tracker
+            .register_owner(member_index)
+            .expect("runner should register tracker ownership");
+        runner.dirty_write_tracker = Some(Arc::clone(&tracker));
+        runner.dirty_write_member_index = member_index;
+        runner
+            .dirty_write_owner_registered
+            .store(true, std::sync::atomic::Ordering::Release);
+        tracker
     }
 
     fn start_psci_run_step_recording_runner(
@@ -33429,6 +33658,137 @@ pub(crate) mod tests {
         );
 
         runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn tracked_dirty_write_retries_without_pc_advance_mmio_lock_or_hidden_run() {
+        let (mut runner, dispatched_receiver, register_write_receiver) =
+            start_run_step_recording_runner(
+                Ok(dirty_write_exception_exit(0x4123)),
+                Ok(MmioDispatchOutcome::Write),
+            );
+        let mapper = Arc::new(RunnerProtectionMapper::default());
+        let tracker = attach_dirty_write_tracker(&mut runner, 0, mapper.clone(), 0x4000, 2);
+        let dispatcher = shared_dispatcher();
+        let dispatcher_guard = dispatcher
+            .lock()
+            .expect("dispatcher lock should be available");
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)),
+            Ok(HvfVcpuRunStepOutcome::DirtyWrite {
+                page: GuestAddress::new(0x4000),
+                first_write: true,
+            })
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(
+            dispatched_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RAW_RUN_WITH_DIRTY_TRACKING_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)),
+            Err(HvfVcpuRunnerError::DirtyWriteFault(
+                HvfDirtyWriteFaultError::NoProgress
+            ))
+        );
+        drop(dispatcher_guard);
+        assert_eq!(mapper.calls().len(), 2);
+        assert_eq!(
+            tracker.stop(),
+            Err(HvfDirtyWriteTrackerStopError::OwnersActive { count: 1 })
+        );
+
+        runner.shutdown().expect("tracked runner should shut down");
+        tracker.stop().expect("owner-free tracker should stop");
+    }
+
+    #[test]
+    fn tracked_runner_preserves_mmio_classification_and_pc_advance() {
+        let access = resolved_mmio_access();
+        let (mut runner, dispatched_receiver, register_write_receiver) =
+            start_run_step_recording_runner(
+                Ok(mmio_exception_exit()),
+                Ok(MmioDispatchOutcome::Write),
+            );
+        let mapper = Arc::new(RunnerProtectionMapper::default());
+        let tracker = attach_dirty_write_tracker(&mut runner, 0, mapper.clone(), 0x1000, 1);
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher_with_region()),
+            Ok(HvfVcpuRunStepOutcome::Mmio {
+                access,
+                outcome: MmioDispatchOutcome::Write,
+            })
+        );
+        assert_eq!(
+            dispatched_receiver
+                .recv()
+                .expect("tracked MMIO should dispatch"),
+            access
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("tracked MMIO should advance PC"),
+            (HvfRegister::PC, 0x8020_3004)
+        );
+        assert!(
+            tracker
+                .dirty_pages()
+                .expect("tracker query should succeed")
+                .is_empty()
+        );
+
+        runner.shutdown().expect("tracked runner should shut down");
+        tracker.stop().expect("clean tracker should stop");
+        assert_eq!(mapper.calls().len(), 2);
+    }
+
+    #[test]
+    fn tracked_unprotect_failure_runs_no_mmio_or_pc_side_effect() {
+        let (mut runner, dispatched_receiver, register_write_receiver) =
+            start_run_step_recording_runner(
+                Ok(dirty_write_exception_exit(0x4000)),
+                Ok(MmioDispatchOutcome::Write),
+            );
+        let mapper = Arc::new(RunnerProtectionMapper::failing_on(1));
+        let tracker = attach_dirty_write_tracker(&mut runner, 0, mapper.clone(), 0x4000, 1);
+        let dispatcher = shared_dispatcher();
+        let dispatcher_guard = dispatcher
+            .lock()
+            .expect("dispatcher lock should be available");
+
+        assert!(matches!(
+            runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)),
+            Err(HvfVcpuRunnerError::DirtyWriteFault(
+                HvfDirtyWriteFaultError::UnprotectFailed(_)
+            ))
+        ));
+        assert_eq!(
+            dispatched_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        drop(dispatcher_guard);
+
+        runner.shutdown().expect("tracked runner should shut down");
+        tracker
+            .stop()
+            .expect("poisoned tracker cleanup should retry");
+        assert_eq!(mapper.calls().len(), 3);
     }
 
     #[test]

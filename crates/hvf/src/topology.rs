@@ -7,6 +7,7 @@ use bangbang_runtime::mmio::MmioDispatcher;
 
 use crate::coordinator::{HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError};
 use crate::cpu_template::{HvfArm64CpuTemplateError, PreparedHvfArm64CpuTemplate};
+use crate::dirty::HvfDirtyWriteTracker;
 use crate::runner::{HvfVcpuMpidrAffinityStage, HvfVcpuRunner, HvfVcpuRunnerError};
 
 const MAX_ORDERED_MPIDR: u64 = MAX_SUPPORTED_VCPUS as u64 - 1;
@@ -277,12 +278,20 @@ pub struct HvfVcpuTopology<'vm> {
 }
 
 impl<'vm> HvfVcpuTopology<'vm> {
-    pub(crate) fn create(vcpu_count: u8) -> Result<Self, HvfVcpuTopologyError> {
+    pub(crate) fn create(
+        vcpu_count: u8,
+        dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+    ) -> Result<Self, HvfVcpuTopologyError> {
         let created = create_ordered_topology_with(
             vcpu_count,
             crate::ffi::get_max_vcpu_count,
             |_, _| Ok(()),
-            |_| HvfVcpuRunner::new_unconfigured(),
+            |index| {
+                HvfVcpuRunner::new_unconfigured_with_dirty_write_tracker(
+                    index,
+                    dirty_write_tracker.as_ref().map(Arc::clone),
+                )
+            },
         )?;
         Ok(Self {
             runners: created.members,

@@ -74,6 +74,28 @@ and no fixed sleep, then collect two `Canceled` acknowledgements from one stop
 barrier. Repeat complete owner and VM teardown to catch stale cancellation or
 resource leaks.
 
+HVF dirty-write protection changes require focused tests for page alignment,
+overflow and mapped ownership; retained original permissions; complete
+preflight; reverse activation rollback and terminal incomplete rollback;
+dynamic-range inclusion and active mutation rejection; exact syndrome and
+unowned-MMIO discrimination; same-page first-writer serialization; bounded peer
+stale exits; page-unprotect and stop retry; and owner-before-cleanup ordering.
+Runner tests must prove the dirty branch runs before MMIO without taking its
+lock, does not read or advance PC, performs no hidden second run, and preserves
+ordinary MMIO PC advancement. The signed `hvf_lifecycle` gate must use at least
+two vCPUs writing shared and distinct protected pages, explicitly redispatch
+each dirty outcome, verify final guest values and the exact bitmap, bound event
+progress without sleeps, batch-cancel, join every owner, restore permissions,
+and destroy the VM. The accepted signed syndrome is EC `0x24`, WnR set,
+CM/S1PTW clear, and exact DFSC `0x07` at the tracker-owned IPA. A different
+encoding must fail closed and reopen feasibility; tests must not broaden it.
+
+Run the focused signed proof with:
+
+```sh
+scripts/run-integration-tests.sh --test hvf_lifecycle -- tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation --exact
+```
+
 Retained virtual-timer owner waits require pure tests for the Arm unsigned
 `CVAL <= virtual count` condition, wrapping offset subtraction, Mach timebase
 conversion, injected failures for every owner read and PPI write,
