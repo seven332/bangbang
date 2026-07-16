@@ -39,6 +39,8 @@ crates/launcher   Production app bundle, nested-worker validation, and supervisi
 crates/session    Private launcher-worker protocol and runtime namespace ownership
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
+tools/seccompiler Offline Firecracker v1.16 Linux-target seccomp compiler core;
+                  it cannot install or enforce filters on macOS
 ```
 
 On supported macOS Apple Silicon hosts, the public machine configuration accepts
