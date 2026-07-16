@@ -11,6 +11,7 @@ pub mod interrupt;
 pub mod logger;
 pub mod machine;
 pub mod memory;
+pub mod memory_dirty;
 pub mod memory_hotplug;
 pub mod metrics;
 pub mod mmds;
@@ -1116,7 +1117,6 @@ impl VmmController {
             && !machine_config.smt()
             && machine_config.cpu_template().is_none()
             && self.custom_cpu_template.is_none()
-            && !machine_config.track_dirty_pages()
             && machine_config.huge_pages() == machine::MachineConfigHugePages::None;
         let drive_supported = match self.drive_configs.as_slice() {
             [drive] => drive.is_root_device() && drive.is_read_only(),
@@ -2793,12 +2793,18 @@ mod tests {
                 drive_input("root", "/tmp/rootfs", true).with_is_read_only(true),
             ))
             .expect("read-only root drive should be stored");
+        controller
+            .handle_action(VmmAction::PatchMachineConfig(
+                MachineConfigPatchInput::new().with_track_dirty_pages(true),
+            ))
+            .expect("dirty tracking should remain compatible with a full snapshot");
         controller.instance_info.state = InstanceState::Paused;
 
         assert_eq!(
             controller.preflight_create_snapshot(&snapshot_create_input(SnapshotType::Full)),
             Ok(())
         );
+        assert!(controller.machine_config().track_dirty_pages());
         assert_eq!(controller.instance_info().state, InstanceState::Paused);
     }
 

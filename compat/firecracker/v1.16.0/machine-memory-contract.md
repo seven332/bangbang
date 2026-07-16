@@ -1,9 +1,9 @@
 # Firecracker v1.16 machine sizing and 2M page contract
 
 This contract fixes Bangbang's Apple Silicon/HVF interpretation of the pinned
-Firecracker v1.16.0 machine fields `vcpu_count`, `mem_size_mib`, `smt`, and
-`huge_pages`. CPU templates and dirty tracking remain separate capability
-slices.
+Firecracker v1.16.0 machine fields `vcpu_count`, `mem_size_mib`, `smt`,
+`track_dirty_pages`, and `huge_pages`. CPU templates remain a separate
+capability slice.
 
 ## Pinned request and update behavior
 
@@ -26,14 +26,23 @@ Bangbang selects pre-boot machine-candidate faults in this order:
 3. memory must be in `1..=1,046,528` MiB;
 4. a `2M` candidate must use an even MiB value;
 5. the existing CPU-template policy is applied;
-6. the existing dirty-tracking policy is applied; and
+6. the dirty-tracking value is accepted; and
 7. an otherwise valid exact `2M` candidate receives the platform result.
 
 This preserves the pinned aarch64 SMT/vCPU/memory/page ordering while adding
 Bangbang's realized-memory maximum. Only a valid complete machine candidate is
 then checked against the configured balloon target, so cross-configuration
-compatibility cannot mask a machine-field fault. CPU-template and dirty-policy
-delivery remain owned by their separate issues.
+compatibility cannot mask a machine-field fault. CPU-template delivery remains
+owned by its separate issue.
+
+`track_dirty_pages = true` installs a backend-neutral page bitmap before normal
+boot population and write-protects every writable HVF guest-RAM mapping before
+vCPU ownership. Guest CPU faults and all bounded boot, VMM, device, discard,
+and dynamic-memory mutations feed the same epoch. A visibly committed Full
+snapshot transactionally re-protects pages and advances the epoch; load-time
+tracking instead starts after image population, so the restored baseline is
+clean and the required VMGenID replacement is the first dirty write. This
+tracking contract does not admit `Diff` snapshot artifacts.
 
 Rejected numeric candidates use unit-like errors and do not retain or echo the
 submitted value. PUT and PATCH validate a complete candidate before changing
@@ -199,9 +208,10 @@ Challenge checkpoints:
 - [framing Challenge Review](https://github.com/seven332/bangbang/issues/1391#issuecomment-4989728561)
 - [plan Challenge Review](https://github.com/seven332/bangbang/issues/1391#issuecomment-4989883731)
 
-CPU templates, register modifiers, dirty primitives, dirty epochs, diff
-snapshots, and dynamic topology remain owned by sibling issues. #1392's cache
-presentation consumes the configured vCPU count but neither changes these
-machine/memory bounds nor caps that count to one matched host performance
-level. The exact 2M exclusion does not certify the remaining capabilities or
-the aggregate machine schema complete.
+CPU templates and register modifiers were completed by their sibling issues;
+#1395 and #1396 complete the guest-CPU primitive and public shared dirty epochs.
+Diff snapshot serialization and dynamic CPU topology remain separate work.
+#1392's cache presentation consumes the configured vCPU count but neither
+changes these machine/memory bounds nor caps that count to one matched host
+performance level. The exact 2M exclusion does not by itself certify the
+remaining aggregate machine schema complete.

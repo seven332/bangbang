@@ -68,6 +68,7 @@ use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
 use crate::backend::HvfBackend;
 use crate::coordinator::{HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuRunTerminalReport};
+use crate::dirty::{HvfDirtyWriteEpochResetError, HvfDirtyWriteTrackerStartError};
 use crate::gic::{
     HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator,
     HvfGicMetadata, HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
@@ -88,7 +89,7 @@ use crate::snapshot_restore::{
     HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreError, HvfSnapshotV1RestoreFailure,
     HvfSnapshotV1RestoreStage, PreparedHvfSnapshotV1Load,
 };
-use crate::topology::HvfVcpuTopologyError;
+use crate::topology::{HvfVcpuTopologyError, prepare_ordered_mpidrs};
 use crate::vcpu::{
     HvfArm64BootRegisters, HvfArm64VcpuBreakpointRegisterState,
     HvfArm64VcpuCacheSelectionRegisterState, HvfArm64VcpuCoreSystemRegisterState,
@@ -1711,6 +1712,21 @@ impl HvfArm64BootSession<'_> {
         self.backend.mapped_guest_memory_mut()
     }
 
+    /// Advance one complete dirty generation under snapshot-ready quiescence.
+    pub fn reset_dirty_epoch_quiesced(
+        &mut self,
+    ) -> Result<Option<u64>, HvfDirtyWriteEpochResetError> {
+        if !self.runtime_resources.machine_config.track_dirty_pages() {
+            return Ok(None);
+        }
+        self.backend
+            .reset_dirty_epoch_quiesced()?
+            .ok_or(HvfDirtyWriteEpochResetError::InvalidState(
+                "tracked boot session has no active dirty tracker",
+            ))
+            .map(Some)
+    }
+
     pub fn block_interrupt_lines(&self) -> &[GuestInterruptLine] {
         &self.block_interrupt_lines
     }
@@ -2759,6 +2775,7 @@ impl OwnedHvfArm64BootSession {
     /// Construct and completely restore one never-run native-v1 destination.
     pub fn restore_snapshot_v1(
         prepared: PreparedHvfSnapshotV1Load,
+        track_dirty_pages: bool,
     ) -> Result<RestoredHvfArm64BootSession, HvfSnapshotV1RestoreError> {
         let (state, installed) = prepared.into_parts();
         let (_machine, compatibility, vcpu_state, interrupt_state, _device_state) =
@@ -2778,7 +2795,7 @@ impl OwnedHvfArm64BootSession {
         );
 
         let InstalledSnapshotV1Runtime {
-            memory,
+            mut memory,
             mmio_dispatcher,
             mut runtime_resources,
             drive_config,
@@ -2786,6 +2803,9 @@ impl OwnedHvfArm64BootSession {
             serial_output,
             serial_output_buffer,
         } = installed;
+        runtime_resources.machine_config = runtime_resources
+            .machine_config
+            .with_track_dirty_pages(track_dirty_pages);
         let block_interrupt_lines = runtime_resources
             .block_devices
             .iter()
@@ -2838,6 +2858,15 @@ impl OwnedHvfArm64BootSession {
                 &mut backend,
             ));
         }
+        if track_dirty_pages && memory.enable_dirty_tracking().is_err() {
+            return Err(failed_snapshot_v1_restore(
+                HvfSnapshotV1RestoreStage::EnableDirtyTracking,
+                HvfSnapshotV1RestoreFailure::DirtyTracking,
+                &mut block_retry_wakeup_scheduler,
+                &mut runner,
+                &mut backend,
+            ));
+        }
         if backend
             .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
             .is_err()
@@ -2845,6 +2874,15 @@ impl OwnedHvfArm64BootSession {
             return Err(failed_snapshot_v1_restore(
                 HvfSnapshotV1RestoreStage::MapMemory,
                 HvfSnapshotV1RestoreFailure::MemoryMapping,
+                &mut block_retry_wakeup_scheduler,
+                &mut runner,
+                &mut backend,
+            ));
+        }
+        if track_dirty_pages && backend.start_dirty_write_tracking().is_err() {
+            return Err(failed_snapshot_v1_restore(
+                HvfSnapshotV1RestoreStage::EnableDirtyTracking,
+                HvfSnapshotV1RestoreFailure::DirtyTracking,
                 &mut block_retry_wakeup_scheduler,
                 &mut runner,
                 &mut backend,
@@ -3297,6 +3335,21 @@ impl OwnedHvfArm64BootSession {
     /// unmap the memory through the backend.
     pub fn guest_memory_mut(&mut self) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
         self.backend.mapped_guest_memory_mut()
+    }
+
+    /// Advance one complete dirty generation under snapshot-ready quiescence.
+    pub fn reset_dirty_epoch_quiesced(
+        &mut self,
+    ) -> Result<Option<u64>, HvfDirtyWriteEpochResetError> {
+        if !self.runtime_resources.machine_config.track_dirty_pages() {
+            return Ok(None);
+        }
+        self.backend
+            .reset_dirty_epoch_quiesced()?
+            .ok_or(HvfDirtyWriteEpochResetError::InvalidState(
+                "tracked boot session has no active dirty tracker",
+            ))
+            .map(Some)
     }
 
     pub fn block_interrupt_lines(&self) -> &[GuestInterruptLine] {
@@ -7592,6 +7645,9 @@ pub enum HvfArm64BootSessionError {
     StartTopology {
         source: HvfVcpuTopologyError,
     },
+    StartDirtyTracking {
+        source: HvfDirtyWriteTrackerStartError,
+    },
     CpuTemplate {
         source: crate::cpu_template::HvfArm64CpuTemplateError,
     },
@@ -7667,6 +7723,9 @@ impl fmt::Display for HvfArm64BootSessionError {
             Self::StartTopology { source } => {
                 write!(f, "failed to start HVF vCPU topology: {source}")
             }
+            Self::StartDirtyTracking { source } => {
+                write!(f, "failed to start HVF dirty tracking: {source}")
+            }
             Self::CpuTemplate { source } => {
                 write!(f, "failed to apply HVF arm64 CPU template: {source}")
             }
@@ -7734,6 +7793,7 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::AllocateInterruptLine { source, .. } => Some(source),
             Self::StartRunner { source } => Some(source),
             Self::StartTopology { source } => Some(source),
+            Self::StartDirtyTracking { source } => Some(source),
             Self::CpuTemplate { source } => Some(source),
             Self::RunCoordinator { source } => Some(source),
             Self::StartBlockRetryWakeupScheduler { source } => Some(source),
@@ -8055,17 +8115,10 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         },
     )?;
 
-    let topology = backend
-        .start_session_vcpu_topology(controller.machine_config().vcpu_count())
+    let mpidrs = prepare_ordered_mpidrs(controller.machine_config().vcpu_count())
         .map_err(|source| HvfArm64BootSessionError::StartTopology { source })?;
-    let mpidrs = topology.mpidrs().to_vec();
     let power = PsciCpuPowerCoordinator::new(&mpidrs)
         .map_err(|_| HvfArm64BootSessionError::PowerTopology)?;
-    if let Some(template) = cpu_template.as_ref() {
-        topology
-            .apply_arm64_cpu_template(template)
-            .map_err(|source| HvfArm64BootSessionError::CpuTemplate { source })?;
-    }
     let runtime_serial = config
         .serial_device
         .zip(interrupt_lines.serial)
@@ -8135,6 +8188,20 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
             HvfMemoryPermissions::GUEST_RAM,
         )
         .map_err(|source| HvfArm64BootSessionError::MapGuestMemory { source })?;
+    if controller.machine_config().track_dirty_pages() {
+        backend
+            .start_dirty_write_tracking()
+            .map_err(|source| HvfArm64BootSessionError::StartDirtyTracking { source })?;
+    }
+    let topology = backend
+        .start_session_vcpu_topology(controller.machine_config().vcpu_count())
+        .map_err(|source| HvfArm64BootSessionError::StartTopology { source })?;
+    debug_assert_eq!(topology.mpidrs(), mpidrs);
+    if let Some(template) = cpu_template.as_ref() {
+        topology
+            .apply_arm64_cpu_template(template)
+            .map_err(|source| HvfArm64BootSessionError::CpuTemplate { source })?;
+    }
     let mmio_dispatcher = Arc::new(Mutex::new(mmio_dispatcher));
     let coordinator = topology
         .into_run_coordinator(Arc::clone(&mmio_dispatcher), &[0])

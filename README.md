@@ -174,8 +174,9 @@ quiesces the block, PMEM, network, and entropy retry publishers. The same lease
 preflights both final namespaces, streams the paused aggregate capture into an
 owner-only staging inode, verifies and synchronizes it, publishes memory first
 and state last as the commit marker without replacing existing entries, and
-runs a currently no-op post-publication hook before reopening ordinary command
-admission. The synchronous process borrow also serializes API/MMDS/controller
+runs the session's post-publication transition before reopening ordinary command
+admission. For tracked sessions this failure-atomically re-protects guest-written
+pages and advances the shared epoch. The synchronous process borrow also serializes API/MMDS/controller
 mutation and periodic callbacks until this transaction returns.
 
 SIGINT/SIGTERM cancellation wins only before the atomic commit seal. Once
@@ -183,13 +184,20 @@ sealed, publication finishes and preserves its exact durable,
 durability-uncertain, memory-orphan, or other typed visibility result before
 orderly shutdown continues. A successful request returns `204 No Content` and
 leaves the source paused and usable. Earlier failures clean only private staging
-where safe and release every scheduler without losing deferred wakeups.
+where safe and release every scheduler without losing deferred wakeups. A
+recoverable tracked reset failure preserves the old conservative epoch; an
+incomplete rollback keeps the committed artifact result but latches terminal
+failure and prevents resume.
 
 `PUT /snapshot/load` accepts the matching committed pair only in a pristine
 fresh process, except that logger and metrics configuration are allowed. It
 supports a `File` memory backend (or the deprecated sole `mem_file_path` alias),
 constructs a fresh HVF VM/GIC/vCPU, restores the exact local native state,
 replaces and signals VMGenID, and first commits the session as `Paused`.
+`track_dirty_pages: true` or deprecated `enable_diff_snapshots: true` installs
+tracking after the loaded memory baseline and before mapping, vCPU ownership,
+and VMGenID replacement; the destination request controls the restored setting
+independently of the source snapshot.
 `resume_vm: true` then uses the ordinary resume path; otherwise resume later
 with `PATCH /vm`. The external root backing must still match the captured
 regular-file identity. Snapshot files and guest state are untrusted and
@@ -212,13 +220,16 @@ one-vCPU baseline; optional devices and multi-vCPU snapshot artifacts are still
 outside this format.
 
 This is not Firecracker snapshot-file compatibility or a portable migration
-format. The HVF layer has a signed, fail-closed guest-CPU dirty-write primitive
-that write-protects mapped guest RAM and reports exact first-written pages, but
-it is not a public tracking epoch: device and other userspace writes are not yet
-merged or reset transactionally. `Diff`, UFFD, public dirty-tracking flags,
-clock adjustment, restore overrides, writable or additional drives, optional
-devices, active SVE/SME/debug state, EL2 GIC CPU-interface state, and cross-host
-portability remain unsupported.
+format. Machine `track_dirty_pages` now enables one shared guest-RAM epoch
+before boot population. Boot-loader, VMM, current virtio-device, balloon
+discard, dynamic-memory, and guest-CPU writes all enter the same bitmap; HVF
+keeps a separate write-protection overlay. A visibly committed Full snapshot
+re-protects guest-written pages before clearing and advancing the epoch while
+the source is still paused. Complete rollback keeps the old conservative epoch;
+incomplete rollback prevents resume and tears the VM down safely. `Diff`
+artifacts and merging, UFFD, clock adjustment, restore overrides, writable or
+additional drives, optional-device snapshot state, active SVE/SME/debug state,
+EL2 GIC CPU-interface state, and cross-host portability remain unsupported.
 
 ## Process CLI
 

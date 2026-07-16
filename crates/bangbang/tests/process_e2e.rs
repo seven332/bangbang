@@ -3597,45 +3597,40 @@ fn executable_serves_and_patches_machine_config() {
         "PATCH /machine-config oversized",
     );
 
-    let invalid_patch_response = http_json(
+    let tracking_patch_response = http_json(
         &socket_path,
         "PATCH",
         "/machine-config",
         r#"{"track_dirty_pages":true}"#,
     );
-    assert_bad_request_response(&invalid_patch_response, "PATCH /machine-config invalid");
-    assert_response_contains(
-        &invalid_patch_response,
-        r#"{"fault_message":"machine track_dirty_pages is not supported"}"#,
-        "PATCH /machine-config invalid",
-    );
+    assert_no_content_response(&tracking_patch_response, "PATCH /machine-config tracking");
 
-    let after_invalid_patch = http_get(&socket_path, "/machine-config");
+    let after_tracking_patch = http_get(&socket_path, "/machine-config");
     assert_ok_response(
-        &after_invalid_patch,
-        "GET /machine-config after invalid patch",
+        &after_tracking_patch,
+        "GET /machine-config after tracking patch",
     );
     assert_response_contains(
-        &after_invalid_patch,
+        &after_tracking_patch,
         r#""vcpu_count":2"#,
-        "GET /machine-config after invalid patch",
+        "GET /machine-config after tracking patch",
     );
     assert_response_contains(
-        &after_invalid_patch,
+        &after_tracking_patch,
         r#""mem_size_mib":512"#,
-        "GET /machine-config after invalid patch",
+        "GET /machine-config after tracking patch",
     );
     assert_response_contains(
-        &after_invalid_patch,
-        r#""track_dirty_pages":false"#,
-        "GET /machine-config after invalid patch",
+        &after_tracking_patch,
+        r#""track_dirty_pages":true"#,
+        "GET /machine-config after tracking patch",
     );
 
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
 }
 
 #[test]
-fn executable_rejects_invalid_machine_config_put_without_mutating() {
+fn executable_accepts_machine_dirty_tracking_put() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let instance_id = test_dir.instance_id();
@@ -3648,50 +3643,39 @@ fn executable_rejects_invalid_machine_config_put_without_mutating() {
     );
     assert_no_content_response(&put_response, "PUT /machine-config original");
 
-    let invalid_put_response = http_put_json(
+    let tracked_put_response = http_put_json(
         &socket_path,
         "/machine-config",
         r#"{"vcpu_count":4,"mem_size_mib":512,"track_dirty_pages":true}"#,
     );
-    assert_bad_request_response(&invalid_put_response, "PUT /machine-config invalid");
-    assert_response_contains(
-        &invalid_put_response,
-        r#"{"fault_message":"machine track_dirty_pages is not supported"}"#,
-        "PUT /machine-config invalid",
-    );
+    assert_no_content_response(&tracked_put_response, "PUT /machine-config tracked");
 
     let machine_config = http_get(&socket_path, "/machine-config");
-    assert_ok_response(&machine_config, "GET /machine-config after invalid PUT");
+    assert_ok_response(&machine_config, "GET /machine-config after tracked PUT");
     assert_response_contains(
         &machine_config,
-        r#""vcpu_count":2"#,
-        "GET /machine-config after invalid PUT",
+        r#""vcpu_count":4"#,
+        "GET /machine-config after tracked PUT",
     );
     assert_response_contains(
         &machine_config,
-        r#""mem_size_mib":256"#,
-        "GET /machine-config after invalid PUT",
+        r#""mem_size_mib":512"#,
+        "GET /machine-config after tracked PUT",
     );
     assert_response_contains(
         &machine_config,
         r#""smt":false"#,
-        "GET /machine-config after invalid PUT",
+        "GET /machine-config after tracked PUT",
     );
     assert_response_contains(
         &machine_config,
-        r#""track_dirty_pages":false"#,
-        "GET /machine-config after invalid PUT",
+        r#""track_dirty_pages":true"#,
+        "GET /machine-config after tracked PUT",
     );
     assert_response_contains(
         &machine_config,
         r#""huge_pages":"None""#,
-        "GET /machine-config after invalid PUT",
-    );
-    assert!(
-        !machine_config.contains(r#""vcpu_count":4"#)
-            && !machine_config.contains(r#""mem_size_mib":512"#)
-            && !machine_config.contains(r#""track_dirty_pages":true"#),
-        "invalid PUT /machine-config must not mutate stored machine config; response:\n{machine_config}"
+        "GET /machine-config after tracked PUT",
     );
 
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");

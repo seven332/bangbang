@@ -1532,29 +1532,41 @@ when HVF is unavailable.
 `hv_vm_protect` dirty-write tracking is an observation mechanism, not a guest
 memory security boundary. It removes WRITE only from mapped guest RAM owned by
 one active tracker and accepts an exit only when the lower-EL write has
-CM/S1PTW clear, exact DFSC `0x07`, and a physical address resolving to a
-tracker-owned RAM page. The DFSC value
-is signed Apple Silicon evidence rather than a public Apple promise; drift is
-fail-closed through ordinary MMIO/error handling and must not cause another
-syndrome to be accepted. MMIO, host-backed pmem, readonly mappings, and IPAs
-outside the immutable tracker set cannot become dirty through this path.
+CM/S1PTW clear, a physical address resolving to a tracker-owned currently
+protected RAM page, and one of two signed-observed encodings: level-three
+translation DFSC `0x07` for initial protection or level-three permission DFSC
+`0x0f` after re-protection. These values are empirical Apple Silicon evidence,
+not public Apple promises. Drift is fail-closed through ordinary MMIO/error
+handling. MMIO, host-backed pmem payload mappings, readonly mappings, and IPAs
+outside the current tracker set cannot become dirty through this path.
 
-The tracker removes permissions transactionally before any vCPU owner exists,
-restores one page before publishing its bitmap bit, and restores remaining
-clean pages only after every owner has joined. One peer may already have exited
-on the same protected page, so stale admission is bounded once per member; a
-repeat by the same member/page is a typed no-progress failure. Partial
-activation rollback, unprotect failure, and incomplete stop block new guest
-execution and mapping mutation until cleanup or VM unmap. Errors and automatic
-`Debug` output expose operation indexes and typed stages, not syndrome dumps,
-guest values, host pointers, or memory contents. Explicit dirty outcomes and
-page queries return structural guest page identities by design and must remain
-an authorized snapshot-internal surface.
+`GuestMemory` owns the authoritative atomic bitmap. Its bounded write API marks
+boot-loader and every current VMM/virtio guest-RAM write after whole-range
+validation; discard marks the aligned attempted interior before host advice so
+partial zero/free failure cannot create a false negative. HVF restores one
+protected page before marking that same bitmap. The protection bit is separate:
+a host-dirty page remains protected and still takes one guest fault. One peer
+may already have exited on the same page, so stale admission is bounded once per
+member; a repeat by the same member/page is a typed no-progress failure.
 
-This primitive accounts only for guest-CPU writes. It does not authorize the
-public dirty flags or claim complete epochs: boot-loader, VMM/device, pmem,
-balloon, and other userspace writes still require an independently synchronized
-bitmap union and quiescent commit/reset policy.
+The tracker is installed before normal boot population or after snapshot image
+population. Live writable RAM additions are mapped without WRITE and enter the
+current epoch wholly dirty; exact unmap removes both bitmap and protection
+metadata under the fault lock. Host-backed pmem payload storage is not guest RAM
+in the native-v1 image, while its guest-RAM queues and status writes still pass
+through `GuestMemory`.
+
+Only the paused snapshot-ready transaction may advance an epoch. After the
+complete Full pair becomes visible, it re-protects coalesced restored-WRITE
+ranges before clearing bits and incrementing the generation. A failed protect
+reverses completed calls and preserves the old conservative epoch. If that
+rollback is incomplete, the tracker is poisoned, command admission closes,
+resume is impossible, and teardown owns cleanup even though the already-visible
+artifact outcome remains accurately reported. Every pre-commit capture, I/O,
+flush, rename, cancellation, or cleanup failure leaves the old epoch unchanged.
+Errors and automatic `Debug` output expose typed stages and operation indexes,
+not guest values, host pointers, memory contents, or public configuration
+values. Exact page queries remain an authorized snapshot-internal/test surface.
 
 An internal multi-vCPU topology does not relax HVF ownership rules. Each vCPU
 is created, configured, queried, run, and destroyed only on its permanent owner

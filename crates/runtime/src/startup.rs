@@ -44,6 +44,7 @@ use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError,
     GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64,
 };
+use crate::memory_dirty::GuestMemoryDirtyTrackerError;
 use crate::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
     MemoryHotplugUpdateError, PreparedVirtioMemDevice, VirtioMemDeviceNotificationDispatch,
@@ -3005,6 +3006,9 @@ pub enum Arm64BootResourceError {
     GuestMemoryAllocation {
         source: GuestMemoryAllocationError,
     },
+    DirtyTracking {
+        source: GuestMemoryDirtyTrackerError,
+    },
     BootSourceLoad {
         source: BootSourceLoadError,
     },
@@ -3145,6 +3149,9 @@ impl fmt::Display for Arm64BootResourceError {
             }
             Self::GuestMemoryAllocation { source } => {
                 write!(f, "failed to allocate guest memory: {source}")
+            }
+            Self::DirtyTracking { source } => {
+                write!(f, "failed to enable guest-memory dirty tracking: {source}")
             }
             Self::BootSourceLoad { source } => {
                 write!(f, "failed to load boot source: {source}")
@@ -3288,6 +3295,7 @@ impl std::error::Error for Arm64BootResourceError {
         match self {
             Self::MemoryLayout { source } => Some(source),
             Self::GuestMemoryAllocation { source } => Some(source),
+            Self::DirtyTracking { source } => Some(source),
             Self::BootSourceLoad { source } => Some(source),
             Self::RootDriveCommandLine { source } => Some(source),
             Self::PrepareBlockDevices { source } => Some(source),
@@ -3504,6 +3512,11 @@ impl Arm64BootResources {
             .map_err(|source| Arm64BootResourceError::MemoryLayout { source })?;
         let mut memory = GuestMemory::allocate(&layout)
             .map_err(|source| Arm64BootResourceError::GuestMemoryAllocation { source })?;
+        if machine_config.track_dirty_pages() {
+            memory
+                .enable_dirty_tracking()
+                .map_err(|source| Arm64BootResourceError::DirtyTracking { source })?;
+        }
         let boot_source = boot_source_from_config(boot_source_config);
         let mut loaded_boot_source = boot_source
             .load_with_files(&layout, &mut memory, boot_files)

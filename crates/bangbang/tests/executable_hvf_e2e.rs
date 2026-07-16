@@ -5388,7 +5388,7 @@ mod macos_arm64 {
         let machine = http_put_json(
             &source_socket,
             "/machine-config",
-            r#"{"vcpu_count":1,"mem_size_mib":16}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":16,"track_dirty_pages":true}"#,
         );
         assert_no_content_response(&machine, "PUT source /machine-config");
         let boot = http_put_json(
@@ -5479,6 +5479,17 @@ mod macos_arm64 {
         );
         assert_no_snapshot_staging(test_dir.path());
 
+        let resume_source = http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        assert_no_content_response(
+            &resume_source,
+            "PATCH tracked snapshot source /vm Resumed after commit",
+        );
+        let repause_source = http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        assert_no_content_response(
+            &repause_source,
+            "PATCH tracked snapshot source /vm Paused after committed epoch reset",
+        );
+
         let source_output = source.terminate();
         assert_clean_shutdown(source_output, &source_socket, "snapshot source");
 
@@ -5556,6 +5567,13 @@ mod macos_arm64 {
             r#""state":"Paused""#,
             "GET paused destination state",
         );
+        let paused_machine = http_get(&paused_socket, "/machine-config");
+        assert_ok_response(&paused_machine, "GET tracked paused destination machine");
+        assert_response_contains(
+            &paused_machine,
+            r#""track_dirty_pages":true"#,
+            "GET tracked paused destination machine",
+        );
         let resume = http_json(&paused_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
         assert_no_content_response(&resume, "PATCH paused destination /vm Resumed");
         let paused_output = paused.wait_for_exit_with_timeout(
@@ -5625,7 +5643,7 @@ mod macos_arm64 {
 
     fn snapshot_load_body(state_path: &Path, memory_path: &Path, resume_vm: bool) -> String {
         format!(
-            r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"File"}},"resume_vm":{resume_vm}}}"#,
+            r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"File"}},"track_dirty_pages":true,"resume_vm":{resume_vm}}}"#,
             json_string(path_text(state_path)),
             json_string(path_text(memory_path))
         )

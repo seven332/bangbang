@@ -352,7 +352,6 @@ impl fmt::Debug for SnapshotLoadInput {
 pub(crate) enum SnapshotV1Rejection {
     CreateSnapshotType,
     LoadMemoryBackend,
-    LoadDirtyTracking,
     LoadClockRealtime,
     LoadNetworkOverrides,
     LoadVsockOverride,
@@ -470,9 +469,6 @@ pub(crate) fn classify_v1_load_request(
 ) -> Result<(), SnapshotV1Rejection> {
     if input.mem_backend.backend_type != SnapshotMemoryBackendType::File {
         return Err(SnapshotV1Rejection::LoadMemoryBackend);
-    }
-    if input.track_dirty_pages {
-        return Err(SnapshotV1Rejection::LoadDirtyTracking);
     }
     if input.clock_realtime {
         return Err(SnapshotV1Rejection::LoadClockRealtime);
@@ -752,7 +748,7 @@ mod tests {
                 true,
                 clean_load_profile(),
             ),
-            Err(SnapshotV1Rejection::LoadDirtyTracking)
+            Ok(())
         );
         assert_eq!(
             classify_v1_load(

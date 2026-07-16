@@ -75,7 +75,7 @@
     {
       "id": "api-operation:GET /machine-config",
       "family": "api-contract",
-      "summary": "GET returns Firecracker-shaped stored/default machine state with completed vCPU, target-bounded configured-equals-realized memory, aarch64 SMT, and default-None/exact-2M platform policy; keep the aggregate operation open for CPU-template and dirty-tracking siblings.",
+      "summary": "GET returns Firecracker-shaped stored/default machine state with terminal field-level behavior for vCPU, target-bounded configured-equals-realized memory, aarch64 SMT, CPU templates, dirty tracking, and exact-2M platform policy; the aggregate operation awaits the #1388 parent reconciliation.",
       "source_refs": [
         "api-operation:GET /machine-config"
       ],
@@ -165,7 +165,7 @@
     {
       "id": "api-operation:PATCH /machine-config",
       "family": "api-contract",
-      "summary": "PATCH implements partial/null-preserving machine updates, explicit None clearing, stable empty-candidate and typed sizing/page faults, and machine/balloon failure atomicity; keep the aggregate operation open for CPU-template and dirty-tracking siblings.",
+      "summary": "PATCH implements partial/null-preserving machine updates, explicit None clearing, stable empty-candidate and typed sizing/page faults, CPU-template and dirty-tracking policy, and machine/balloon failure atomicity; the aggregate operation awaits the #1388 parent reconciliation.",
       "source_refs": [
         "api-operation:PATCH /machine-config"
       ],
@@ -345,7 +345,7 @@
     {
       "id": "api-operation:PUT /machine-config",
       "family": "api-contract",
-      "summary": "PUT implements Firecracker-shaped required/default replacement plus typed vCPU, target-bounded configured-equals-realized memory, aarch64 SMT, and exact-2M platform policy; keep the aggregate operation open for CPU-template and dirty-tracking siblings.",
+      "summary": "PUT implements Firecracker-shaped required/default replacement plus typed vCPU, target-bounded configured-equals-realized memory, aarch64 SMT, CPU-template and dirty-tracking policy, and exact-2M platform behavior; the aggregate operation awaits the #1388 parent reconciliation.",
       "source_refs": [
         "api-operation:PUT /machine-config"
       ],
@@ -2011,11 +2011,50 @@
     {
       "id": "api-property:MachineConfiguration.track_dirty_pages",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.track_dirty_pages.",
+      "summary": "Accept false or true transactionally through PUT/PATCH, report the stored value through GET, and enforce true with one complete boot/VMM/device/guest-CPU dirty epoch whose Full-publication reset is failure-atomic.",
       "source_refs": [
         "api-property:MachineConfiguration.track_dirty_pages"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/dirty.rs",
+          "anchor": "HvfDirtyWriteTracker and reset_epoch_quiesced"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "tracked normal boot startup ordering"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "MachineConfig dirty-page tracking value"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_dirty.rs",
+          "anchor": "GuestMemoryDirtyTracker"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "machine PUT/PATCH tracking transaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_accepts_machine_dirty_tracking_put"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "tracked normal startup and two-epoch signed evidence"
+        }
+      ]
     },
     {
       "id": "api-property:MachineConfiguration.vcpu_count",
@@ -2506,11 +2545,45 @@
     {
       "id": "api-property:SnapshotLoadParams.enable_diff_snapshots",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.enable_diff_snapshots.",
+      "summary": "Normalize the deprecated true value into destination dirty tracking, count deprecated use, and activate tracking after the loaded memory baseline without enabling Diff artifact serialization.",
       "source_refs": [
         "api-property:SnapshotLoadParams.enable_diff_snapshots"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "SnapshotLoadParams deprecated dirty-field normalization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot_load_input_from_request"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "OwnedHvfArm64BootSession::restore_snapshot_v1"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "snapshot load deprecated-field parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot load conversion tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "tracked native-v1 load signed evidence"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.mem_backend",
@@ -2560,11 +2633,50 @@
     {
       "id": "api-property:SnapshotLoadParams.track_dirty_pages",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.track_dirty_pages.",
+      "summary": "Let the destination request independently select dirty tracking, install it after baseline image population and before mapping/owners/VMGenID replacement, and commit that effective value to the restored controller.",
       "source_refs": [
         "api-property:SnapshotLoadParams.track_dirty_pages"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "HvfInstanceStartExecutor::load_prepared_snapshot_v1"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "OwnedHvfArm64BootSession::restore_snapshot_v1"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "classify_v1_load_request"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public_native_v1_load_commits_one_paused_session"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_creates_and_restores_native_v1_snapshot_across_processes"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "captures_native_v1_composite_and_keeps_source_session_usable"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "native_v1_load_policy_rejects_each_unsupported_dimension"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.vsock_override",
@@ -3171,7 +3283,7 @@
     {
       "id": "api-schema:MachineConfiguration",
       "family": "api-contract",
-      "summary": "The strict schema, defaults, vCPU, target-bounded memory, aarch64 SMT, and exact-2M platform behavior are classified; keep the aggregate schema open for CPU-template and dirty-tracking siblings.",
+      "summary": "The strict schema, defaults, vCPU, target-bounded memory, aarch64 SMT, CPU-template, dirty-tracking, and exact-2M platform behavior are all classified; the aggregate schema awaits the #1388 parent reconciliation.",
       "source_refs": [
         "api-schema:MachineConfiguration"
       ],
@@ -4967,12 +5079,61 @@
     {
       "id": "semantic.memory:machine-sizing-hugepages-and-dirty-tracking",
       "family": "machine-memory",
-      "summary": "Machine sizing, bounds, configured-equals-realized state, host vCPU admission, failure atomicity, and exact hugetlbfs 2M platform exclusion are classified; continue auditing ordinary mapping/protection plus dirty primitives, permission, and epochs.",
+      "summary": "Machine sizing, configured-equals-realized bounds, host admission, ordinary mappings, exact hugetlbfs 2M platform exclusion, and complete failure-atomic dirty epochs now have terminal behavior and signed evidence.",
       "source_refs": [
         "corpus:hugepages",
         "corpus:specification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/dirty.rs",
+          "anchor": "HVF protection overlay and dirty epoch reset"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "tracked guest-memory mapping and dynamic mutation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "MachineConfig validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory.rs",
+          "anchor": "GuestMemory tracked mutation boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_dirty.rs",
+          "anchor": "GuestMemoryDirtyTracker"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/dirty.rs",
+          "anchor": "dirty union reset rollback and poison tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "tracked dynamic mapping transaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed normal boot load device SMP and two-epoch tracking"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory.rs",
+          "anchor": "guest-memory dirty tracking and discard tests"
+        }
+      ]
     },
     {
       "id": "semantic.mmds:tcp-token-session-and-isolation",
@@ -5086,7 +5247,7 @@
     {
       "id": "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
       "family": "snapshots",
-      "summary": "Audit Diff snapshots, dirty tracking, File and UFFD-equivalent memory backends, cancellation, bounds, and security.",
+      "summary": "Full/File snapshot load can now activate a complete destination dirty epoch and Full commit resets an active source epoch; Diff serialization/merge/restore and UFFD-equivalent backends remain for Wave 6.",
       "source_refs": [
         "corpus:snapshot-page-faults",
         "corpus:snapshot-support"
