@@ -3,6 +3,7 @@
 mod backend;
 mod cache;
 mod coordinator;
+mod cpu_template;
 mod exit;
 mod ffi;
 mod gic;
@@ -27,6 +28,7 @@ pub use coordinator::{
     HvfVcpuRunControlReason, HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError, HvfVcpuRunEvent,
     HvfVcpuRunMemberOutcome, HvfVcpuRunMemberResult, HvfVcpuRunTerminalReport,
 };
+pub use cpu_template::{HvfArm64CpuTemplateError, HvfArm64CpuTemplateVcpuError};
 pub use exit::{
     HvfExceptionExit, HvfHvcDecodeError, HvfHvcExit, HvfMmioAccess, HvfMmioAccessSize,
     HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth,

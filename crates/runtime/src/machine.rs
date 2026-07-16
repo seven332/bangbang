@@ -53,6 +53,10 @@ impl MachineConfigInput {
         self
     }
 
+    pub const fn cpu_template_update(self) -> Option<MachineConfigCpuTemplate> {
+        self.cpu_template
+    }
+
     pub fn validate(self) -> Result<MachineConfig, MachineConfigError> {
         MachineConfig::try_from(self)
     }
@@ -119,6 +123,10 @@ impl MachineConfigPatchInput {
             && self.huge_pages.is_none()
     }
 
+    pub const fn cpu_template_update(self) -> Option<MachineConfigCpuTemplate> {
+        self.cpu_template
+    }
+
     pub fn apply_to(self, current: MachineConfig) -> Result<MachineConfig, MachineConfigError> {
         if self.is_empty() {
             return Err(MachineConfigError::EmptyPatch);
@@ -178,6 +186,14 @@ impl MachineConfig {
         self.huge_pages
     }
 
+    pub(crate) const fn with_cpu_template_selection(
+        mut self,
+        cpu_template: Option<MachineConfigCpuTemplate>,
+    ) -> Self {
+        self.cpu_template = cpu_template;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) const fn new_unchecked_for_tests(vcpu_count: u8, mem_size_mib: u64) -> Self {
         Self {
@@ -221,11 +237,13 @@ impl TryFrom<MachineConfigInput> for MachineConfig {
         {
             return Err(MachineConfigError::InvalidHugePages2MMemorySize);
         }
-        if let Some(cpu_template) = input.cpu_template
-            && cpu_template != MachineConfigCpuTemplate::None
-        {
-            return Err(MachineConfigError::UnsupportedCpuTemplate { cpu_template });
-        }
+        let cpu_template = match input.cpu_template {
+            Some(MachineConfigCpuTemplate::V1N1) => Some(MachineConfigCpuTemplate::V1N1),
+            Some(MachineConfigCpuTemplate::None) | None => None,
+            Some(cpu_template) => {
+                return Err(MachineConfigError::UnsupportedCpuTemplate { cpu_template });
+            }
+        };
         if input.track_dirty_pages {
             return Err(MachineConfigError::DirtyPageTrackingNotSupported);
         }
@@ -237,7 +255,7 @@ impl TryFrom<MachineConfigInput> for MachineConfig {
             vcpu_count: input.vcpu_count,
             mem_size_mib: input.mem_size_mib,
             smt: input.smt,
-            cpu_template: None,
+            cpu_template,
             track_dirty_pages: input.track_dirty_pages,
             huge_pages: input.huge_pages,
         })
@@ -287,6 +305,7 @@ pub enum MachineConfigError {
     UnsupportedCpuTemplate {
         cpu_template: MachineConfigCpuTemplate,
     },
+    V1N1SourceModelUnsupported,
     DirtyPageTrackingNotSupported,
     HugePages2MPlatformLimited,
 }
@@ -314,6 +333,9 @@ impl fmt::Display for MachineConfigError {
                     "machine cpu_template {cpu_template} is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"
                 )
             }
+            Self::V1N1SourceModelUnsupported => f.write_str(
+                "machine cpu_template V1N1 requires a Neoverse V1 source model that Apple Silicon/HVF cannot represent",
+            ),
             Self::DirtyPageTrackingNotSupported => {
                 f.write_str("machine track_dirty_pages is not supported")
             }
@@ -398,12 +420,6 @@ mod tests {
                 MachineConfigError::SmtNotSupported,
             ),
             (
-                MachineConfigInput::new(1, 128).with_cpu_template(MachineConfigCpuTemplate::V1N1),
-                MachineConfigError::UnsupportedCpuTemplate {
-                    cpu_template: MachineConfigCpuTemplate::V1N1,
-                },
-            ),
-            (
                 MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
                 MachineConfigError::DirtyPageTrackingNotSupported,
             ),
@@ -449,9 +465,7 @@ mod tests {
                     .with_cpu_template(MachineConfigCpuTemplate::V1N1)
                     .with_track_dirty_pages(true)
                     .with_huge_pages(MachineConfigHugePages::TwoM),
-                MachineConfigError::UnsupportedCpuTemplate {
-                    cpu_template: MachineConfigCpuTemplate::V1N1,
-                },
+                MachineConfigError::DirtyPageTrackingNotSupported,
             ),
             (
                 MachineConfigInput::new(1, 128)
@@ -472,14 +486,33 @@ mod tests {
     }
 
     #[test]
-    fn classifies_all_non_none_cpu_templates_as_deprecated_platform_policies() {
+    fn retains_v1n1_as_pending_static_selection() {
+        let config = MachineConfigInput::new(2, 256)
+            .with_cpu_template(MachineConfigCpuTemplate::V1N1)
+            .validate()
+            .expect("V1N1 should remain pending until start");
+
+        assert_eq!(config.cpu_template(), Some(MachineConfigCpuTemplate::V1N1));
+        let patched = MachineConfigPatchInput::new()
+            .with_mem_size_mib(512)
+            .apply_to(config)
+            .expect("an omitted template patch should preserve V1N1");
+        assert_eq!(patched.cpu_template(), Some(MachineConfigCpuTemplate::V1N1));
+        let cleared = MachineConfigPatchInput::new()
+            .with_cpu_template(MachineConfigCpuTemplate::None)
+            .apply_to(patched)
+            .expect("explicit None should clear V1N1");
+        assert_eq!(cleared.cpu_template(), None);
+    }
+
+    #[test]
+    fn classifies_x86_cpu_templates_as_deprecated_platform_policies() {
         for cpu_template in [
             MachineConfigCpuTemplate::C3,
             MachineConfigCpuTemplate::T2,
             MachineConfigCpuTemplate::T2S,
             MachineConfigCpuTemplate::T2CL,
             MachineConfigCpuTemplate::T2A,
-            MachineConfigCpuTemplate::V1N1,
         ] {
             let error = MachineConfigInput::new(1, 128)
                 .with_cpu_template(cpu_template)
@@ -600,10 +633,14 @@ mod tests {
         );
         assert_eq!(
             MachineConfigError::UnsupportedCpuTemplate {
-                cpu_template: MachineConfigCpuTemplate::V1N1,
+                cpu_template: MachineConfigCpuTemplate::T2A,
             }
             .to_string(),
-            "machine cpu_template V1N1 is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"
+            "machine cpu_template T2A is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"
+        );
+        assert_eq!(
+            MachineConfigError::V1N1SourceModelUnsupported.to_string(),
+            "machine cpu_template V1N1 requires a Neoverse V1 source model that Apple Silicon/HVF cannot represent"
         );
         assert_eq!(
             MachineConfigError::DirtyPageTrackingNotSupported.to_string(),

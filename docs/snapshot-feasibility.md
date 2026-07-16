@@ -284,6 +284,16 @@ order; it does not skip unknown future components:
 | 4 | timer/interrupt/GIC | Normalized timer state, CPU IRQ/FIQ levels, bounded opaque Hypervisor.framework GIC bytes, and all ten EL1 ICC registers. |
 | 5 | baseline device | The exact nested `BANGDEV\0` profile for one read-only root block device, UART, limiter/retry time, VMGenID metadata/policy, and VMClock metadata/policy. |
 
+The no-template machine/profile rule covers both static and custom selection.
+An effective custom ID-register template may start, but native-v1 snapshot
+create rejects it before capture or artifact publication and serializes no
+modifier content. Pending static `V1N1` cannot become a running/paused source
+because its Neoverse V1 source-model gate runs before backend construction.
+Empty custom or explicit machine `None` clears the selection and leaves the
+ordinary profile unchanged. Snapshot load still requires pristine default
+no-template controller state. No schema/version or destination CPU policy is
+added; Wave 6 owns any broader template-bearing profile.
+
 Construction and decode cross-check the machine memory size and one canonical
 DRAM range against the memory binding, the primary MPIDR against CPU identity,
 optional-feature absence/inactivity, the baseline GIC topology, fixed RTC

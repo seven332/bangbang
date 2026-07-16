@@ -23,6 +23,8 @@ Options:
 Environment:
   BANGBANG_GUEST_ARTIFACTS_DIR  Override the guest artifact cache root.
   BANGBANG_MKFS_EXT4            Override the mkfs.ext4 executable path.
+  BANGBANG_RUSTC                Override the rustc executable used to build the
+                                static arm64 ID-register report helper.
 EOF
 }
 
@@ -114,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v40"
+direct_boot_variant="direct-boot-v41"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -304,6 +306,7 @@ prepare_ext4() {
   echo "extracting Firecracker rootfs artifact: $upstream_path" >&2
   unsquashfs -q -no-progress -no-xattrs -d "$extract_dir" "$upstream_path"
   if [[ "$direct_boot_init" == true ]]; then
+    install_arm64_id_register_report_helper
     install_direct_boot_init
   fi
 
@@ -315,6 +318,57 @@ prepare_ext4() {
   tmp_ext4=""
   rm -rf "$extract_dir"
   extract_dir=""
+}
+
+install_arm64_id_register_report_helper() {
+  local helper_source="${repo_root}/scripts/guest/arm64-id-register-report.rs"
+  local helper_path="${extract_dir}/bangbang-arm64-id-register-report"
+  local rustc_path="${BANGBANG_RUSTC:-rustc}"
+  local host_target
+  local rust_lld
+  local rust_sysroot
+  local target_libdir
+
+  if [[ ! -f "$helper_source" ]]; then
+    echo "arm64 ID-register report helper source is missing: $helper_source" >&2
+    exit 1
+  fi
+  if ! command -v "$rustc_path" >/dev/null 2>&1; then
+    echo "rustc is required to build the arm64 ID-register report helper" >&2
+    exit 1
+  fi
+
+  target_libdir="$("$rustc_path" --print target-libdir --target aarch64-unknown-linux-musl 2>/dev/null || true)"
+  if [[ -z "$target_libdir" || ! -d "$target_libdir" ]] \
+    || ! compgen -G "$target_libdir/libcore-*.rlib" >/dev/null; then
+    echo "Rust target aarch64-unknown-linux-musl is required; install it with rustup target add aarch64-unknown-linux-musl" >&2
+    exit 1
+  fi
+  rust_sysroot="$("$rustc_path" --print sysroot)"
+  host_target="$("$rustc_path" -vV | sed -n 's/^host: //p')"
+  rust_lld="$rust_sysroot/lib/rustlib/$host_target/bin/rust-lld"
+  if [[ -z "$host_target" || ! -x "$rust_lld" ]]; then
+    echo "the active Rust toolchain does not provide rust-lld for the host" >&2
+    exit 1
+  fi
+
+  echo "building static arm64 ID-register report helper" >&2
+  "$rustc_path" \
+    "$helper_source" \
+    --edition 2024 \
+    --target aarch64-unknown-linux-musl \
+    --remap-path-prefix "$repo_root=/bangbang" \
+    -C linker="$rust_lld" \
+    -C link-self-contained=no \
+    -C link-arg=--build-id=none \
+    -C link-arg=--entry=_start \
+    -C opt-level=s \
+    -C panic=abort \
+    -C link-arg=-static \
+    -C link-arg=--strip-all \
+    -C relocation-model=static \
+    -o "$helper_path"
+  chmod 0755 "$helper_path"
 }
 
 install_direct_boot_init() {
@@ -370,6 +424,100 @@ write_vdb_marker_at_sector() {
 
 write_vdb_marker() {
   write_vdb_marker_at_sector "$1" 0
+}
+
+cpu_template_report_failure() {
+  emit_line BANGBANG_CPU_TEMPLATE_GUEST_CHECK_FAIL
+  write_vdb_marker BANGBANG_CPU_TEMPLATE_GUEST_CHECK_FAIL
+}
+
+report_cpu_template_ids() {
+  cpu_report=/dev/bangbang-cpu-template-member
+  aggregate_report=/dev/bangbang-cpu-template-report
+
+  if [ ! -x /bangbang-arm64-id-register-report ] \
+    || ! command -v taskset >/dev/null 2>&1 \
+    || [ ! -b /dev/vdb ]; then
+    cpu_template_report_failure
+    return
+  fi
+
+  if ! printf '%s\n' BANGBANG_ARM64_ID_SET_V1 > "$aggregate_report"; then
+    cpu_template_report_failure
+    return
+  fi
+
+  member_count=0
+  for cpu_path in /sys/devices/system/cpu/cpu[0-9]*; do
+    if [ ! -d "$cpu_path" ]; then
+      continue
+    fi
+    cpu=${cpu_path##*cpu}
+    case "$cpu" in
+      "" | *[!0123456789]*) continue ;;
+    esac
+
+    if [ -e "$cpu_path/online" ]; then
+      if ! printf '1\n' > "$cpu_path/online" 2>/dev/null; then
+        cpu_template_report_failure
+        return
+      fi
+      if [ "$(cat "$cpu_path/online" 2>/dev/null || true)" != 1 ]; then
+        cpu_template_report_failure
+        return
+      fi
+    fi
+
+    if ! taskset -c "$cpu" /bangbang-arm64-id-register-report \
+      > "$cpu_report" 2>/dev/null; then
+      cpu_template_report_failure
+      return
+    fi
+    report_size=$(wc -c < "$cpu_report" 2>/dev/null || true)
+    report_lines=$(wc -l < "$cpu_report" 2>/dev/null || true)
+    report_size=${report_size##* }
+    report_lines=${report_lines##* }
+    case "$report_size:$report_lines" in
+      "" | *[!0123456789:]* | *:) cpu_template_report_failure; return ;;
+    esac
+    if [ "$report_size" -gt 160 ] || [ "$report_lines" -ne 5 ] \
+      || [ "$(sed -n '1p' "$cpu_report")" != BANGBANG_ARM64_ID_REPORT_V1 ] \
+      || ! grep -Eq '^pfr0=[0-9a-f]{16}$' "$cpu_report" \
+      || ! grep -Eq '^isar0=[0-9a-f]{16}$' "$cpu_report" \
+      || ! grep -Eq '^isar1=[0-9a-f]{16}$' "$cpu_report" \
+      || ! grep -Eq '^mmfr2=[0-9a-f]{16}$' "$cpu_report"; then
+      cpu_template_report_failure
+      return
+    fi
+
+    if ! printf 'cpu=%s\n' "$cpu" >> "$aggregate_report" \
+      || ! sed -n '2,5p' "$cpu_report" >> "$aggregate_report"; then
+      cpu_template_report_failure
+      return
+    fi
+    member_count=$((member_count + 1))
+    if [ "$member_count" -gt 32 ]; then
+      cpu_template_report_failure
+      return
+    fi
+  done
+
+  aggregate_size=$(wc -c < "$aggregate_report" 2>/dev/null || true)
+  aggregate_size=${aggregate_size##* }
+  case "$aggregate_size" in
+    "" | *[!0123456789]*) cpu_template_report_failure; return ;;
+  esac
+  if [ "$member_count" -eq 0 ] || [ "$aggregate_size" -gt 512 ]; then
+    cpu_template_report_failure
+    return
+  fi
+  if ! dd if="$aggregate_report" of=/dev/vdb bs=512 count=1 conv=sync,notrunc,fsync \
+    2>/dev/null; then
+    cpu_template_report_failure
+    return
+  fi
+
+  emit_line BANGBANG_CPU_TEMPLATE_GUEST_CHECK_OK
 }
 
 first_network_iface() {
@@ -1919,7 +2067,9 @@ if [ -r /proc/cmdline ]; then
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if cmdline_has bangbang.cache-fdt-check=1; then
+if cmdline_has bangbang.cpu-template-report=1; then
+  report_cpu_template_ids
+elif cmdline_has bangbang.cache-fdt-check=1; then
   check_cache_fdt_marker
 elif cmdline_has bangbang.entropy-read=1; then
   read_entropy_marker

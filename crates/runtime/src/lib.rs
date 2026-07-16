@@ -531,6 +531,7 @@ impl std::error::Error for VmmActionError {
 pub struct VmmController {
     instance_info: InstanceInfo,
     machine_config: machine::MachineConfig,
+    custom_cpu_template: Option<cpu::CustomCpuTemplate>,
     boot_source_config: Option<boot::BootSourceConfig>,
     drive_configs: block::DriveConfigs,
     network_interface_configs: network::NetworkInterfaceConfigs,
@@ -576,6 +577,7 @@ impl VmmController {
                 app_name,
             ),
             machine_config: machine::MachineConfig::default(),
+            custom_cpu_template: None,
             boot_source_config: None,
             drive_configs: block::DriveConfigs::new(),
             network_interface_configs: network::NetworkInterfaceConfigs::new(),
@@ -651,6 +653,10 @@ impl VmmController {
 
     pub const fn machine_config(&self) -> machine::MachineConfig {
         self.machine_config
+    }
+
+    pub fn custom_cpu_template(&self) -> Option<&cpu::CustomCpuTemplate> {
+        self.custom_cpu_template.as_ref()
     }
 
     pub fn boot_source_config(&self) -> Option<&boot::BootSourceConfig> {
@@ -1038,6 +1044,12 @@ impl VmmController {
             return Err(VmmActionError::MissingBootSource);
         }
 
+        if self.machine_config.cpu_template() == Some(machine::MachineConfigCpuTemplate::V1N1) {
+            return Err(VmmActionError::MachineConfig(
+                machine::MachineConfigError::V1N1SourceModelUnsupported,
+            ));
+        }
+
         Ok(())
     }
 
@@ -1103,6 +1115,7 @@ impl VmmController {
         let machine_supported = machine_config.vcpu_count() == 1
             && !machine_config.smt()
             && machine_config.cpu_template().is_none()
+            && self.custom_cpu_template.is_none()
             && !machine_config.track_dirty_pages()
             && machine_config.huge_pages() == machine::MachineConfigHugePages::None;
         let drive_supported = match self.drive_configs.as_slice() {
@@ -1127,7 +1140,8 @@ impl VmmController {
 
     fn snapshot_v1_load_profile(&self) -> Result<snapshot::SnapshotV1LoadProfile, VmmActionError> {
         Ok(snapshot::SnapshotV1LoadProfile {
-            machine_is_default: self.machine_config == machine::MachineConfig::default(),
+            machine_is_default: self.machine_config == machine::MachineConfig::default()
+                && self.custom_cpu_template.is_none(),
             boot_source_configured: self.boot_source_config.is_some(),
             drive_configured: !self.drive_configs.as_slice().is_empty(),
             network_configured: !self.network_interface_configs.as_slice().is_empty(),
@@ -1185,6 +1199,7 @@ impl VmmController {
     ) -> bool {
         let (machine_config, drive_configs, serial_config, resume_requested) = commit.into_parts();
         self.machine_config = machine_config;
+        self.custom_cpu_template = None;
         self.drive_configs = drive_configs;
         self.serial_config = serial_config;
         self.snapshot_load_history_fresh = false;
@@ -1584,12 +1599,12 @@ impl VmmController {
                     });
                 }
 
-                if let Some(category) = config.category() {
-                    return Err(VmmActionError::CpuConfig(
-                        cpu::CpuConfigError::unsupported_on_hvf(category),
-                    ));
-                }
+                let custom_cpu_template = config
+                    .into_custom_template()
+                    .map_err(VmmActionError::CpuConfig)?;
 
+                self.custom_cpu_template = custom_cpu_template;
+                self.machine_config = self.machine_config.with_cpu_template_selection(None);
                 Ok(VmmData::Empty)
             }
             VmmAction::PutLogger(config) => {
@@ -1607,9 +1622,18 @@ impl VmmController {
                     });
                 }
 
-                let config = config.validate().map_err(VmmActionError::MachineConfig)?;
-                self.machine_config =
-                    self.validate_machine_config_compatible_with_balloon(config)?;
+                let cpu_template_update = config.cpu_template_update();
+                let mut candidate = config.validate().map_err(VmmActionError::MachineConfig)?;
+                if cpu_template_update.is_none() {
+                    candidate =
+                        candidate.with_cpu_template_selection(self.machine_config.cpu_template());
+                }
+                let candidate = self.validate_machine_config_compatible_with_balloon(candidate)?;
+
+                self.machine_config = candidate;
+                if cpu_template_update.is_some() {
+                    self.custom_cpu_template = None;
+                }
 
                 Ok(VmmData::Empty)
             }
@@ -1621,11 +1645,16 @@ impl VmmController {
                     });
                 }
 
-                let config = config
+                let cpu_template_update = config.cpu_template_update();
+                let candidate = config
                     .apply_to(self.machine_config)
                     .map_err(VmmActionError::MachineConfig)?;
-                self.machine_config =
-                    self.validate_machine_config_compatible_with_balloon(config)?;
+                let candidate = self.validate_machine_config_compatible_with_balloon(candidate)?;
+
+                self.machine_config = candidate;
+                if cpu_template_update.is_some() {
+                    self.custom_cpu_template = None;
+                }
 
                 Ok(VmmData::Empty)
             }
@@ -1841,14 +1870,19 @@ mod tests {
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
-        cpu::{CpuConfigError, CpuConfigInput, CpuConfigTemplateCategory},
+        cpu::{
+            CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigError,
+            CpuConfigInput, CpuConfigKvmCapability, CpuConfigVcpuFeature,
+            KVM_REG_ARM64_ID_AA64PFR0_EL1,
+        },
         entropy::{
             EntropyConfig, EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
         },
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
         machine::{
-            DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigError,
-            MachineConfigHugePages, MachineConfigInput, MachineConfigPatchInput,
+            DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigCpuTemplate,
+            MachineConfigError, MachineConfigHugePages, MachineConfigInput,
+            MachineConfigPatchInput,
         },
         memory_hotplug::{
             MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugConfigInput,
@@ -1878,6 +1912,44 @@ mod tests {
 
     fn drive_input(id: &str, path: &str, is_root_device: bool) -> DriveConfigInput {
         DriveConfigInput::new(id, id, path, is_root_device)
+    }
+
+    fn supported_cpu_config_input() -> CpuConfigInput {
+        CpuConfigInput::new(
+            Vec::new(),
+            vec![CpuConfigArmRegisterModifier::new(
+                KVM_REG_ARM64_ID_AA64PFR0_EL1,
+                CpuConfigArmRegisterWidth::U64,
+                0xf,
+                0x1,
+            )],
+            Vec::new(),
+        )
+    }
+
+    fn kvm_cpu_config_input() -> CpuConfigInput {
+        CpuConfigInput::new(vec![CpuConfigKvmCapability::Add(1)], Vec::new(), Vec::new())
+    }
+
+    fn feature_cpu_config_input() -> CpuConfigInput {
+        CpuConfigInput::new(
+            Vec::new(),
+            Vec::new(),
+            vec![CpuConfigVcpuFeature::new(0, 1, 1)],
+        )
+    }
+
+    fn mixed_cpu_config_input() -> CpuConfigInput {
+        CpuConfigInput::new(
+            vec![CpuConfigKvmCapability::Add(1)],
+            vec![CpuConfigArmRegisterModifier::new(
+                KVM_REG_ARM64_ID_AA64PFR0_EL1,
+                CpuConfigArmRegisterWidth::U64,
+                1,
+                1,
+            )],
+            Vec::new(),
+        )
     }
 
     fn snapshot_create_input(snapshot_type: SnapshotType) -> SnapshotCreateInput {
@@ -2991,6 +3063,11 @@ mod tests {
             controller
                 .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 128)))
                 .expect("two-vCPU machine config should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutCpuConfig(supported_cpu_config_input()))
+                .expect("custom CPU template should be stored");
         });
         assert_snapshot_profile_rejected(|controller| {
             controller
@@ -4170,34 +4247,165 @@ mod tests {
     }
 
     #[test]
-    fn put_cpu_config_custom_template_rejects_not_started_without_mutating() {
+    fn put_cpu_config_stores_supported_template_and_rejects_kvm_inputs() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
             .expect("boot source config should be stored");
 
-        for category in [
-            CpuConfigTemplateCategory::KvmCapabilities,
-            CpuConfigTemplateCategory::VcpuFeatures,
-            CpuConfigTemplateCategory::ArmRegisterModifiers,
-            CpuConfigTemplateCategory::Mixed,
+        assert_eq!(
+            controller.handle_action(VmmAction::PutCpuConfig(supported_cpu_config_input())),
+            Ok(VmmData::Empty)
+        );
+        assert!(controller.custom_cpu_template().is_some());
+
+        for (input, expected) in [
+            (
+                kvm_cpu_config_input(),
+                CpuConfigError::KvmCapabilitiesUnsupported,
+            ),
+            (
+                feature_cpu_config_input(),
+                CpuConfigError::VcpuFeaturesUnsupported,
+            ),
+            (mixed_cpu_config_input(), CpuConfigError::MixedUnsupported),
         ] {
             let err = controller
-                .handle_action(VmmAction::PutCpuConfig(CpuConfigInput::with_category(
-                    category,
-                )))
-                .expect_err("custom CPU config should remain unsupported");
-            assert_eq!(
-                err,
-                VmmActionError::CpuConfig(CpuConfigError::unsupported_on_hvf(category))
-            );
+                .handle_action(VmmAction::PutCpuConfig(input))
+                .expect_err("KVM-specific CPU config should remain unsupported");
+            assert_eq!(err, VmmActionError::CpuConfig(expected));
             assert_eq!(
                 std::error::Error::source(&err).map(ToString::to_string),
-                Some(CpuConfigError::unsupported_on_hvf(category).to_string())
+                Some(expected.to_string())
             );
             assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
             assert!(controller.boot_source_config().is_some());
+            assert!(controller.custom_cpu_template().is_some());
         }
+    }
+
+    #[test]
+    fn static_and_custom_cpu_template_updates_replace_only_when_explicit() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutCpuConfig(supported_cpu_config_input()))
+            .expect("custom CPU template should store");
+
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("omitted static template should preserve the custom template");
+        assert!(controller.custom_cpu_template().is_some());
+        assert_eq!(controller.machine_config().cpu_template(), None);
+
+        controller
+            .handle_action(VmmAction::PatchMachineConfig(
+                MachineConfigPatchInput::new().with_cpu_template(MachineConfigCpuTemplate::None),
+            ))
+            .expect("explicit None should clear the custom template");
+        assert!(controller.custom_cpu_template().is_none());
+        assert_eq!(controller.machine_config().cpu_template(), None);
+
+        controller
+            .handle_action(VmmAction::PutCpuConfig(supported_cpu_config_input()))
+            .expect("custom CPU template should store again");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(
+                MachineConfigInput::new(2, 256).with_cpu_template(MachineConfigCpuTemplate::V1N1),
+            ))
+            .expect("V1N1 should remain pending configuration");
+        assert!(controller.custom_cpu_template().is_none());
+        assert_eq!(
+            controller.machine_config().cpu_template(),
+            Some(MachineConfigCpuTemplate::V1N1)
+        );
+
+        controller
+            .handle_action(VmmAction::PutCpuConfig(CpuConfigInput::noop()))
+            .expect("empty custom template should clear static selection");
+        assert!(controller.custom_cpu_template().is_none());
+        assert_eq!(controller.machine_config().cpu_template(), None);
+    }
+
+    #[test]
+    fn failed_cpu_template_replacements_preserve_the_effective_selection() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutCpuConfig(supported_cpu_config_input()))
+            .expect("custom CPU template should store");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMachineConfig(
+                MachineConfigInput::new(0, 256).with_cpu_template(MachineConfigCpuTemplate::V1N1),
+            )),
+            Err(VmmActionError::MachineConfig(
+                MachineConfigError::InvalidVcpuCount
+            ))
+        );
+        assert!(controller.custom_cpu_template().is_some());
+        assert_eq!(controller.machine_config().cpu_template(), None);
+
+        controller
+            .handle_action(VmmAction::PutMachineConfig(
+                MachineConfigInput::new(1, 128).with_cpu_template(MachineConfigCpuTemplate::V1N1),
+            ))
+            .expect("V1N1 should replace the custom template");
+        assert_eq!(
+            controller.handle_action(VmmAction::PutCpuConfig(kvm_cpu_config_input())),
+            Err(VmmActionError::CpuConfig(
+                CpuConfigError::KvmCapabilitiesUnsupported
+            ))
+        );
+        assert!(controller.custom_cpu_template().is_none());
+        assert_eq!(
+            controller.machine_config().cpu_template(),
+            Some(MachineConfigCpuTemplate::V1N1)
+        );
+    }
+
+    #[test]
+    fn effective_v1n1_fails_before_executor_and_custom_replacement_can_retry_start() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source should store");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(
+                MachineConfigInput::new(1, 128).with_cpu_template(MachineConfigCpuTemplate::V1N1),
+            ))
+            .expect("V1N1 should remain visible before start");
+        let called = Cell::new(false);
+
+        let error = controller
+            .start_instance_with(|_| {
+                called.set(true);
+                Ok(())
+            })
+            .expect_err("V1N1 cannot be represented on Apple Silicon HVF");
+
+        assert_eq!(
+            error,
+            VmmActionError::MachineConfig(MachineConfigError::V1N1SourceModelUnsupported)
+        );
+        assert!(!called.get());
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(
+            controller.machine_config().cpu_template(),
+            Some(MachineConfigCpuTemplate::V1N1)
+        );
+
+        controller
+            .handle_action(VmmAction::PutCpuConfig(supported_cpu_config_input()))
+            .expect("supported custom template should replace pending V1N1");
+        assert_eq!(controller.machine_config().cpu_template(), None);
+        assert!(controller.custom_cpu_template().is_some());
+        controller
+            .start_instance_with(|_| {
+                called.set(true);
+                Ok(())
+            })
+            .expect("replacement should make start retryable");
+        assert!(called.get());
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
     }
 
     #[test]
@@ -4205,8 +4413,8 @@ mod tests {
         for state in [InstanceState::Running, InstanceState::Paused] {
             for input in [
                 CpuConfigInput::noop(),
-                CpuConfigInput::with_category(CpuConfigTemplateCategory::KvmCapabilities),
-                CpuConfigInput::with_category(CpuConfigTemplateCategory::Mixed),
+                kvm_cpu_config_input(),
+                mixed_cpu_config_input(),
             ] {
                 let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
                 controller
@@ -4221,7 +4429,7 @@ mod tests {
                 assert_eq!(
                     err,
                     VmmActionError::UnsupportedState {
-                        action: VmmAction::PutCpuConfig(input).name(),
+                        action: "PutCpuConfig",
                         state,
                     }
                 );

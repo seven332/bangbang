@@ -1539,6 +1539,11 @@ where
     }
 
     #[cfg(test)]
+    pub(crate) fn has_custom_cpu_template(&self) -> bool {
+        self.controller.custom_cpu_template().is_some()
+    }
+
+    #[cfg(test)]
     pub(crate) fn boot_source_config(&self) -> Option<&BootSourceConfig> {
         self.controller.boot_source_config()
     }
@@ -6406,7 +6411,7 @@ mod tests {
         PreparedBlockDevices,
     };
     use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
-    use bangbang_runtime::cpu::{CpuConfigInput, CpuConfigTemplateCategory};
+    use bangbang_runtime::cpu::{CpuConfigInput, CpuConfigKvmCapability};
     use bangbang_runtime::entropy::EntropyConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
@@ -14323,13 +14328,13 @@ mod tests {
         )))
         .expect("vsock should configure");
         assert_eq!(
-            vmm.handle_action(VmmAction::PutCpuConfig(CpuConfigInput::with_category(
-                CpuConfigTemplateCategory::KvmCapabilities
+            vmm.handle_action(VmmAction::PutCpuConfig(CpuConfigInput::new(
+                vec![CpuConfigKvmCapability::Add(1)],
+                Vec::new(),
+                Vec::new(),
             ))),
             Err(VmmActionError::CpuConfig(
-                bangbang_runtime::cpu::CpuConfigError::unsupported_on_hvf(
-                    CpuConfigTemplateCategory::KvmCapabilities
-                )
+                bangbang_runtime::cpu::CpuConfigError::KvmCapabilitiesUnsupported
             ))
         );
         assert_eq!(

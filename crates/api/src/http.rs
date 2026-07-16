@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv4Addr;
 
@@ -13,8 +14,13 @@ const RATE_LIMITER_OPS_FIELD: &str = "ops";
 const TOKEN_BUCKET_SIZE_FIELD: &str = "size";
 const TOKEN_BUCKET_ONE_TIME_BURST_FIELD: &str = "one_time_burst";
 const TOKEN_BUCKET_REFILL_TIME_FIELD: &str = "refill_time";
+const CPU_CONFIG_MAX_ENTRIES_PER_ARRAY: usize = 256;
+const CPU_CONFIG_KVM_VCPU_FEATURE_WORDS: u32 = 7;
+const ARM64_KVM_REG_ARCH_MASK: u64 = 0xff00_0000_0000_0000;
+const ARM64_KVM_REG_ARCH: u64 = 0x6000_0000_0000_0000;
 const ARM64_KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
 const ARM64_KVM_REG_SIZE_SHIFT: u32 = 52;
+const CPU_CONFIG_VALUE_REDACTED: &str = "<redacted>";
 const SNAPSHOT_VALUE_REDACTED: &str = "<redacted>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,51 +269,27 @@ enum ActionTypeBody {
     SendCtrlAltDel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CpuConfigRequest {
-    category: Option<CpuConfigTemplateCategory>,
-}
-
-impl CpuConfigRequest {
-    pub const fn category(&self) -> Option<CpuConfigTemplateCategory> {
-        self.category
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CpuConfigTemplateCategory {
-    KvmCapabilities,
-    VcpuFeatures,
-    ArmRegisterModifiers,
-    Mixed,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CpuConfigRequestBody {
-    #[serde(default)]
     kvm_capabilities: Vec<CpuConfigKvmCapability>,
-    #[serde(default)]
     reg_modifiers: Vec<CpuConfigArmRegisterModifier>,
-    #[serde(default)]
     vcpu_features: Vec<CpuConfigVcpuFeature>,
 }
 
-impl CpuConfigRequestBody {
-    fn validate(&self) -> Result<(), ()> {
-        for capability in &self.kvm_capabilities {
-            capability.validate()?;
-        }
-        for modifier in &self.reg_modifiers {
-            modifier.validate()?;
-        }
-        for feature in &self.vcpu_features {
-            feature.validate()?;
-        }
-        Ok(())
+impl CpuConfigRequest {
+    pub fn kvm_capabilities(&self) -> &[CpuConfigKvmCapability] {
+        &self.kvm_capabilities
     }
 
-    fn category(&self) -> Option<CpuConfigTemplateCategory> {
+    pub fn reg_modifiers(&self) -> &[CpuConfigArmRegisterModifier] {
+        &self.reg_modifiers
+    }
+
+    pub fn vcpu_features(&self) -> &[CpuConfigVcpuFeature] {
+        &self.vcpu_features
+    }
+
+    pub const fn category(&self) -> Option<CpuConfigTemplateCategory> {
         match (
             self.kvm_capabilities.is_empty(),
             self.reg_modifiers.is_empty(),
@@ -322,56 +304,273 @@ impl CpuConfigRequestBody {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-struct CpuConfigKvmCapability(String);
+impl fmt::Debug for CpuConfigRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CpuConfigRequest")
+            .field("category", &self.category())
+            .field("kvm_capability_count", &self.kvm_capabilities.len())
+            .field("reg_modifier_count", &self.reg_modifiers.len())
+            .field("vcpu_feature_count", &self.vcpu_features.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuConfigTemplateCategory {
+    KvmCapabilities,
+    VcpuFeatures,
+    ArmRegisterModifiers,
+    Mixed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CpuConfigKvmCapability {
+    Add(u32),
+    Remove(u32),
+}
 
 impl CpuConfigKvmCapability {
-    fn validate(&self) -> Result<(), ()> {
-        let capability = self.0.strip_prefix('!').unwrap_or(&self.0);
+    pub const fn value(self) -> u32 {
+        match self {
+            Self::Add(value) | Self::Remove(value) => value,
+        }
+    }
+}
+
+impl fmt::Debug for CpuConfigKvmCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let operation = match self {
+            Self::Add(_) => "Add",
+            Self::Remove(_) => "Remove",
+        };
+        f.debug_tuple(operation)
+            .field(&CPU_CONFIG_VALUE_REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuConfigArmRegisterWidth {
+    U32,
+    U64,
+    U128,
+}
+
+impl CpuConfigArmRegisterWidth {
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::U32 => 32,
+            Self::U64 => 64,
+            Self::U128 => 128,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CpuConfigArmRegisterModifier {
+    id: u64,
+    width: CpuConfigArmRegisterWidth,
+    filter: u128,
+    value: u128,
+}
+
+impl CpuConfigArmRegisterModifier {
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+
+    pub const fn width(self) -> CpuConfigArmRegisterWidth {
+        self.width
+    }
+
+    pub const fn filter(self) -> u128 {
+        self.filter
+    }
+
+    pub const fn value(self) -> u128 {
+        self.value
+    }
+}
+
+impl fmt::Debug for CpuConfigArmRegisterModifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CpuConfigArmRegisterModifier")
+            .field("width", &self.width)
+            .field("id", &CPU_CONFIG_VALUE_REDACTED)
+            .field("filter", &CPU_CONFIG_VALUE_REDACTED)
+            .field("value", &CPU_CONFIG_VALUE_REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CpuConfigVcpuFeature {
+    index: u32,
+    filter: u32,
+    value: u32,
+}
+
+impl CpuConfigVcpuFeature {
+    pub const fn index(self) -> u32 {
+        self.index
+    }
+
+    pub const fn filter(self) -> u32 {
+        self.filter
+    }
+
+    pub const fn value(self) -> u32 {
+        self.value
+    }
+}
+
+impl fmt::Debug for CpuConfigVcpuFeature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CpuConfigVcpuFeature")
+            .field("index", &CPU_CONFIG_VALUE_REDACTED)
+            .field("filter", &CPU_CONFIG_VALUE_REDACTED)
+            .field("value", &CPU_CONFIG_VALUE_REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CpuConfigRequestBody {
+    #[serde(default)]
+    kvm_capabilities: Vec<CpuConfigKvmCapabilityBody>,
+    #[serde(default)]
+    reg_modifiers: Vec<CpuConfigArmRegisterModifierBody>,
+    #[serde(default)]
+    vcpu_features: Vec<CpuConfigVcpuFeatureBody>,
+}
+
+impl CpuConfigRequestBody {
+    fn into_request(self) -> Result<CpuConfigRequest, ()> {
+        if self.kvm_capabilities.len() > CPU_CONFIG_MAX_ENTRIES_PER_ARRAY
+            || self.reg_modifiers.len() > CPU_CONFIG_MAX_ENTRIES_PER_ARRAY
+            || self.vcpu_features.len() > CPU_CONFIG_MAX_ENTRIES_PER_ARRAY
+        {
+            return Err(());
+        }
+
+        let mut capability_ids = HashSet::with_capacity(self.kvm_capabilities.len());
+        let mut kvm_capabilities = Vec::with_capacity(self.kvm_capabilities.len());
+        for capability in self.kvm_capabilities {
+            let capability = capability.into_value()?;
+            if !capability_ids.insert(capability.value()) {
+                return Err(());
+            }
+            kvm_capabilities.push(capability);
+        }
+
+        let mut register_ids = HashSet::with_capacity(self.reg_modifiers.len());
+        let mut reg_modifiers = Vec::with_capacity(self.reg_modifiers.len());
+        for modifier in self.reg_modifiers {
+            let modifier = modifier.into_value()?;
+            if !register_ids.insert(modifier.id()) {
+                return Err(());
+            }
+            reg_modifiers.push(modifier);
+        }
+
+        let mut feature_indexes = HashSet::with_capacity(self.vcpu_features.len());
+        let mut vcpu_features = Vec::with_capacity(self.vcpu_features.len());
+        for feature in self.vcpu_features {
+            let feature = feature.into_value()?;
+            if !feature_indexes.insert(feature.index()) {
+                return Err(());
+            }
+            vcpu_features.push(feature);
+        }
+
+        Ok(CpuConfigRequest {
+            kvm_capabilities,
+            reg_modifiers,
+            vcpu_features,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct CpuConfigKvmCapabilityBody(String);
+
+impl CpuConfigKvmCapabilityBody {
+    fn into_value(self) -> Result<CpuConfigKvmCapability, ()> {
+        let (capability, remove) = match self.0.strip_prefix('!') {
+            Some(capability) => (capability, true),
+            None => (self.0.as_str(), false),
+        };
 
         if capability.is_empty() {
             return Err(());
         }
 
-        capability.parse::<u32>().map(|_| ()).map_err(|_| ())
+        let capability = capability.parse::<u32>().map_err(|_| ())?;
+        Ok(if remove {
+            CpuConfigKvmCapability::Remove(capability)
+        } else {
+            CpuConfigKvmCapability::Add(capability)
+        })
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CpuConfigArmRegisterModifier {
+struct CpuConfigArmRegisterModifierBody {
     addr: String,
     bitmap: String,
 }
 
-impl CpuConfigArmRegisterModifier {
-    fn validate(&self) -> Result<(), ()> {
-        let register_id = validate_prefixed_u64(&self.addr)?;
-        let register_bits = validate_arm64_register_bits(register_id)?;
+impl CpuConfigArmRegisterModifierBody {
+    fn into_value(self) -> Result<CpuConfigArmRegisterModifier, ()> {
+        let id = validate_prefixed_u64(&self.addr)?;
+        let width = validate_arm64_register_width(id)?;
         let bitmap = validate_bitmap(&self.bitmap, u128::BITS)?;
 
-        if let Some(limit) = register_bitmap_limit(register_bits)
+        if let Some(limit) = register_bitmap_limit(width.bits())
             && (bitmap.value > limit || bitmap.filter > limit)
         {
             return Err(());
         }
+        if bitmap.value & !bitmap.filter != 0 {
+            return Err(());
+        }
 
-        Ok(())
+        Ok(CpuConfigArmRegisterModifier {
+            id,
+            width,
+            filter: bitmap.filter,
+            value: bitmap.value,
+        })
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CpuConfigVcpuFeature {
+struct CpuConfigVcpuFeatureBody {
     index: u32,
     bitmap: String,
 }
 
-impl CpuConfigVcpuFeature {
-    fn validate(&self) -> Result<(), ()> {
-        let _ = self.index;
-        validate_bitmap(&self.bitmap, u32::BITS).map(|_| ())
+impl CpuConfigVcpuFeatureBody {
+    fn into_value(self) -> Result<CpuConfigVcpuFeature, ()> {
+        if self.index >= CPU_CONFIG_KVM_VCPU_FEATURE_WORDS {
+            return Err(());
+        }
+        let bitmap = validate_bitmap(&self.bitmap, u32::BITS)?;
+        let filter = u32::try_from(bitmap.filter).map_err(|_| ())?;
+        let value = u32::try_from(bitmap.value).map_err(|_| ())?;
+        if value & !filter != 0 {
+            return Err(());
+        }
+
+        Ok(CpuConfigVcpuFeature {
+            index: self.index,
+            filter,
+            value,
+        })
     }
 }
 
@@ -1347,6 +1546,7 @@ pub struct MachineConfigResponse {
     vcpu_count: u8,
     mem_size_mib: u64,
     smt: bool,
+    cpu_template: Option<String>,
     track_dirty_pages: bool,
     huge_pages: String,
 }
@@ -1363,9 +1563,15 @@ impl MachineConfigResponse {
             vcpu_count,
             mem_size_mib,
             smt,
+            cpu_template: None,
             track_dirty_pages,
             huge_pages: huge_pages.into(),
         }
+    }
+
+    pub fn with_cpu_template(mut self, cpu_template: impl Into<String>) -> Self {
+        self.cpu_template = Some(cpu_template.into());
+        self
     }
 }
 
@@ -2356,18 +2562,43 @@ impl HttpResponse {
         track_dirty_pages: bool,
         huge_pages: &str,
     ) -> Self {
-        let body = serde_json::json!({
-            "huge_pages": huge_pages,
-            "mem_size_mib": mem_size_mib,
-            "smt": smt,
-            "track_dirty_pages": track_dirty_pages,
-            "vcpu_count": vcpu_count,
-        })
-        .to_string();
+        Self::machine_config_with_cpu_template(
+            vcpu_count,
+            mem_size_mib,
+            smt,
+            track_dirty_pages,
+            huge_pages,
+            None,
+        )
+    }
+
+    pub fn machine_config_with_cpu_template(
+        vcpu_count: u8,
+        mem_size_mib: u64,
+        smt: bool,
+        track_dirty_pages: bool,
+        huge_pages: &str,
+        cpu_template: Option<&str>,
+    ) -> Self {
+        let mut body = serde_json::Map::new();
+        body.insert("huge_pages".to_string(), serde_json::json!(huge_pages));
+        body.insert("mem_size_mib".to_string(), serde_json::json!(mem_size_mib));
+        body.insert("smt".to_string(), serde_json::json!(smt));
+        body.insert(
+            "track_dirty_pages".to_string(),
+            serde_json::json!(track_dirty_pages),
+        );
+        body.insert("vcpu_count".to_string(), serde_json::json!(vcpu_count));
+        if let Some(cpu_template) = cpu_template {
+            body.insert(
+                "cpu_template".to_string(),
+                serde_json::Value::String(cpu_template.to_string()),
+            );
+        }
 
         Self {
             status: StatusCode::Ok,
-            body,
+            body: serde_json::Value::Object(body).to_string(),
         }
     }
 
@@ -2532,13 +2763,31 @@ impl HttpResponse {
 }
 
 fn machine_config_response_value(config: &MachineConfigResponse) -> serde_json::Value {
-    serde_json::json!({
-        "huge_pages": config.huge_pages.as_str(),
-        "mem_size_mib": config.mem_size_mib,
-        "smt": config.smt,
-        "track_dirty_pages": config.track_dirty_pages,
-        "vcpu_count": config.vcpu_count,
-    })
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "huge_pages".to_string(),
+        serde_json::json!(config.huge_pages.as_str()),
+    );
+    body.insert(
+        "mem_size_mib".to_string(),
+        serde_json::json!(config.mem_size_mib),
+    );
+    body.insert("smt".to_string(), serde_json::json!(config.smt));
+    body.insert(
+        "track_dirty_pages".to_string(),
+        serde_json::json!(config.track_dirty_pages),
+    );
+    body.insert(
+        "vcpu_count".to_string(),
+        serde_json::json!(config.vcpu_count),
+    );
+    if let Some(cpu_template) = &config.cpu_template {
+        body.insert(
+            "cpu_template".to_string(),
+            serde_json::Value::String(cpu_template.clone()),
+        );
+    }
+    serde_json::Value::Object(body)
 }
 
 fn boot_source_response_value(boot_source: &BootSourceResponse) -> serde_json::Value {
@@ -3101,12 +3350,11 @@ fn parse_cpu_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
 
     let body = serde_json::from_slice::<CpuConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    body.validate()
+    let request = body
+        .into_request()
         .map_err(|()| RequestError::MalformedRequest)?;
 
-    Ok(ApiRequest::PutCpuConfig(Box::new(CpuConfigRequest {
-        category: body.category(),
-    })))
+    Ok(ApiRequest::PutCpuConfig(Box::new(request)))
 }
 
 fn validate_cpu_config_json_shape(value: &serde_json::Value) -> Result<(), ()> {
@@ -3181,11 +3429,15 @@ fn parse_prefixed_integer<T>(
     parse(digits, radix).map_err(|_| ())
 }
 
-fn validate_arm64_register_bits(register_id: u64) -> Result<u32, ()> {
+fn validate_arm64_register_width(register_id: u64) -> Result<CpuConfigArmRegisterWidth, ()> {
+    if register_id & ARM64_KVM_REG_ARCH_MASK != ARM64_KVM_REG_ARCH {
+        return Err(());
+    }
+
     match (register_id & ARM64_KVM_REG_SIZE_MASK) >> ARM64_KVM_REG_SIZE_SHIFT {
-        2 => Ok(32),
-        3 => Ok(64),
-        4 => Ok(128),
+        2 => Ok(CpuConfigArmRegisterWidth::U32),
+        3 => Ok(CpuConfigArmRegisterWidth::U64),
+        4 => Ok(CpuConfigArmRegisterWidth::U128),
         _ => Err(()),
     }
 }
@@ -6800,23 +7052,23 @@ mod tests {
                 CpuConfigTemplateCategory::KvmCapabilities,
             ),
             (
-                r#"{"reg_modifiers":[{"addr":"0x0030000000000000","bitmap":"0b10100101"}]}"#,
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"}]}"#,
                 CpuConfigTemplateCategory::ArmRegisterModifiers,
             ),
             (
-                r#"{"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
+                r#"{"vcpu_features":[{"index":6,"bitmap":"0b11010011"}]}"#,
                 CpuConfigTemplateCategory::VcpuFeatures,
             ),
             (
-                r#"{"kvm_capabilities":["4294967295"],"reg_modifiers":[{"addr":"0x0030000000000000","bitmap":"0b10100101"}]}"#,
+                r#"{"kvm_capabilities":["4294967295"],"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"}]}"#,
                 CpuConfigTemplateCategory::Mixed,
             ),
             (
-                r#"{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
+                r#"{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":6,"bitmap":"0b11010011"}]}"#,
                 CpuConfigTemplateCategory::Mixed,
             ),
             (
-                r#"{"reg_modifiers":[{"addr":"0x0030000000000000","bitmap":"0b10100101"}],"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"}],"vcpu_features":[{"index":6,"bitmap":"0b11010011"}]}"#,
                 CpuConfigTemplateCategory::Mixed,
             ),
         ] {
@@ -6831,9 +7083,8 @@ mod tests {
             let debug = format!("{config:?}");
             for raw_value in [
                 "4294967295",
-                "0x0030000000000000",
+                "0x603000000013c020",
                 "0b10100101",
-                "31415926",
                 "0b11010011",
             ] {
                 assert!(!debug.contains(raw_value), "{body}: {debug}");
@@ -6847,13 +7098,13 @@ mod tests {
             "kvm_capabilities": ["1", "!2"],
             "reg_modifiers": [
                 {
-                    "addr": "0x0030000000000000",
+                    "addr": "0x603000000013c020",
                     "bitmap": "0bx00100x0x1xxxx01xxx1xxxxxxxxxxx1"
                 }
             ],
             "vcpu_features": [
                 {
-                    "index": 0,
+                    "index": 6,
                     "bitmap": "0b1100000"
                 }
             ]
@@ -6866,6 +7117,250 @@ mod tests {
             panic!("expected cpu-config request");
         };
         assert_eq!(config.category(), Some(CpuConfigTemplateCategory::Mixed));
+    }
+
+    #[test]
+    fn retains_ordered_cpu_config_values_for_every_register_width() {
+        let binary_register_id = format!("0b{:064b}", 0x6020_0000_0010_0000_u64);
+        let body = format!(
+            r#"{{
+                "kvm_capabilities": ["4000000001", "!4000000002"],
+                "reg_modifiers": [
+                    {{"addr":"{binary_register_id}","bitmap":"0b10x1"}},
+                    {{"addr":"0x603000000013c030","bitmap":"0b1x0"}},
+                    {{"addr":"0x6040000000100002","bitmap":"0b1_xx0"}}
+                ],
+                "vcpu_features": [
+                    {{"index":0,"bitmap":"0b1x01"}},
+                    {{"index":6,"bitmap":"xx10"}}
+                ]
+            }}"#
+        );
+
+        let parsed = parse_request(&request_with_body("PUT", "/cpu-config", &body))
+            .expect("lossless cpu-config should parse");
+        let ApiRequest::PutCpuConfig(config) = parsed else {
+            panic!("expected cpu-config request");
+        };
+
+        assert_eq!(
+            config.kvm_capabilities(),
+            &[
+                CpuConfigKvmCapability::Add(4_000_000_001),
+                CpuConfigKvmCapability::Remove(4_000_000_002),
+            ]
+        );
+
+        let modifiers = config.reg_modifiers();
+        assert_eq!(modifiers.len(), 3);
+        assert_eq!(modifiers[0].id(), 0x6020_0000_0010_0000);
+        assert_eq!(modifiers[0].width(), CpuConfigArmRegisterWidth::U32);
+        assert_eq!((modifiers[0].filter(), modifiers[0].value()), (0xd, 0x9));
+        assert_eq!(modifiers[1].id(), 0x6030_0000_0013_c030);
+        assert_eq!(modifiers[1].width(), CpuConfigArmRegisterWidth::U64);
+        assert_eq!((modifiers[1].filter(), modifiers[1].value()), (0x5, 0x4));
+        assert_eq!(modifiers[2].id(), 0x6040_0000_0010_0002);
+        assert_eq!(modifiers[2].width(), CpuConfigArmRegisterWidth::U128);
+        assert_eq!((modifiers[2].filter(), modifiers[2].value()), (0x9, 0x8));
+
+        let features = config.vcpu_features();
+        assert_eq!(features.len(), 2);
+        assert_eq!(
+            (
+                features[0].index(),
+                features[0].filter(),
+                features[0].value()
+            ),
+            (0, 0xb, 0x9)
+        );
+        assert_eq!(
+            (
+                features[1].index(),
+                features[1].filter(),
+                features[1].value()
+            ),
+            (6, 0x3, 0x2)
+        );
+
+        let debug = format!("{config:?}");
+        for secret in [
+            "4000000001",
+            "4000000002",
+            binary_register_id.as_str(),
+            "603000000013c030",
+            "6040000000100002",
+            "0xd",
+            "0x9",
+            "0xb",
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret}: {debug}");
+        }
+        for value in config.kvm_capabilities() {
+            assert!(!format!("{value:?}").contains(&value.value().to_string()));
+        }
+        assert_eq!(
+            format!("{:?}", modifiers[0]),
+            "CpuConfigArmRegisterModifier { width: U32, id: \"<redacted>\", filter: \"<redacted>\", value: \"<redacted>\" }"
+        );
+        assert_eq!(
+            format!("{:?}", features[0]),
+            "CpuConfigVcpuFeature { index: \"<redacted>\", filter: \"<redacted>\", value: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
+    fn retains_canonical_v1n1_register_masks_exactly() {
+        fn ternary_bitmap(filter: u64, value: u64) -> String {
+            assert_eq!(value & !filter, 0);
+            let mut bitmap = String::from("0b");
+            for bit in (0..u64::BITS).rev() {
+                let mask = 1_u64 << bit;
+                bitmap.push(if filter & mask == 0 {
+                    'x'
+                } else if value & mask == 0 {
+                    '0'
+                } else {
+                    '1'
+                });
+            }
+            bitmap
+        }
+
+        let expected = [
+            (0x6030_0000_0013_c020_u64, 0x000f_000f_0000_0000, 0),
+            (
+                0x6030_0000_0013_c030,
+                0xf0ff_0fff_0000_f000,
+                0x0000_0000_0000_1000,
+            ),
+            (
+                0x6030_0000_0013_c031,
+                0x00ff_f000_00ff_f00f,
+                0x0000_0000_0010_0001,
+            ),
+            (0x6030_0000_0013_c03a, 0x0000_000f_0000_0000, 0),
+        ];
+        let modifiers = expected
+            .iter()
+            .map(|(id, filter, value)| {
+                format!(
+                    r#"{{"addr":"0x{id:016x}","bitmap":"{}"}}"#,
+                    ternary_bitmap(*filter, *value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(r#"{{"reg_modifiers":[{modifiers}]}}"#);
+
+        let parsed = parse_request(&request_with_body("PUT", "/cpu-config", &body))
+            .expect("canonical V1N1-equivalent custom template should parse");
+        let ApiRequest::PutCpuConfig(config) = parsed else {
+            panic!("expected cpu-config request");
+        };
+
+        assert_eq!(config.reg_modifiers().len(), expected.len());
+        for (modifier, (id, filter, value)) in config.reg_modifiers().iter().zip(expected) {
+            assert_eq!(modifier.id(), id);
+            assert_eq!(modifier.width(), CpuConfigArmRegisterWidth::U64);
+            assert_eq!(modifier.filter(), u128::from(filter));
+            assert_eq!(modifier.value(), u128::from(value));
+        }
+    }
+
+    #[test]
+    fn enforces_cpu_config_collection_and_feature_bounds() {
+        let capabilities = (0..CPU_CONFIG_MAX_ENTRIES_PER_ARRAY)
+            .map(|index| format!("\"{}\"", 1_000_000_000_u32 + index as u32))
+            .collect::<Vec<_>>()
+            .join(",");
+        let exact_capability_body = format!(r#"{{"kvm_capabilities":[{capabilities}]}}"#);
+        assert!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/cpu-config",
+                &exact_capability_body,
+            ))
+            .is_ok()
+        );
+
+        let excessive_capabilities = format!("{capabilities},\"2000000000\"");
+        let excessive_capability_body =
+            format!(r#"{{"kvm_capabilities":[{excessive_capabilities}]}}"#);
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/cpu-config",
+                &excessive_capability_body,
+            )),
+            Err(RequestError::MalformedRequest)
+        );
+
+        let modifiers = (0..CPU_CONFIG_MAX_ENTRIES_PER_ARRAY)
+            .map(|index| {
+                format!(
+                    r#"{{"addr":"0x{:016x}","bitmap":"0bx"}}"#,
+                    0x6030_0000_0010_0000_u64 + index as u64
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let exact_modifier_body = format!(r#"{{"reg_modifiers":[{modifiers}]}}"#);
+        assert!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/cpu-config",
+                &exact_modifier_body
+            ))
+            .is_ok()
+        );
+
+        let excessive_modifiers =
+            format!(r#"{modifiers},{{"addr":"0x6030000000101000","bitmap":"0bx"}}"#);
+        let excessive_modifier_body = format!(r#"{{"reg_modifiers":[{excessive_modifiers}]}}"#);
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/cpu-config",
+                &excessive_modifier_body,
+            )),
+            Err(RequestError::MalformedRequest)
+        );
+
+        let seven_features = (0..CPU_CONFIG_KVM_VCPU_FEATURE_WORDS)
+            .map(|index| format!(r#"{{"index":{index},"bitmap":"0bx"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/cpu-config",
+                &format!(r#"{{"vcpu_features":[{seven_features}]}}"#),
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/cpu-config",
+                r#"{"vcpu_features":[{"index":7,"bitmap":"0bx"}]}"#,
+            )),
+            Err(RequestError::MalformedRequest)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_cpu_config_identities() {
+        for body in [
+            r#"{"kvm_capabilities":["42","!42"]}"#,
+            r#"{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0bx"},{"addr":"0x603000000013c020","bitmap":"0b1"}]}"#,
+            r#"{"vcpu_features":[{"index":3,"bitmap":"0bx"},{"index":3,"bitmap":"0b1"}]}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/cpu-config", body)),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
     }
 
     #[test]
@@ -6889,9 +7384,12 @@ mod tests {
             r#"{"reg_modifiers":[{"addr":"1","bitmap":"0b1"}]}"#,
             r#"{"reg_modifiers":[{"addr":"0x1","bitmap":"0b2"}]}"#,
             r#"{"reg_modifiers":[{"addr":"0x0010000000000000","bitmap":"0b1"}]}"#,
+            r#"{"reg_modifiers":[{"addr":"0x6010000000000000","bitmap":"0b1"}]}"#,
+            r#"{"reg_modifiers":[{"addr":"0x6020000000000000","bitmap":"0b100000000000000000000000000000000"}]}"#,
             r#"{"reg_modifiers":[["0x0030000000000000","0b1"]]}"#,
             r#"{"vcpu_features":[[0,"0b1"]]}"#,
             r#"{"vcpu_features":[{"index":4294967296,"bitmap":"0b1"}]}"#,
+            r#"{"vcpu_features":[{"index":7,"bitmap":"0b1"}]}"#,
         ] {
             let request = request_with_body("PUT", "/cpu-config", body);
 
@@ -6903,7 +7401,7 @@ mod tests {
         }
 
         let high_bit_body = format!(
-            r#"{{"reg_modifiers":[{{"addr":"0x0030000000000000","bitmap":"0b1{}"}}]}}"#,
+            r#"{{"reg_modifiers":[{{"addr":"0x603000000013c020","bitmap":"0b1{}"}}]}}"#,
             "0".repeat(64)
         );
         let request = request_with_body("PUT", "/cpu-config", &high_bit_body);

@@ -31,6 +31,10 @@ claims mechanically visible.
   macOS bundle/worker boundary, its executable evidence, and the remaining
   #1351 isolation/resource/seccomp outcomes without treating them as direct
   Linux jailer parity.
+- [`cpu-template-contract.md`](cpu-template-contract.md) records the bounded
+  custom four-register subset, transactional static/custom selection, strict
+  KVM/static execution exclusions, startup/readback/cleanup order, snapshot
+  boundary, and #1394/Wave handoffs.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -145,11 +149,16 @@ three `missing-platform-feasible`, and eight
 snapshot-quiescence lifecycle records. #1391 promotes the individual
 MachineConfiguration vCPU, target-bounded memory, and aarch64 SMT leaves and
 certifies the exact `2M` property plus pinned hugepages corpus as public arm64
-macOS/XNU/HVF platform exclusions. The current 417-record delivery inventory is
-38 `implemented-and-verified`, 366 `audit-required`, three
-`missing-platform-feasible`, and ten `proven-platform-impossible` records.
-Aggregate machine operations/schema remain open for CPU-template and dirty
-siblings.
+macOS/XNU/HVF platform exclusions. #1392 adds the verified arm64 cache
+presentation record. #1393 implements the bounded four-ID-register custom
+template subset and certifies exactly seven narrow KVM/static schema leaves as
+platform-impossible: machine `cpu_template`, `CpuTemplate`, KVM capabilities,
+KVM vCPU-init features, both `VcpuFeatures` properties, and its schema. The
+current 418-record delivery inventory is 39 `implemented-and-verified`, 359
+`audit-required`, three `missing-platform-feasible`, and 17
+`proven-platform-impossible` records. Aggregate CPU operations/schema,
+register-modifier leaves, corpora, and helper tools remain open for #1394 and
+Wave 7; dirty siblings remain with the later #1388 slices.
 
 ## Commands
 

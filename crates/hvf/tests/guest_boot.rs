@@ -41,7 +41,13 @@ const CACHE_FDT_GUEST_CHECK_MARKER: &[u8] = b"BANGBANG_CACHE_FDT_GUEST_CHECK_OK"
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CACHE_FDT_GUEST_FAILURE_MARKER: &[u8] = b"BANGBANG_CACHE_FDT_GUEST_CHECK_FAIL";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CPU_TEMPLATE_GUEST_CHECK_MARKER: &[u8] = b"BANGBANG_CPU_TEMPLATE_GUEST_CHECK_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CPU_TEMPLATE_GUEST_FAILURE_MARKER: &[u8] = b"BANGBANG_CPU_TEMPLATE_GUEST_CHECK_FAIL";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CACHE_REPORT_HEADER: &str = "BANGBANG_CACHE_REPORT_V1";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CPU_TEMPLATE_REPORT_HEADER: &str = "BANGBANG_ARM64_ID_SET_V1";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CACHE_REPORT_BACKING_SIZE: u64 = 64 * 1024;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -461,6 +467,169 @@ fn boots_two_cpu_linux_and_matches_cache_sysfs_to_retained_model() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn two_cpu_linux_observes_exact_custom_id_register_mask_results() {
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let baseline_backing = GuestBlockBacking::zeroed();
+    let custom_backing = GuestBlockBacking::zeroed();
+
+    let baseline_observation = run_guest_cpu_template_report(
+        "guest-cpu-template-baseline",
+        &rootfs_path,
+        &baseline_backing,
+        false,
+    );
+    let custom_observation = run_guest_cpu_template_report(
+        "guest-cpu-template-custom",
+        &rootfs_path,
+        &custom_backing,
+        true,
+    );
+    for observation in [&baseline_observation, &custom_observation] {
+        assert_guest_boot_observed_marker(
+            observation,
+            CPU_TEMPLATE_GUEST_CHECK_MARKER,
+            "CPU-template guest report marker",
+        );
+        assert!(
+            !bytes_contain_marker(&observation.serial_bytes, CPU_TEMPLATE_GUEST_FAILURE_MARKER),
+            "CPU-template guest report must not emit its fixed failure marker\nserial output:\n{}",
+            String::from_utf8_lossy(&observation.serial_bytes)
+        );
+        assert_eq!(observation.boot_diagnostics.vcpu_mpidrs, [0, 1]);
+    }
+
+    let baseline = parse_guest_cpu_template_report(&baseline_backing.bytes());
+    let custom = parse_guest_cpu_template_report(&custom_backing.bytes());
+    assert_eq!(
+        baseline.iter().map(|record| record.cpu).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(
+        custom.iter().map(|record| record.cpu).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    for register_index in 0..4 {
+        assert!(
+            baseline[0].values[register_index] == baseline[1].values[register_index],
+            "baseline Linux ID-register view must agree across both vCPUs at register position {register_index}"
+        );
+        assert!(
+            custom[0].values[register_index] == custom[1].values[register_index],
+            "custom Linux ID-register view must agree across both vCPUs at register position {register_index}"
+        );
+    }
+
+    let masks = [
+        (0x000f_000f_0000_0000, 0),
+        (0xf0ff_0fff_0000_f000, 0x1000),
+        (0x00ff_f000_00ff_f00f, 0x0010_0001),
+        (0x0000_000f_0000_0000, 0),
+    ];
+    for (baseline_record, custom_record) in baseline.iter().zip(&custom) {
+        assert_eq!(baseline_record.cpu, custom_record.cpu);
+        for (index, (filter, value)) in masks.into_iter().enumerate() {
+            assert!(
+                custom_record.values[index] == (baseline_record.values[index] & !filter) | value,
+                "custom guest value must equal the exact baseline mask result for CPU {} register index {index}",
+                baseline_record.cpu
+            );
+        }
+    }
+
+    for observation in [&baseline_observation, &custom_observation] {
+        for record in baseline.iter().chain(&custom) {
+            for value in record.values {
+                let encoded = format!("{value:016x}");
+                assert!(
+                    !observation
+                        .serial_bytes
+                        .windows(encoded.len())
+                        .any(|window| window == encoded.as_bytes()),
+                    "guest serial output must not contain raw ID-register values"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_guest_cpu_template_report(
+    instance_id: &str,
+    rootfs_path: &std::path::Path,
+    report_backing: &GuestBlockBacking,
+    custom: bool,
+) -> GuestBootObservation {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+    use bangbang_runtime::cpu::{
+        CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigInput,
+        KVM_REG_ARM64_ID_AA64ISAR0_EL1, KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+        KVM_REG_ARM64_ID_AA64MMFR2_EL1, KVM_REG_ARM64_ID_AA64PFR0_EL1,
+    };
+    use bangbang_runtime::machine::MachineConfigInput;
+
+    let boot_args = format!("{DIRECT_ROOTFS_BOOT_ARGS} maxcpus=1 bangbang.cpu-template-report=1");
+    run_guest_boot_without_initrd_until_marker(
+        instance_id,
+        CPU_TEMPLATE_GUEST_CHECK_MARKER,
+        &boot_args,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 128)))
+                .expect("two-vCPU CPU-template evidence machine config should store");
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path, true)
+                        .with_is_read_only(true),
+                ))
+                .expect("CPU-template evidence rootfs drive should configure");
+            controller
+                .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                    "cpu_report",
+                    "cpu_report",
+                    report_backing.path(),
+                    false,
+                )))
+                .expect("CPU-template evidence scratch drive should configure");
+            if custom {
+                let modifier = |id, filter, value| {
+                    CpuConfigArmRegisterModifier::new(
+                        id,
+                        CpuConfigArmRegisterWidth::U64,
+                        filter,
+                        value,
+                    )
+                };
+                controller
+                    .handle_action(VmmAction::PutCpuConfig(CpuConfigInput::new(
+                        Vec::new(),
+                        vec![
+                            modifier(KVM_REG_ARM64_ID_AA64PFR0_EL1, 0x000f_000f_0000_0000, 0),
+                            modifier(
+                                KVM_REG_ARM64_ID_AA64ISAR0_EL1,
+                                0xf0ff_0fff_0000_f000,
+                                0x1000,
+                            ),
+                            modifier(
+                                KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+                                0x00ff_f000_00ff_f00f,
+                                0x0010_0001,
+                            ),
+                            modifier(KVM_REG_ARM64_ID_AA64MMFR2_EL1, 0x0000_000f_0000_0000, 0),
+                        ],
+                        Vec::new(),
+                    )))
+                    .expect("canonical guest CPU template should store");
+            }
+        },
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn boots_firecracker_kernel_exposes_vmgenid_to_guest() {
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::DriveConfigInput;
@@ -724,6 +893,77 @@ struct GuestBootObservation {
     run_diagnostics: GuestBootRunDiagnostics,
     serial_bytes: Vec<u8>,
     cache_hierarchy: bangbang_runtime::fdt::Arm64FdtCacheHierarchy,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GuestCpuTemplateReportRecord {
+    cpu: u32,
+    values: [u64; 4],
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn parse_guest_cpu_template_report(backing: &[u8]) -> Vec<GuestCpuTemplateReportRecord> {
+    let report_end = backing
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(backing.len());
+    assert!(
+        backing[report_end..].iter().all(|byte| *byte == 0),
+        "CPU-template report bytes after the bounded payload should remain zero"
+    );
+    let report =
+        std::str::from_utf8(&backing[..report_end]).expect("CPU-template report should be UTF-8");
+    let mut lines = report.lines();
+    assert_eq!(
+        lines.next(),
+        Some(CPU_TEMPLATE_REPORT_HEADER),
+        "CPU-template report should start with its version marker"
+    );
+
+    let mut records = Vec::new();
+    while let Some(cpu_line) = lines.next() {
+        let cpu = cpu_line
+            .strip_prefix("cpu=")
+            .expect("CPU-template member should begin with cpu=")
+            .parse()
+            .expect("CPU-template member index should be an unsigned integer");
+        let mut values = [0_u64; 4];
+        for (index, name) in ["pfr0=", "isar0=", "isar1=", "mmfr2="]
+            .into_iter()
+            .enumerate()
+        {
+            let line = lines
+                .next()
+                .expect("CPU-template member should contain all four registers");
+            let value = line
+                .strip_prefix(name)
+                .expect("CPU-template register order should be canonical");
+            assert_eq!(
+                value.len(),
+                16,
+                "CPU-template register should contain exactly 64 bits"
+            );
+            assert!(
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "CPU-template register should contain lowercase hexadecimal digits"
+            );
+            values[index] = u64::from_str_radix(value, 16)
+                .expect("CPU-template register should contain lowercase hexadecimal digits");
+        }
+        records.push(GuestCpuTemplateReportRecord { cpu, values });
+    }
+    assert!(
+        !records.is_empty(),
+        "CPU-template report should contain members"
+    );
+    assert!(
+        records.windows(2).all(|pair| pair[0].cpu < pair[1].cpu),
+        "CPU-template report members should be unique and ordered"
+    );
+    records
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -6043,7 +6043,7 @@ mod tests {
         let config_path = unique_config_path("cpu-config");
         fs::write(
             &config_path,
-            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":6,"bitmap":"0b11010011"}]}}"#,
         )
         .expect("config file should be written");
         let mut vmm = ProcessVmm::with_starter(
@@ -6063,18 +6063,16 @@ mod tests {
             &err,
             ProcessError::ConfigFile(super::ConfigFileError::Apply(
                 bangbang_runtime::VmmActionError::CpuConfig(
-                    bangbang_runtime::cpu::CpuConfigError::UnsupportedOnHvf {
-                        category: bangbang_runtime::cpu::CpuConfigTemplateCategory::Mixed
-                    }
+                    bangbang_runtime::cpu::CpuConfigError::MixedUnsupported
                 )
             ))
         ));
         let display = err.to_string();
         let debug = format!("{err:?}");
         assert!(display.contains(
-            "mixed cpu-config categories are KVM-specific and are not supported on arm64 HVF"
+            "mixed cpu-config categories include KVM-specific or unsupported inputs on arm64 HVF"
         ));
-        for raw_value in ["4294967295", "31415926", "0b11010011"] {
+        for raw_value in ["4294967295", "0b11010011"] {
             assert!(!display.contains(raw_value));
             assert!(!debug.contains(raw_value));
         }
@@ -6178,6 +6176,108 @@ mod tests {
 
         assert_eq!(vmm.instance_info().state, InstanceState::Running);
         assert!(vmm.has_started_session());
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_effective_v1n1_fails_before_instance_starter() {
+        let config_path = unique_config_path("v1n1-cpu-template");
+        fs::write(
+            &config_path,
+            r#"{
+                "machine-config":{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"},
+                "boot-source":{"kernel_image_path":"/tmp/vmlinux"}
+            }"#,
+        )
+        .expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let error = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("effective V1N1 should fail before the starter");
+
+        assert!(matches!(
+            error,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                bangbang_runtime::VmmActionError::MachineConfig(
+                    bangbang_runtime::machine::MachineConfigError::V1N1SourceModelUnsupported
+                )
+            ))
+        ));
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(
+            vmm.machine_config().cpu_template(),
+            Some(bangbang_runtime::machine::MachineConfigCpuTemplate::V1N1)
+        );
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_custom_cpu_config_overrides_v1n1_and_starts_instance() {
+        let config_path = unique_config_path("custom-overrides-v1n1");
+        fs::write(
+            &config_path,
+            r#"{
+                "machine-config":{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"},
+                "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+                "cpu-config":{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"}]}
+            }"#,
+        )
+        .expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("custom CPU config should override pending V1N1");
+
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
+        assert_eq!(vmm.machine_config().cpu_template(), None);
+        assert!(vmm.has_custom_cpu_template());
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_empty_cpu_config_clears_v1n1_and_starts_instance() {
+        let config_path = unique_config_path("empty-clears-v1n1");
+        fs::write(
+            &config_path,
+            r#"{
+                "machine-config":{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"},
+                "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+                "cpu-config":{}
+            }"#,
+        )
+        .expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("empty CPU config should clear pending V1N1");
+
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
+        assert_eq!(vmm.machine_config().cpu_template(), None);
+        assert!(!vmm.has_custom_cpu_template());
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }

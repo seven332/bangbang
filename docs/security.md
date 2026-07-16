@@ -1180,19 +1180,25 @@ is resource-specific:
   retained FDT hierarchy or change the snapshot schema. These internal needs do
   not authorize logging the raw source or treating it as a safe live CSSELR
   restore policy.
-  Firecracker-shaped custom CPU-template values have a narrower control-plane
-  boundary. The HTTP/config-file parser validates KVM capability identifiers,
-  KVM vCPU-init feature indexes, arm register identifiers, and bitmaps, then
-  discards every raw value and retains only a singleton or mixed category.
-  Runtime actions, `Debug`, platform errors, logs, `GET /vm/config`, backend
-  construction, and snapshots therefore receive no modifier values. Empty
-  input stores nothing. Non-empty categories fail before mutation or VM
-  construction because Hypervisor.framework exposes feature/cache queries but
-  no equivalent contract for setting the created guest feature view. Existing
-  live general/system-register setters are execution-state primitives and must
-  not be repurposed as arbitrary CPU feature masks. Any future writable subset
-  requires a separate Apple API, destination feature-view, atomicity,
-  persistence, and snapshot-policy review.
+  Firecracker-shaped custom CPU-template values have a narrower untrusted
+  control-plane boundary. The HTTP/config-file parser retains bounded ordered
+  KVM capability, KVM vCPU-init feature, and 32/64/128-bit arm one-register
+  values, but every aggregate has manual value-redacted `Debug`. Only four
+  reviewed 64-bit identification registers can become executable state. All
+  requested baselines are read on every vCPU before the first write; targets
+  are computed once, then every owner writes and immediately rereads each one.
+  Any mapping/read/write/mismatch failure destroys the complete unpublished VM
+  because live register mutation is not rollback-safe.
+  The allowlist and exact readback do not make an arbitrary mask safe: a custom
+  view can still crash a guest or create an incoherent/insecure instruction
+  contract. Raw capability numbers, indexes, register identities, masks,
+  baselines, targets, and readbacks must not enter product `Debug`, `Display`,
+  HTTP faults, logs, metrics, or serial output. Custom contents remain omitted
+  from GET and excluded from native-v1 snapshots. KVM capability/feature
+  namespaces have fixed platform faults. Pending static `V1N1` fails before
+  executor/backend construction because live writes cannot establish its
+  documented Neoverse V1 source model on Apple Silicon. The complete boundary
+  is checked in `compat/firecracker/v1.16.0/cpu-template-contract.md`.
   Breakpoint value registers can expose guest virtual addresses, Context IDs,
   or VMIDs. Watchpoint value registers expose guest data virtual addresses, and
   their controls can encode access type, byte selection, linking, and enabled
