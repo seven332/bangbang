@@ -1,6 +1,46 @@
 use std::fmt;
 use std::io;
 
+/// Firecracker jailer isolation arguments that have no equivalent macOS process boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JailerIsolationArgument {
+    /// Configure one Linux cgroup controller property.
+    Cgroup,
+    /// Select the Linux cgroup hierarchy version.
+    CgroupVersion,
+    /// Select the parent Linux cgroup.
+    ParentCgroup,
+    /// Join a path-named Linux network namespace.
+    NetworkNamespace,
+    /// Create a nested Linux PID namespace.
+    PidNamespace,
+}
+
+impl JailerIsolationArgument {
+    /// Return the fixed Firecracker jailer argument name without its `--` prefix.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cgroup => "cgroup",
+            Self::CgroupVersion => "cgroup-version",
+            Self::ParentCgroup => "parent-cgroup",
+            Self::NetworkNamespace => "netns",
+            Self::PidNamespace => "new-pid-ns",
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "cgroup" => Some(Self::Cgroup),
+            "cgroup-version" => Some(Self::CgroupVersion),
+            "parent-cgroup" => Some(Self::ParentCgroup),
+            "netns" => Some(Self::NetworkNamespace),
+            "new-pid-ns" => Some(Self::PidNamespace),
+            _ => None,
+        }
+    }
+}
+
 /// Stable launcher failure categories that do not expose package paths or tool output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LauncherError {
@@ -26,6 +66,8 @@ pub enum LauncherError {
     InvalidGrantInput,
     /// The versioned production launch-control envelope is invalid.
     InvalidLaunchPolicy,
+    /// A Linux-only Firecracker jailer isolation argument was requested on macOS.
+    UnsupportedJailerIsolation(JailerIsolationArgument),
     /// The authenticated worker rejected or could not install its launch policy.
     WorkerPolicy,
     /// The private daemon ownership handoff failed.
@@ -78,6 +120,11 @@ impl fmt::Display for LauncherError {
             Self::SessionProtocol => formatter.write_str("private worker session failed"),
             Self::InvalidGrantInput => formatter.write_str("invalid resource grant input"),
             Self::InvalidLaunchPolicy => formatter.write_str("invalid production launch policy"),
+            Self::UnsupportedJailerIsolation(argument) => write!(
+                formatter,
+                "unsupported Firecracker jailer isolation argument on macOS: --{}",
+                argument.name()
+            ),
             Self::WorkerPolicy => formatter.write_str("sandbox worker launch policy failed"),
             Self::DaemonHandoff => formatter.write_str("private daemon handoff failed"),
             Self::GrantPreparation => formatter.write_str("resource grant preparation failed"),

@@ -64,17 +64,18 @@ closure does not automatically promote a record from `audit-required`.
 
 The #1352 process audit plus #1368 snapshot-description delivery promote exactly
 21 of the 29 process-family records: 19 complete argument leaves plus the
-complete CLI/readiness and signal/exit/fd/cleanup semantics. Four incomplete
-argument leaves, the snapshot-containing identity/output semantic, the
+complete CLI/readiness and signal/exit/fd/cleanup semantics. #1384 additionally
+classifies the two seccomp argument leaves as `proven-platform-impossible`.
+Two argument leaves, the snapshot-containing identity/output semantic, the
 aggregate run operation, and both broad source corpora remain `audit-required`.
-The checked [`process-contract.md`](process-contract.md) records those eight handoffs; a
-partially implemented composite is not a terminal claim.
+The checked [`process-contract.md`](process-contract.md) records those six
+handoffs; a partially implemented composite is not a terminal claim.
 
 The #1354 production-boundary audit moves exactly three composite isolation
 records to `missing-platform-feasible` with #1351 as their delivery owner. It
 does not terminally promote them: external resource authority, authenticated
 brokerage, vmnet policy, crash coupling, deployment identity, and complete
-jailer/seccomp outcome classification remain incomplete. The broad source
+jailer/seccomp outcome classification remained incomplete at that checkpoint. The broad source
 corpus records remain `audit-required`. The checked
 [`isolation-contract.md`](isolation-contract.md) separates the delivered
 package/sandbox/supervisor subset from those handoffs.
@@ -108,10 +109,10 @@ before `Prepared`. A same-code signed launcher re-exec supplies bounded
 Ready/PID acknowledgment and retained daemon supervision. Signed tests exercise
 real descriptor/file-size exhaustion, pre-ack parent loss, post-ack signals,
 and concurrent daemon isolation. The complete 417-record delivery inventory is
-therefore 26 `implemented-and-verified`, 388 `audit-required`, and three
+therefore, at that checkpoint, 26 `implemented-and-verified`, 388 `audit-required`, and three
 `missing-platform-feasible`. Arbitrary uid/gid, configurable chroot, cgroups,
 network/PID namespaces, seccomp, aggregate jailer operation/corpus, general
-brokerage, vmnet, and deployment identity remain nonterminal under #1351.
+brokerage, vmnet, and deployment identity remained nonterminal under #1351.
 
 The #1383 offline-seccompiler slice promotes exactly seven isolation records:
 the complete pinned `seccompiler` corpus, its `compile` operation, and the
@@ -121,9 +122,24 @@ architecture action, bitcode 0.6.9 combined format, raw split files, default
 name, size cap, and public argument spellings while adding bounded redacted I/O
 and transactional publication. It does not install a filter. The install-helper
 language in pinned `docs/seccompiler.md` describes the current Linux VMM
-consumer owned by `corpus:seccomp`; that runtime work remains with #1384.
-The 417-record delivery inventory is now 33 `implemented-and-verified`, 381
-`audit-required`, and three `missing-platform-feasible` records.
+consumer owned by `corpus:seccomp`; that runtime work passed to #1384. At the
+#1383 checkpoint the 417-record delivery inventory contained 33
+`implemented-and-verified`, 381 `audit-required`, and three
+`missing-platform-feasible` records.
+
+The #1384 runtime-isolation slice certifies exactly eight
+`proven-platform-impossible` records: `corpus:seccomp`, both Firecracker runtime
+seccomp arguments, and the five jailer cgroup/network/PID-namespace arguments.
+Each record binds its pinned Linux kernel contract to current Apple SDK/XNU
+evidence, rejected native aliases, fixed pre-mutation behavior, focused tests,
+documentation, and the current Plan Challenge. The executable never opens a
+rejected filter path; the launch-policy parser returns a closed fixed-name error
+before grants, profile/staging, session creation, spawn, publication, or worker
+execution. Broader jailer, design, getting-started, production-host, aggregate,
+and composite records retain their independent handoffs. The 417-record
+delivery inventory is now 33 `implemented-and-verified`, 373 `audit-required`,
+three `missing-platform-feasible`, and eight
+`proven-platform-impossible` records.
 
 ## Commands
 

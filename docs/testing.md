@@ -611,14 +611,16 @@ Ordinary tests do not discover or require a sibling Firecracker checkout.
 Process-facing changes must also keep the checked
 [`process-contract.md`](../compat/firecracker/v1.16.0/process-contract.md)
 aligned with production code, executable tests, and the exact overlay records.
-The current main-process audit has 21 terminal and eight nonterminal
-process-family records. #1383 separately promotes seven offline-seccompiler
-records, moving the complete 417-record delivery inventory to 33
-implemented-and-verified, 381 audit-required, and three
-missing-platform-feasible. Delivery validation permits those explicit
-handoffs, while final validation continues to reject them. Parser recognition
-or native snapshot output is not sufficient evidence for a Firecracker runtime
-or artifact claim.
+The current main-process audit has 21 `implemented-and-verified`, two
+`proven-platform-impossible`, and six nonterminal process-family records. #1383
+separately promotes seven offline-seccompiler records; #1384 certifies the two
+runtime seccomp leaves, five jailer leaves, and `corpus:seccomp` as exact macOS
+platform exclusions. The complete 417-record delivery inventory is therefore
+33 implemented-and-verified, 373 audit-required, three
+missing-platform-feasible, and eight proven-platform-impossible. Delivery
+validation permits the explicit handoffs, while final validation continues to
+reject them. Parser recognition or native snapshot output is not sufficient
+evidence for a Firecracker runtime or artifact claim.
 
 Run the offline compiler's focused surface with:
 
@@ -731,6 +733,11 @@ may skip execution. On supported Apple Silicon it proves:
   fixed executable/current credentials, ID/timing injection, duplicate and
   forwarded-singleton rejection, last-value resource limits, canonical
   default-denied vmnet grammar, and redacted failure;
+- fixed typed rejection of exact, attached, and separated `--cgroup`,
+  `--cgroup-version`, `--parent-cgroup`, `--netns`, and `--new-pid-ns` requests
+  before an intentionally invalid private grant, profile/staging/spawn work,
+  worker output, or socket/session mutation, with every supplied value absent
+  from stdout and stderr;
 - rejection of every positive host/shared/bridge/count vmnet authority by the
   exact two-entitlement networkless profile before worker execution, plus
   negative private-copy coverage for an unexpected networkless profile, a

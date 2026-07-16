@@ -22,7 +22,7 @@ mod package_options;
 mod provisioning_profile;
 mod supervisor;
 
-pub use error::{LauncherError, PackageError};
+pub use error::{JailerIsolationArgument, LauncherError, PackageError};
 pub use layout::{
     BundleLayout, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME, OUTER_BUNDLE_NAME,
     WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,

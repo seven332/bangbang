@@ -6,8 +6,8 @@ use bangbang_session::{
     MAX_VMNET_ACTIVE_INTERFACES, MAX_VMNET_BRIDGE_NAMES, VmnetAuthority, WorkerPolicy,
 };
 
-use crate::LauncherError;
 use crate::grant_manifest::{LaunchInput, PreparedGrantBatch};
+use crate::{JailerIsolationArgument, LauncherError};
 
 pub(crate) const JAILER_ACTIVATION: &str = "--bangbang-jailer-v1";
 const DELIMITER: &str = "--";
@@ -242,7 +242,6 @@ pub(crate) const fn help() -> &'static str {
 }
 
 fn parse_jailer(args: Vec<OsString>) -> Result<LaunchCommand, LauncherError> {
-    let raw_args = args.clone();
     let mut id = None;
     let mut exec_file = None;
     let mut uid = None;
@@ -256,11 +255,15 @@ fn parse_jailer(args: Vec<OsString>) -> Result<LaunchCommand, LauncherError> {
     let mut vmnet_max_interfaces = None;
     let mut index = 1;
     while index < args.len() {
-        let argument = policy_text(args.get(index).ok_or(LauncherError::InvalidLaunchPolicy)?)?;
-        if argument == DELIMITER {
+        let argument = args.get(index).ok_or(LauncherError::InvalidLaunchPolicy)?;
+        if argument == OsStr::new(DELIMITER) {
             index += 1;
             break;
         }
+        if let Some(argument) = unsupported_jailer_isolation_argument(argument) {
+            return Err(LauncherError::UnsupportedJailerIsolation(argument));
+        }
+        let argument = policy_text(argument)?;
         match argument {
             ID_OPTION => {
                 if id.is_some() {
@@ -395,10 +398,16 @@ fn parse_jailer(args: Vec<OsString>) -> Result<LaunchCommand, LauncherError> {
         vmnet_authority,
     };
     Ok(LaunchCommand::Run(LaunchRequest {
-        raw_args,
+        raw_args: args,
         grants,
         jailer: Some(Box::new(jailer)),
     }))
+}
+
+fn unsupported_jailer_isolation_argument(argument: &OsStr) -> Option<JailerIsolationArgument> {
+    let name = argument.as_bytes().strip_prefix(b"--")?;
+    let name = name.split(|byte| *byte == b'=').next()?;
+    JailerIsolationArgument::from_name(std::str::from_utf8(name).ok()?)
 }
 
 fn reject_forwarded_singletons(args: &[OsString]) -> Result<(), LauncherError> {
@@ -526,6 +535,129 @@ mod tests {
             LaunchCommand::parse(args),
             Err(LauncherError::InvalidLaunchPolicy)
         ));
+    }
+
+    fn assert_unsupported_isolation(
+        args: Vec<OsString>,
+        expected: JailerIsolationArgument,
+        private_values: &[&str],
+    ) {
+        let error = LaunchCommand::parse(args).expect_err("Linux isolation input should fail");
+        assert_eq!(error, LauncherError::UnsupportedJailerIsolation(expected));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "unsupported Firecracker jailer isolation argument on macOS: --{}",
+                expected.name()
+            )
+        );
+        let diagnostics = format!("{error:?}\n{error}");
+        for private_value in private_values {
+            assert!(!diagnostics.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn rejects_named_linux_isolation_before_consuming_values() {
+        let worker = Path::new("/fixed/BangbangWorker");
+        let arguments = [
+            JailerIsolationArgument::Cgroup,
+            JailerIsolationArgument::CgroupVersion,
+            JailerIsolationArgument::ParentCgroup,
+            JailerIsolationArgument::NetworkNamespace,
+            JailerIsolationArgument::PidNamespace,
+        ];
+
+        for argument in arguments {
+            let mut exact = base(worker);
+            exact.insert(exact.len() - 1, format!("--{}", argument.name()).into());
+            assert_unsupported_isolation(exact, argument, &[]);
+
+            let private_value = format!("private-{}-value", argument.name());
+            let mut attached = base(worker);
+            attached.insert(
+                attached.len() - 1,
+                format!("--{}={private_value}", argument.name()).into(),
+            );
+            assert_unsupported_isolation(attached, argument, &[&private_value]);
+        }
+
+        for argument in [
+            JailerIsolationArgument::Cgroup,
+            JailerIsolationArgument::CgroupVersion,
+            JailerIsolationArgument::ParentCgroup,
+            JailerIsolationArgument::NetworkNamespace,
+        ] {
+            let private_value = format!("private-separated-{}-value", argument.name());
+            let mut separated = base(worker);
+            separated.splice(
+                separated.len() - 1..separated.len() - 1,
+                [
+                    OsString::from(format!("--{}", argument.name())),
+                    OsString::from(&private_value),
+                ],
+            );
+            assert_unsupported_isolation(separated, argument, &[&private_value]);
+        }
+
+        let mut non_utf8_attached = base(worker);
+        non_utf8_attached.insert(
+            non_utf8_attached.len() - 1,
+            OsString::from_vec(b"--netns=private-\xff-path".to_vec()),
+        );
+        assert_unsupported_isolation(
+            non_utf8_attached,
+            JailerIsolationArgument::NetworkNamespace,
+            &[],
+        );
+    }
+
+    #[test]
+    fn linux_isolation_names_are_exact_and_pre_delimiter_only() {
+        let worker = Path::new("/fixed/BangbangWorker");
+        for lookalike in [
+            "--cgroups",
+            "--cgroup-version-extra",
+            "--parent-cgroup-child",
+            "--netns-path",
+            "--new-pid-ns-extra",
+        ] {
+            let mut args = base(worker);
+            args.insert(args.len() - 1, lookalike.into());
+            assert_invalid(args);
+        }
+
+        for argument in [
+            JailerIsolationArgument::Cgroup,
+            JailerIsolationArgument::CgroupVersion,
+            JailerIsolationArgument::ParentCgroup,
+            JailerIsolationArgument::NetworkNamespace,
+            JailerIsolationArgument::PidNamespace,
+        ] {
+            let private_value = format!("opaque-{}-value", argument.name());
+            let mut args = base(worker);
+            args.push(format!("--{}={private_value}", argument.name()).into());
+            let LaunchCommand::Run(request) =
+                LaunchCommand::parse(args).expect("worker arguments should remain opaque")
+            else {
+                panic!("run command expected");
+            };
+            let prepared = request
+                .prepare(
+                    worker,
+                    LaunchTiming::sample().expect("timing should sample"),
+                    false,
+                    networkless_profile(),
+                )
+                .expect("opaque worker argument should prepare");
+            assert_eq!(
+                prepared.worker_args.last(),
+                Some(&OsString::from(format!(
+                    "--{}={private_value}",
+                    argument.name()
+                )))
+            );
+        }
     }
 
     #[test]

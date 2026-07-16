@@ -343,11 +343,29 @@ The following remain feasible work owned by #1351:
 - automatic restart/reconnect and any long-lived broker/service policy;
 - arbitrary uid/gid transition, configurable chroot ownership, and any
   installer-owned or elevated service needed to support them;
-- exact macOS outcome mapping for remaining jailer cgroup/network/PID-namespace
-  arguments, runtime seccomp and seccompiler-to-VMM handoff, and
-  production-host requirements; the offline compiler itself is complete;
+- remaining production-host requirements and any future distinct macOS-native
+  resource controls; the exact Linux seccomp/cgroup/network/PID-namespace
+  mechanisms and offline compiler now have separate terminal conclusions;
 - Developer ID/team possession, notarization, launch constraints, and release
   policy.
+
+## Certified Linux runtime isolation exclusions
+
+The exact Firecracker mechanisms below have terminal public-macOS conclusions.
+They are not claims that the narrower production boundary is Linux-equivalent:
+
+| Firecracker v1.16 contract | Current public macOS conclusion | Rejected aliases |
+| --- | --- | --- |
+| Default, empty, or custom `vmm`/`api`/`vcpu` classic-BPF programs installed per Linux thread with `PR_SET_NO_NEW_PRIVS` and `seccomp(SECCOMP_SET_MODE_FILTER)` | No public macOS syscall or API installs the requested per-thread filter map. `--no-seccomp` and `--seccomp-filter` are rejected before filter-path access, configuration-file access, VMM/backend construction, readiness, or socket publication. `corpus:seccomp` is terminal with them; offline artifact compilation remains separately implemented. | App Sandbox is fixed signed resource policy; private Seatbelt is unsupported; Endpoint Security is privileged event monitoring; parsing a BPF artifact without installation is not enforcement. |
+| `--cgroup`, `--cgroup-version`, and `--parent-cgroup` select Linux v1/v2 hierarchies, write arbitrary controller files, enable/inherit parents, and attach the PID through `tasks` or `cgroup.procs` | macOS exposes no generic controller filesystem, hierarchy version, delegation, parent placement, or attach identity. Exact/attached/separated forms are fixed named rejections before grants, profile/staging, session creation, spawn, or publication. | Darwin rlimits are scalar inherited process limits; App Sandbox, launchd resource classes, nice, and QoS do not provide cgroup identity or controller semantics. |
+| `--netns PATH` opens a Linux namespace handle with no-follow and calls `setns(CLONE_NEWNET)` before later jail setup | macOS exposes no path-named host-process network namespace join. The path is never opened and the fixed named rejection precedes all launcher mutation. | Network Extension is an entitled VPN extension; vmnet configures guest networking; App Sandbox network policy does not select a host network stack by path. |
+| `--new-pid-ns` calls `clone(CLONE_NEWPID)` and makes the first child PID 1 inside a nested process view | macOS exposes no nested PID namespace or remapped PID 1 contract. The fixed named rejection precedes session or worker creation. | Process groups, sessions, supervision, and Endpoint Security retain host PID visibility and identity. |
+
+`JailerIsolationArgument` is a closed public enum whose `name()`, `Debug`, and
+`Display` surfaces contain only one of the five fixed names. The launch-policy
+parser matches only names before its first `--`, examines only the portion
+before `=`, does not consume a following value, and leaves post-delimiter worker
+argv opaque. A rejected request is not cloned into retained launch state.
 
 ## Executable validation
 
@@ -363,6 +381,10 @@ execution proves:
 - exact identifiers, entitlement separation, Hardened Runtime, and strict
   recursive signature validity;
 - unchanged help/output and representative nonzero worker status forwarding;
+- all five exact and attached Linux jailer isolation names plus separated
+  values for value-taking flags returning their fixed category ahead of a
+  private invalid grant and socket request, with empty stdout, redacted stderr,
+  no socket, and unchanged session state;
 - exact jailer-policy help/version grammar, fixed executable/current credential
   binding, ID/timing injection, nested grant composition, last-value/default
   limits, closed environment, private cwd, and value-redacted rejection;
@@ -468,9 +490,18 @@ host-side artifact compiler with bounded redacted input and descriptor-anchored
 transactional output; it neither enters the launcher/worker boundary nor
 installs seccomp. The pinned documentation's stale install-helper wording is
 classified with the current Linux VMM consumer and `corpus:seccomp`, which
-remains under #1384. The current 417-record inventory therefore contains 33
+passed to #1384. At that checkpoint the 417-record inventory contained 33
 implemented-and-verified, 381 audit-required, and three
 missing-platform-feasible records.
+
+#1384 certifies exactly eight `proven-platform-impossible` records: the two
+Firecracker seccomp arguments, five jailer cgroup/network/PID-namespace
+arguments, and `corpus:seccomp`. Each carries pinned upstream source, current
+Apple/XNU evidence, reviewed alternatives, fixed pre-mutation behavior, focused
+unit/process/signed tests, compatibility/security documentation, and the
+current Plan Challenge result. The 417-record delivery inventory is now 33
+implemented-and-verified, 373 audit-required, three
+missing-platform-feasible, and eight proven-platform-impossible.
 
 The delivered package/session/policy/grant/fd/crash subset, including exact adoption by
 the singleton startup inputs/outputs, repeatable block/pmem consumers, and
@@ -478,11 +509,11 @@ singleton API/vsock directories plus the fixed port-only vsock facet, and
 snapshot describe/state/memory/root/output consumers with exact crash cleanup,
 is real but does not complete any of those composite records because general
 dynamic brokerage/hard revocation, network,
-Linux-outcome, arbitrary credential/root authority, and deployment work remains.
-The jailer `uid`, `gid`, `chroot-base-dir`, cgroup, network/PID-namespace,
-parent-cgroup, aggregate operation, and broad corpus records remain
-`audit-required`, as do the broad `seccomp` and `production-host` corpus
-records. The offline `seccompiler` corpus is complete without implying runtime
-filter enforcement.
+arbitrary credential/root authority, and deployment work remains. The jailer
+`uid`, `gid`, `chroot-base-dir`, aggregate operation, and broad jailer/design/
+getting-started/production-host records remain `audit-required`; their updated
+handoffs explicitly separate this resolved Linux-mechanism subset from the
+independent work. The offline `seccompiler` corpus is complete, while runtime
+seccomp is terminal only as a platform exclusion and is not enforced.
 This audit certifies only the named observable macOS outcomes, not direct Linux
 jailer mechanism parity.

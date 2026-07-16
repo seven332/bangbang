@@ -896,34 +896,86 @@ fn executable_maps_firecracker_fatal_signals_to_exit_codes() {
 
 #[test]
 fn executable_rejects_unsupported_firecracker_process_flags_before_socket_publication() {
-    for (case_name, expected_name, args, private_value) in [
-        ("enable-pci", "enable-pci", &["--enable-pci"][..], None),
+    let cases: &[(&str, &str, &[&str], &[&str])] = &[
+        ("enable-pci", "enable-pci", &["--enable-pci"], &[]),
         (
             "enable-pci-attached",
             "enable-pci",
-            &["--enable-pci=secret-enable-pci-value"][..],
-            Some("secret-enable-pci-value"),
+            &["--enable-pci=secret-enable-pci-value"],
+            &["secret-enable-pci-value"],
         ),
-        ("no-seccomp", "no-seccomp", &["--no-seccomp"][..], None),
+        ("no-seccomp", "no-seccomp", &["--no-seccomp"], &[]),
         (
             "no-seccomp-attached",
             "no-seccomp",
-            &["--no-seccomp=secret-no-seccomp-value"][..],
-            Some("secret-no-seccomp-value"),
+            &["--no-seccomp=secret-no-seccomp-value"],
+            &["secret-no-seccomp-value"],
         ),
         (
+            "no-seccomp-duplicate",
+            "no-seccomp",
+            &["--no-seccomp", "--no-seccomp=secret-duplicate-value"],
+            &["secret-duplicate-value"],
+        ),
+        (
+            "no-seccomp-after-config-path",
+            "no-seccomp",
+            &[
+                "--config-file",
+                "secret-unopened-config.json",
+                "--no-seccomp",
+            ],
+            &["secret-unopened-config.json"],
+        ),
+        (
+            "seccomp-filter-missing",
             "seccomp-filter",
+            &["--seccomp-filter"],
+            &[],
+        ),
+        (
+            "seccomp-filter-separated",
             "seccomp-filter",
-            &["--seccomp-filter", "secret-seccomp.bpf"][..],
-            Some("secret-seccomp.bpf"),
+            &["--seccomp-filter", "secret-separated-seccomp.bpf"],
+            &["secret-separated-seccomp.bpf"],
         ),
         (
             "seccomp-filter-attached",
             "seccomp-filter",
-            &["--seccomp-filter=secret-seccomp.bpf"][..],
-            Some("secret-seccomp.bpf"),
+            &["--seccomp-filter=secret-attached-seccomp.bpf"],
+            &["secret-attached-seccomp.bpf"],
         ),
-    ] {
+        (
+            "seccomp-filter-duplicate",
+            "seccomp-filter",
+            &[
+                "--seccomp-filter",
+                "secret-first-seccomp.bpf",
+                "--seccomp-filter=secret-second-seccomp.bpf",
+            ],
+            &["secret-first-seccomp.bpf", "secret-second-seccomp.bpf"],
+        ),
+        (
+            "no-seccomp-first-conflict",
+            "no-seccomp",
+            &[
+                "--no-seccomp",
+                "--seccomp-filter=secret-conflict-seccomp.bpf",
+            ],
+            &["secret-conflict-seccomp.bpf"],
+        ),
+        (
+            "seccomp-filter-first-conflict",
+            "seccomp-filter",
+            &[
+                "--seccomp-filter=secret-reverse-seccomp.bpf",
+                "--no-seccomp",
+            ],
+            &["secret-reverse-seccomp.bpf"],
+        ),
+    ];
+
+    for (case_name, expected_name, args, private_values) in cases {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join(format!("{case_name}.socket"));
         let instance_id = test_dir.instance_id();
@@ -939,19 +991,17 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
             output.stdout,
             output.stderr
         );
-        assert!(
-            output.stderr.contains(&format!(
-                "bangbang: unsupported Firecracker argument: --{expected_name}"
-            )),
-            "unsupported {case_name} should report a Firecracker argument rejection; stderr:\n{}",
-            output.stderr
+        assert_eq!(
+            output.stderr,
+            format!("bangbang: unsupported Firecracker argument: --{expected_name}\n"),
+            "unsupported {case_name} should report only the fixed Firecracker argument rejection"
         );
         assert!(
-            !output.stdout.contains("status: API server listening"),
-            "unsupported {case_name} must not report API readiness; stdout:\n{}",
+            output.stdout.is_empty(),
+            "unsupported {case_name} must fail before VMM construction or readiness; stdout:\n{}",
             output.stdout
         );
-        if let Some(private_value) = private_value {
+        for private_value in *private_values {
             assert!(
                 !output.stdout.contains(private_value) && !output.stderr.contains(private_value),
                 "unsupported {case_name} failure must not echo private argument value {private_value:?}; stdout:\n{}\nstderr:\n{}",
