@@ -1848,7 +1848,7 @@ mod tests {
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
         machine::{
             DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigError,
-            MachineConfigInput, MachineConfigPatchInput,
+            MachineConfigHugePages, MachineConfigInput, MachineConfigPatchInput,
         },
         memory_hotplug::{
             MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugConfigInput,
@@ -5936,28 +5936,42 @@ mod tests {
         controller
             .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
             .expect("initial machine config should be stored");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(128, true)))
+            .expect("balloon config should be stored");
+        let original_machine = controller.machine_config();
+        let original_balloon = controller.balloon_config();
 
-        let err = controller
-            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(0, 512)))
-            .expect_err("invalid machine config should fail");
+        for (input, expected) in [
+            (
+                MachineConfigInput::new(0, 512),
+                MachineConfigError::InvalidVcpuCount,
+            ),
+            (
+                MachineConfigInput::new(4, MAX_MEM_SIZE_MIB + 1),
+                MachineConfigError::InvalidMemorySize,
+            ),
+            (
+                MachineConfigInput::new(4, 512).with_smt(true),
+                MachineConfigError::SmtNotSupported,
+            ),
+            (
+                MachineConfigInput::new(4, 511).with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::InvalidHugePages2MMemorySize,
+            ),
+            (
+                MachineConfigInput::new(4, 512).with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::HugePages2MPlatformLimited,
+            ),
+        ] {
+            let err = controller
+                .handle_action(VmmAction::PutMachineConfig(input))
+                .expect_err("invalid machine config should fail");
 
-        assert_eq!(err.to_string(), "machine vcpu_count must be in 1..=32");
-        assert_eq!(controller.machine_config().vcpu_count(), 2);
-        assert_eq!(controller.machine_config().mem_size_mib(), 256);
-
-        let err = controller
-            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(
-                4,
-                MAX_MEM_SIZE_MIB + 1,
-            )))
-            .expect_err("oversized machine config should fail");
-
-        assert_eq!(
-            err.to_string(),
-            format!("machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}")
-        );
-        assert_eq!(controller.machine_config().vcpu_count(), 2);
-        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+            assert_eq!(err, VmmActionError::MachineConfig(expected));
+            assert_eq!(controller.machine_config(), original_machine);
+            assert_eq!(controller.balloon_config(), original_balloon);
+        }
     }
 
     #[test]
@@ -6062,29 +6076,44 @@ mod tests {
         controller
             .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
             .expect("initial machine config should be stored");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(128, true)))
+            .expect("balloon config should be stored");
+        let original_machine = controller.machine_config();
+        let original_balloon = controller.balloon_config();
 
-        let err = controller
-            .handle_action(VmmAction::PatchMachineConfig(
+        for (input, expected) in [
+            (
                 MachineConfigPatchInput::new().with_vcpu_count(0),
-            ))
-            .expect_err("invalid machine config patch should fail");
-
-        assert_eq!(err.to_string(), "machine vcpu_count must be in 1..=32");
-        assert_eq!(controller.machine_config().vcpu_count(), 2);
-        assert_eq!(controller.machine_config().mem_size_mib(), 256);
-
-        let err = controller
-            .handle_action(VmmAction::PatchMachineConfig(
+                MachineConfigError::InvalidVcpuCount,
+            ),
+            (
                 MachineConfigPatchInput::new().with_mem_size_mib(MAX_MEM_SIZE_MIB + 1),
-            ))
-            .expect_err("oversized machine config patch should fail");
+                MachineConfigError::InvalidMemorySize,
+            ),
+            (
+                MachineConfigPatchInput::new().with_smt(true),
+                MachineConfigError::SmtNotSupported,
+            ),
+            (
+                MachineConfigPatchInput::new()
+                    .with_mem_size_mib(127)
+                    .with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::InvalidHugePages2MMemorySize,
+            ),
+            (
+                MachineConfigPatchInput::new().with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::HugePages2MPlatformLimited,
+            ),
+        ] {
+            let err = controller
+                .handle_action(VmmAction::PatchMachineConfig(input))
+                .expect_err("invalid machine config patch should fail");
 
-        assert_eq!(
-            err.to_string(),
-            format!("machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}")
-        );
-        assert_eq!(controller.machine_config().vcpu_count(), 2);
-        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+            assert_eq!(err, VmmActionError::MachineConfig(expected));
+            assert_eq!(controller.machine_config(), original_machine);
+            assert_eq!(controller.balloon_config(), original_balloon);
+        }
     }
 
     #[test]

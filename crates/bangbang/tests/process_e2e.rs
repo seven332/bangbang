@@ -3698,6 +3698,188 @@ fn executable_rejects_invalid_machine_config_put_without_mutating() {
 }
 
 #[test]
+fn executable_machine_config_bounds_and_fault_precedence_are_transactional() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let minimum_put = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":1,"mem_size_mib":1}"#,
+    );
+    assert_no_content_response(&minimum_put, "PUT /machine-config minimum bounds");
+    let minimum_get = http_get(&socket_path, "/machine-config");
+    assert_ok_response(&minimum_get, "GET /machine-config minimum bounds");
+    assert_response_contains(
+        &minimum_get,
+        r#""vcpu_count":1"#,
+        "GET /machine-config minimum vCPU",
+    );
+    assert_response_contains(
+        &minimum_get,
+        r#""mem_size_mib":1"#,
+        "GET /machine-config minimum memory",
+    );
+
+    let maximum_put = http_put_json(
+        &socket_path,
+        "/machine-config",
+        &format!(r#"{{"vcpu_count":32,"mem_size_mib":{MAX_MEM_SIZE_MIB}}}"#),
+    );
+    assert_no_content_response(&maximum_put, "PUT /machine-config maximum bounds");
+    let maximum_get = http_get(&socket_path, "/machine-config");
+    assert_ok_response(&maximum_get, "GET /machine-config maximum bounds");
+    assert_response_contains(
+        &maximum_get,
+        r#""vcpu_count":32"#,
+        "GET /machine-config maximum vCPU",
+    );
+    assert_response_contains(
+        &maximum_get,
+        &format!(r#""mem_size_mib":{MAX_MEM_SIZE_MIB}"#),
+        "GET /machine-config maximum memory",
+    );
+
+    let original_put = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":2,"mem_size_mib":256}"#,
+    );
+    assert_no_content_response(&original_put, "PUT /machine-config original");
+
+    let range_fault =
+        format!(r#"{{"fault_message":"machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}"}}"#);
+    let oversized = MAX_MEM_SIZE_MIB + 1;
+    let cases = [
+        (
+            "PUT vCPU zero",
+            "PUT",
+            r#"{"vcpu_count":0,"mem_size_mib":128}"#.to_string(),
+            r#"{"fault_message":"machine vcpu_count must be in 1..=32"}"#.to_string(),
+        ),
+        (
+            "PATCH vCPU 33",
+            "PATCH",
+            r#"{"vcpu_count":33}"#.to_string(),
+            r#"{"fault_message":"machine vcpu_count must be in 1..=32"}"#.to_string(),
+        ),
+        (
+            "PUT memory zero",
+            "PUT",
+            r#"{"vcpu_count":1,"mem_size_mib":0}"#.to_string(),
+            range_fault.clone(),
+        ),
+        (
+            "PATCH memory zero",
+            "PATCH",
+            r#"{"mem_size_mib":0}"#.to_string(),
+            range_fault.clone(),
+        ),
+        (
+            "PUT oversized memory",
+            "PUT",
+            format!(r#"{{"vcpu_count":1,"mem_size_mib":{oversized}}}"#),
+            range_fault.clone(),
+        ),
+        (
+            "PATCH oversized memory",
+            "PATCH",
+            format!(r#"{{"mem_size_mib":{oversized}}}"#),
+            range_fault,
+        ),
+        (
+            "PUT SMT precedence",
+            "PUT",
+            r#"{"vcpu_count":0,"mem_size_mib":0,"smt":true,"huge_pages":"2M"}"#
+                .to_string(),
+            r#"{"fault_message":"machine smt is not supported"}"#.to_string(),
+        ),
+        (
+            "PATCH vCPU precedence",
+            "PATCH",
+            r#"{"vcpu_count":0,"mem_size_mib":0,"huge_pages":"2M"}"#.to_string(),
+            r#"{"fault_message":"machine vcpu_count must be in 1..=32"}"#.to_string(),
+        ),
+        (
+            "PUT odd 2M memory",
+            "PUT",
+            r#"{"vcpu_count":1,"mem_size_mib":127,"huge_pages":"2M"}"#.to_string(),
+            r#"{"fault_message":"machine mem_size_mib must be an even value when huge_pages is 2M"}"#
+                .to_string(),
+        ),
+        (
+            "PATCH odd 2M memory",
+            "PATCH",
+            r#"{"mem_size_mib":127,"huge_pages":"2M"}"#.to_string(),
+            r#"{"fault_message":"machine mem_size_mib must be an even value when huge_pages is 2M"}"#
+                .to_string(),
+        ),
+        (
+            "PUT exact 2M platform limit",
+            "PUT",
+            r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":"2M"}"#.to_string(),
+            r#"{"fault_message":"machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF"}"#
+                .to_string(),
+        ),
+        (
+            "PATCH exact 2M platform limit",
+            "PATCH",
+            r#"{"mem_size_mib":128,"huge_pages":"2M"}"#.to_string(),
+            r#"{"fault_message":"machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF"}"#
+                .to_string(),
+        ),
+    ];
+
+    for (context, method, body, expected_fault) in cases {
+        let response = if method == "PUT" {
+            http_put_json(&socket_path, "/machine-config", &body)
+        } else {
+            http_json(&socket_path, method, "/machine-config", &body)
+        };
+        assert_bad_request_response(&response, context);
+        assert_response_contains(&response, &expected_fault, context);
+
+        let machine_config = http_get(&socket_path, "/machine-config");
+        assert_ok_response(&machine_config, &format!("GET after {context}"));
+        assert_response_contains(&machine_config, r#""vcpu_count":2"#, context);
+        assert_response_contains(&machine_config, r#""mem_size_mib":256"#, context);
+        assert_response_contains(&machine_config, r#""smt":false"#, context);
+        assert_response_contains(&machine_config, r#""huge_pages":"None""#, context);
+    }
+
+    for body in [
+        r#"{}"#,
+        r#"{"vcpu_count":null}"#,
+        r#"{"vcpu_count":null,"mem_size_mib":null,"huge_pages":null}"#,
+    ] {
+        let response = http_json(&socket_path, "PATCH", "/machine-config", body);
+        assert_bad_request_response(&response, "PATCH /machine-config empty candidate");
+        assert_response_contains(
+            &response,
+            r#"{"fault_message":"Empty PATCH request."}"#,
+            "PATCH /machine-config empty candidate",
+        );
+
+        let machine_config = http_get(&socket_path, "/machine-config");
+        assert_ok_response(&machine_config, "GET after empty machine PATCH");
+        assert_response_contains(
+            &machine_config,
+            r#""vcpu_count":2"#,
+            "GET after empty machine PATCH",
+        );
+        assert_response_contains(
+            &machine_config,
+            r#""mem_size_mib":256"#,
+            "GET after empty machine PATCH",
+        );
+    }
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_rejects_unsupported_machine_config_options_without_mutating() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
@@ -3740,13 +3922,13 @@ fn executable_rejects_unsupported_machine_config_options_without_mutating() {
             "PUT /machine-config huge_pages",
             "PUT",
             r#"{"vcpu_count":4,"mem_size_mib":512,"huge_pages":"2M"}"#,
-            r#"{"fault_message":"machine huge_pages is not supported"}"#,
+            r#"{"fault_message":"machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF"}"#,
         ),
         (
             "PATCH /machine-config huge_pages",
             "PATCH",
             r#"{"mem_size_mib":512,"huge_pages":"2M"}"#,
-            r#"{"fault_message":"machine huge_pages is not supported"}"#,
+            r#"{"fault_message":"machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF"}"#,
         ),
     ] {
         let response = if method == "PUT" {

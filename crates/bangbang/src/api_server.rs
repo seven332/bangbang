@@ -3921,7 +3921,9 @@ mod tests {
         );
         assert_eq!(
             response.body(),
-            r#"{"fault_message":"Malformed HTTP request."}"#
+            format!(
+                r#"{{"fault_message":"machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}"}}"#
+            )
         );
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
@@ -3968,6 +3970,136 @@ mod tests {
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
         assert!(!vmm.machine_config().track_dirty_pages());
+    }
+
+    #[test]
+    fn machine_config_semantic_faults_follow_aarch64_precedence_without_mutating() {
+        let mut vmm = test_controller();
+        let original_body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
+        let original_request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{original_body}",
+            original_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(original_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let original = vmm.machine_config();
+
+        let range_fault = format!(
+            r#"{{"fault_message":"machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}"}}"#
+        );
+        let cases = [
+            (
+                "PUT",
+                r#"{"vcpu_count":0,"mem_size_mib":128}"#,
+                r#"{"fault_message":"machine vcpu_count must be in 1..=32"}"#,
+            ),
+            (
+                "PATCH",
+                r#"{"vcpu_count":33}"#,
+                r#"{"fault_message":"machine vcpu_count must be in 1..=32"}"#,
+            ),
+            (
+                "PUT",
+                r#"{"vcpu_count":0,"mem_size_mib":0,"smt":true,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine smt is not supported"}"#,
+            ),
+            (
+                "PATCH",
+                r#"{"vcpu_count":0,"mem_size_mib":0,"smt":true,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine smt is not supported"}"#,
+            ),
+            (
+                "PUT",
+                r#"{"vcpu_count":0,"mem_size_mib":0,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine vcpu_count must be in 1..=32"}"#,
+            ),
+            (
+                "PATCH",
+                r#"{"vcpu_count":0,"mem_size_mib":0,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine vcpu_count must be in 1..=32"}"#,
+            ),
+            (
+                "PUT",
+                r#"{"vcpu_count":1,"mem_size_mib":127,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine mem_size_mib must be an even value when huge_pages is 2M"}"#,
+            ),
+            (
+                "PATCH",
+                r#"{"mem_size_mib":127,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine mem_size_mib must be an even value when huge_pages is 2M"}"#,
+            ),
+            (
+                "PUT",
+                r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF"}"#,
+            ),
+            (
+                "PATCH",
+                r#"{"mem_size_mib":128,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF"}"#,
+            ),
+        ];
+
+        for (method, body, expected_fault) in cases {
+            let request = format!(
+                "{method} /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+            assert_eq!(
+                response.status(),
+                bangbang_api::http::StatusCode::BadRequest,
+                "{method} {body}"
+            );
+            assert_eq!(response.body(), expected_fault, "{method} {body}");
+            assert_eq!(vmm.machine_config(), original, "{method} {body}");
+        }
+
+        for (method, body) in [
+            ("PUT", r#"{"vcpu_count":1,"mem_size_mib":0}"#),
+            ("PATCH", r#"{"mem_size_mib":0}"#),
+        ] {
+            let request = format!(
+                "{method} /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+            assert_eq!(
+                response.status(),
+                bangbang_api::http::StatusCode::BadRequest,
+                "{method} {body}"
+            );
+            assert_eq!(response.body(), range_fault, "{method} {body}");
+            assert_eq!(vmm.machine_config(), original, "{method} {body}");
+        }
+
+        for body in [
+            r#"{}"#,
+            r#"{"vcpu_count":null}"#,
+            r#"{"vcpu_count":null,"mem_size_mib":null,"huge_pages":null}"#,
+        ] {
+            let request = format!(
+                "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+            assert_eq!(
+                response.status(),
+                bangbang_api::http::StatusCode::BadRequest,
+                "PATCH {body}"
+            );
+            assert_eq!(
+                response.body(),
+                r#"{"fault_message":"Empty PATCH request."}"#,
+                "PATCH {body}"
+            );
+            assert_eq!(vmm.machine_config(), original, "PATCH {body}");
+        }
     }
 
     #[test]
@@ -4046,13 +4178,13 @@ mod tests {
                 "PUT",
                 "mh-put",
                 r#"{"vcpu_count":4,"mem_size_mib":512,"huge_pages":"2M"}"#,
-                r#"{"fault_message":"machine huge_pages is not supported"}"#,
+                r#"{"fault_message":"machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF"}"#,
             ),
             (
                 "PATCH",
                 "mh-pat",
                 r#"{"mem_size_mib":512,"huge_pages":"2M"}"#,
-                r#"{"fault_message":"machine huge_pages is not supported"}"#,
+                r#"{"fault_message":"machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF"}"#,
             ),
         ] {
             let request = format!(

@@ -476,12 +476,14 @@ authoritative platform evidence, alternatives, stable public behavior, focused
 tests, compatibility/security documentation, and a current Challenge result.
 The inventory foundation itself changes no runtime behavior.
 
-After #1389, the 417-record delivery inventory contains 34
-`implemented-and-verified`, 372 `audit-required`, three
-`missing-platform-feasible`, and eight `proven-platform-impossible` records.
-The eight are exactly `corpus:seccomp`, both executable seccomp leaves, and the
-five jailer cgroup/network/PID-namespace leaves; broad corpora, aggregate run
-operations, and isolation composites retain their independent handoffs.
+After #1389/#1390 lifecycle delivery and #1391 machine sizing/page policy, the
+417-record delivery inventory contains 38 `implemented-and-verified`, 366
+`audit-required`, three `missing-platform-feasible`, and ten
+`proven-platform-impossible` records. Eight exclusions are
+`corpus:seccomp`, both executable seccomp leaves, and the five jailer
+cgroup/network/PID-namespace leaves; the other two are the exact machine `2M`
+property and pinned hugepages corpus. Broad aggregates retain independent
+handoffs.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
@@ -968,20 +970,20 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /boot-source` | `initrd_path` | optional | Optional host path or contained grant tag for an initrd. Explicitly empty values fail before file IO; direct paths retain startup-time opening, while contained tags use the same request-time exact read-only claim and redacted validation policy as the kernel. |
 | `PUT /boot-source` | `boot_args` | optional | Firecracker uses its default kernel command line when omitted. The API/VMM storage path validates the 2048-byte aarch64 limit including the trailing NUL byte and rejects embedded NUL bytes. |
 | `PUT /boot-source` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`, and bangbang stores that range for API compatibility. On supported Apple Silicon hosts, HVF `InstanceStart` admits `1..=min(32, host_max)`. A count above the host-reported maximum returns a stable capacity fault before a session is retained or `Running` is committed. |
-| `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; accepted range is `1..=1046528` MiB for the current Apple Silicon/aarch64 target. When a pre-boot balloon target is already configured, the new memory size must be at least that target size or the previous machine config is preserved. Host free-memory preflight remains deferred. |
-| `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false`; the initial HVF target accepts explicit no-SMT config and currently returns `machine smt is not supported` when SMT is enabled. |
+| `PUT /machine-config` | `vcpu_count` | required | Representable JSON reaches VMM validation. Firecracker and bangbang accept `1..=32`; out-of-range values return the typed value-redacted machine fault. On supported Apple Silicon hosts, HVF `InstanceStart` then admits `1..=min(32, host_max)`. A count above the host-reported maximum returns a stable capacity fault before a session is retained or `Running` is committed. |
+| `PUT /machine-config` | `mem_size_mib` | required | Representable JSON reaches VMM validation. Bangbang accepts `1..=1046528` MiB and rejects a larger value before storage, while pinned Firecracker stores/echoes it and later truncates realized aarch64 memory to the same 1022-GiB maximum. Bangbang's accepted GET value therefore remains identical to balloon, allocation, FDT, HVF mapping, and snapshot memory. A configured balloon target must fit or the previous machine and balloon state is preserved. Dynamic host-free-memory preflight is not promised. |
+| `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false`; the Apple Silicon target accepts explicit no-SMT config and returns `machine smt is not supported` when enabled. On combined-invalid aarch64 candidates this check precedes vCPU and memory. |
 | `PUT /machine-config` | `cpu_template` | optional when omitted, `null`, or `None`; classified and rejected for known non-`None` templates | Explicit `null` is treated as omitted and does not count as deprecated API usage. Explicit `None` matches Firecracker's deprecated default, succeeds as a normalized no-op, and counts as deprecated API usage. Known non-default names are deprecated Firecracker AWS/Linux CPU policies rather than arm64 HVF profiles; they return a stable platform-specific fault before mutation and still count as deprecated usage. |
 | `PUT /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support and currently returns `machine track_dirty_pages is not supported`. |
-| `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target and `2M` currently returns `machine huge_pages is not supported`. |
+| `PUT /machine-config` | `huge_pages` | optional when `None`; exact `2M` platform-limited | Explicit `None` matches Firecracker's default. `2M` means exact Linux hugetlbfs backing, not alignment or an IPA granule. Odd MiB returns `machine mem_size_mib must be an even value when huge_pages is 2M`; an otherwise valid candidate returns `machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF`. Both are transactional and precede allocation/HVF construction. |
 | `PUT /machine-config` | unknown or duplicate fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /machine-config` | `vcpu_count` | optional | When present, updates the stored vCPU count with the same `1..=32` bounds as `PUT`; omitted fields keep their current values. Startup applies the same runtime host-capacity bound as `PUT`. |
-| `PATCH /machine-config` | `mem_size_mib` | optional | When present, updates the stored memory size with the same `1..=1046528` MiB target bound as `PUT`; omitted fields keep their current values. When a pre-boot balloon target is already configured, the patched memory size must be at least that target size or the previous machine config is preserved. |
+| `PATCH /machine-config` | `mem_size_mib` | optional | When present, updates the stored memory size with the same `1..=1046528` MiB target bound and configured-equals-realized policy as PUT; omitted/null fields keep their current values. A configured balloon target must fit or the previous machine and balloon state is preserved. |
 | `PATCH /machine-config` | `smt` | optional when `false`; rejected when `true` | Matches the current `PUT` policy for the Apple Silicon target and currently returns `machine smt is not supported` when SMT is enabled. |
 | `PATCH /machine-config` | `cpu_template` | optional when omitted or `null`; accepted when `None`; classified and rejected for known non-`None` templates | Explicit `null` is treated as omitted and does not count as deprecated API usage. Explicit `None` is accepted as a normalized no-op and counts as deprecated API usage; known non-default names return the same deprecated Firecracker AWS/Linux policy versus arm64 HVF fault before the candidate patch is committed. |
 | `PATCH /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Matches the current `PUT` dirty-tracking policy. |
-| `PATCH /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Matches the current `PUT` huge-pages policy and currently returns `machine huge_pages is not supported` for `2M`. |
-| `PATCH /machine-config` | unknown or duplicate fields; empty patch | rejected | Matches Firecracker's strict request model behavior and avoids silent no-op updates. |
+| `PATCH /machine-config` | `huge_pages` | optional when `None`; exact `2M` platform-limited | Matches PUT's even-MiB validation and exact hugetlbfs platform result without mutating the current machine or balloon state. |
+| `PATCH /machine-config` | unknown or duplicate fields; empty patch | rejected | Unknown/duplicate fields remain strict JSON faults. `{}` and null-only candidates return Firecracker's stable `Empty PATCH request.` fault and do not silently succeed. |
 | `PUT /snapshot/create` | `snapshot_type` | optional; `Full` supported, `Diff` rejected | Accepts `Full` and `Diff`, defaulting to `Full`. Only `Full` passes the native-v1 gate; `Diff` returns the snapshot-specific unsupported fault before namespace or capture work. |
 | `PUT /snapshot/create` | `snapshot_path` | required; redacted, opened or anchor-adopted after preflight | Retained with redacted `Debug`; an admitted direct create opens its parent/final namespace only after paused/profile preflight. In contained mode an exact `bangbang-grant:<GrantId>/<SnapshotOutputChild>` claims or reuses a matching `SnapshotOutputDirectory`/`CreateChildren` anchor after complete preflight. The UTF-8 child is 1–255 bytes, contains no NUL or `/`, and is not `.` or `..`. It is never logged or echoed. |
 | `PUT /snapshot/create` | `mem_file_path` | required; redacted, opened or anchor-adopted after preflight | Uses the same redaction, child grammar, and gate ordering as `snapshot_path`; one shared grant with distinct children, two distinct grants, or a mixed ordinary/granted pair is supported. Guest memory streams directly into the destination-anchored staging inode. |
@@ -1086,6 +1088,15 @@ fields and preserve omitted stored values. Both return `204 No Content` on
 success; invalid updates leave the stored configuration unchanged.
 `GET /machine-config` returns the stored or default configuration. The stored
 values are applied during `InstanceStart` startup.
+
+Machine JSON syntax, representation, required fields, strict fields, and enum
+names are parser-owned. Representable semantic candidates reach one VMM
+validator. Its owned aarch64 precedence is SMT, vCPU, memory range, and selected
+page compatibility; adjacent CPU-template and dirty policy follow until their
+separate capability slices complete. See the checked
+[machine-memory contract](../compat/firecracker/v1.16.0/machine-memory-contract.md)
+for pinned sources, the oversized-policy comparison, exact 2M platform evidence,
+alternatives, stable errors, and validation anchors.
 
 Entropy support is tracked by #797 and needs to move as one guest-visible
 capability, not only a configuration endpoint. The current supported subset is
@@ -1435,8 +1446,9 @@ The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
 - the architectural DRAM maximum is 1022 GiB
 - RAM crossing the 256-512 GiB MMIO64 gap is split around that gap
 - zero requested memory is rejected by the layout helper
-- requests above the architectural maximum are capped inside the layout model,
-  while public machine configuration rejects them before storage
+- requests above the architectural maximum are capped inside the defensive
+  layout helper, while public machine configuration rejects them before storage
+  so every successful configured size equals the realized layout
 
 The allocation model creates one anonymous read/write private host memory
 mapping for each validated guest RAM range and releases the mappings with
@@ -2719,8 +2731,12 @@ Firecracker's aarch64 process boundary, `SYSTEM_RESET` is terminal rather than
 an in-process reboot. Public
 machine configuration rejects `mem_size_mib` above the current 1022 GiB Apple
 Silicon/aarch64 DRAM maximum before storage; startup keeps its architectural
-maximum check as a defensive guard. Dynamic host-memory availability policy
-remains deferred.
+maximum check as a defensive guard. This deliberately differs from pinned
+Firecracker, which accepts/echoes a larger request and truncates only the
+realized layout. Dynamic host-memory availability is not a reliable preflight
+contract with lazy/no-reserve mappings. Exact Firecracker 2-MiB hugetlbfs
+backing is a certified public-platform exclusion; ordinary memory allocation,
+mapping, protection, alignment, and resource-failure behavior are not.
 
 ## API State and Response Policy
 
@@ -2799,8 +2815,8 @@ The first API implementation should model the same broad stages as Firecracker:
 | `GET /version` | implemented; `200` JSON | implemented; `200` JSON | Body uses Firecracker's `firecracker_version` field shape. |
 | `GET /vm/config` | implemented; `200` JSON | implemented; `200` JSON | Returns the accumulated supported configuration subset, including an always-present `pmem` array that is populated after successful pre-boot pmem configuration, `mmds-config` after successful MMDS config storage, `entropy` after successful entropy configuration, `memory-hotplug` after successful pre-boot memory hotplug configuration, and `balloon` after successful pre-boot balloon configuration. Startup applies the supported boot subset to an owned HVF session and internal boot run-loop worker across bounded step windows. |
 | `GET /machine-config` | implemented; `200` JSON | supported target; `200` JSON | Returns the stored/default machine configuration. |
-| `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
-| `PATCH /machine-config` | implemented; `204` empty response on successful partial config update | unsupported after start; `400` `fault_message` | Pre-boot-only partial configuration. Omitted fields preserve current stored values; invalid updates leave stored values unchanged. |
+| `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Representable invalid values return typed VMM faults. Accepted vCPU/memory state is applied exactly during startup; host vCPU capacity and ordinary memory allocation remain startup checks. |
+| `PATCH /machine-config` | implemented; `204` empty response on successful partial config update | unsupported after start; `400` `fault_message` | Pre-boot-only partial configuration. Omitted/null fields preserve current stored values; empty/null-only candidates use `Empty PATCH request.`; invalid updates leave machine and balloon state unchanged. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config. Direct host paths open during startup preparation; contained grant tags claim exact read-only kernel/initrd descriptors during the successful request and move them into startup without reopening the tags. Host path and grant errors avoid leaking sensitive values. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage; recognized unsupported for vhost-user-block `socket` configs | unsupported after start; `400` `fault_message` | Records validated pre-boot virtio-block config, including optional bandwidth/ops rate limiters. Direct paths open during startup; contained grant tags claim and retain exact-ID, exact-access regular-file descriptors during successful requests. Startup moves provided descriptors or opens missing direct paths, registers initial block MMIO devices, applies configured limiters in queue dispatch without sleeping, and wires session-owned HVF retry wakeups when a throttled descriptor remains pending. Firecracker-shaped socket-backed vhost-user-block configs are parsed and rejected with `drive socket is not supported` without mutating stored config or consuming a grant. Firecracker v1.16.0 runtime PUT is developer-preview PCI hotplug requiring `--enable-pci` and guest rescan; bangbang uses MMIO, rejects that option, and rejects runtime PUT before opening or retaining the proposed backing. External vhost-user-block execution remains unsupported. |
 | `PUT /pmem/{id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records Firecracker-shaped pre-boot config and replaces prior config for the same ID failure-atomically; empty or all-null limiter objects are unconfigured, valid bandwidth/ops buckets are stored and reported through `GET /vm/config`, and `root_device: true` is rejected without mutation. Direct paths remain unopened until startup; contained grant tags claim and retain exact-ID, exact-access nonzero regular-file descriptors during successful requests. Startup moves provided descriptors or opens missing direct paths, maps and registers each guest range, attaches one virtio-mmio/FDT device, applies the limiter before coalesced flush dispatch, writes writable shadows back for guest queue-driven flush requests and after clean unmap, and retains the handles, mappings, and range metadata. Root-device semantics, dirty-range tracking, direct file-backed HVF mapping, and hot-unplug remain deferred. |

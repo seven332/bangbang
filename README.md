@@ -67,7 +67,16 @@ runtime seccomp inputs before opening a filter path or constructing the VMM.
 On supported macOS Apple Silicon hosts, the public machine configuration accepts
 `vcpu_count` from 1 through 32 and HVF startup admits the host-limited subset
 `1..=min(32, host_max)`. Counts above the runtime host maximum fail before a
-session is retained or the instance becomes `Running`. Public pause/resume uses
+session is retained or the instance becomes `Running`. Machine memory accepts
+`1..=1,046,528` MiB (1022 GiB); unlike Firecracker's stored-request/later-clamp
+behavior, Bangbang rejects a larger value before storage so GET, balloon, FDT,
+guest memory, and native snapshots use one exact size. Dynamic host-free-memory
+preflight is not promised. `huge_pages = "None"` is supported; exact Firecracker
+`"2M"` Linux hugetlbfs backing is unavailable through public arm64 macOS/HVF
+and returns a stable platform fault rather than substituting alignment or a
+16-KiB IPA granule. See the checked
+[machine-memory contract](compat/firecracker/v1.16.0/machine-memory-contract.md).
+Public pause/resume uses
 a topology-wide active-run barrier for every online vCPU. Guest PSCI `CPU_OFF`
 and later `CPU_ON` re-entry reuse the fixed owner topology. PSCI
 `CPU_SUSPEND32/64` provides KVM-style retained standby for an enabled,
@@ -871,11 +880,11 @@ features. See [Firecracker Validation Matrix](docs/firecracker-validation-matrix
 for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 417
-records currently contain 33 implemented-and-verified, 373 audit-required,
-three missing-platform-feasible, and eight proven-platform-impossible outcomes;
-the latter are exactly the runtime seccomp corpus/two executable inputs and five
-jailer isolation inputs described above. Nonterminal entries do not make new
-runtime claims.
+records currently contain 38 implemented-and-verified, 366 audit-required,
+three missing-platform-feasible, and ten proven-platform-impossible outcomes.
+The ten comprise the runtime seccomp corpus/two executable inputs, five jailer
+isolation inputs, and the exact `MachineConfiguration.huge_pages`/hugepages-
+corpus 2M hugetlbfs boundary. Nonterminal entries do not make new runtime claims.
 
 ## Build And Test
 

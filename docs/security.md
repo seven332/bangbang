@@ -163,6 +163,35 @@ changes Firecracker-facing behavior or security posture:
 When a capability moves between these categories, update the compatibility docs,
 validation matrix, tests, and related issue links in the same PR.
 
+## Machine Memory and Exact 2M Boundary
+
+Machine configuration is a transactional pre-boot security boundary. JSON
+syntax and representation errors stay in the parser; representable semantic
+values reach one runtime candidate validator. Numeric faults do not retain or
+echo the submitted value, and a failed PUT/PATCH preserves both prior machine
+configuration and balloon target.
+
+Bangbang accepts `mem_size_mib` only through the 1022-GiB aarch64 DRAM maximum
+and rejects larger values before storage. Every successful GET value is the
+value used for balloon checks, guest-memory allocation, FDT, HVF mapping, and
+native-v1 snapshot length. Startup keeps an independent defensive maximum for
+unchecked state. This avoids silently accepting a configuration the guest does
+not receive. It does not promise current or future host-free-memory
+availability: anonymous no-reserve mappings and changing host pressure make
+such a preflight unreliable, and normal allocation/mapping failures remain
+failure-atomic startup outcomes.
+
+Firecracker's `huge_pages = "2M"` requires exact Linux hugetlbfs backing.
+Public XNU arm/SPTM and Hypervisor.framework do not provide that contract.
+Bangbang rejects the known enum before allocation or HVF construction with a
+fixed value-redacted platform fault. It does not substitute virtual alignment,
+2-MiB batching, the 16-KiB host page/IPA granule, a private API, root-only host
+configuration, a Linux sidecar, or a new entitlement. Ordinary allocation,
+mapping, protection, alignment, balloon discard, and resource exhaustion are
+not classified as impossible. The complete sources, local probe result,
+alternatives, tests, and Challenge references are in the checked
+[machine-memory contract](../compat/firecracker/v1.16.0/machine-memory-contract.md).
+
 ## Isolation Compatibility Checklist
 
 Use this checklist when reviewing Firecracker-facing host isolation changes:
