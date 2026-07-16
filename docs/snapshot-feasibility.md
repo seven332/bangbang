@@ -999,17 +999,20 @@ The public load orchestrator holds one aggregate never-run runner admission
 window and uses this order only after complete compatibility and optional-state
 validation:
 
-1. construct validated guest memory, baseline devices, the GIC, and one vCPU;
-2. restore baseline architectural register and data state in its documented
+1. construct validated guest memory and baseline devices, then create and
+   validate the GIC;
+2. when requested, attach a clean dirty bitmap after image population, map and
+   protect guest RAM, and only then create the one vCPU owner;
+3. restore baseline architectural register and data state in its documented
    dependency order, while active SVE/SME/debug optional state remains rejected;
-3. apply the compatible opaque GIC device blob;
-4. restore and validate the EL1 ICC CPU-interface state;
-5. restore normalized physical and virtual timers, taking timer-PPI state from
+4. apply the compatible opaque GIC device blob;
+5. restore and validate the EL1 ICC CPU-interface state;
+6. restore normalized physical and virtual timers, taking timer-PPI state from
    the compatible GIC image rather than replaying TVAL or ISTATUS;
-6. restore CPU IRQ/FIQ pending injection last among runner-owned state;
-7. replace the guest VMGenID buffer and inject its SPI only after every GIC
+7. restore CPU IRQ/FIQ pending injection last among runner-owned state;
+8. replace the guest VMGenID buffer and inject its SPI only after every GIC
    restore, so the notification cannot be overwritten; and
-8. commit a paused session and permit resume only after every step succeeds.
+9. commit a paused session and permit resume only after every step succeeds.
 
 The runner-owned portion is one command rather than a transaction: an HVF write
 failure may leave a prefix applied, so the destination is torn down and explicit
