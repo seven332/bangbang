@@ -3919,6 +3919,63 @@
       "disposition": "audit-required"
     },
     {
+      "id": "semantic.boot:arm64-cache-fdt",
+      "family": "boot-and-lifecycle",
+      "summary": "Publish a strictly admitted arm64 cache hierarchy in the guest FDT: decode active legacy or CCIDX HVF cache levels from one same-configuration identity, require a unique matching public macOS performance-level description for sizes and nested sharing, reject incomplete or conflicting evidence before VM construction, link per-vCPU L1 and shared L2/L3 nodes including partial final groups, and retain the exact source for native-v1 capture without changing its schema. Host performance-level CPU counts do not cap configured guest vCPUs; private APIs, scheduler affinity, model tables, cross-host portability, mutable selector synchronization, cache maintenance, and writable CPU feature views remain outside this capability.",
+      "source_refs": [
+        "corpus:cpu-boot-protocol",
+        "corpus:rootfs-and-kernel"
+      ],
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cache.rs",
+          "anchor": "prepare_arm64_cache_with"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "prepare_arm64_boot_session_parts_with_cache"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/fdt.rs",
+          "anchor": "create_cpu_nodes"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cache.rs",
+          "anchor": "cache topology decode, host-fact reconciliation, sysctl boundary, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "cache_admission_failure_precedes_all_vm_owned_startup_state and snapshot_capture_reuses_retained_manifest_and_rejects_mmfr2_drift"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "boots_two_cpu_linux_and_matches_cache_sysfs_to_retained_model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/fdt.rs",
+          "anchor": "parsed cache hierarchy FDT tests"
+        },
+        {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1392#issuecomment-4990257112"
+        },
+        {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1392#issuecomment-4990500660"
+        }
+      ]
+    },
+    {
       "id": "semantic.boot:kernel-rootfs-fdt-and-cache",
       "family": "boot-and-lifecycle",
       "summary": "Audit kernel/initrd/rootfs loading, boot arguments, DeviceTree construction, boot cache behavior, and startup failure ordering.",

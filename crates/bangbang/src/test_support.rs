@@ -1,6 +1,9 @@
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::block::BlockMmioLayout;
-use bangbang_runtime::fdt::{Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
+use bangbang_runtime::fdt::{
+    Arm64FdtCache, Arm64FdtCacheHierarchy, Arm64FdtCacheType, Arm64FdtGic, Arm64FdtRegion,
+    Arm64FdtTimerInterrupts,
+};
 use bangbang_runtime::interrupt::GuestInterruptLine;
 use bangbang_runtime::memory::GuestAddress;
 use bangbang_runtime::mmio::MmioRegionId;
@@ -15,6 +18,11 @@ pub(crate) fn minimal_arm64_boot_resource_config() -> Arm64BootResourceConfig<'s
 
     Arm64BootResourceConfig {
         vcpu_mpidrs: VCPU_MPIDRS,
+        cache_hierarchy: Arm64FdtCacheHierarchy::new(vec![
+            Arm64FdtCache::new(1, Arm64FdtCacheType::Unified, 32_768, 64, 64, 8, 1)
+                .expect("test L1 cache should be valid"),
+        ])
+        .expect("test cache hierarchy should be valid"),
         gic: Arm64FdtGic {
             distributor: Arm64FdtRegion {
                 base: 0x0800_0000,

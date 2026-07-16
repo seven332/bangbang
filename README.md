@@ -76,6 +76,15 @@ preflight is not promised. `huge_pages = "None"` is supported; exact Firecracker
 and returns a stable platform fault rather than substituting alignment or a
 16-KiB IPA granule. See the checked
 [machine-memory contract](compat/firecracker/v1.16.0/machine-memory-contract.md).
+Before VM creation, arm64 startup also reads one same-default-configuration HVF
+cache identity and requires exactly one public macOS performance-level
+description to confirm its cache sizes and sharing factors. Invalid,
+incomplete, mismatched, or ambiguous facts fail startup without retaining VM
+state. The resulting FDT publishes exact split or unified L1 geometry and
+shared unified L2/L3 nodes, with deterministic links for every guest vCPU and
+partial final sharing groups. Host performance-level CPU counts prove sharing
+only; they do not reduce the existing guest-vCPU limit. Signed Linux coverage
+compares the retained model against the guest's cache sysfs view.
 Public pause/resume uses
 a topology-wide active-run barrier for every online vCPU. Guest PSCI `CPU_OFF`
 and later `CPU_ON` re-entry reuse the fixed owner topology. PSCI
@@ -879,8 +888,8 @@ the full endpoint matrix, implemented behavior, and deferred Firecracker
 features. See [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md)
 for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
-mechanically checked scope authority for exhaustive compatibility work. Its 417
-records currently contain 38 implemented-and-verified, 366 audit-required,
+mechanically checked scope authority for exhaustive compatibility work. Its 418
+records currently contain 39 implemented-and-verified, 366 audit-required,
 three missing-platform-feasible, and ten proven-platform-impossible outcomes.
 The ten comprise the runtime seccomp corpus/two executable inputs, five jailer
 isolation inputs, and the exact `MachineConfiguration.huge_pages`/hugepages-

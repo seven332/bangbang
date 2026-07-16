@@ -1158,16 +1158,28 @@ is resource-specific:
   CSSELR records the guest's current cache-size query selector but does not
   contain cache topology. The internal capture-order apply treats the selector
   as raw untrusted state and never queries CCSIDR, but it is not a validated
-  snapshot restore: a higher layer still must validate it against an atomic
-  destination cache manifest and define ISB/dependent-read synchronization and
-  cache-maintenance policy. The separately queried default
-  vCPU configuration's raw CTR_EL0, CLIDR_EL1, and DCZID_EL0 values and its
-  independent eight-entry data/unified and instruction CCSIDR arrays are
-  read-only metadata, not guest execution state, but can fingerprint the
-  exposed virtual CPU model. They must not be logged or persisted without a
-  defined need. The independent queries are not one atomic manifest, and even
-  together they are not trusted topology or destination policy without cache-
-  level interpretation, masks, and validation.
+  snapshot restore: a higher layer must still define selector validation,
+  ISB/dependent-read synchronization, and cache-maintenance policy. The public
+  standalone default-configuration feature and geometry queries remain
+  independent read-only diagnostics; they do not form one atomic manifest and
+  can fingerprint the exposed virtual CPU model.
+  Ordinary arm64 startup instead owns a distinct same-configuration source
+  containing MMFR2, CTR/CLIDR/DCZID, and both CCSIDR arrays. It interprets only
+  active levels and accepts the result only when exactly one public macOS
+  performance-level description independently confirms sizes and supplies
+  valid nested sharing factors. Missing, malformed, mismatched, or ambiguous
+  evidence fails before VM construction. It uses neither scheduler affinity,
+  private Apple interfaces, nor model-specific tables. Errors and `Debug`
+  output expose no raw HVF values, sysctl values, selector names, or underlying
+  host diagnostics. The normalized geometry and sharing are deliberately guest
+  observable through the FDT, but remain a same-host presentation rather than
+  a physical-host identity or cross-host portability promise.
+  Native-v1 capture reuses the retained startup manifest after an MMFR2
+  cross-check instead of querying mutable external state. Restore reconstructs
+  only that already-validated compatibility source; it does not fabricate a
+  retained FDT hierarchy or change the snapshot schema. These internal needs do
+  not authorize logging the raw source or treating it as a safe live CSSELR
+  restore policy.
   Firecracker-shaped custom CPU-template values have a narrower control-plane
   boundary. The HTTP/config-file parser validates KVM capability identifiers,
   KVM vCPU-init feature indexes, arm register identifiers, and bitmaps, then

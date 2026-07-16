@@ -1,6 +1,7 @@
 //! Hypervisor.framework backend.
 
 mod backend;
+mod cache;
 mod coordinator;
 mod exit;
 mod ffi;
@@ -20,6 +21,7 @@ mod vcpu;
 mod vcpu_config;
 
 pub use backend::HvfBackend;
+pub use cache::{HostFactReadError, HvfArm64CacheTopologyError};
 pub use coordinator::{
     HvfVcpuCoordinatorWork, HvfVcpuRunBarrierReport, HvfVcpuRunBarrierWaiter, HvfVcpuRunControl,
     HvfVcpuRunControlReason, HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError, HvfVcpuRunEvent,

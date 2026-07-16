@@ -74,6 +74,37 @@ pub struct HvfArm64VcpuCacheManifest {
     geometry: HvfArm64VcpuCacheGeometry,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HvfArm64VcpuCacheFdtSource {
+    id_aa64mmfr2_el1: u64,
+    manifest: HvfArm64VcpuCacheManifest,
+}
+
+impl HvfArm64VcpuCacheFdtSource {
+    pub(crate) const fn new(id_aa64mmfr2_el1: u64, manifest: HvfArm64VcpuCacheManifest) -> Self {
+        Self {
+            id_aa64mmfr2_el1,
+            manifest,
+        }
+    }
+
+    pub(crate) const fn id_aa64mmfr2_el1(self) -> u64 {
+        self.id_aa64mmfr2_el1
+    }
+
+    pub(crate) const fn manifest(self) -> HvfArm64VcpuCacheManifest {
+        self.manifest
+    }
+}
+
+impl fmt::Debug for HvfArm64VcpuCacheFdtSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64VcpuCacheFdtSource")
+            .field("cache_identity", &"<redacted>")
+            .finish()
+    }
+}
+
 impl HvfArm64VcpuCacheManifest {
     pub(crate) const fn new(
         configuration: HvfArm64VcpuCacheConfiguration,
@@ -157,6 +188,21 @@ impl HvfBackend {
             )
         })
     }
+
+    pub(crate) fn arm64_vcpu_cache_fdt_source() -> Result<HvfArm64VcpuCacheFdtSource, BackendError>
+    {
+        crate::ffi::get_arm64_vcpu_cache_fdt_source().map(
+            |(id_aa64mmfr2_el1, configuration, geometry)| {
+                HvfArm64VcpuCacheFdtSource::new(
+                    id_aa64mmfr2_el1,
+                    HvfArm64VcpuCacheManifest::new(
+                        HvfArm64VcpuCacheConfiguration::new(configuration),
+                        HvfArm64VcpuCacheGeometry::new(geometry),
+                    ),
+                )
+            },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -167,7 +213,8 @@ mod tests {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     use super::HvfBackend;
     use super::{
-        HvfArm64VcpuCacheConfiguration, HvfArm64VcpuCacheGeometry, HvfArm64VcpuCacheManifest,
+        HvfArm64VcpuCacheConfiguration, HvfArm64VcpuCacheFdtSource, HvfArm64VcpuCacheGeometry,
+        HvfArm64VcpuCacheManifest,
     };
 
     #[test]
@@ -224,6 +271,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_fdt_source_preserves_mmfr2_and_manifest_and_redacts_debug() {
+        let manifest = HvfArm64VcpuCacheManifest::new(
+            HvfArm64VcpuCacheConfiguration::new([1, 2, 3]),
+            HvfArm64VcpuCacheGeometry::new([[4; 8], [5; 8]]),
+        );
+        let source = HvfArm64VcpuCacheFdtSource::new(u64::MAX, manifest);
+
+        assert_eq!(source.id_aa64mmfr2_el1(), u64::MAX);
+        assert_eq!(source.manifest(), manifest);
+        assert_eq!(
+            format!("{source:?}"),
+            "HvfArm64VcpuCacheFdtSource { cache_identity: \"<redacted>\" }"
+        );
+    }
+
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     #[test]
     fn cache_configuration_query_reports_unsupported_compile_target() {
@@ -251,6 +314,17 @@ mod tests {
     fn cache_manifest_query_reports_unsupported_compile_target() {
         assert_eq!(
             HvfBackend::arm64_vcpu_cache_manifest(),
+            Err(BackendError::Unsupported(
+                crate::ffi::UNSUPPORTED_TARGET_MESSAGE
+            ))
+        );
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn cache_fdt_source_query_reports_unsupported_compile_target() {
+        assert_eq!(
+            HvfBackend::arm64_vcpu_cache_fdt_source(),
             Err(BackendError::Unsupported(
                 crate::ffi::UNSUPPORTED_TARGET_MESSAGE
             ))

@@ -33,10 +33,10 @@ use crate::entropy::{
     VirtioRngOsEntropySource,
 };
 use crate::fdt::{
-    ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtBootInfo, Arm64FdtConfig,
-    Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite, Arm64FdtRegion, Arm64FdtRtcDevice,
-    Arm64FdtSerialDevice, Arm64FdtTimerInterrupts, Arm64FdtVirtioMmioDevice, Arm64FdtVmClockDevice,
-    Arm64FdtVmGenIdDevice, write_arm64_fdt,
+    ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtBootInfo, Arm64FdtCacheHierarchy,
+    Arm64FdtConfig, Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite, Arm64FdtRegion,
+    Arm64FdtRtcDevice, Arm64FdtSerialDevice, Arm64FdtTimerInterrupts, Arm64FdtVirtioMmioDevice,
+    Arm64FdtVmClockDevice, Arm64FdtVmGenIdDevice, write_arm64_fdt,
 };
 use crate::interrupt::GuestInterruptLine;
 use crate::machine::MachineConfig;
@@ -215,6 +215,7 @@ const ARM64_BOOT_VMCLOCK_ADDRESS: GuestAddress = GuestAddress::new(
 #[derive(Debug, Clone)]
 pub struct Arm64BootResourceConfig<'a> {
     pub vcpu_mpidrs: &'a [u64],
+    pub cache_hierarchy: Arm64FdtCacheHierarchy,
     pub gic: Arm64FdtGic,
     pub timer: Arm64FdtTimerInterrupts,
     pub rtc_device: Option<Arm64BootRtcDeviceConfig>,
@@ -3449,6 +3450,7 @@ impl Arm64BootResources {
             startup_resources.into_parts();
         let Arm64BootResourceConfig {
             vcpu_mpidrs,
+            cache_hierarchy,
             gic,
             timer,
             rtc_device,
@@ -3730,6 +3732,7 @@ impl Arm64BootResources {
                 layout: &layout,
                 boot: Arm64FdtBootInfo::from(&loaded_boot_source),
                 vcpu_mpidrs,
+                cache_hierarchy: &cache_hierarchy,
                 gic,
                 timer,
                 rtc_device: rtc_fdt_device,
@@ -4380,8 +4383,8 @@ mod tests {
         VirtioRngOsEntropySource,
     };
     use crate::fdt::{
-        ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtError, Arm64FdtGic, Arm64FdtRegion,
-        Arm64FdtTimerInterrupts,
+        ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtCache, Arm64FdtCacheHierarchy,
+        Arm64FdtCacheType, Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts,
     };
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::{MachineConfig, MachineConfigInput};
@@ -4759,6 +4762,7 @@ mod tests {
     ) -> Arm64BootResourceConfig<'a> {
         Arm64BootResourceConfig {
             vcpu_mpidrs: &[0],
+            cache_hierarchy: test_cache_hierarchy(),
             gic: valid_gic(),
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
             rtc_device: None,
@@ -4787,6 +4791,14 @@ mod tests {
             memory_hotplug_device: None,
             entropy_device: None,
         }
+    }
+
+    fn test_cache_hierarchy() -> Arm64FdtCacheHierarchy {
+        Arm64FdtCacheHierarchy::new(vec![
+            Arm64FdtCache::new(1, Arm64FdtCacheType::Unified, 32_768, 64, 64, 8, 1)
+                .expect("test L1 cache should be valid"),
+        ])
+        .expect("test cache hierarchy should be valid")
     }
 
     fn boot_runtime_with_entropy(
