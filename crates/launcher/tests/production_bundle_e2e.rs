@@ -22,8 +22,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bangbang_launcher::{
-    LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME, OUTER_BUNDLE_NAME,
-    WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
+    JailerIsolationArgument, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME,
+    OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 use bangbang_session::{
     Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD,
@@ -215,6 +215,16 @@ fn run_launcher(bundle: &Path, args: &[&OsStr]) -> Output {
 }
 
 fn jailer_command(bundle: &Path, id: &str, limits: &[&str], daemonize: bool) -> Command {
+    jailer_command_with_policy(bundle, id, limits, daemonize, &[])
+}
+
+fn jailer_command_with_policy(
+    bundle: &Path,
+    id: &str,
+    limits: &[&str],
+    daemonize: bool,
+    policy_args: &[OsString],
+) -> Command {
     // SAFETY: Credential getters have no pointer or ownership contract.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let mut command = Command::new(launcher(bundle));
@@ -230,6 +240,7 @@ fn jailer_command(bundle: &Path, id: &str, limits: &[&str], daemonize: bool) -> 
     if daemonize {
         command.arg("--daemonize");
     }
+    command.args(policy_args);
     command.arg("--");
     command
 }
@@ -389,6 +400,112 @@ fn launcher_exposes_exact_jailer_help_version_and_policy_validation() {
         vmnet,
         "networkless signed profile with positive vmnet authority",
     );
+}
+
+#[test]
+fn signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker() {
+    let bundle = production_bundle();
+    initialize_worker_container(&bundle);
+    let private = TestDir::new("linux-isolation-rejection");
+
+    let run_case = |case: &str,
+                    argument: JailerIsolationArgument,
+                    policy_args: Vec<OsString>,
+                    private_values: &[&str]| {
+        let baseline_sessions = session_entries();
+        let private_manifest = private
+            .path()
+            .join(format!("private-grant-{case}-must-not-open.json"));
+        let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let socket_path =
+            container_tmp_dir().join(format!("i-{:x}-{socket_id:x}.sock", std::process::id()));
+        assert!(!private_manifest.exists());
+        assert!(!socket_path.exists());
+
+        let mut command = jailer_command_with_policy(&bundle, case, &[], false, &policy_args);
+        command
+            .arg(GRANT_MANIFEST_OPTION)
+            .arg(&private_manifest)
+            .arg("--")
+            .arg("--api-sock")
+            .arg(&socket_path);
+        let output = run_with_timeout(
+            &mut command,
+            PROCESS_TIMEOUT,
+            "signed Linux isolation rejection",
+        );
+
+        assert_eq!(output.status.code(), Some(PROCESS_FAILURE_EXIT_CODE));
+        assert!(
+            output.stdout.is_empty(),
+            "{case} must not execute the worker or publish readiness; stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!(
+                "bangbang launcher: unsupported Firecracker jailer isolation argument on macOS: --{}\n",
+                argument.name()
+            )
+        );
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for private_value in private_values {
+            assert!(!diagnostics.contains(private_value));
+        }
+        assert!(!diagnostics.contains(path_text(&private_manifest)));
+        assert!(!diagnostics.contains(path_text(&socket_path)));
+        assert!(!private_manifest.exists());
+        assert!(!socket_path.exists());
+        assert_eq!(session_entries(), baseline_sessions);
+    };
+
+    let arguments = [
+        JailerIsolationArgument::Cgroup,
+        JailerIsolationArgument::CgroupVersion,
+        JailerIsolationArgument::ParentCgroup,
+        JailerIsolationArgument::NetworkNamespace,
+        JailerIsolationArgument::PidNamespace,
+    ];
+    for argument in arguments {
+        let name = argument.name();
+        run_case(
+            &format!("{name}-exact"),
+            argument,
+            vec![OsString::from(format!("--{name}"))],
+            &[],
+        );
+
+        let private_value = format!("private-{name}-attached-value");
+        run_case(
+            &format!("{name}-attached"),
+            argument,
+            vec![OsString::from(format!("--{name}={private_value}"))],
+            &[&private_value],
+        );
+    }
+
+    for argument in [
+        JailerIsolationArgument::Cgroup,
+        JailerIsolationArgument::CgroupVersion,
+        JailerIsolationArgument::ParentCgroup,
+        JailerIsolationArgument::NetworkNamespace,
+    ] {
+        let name = argument.name();
+        let private_value = format!("private-{name}-separated-value");
+        run_case(
+            &format!("{name}-separated"),
+            argument,
+            vec![
+                OsString::from(format!("--{name}")),
+                OsString::from(&private_value),
+            ],
+            &[&private_value],
+        );
+    }
 }
 
 #[test]

@@ -434,9 +434,11 @@ describe/state/memory/root consumers adopt exact files; create retains
 repeatable output anchors with bounded children and strict crash-cleanup
 records. General dynamic post-Ready delivery, hard revocation, cross-filesystem
 socket publication, vmnet provisioning and policy, arbitrary uid/gid transition,
-configurable chroot, cgroups, network/PID namespaces, seccomp outcomes, launch
-constraints, Developer ID possession, automatic restart, and notarization
-remain later work.
+configurable chroot, launch constraints, Developer ID possession, automatic
+restart, and notarization remain later work. The exact Linux seccomp, cgroup,
+network-namespace, and PID-namespace mechanisms now have terminal macOS
+platform exclusions; this does not make the surrounding aggregate jailer or
+production-host records complete.
 
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current
@@ -473,6 +475,13 @@ visible nonterminal states. Final validation rejects both. A
 authoritative platform evidence, alternatives, stable public behavior, focused
 tests, compatibility/security documentation, and a current Challenge result.
 The inventory foundation itself changes no runtime behavior.
+
+After #1384, the 417-record delivery inventory contains 33
+`implemented-and-verified`, 373 `audit-required`, three
+`missing-platform-feasible`, and eight `proven-platform-impossible` records.
+The eight are exactly `corpus:seccomp`, both executable seccomp leaves, and the
+five jailer cgroup/network/PID-namespace leaves; broad corpora, aggregate run
+operations, and isolation composites retain their independent handoffs.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
@@ -540,18 +549,46 @@ single transaction spanning the three split names, so crash-atomic three-file
 publication is not claimed.
 
 This capability ends at offline artifact creation. macOS/HVF cannot install or
-enforce Linux seccomp. Firecracker v1.16's current filter reader and process
-flags belong to the separate `corpus:seccomp` runtime work under #1384; the
-older install-helper wording in pinned `docs/seccompiler.md` does not expand
-the host tool into a runtime API.
+enforce Linux seccomp. #1384 terminally classifies Firecracker v1.16's current
+filter reader, runtime corpus, and process flags as public-macOS platform
+exclusions; the older install-helper wording in pinned `docs/seccompiler.md`
+does not expand the host tool into a runtime API.
+
+## Runtime Isolation Platform Exclusions
+
+The following Linux identities have no equivalent current public macOS process
+boundary. Their Firecracker names are rejected, not accepted as no-ops or
+translated into narrower native controls:
+
+| Firecracker input/corpus | Exact upstream effect | Stable macOS outcome |
+| --- | --- | --- |
+| `corpus:seccomp`, `--no-seccomp`, `--seccomp-filter PATH` | Select default, empty, or caller-loaded `vmm`/`api`/`vcpu` classic-BPF programs and install each nonempty program after `PR_SET_NO_NEW_PRIVS` with Linux `seccomp(SECCOMP_SET_MODE_FILTER)`. | `bangbang` reports only the first fixed unsupported name before filter-path/config-file access, VMM/backend construction, readiness, or API socket publication. Missing, separated, attached, duplicate, and both conflict orders are covered. Direct mode already has no Linux filter; App Sandbox remains an immutable signed boundary. |
+| jailer `--cgroup`, `--cgroup-version`, `--parent-cgroup` | Select cgroup v1/v2, create/inherit controller hierarchies, write arbitrary controller files, and attach the PID through `tasks` or `cgroup.procs`. | The production parser returns a closed fixed-name category before grant parsing/preparation, bundle/profile work, private staging, session creation, spawn, publication, or worker execution. Darwin rlimits are scalar process limits, not cgroup identities. |
+| jailer `--netns PATH` | Open the supplied namespace handle with no-follow and call `setns(CLONE_NEWNET)` before later jail setup. | The same early rejection never opens `PATH`. Network Extension is an entitled VPN extension, App Sandbox is access policy, and vmnet configures guest networking; none joins the host process to a path-named stack. |
+| jailer `--new-pid-ns` | Call `clone(CLONE_NEWPID)` so the first child is PID 1 in a nested visibility domain. | The same early rejection precedes session/worker creation. Darwin process groups, sessions, supervision, and event monitoring retain host PID identity and visibility. |
+
+The five jailer names are recognized only before the launch-policy delimiter and
+are absent from successful help. Attached values are inspected only for their
+fixed name, separated values are not consumed, lookalikes retain the generic
+invalid-policy result, and post-delimiter worker argv stays opaque. Derived
+`Debug` and fixed `Display` use a closed `JailerIsolationArgument` enum, so a
+path, cgroup property, parent, PID, or policy value cannot enter the error.
+
+Unit and direct process tests prove fixed errors and no socket/readiness for the
+seccomp inputs. The separately signed production-bundle test combines each
+jailer shape with a private invalid grant and socket request, then proves empty
+stdout, exact redacted stderr, no socket, and unchanged session state. This is
+ordering evidence for rejection before any public or persistent mutation, not
+a claim that App Sandbox, rlimits, Endpoint Security, Network Extension, vmnet,
+sessions, or supervision implements the Linux mechanism.
 
 ## Process Startup CLI
 
 The current `bangbang` executable has a checked Firecracker v1.16.0 process
 contract for all 23 configured argument names. Nineteen argument leaves have
-implemented and verified process-facing behavior; PCI, both seccomp flags, and
-`--snapshot-version` remain explicit cross-family
-handoffs. The exact audit and evidence are recorded in
+implemented and verified process-facing behavior; both seccomp leaves are
+terminal public-macOS platform exclusions; PCI and `--snapshot-version` remain
+explicit cross-family handoffs. The exact audit and evidence are recorded in
 [`compat/firecracker/v1.16.0/process-contract.md`](../compat/firecracker/v1.16.0/process-contract.md).
 The executable binds a Unix socket and
 serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,

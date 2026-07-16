@@ -4445,10 +4445,93 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_firecracker_linux_arg() {
-        let err = parse(&["--no-seccomp"]).expect_err("unsupported Linux flag should fail");
+    fn rejects_firecracker_seccomp_arguments_with_fixed_first_name() {
+        let cases: &[(&str, &[&str], &str, &[&str])] = &[
+            ("no-seccomp exact", &["--no-seccomp"], "no-seccomp", &[]),
+            (
+                "no-seccomp attached",
+                &["--no-seccomp=private-no-seccomp-value"],
+                "no-seccomp",
+                &["private-no-seccomp-value"],
+            ),
+            (
+                "no-seccomp duplicate",
+                &["--no-seccomp", "--no-seccomp=private-duplicate-value"],
+                "no-seccomp",
+                &["private-duplicate-value"],
+            ),
+            (
+                "no-seccomp after config path",
+                &[
+                    "--config-file",
+                    "private-unopened-config.json",
+                    "--no-seccomp",
+                ],
+                "no-seccomp",
+                &["private-unopened-config.json"],
+            ),
+            (
+                "seccomp-filter missing",
+                &["--seccomp-filter"],
+                "seccomp-filter",
+                &[],
+            ),
+            (
+                "seccomp-filter separated",
+                &["--seccomp-filter", "private-separated-filter.bpf"],
+                "seccomp-filter",
+                &["private-separated-filter.bpf"],
+            ),
+            (
+                "seccomp-filter attached",
+                &["--seccomp-filter=private-attached-filter.bpf"],
+                "seccomp-filter",
+                &["private-attached-filter.bpf"],
+            ),
+            (
+                "seccomp-filter duplicate",
+                &[
+                    "--seccomp-filter",
+                    "private-first-filter.bpf",
+                    "--seccomp-filter=private-second-filter.bpf",
+                ],
+                "seccomp-filter",
+                &["private-first-filter.bpf", "private-second-filter.bpf"],
+            ),
+            (
+                "no-seccomp first conflict",
+                &[
+                    "--no-seccomp",
+                    "--seccomp-filter=private-conflict-filter.bpf",
+                ],
+                "no-seccomp",
+                &["private-conflict-filter.bpf"],
+            ),
+            (
+                "seccomp-filter first conflict",
+                &[
+                    "--seccomp-filter=private-reverse-filter.bpf",
+                    "--no-seccomp",
+                ],
+                "seccomp-filter",
+                &["private-reverse-filter.bpf"],
+            ),
+        ];
 
-        assert_eq!(err, "unsupported Firecracker argument: --no-seccomp");
+        for (case, args, expected_name, private_values) in cases {
+            let error = parse(args).expect_err(case);
+            assert_eq!(
+                error,
+                format!("unsupported Firecracker argument: --{expected_name}"),
+                "{case}"
+            );
+            for private_value in *private_values {
+                assert!(
+                    !error.contains(private_value),
+                    "{case} leaked a private value"
+                );
+            }
+        }
     }
 
     #[test]

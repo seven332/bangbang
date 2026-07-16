@@ -2442,7 +2442,7 @@
     {
       "id": "corpus:design",
       "family": "process",
-      "summary": "Audit all applicable capability claims owned by the pinned design source corpus.",
+      "summary": "The runtime seccomp, cgroup, network-namespace, and PID-namespace limits now have terminal macOS platform conclusions; continue auditing the pinned design corpus for independent lifecycle, resource brokerage, deployment, and broader architecture claims.",
       "source_refs": [
         "corpus:design"
       ],
@@ -2487,7 +2487,7 @@
     {
       "id": "corpus:getting-started",
       "family": "process",
-      "summary": "Audit all applicable capability claims owned by the pinned getting-started source corpus.",
+      "summary": "The Linux runtime isolation inputs referenced by getting-started now have explicit macOS platform exclusions; continue auditing setup, operator workflow, artifacts, deployment identity, and all other pinned getting-started claims.",
       "source_refs": [
         "corpus:getting-started"
       ],
@@ -2505,7 +2505,7 @@
     {
       "id": "corpus:jailer",
       "family": "isolation",
-      "summary": "Audit all applicable capability claims owned by the pinned jailer source corpus.",
+      "summary": "Five production launch-control leaves are implemented and the cgroup, network-namespace, and PID-namespace leaves have terminal macOS exclusions; continue auditing arbitrary uid/gid transition, configurable chroot ownership, remaining arguments, and aggregate jailer behavior.",
       "source_refs": [
         "corpus:jailer"
       ],
@@ -2604,7 +2604,7 @@
     {
       "id": "corpus:production-host",
       "family": "isolation",
-      "summary": "Audit all applicable capability claims owned by the pinned production-host source corpus.",
+      "summary": "Linux seccomp, cgroup, network-namespace, and PID-namespace identities now have terminal macOS conclusions; continue auditing production brokerage, vmnet live evidence, credential and chroot authority, signing and deployment, recovery, and other host requirements.",
       "source_refs": [
         "corpus:production-host"
       ],
@@ -2631,11 +2631,98 @@
     {
       "id": "corpus:seccomp",
       "family": "isolation",
-      "summary": "Audit all applicable capability claims owned by the pinned seccomp source corpus.",
+      "summary": "Classify the pinned runtime seccomp corpus as Linux-only enforcement that macOS cannot install or replace, while keeping the separately implemented offline compiler outside this exclusion.",
       "source_refs": [
         "corpus:seccomp"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/seccomp.md#L24-L90"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/src/seccomp.rs#L33-L109"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/seccomp.rs#L10-L139"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.endpoint-security.client"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/endpointsecurity/client"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/app-sandbox"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/syscalls.master"
+          }
+        ],
+        "alternatives": [
+          "App Sandbox installs a fixed signed resource policy and is not caller-defined per-thread classic BPF.",
+          "Endpoint Security requires root, TCC approval, and an Apple-granted entitlement, observes only published events, and cannot filter every syscall in-process.",
+          "Private Seatbelt profiles are undocumented unsupported APIs and an active App Sandbox profile cannot be replaced from worker argv.",
+          "Running Firecracker's Linux installer in a sidecar would constrain a different process and change bangbang's native product boundary."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/main.rs",
+            "anchor": "unsupported_firecracker_arg"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/main.rs",
+            "anchor": "rejects_firecracker_seccomp_arguments_with_fixed_first_name"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/process_e2e.rs",
+            "anchor": "executable_rejects_unsupported_firecracker_process_flags_before_socket_publication"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/process-contract.md",
+            "anchor": "Platform-excluded seccomp inputs"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Runtime isolation platform exclusions"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1384#issuecomment-4987589364"
+        }
+      }
     },
     {
       "id": "corpus:seccompiler",
@@ -3102,11 +3189,88 @@
     {
       "id": "firecracker-argument:no-seccomp",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --no-seccomp.",
+      "summary": "Reject Firecracker v1.16 --no-seccomp with a fixed redacted category because macOS has no default per-thread Linux seccomp filter that this flag could disable.",
       "source_refs": [
         "firecracker-argument:no-seccomp"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/seccomp.md#L78-L90"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/src/main.rs#L166-L189"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/src/seccomp.rs#L33-L66"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/seccomp.rs#L43-L139"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/app-sandbox"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/syscalls.master"
+          }
+        ],
+        "alternatives": [
+          "Accepting --no-seccomp as a no-op would falsely report a default-filter-to-empty transition when direct bangbang already has no Linux filter.",
+          "App Sandbox cannot be disabled by worker argv and is a distinct fixed signed resource boundary rather than Firecracker's per-thread filter state.",
+          "Endpoint Security monitoring does not create an in-process default filter whose removal matches Firecracker's flag."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/main.rs",
+            "anchor": "unsupported_firecracker_arg"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/main.rs",
+            "anchor": "rejects_firecracker_seccomp_arguments_with_fixed_first_name"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/process_e2e.rs",
+            "anchor": "executable_rejects_unsupported_firecracker_process_flags_before_socket_publication"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/process-contract.md",
+            "anchor": "Platform-excluded seccomp inputs"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Runtime isolation platform exclusions"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1384#issuecomment-4987589364"
+        }
+      }
     },
     {
       "id": "firecracker-argument:parent-cpu-time-us",
@@ -3134,11 +3298,88 @@
     {
       "id": "firecracker-argument:seccomp-filter",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --seccomp-filter.",
+      "summary": "Reject Firecracker v1.16 --seccomp-filter with a fixed redacted category before path access because macOS cannot install its per-thread Linux classic-BPF filter map.",
       "source_refs": [
         "firecracker-argument:seccomp-filter"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/seccomp.md#L51-L76"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/src/main.rs#L166-L189"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/src/seccomp.rs#L33-L109"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/seccomp.rs#L10-L139"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/app-sandbox"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/syscalls.master"
+          }
+        ],
+        "alternatives": [
+          "App Sandbox cannot load a caller-supplied vmm/api/vcpu classic-BPF map or replace its signed policy per thread.",
+          "Deserializing or compiling the filter without installing it would validate an artifact but not enforce the requested thread boundary.",
+          "Endpoint Security event monitoring is privileged, incomplete at the syscall boundary, and cannot install the requested in-process return actions."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/main.rs",
+            "anchor": "unsupported_firecracker_arg"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/main.rs",
+            "anchor": "rejects_firecracker_seccomp_arguments_with_fixed_first_name"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/process_e2e.rs",
+            "anchor": "executable_rejects_unsupported_firecracker_process_flags_before_socket_publication"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/process-contract.md",
+            "anchor": "Platform-excluded seccomp inputs"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Runtime isolation platform exclusions"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1384#issuecomment-4987589364"
+        }
+      }
     },
     {
       "id": "firecracker-argument:show-level",
@@ -3375,7 +3616,7 @@
     {
       "id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
       "family": "isolation",
-      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a closed environment and default-close standard/lifecycle/grant/dormant-broker descriptor allowlist, authenticated lifecycle v4 credential/resource-limit/vmnet launch policy, exact worker-only RLIMIT_FSIZE/RLIMIT_NOFILE, current-credential and session verification, a descriptor-entered locked private namespace with strict post-gate ownership records, and exact contained consumption of granted startup config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket, and vsock-socket authority. The canonical vmnet policy is immutable and redacted, final contained InstanceStart enforces its host/shared/exact-bridge allowlist and separate active-interface maximum before resource or backend construction, and static/live validation admits only the exact networkless or caller-approved vmnet profile and binds positive authority only to vmnet. Vmnet packaging requires bounded captured profile relationships, a profile-listed signing leaf, and a disposable current-host authorization launch before publication. A signed same-code launcher re-exec provides detached readiness, PID, signal, supervision, and cleanup ownership without exposing an orphaned worker. Normal signed execution proves outside-container descriptors and anchored directories work through launcher-preauthorized identities, native snapshot create/describe/restore reaches a real guest, recorded snapshot staging is recovered after worker death without deleting replacements, both real vsock initiation directions work through supplied listeners or the fixed launcher facet, networkless vmnet requests are rejected, helpers are reaped before exposure, and worker entitlements remain exactly App Sandbox plus Hypervisor. Arbitrary uid/gid transition and configurable chroot ownership, cgroups, network/PID namespaces, seccomp, general brokerage/hard revocation, cross-filesystem socket publication, real vmnet start/connectivity/cleanup evidence and repository-owned approved credentials, and deployment outcomes still require explicit macOS conclusions under #1351.",
+      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a closed environment and default-close standard/lifecycle/grant/dormant-broker descriptor allowlist, authenticated lifecycle v4 credential/resource-limit/vmnet launch policy, exact worker-only RLIMIT_FSIZE/RLIMIT_NOFILE, current-credential and session verification, a descriptor-entered locked private namespace with strict post-gate ownership records, and exact contained consumption of granted startup config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket, and vsock-socket authority. The canonical vmnet policy is immutable and redacted, final contained InstanceStart enforces its host/shared/exact-bridge allowlist and separate active-interface maximum before resource or backend construction, and static/live validation admits only the exact networkless or caller-approved vmnet profile and binds positive authority only to vmnet. Vmnet packaging requires bounded captured profile relationships, a profile-listed signing leaf, and a disposable current-host authorization launch before publication. A signed same-code launcher re-exec provides detached readiness, PID, signal, supervision, and cleanup ownership without exposing an orphaned worker. Normal signed execution proves outside-container descriptors and anchored directories work through launcher-preauthorized identities, native snapshot create/describe/restore reaches a real guest, recorded snapshot staging is recovered after worker death without deleting replacements, both real vsock initiation directions work through supplied listeners or the fixed launcher facet, networkless vmnet requests are rejected, helpers are reaped before exposure, and worker entitlements remain exactly App Sandbox plus Hypervisor. The exact Linux seccomp, cgroup, network-namespace, and PID-namespace mechanisms now have terminal macOS platform exclusions rather than false native aliases. Arbitrary uid/gid transition and configurable chroot ownership, general brokerage and hard revocation, cross-filesystem socket publication, real vmnet start/connectivity/cleanup evidence and repository-owned approved credentials, and deployment outcomes remain feasible independent work under #1351.",
       "source_refs": [
         "corpus:jailer",
         "corpus:production-host",
@@ -3814,20 +4055,188 @@
     {
       "id": "tool-argument:jailer/cgroup",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/cgroup.",
+      "summary": "Reject jailer --cgroup with a fixed redacted category because macOS exposes no generic Linux cgroup controller hierarchy or PID-attachment identity.",
       "source_refs": [
         "tool-argument:jailer/cgroup"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/cgroup.rs#L133-L238"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/cgroup.rs#L314-L499"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L191-L248"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L208-L225"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/app-sandbox"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setrlimit.2.html"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/syscalls.master"
+          }
+        ],
+        "alternatives": [
+          "App Sandbox fixes resource access at code-sign time and exposes no arbitrary hierarchy, controller file, delegation, or PID-attachment contract.",
+          "Darwin rlimits and per-user RLIMIT_NPROC are scalar inherited limits, not generic cgroup v1/v2 identities.",
+          "launchd resource classes, nice, and QoS do not expose Firecracker's repeatable controller-file grammar or placement semantics."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/error.rs",
+            "anchor": "JailerIsolationArgument::Cgroup"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "unsupported_jailer_isolation_argument"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "rejects_named_linux_isolation_before_consuming_values"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Runtime isolation platform exclusions"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1384#issuecomment-4987589364"
+        }
+      }
     },
     {
       "id": "tool-argument:jailer/cgroup-version",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/cgroup-version.",
+      "summary": "Reject jailer --cgroup-version with a fixed redacted category because macOS has neither the Linux cgroup v1 controller mounts nor the v2 unified hierarchy.",
       "source_refs": [
         "tool-argument:jailer/cgroup-version"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/cgroup.rs#L23-L184"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L191-L248"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L208-L225"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/app-sandbox"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setrlimit.2.html"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/syscalls.master"
+          }
+        ],
+        "alternatives": [
+          "App Sandbox has no selectable cgroup version, controller filesystem, delegation, or nested resource-group identity.",
+          "Darwin rlimits expose one scalar process interface and cannot select or emulate Linux cgroup v1 versus v2 semantics.",
+          "Inventing a macOS-only version value would make a security-sensitive Firecracker selector succeed without its requested kernel contract."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/error.rs",
+            "anchor": "JailerIsolationArgument::CgroupVersion"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "unsupported_jailer_isolation_argument"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "rejects_named_linux_isolation_before_consuming_values"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Runtime isolation platform exclusions"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1384#issuecomment-4987589364"
+        }
+      }
     },
     {
       "id": "tool-argument:jailer/chroot-base-dir",
@@ -3934,29 +4343,275 @@
     {
       "id": "tool-argument:jailer/netns",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/netns.",
+      "summary": "Reject jailer --netns with a fixed redacted category before path access because macOS cannot join a path-named Linux network namespace.",
       "source_refs": [
         "tool-argument:jailer/netns"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L520-L533"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L649-L660"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L190-L208"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/networkextension/packet-tunnel-provider"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/technotes/tn3120-expected-use-cases-for-network-extension-packet-tunnel-providers"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/vmnet"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/syscalls.master"
+          }
+        ],
+        "alternatives": [
+          "App Sandbox network entitlements restrict access but do not join a caller-selected host network stack by namespace path.",
+          "Network Extension packet tunnels are entitled VPN extensions with deployment state, not unprivileged setns for the VMM process.",
+          "vmnet provides guest-facing virtual networking and does not remap the launcher's or worker's host network namespace."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/error.rs",
+            "anchor": "JailerIsolationArgument::NetworkNamespace"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "unsupported_jailer_isolation_argument"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "rejects_named_linux_isolation_before_consuming_values"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Runtime isolation platform exclusions"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1384#issuecomment-4987589364"
+        }
+      }
     },
     {
       "id": "tool-argument:jailer/new-pid-ns",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/new-pid-ns.",
+      "summary": "Reject jailer --new-pid-ns with a fixed redacted category because macOS cannot clone a nested PID namespace with a remapped PID 1 and isolated PID view.",
       "source_refs": [
         "tool-argument:jailer/new-pid-ns"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L333-L382"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L68-L99"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L190-L208"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/endpointsecurity"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/syscalls.master"
+          }
+        ],
+        "alternatives": [
+          "Darwin process groups and sessions change signaling and terminal ownership but do not remap PID 1 or process visibility.",
+          "Endpoint Security observes selected process events and does not create a nested PID identity or namespace init process.",
+          "Supervisor ownership and daemon re-exec retain host PIDs and cannot claim Linux CLONE_NEWPID semantics."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/error.rs",
+            "anchor": "JailerIsolationArgument::PidNamespace"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "unsupported_jailer_isolation_argument"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "rejects_named_linux_isolation_before_consuming_values"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Runtime isolation platform exclusions"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1384#issuecomment-4987589364"
+        }
+      }
     },
     {
       "id": "tool-argument:jailer/parent-cgroup",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/parent-cgroup.",
+      "summary": "Reject jailer --parent-cgroup with a fixed redacted category because macOS has no Linux cgroup parent hierarchy or process placement contract.",
       "source_refs": [
         "tool-argument:jailer/parent-cgroup"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/cgroup.rs#L252-L313"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L191-L248"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L222-L234"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/app-sandbox"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setrlimit.2.html"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/syscalls.master"
+          }
+        ],
+        "alternatives": [
+          "App Sandbox containers are signing identities, not caller-selected nested cgroup parents with controller inheritance.",
+          "Darwin rlimits inherit across children but provide no parent group path, delegation, or attach-to-existing-group operation.",
+          "launchd jobs and process groups have distinct lifecycle semantics and cannot place a PID into Firecracker's requested cgroup hierarchy."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/error.rs",
+            "anchor": "JailerIsolationArgument::ParentCgroup"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "unsupported_jailer_isolation_argument"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "rejects_named_linux_isolation_before_consuming_values"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Runtime isolation platform exclusions"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Certified Linux runtime isolation exclusions"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1384#issuecomment-4987589364"
+        }
+      }
     },
     {
       "id": "tool-argument:jailer/resource-limit",
@@ -4345,7 +5000,7 @@
     {
       "id": "tool-operation:jailer/run",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool operation jailer/run.",
+      "summary": "The fixed-code/current-user/resource-limit/daemon leaves are implemented and Linux cgroup/network/PID namespace inputs have terminal macOS exclusions; continue auditing uid/gid/chroot, remaining arguments, ordering, and the aggregate jailer run contract.",
       "source_refs": [
         "tool-operation:jailer/run"
       ],

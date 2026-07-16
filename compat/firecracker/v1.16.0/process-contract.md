@@ -59,15 +59,35 @@ remains `audit-required` for the named owner.
 | `--mmds-size-limit <BYTES>` | One `usize`; omitted value inherits the effective HTTP limit; zero is valid. | Exact inheritance and complete non-negative `usize` domain. A zero limit permits startup and rejects every serialized object through the MMDS data-store-limit path. | process-MMDS / I+V | [`StartupConfig::effective_mmds_size_limit`](../../../crates/bangbang/src/main.rs); zero/max unit cases and [`executable_zero_mmds_limit_rejects_every_serialized_object`](../../../crates/bangbang/tests/process_e2e.rs) |
 | `--module <MODULE>` | One value; configure logger module filtering. | Applies Firecracker-style module-prefix filtering to implemented process logger events before readiness. Producer breadth stays with observability records. | observability / I+V | logger argument handling in [`Args::parse`](../../../crates/bangbang/src/main.rs); [`executable_applies_startup_logger_arguments`](../../../crates/bangbang/tests/process_e2e.rs) |
 | `--no-api` | Flag; requires `--config-file`; start and run without an API socket. | Enforces the prerequisite, applies the same supported config path, publishes only no-API readiness, and owns no socket. Clean signals and guest terminal outcomes end the process. | process / I+V | [`run_without_api`](../../../crates/bangbang/src/main.rs); no-API failure/readiness/guest-outcome cases in [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) and [`executable_hvf_e2e.rs`](../../../crates/bangbang/tests/executable_hvf_e2e.rs) |
-| `--no-seccomp` | Flag; conflicts with `--seccomp-filter`; disable Firecracker's Linux seccomp filters. | Rejected before readiness. Acceptance is deferred until #1351 establishes production containment and then classifies the remaining seccomp contract. | #1351 post-containment seccomp slice / audit | Stable nonmutating rejection in [`Args::parse`](../../../crates/bangbang/src/main.rs) and unsupported-flag process tests in [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) |
+| `--no-seccomp` | Flag; conflicts with `--seccomp-filter`; replace Firecracker's default `vmm`/`api`/`vcpu` Linux filters with empty programs. | Rejected with a fixed name before configuration-file access, VMM/backend construction, readiness, or API socket publication. Direct bangbang already has no Linux filter, so accepting this as a no-op would falsely report the upstream default-to-empty transition. | process / proven-platform-impossible (#1384) | Fixed first-name behavior in [`Args::parse`](../../../crates/bangbang/src/main.rs), full exact/attached/duplicate/conflict unit coverage, and process no-output/no-socket evidence in [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) |
 | `--parent-cpu-time-us <MICROS>` | One `u64`; optional; zero through `u64::MAX`. | Exact input domain; contributes to emitted startup CPU diagnostics when `--start-time-cpu-us` is present. | process-observability / I+V | [`StartupTimeConfig`](../../../crates/bangbang/src/main.rs); startup-time unit/process and metrics cases in [`main.rs`](../../../crates/bangbang/src/main.rs) and [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) |
-| `--seccomp-filter <PATH>` | One value; conflicts with `--no-seccomp`; load a custom Linux BPF filter. | Rejected before readiness without echoing the private path. Acceptance is deferred until #1351's production containment and seccomp classification. | #1351 post-containment seccomp slice / audit | Stable redacted rejection in [`Args::parse`](../../../crates/bangbang/src/main.rs) and unsupported-flag process tests in [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) |
+| `--seccomp-filter <PATH>` | One value; conflicts with `--no-seccomp`; load a bounded bitcode map and install its `vmm`/`api`/`vcpu` classic-BPF programs on Linux threads. | Missing, separated, attached, duplicate, and conflicting forms all return the first fixed name before consuming or opening a path, configuration-file access, VMM/backend construction, readiness, or socket publication. macOS has no public per-thread Linux seccomp installer. | process / proven-platform-impossible (#1384) | Fixed redacted behavior in [`Args::parse`](../../../crates/bangbang/src/main.rs), complete unit matrix there, and exact exit/stderr/no-output/no-socket process proof in [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) |
 | `--show-level` | Flag; include logger level. | Enables the level field for implemented process logger events. | observability / I+V | logger configuration in [`Args::parse`](../../../crates/bangbang/src/main.rs); [`executable_applies_startup_logger_arguments`](../../../crates/bangbang/tests/process_e2e.rs) |
 | `--show-log-origin` | Flag; include logger callsite origin. | Enables the origin field for implemented process logger events. | observability / I+V | logger configuration in [`Args::parse`](../../../crates/bangbang/src/main.rs); [`executable_applies_startup_logger_arguments`](../../../crates/bangbang/tests/process_e2e.rs) |
 | `--snapshot-version` | Flag; early command that prints Firecracker's supported snapshot data-format version. | Early command exists, but prints bangbang native-v1 (`v1.0.0`), not Firecracker's state-artifact format version. | snapshot wave under #1348 / audit | Native-only implementation in [`run`](../../../crates/bangbang/src/main.rs) and native snapshot process tests in [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) |
 | `--start-time-cpu-us <MICROS>` | One `u64`; optional; zero through `u64::MAX`. | Exact input domain; reports sampled process CPU time relative to the supplied value and optional parent time. | process-observability / I+V | [`StartupTimeConfig`](../../../crates/bangbang/src/main.rs); startup-time unit/process and metrics cases in [`main.rs`](../../../crates/bangbang/src/main.rs) and [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) |
 | `--start-time-us <MICROS>` | One `u64`; optional; zero through `u64::MAX`. | Exact input domain; reports sampled monotonic startup time relative to the supplied value, saturating at zero. | process-observability / I+V | [`StartupTimeConfig`](../../../crates/bangbang/src/main.rs); startup-time unit/process and metrics cases in [`main.rs`](../../../crates/bangbang/src/main.rs) and [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) |
 | `--version` | Flag; early command that prints the running product version. | Prints `bangbang <package-version>` and exits before resource setup. Product branding/version is intentionally bangbang's; the early-command behavior is equivalent. `-V` is an extension. | process / I+V | [`run`](../../../crates/bangbang/src/main.rs); version, alias, precedence, and no-socket cases in [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) |
+
+## Platform-excluded seccomp inputs
+
+Firecracker v1.16's default, empty, and custom paths all produce a per-thread
+Linux classic-BPF installation contract: nonempty programs first set
+`PR_SET_NO_NEW_PRIVS` and then use `seccomp(SECCOMP_SET_MODE_FILTER)`. The
+current public macOS SDK and XNU syscall surface expose no `seccomp` operation.
+App Sandbox is a fixed signed resource boundary, Endpoint Security is privileged
+event monitoring, and private Seatbelt policy is unsupported; none can load the
+caller's `vmm`/`api`/`vcpu` return actions. Offline `seccompiler-bin` artifact
+creation remains implemented, but compiling or deserializing a map without
+installing it is not runtime equivalence.
+
+Both executable names are therefore terminal `proven-platform-impossible`
+records, not accepted no-ops. The parser reads only the fixed option name,
+returns on its first occurrence, never opens the supplied filter path, and
+prints only `unsupported Firecracker argument: --NAME`. Unit and real process
+tests cover exact, attached, missing, separated, duplicate, and both conflict
+orders while proving empty stdout, the argument exit code, no readiness, and no
+API socket.
 
 ## Composite process semantics
 
@@ -76,17 +96,18 @@ remains `audit-required` for the named owner.
 | `semantic.process:cli-config-readiness-and-api-socket` | Argument parsing precedes process setup. API-only startup publishes one owner-only socket after successful setup; config-file API startup publishes it only after the VM starts; no-API startup never creates it. Failed setup reports no readiness and cleans any owned socket. Concurrent processes have independent controller, MMDS, observability, socket, signal, and VM state. | I+V; production ownership in [`run`, `run_with_api`, and `run_without_api`](../../../crates/bangbang/src/main.rs), with API/config/no-API, failure, conflict, and concurrent-owner coverage in [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs) and signed startup coverage in [`executable_hvf_e2e.rs`](../../../crates/bangbang/tests/executable_hvf_e2e.rs). |
 | `semantic.process:instance-identity-and-version-output` | Unicode instance identity and product help/version output are implemented. The record also owns snapshot version/description output, whose artifact semantics are native-only. | audit; snapshot wave under #1348. Partial behavior is documented but cannot terminally certify the composite. |
 | `semantic.process:signals-exits-fd-and-cleanup` | SIGINT/SIGTERM request clean shutdown; SIGPIPE is nonfatal and counted; Firecracker fatal signals map to stable exit classes. Best-effort fd-table preallocation never clobbers an inherited target descriptor. Normal/error/guest terminal paths join the owned worker, stop schedulers, close resources, and unlink only the socket inode they own. | I+V; production logic and focused unit tests in [`main.rs`](../../../crates/bangbang/src/main.rs), process signal/socket/cleanup cases in [`process_e2e.rs`](../../../crates/bangbang/tests/process_e2e.rs), and signed repeatable lifecycle cases in [`executable_hvf_e2e.rs`](../../../crates/bangbang/tests/executable_hvf_e2e.rs). |
-| `tool-operation:firecracker/run` | The executable entrypoint and the 19 implemented arguments run, but the operation aggregates four incomplete argument capabilities. | audit; remains nonterminal until PCI, seccomp, and snapshot-version argument leaves reach terminal outcomes. |
-| `corpus:design` | The pinned whole file includes process model, isolation, API, device, guest, resource, and Linux mechanism claims. | audit; owned across later #1348 waves. |
-| `corpus:getting-started` | The pinned whole file includes executable, jailer, KVM/Linux host, configuration, boot, and device claims. | audit; owned across later #1348 waves. |
+| `tool-operation:firecracker/run` | The executable entrypoint has 19 implemented arguments and two terminal platform-excluded seccomp arguments, but the aggregate still includes PCI and native-only snapshot-version leaves. | audit; remains nonterminal until those independent argument leaves and aggregate ordering reach terminal outcomes. |
+| `corpus:design` | The pinned whole file includes process model, isolation, API, device, guest, resource, and Linux mechanism claims. Runtime seccomp now has a terminal macOS conclusion. | audit; broader lifecycle, device, resource, and architecture claims remain owned across later #1348 waves. |
+| `corpus:getting-started` | The pinned whole file includes executable, jailer, KVM/Linux host, configuration, boot, and device claims. Its runtime seccomp references now have terminal macOS conclusions. | audit; setup, artifacts, operator workflow, deployment, and other claims remain owned across later #1348 waves. |
 
-## Terminal record set through #1368
+## Terminal record set through #1384
 
-Exactly 21 of the 29 process-family records are
+Exactly 23 of the 29 process-family records are terminal. Twenty-one are
 `implemented-and-verified`: the 19 `I+V` argument rows and the two `I+V`
-semantic rows above. Eight remain `audit-required`: four argument rows, one
-snapshot-containing semantic record, the aggregate run operation, and the two
-broad corpus records.
+semantic rows above. `--no-seccomp` and `--seccomp-filter` are the two
+`proven-platform-impossible` records. Six remain `audit-required`: two argument
+rows, one snapshot-containing semantic record, the aggregate run operation, and
+the two broad corpus records.
 
 The repository validates overlay structure and tracked references with
 `cargo run -p bangbang-firecracker-capability-audit --locked -- validate` and
@@ -131,5 +152,6 @@ validation is in [`tests/cli.rs`](../../../tools/seccompiler/tests/cli.rs),
 with independent classic-BPF semantics in
 [`tests/semantics.rs`](../../../tools/seccompiler/tests/semantics.rs). The
 pinned documentation's install-helper prose maps to the Linux VMM filter
-consumer, not this offline tool; `corpus:seccomp` and runtime adoption remain
-nonterminal under #1384.
+consumer, not this offline tool. #1384 terminally classifies that complete
+runtime corpus and its two executable inputs as public-macOS platform
+exclusions without expanding the offline tool into an installer.

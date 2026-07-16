@@ -607,6 +607,7 @@ impl FailureCategory {
             | LauncherError::InvalidBundleSignature => Self::Bundle,
             LauncherError::InvalidGrantInput
             | LauncherError::InvalidLaunchPolicy
+            | LauncherError::UnsupportedJailerIsolation(_)
             | LauncherError::GrantPreparation => Self::Policy,
             LauncherError::WorkerSpawn(_) | LauncherError::SessionSetup(_) => Self::Spawn,
             LauncherError::InvalidWorkerIdentity | LauncherError::InvalidDaemonIdentity => {

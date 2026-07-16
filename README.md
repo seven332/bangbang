@@ -59,8 +59,10 @@ condition-dropping mode. Combined output uses the pinned v1.16 bitcode format
 and Firecracker's 100,000-byte consumer limit. The tool reads one bounded
 regular UTF-8 policy, rejects symlink and special-file endpoints, stages
 owner-only complete outputs, and publishes through checked atomic rename
-operations. It is an artifact compiler only: macOS cannot install or enforce
-Linux seccomp filters, and runtime filter loading remains a separate capability.
+operations. It is an artifact compiler only: current public macOS cannot install
+or enforce Firecracker's per-thread Linux seccomp filters. Runtime installation
+is therefore a certified platform exclusion, and the executable rejects both
+runtime seccomp inputs before opening a filter path or constructing the VMM.
 
 On supported macOS Apple Silicon hosts, the public machine configuration accepts
 `vcpu_count` from 1 through 32 and HVF startup admits the host-limited subset
@@ -395,6 +397,28 @@ worker, including launches without this envelope. The launcher injects the
 validated ID and sampled timing once. `--bangbang-jailer-v1 --help` and
 `--version` are exact early commands.
 
+### Linux-only runtime isolation arguments
+
+These names are not part of either successful help grammar. They are recognized
+only to return a fixed, value-redacted macOS platform error:
+
+| Process | Linux-only input | macOS outcome |
+| --- | --- | --- |
+| `bangbang` | `--no-seccomp` | rejected before configuration-file access, VMM/backend construction, readiness, or API socket publication |
+| `bangbang` | `--seccomp-filter[=PATH]` | rejected before consuming or opening `PATH`, with the same fixed category for missing, separated, attached, duplicate, and conflicting forms |
+| `bangbang-launcher` | `--cgroup[=VALUE]` | rejected before grant parsing/preparation, profile selection, staging, spawn, publication, or worker execution |
+| `bangbang-launcher` | `--cgroup-version[=VALUE]` | same fixed pre-mutation rejection; Darwin rlimits are not a cgroup version |
+| `bangbang-launcher` | `--parent-cgroup[=VALUE]` | same fixed pre-mutation rejection; no parent hierarchy or PID placement is claimed |
+| `bangbang-launcher` | `--netns[=PATH]` | same fixed pre-mutation rejection without opening `PATH`; vmnet is guest networking, not host-process `setns` |
+| `bangbang-launcher` | `--new-pid-ns[=VALUE]` | same fixed pre-mutation rejection; sessions and supervision do not remap PID 1 or process visibility |
+
+Launcher matching is exact and applies only before the launch-policy `--`.
+Attached values are inspected only for the fixed name, separated values are not
+consumed, and post-delimiter worker arguments remain opaque. App Sandbox,
+rlimits, Endpoint Security, Network Extension, vmnet, process sessions, and the
+supervisor retain their narrower documented roles; none is presented as a
+seccomp, cgroup, network-namespace, or PID-namespace alias.
+
 `--vmnet-allow` is repeatable but exact host/shared or bridge duplicates are
 invalid. A nonempty allowlist requires exactly one
 `--vmnet-max-interfaces`; the maximum without an allowlist is also invalid.
@@ -417,7 +441,10 @@ unpublished session; after acknowledgment the handoff endpoint is closed.
 This is the unprivileged macOS outcome for fixed executable/current-user
 identity, private working root, environment/descriptors, resource limits, and
 daemon ownership. It does not claim arbitrary uid/gid switching, configurable
-chroot ownership, cgroups, network/PID namespaces, or seccomp.
+chroot ownership, or Linux runtime-isolation identity. The exact seccomp,
+cgroup, network-namespace, and PID-namespace inputs above are certified platform
+exclusions rather than accepted no-ops; broader credential/chroot work remains
+separate.
 
 After the launch-policy delimiter, the existing optional grant envelope remains
 position one in the worker argument sequence:
@@ -828,8 +855,12 @@ the full endpoint matrix, implemented behavior, and deferred Firecracker
 features. See [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md)
 for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
-mechanically checked scope authority for exhaustive compatibility work; its
-initial `audit-required` entries do not make new runtime claims.
+mechanically checked scope authority for exhaustive compatibility work. Its 417
+records currently contain 33 implemented-and-verified, 373 audit-required,
+three missing-platform-feasible, and eight proven-platform-impossible outcomes;
+the latter are exactly the runtime seccomp corpus/two executable inputs and five
+jailer isolation inputs described above. Nonterminal entries do not make new
+runtime claims.
 
 ## Build And Test
 
@@ -877,7 +908,9 @@ static and live-worker validation, tamper rejection, the descriptor allowlist,
 closed worker environment, lifecycle-v4 launch-policy authentication, canonical
 default-denied vmnet policy and networkless-profile rejection, exact and
 kernel-enforced resource limits, private-root entry, jailer help/version/parser
-rejection, foreground compatibility, daemon readiness/PID/stdio/session
+rejection, fixed redacted pre-mutation rejection of every exact/attached Linux
+cgroup/network/PID-namespace name, foreground compatibility, daemon
+readiness/PID/stdio/session
 ownership, pre-ack parent-loss cancellation, concurrent daemon isolation,
 malformed-bootstrap rejection, container-only path denial and redaction,
 structured API/no-API readiness and cancellation, worker-first/launcher-first

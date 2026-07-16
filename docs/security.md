@@ -57,8 +57,10 @@ handoff, and socket-broker channels. Contained startup config, startup metadata,
 adopt exact read-only grants; block and pmem devices adopt exact repeatable
 read-only/read-write backing grants; logger, metrics, and serial adopt exact
 singleton write-only sink grants. Arbitrary uid/gid transition, configurable
-chroot ownership, cgroups, network/PID namespaces, seccomp, and complete
-distribution-signing policy remain absent.
+chroot ownership, and complete distribution-signing policy remain absent. The
+exact seccomp, cgroup, network-namespace, and PID-namespace mechanisms are now
+certified public-macOS exclusions rather than unresolved or silently accepted
+inputs.
 
 Apple App Sandbox is a supportable containment building block, not a direct
 jailer port. The lower-level signed target packages real binaries as minimal
@@ -75,6 +77,52 @@ block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket,
 and vsock-socket consumers use granted identities or exact retained anchors
 without reopening their tagged path strings. General dynamic post-Ready
 delivery and hard revocation still need dedicated designs.
+
+## Certified Linux Runtime Isolation Exclusions
+
+Firecracker v1.16 installs a nonempty classic-BPF program on each `vmm`, `api`,
+and `vcpu` Linux thread after `PR_SET_NO_NEW_PRIVS`; `--no-seccomp` replaces the
+default programs with empty programs, while `--seccomp-filter` loads the caller's
+bounded map. Current public macOS exposes neither Linux `seccomp` installation
+nor an equivalent caller-defined per-thread syscall-return policy. Direct
+bangbang already has no Linux filter, so accepting `--no-seccomp` as a no-op
+would falsely report a default-to-empty transition. App Sandbox is a fixed
+signed resource boundary, private Seatbelt policy is unsupported, and Endpoint
+Security is privileged event monitoring rather than an every-syscall in-process
+filter.
+
+Firecracker's jailer cgroup inputs select v1 or v2 controller hierarchies, write
+arbitrary controller files, inherit/enable parents, and attach the process via
+`tasks` or `cgroup.procs`. Darwin rlimits are inherited scalar process limits
+(`RLIMIT_NPROC` is per user), not group identity, hierarchy, delegation,
+controller files, or arbitrary PID placement. App Sandbox, launchd classes,
+nice, and QoS do not supply that contract.
+
+`--netns` opens a named Linux namespace handle without following its final
+symlink and calls `setns(CLONE_NEWNET)` before later jail setup. Network
+Extension packet tunnels are entitled VPN extensions, and vmnet provides guest
+networking; neither joins the host launcher/worker to a caller-selected network
+stack. `--new-pid-ns` uses `clone(CLONE_NEWPID)` so the first child is PID 1 in a
+nested visibility domain. Darwin process groups, sessions, monitoring, and
+supervisor ownership keep host PIDs and cannot reproduce that identity.
+
+The executable rejects `--no-seccomp` and every shape of `--seccomp-filter`
+before filter-path access, configuration-file access, VMM/backend construction,
+readiness, or API socket publication. Its error contains only the first fixed
+unsupported name. The production launch-policy parser similarly recognizes
+only exact pre-delimiter `--cgroup`, `--cgroup-version`, `--parent-cgroup`,
+`--netns`, and `--new-pid-ns` names, including attached forms, and returns a
+closed typed error before grant parsing/preparation, bundle/profile selection,
+private staging, session creation, spawn, publication, or worker execution. It
+does not consume a following value or reinterpret post-delimiter worker argv.
+
+Unit and direct process tests cover missing, separated, attached, duplicate,
+conflicting, lookalike, and delimiter cases with fixed Debug/Display/stdout/
+stderr redaction. The real separately signed production bundle combines each
+jailer rejection with private invalid grant and socket inputs and proves empty
+stdout, exact stderr, no socket, and an unchanged session directory. Those
+tests certify rejection ordering; they do not turn App Sandbox, rlimits, vmnet,
+sessions, or supervision into Linux-isolation substitutes.
 
 ## Platform-Limit Taxonomy
 
