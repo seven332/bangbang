@@ -438,17 +438,18 @@ fn validate_mpidrs(mpidrs: &[u64]) -> Result<(), HvfVcpuTopologyError> {
     Ok(())
 }
 
-fn create_ordered_topology_with<M, Q, A, F>(
+pub(crate) fn prepare_ordered_mpidrs(vcpu_count: u8) -> Result<Vec<u64>, HvfVcpuTopologyError> {
+    prepare_ordered_mpidrs_with(vcpu_count, crate::ffi::get_max_vcpu_count, |_, _| Ok(()))
+}
+
+fn prepare_ordered_mpidrs_with<Q, A>(
     vcpu_count: u8,
     query_host_max: Q,
     mut before_allocation: A,
-    start_member: F,
-) -> Result<CreatedTopology<M>, HvfVcpuTopologyError>
+) -> Result<Vec<u64>, HvfVcpuTopologyError>
 where
-    M: TopologyMember,
     Q: FnOnce() -> Result<u32, BackendError>,
     A: FnMut(HvfVcpuTopologyAllocation, usize) -> Result<(), String>,
-    F: FnMut(usize) -> Result<M, HvfVcpuRunnerError>,
 {
     let requested = validate_vcpu_count(vcpu_count)?;
     let host_max = query_host_max().map_err(HvfVcpuTopologyError::Backend)?;
@@ -471,6 +472,22 @@ where
         })?;
     mpidrs.extend((0..vcpu_count).map(u64::from));
     validate_mpidrs(&mpidrs)?;
+    Ok(mpidrs)
+}
+
+fn create_ordered_topology_with<M, Q, A, F>(
+    vcpu_count: u8,
+    query_host_max: Q,
+    mut before_allocation: A,
+    start_member: F,
+) -> Result<CreatedTopology<M>, HvfVcpuTopologyError>
+where
+    M: TopologyMember,
+    Q: FnOnce() -> Result<u32, BackendError>,
+    A: FnMut(HvfVcpuTopologyAllocation, usize) -> Result<(), String>,
+    F: FnMut(usize) -> Result<M, HvfVcpuRunnerError>,
+{
+    let mpidrs = prepare_ordered_mpidrs_with(vcpu_count, query_host_max, &mut before_allocation)?;
 
     create_topology_from_mpidrs_with(mpidrs, &mut before_allocation, start_member)
 }

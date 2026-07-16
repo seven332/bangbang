@@ -31,8 +31,9 @@ pub use coordinator::{
 };
 pub use cpu_template::{HvfArm64CpuTemplateError, HvfArm64CpuTemplateVcpuError};
 pub use dirty::{
-    HvfDirtyWriteFaultError, HvfDirtyWriteProtectionFailure, HvfDirtyWriteTracker,
-    HvfDirtyWriteTrackerQueryError, HvfDirtyWriteTrackerStartError, HvfDirtyWriteTrackerStopError,
+    HvfDirtyWriteEpochResetError, HvfDirtyWriteFaultError, HvfDirtyWriteProtectionFailure,
+    HvfDirtyWriteTracker, HvfDirtyWriteTrackerQueryError, HvfDirtyWriteTrackerStartError,
+    HvfDirtyWriteTrackerStopError,
 };
 pub use exit::{
     HvfExceptionExit, HvfHvcDecodeError, HvfHvcExit, HvfMmioAccess, HvfMmioAccessSize,

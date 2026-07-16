@@ -3,11 +3,12 @@ use std::ffi::c_void;
 use std::fmt;
 use std::io;
 use std::ptr::{self, NonNull};
+use std::sync::Arc;
 
 #[cfg(test)]
-use std::sync::Arc;
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::memory_dirty::{GuestMemoryDirtyTracker, GuestMemoryDirtyTrackerError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestAddress(u64);
@@ -339,6 +340,7 @@ pub(crate) struct SystemGuestMemoryDiscardAdviser;
 #[derive(Debug)]
 pub struct GuestMemory {
     regions: Vec<GuestMemoryRegion>,
+    dirty_tracker: Option<Arc<GuestMemoryDirtyTracker>>,
 }
 
 impl GuestMemory {
@@ -370,7 +372,36 @@ impl GuestMemory {
             });
         }
 
-        Ok(Self { regions })
+        Ok(Self {
+            regions,
+            dirty_tracker: None,
+        })
+    }
+
+    /// Install one shared dirty-page generation over every current region.
+    ///
+    /// Calling this before normal boot population records boot-loader and
+    /// device initialization writes. Calling it after snapshot image loading
+    /// establishes that image as a clean baseline.
+    pub fn enable_dirty_tracking(
+        &mut self,
+    ) -> Result<Arc<GuestMemoryDirtyTracker>, GuestMemoryDirtyTrackerError> {
+        if let Some(tracker) = self.dirty_tracker.as_ref() {
+            return Ok(Arc::clone(tracker));
+        }
+        let page_size = system_host_page_size()
+            .ok_or(GuestMemoryDirtyTrackerError::InvalidPageSize { page_size: 0 })?;
+        let tracker = Arc::new(GuestMemoryDirtyTracker::new(
+            self.regions.iter().map(GuestMemoryRegion::range),
+            page_size,
+        )?);
+        self.dirty_tracker = Some(Arc::clone(&tracker));
+        Ok(tracker)
+    }
+
+    /// Return the active shared dirty-page tracker, if configured.
+    pub fn dirty_tracker(&self) -> Option<Arc<GuestMemoryDirtyTracker>> {
+        self.dirty_tracker.as_ref().map(Arc::clone)
     }
 
     /// Allocate and add one process-owned guest memory region.
@@ -399,6 +430,11 @@ impl GuestMemory {
         })?;
 
         let region = allocate_region_with_mapper(range, page_size, mapper)?;
+        if let Some(tracker) = self.dirty_tracker.as_ref() {
+            tracker
+                .insert_region(range, true)
+                .map_err(|source| GuestMemoryAllocationError::DirtyTrackingMetadata { source })?;
+        }
         self.regions.insert(insert_index, region);
         Ok(())
     }
@@ -443,6 +479,10 @@ impl GuestMemory {
             return Err(GuestMemoryRegionRemovalError::MissingRange { range });
         };
 
+        if let Some(tracker) = self.dirty_tracker.as_ref() {
+            let removed = tracker.remove_region(range);
+            debug_assert!(removed, "dirty tracker must mirror guest-memory regions");
+        }
         self.regions.remove(index);
         Ok(())
     }
@@ -545,6 +585,28 @@ impl GuestMemory {
                 outcome.record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::HostAddress);
                 continue;
             };
+            if let Some(tracker) = self.dirty_tracker.as_ref() {
+                let Some(advice_guest_start) = region.range().start().checked_add(
+                    u64::try_from(advice_start_address - mapping_start.addr()).unwrap_or(u64::MAX),
+                ) else {
+                    outcome
+                        .record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::HostAddress);
+                    continue;
+                };
+                let Ok(advice_range) = GuestMemoryRange::new(advice_guest_start, advice_size_u64)
+                else {
+                    outcome
+                        .record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::HostAddress);
+                    continue;
+                };
+                if tracker.mark_range(advice_range).is_err() {
+                    outcome.record_failed(
+                        advice_size_u64,
+                        GuestMemoryDiscardFailureKind::RangeValidation,
+                    );
+                    continue;
+                }
+            }
             if adviser.zero(advice_address, advice_size).is_err() {
                 outcome.record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::ZeroAdvice);
                 continue;
@@ -570,6 +632,12 @@ impl GuestMemory {
         };
 
         self.validate_mapped_range(range)?;
+
+        if let Some(tracker) = self.dirty_tracker.as_ref() {
+            tracker
+                .mark_range(range)
+                .map_err(|_| GuestMemoryAccessError::DirtyTrackingState)?;
+        }
 
         let mut remaining = source;
         let mut current = range.start();
@@ -708,10 +776,22 @@ impl fmt::Debug for GuestMemoryRegion {
 pub enum GuestMemoryAllocationError {
     InvalidLayout(GuestMemoryError),
     InvalidHostPageSize,
-    SizeTooLarge { range: GuestMemoryRange },
-    RegionMetadataAllocationFailed { source: TryReserveError },
-    AnonymousMmapFailed { size: usize, source: io::Error },
-    AnonymousMmapReturnedNull { size: usize },
+    SizeTooLarge {
+        range: GuestMemoryRange,
+    },
+    RegionMetadataAllocationFailed {
+        source: TryReserveError,
+    },
+    DirtyTrackingMetadata {
+        source: GuestMemoryDirtyTrackerError,
+    },
+    AnonymousMmapFailed {
+        size: usize,
+        source: io::Error,
+    },
+    AnonymousMmapReturnedNull {
+        size: usize,
+    },
 }
 
 impl fmt::Display for GuestMemoryAllocationError {
@@ -732,6 +812,9 @@ impl fmt::Display for GuestMemoryAllocationError {
                     f,
                     "failed to reserve guest memory region metadata: {source}"
                 )
+            }
+            Self::DirtyTrackingMetadata { source } => {
+                write!(f, "failed to extend guest-memory dirty tracking: {source}")
             }
             Self::AnonymousMmapFailed { size, source } => {
                 write!(
@@ -754,6 +837,7 @@ impl std::error::Error for GuestMemoryAllocationError {
         match self {
             Self::InvalidLayout(source) => Some(source),
             Self::RegionMetadataAllocationFailed { source } => Some(source),
+            Self::DirtyTrackingMetadata { source } => Some(source),
             Self::AnonymousMmapFailed { source, .. } => Some(source),
             Self::InvalidHostPageSize
             | Self::SizeTooLarge { .. }
@@ -806,6 +890,7 @@ pub enum GuestMemoryAccessError {
         range: GuestMemoryRange,
         size: u64,
     },
+    DirtyTrackingState,
 }
 
 impl fmt::Display for GuestMemoryAccessError {
@@ -837,6 +922,9 @@ impl fmt::Display for GuestMemoryAccessError {
                     f,
                     "guest memory access segment of {size} bytes in range {range} is too large for this host"
                 )
+            }
+            Self::DirtyTrackingState => {
+                f.write_str("guest memory dirty tracking does not cover the write")
             }
         }
     }
@@ -1684,11 +1772,14 @@ mod tests {
     #[test]
     fn guest_memory_discard_reports_partial_failures_and_continues() {
         let page_size = host_page_size().expect("host page size should be available for tests");
-        let memory = allocate_memory(vec![
+        let mut memory = allocate_memory(vec![
             range(0, page_size),
             range(page_size, page_size),
             range(page_size * 2, page_size),
         ]);
+        let tracker = memory
+            .enable_dirty_tracking()
+            .expect("discard test should enable dirty tracking");
         let addresses = memory
             .regions()
             .iter()
@@ -1750,6 +1841,16 @@ mod tests {
                     address: third_address,
                     size: page_size_usize,
                 },
+            ]
+        );
+        assert_eq!(
+            tracker
+                .dirty_pages()
+                .expect("failed and successful discard interiors should remain conservative"),
+            [
+                GuestAddress::new(0),
+                GuestAddress::new(page_size),
+                GuestAddress::new(page_size * 2),
             ]
         );
     }
@@ -1830,6 +1931,7 @@ mod tests {
                     },
                 },
             }],
+            dirty_tracker: None,
         };
         let mut adviser = TestDiscardAdviser::new(PAGE_SIZE);
 
@@ -2339,6 +2441,56 @@ mod tests {
             .expect("guest memory read should succeed");
 
         assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn guest_memory_dirty_tracking_marks_exact_writes_and_dynamic_regions() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(0, page_size), range(page_size, page_size)]);
+        let tracker = memory
+            .enable_dirty_tracking()
+            .expect("dirty tracking should enable");
+
+        memory
+            .write_slice(&[0xaa, 0xbb], GuestAddress::new(page_size - 1))
+            .expect("cross-region write should succeed");
+        assert_eq!(
+            tracker.dirty_pages().expect("dirty pages should query"),
+            [GuestAddress::new(0), GuestAddress::new(page_size)]
+        );
+        assert_eq!(tracker.clear_quiesced(), 1);
+        assert_eq!(
+            memory.write_slice(&[0xcc], GuestAddress::new(page_size * 3)),
+            Err(GuestMemoryAccessError::UnmappedRange {
+                range: range(page_size * 3, 1),
+            })
+        );
+        assert!(
+            tracker
+                .dirty_pages()
+                .expect("failed write should leave generation clean")
+                .is_empty()
+        );
+
+        let dynamic = range(page_size * 4, page_size);
+        memory
+            .insert_region(dynamic)
+            .expect("tracked dynamic region should insert");
+        assert_eq!(
+            tracker
+                .dirty_pages()
+                .expect("new dynamic region should be wholly dirty"),
+            vec![dynamic.start()]
+        );
+        memory
+            .remove_region(dynamic)
+            .expect("tracked dynamic region should remove");
+        assert!(
+            tracker
+                .dirty_pages()
+                .expect("removed region should leave no dirty metadata")
+                .is_empty()
+        );
     }
 
     #[test]

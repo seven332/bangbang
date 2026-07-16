@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use bangbang_runtime::BackendError;
 use bangbang_runtime::machine::MAX_SUPPORTED_VCPUS;
 use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
+use bangbang_runtime::memory_dirty::{
+    GuestMemoryDirtyTracker, GuestMemoryDirtyTrackerAccessError, GuestMemoryDirtyTrackerError,
+};
 
 use crate::exit::HvfExceptionExit;
 use crate::memory::{HvfMappedGuestMemoryRegion, HvfMemoryMapper, HvfMemoryPermissions};
@@ -61,6 +64,7 @@ impl std::error::Error for HvfDirtyWriteProtectionFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfDirtyWriteTrackerStartError {
     Backend(BackendError),
+    DirtyBitmap,
     InvalidState(&'static str),
     InvalidHostPageSize {
         page_size: u64,
@@ -88,6 +92,7 @@ impl fmt::Display for HvfDirtyWriteTrackerStartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Backend(source) => write!(f, "{source}"),
+            Self::DirtyBitmap => f.write_str("failed to prepare dirty bitmap"),
             Self::InvalidState(message) => {
                 write!(f, "invalid dirty-write tracker start state: {message}")
             }
@@ -119,6 +124,7 @@ impl std::error::Error for HvfDirtyWriteTrackerStartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(source) => Some(source),
+            Self::DirtyBitmap => None,
             Self::ProtectionFailed { failure, .. } => Some(failure),
             Self::InvalidState(_)
             | Self::InvalidHostPageSize { .. }
@@ -130,6 +136,12 @@ impl std::error::Error for HvfDirtyWriteTrackerStartError {
 impl From<BackendError> for HvfDirtyWriteTrackerStartError {
     fn from(source: BackendError) -> Self {
         Self::Backend(source)
+    }
+}
+
+impl From<GuestMemoryDirtyTrackerError> for HvfDirtyWriteTrackerStartError {
+    fn from(_source: GuestMemoryDirtyTrackerError) -> Self {
+        Self::DirtyBitmap
     }
 }
 
@@ -188,6 +200,91 @@ impl std::error::Error for HvfDirtyWriteTrackerStopError {
 pub enum HvfDirtyWriteTrackerQueryError {
     InvalidState(&'static str),
     AllocationFailed,
+}
+
+/// Failure while advancing one dirty generation under external quiescence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfDirtyWriteEpochResetError {
+    InvalidState(&'static str),
+    AllocationFailed,
+    ProtectionFailed {
+        failure: HvfDirtyWriteProtectionFailure,
+        rollback_failures: Vec<HvfDirtyWriteProtectionFailure>,
+    },
+}
+
+/// Failure while serializing a live guest-memory topology change with faults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfDirtyWriteMappingMutationError {
+    InvalidState(&'static str),
+    UnalignedRegion,
+    OverlappingRegion,
+    MissingRegion,
+    AllocationFailed,
+}
+
+impl fmt::Display for HvfDirtyWriteMappingMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidState(message) => return formatter.write_str(message),
+            Self::UnalignedRegion => "tracked dynamic region is not host-page aligned",
+            Self::OverlappingRegion => "tracked dynamic region overlaps existing metadata",
+            Self::MissingRegion => "tracked dynamic region metadata is missing",
+            Self::AllocationFailed => "failed to allocate tracked dynamic region metadata",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for HvfDirtyWriteMappingMutationError {}
+
+impl HvfDirtyWriteEpochResetError {
+    /// Return whether protection is no longer safe for guest execution.
+    pub fn requires_vm_teardown(&self) -> bool {
+        match self {
+            Self::InvalidState(_) => true,
+            Self::ProtectionFailed {
+                rollback_failures, ..
+            } => !rollback_failures.is_empty(),
+            Self::AllocationFailed => false,
+        }
+    }
+}
+
+impl fmt::Display for HvfDirtyWriteEpochResetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidState(message) => {
+                write!(formatter, "invalid dirty epoch reset state: {message}")
+            }
+            Self::AllocationFailed => {
+                formatter.write_str("failed to allocate dirty epoch reset metadata")
+            }
+            Self::ProtectionFailed {
+                failure,
+                rollback_failures,
+            } if rollback_failures.is_empty() => {
+                write!(formatter, "failed to reset dirty epoch: {failure}")
+            }
+            Self::ProtectionFailed {
+                failure,
+                rollback_failures,
+            } => write!(
+                formatter,
+                "failed to reset dirty epoch: {failure}; also failed to restore {} completed range(s)",
+                rollback_failures.len()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HvfDirtyWriteEpochResetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ProtectionFailed { failure, .. } => Some(failure),
+            Self::InvalidState(_) | Self::AllocationFailed => None,
+        }
+    }
 }
 
 impl fmt::Display for HvfDirtyWriteTrackerQueryError {
@@ -264,11 +361,39 @@ pub struct HvfDirtyWriteTracker {
     owner_count: AtomicUsize,
 }
 
+pub(crate) struct HvfDirtyWriteMappingMutation<'a> {
+    state: MutexGuard<'a, TrackerState>,
+}
+
+pub(crate) struct PreparedHvfDirtyWriteRegion {
+    insert_index: usize,
+    region: TrackedRegion,
+}
+
 impl HvfDirtyWriteTracker {
+    #[cfg(test)]
     pub(crate) fn start(
         mapped_regions: &[HvfMappedGuestMemoryRegion],
         mapper: Arc<dyn HvfMemoryMapper>,
         page_size: u64,
+    ) -> Result<Arc<Self>, HvfDirtyWriteTrackerStartError> {
+        Self::start_internal(mapped_regions, mapper, page_size, None)
+    }
+
+    pub(crate) fn start_with_dirty_tracker(
+        mapped_regions: &[HvfMappedGuestMemoryRegion],
+        mapper: Arc<dyn HvfMemoryMapper>,
+        page_size: u64,
+        dirty_tracker: Arc<GuestMemoryDirtyTracker>,
+    ) -> Result<Arc<Self>, HvfDirtyWriteTrackerStartError> {
+        Self::start_internal(mapped_regions, mapper, page_size, Some(dirty_tracker))
+    }
+
+    fn start_internal(
+        mapped_regions: &[HvfMappedGuestMemoryRegion],
+        mapper: Arc<dyn HvfMemoryMapper>,
+        page_size: u64,
+        dirty_tracker: Option<Arc<GuestMemoryDirtyTracker>>,
     ) -> Result<Arc<Self>, HvfDirtyWriteTrackerStartError> {
         if page_size == 0 || !page_size.is_power_of_two() {
             return Err(HvfDirtyWriteTrackerStartError::InvalidHostPageSize { page_size });
@@ -320,15 +445,15 @@ impl HvfDirtyWriteTracker {
                 .ok_or(HvfDirtyWriteTrackerStartError::AllocationFailed(
                     "page bitmap",
                 ))?;
-            let mut dirty_words = Vec::new();
-            dirty_words
+            let mut restored_write_words = Vec::new();
+            restored_write_words
                 .try_reserve_exact(word_count)
                 .map_err(|_| HvfDirtyWriteTrackerStartError::AllocationFailed("page bitmap"))?;
-            dirty_words.resize(word_count, 0);
+            restored_write_words.resize(word_count, 0);
             regions.push(TrackedRegion {
                 range: mapped.range,
                 original_permissions: mapped.permissions,
-                dirty_words,
+                restored_write_words,
             });
         }
         if regions.is_empty() {
@@ -336,6 +461,24 @@ impl HvfDirtyWriteTracker {
                 "no mapped writable guest RAM is available",
             ));
         }
+        let dirty_tracker = match dirty_tracker {
+            Some(dirty_tracker) => {
+                if dirty_tracker.page_size() != page_size
+                    || regions
+                        .iter()
+                        .any(|region| !dirty_tracker.contains_range(region.range))
+                {
+                    return Err(HvfDirtyWriteTrackerStartError::InvalidState(
+                        "dirty bitmap does not cover mapped writable guest RAM",
+                    ));
+                }
+                dirty_tracker
+            }
+            None => Arc::new(GuestMemoryDirtyTracker::new(
+                regions.iter().map(|region| region.range),
+                page_size,
+            )?),
+        };
 
         let mut rollback_failures = Vec::new();
         rollback_failures
@@ -374,6 +517,7 @@ impl HvfDirtyWriteTracker {
                 mapper,
                 page_size,
                 regions,
+                dirty_tracker,
                 last_admitted_pages: [None; MAX_SUPPORTED_VCPUS as usize],
             }),
             owner_count: AtomicUsize::new(0),
@@ -409,46 +553,22 @@ impl HvfDirtyWriteTracker {
                 ));
             }
         }
-        let dirty_count: usize = state
-            .regions
-            .iter()
-            .flat_map(|region| region.dirty_words.iter())
-            .map(|word| word.count_ones() as usize)
-            .sum();
-        let mut pages = Vec::new();
-        pages
-            .try_reserve_exact(dirty_count)
-            .map_err(|_| HvfDirtyWriteTrackerQueryError::AllocationFailed)?;
-        for region in &state.regions {
-            for (word_index, word) in region.dirty_words.iter().copied().enumerate() {
-                let mut remaining = word;
-                while remaining != 0 {
-                    let bit_index = remaining.trailing_zeros() as usize;
-                    let page_index = word_index
-                        .checked_mul(64)
-                        .and_then(|base| base.checked_add(bit_index))
-                        .ok_or(HvfDirtyWriteTrackerQueryError::InvalidState(
-                            "dirty page index overflowed",
-                        ))?;
-                    let offset = u64::try_from(page_index)
-                        .ok()
-                        .and_then(|index| index.checked_mul(state.page_size))
-                        .ok_or(HvfDirtyWriteTrackerQueryError::InvalidState(
-                            "dirty page offset overflowed",
-                        ))?;
-                    let page = region.range.start().checked_add(offset).ok_or(
-                        HvfDirtyWriteTrackerQueryError::InvalidState(
-                            "dirty page address overflowed",
-                        ),
-                    )?;
-                    if region.range.contains(page) {
-                        pages.push(page);
-                    }
-                    remaining &= remaining - 1;
+        state
+            .dirty_tracker
+            .dirty_pages()
+            .map_err(|source| match source {
+                GuestMemoryDirtyTrackerAccessError::MetadataAllocationFailed { .. } => {
+                    HvfDirtyWriteTrackerQueryError::AllocationFailed
                 }
-            }
-        }
-        Ok(pages)
+                GuestMemoryDirtyTrackerAccessError::InvalidState(message) => {
+                    HvfDirtyWriteTrackerQueryError::InvalidState(message)
+                }
+                GuestMemoryDirtyTrackerAccessError::UntrackedRange { .. } => {
+                    HvfDirtyWriteTrackerQueryError::InvalidState(
+                        "dirty bitmap does not cover mapped writable guest RAM",
+                    )
+                }
+            })
     }
 
     pub(crate) fn register_owner(
@@ -473,6 +593,23 @@ impl HvfDirtyWriteTracker {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             });
+    }
+
+    pub(crate) fn begin_mapping_mutation(
+        &self,
+    ) -> Result<HvfDirtyWriteMappingMutation<'_>, HvfDirtyWriteMappingMutationError> {
+        let state = self.state.lock().map_err(|_| {
+            HvfDirtyWriteMappingMutationError::InvalidState(TRACKER_LOCK_POISONED_MESSAGE)
+        })?;
+        match state.status {
+            TrackerStatus::Active => Ok(HvfDirtyWriteMappingMutation { state }),
+            TrackerStatus::Poisoned => Err(HvfDirtyWriteMappingMutationError::InvalidState(
+                TRACKER_POISONED_MESSAGE,
+            )),
+            TrackerStatus::Stopping | TrackerStatus::Stopped => Err(
+                HvfDirtyWriteMappingMutationError::InvalidState(TRACKER_NOT_ACTIVE_MESSAGE),
+            ),
+        }
     }
 
     pub(crate) fn handle_exception(
@@ -504,13 +641,14 @@ impl HvfDirtyWriteTracker {
             return Ok(None);
         };
         let page_index = state.page_index(region_index, page)?;
-        let first_write = !state.page_is_dirty(region_index, page_index)?;
+        let first_write = !state.page_has_restored_write(region_index, page_index)?;
         if !first_write {
             // Another member may already have exited before the first member
             // restored WRITE. Once restored, this mapped RAM page cannot raise
-            // a new stage-two translation exit while active mapping mutation
-            // is forbidden. Admit that stale exit once per member; an immediate
-            // repeat proves the unchanged instruction made no progress.
+            // a new stage-two translation exit until a serialized epoch reset
+            // re-protects it or a serialized mapping transaction removes it.
+            // Admit that stale exit once per member; an immediate repeat proves
+            // the unchanged instruction made no progress.
             let last = state.last_admitted_pages.get_mut(member_index).ok_or(
                 HvfDirtyWriteFaultError::InvalidMemberIndex {
                     index: member_index,
@@ -548,7 +686,13 @@ impl HvfDirtyWriteTracker {
                 },
             ));
         }
-        state.set_page_dirty(region_index, page_index)?;
+        state.set_page_restored_write(region_index, page_index)?;
+        if state.dirty_tracker.mark_range(page_range).is_err() {
+            state.status = TrackerStatus::Poisoned;
+            return Err(HvfDirtyWriteFaultError::InvalidState(
+                "dirty bitmap does not cover a protected page",
+            ));
+        }
         let last = state.last_admitted_pages.get_mut(member_index).ok_or(
             HvfDirtyWriteFaultError::InvalidMemberIndex {
                 index: member_index,
@@ -559,6 +703,94 @@ impl HvfDirtyWriteTracker {
             page,
             first_write: true,
         }))
+    }
+
+    /// Re-protect every page made writable in this generation and clear it.
+    ///
+    /// The caller must hold snapshot-ready quiescence across this complete
+    /// operation. Permanent vCPU owners may exist, but none may enter the guest
+    /// or publish a host/device write until this method returns.
+    pub fn reset_epoch_quiesced(&self) -> Result<u64, HvfDirtyWriteEpochResetError> {
+        let mut state = self.state.lock().map_err(|_| {
+            HvfDirtyWriteEpochResetError::InvalidState(TRACKER_LOCK_POISONED_MESSAGE)
+        })?;
+        match state.status {
+            TrackerStatus::Active => {}
+            TrackerStatus::Poisoned => {
+                return Err(HvfDirtyWriteEpochResetError::InvalidState(
+                    TRACKER_POISONED_MESSAGE,
+                ));
+            }
+            TrackerStatus::Stopping | TrackerStatus::Stopped => {
+                return Err(HvfDirtyWriteEpochResetError::InvalidState(
+                    TRACKER_NOT_ACTIVE_MESSAGE,
+                ));
+            }
+        }
+
+        let run_count = state.restored_write_run_count()?;
+        let mut completed = Vec::new();
+        completed
+            .try_reserve_exact(run_count)
+            .map_err(|_| HvfDirtyWriteEpochResetError::AllocationFailed)?;
+        let mut rollback_failures = Vec::new();
+        rollback_failures
+            .try_reserve_exact(run_count)
+            .map_err(|_| HvfDirtyWriteEpochResetError::AllocationFailed)?;
+
+        for region_index in 0..state.regions.len() {
+            let page_count = state.region_page_count_for_reset(region_index)?;
+            let mut page_index = 0usize;
+            while page_index < page_count {
+                while page_index < page_count
+                    && !state.page_has_restored_write_for_reset(region_index, page_index)?
+                {
+                    page_index += 1;
+                }
+                if page_index == page_count {
+                    break;
+                }
+                let run_start = page_index;
+                while page_index < page_count
+                    && state.page_has_restored_write_for_reset(region_index, page_index)?
+                {
+                    page_index += 1;
+                }
+                let (range, original_permissions) =
+                    state.restored_write_run(region_index, run_start, page_index)?;
+                let protected = original_permissions.without(HvfMemoryPermissions::WRITE);
+                let operation_index = completed.len();
+                if let Err(source) = state.mapper.protect_region(range, protected) {
+                    for (rollback_index, (completed_range, permissions)) in
+                        completed.iter().enumerate().rev()
+                    {
+                        if let Err(source) =
+                            state.mapper.protect_region(*completed_range, *permissions)
+                        {
+                            rollback_failures.push(HvfDirtyWriteProtectionFailure {
+                                operation_index: rollback_index,
+                                source,
+                            });
+                        }
+                    }
+                    if !rollback_failures.is_empty() {
+                        state.status = TrackerStatus::Poisoned;
+                    }
+                    return Err(HvfDirtyWriteEpochResetError::ProtectionFailed {
+                        failure: HvfDirtyWriteProtectionFailure {
+                            operation_index,
+                            source,
+                        },
+                        rollback_failures,
+                    });
+                }
+                completed.push((range, original_permissions));
+            }
+        }
+
+        state.clear_restored_writes();
+        state.last_admitted_pages.fill(None);
+        Ok(state.dirty_tracker.clear_quiesced())
     }
 
     pub fn stop(&self) -> Result<(), HvfDirtyWriteTrackerStopError> {
@@ -589,7 +821,7 @@ impl HvfDirtyWriteTracker {
             let mut page_index = 0usize;
             while page_index < page_count {
                 while page_index < page_count
-                    && state.page_is_dirty_for_stop(region_index, page_index)?
+                    && state.page_has_restored_write_for_stop(region_index, page_index)?
                 {
                     page_index += 1;
                 }
@@ -598,7 +830,7 @@ impl HvfDirtyWriteTracker {
                 }
                 let run_start = page_index;
                 while page_index < page_count
-                    && !state.page_is_dirty_for_stop(region_index, page_index)?
+                    && !state.page_has_restored_write_for_stop(region_index, page_index)?
                 {
                     page_index += 1;
                 }
@@ -641,6 +873,92 @@ impl HvfDirtyWriteTracker {
     }
 }
 
+impl HvfDirtyWriteMappingMutation<'_> {
+    pub(crate) fn prepare_add(
+        &mut self,
+        range: GuestMemoryRange,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<Option<PreparedHvfDirtyWriteRegion>, HvfDirtyWriteMappingMutationError> {
+        if !permissions.contains(HvfMemoryPermissions::WRITE) {
+            return Ok(None);
+        }
+        if range.validate_alignment(self.state.page_size).is_err() {
+            return Err(HvfDirtyWriteMappingMutationError::UnalignedRegion);
+        }
+        let insert_index = self
+            .state
+            .regions
+            .iter()
+            .position(|region| range.start() < region.range.start())
+            .unwrap_or(self.state.regions.len());
+        if self
+            .state
+            .regions
+            .iter()
+            .any(|region| region.range.overlaps(range))
+        {
+            return Err(HvfDirtyWriteMappingMutationError::OverlappingRegion);
+        }
+        self.state
+            .regions
+            .try_reserve_exact(1)
+            .map_err(|_| HvfDirtyWriteMappingMutationError::AllocationFailed)?;
+        let page_count = usize::try_from(range.size() / self.state.page_size)
+            .map_err(|_| HvfDirtyWriteMappingMutationError::AllocationFailed)?;
+        let word_count = page_count
+            .checked_add(63)
+            .map(|count| count / 64)
+            .ok_or(HvfDirtyWriteMappingMutationError::AllocationFailed)?;
+        let mut restored_write_words = Vec::new();
+        restored_write_words
+            .try_reserve_exact(word_count)
+            .map_err(|_| HvfDirtyWriteMappingMutationError::AllocationFailed)?;
+        restored_write_words.resize(word_count, 0);
+        Ok(Some(PreparedHvfDirtyWriteRegion {
+            insert_index,
+            region: TrackedRegion {
+                range,
+                original_permissions: permissions,
+                restored_write_words,
+            },
+        }))
+    }
+
+    pub(crate) fn commit_add(&mut self, prepared: PreparedHvfDirtyWriteRegion) {
+        debug_assert!(
+            self.state
+                .dirty_tracker
+                .contains_range(prepared.region.range),
+            "guest-memory dirty metadata must precede protected mapping publication"
+        );
+        self.state
+            .regions
+            .insert(prepared.insert_index, prepared.region);
+    }
+
+    pub(crate) fn prepare_remove(
+        &self,
+        range: GuestMemoryRange,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<Option<usize>, HvfDirtyWriteMappingMutationError> {
+        if !permissions.contains(HvfMemoryPermissions::WRITE) {
+            return Ok(None);
+        }
+        self.state
+            .regions
+            .iter()
+            .position(|region| region.range == range)
+            .map(Some)
+            .ok_or(HvfDirtyWriteMappingMutationError::MissingRegion)
+    }
+
+    pub(crate) fn commit_remove(&mut self, region_index: Option<usize>) {
+        if let Some(region_index) = region_index {
+            self.state.regions.remove(region_index);
+        }
+    }
+}
+
 impl fmt::Debug for HvfDirtyWriteTracker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let owners = self.owner_count.load(Ordering::Acquire);
@@ -673,6 +991,7 @@ struct TrackerState {
     mapper: Arc<dyn HvfMemoryMapper>,
     page_size: u64,
     regions: Vec<TrackedRegion>,
+    dirty_tracker: Arc<GuestMemoryDirtyTracker>,
     last_admitted_pages: [Option<u64>; MAX_SUPPORTED_VCPUS as usize],
 }
 
@@ -715,7 +1034,7 @@ impl TrackerState {
         (page_index / 64, 1u64 << (page_index % 64))
     }
 
-    fn page_is_dirty(
+    fn page_has_restored_write(
         &self,
         region_index: usize,
         page_index: usize,
@@ -724,14 +1043,14 @@ impl TrackerState {
         let word = self
             .regions
             .get(region_index)
-            .and_then(|region| region.dirty_words.get(word_index))
+            .and_then(|region| region.restored_write_words.get(word_index))
             .ok_or(HvfDirtyWriteFaultError::InvalidState(
-                "dirty-write page is outside its bitmap",
+                "dirty-write page is outside its protection bitmap",
             ))?;
         Ok(*word & bit != 0)
     }
 
-    fn set_page_dirty(
+    fn set_page_restored_write(
         &mut self,
         region_index: usize,
         page_index: usize,
@@ -740,9 +1059,9 @@ impl TrackerState {
         let word = self
             .regions
             .get_mut(region_index)
-            .and_then(|region| region.dirty_words.get_mut(word_index))
+            .and_then(|region| region.restored_write_words.get_mut(word_index))
             .ok_or(HvfDirtyWriteFaultError::InvalidState(
-                "dirty-write page is outside its bitmap",
+                "dirty-write page is outside its protection bitmap",
             ))?;
         *word |= bit;
         Ok(())
@@ -765,7 +1084,7 @@ impl TrackerState {
         })
     }
 
-    fn page_is_dirty_for_stop(
+    fn page_has_restored_write_for_stop(
         &self,
         region_index: usize,
         page_index: usize,
@@ -774,11 +1093,106 @@ impl TrackerState {
         let word = self
             .regions
             .get(region_index)
-            .and_then(|region| region.dirty_words.get(word_index))
+            .and_then(|region| region.restored_write_words.get(word_index))
             .ok_or(HvfDirtyWriteTrackerStopError::InvalidState(
-                "tracked page is outside its bitmap",
+                "tracked page is outside its protection bitmap",
             ))?;
         Ok(*word & bit != 0)
+    }
+
+    fn restored_write_run_count(&self) -> Result<usize, HvfDirtyWriteEpochResetError> {
+        let mut count = 0usize;
+        for region_index in 0..self.regions.len() {
+            let page_count = self.region_page_count_for_reset(region_index)?;
+            let mut in_run = false;
+            for page_index in 0..page_count {
+                let restored = self.page_has_restored_write_for_reset(region_index, page_index)?;
+                if restored && !in_run {
+                    count = count
+                        .checked_add(1)
+                        .ok_or(HvfDirtyWriteEpochResetError::AllocationFailed)?;
+                }
+                in_run = restored;
+            }
+        }
+        Ok(count)
+    }
+
+    fn region_page_count_for_reset(
+        &self,
+        region_index: usize,
+    ) -> Result<usize, HvfDirtyWriteEpochResetError> {
+        let region =
+            self.regions
+                .get(region_index)
+                .ok_or(HvfDirtyWriteEpochResetError::InvalidState(
+                    "tracked region index is invalid",
+                ))?;
+        usize::try_from(region.range.size() / self.page_size).map_err(|_| {
+            HvfDirtyWriteEpochResetError::InvalidState(
+                "tracked region page count exceeds this host",
+            )
+        })
+    }
+
+    fn page_has_restored_write_for_reset(
+        &self,
+        region_index: usize,
+        page_index: usize,
+    ) -> Result<bool, HvfDirtyWriteEpochResetError> {
+        let (word_index, bit) = Self::bitmap_location(page_index);
+        let word = self
+            .regions
+            .get(region_index)
+            .and_then(|region| region.restored_write_words.get(word_index))
+            .ok_or(HvfDirtyWriteEpochResetError::InvalidState(
+                "tracked page is outside its protection bitmap",
+            ))?;
+        Ok(*word & bit != 0)
+    }
+
+    fn restored_write_run(
+        &self,
+        region_index: usize,
+        start_page: usize,
+        end_page: usize,
+    ) -> Result<(GuestMemoryRange, HvfMemoryPermissions), HvfDirtyWriteEpochResetError> {
+        let region =
+            self.regions
+                .get(region_index)
+                .ok_or(HvfDirtyWriteEpochResetError::InvalidState(
+                    "tracked region index is invalid",
+                ))?;
+        let start_page = u64::try_from(start_page).map_err(|_| {
+            HvfDirtyWriteEpochResetError::InvalidState(
+                "restored-write range start exceeds this host",
+            )
+        })?;
+        let end_page = u64::try_from(end_page).map_err(|_| {
+            HvfDirtyWriteEpochResetError::InvalidState("restored-write range end exceeds this host")
+        })?;
+        let offset = start_page.checked_mul(self.page_size).ok_or(
+            HvfDirtyWriteEpochResetError::InvalidState("restored-write range start overflowed"),
+        )?;
+        let size = end_page
+            .checked_sub(start_page)
+            .and_then(|pages| pages.checked_mul(self.page_size))
+            .ok_or(HvfDirtyWriteEpochResetError::InvalidState(
+                "restored-write range size overflowed",
+            ))?;
+        let start = region.range.start().checked_add(offset).ok_or(
+            HvfDirtyWriteEpochResetError::InvalidState("restored-write range address overflowed"),
+        )?;
+        let range = GuestMemoryRange::new(start, size).map_err(|_| {
+            HvfDirtyWriteEpochResetError::InvalidState("restored-write range is invalid")
+        })?;
+        Ok((range, region.original_permissions))
+    }
+
+    fn clear_restored_writes(&mut self) {
+        for region in &mut self.regions {
+            region.restored_write_words.fill(0);
+        }
     }
 
     fn clean_run(
@@ -820,7 +1234,7 @@ impl TrackerState {
 struct TrackedRegion {
     range: GuestMemoryRange,
     original_permissions: HvfMemoryPermissions,
-    dirty_words: Vec<u64>,
+    restored_write_words: Vec<u64>,
 }
 
 #[cfg(test)]
@@ -832,8 +1246,8 @@ mod tests {
     use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
 
     use super::{
-        HvfDirtyWriteFaultError, HvfDirtyWriteTracker, HvfDirtyWriteTrackerStartError,
-        HvfDirtyWriteTrackerStopError,
+        HvfDirtyWriteEpochResetError, HvfDirtyWriteFaultError, HvfDirtyWriteTracker,
+        HvfDirtyWriteTrackerStartError, HvfDirtyWriteTrackerStopError,
     };
     use crate::exit::HvfExceptionExit;
     use crate::memory::{
@@ -845,6 +1259,7 @@ mod tests {
     const ESR_EC_SHIFT: u64 = 26;
     const ESR_ISS_WNR: u64 = 1 << 6;
     const ESR_ISS_LEVEL_THREE_TRANSLATION: u64 = 0x07;
+    const ESR_ISS_LEVEL_THREE_PERMISSION: u64 = 0x0f;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct ProtectionCall {
@@ -940,10 +1355,16 @@ mod tests {
     }
 
     fn tracked_write_fault(physical_address: u64) -> HvfExceptionExit {
+        tracked_write_fault_with_dfsc(physical_address, ESR_ISS_LEVEL_THREE_TRANSLATION)
+    }
+
+    fn reprotected_write_fault(physical_address: u64) -> HvfExceptionExit {
+        tracked_write_fault_with_dfsc(physical_address, ESR_ISS_LEVEL_THREE_PERMISSION)
+    }
+
+    fn tracked_write_fault_with_dfsc(physical_address: u64, dfsc: u64) -> HvfExceptionExit {
         HvfExceptionExit {
-            syndrome: (ESR_EC_DATA_ABORT_LOWER_EL << ESR_EC_SHIFT)
-                | ESR_ISS_WNR
-                | ESR_ISS_LEVEL_THREE_TRANSLATION,
+            syndrome: (ESR_EC_DATA_ABORT_LOWER_EL << ESR_EC_SHIFT) | ESR_ISS_WNR | dfsc,
             virtual_address: 0xfeed_face,
             physical_address,
         }
@@ -1191,6 +1612,33 @@ mod tests {
     }
 
     #[test]
+    fn reprotected_permission_fault_still_requires_exact_tracker_ownership() {
+        let mapper = Arc::new(RecordingMapper::default());
+        let tracker = start_tracker(
+            &[mapped_region(0x5000, 1, HvfMemoryPermissions::GUEST_RAM)],
+            mapper,
+        );
+
+        assert_eq!(
+            tracker
+                .handle_exception(0, reprotected_write_fault(0x9000))
+                .expect("unowned permission fault should remain unhandled"),
+            None
+        );
+        let handled = tracker
+            .handle_exception(0, reprotected_write_fault(0x5fff))
+            .expect("owned reprotected write should succeed")
+            .expect("owned reprotected write should be handled");
+        assert_eq!(handled.page(), GuestAddress::new(0x5000));
+        assert!(handled.first_write());
+        assert_eq!(
+            tracker.dirty_pages().expect("permission fault should mark"),
+            vec![GuestAddress::new(0x5000)]
+        );
+        tracker.stop().expect("tracker should stop");
+    }
+
+    #[test]
     fn concurrent_same_page_first_writes_unprotect_once_and_bound_stale_retries() {
         let mapper = Arc::new(RecordingMapper::default());
         let tracker = start_tracker(
@@ -1265,7 +1713,7 @@ mod tests {
                 .lock()
                 .expect("tracker state should be available")
                 .regions[0]
-                .dirty_words,
+                .restored_write_words,
             vec![0]
         );
         assert!(tracker.dirty_pages().is_err());
@@ -1277,6 +1725,138 @@ mod tests {
         tracker.stop().expect("cleanup retry should succeed");
         assert!(!tracker.is_active().expect("query should succeed"));
         assert_eq!(mapper.calls().len(), 3);
+    }
+
+    #[test]
+    fn userspace_dirty_page_remains_protected_until_its_first_guest_write() {
+        let mapper = Arc::new(RecordingMapper::default());
+        let tracker = start_tracker(
+            &[mapped_region(0xc000, 1, HvfMemoryPermissions::GUEST_RAM)],
+            mapper.clone(),
+        );
+        let dirty_tracker = Arc::clone(
+            &tracker
+                .state
+                .lock()
+                .expect("tracker state should lock")
+                .dirty_tracker,
+        );
+        dirty_tracker
+            .mark_range(range(0xc000, 1))
+            .expect("userspace mark should succeed");
+
+        let fault = tracker
+            .handle_exception(0, tracked_write_fault(0xc000))
+            .expect("protected userspace-dirty page should handle")
+            .expect("fault should belong to tracker");
+
+        assert!(fault.first_write());
+        assert_eq!(
+            tracker.dirty_pages().expect("query should succeed").len(),
+            1
+        );
+        assert_eq!(mapper.calls().len(), 2);
+        tracker.stop().expect("tracker should stop");
+    }
+
+    #[test]
+    fn committed_reset_reprotects_cpu_pages_and_clears_cpu_userspace_union() {
+        let mapper = Arc::new(RecordingMapper::default());
+        let tracker = start_tracker(
+            &[mapped_region(0x30_000, 3, HvfMemoryPermissions::GUEST_RAM)],
+            mapper.clone(),
+        );
+        tracker
+            .handle_exception(0, tracked_write_fault(0x30_000))
+            .expect("CPU page should handle")
+            .expect("CPU page should belong to tracker");
+        let dirty_tracker = Arc::clone(
+            &tracker
+                .state
+                .lock()
+                .expect("tracker state should lock")
+                .dirty_tracker,
+        );
+        dirty_tracker
+            .mark_range(range(0x32_000, PAGE_SIZE))
+            .expect("userspace page should mark");
+        assert_eq!(
+            tracker.dirty_pages().expect("union should query"),
+            [GuestAddress::new(0x30_000), GuestAddress::new(0x32_000)]
+        );
+
+        assert_eq!(tracker.reset_epoch_quiesced(), Ok(1));
+        assert!(
+            tracker
+                .dirty_pages()
+                .expect("new epoch should query")
+                .is_empty()
+        );
+        assert_eq!(
+            mapper.calls().last(),
+            Some(&ProtectionCall {
+                range: range(0x30_000, PAGE_SIZE),
+                permissions: HvfMemoryPermissions::new(true, false, true),
+            })
+        );
+
+        tracker
+            .handle_exception(0, tracked_write_fault(0x31_000))
+            .expect("second epoch CPU page should handle")
+            .expect("second epoch CPU page should belong to tracker");
+        assert_eq!(
+            tracker.dirty_pages().expect("second epoch should query"),
+            vec![GuestAddress::new(0x31_000)]
+        );
+        assert_eq!(tracker.reset_epoch_quiesced(), Ok(2));
+        tracker.stop().expect("tracker should stop");
+    }
+
+    #[test]
+    fn failed_reset_rolls_back_or_poisons_without_clearing_the_epoch() {
+        for (failures, requires_teardown) in [(&[4][..], false), (&[4, 5][..], true)] {
+            let mapper = Arc::new(RecordingMapper::failing_on(failures));
+            let tracker = start_tracker(
+                &[mapped_region(0x40_000, 3, HvfMemoryPermissions::GUEST_RAM)],
+                mapper,
+            );
+            tracker
+                .handle_exception(0, tracked_write_fault(0x40_000))
+                .expect("first CPU page should handle")
+                .expect("first CPU page should belong to tracker");
+            tracker
+                .handle_exception(0, tracked_write_fault(0x42_000))
+                .expect("second CPU page should handle")
+                .expect("second CPU page should belong to tracker");
+
+            let error = tracker
+                .reset_epoch_quiesced()
+                .expect_err("injected reset should fail");
+            assert_eq!(error.requires_vm_teardown(), requires_teardown);
+            assert!(matches!(
+                error,
+                HvfDirtyWriteEpochResetError::ProtectionFailed { .. }
+            ));
+            if requires_teardown {
+                assert!(tracker.dirty_pages().is_err());
+            } else {
+                assert_eq!(
+                    tracker.dirty_pages().expect("old epoch should remain"),
+                    [GuestAddress::new(0x40_000), GuestAddress::new(0x42_000)]
+                );
+                assert_eq!(tracker.reset_epoch_quiesced(), Ok(1));
+                tracker.stop().expect("recovered tracker should stop");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_reset_state_requires_teardown_but_preflight_allocation_does_not() {
+        assert!(
+            HvfDirtyWriteEpochResetError::InvalidState("injected invariant failure")
+                .requires_vm_teardown()
+        );
+        assert!(!HvfDirtyWriteEpochResetError::AllocationFailed.requires_vm_teardown());
     }
 
     #[test]

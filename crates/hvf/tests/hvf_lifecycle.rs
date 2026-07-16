@@ -2694,14 +2694,22 @@ fn tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation() {
         HvfVcpuRunControlReason, HvfVcpuRunEvent, HvfVcpuRunMemberOutcome, HvfVcpuRunStepOutcome,
     };
     use bangbang_runtime::VmBackend;
+    use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVmGenIdDevice};
+    use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
     use bangbang_runtime::mmio::MmioDispatcher;
+    use bangbang_runtime::startup::{
+        ARM64_BOOT_VMGENID_SIZE, Arm64BootVmGenIdDevice, replace_arm64_boot_vmgenid,
+    };
 
     const SECOND_ENTRY_OFFSET: u64 = 0x100;
     const TARGET_START_PAGE: u64 = 2;
     const VCPU0_VALUE: u16 = 0x11;
     const VCPU1_VALUE: u16 = 0x22;
-    const STR_W1_X0: u32 = 0xb900_0001;
+    const VCPU0_SECOND_VALUE: u16 = 0x33;
+    const VCPU1_SECOND_VALUE: u16 = 0x44;
+    const MOV_X3_X0: u32 = 0xaa00_03e3;
+    const STR_W1_X3: u32 = 0xb900_0061;
     const STR_W1_X2: u32 = 0xb900_0041;
     const DMB_ISH: u32 = 0xd503_3bbf;
     const HVC_ZERO: u32 = 0xd400_0002;
@@ -2713,8 +2721,8 @@ fn tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation() {
         0x5280_0001 | (u32::from(value) << 5)
     }
 
-    fn add_x2_x0_page_offset(host_page_size: u64, pages: u64) -> u32 {
-        const ADD_X2_X0_SHIFT_12: u32 = 0x9140_0002;
+    fn add_x2_x3_page_offset(host_page_size: u64, pages: u64) -> u32 {
+        const ADD_X2_X3_SHIFT_12: u32 = 0x9140_0062;
         const ARM64_IMMEDIATE_PAGE_SIZE: u64 = 0x1000;
 
         assert!(host_page_size.is_multiple_of(ARM64_IMMEDIATE_PAGE_SIZE));
@@ -2724,16 +2732,30 @@ fn tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation() {
             .and_then(|units| u32::try_from(units).ok())
             .expect("guest page offset should fit the ADD immediate");
         assert!(immediate <= 0xfff);
-        ADD_X2_X0_SHIFT_12 | (immediate << 10)
+        ADD_X2_X3_SHIFT_12 | (immediate << 10)
     }
 
-    fn guest_code(host_page_size: u64, value: u16, first_page: u64) -> Vec<u8> {
+    fn guest_code(
+        host_page_size: u64,
+        first_value: u16,
+        second_value: u16,
+        first_page: u64,
+    ) -> Vec<u8> {
         [
-            mov_w1(value),
-            STR_W1_X0,
-            add_x2_x0_page_offset(host_page_size, first_page),
+            MOV_X3_X0,
+            mov_w1(first_value),
+            STR_W1_X3,
+            add_x2_x3_page_offset(host_page_size, first_page),
             STR_W1_X2,
-            add_x2_x0_page_offset(host_page_size, first_page + 1),
+            add_x2_x3_page_offset(host_page_size, first_page + 1),
+            STR_W1_X2,
+            DMB_ISH,
+            HVC_ZERO,
+            mov_w1(second_value),
+            STR_W1_X3,
+            add_x2_x3_page_offset(host_page_size, first_page),
+            STR_W1_X2,
+            add_x2_x3_page_offset(host_page_size, first_page + 1),
             STR_W1_X2,
             DMB_ISH,
             HVC_ZERO,
@@ -2775,11 +2797,20 @@ fn tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation() {
             .checked_add(page_size * 4)
             .expect("second vCPU1 page should fit"),
     ];
+    let device_page = shared_page
+        .checked_add(page_size * 5)
+        .expect("current-device dirty page should fit");
     memory
-        .write_slice(&guest_code(page_size, VCPU0_VALUE, 1), first_entry)
+        .write_slice(
+            &guest_code(page_size, VCPU0_VALUE, VCPU0_SECOND_VALUE, 1),
+            first_entry,
+        )
         .expect("first dirty-write guest code should be written");
     memory
-        .write_slice(&guest_code(page_size, VCPU1_VALUE, 3), second_entry)
+        .write_slice(
+            &guest_code(page_size, VCPU1_VALUE, VCPU1_SECOND_VALUE, 3),
+            second_entry,
+        )
         .expect("second dirty-write guest code should be written");
     for page in [
         shared_page,
@@ -2792,6 +2823,34 @@ fn tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation() {
             .write_slice(&0_u32.to_le_bytes(), page)
             .expect("dirty-write target should be zeroed");
     }
+    let userspace_tracker = memory
+        .enable_dirty_tracking()
+        .expect("shared dirty epoch should start before current-device activity");
+    let vmgenid_range = bangbang_runtime::memory::GuestMemoryRange::new(
+        device_page,
+        ARM64_BOOT_VMGENID_SIZE as u64,
+    )
+    .expect("current-device VMGenID range should validate");
+    let mut vmgenid = Arm64BootVmGenIdDevice {
+        range: vmgenid_range,
+        generation_id: [0; ARM64_BOOT_VMGENID_SIZE],
+        fdt_device: Arm64FdtVmGenIdDevice {
+            region: Arm64FdtRegion {
+                base: device_page.raw_value(),
+                size: ARM64_BOOT_VMGENID_SIZE as u64,
+            },
+            interrupt_line: GuestInterruptLine::new(1)
+                .expect("current-device interrupt line should validate"),
+        },
+    };
+    replace_arm64_boot_vmgenid(&mut memory, &mut vmgenid)
+        .expect("current VMGenID device should write through tracked guest memory");
+    assert_eq!(
+        userspace_tracker
+            .dirty_pages()
+            .expect("current-device dirty page should query"),
+        vec![device_page]
+    );
     let dram_region = memory
         .regions()
         .first()
@@ -2866,90 +2925,123 @@ fn tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation() {
         .collect::<BTreeSet<_>>();
         let expected_vcpu0_pages = vcpu0_pages.into_iter().collect::<BTreeSet<_>>();
         let expected_vcpu1_pages = vcpu1_pages.into_iter().collect::<BTreeSet<_>>();
-        let mut first_write_pages = BTreeSet::new();
-        let mut vcpu0_first_write_pages = BTreeSet::new();
-        let mut vcpu1_first_write_pages = BTreeSet::new();
-        let mut stale_shared_faults = 0usize;
-        let mut reached_hvc = [false; 2];
+        for epoch_index in 0..2u64 {
+            let mut first_write_pages = BTreeSet::new();
+            let mut vcpu0_first_write_pages = BTreeSet::new();
+            let mut vcpu1_first_write_pages = BTreeSet::new();
+            let mut stale_shared_faults = 0usize;
+            let mut reached_hvc = [false; 2];
 
-        for _ in 0..MAX_MEMBER_EVENTS {
-            let event = coordinator
-                .receive_event()
-                .expect("tracked member event should be received");
-            let HvfVcpuRunEvent::Member(result) = event else {
-                panic!("tracked guest should not terminate before cancellation: {event:?}");
-            };
-            match result.result() {
-                Ok(HvfVcpuRunMemberOutcome::Handled(HvfVcpuRunStepOutcome::DirtyWrite {
-                    page,
-                    first_write,
-                })) => {
-                    assert!(expected_pages.contains(page));
-                    if *first_write {
-                        assert!(first_write_pages.insert(*page));
-                        match result.index() {
-                            0 => {
-                                vcpu0_first_write_pages.insert(*page);
+            for _ in 0..MAX_MEMBER_EVENTS {
+                let event = coordinator
+                    .receive_event()
+                    .expect("tracked member event should be received");
+                let HvfVcpuRunEvent::Member(result) = event else {
+                    panic!("tracked guest should not terminate before cancellation: {event:?}");
+                };
+                match result.result() {
+                    Ok(HvfVcpuRunMemberOutcome::Handled(HvfVcpuRunStepOutcome::DirtyWrite {
+                        page,
+                        first_write,
+                    })) => {
+                        assert!(expected_pages.contains(page));
+                        if *first_write {
+                            assert!(first_write_pages.insert(*page));
+                            match result.index() {
+                                0 => {
+                                    vcpu0_first_write_pages.insert(*page);
+                                }
+                                1 => {
+                                    vcpu1_first_write_pages.insert(*page);
+                                }
+                                index => panic!("unexpected tracked member index {index}"),
                             }
-                            1 => {
-                                vcpu1_first_write_pages.insert(*page);
-                            }
-                            index => panic!("unexpected tracked member index {index}"),
+                        } else {
+                            assert_eq!(*page, shared_page);
+                            stale_shared_faults += 1;
+                            assert!(stale_shared_faults <= 1);
                         }
-                    } else {
-                        assert_eq!(*page, shared_page);
-                        stale_shared_faults += 1;
-                        assert!(stale_shared_faults <= 1);
+                        assert_eq!(
+                            coordinator.dispatch_online(),
+                            Ok(1),
+                            "a dirty exit should retry exactly the completed member"
+                        );
                     }
+                    Ok(HvfVcpuRunMemberOutcome::Handled(HvfVcpuRunStepOutcome::Hvc { .. })) => {
+                        reached_hvc[result.index()] = true;
+                    }
+                    outcome => panic!("unexpected tracked member outcome: {outcome:?}"),
                 }
-                Ok(HvfVcpuRunMemberOutcome::Handled(HvfVcpuRunStepOutcome::Hvc { .. })) => {
-                    reached_hvc[result.index()] = true;
+                if reached_hvc == [true, true] {
+                    break;
                 }
-                outcome => panic!("unexpected tracked member outcome: {outcome:?}"),
+            }
+
+            assert_eq!(reached_hvc, [true, true]);
+            assert_eq!(first_write_pages, expected_pages);
+            assert!(expected_vcpu0_pages.is_subset(&vcpu0_first_write_pages));
+            assert!(expected_vcpu1_pages.is_subset(&vcpu1_first_write_pages));
+            let mut expected_epoch_pages = expected_pages.clone();
+            if epoch_index == 0 {
+                expected_epoch_pages.insert(device_page);
             }
             assert_eq!(
-                coordinator.dispatch_online(),
-                Ok(1),
-                "the completed member should be explicitly retried exactly once"
+                tracker
+                    .dirty_pages()
+                    .expect("active tracker query should succeed")
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                expected_epoch_pages
             );
-            if reached_hvc == [true, true] {
-                break;
+
+            // SAFETY: these aligned pointers remain inside the live mapped
+            // DRAM region owned by `backend`; both HVC exits follow a DMB.
+            let (shared_value, vcpu0_values, vcpu1_values) = unsafe {
+                (
+                    std::ptr::read_volatile(shared_host),
+                    vcpu0_hosts.map(|pointer| std::ptr::read_volatile(pointer)),
+                    vcpu1_hosts.map(|pointer| std::ptr::read_volatile(pointer)),
+                )
+            };
+            let (vcpu0_value, vcpu1_value) = if epoch_index == 0 {
+                (VCPU0_VALUE, VCPU1_VALUE)
+            } else {
+                (VCPU0_SECOND_VALUE, VCPU1_SECOND_VALUE)
+            };
+            assert!([u32::from(vcpu0_value), u32::from(vcpu1_value)].contains(&shared_value));
+            assert_eq!(vcpu0_values, [u32::from(vcpu0_value); 2]);
+            assert_eq!(vcpu1_values, [u32::from(vcpu1_value); 2]);
+
+            assert_eq!(tracker.reset_epoch_quiesced(), Ok(epoch_index + 1));
+            assert!(
+                tracker
+                    .dirty_pages()
+                    .expect("advanced epoch should be clean")
+                    .is_empty()
+            );
+            if epoch_index == 0 {
+                assert_eq!(
+                    coordinator.dispatch_online(),
+                    Ok(2),
+                    "both idle owners should enter the second protected epoch"
+                );
             }
         }
 
-        assert_eq!(reached_hvc, [true, true]);
         progress_sender
             .send(())
             .expect("dirty progress watchdog should be released");
         watchdog
             .join()
             .expect("dirty progress watchdog should join");
-        assert_eq!(first_write_pages, expected_pages);
-        assert!(expected_vcpu0_pages.is_subset(&vcpu0_first_write_pages));
-        assert!(expected_vcpu1_pages.is_subset(&vcpu1_first_write_pages));
-        assert_eq!(
-            tracker
-                .dirty_pages()
-                .expect("active tracker query should succeed")
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            expected_pages
-        );
-        // SAFETY: these aligned pointers remain inside the live mapped DRAM
-        // region owned by `backend`; both HVC exits occur after the guest DMB.
-        let (shared_value, vcpu0_values, vcpu1_values) = unsafe {
-            (
-                std::ptr::read_volatile(shared_host),
-                vcpu0_hosts.map(|pointer| std::ptr::read_volatile(pointer)),
-                vcpu1_hosts.map(|pointer| std::ptr::read_volatile(pointer)),
-            )
-        };
-        assert!([u32::from(VCPU0_VALUE), u32::from(VCPU1_VALUE)].contains(&shared_value));
-        assert_eq!(vcpu0_values, [u32::from(VCPU0_VALUE); 2]);
-        assert_eq!(vcpu1_values, [u32::from(VCPU1_VALUE); 2]);
         assert_eq!(
             tracker.stop(),
             Err(HvfDirtyWriteTrackerStopError::OwnersActive { count: 2 })
+        );
+        assert_eq!(
+            coordinator.dispatch_online(),
+            Ok(2),
+            "both owners should resume into the bounded cancellation target"
         );
 
         let waiter = coordinator
@@ -3862,6 +3954,7 @@ fn prepares_owned_hvf_arm64_boot_session() {
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::BlockMmioLayout;
     use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
@@ -3880,6 +3973,11 @@ fn prepares_owned_hvf_arm64_boot_session() {
             kernel.path(),
         )))
         .expect("boot source config should be stored");
+    controller
+        .handle_action(VmmAction::PutMachineConfig(
+            MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
+        ))
+        .expect("tracked normal-boot machine config should be stored");
     let rtc_mmio_layout = test_rtc_mmio_layout();
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
@@ -3912,6 +4010,25 @@ fn prepares_owned_hvf_arm64_boot_session() {
             .expect("owned session should expose mapped guest memory")
             .total_size(),
         session.runtime_resources().layout.total_size()
+    );
+    let dirty_tracker = session
+        .guest_memory()
+        .expect("tracked owned session should expose guest memory")
+        .dirty_tracker()
+        .expect("normal tracked startup should retain one dirty epoch");
+    assert!(
+        !dirty_tracker
+            .dirty_pages()
+            .expect("normal boot dirty pages should query")
+            .is_empty(),
+        "kernel, FDT, and device boot population must enter the initial epoch"
+    );
+    assert_eq!(session.reset_dirty_epoch_quiesced(), Ok(Some(1)));
+    assert!(
+        dirty_tracker
+            .dirty_pages()
+            .expect("reset normal-boot epoch should query")
+            .is_empty()
     );
     let boot_origin = session
         .runtime_resources()
@@ -4104,6 +4221,15 @@ fn prepares_owned_hvf_arm64_boot_session() {
         .read_slice(&mut guest_vmgenid, new_vmgenid.range.start())
         .expect("owned session replacement VMGenID should read");
     assert_eq!(guest_vmgenid, new_vmgenid.generation_id);
+    let page_size = host_page_size().expect("host page size should remain available");
+    let vmgenid_page = GuestAddress::new(new_vmgenid.range.start().raw_value() & !(page_size - 1));
+    assert_eq!(
+        dirty_tracker
+            .dirty_pages()
+            .expect("VMGenID device dirty page should query"),
+        vec![vmgenid_page]
+    );
+    assert_eq!(session.reset_dirty_epoch_quiesced(), Ok(Some(2)));
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();
@@ -4936,8 +5062,8 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         .expect("production-published pair should prepare without constructing a VM");
     assert!(prepared.runtime().runtime_resources.boot_origin.is_none());
 
-    let restored = OwnedHvfArm64BootSession::restore_snapshot_v1(prepared)
-        .expect("fresh destination VM should restore from native-v1 artifacts");
+    let restored = OwnedHvfArm64BootSession::restore_snapshot_v1(prepared, true)
+        .expect("fresh tracked destination VM should restore from native-v1 artifacts");
     let (mut restored_session, restored_drive, _serial_output, restored_serial_buffer) =
         restored.into_parts();
     assert!(restored_session.boot_registers().is_none());
@@ -4965,6 +5091,35 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         .expect("restored VMGenID bytes should read");
     assert_ne!(destination_generation_id, source_generation_id);
     assert_ne!(destination_generation_id, [0; 16]);
+    assert!(
+        restored_session
+            .runtime_resources()
+            .machine_config
+            .track_dirty_pages(),
+        "the destination load request must override the source tracking flag"
+    );
+    let restored_tracker = restored_session
+        .guest_memory()
+        .expect("tracked restored memory should remain mapped")
+        .dirty_tracker()
+        .expect("tracked restore should retain one shared dirty epoch");
+    let page_size = host_page_size().expect("host page size should remain available");
+    let vmgenid_page =
+        GuestAddress::new(decoded.vmgenid().range().start().raw_value() & !(page_size - 1));
+    assert_eq!(
+        restored_tracker
+            .dirty_pages()
+            .expect("post-baseline VMGenID dirty page should query"),
+        vec![vmgenid_page],
+        "snapshot memory is the clean baseline and VMGenID is the first host write"
+    );
+    assert_eq!(restored_session.reset_dirty_epoch_quiesced(), Ok(Some(1)));
+    assert!(
+        restored_tracker
+            .dirty_pages()
+            .expect("committed restore epoch should clear")
+            .is_empty()
+    );
 
     let restored_state = {
         let guard = restored_session

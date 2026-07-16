@@ -161,12 +161,14 @@ macOS 15.2 preflight for ZFR0/SMFR0, and terminal value-free classification for
 every other KVM/public-HVF family. It promotes exactly six parent-owned ARM
 records: both `ArmRegisterModifier` properties, `CpuConfig.reg_modifiers`,
 `FullVmConfiguration.cpu-config`, and the `ArmRegisterModifier` and `CpuConfig`
-schemas. The current 418-record delivery inventory is therefore 45
-`implemented-and-verified`, 353 `audit-required`, three
+schemas. #1395 and #1396 add the signed HVF first-write primitive and complete
+shared dirty epochs, including public machine/load activation and Full commit
+reset. The current 418-record delivery inventory is therefore 49
+`implemented-and-verified`, 349 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` records.
 Multi-architecture operation/path aggregates, CPU corpora, public
-`cpu-template-helper` operations and arguments, portability, and dirty
-snapshot siblings retain their later #1388/Wave 7 owners.
+`cpu-template-helper` operations and arguments, portability, and Diff snapshot
+artifacts retain their later #1388/Wave owners.
 
 ## Commands
 

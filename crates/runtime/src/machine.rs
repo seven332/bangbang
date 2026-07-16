@@ -182,6 +182,11 @@ impl MachineConfig {
         self.track_dirty_pages
     }
 
+    pub const fn with_track_dirty_pages(mut self, track_dirty_pages: bool) -> Self {
+        self.track_dirty_pages = track_dirty_pages;
+        self
+    }
+
     pub const fn huge_pages(self) -> MachineConfigHugePages {
         self.huge_pages
     }
@@ -244,9 +249,6 @@ impl TryFrom<MachineConfigInput> for MachineConfig {
                 return Err(MachineConfigError::UnsupportedCpuTemplate { cpu_template });
             }
         };
-        if input.track_dirty_pages {
-            return Err(MachineConfigError::DirtyPageTrackingNotSupported);
-        }
         if input.huge_pages == MachineConfigHugePages::TwoM {
             return Err(MachineConfigError::HugePages2MPlatformLimited);
         }
@@ -306,7 +308,6 @@ pub enum MachineConfigError {
         cpu_template: MachineConfigCpuTemplate,
     },
     V1N1SourceModelUnsupported,
-    DirtyPageTrackingNotSupported,
     HugePages2MPlatformLimited,
 }
 
@@ -336,9 +337,6 @@ impl fmt::Display for MachineConfigError {
             Self::V1N1SourceModelUnsupported => f.write_str(
                 "machine cpu_template V1N1 requires a Neoverse V1 source model that Apple Silicon/HVF cannot represent",
             ),
-            Self::DirtyPageTrackingNotSupported => {
-                f.write_str("machine track_dirty_pages is not supported")
-            }
             Self::HugePages2MPlatformLimited => f.write_str(
                 "machine huge_pages 2M requires exact Linux hugetlbfs backing, which is unavailable on arm64 macOS/HVF",
             ),
@@ -420,10 +418,6 @@ mod tests {
                 MachineConfigError::SmtNotSupported,
             ),
             (
-                MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
-                MachineConfigError::DirtyPageTrackingNotSupported,
-            ),
-            (
                 MachineConfigInput::new(1, 127).with_huge_pages(MachineConfigHugePages::TwoM),
                 MachineConfigError::InvalidHugePages2MMemorySize,
             ),
@@ -465,13 +459,13 @@ mod tests {
                     .with_cpu_template(MachineConfigCpuTemplate::V1N1)
                     .with_track_dirty_pages(true)
                     .with_huge_pages(MachineConfigHugePages::TwoM),
-                MachineConfigError::DirtyPageTrackingNotSupported,
+                MachineConfigError::HugePages2MPlatformLimited,
             ),
             (
                 MachineConfigInput::new(1, 128)
                     .with_track_dirty_pages(true)
                     .with_huge_pages(MachineConfigHugePages::TwoM),
-                MachineConfigError::DirtyPageTrackingNotSupported,
+                MachineConfigError::HugePages2MPlatformLimited,
             ),
             (
                 MachineConfigInput::new(1, 128).with_huge_pages(MachineConfigHugePages::TwoM),
@@ -586,10 +580,6 @@ mod tests {
                 },
             ),
             (
-                MachineConfigPatchInput::new().with_track_dirty_pages(true),
-                MachineConfigError::DirtyPageTrackingNotSupported,
-            ),
-            (
                 MachineConfigPatchInput::new()
                     .with_mem_size_mib(127)
                     .with_huge_pages(MachineConfigHugePages::TwoM),
@@ -641,10 +631,6 @@ mod tests {
         assert_eq!(
             MachineConfigError::V1N1SourceModelUnsupported.to_string(),
             "machine cpu_template V1N1 requires a Neoverse V1 source model that Apple Silicon/HVF cannot represent"
-        );
-        assert_eq!(
-            MachineConfigError::DirtyPageTrackingNotSupported.to_string(),
-            "machine track_dirty_pages is not supported"
         );
         assert_eq!(
             MachineConfigError::InvalidHugePages2MMemorySize.to_string(),

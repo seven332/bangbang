@@ -905,10 +905,11 @@ fn decode_machine(payload: &[u8]) -> Result<MachineConfig, HvfSnapshotV1DecodeEr
     decoder.zeroes(3)?;
     let memory_mib = decoder.u64()?;
     decoder.finish()?;
-    if smt || track_dirty_pages || huge_pages != 0 || cpu_template_present {
+    if smt || huge_pages != 0 || cpu_template_present {
         return Err(HvfSnapshotV1DecodeError::InvalidMachine);
     }
     let machine = MachineConfigInput::new(vcpu_count, memory_mib)
+        .with_track_dirty_pages(track_dirty_pages)
         .validate()
         .map_err(|_| HvfSnapshotV1DecodeError::InvalidMachine)?;
     validate_machine(machine).map_err(|_| HvfSnapshotV1DecodeError::InvalidMachine)?;
@@ -1230,7 +1231,6 @@ fn validate_machine(machine: MachineConfig) -> Result<(), HvfSnapshotV1EncodeErr
     if machine.vcpu_count() != 1
         || machine.smt()
         || machine.cpu_template().is_some()
-        || machine.track_dirty_pages()
         || machine.huge_pages() != bangbang_runtime::machine::MachineConfigHugePages::None
     {
         Err(HvfSnapshotV1EncodeError::InvalidMachine)
@@ -1686,7 +1686,7 @@ pub(crate) mod tests {
         }
 
         let machine = component + COMPONENT_HEADER_BYTES;
-        for offset in [machine + 1, machine + 2, machine + 3, machine + 4] {
+        for offset in [machine + 1, machine + 3, machine + 4] {
             let mut nonbaseline = encoded.clone();
             nonbaseline[offset] = 1;
             assert!(matches!(
@@ -1694,6 +1694,14 @@ pub(crate) mod tests {
                 Err(HvfSnapshotV1DecodeError::InvalidMachine)
             ));
         }
+        let mut tracked = encoded.clone();
+        tracked[machine + 2] = 1;
+        assert!(
+            decode_hvf_snapshot_v1_state(&tracked)
+                .expect("tracked machine bit should decode")
+                .machine()
+                .track_dirty_pages()
+        );
 
         let compatibility = component_offsets(&encoded)[1] + COMPONENT_HEADER_BYTES;
         let optional_policy = compatibility + 11 * 8 + 1 + 7 + 2 * 8;

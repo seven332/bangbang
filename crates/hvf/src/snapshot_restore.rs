@@ -279,6 +279,7 @@ pub enum HvfSnapshotV1RestoreStage {
     CreateVm,
     CreateGic,
     ValidateGic,
+    EnableDirtyTracking,
     MapMemory,
     StartRunner,
     StartBlockRetryScheduler,
@@ -293,6 +294,7 @@ impl fmt::Display for HvfSnapshotV1RestoreStage {
             Self::CreateVm => "VM creation",
             Self::CreateGic => "GIC creation",
             Self::ValidateGic => "GIC compatibility validation",
+            Self::EnableDirtyTracking => "dirty tracking initialization",
             Self::MapMemory => "guest-memory mapping",
             Self::StartRunner => "vCPU runner startup",
             Self::StartBlockRetryScheduler => "block retry scheduler startup",
@@ -376,6 +378,7 @@ pub enum HvfSnapshotV1RestoreFailure {
     Backend(BackendError),
     Gic(HvfGicError),
     GicMetadataMismatch,
+    DirtyTracking,
     MemoryMapping,
     Runner(Box<HvfVcpuRunnerError>),
     Coordinator(Box<HvfVcpuRunCoordinatorError>),
@@ -392,6 +395,7 @@ impl fmt::Display for HvfSnapshotV1RestoreFailure {
             Self::GicMetadataMismatch => {
                 f.write_str("native-v1 destination GIC metadata is incompatible")
             }
+            Self::DirtyTracking => f.write_str("native-v1 dirty tracking initialization failed"),
             Self::MemoryMapping => f.write_str("native-v1 guest-memory mapping failed"),
             Self::Runner(source) => write!(f, "native-v1 runner operation failed: {source}"),
             Self::Coordinator(source) => {
@@ -415,6 +419,7 @@ impl std::error::Error for HvfSnapshotV1RestoreFailure {
             Self::Coordinator(source) => Some(source.as_ref()),
             Self::VmGenId(source) => Some(source.as_ref()),
             Self::GicMetadataMismatch
+            | Self::DirtyTracking
             | Self::MemoryMapping
             | Self::Scheduler(_)
             | Self::InvalidRuntime => None,

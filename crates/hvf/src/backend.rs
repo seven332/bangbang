@@ -7,7 +7,8 @@ use bangbang_runtime::pmem::PreparedPmemDevice;
 use bangbang_runtime::{BackendError, VmBackend};
 
 use crate::dirty::{
-    HvfDirtyWriteTracker, HvfDirtyWriteTrackerStartError, HvfDirtyWriteTrackerStopError,
+    HvfDirtyWriteEpochResetError, HvfDirtyWriteTracker, HvfDirtyWriteTrackerStartError,
+    HvfDirtyWriteTrackerStopError,
 };
 use crate::gic::{HvfGicCreator, HvfGicError, HvfGicMetadata, RealHvfGicCreator};
 use crate::memory::{
@@ -136,6 +137,15 @@ impl HvfBackend {
             return Ok(());
         };
         mapping.stop_dirty_write_tracking()
+    }
+
+    pub(crate) fn reset_dirty_epoch_quiesced(
+        &mut self,
+    ) -> Result<Option<u64>, HvfDirtyWriteEpochResetError> {
+        let Some(mapping) = self.guest_memory.as_mut() else {
+            return Ok(None);
+        };
+        mapping.reset_dirty_epoch_quiesced()
     }
 
     pub(crate) fn mapped_guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {

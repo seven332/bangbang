@@ -2859,6 +2859,13 @@ impl HvfInstanceStartExecutor {
     }
 }
 
+fn snapshot_destination_machine_config(
+    source: bangbang_runtime::machine::MachineConfig,
+    track_dirty_pages: bool,
+) -> bangbang_runtime::machine::MachineConfig {
+    source.with_track_dirty_pages(track_dirty_pages)
+}
+
 impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
@@ -2948,8 +2955,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         prepared: PreparedHvfSnapshotV1Load,
     ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
         let restored_drive_config = prepared.runtime().drive_config.clone();
-        let controller_commit = SnapshotV1ControllerCommit::try_new(
+        let restored_machine = snapshot_destination_machine_config(
             prepared.state().machine(),
+            input.track_dirty_pages(),
+        );
+        let controller_commit = SnapshotV1ControllerCommit::try_new(
+            restored_machine,
             restored_drive_config.clone(),
             input.resume_vm(),
         )
@@ -2961,8 +2972,9 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 )))
             })?;
 
-        let restored = OwnedHvfArm64BootSession::restore_snapshot_v1(prepared)
-            .map_err(NativeV1SnapshotLoadError::Restore)?;
+        let restored =
+            OwnedHvfArm64BootSession::restore_snapshot_v1(prepared, input.track_dirty_pages())
+                .map_err(NativeV1SnapshotLoadError::Restore)?;
         let (session, restored_drive, serial_output, serial_output_buffer) = restored.into_parts();
         debug_assert!(
             restored_drive == restored_drive_config,
@@ -3217,7 +3229,12 @@ pub(crate) trait NativeV1SnapshotCaptureSession: BootRunLoopSession {
 
     fn native_v1_snapshot_commit_record(bundle: Self::SnapshotBundle) -> SnapshotCommitRecord;
 
-    fn native_v1_snapshot_published(&mut self, _outcome: &SnapshotPublicationOutcome) {}
+    fn native_v1_snapshot_published(
+        &mut self,
+        _outcome: &SnapshotPublicationOutcome,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 impl<S, P> ProcessHvfBootSession<S, P> {
@@ -3263,6 +3280,16 @@ impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
         self.session.guest_memory().map_err(|source| {
             BackendError::Hypervisor(format!("failed to borrow HVF guest memory: {source}"))
         })
+    }
+
+    fn reset_dirty_epoch_after_publication(&mut self) -> Result<(), BackendError> {
+        match self.session.reset_dirty_epoch_quiesced() {
+            Ok(_) => Ok(()),
+            Err(source) if source.requires_vm_teardown() => Err(BackendError::InvalidState(
+                "dirty epoch reset requires VM teardown",
+            )),
+            Err(_) => Ok(()),
+        }
     }
 }
 
@@ -3314,6 +3341,13 @@ where
 
     fn native_v1_snapshot_commit_record(bundle: Self::SnapshotBundle) -> SnapshotCommitRecord {
         bundle.into_commit_record()
+    }
+
+    fn native_v1_snapshot_published(
+        &mut self,
+        _outcome: &SnapshotPublicationOutcome,
+    ) -> Result<(), BackendError> {
+        self.reset_dirty_epoch_after_publication()
     }
 }
 
@@ -5441,7 +5475,15 @@ where
                                         command_queue_capacity,
                                     );
                                 }
-                                BootRunLoopPauseWait::Shutdown => break 'worker,
+                                BootRunLoopPauseWait::Shutdown => {
+                                    if matches!(
+                                        worker_status.snapshot(),
+                                        BootRunLoopWorkerStatus::Failed(_)
+                                    ) {
+                                        let _ = terminal_wakeup_writer.write_all(&[1]);
+                                    }
+                                    break 'worker;
+                                }
                             }
                         }
                         match session.run_loop(&stop_token, max_steps) {
@@ -5827,6 +5869,9 @@ where
             ));
         }
         let completion_cancellation = cancellation.clone();
+        let terminal_status = Arc::clone(&self.status);
+        let terminal_admission = Arc::clone(&self.admission);
+        let terminal_pause_gate = Arc::clone(&self.pause_gate);
 
         self.run_snapshot_quiesced_preserving_result_if(
             move |session| {
@@ -5860,8 +5905,13 @@ where
                     }
                     Ok(record)
                 });
-                if let Ok(outcome) = &result {
-                    session.native_v1_snapshot_published(outcome);
+                if let Ok(outcome) = &result
+                    && let Err(source) = session.native_v1_snapshot_published(outcome)
+                {
+                    terminal_status.record(BootRunLoopWorkerStatus::Failed(source.to_string()));
+                    terminal_admission.shutdown();
+                    terminal_pause_gate.shutdown();
+                    let _ = session.run_loop_control().request_stop();
                 }
                 drop(guard);
                 result.map_err(Box::new)
@@ -6510,7 +6560,7 @@ mod tests {
         ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
         SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
-        require_native_v1_composite_record,
+        require_native_v1_composite_record, snapshot_destination_machine_config,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -7501,7 +7551,7 @@ mod tests {
                     .validate()
                     .expect("fake restored drive should validate");
             let commit = SnapshotV1ControllerCommit::try_new(
-                MachineConfig::default(),
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages()),
                 drive_config,
                 input.resume_vm(),
             )
@@ -7785,6 +7835,7 @@ mod tests {
         native_snapshot_events: Arc<Mutex<Vec<&'static str>>>,
         native_snapshot_panic: bool,
         native_snapshot_cancel_before_seal: Option<NativeV1SnapshotCaptureCancellation>,
+        native_snapshot_publication_error: Option<BackendError>,
     }
 
     impl FakeRunLoopSession {
@@ -7824,6 +7875,7 @@ mod tests {
                 native_snapshot_events: Arc::default(),
                 native_snapshot_panic: false,
                 native_snapshot_cancel_before_seal: None,
+                native_snapshot_publication_error: None,
             }
         }
 
@@ -7880,6 +7932,12 @@ mod tests {
             cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Self {
             self.native_snapshot_cancel_before_seal = Some(cancellation);
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        fn with_native_snapshot_publication_error(mut self, source: BackendError) -> Self {
+            self.native_snapshot_publication_error = Some(source);
             self
         }
 
@@ -8233,11 +8291,18 @@ mod tests {
             .expect("fake native-v1 commit should validate")
         }
 
-        fn native_v1_snapshot_published(&mut self, _outcome: &SnapshotPublicationOutcome) {
+        fn native_v1_snapshot_published(
+            &mut self,
+            _outcome: &SnapshotPublicationOutcome,
+        ) -> Result<(), BackendError> {
             self.native_snapshot_events
                 .lock()
                 .expect("fake native snapshot events should lock")
                 .push("published");
+            match self.native_snapshot_publication_error.clone() {
+                Some(source) => Err(source),
+                None => Ok(()),
+            }
         }
     }
 
@@ -8529,6 +8594,15 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_destination_tracking_overrides_the_source_in_both_directions() {
+        let untracked = MachineConfig::default();
+        let tracked = untracked.with_track_dirty_pages(true);
+
+        assert!(snapshot_destination_machine_config(untracked, true).track_dirty_pages());
+        assert!(!snapshot_destination_machine_config(tracked, false).track_dirty_pages());
+    }
+
+    #[test]
     fn internal_native_v1_load_commits_paused_state_and_returns_resume_intent() {
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
         let calls = starter.calls();
@@ -8571,8 +8645,9 @@ mod tests {
         )))
         .expect("metrics should configure");
 
+        let tracked_load = snapshot_load_input(false).with_track_dirty_pages(true);
         assert_eq!(
-            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
+            vmm.handle_action(VmmAction::LoadSnapshot(tracked_load)),
             Ok(VmmData::Empty)
         );
 
@@ -8587,6 +8662,7 @@ mod tests {
             .expect("public load should retain one session");
         assert_eq!(session.id, 77);
         assert_eq!(session.resume_count, 0);
+        assert!(vmm.machine_config().track_dirty_pages());
         assert_eq!(vmm.drive_configs()[0].drive_id(), "root");
         vmm.handle_initial_metrics_flush();
         vmm.handle_initial_metrics_flush();
@@ -14936,6 +15012,76 @@ mod tests {
         );
         load_snapshot_artifacts(&output_paths).expect("move-only output pair should load");
         output_directory.assert_no_staging();
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v1_visible_commit_with_fatal_epoch_transition_is_reported_and_terminal() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_snapshot_publication_error(BackendError::InvalidState(
+                "dirty epoch reset requires VM teardown",
+            ))
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(55).expect("non-zero limit"))
+                .expect("fatal-transition supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 55);
+        supervisor.pause().expect("supervisor should pause");
+
+        let backing = TempFilePath::create_with_bytes("fatal-transition-root", &[0; 512]);
+        let drive = drive_config("root", backing.path());
+        let serial = bangbang_runtime::serial::SerialConfig::default();
+        let directory = TempSnapshotDirectory::new("fatal-transition-publication");
+        let paths = directory.paths();
+        let outcome = supervisor
+            .publish_native_v1_snapshot(
+                &drive,
+                &serial,
+                &paths,
+                NativeV1SnapshotCaptureCancellation::default(),
+            )
+            .expect("an already-visible pair must still be reported as committed");
+
+        assert_eq!(outcome.durability(), SnapshotCommitDurability::Durable);
+        assert_eq!(
+            load_snapshot_artifacts(&paths)
+                .expect("fatal transition must retain the committed pair")
+                .record(),
+            outcome.record()
+        );
+        assert!(
+            events
+                .lock()
+                .expect("fatal transition events should lock")
+                .contains(&"published")
+        );
+        assert_eq!(
+            supervisor.wait_for_terminal_status(),
+            BootRunLoopWorkerStatus::Failed(
+                "invalid backend state: dirty epoch reset requires VM teardown".to_owned()
+            )
+        );
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Shutdown
+        );
+        assert_eq!(
+            supervisor.resume(),
+            Err(BackendError::InvalidState(
+                "boot run loop worker is not paused"
+            ))
+        );
+        directory.assert_no_staging();
 
         drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);

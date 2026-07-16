@@ -18,7 +18,8 @@ use bangbang_runtime::memory_hotplug::{
 };
 
 use crate::dirty::{
-    HvfDirtyWriteTracker, HvfDirtyWriteTrackerStartError, HvfDirtyWriteTrackerStopError,
+    HvfDirtyWriteEpochResetError, HvfDirtyWriteMappingMutationError, HvfDirtyWriteTracker,
+    HvfDirtyWriteTrackerStartError, HvfDirtyWriteTrackerStopError,
 };
 
 const HOST_MEMORY_WRITEBACK_BUFFER_SIZE: usize = 64 * 1024;
@@ -161,6 +162,9 @@ pub enum HvfGuestMemoryMappingError {
     },
     DirtyWriteTrackingStop {
         source: HvfDirtyWriteTrackerStopError,
+    },
+    DirtyWriteMappingMutation {
+        source: HvfDirtyWriteMappingMutationError,
     },
 }
 
@@ -343,6 +347,9 @@ impl fmt::Display for HvfGuestMemoryMappingError {
                     "failed to stop guest memory dirty-write tracking: {source}"
                 )
             }
+            Self::DirtyWriteMappingMutation { source } => {
+                write!(f, "failed to update tracked guest memory mapping: {source}")
+            }
         }
     }
 }
@@ -364,6 +371,7 @@ impl std::error::Error for HvfGuestMemoryMappingError {
                 .first()
                 .map(|failure| &failure.source as &(dyn std::error::Error + 'static)),
             Self::DirtyWriteTrackingStop { source } => Some(source),
+            Self::DirtyWriteMappingMutation { source } => Some(source),
             Self::InvalidState(_)
             | Self::EmptyGuestMemory
             | Self::EmptyPermissions
@@ -577,10 +585,13 @@ impl HvfGuestMemoryMapping {
     ) -> Result<Arc<HvfDirtyWriteTracker>, HvfDirtyWriteTrackerStartError> {
         let memory = self
             .memory
-            .as_ref()
+            .as_mut()
             .ok_or(HvfDirtyWriteTrackerStartError::InvalidState(
                 "guest memory owner is missing",
             ))?;
+        let dirty_tracker = memory
+            .enable_dirty_tracking()
+            .map_err(|_| HvfDirtyWriteTrackerStartError::DirtyBitmap)?;
         let mut owned_mapped_regions = Vec::new();
         owned_mapped_regions
             .try_reserve_exact(memory.regions().len())
@@ -600,13 +611,20 @@ impl HvfGuestMemoryMapping {
                 ))?;
             owned_mapped_regions.push(mapped);
         }
-        self.state.start_dirty_write_tracking(&owned_mapped_regions)
+        self.state
+            .start_dirty_write_tracking(&owned_mapped_regions, dirty_tracker)
     }
 
     pub(crate) fn stop_dirty_write_tracking(
         &mut self,
     ) -> Result<(), HvfDirtyWriteTrackerStopError> {
         self.state.stop_dirty_write_tracking()
+    }
+
+    pub(crate) fn reset_dirty_epoch_quiesced(
+        &mut self,
+    ) -> Result<Option<u64>, HvfDirtyWriteEpochResetError> {
+        self.state.reset_dirty_epoch_quiesced()
     }
 
     pub(crate) fn active_dirty_write_tracker(
@@ -684,6 +702,7 @@ impl HvfGuestMemoryMappingState {
     fn start_dirty_write_tracking(
         &mut self,
         owned_mapped_regions: &[HvfMappedGuestMemoryRegion],
+        dirty_tracker: Arc<bangbang_runtime::memory_dirty::GuestMemoryDirtyTracker>,
     ) -> Result<Arc<HvfDirtyWriteTracker>, HvfDirtyWriteTrackerStartError> {
         if self.protection_poisoned {
             return Err(HvfDirtyWriteTrackerStartError::InvalidState(
@@ -704,8 +723,12 @@ impl HvfGuestMemoryMappingState {
 
         let page_size = host_page_size()
             .map_err(|_| HvfDirtyWriteTrackerStartError::InvalidHostPageSize { page_size: 0 })?;
-        match HvfDirtyWriteTracker::start(owned_mapped_regions, Arc::clone(&self.mapper), page_size)
-        {
+        match HvfDirtyWriteTracker::start_with_dirty_tracker(
+            owned_mapped_regions,
+            Arc::clone(&self.mapper),
+            page_size,
+            dirty_tracker,
+        ) {
             Ok(tracker) => {
                 self.dirty_write_tracker = Some(Arc::clone(&tracker));
                 Ok(tracker)
@@ -726,6 +749,26 @@ impl HvfGuestMemoryMappingState {
         tracker.stop()?;
         self.dirty_write_tracker = None;
         Ok(())
+    }
+
+    fn reset_dirty_epoch_quiesced(&mut self) -> Result<Option<u64>, HvfDirtyWriteEpochResetError> {
+        if self.protection_poisoned {
+            return Err(HvfDirtyWriteEpochResetError::InvalidState(
+                "guest memory protection rollback requires VM teardown",
+            ));
+        }
+        let Some(tracker) = self.dirty_write_tracker.as_ref() else {
+            return Ok(None);
+        };
+        match tracker.reset_epoch_quiesced() {
+            Ok(epoch) => Ok(Some(epoch)),
+            Err(source) => {
+                if source.requires_vm_teardown() {
+                    self.protection_poisoned = true;
+                }
+                Err(source)
+            }
+        }
     }
 
     fn active_dirty_write_tracker(
@@ -750,15 +793,6 @@ impl HvfGuestMemoryMappingState {
         if self.protection_poisoned {
             return Err(HvfGuestMemoryMappingError::InvalidState(
                 "guest memory protection rollback requires VM teardown",
-            ));
-        }
-        if self
-            .dirty_write_tracker
-            .as_ref()
-            .is_some_and(|tracker| tracker.is_active().unwrap_or(true))
-        {
-            return Err(HvfGuestMemoryMappingError::InvalidState(
-                "guest memory mapping cannot change while dirty-write tracking is active",
             ));
         }
         Ok(())
@@ -794,6 +828,19 @@ impl HvfGuestMemoryMappingState {
                 |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
             )?;
 
+        let tracker = self.dirty_write_tracker.as_ref().map(Arc::clone);
+        let mut mutation = tracker
+            .as_ref()
+            .map(|tracker| tracker.begin_mapping_mutation())
+            .transpose()
+            .map_err(|source| HvfGuestMemoryMappingError::DirtyWriteMappingMutation { source })?;
+        let prepared_tracking = mutation
+            .as_mut()
+            .map(|mutation| mutation.prepare_add(range, permissions))
+            .transpose()
+            .map_err(|source| HvfGuestMemoryMappingError::DirtyWriteMappingMutation { source })?
+            .flatten();
+
         memory.insert_region(range).map_err(|source| {
             HvfGuestMemoryMappingError::DynamicRegionAllocationFailed { range, source }
         })?;
@@ -806,14 +853,23 @@ impl HvfGuestMemoryMappingState {
             }
         };
         let mapped_region = request.mapped_region(permissions);
+        let effective_permissions = if prepared_tracking.is_some() {
+            permissions.without(HvfMemoryPermissions::WRITE)
+        } else {
+            permissions
+        };
 
-        if let Err(source) = self.mapper.map_region(request, permissions) {
+        if let Err(source) = self.mapper.map_region(request, effective_permissions) {
             let owner_cleanup = memory.remove_region(range).err();
             return Err(HvfGuestMemoryMappingError::DynamicRegionMapFailed {
                 range,
                 source,
                 owner_cleanup,
             });
+        }
+
+        if let (Some(mutation), Some(prepared_tracking)) = (mutation.as_mut(), prepared_tracking) {
+            mutation.commit_add(prepared_tracking);
         }
 
         self.mapped_regions.insert(insert_index, mapped_region);
@@ -846,10 +902,26 @@ impl HvfGuestMemoryMappingState {
             .get(mapped_index)
             .copied()
             .ok_or(HvfGuestMemoryMappingError::DynamicRegionMissing { range })?;
+        let tracker = self.dirty_write_tracker.as_ref().map(Arc::clone);
+        let mut mutation = tracker
+            .as_ref()
+            .map(|tracker| tracker.begin_mapping_mutation())
+            .transpose()
+            .map_err(|source| HvfGuestMemoryMappingError::DirtyWriteMappingMutation { source })?;
+        let tracked_region_index = mutation
+            .as_ref()
+            .map(|mutation| mutation.prepare_remove(range, mapped_region.permissions))
+            .transpose()
+            .map_err(|source| HvfGuestMemoryMappingError::DirtyWriteMappingMutation { source })?
+            .flatten();
         if let Err(source) = self.mapper.unmap_region(mapped_region) {
             return Err(HvfGuestMemoryMappingError::UnmapFailed {
                 failures: vec![HvfGuestMemoryUnmapFailure { range, source }],
             });
+        }
+
+        if let Some(mutation) = mutation.as_mut() {
+            mutation.commit_remove(tracked_region_index);
         }
 
         self.mapped_regions.remove(mapped_index);
@@ -3554,7 +3626,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_write_tracking_includes_existing_dynamic_ram_and_blocks_live_mutation() {
+    fn dirty_write_tracking_includes_existing_and_live_dynamic_ram() {
         let page_size = page_size();
         let base_range = range(0, page_size);
         let dynamic_range = range(page_size * 4, page_size);
@@ -3570,7 +3642,7 @@ mod tests {
             .map_dynamic_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
             .expect("dynamic RAM should map before tracking");
 
-        mapping
+        let tracker = mapping
             .start_dirty_write_tracking()
             .expect("dirty-write tracker should include dynamic RAM");
         assert!(matches!(
@@ -3587,24 +3659,108 @@ mod tests {
                 (dynamic_range, HvfMemoryPermissions::new(true, false, true)),
             ]
         );
-        assert!(matches!(
-            mapping.map_dynamic_region(
-                range(page_size * 8, page_size),
-                HvfMemoryPermissions::GUEST_RAM
-            ),
-            Err(HvfGuestMemoryMappingError::InvalidState(
-                "guest memory mapping cannot change while dirty-write tracking is active"
-            ))
-        ));
-        assert!(matches!(
-            mapping.unmap_dynamic_region(dynamic_range),
-            Err(HvfGuestMemoryMappingError::InvalidState(
-                "guest memory mapping cannot change while dirty-write tracking is active"
-            ))
-        ));
+        let live_range = range(page_size * 8, page_size);
+        mapping
+            .map_dynamic_region(live_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("live dynamic RAM should map under tracker serialization");
+        assert_eq!(
+            mapper.maps().last().map(|(_, permissions)| *permissions),
+            Some(HvfMemoryPermissions::new(true, false, true))
+        );
+        assert_eq!(
+            tracker.dirty_pages().expect("new dynamic RAM should query"),
+            vec![live_range.start()]
+        );
+        mapping
+            .unmap_dynamic_region(live_range)
+            .expect("tracked live RAM should unmap");
+        assert!(
+            tracker
+                .dirty_pages()
+                .expect("removed dynamic RAM should leave no dirty page")
+                .is_empty()
+        );
+        mapping
+            .unmap_dynamic_region(dynamic_range)
+            .expect("pre-existing tracked dynamic RAM should unmap");
         mapping
             .unmap_all()
             .expect("tracker and mapping should stop");
+    }
+
+    #[test]
+    fn tracked_dynamic_mapping_failures_preserve_owner_and_epoch_metadata() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let failed_range = range(page_size * 4, page_size);
+        let live_range = range(page_size * 8, page_size);
+        let guest_memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::new(Some(2), false));
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("base guest memory should map");
+        let tracker = mapping
+            .start_dirty_write_tracking()
+            .expect("dirty-write tracking should start");
+
+        assert!(matches!(
+            mapping.map_dynamic_region(failed_range, HvfMemoryPermissions::GUEST_RAM),
+            Err(HvfGuestMemoryMappingError::DynamicRegionMapFailed {
+                owner_cleanup: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("base owner should remain")),
+            vec![base_range]
+        );
+        assert!(
+            tracker
+                .dirty_pages()
+                .expect("failed addition should leave no dirty metadata")
+                .is_empty()
+        );
+
+        mapping
+            .map_dynamic_region(live_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("fresh tracked addition should remain retryable");
+        assert_eq!(
+            tracker
+                .dirty_pages()
+                .expect("successful addition should be wholly dirty"),
+            vec![live_range.start()]
+        );
+
+        mapper.set_fail_unmap(true);
+        assert!(matches!(
+            mapping.unmap_dynamic_region(live_range),
+            Err(HvfGuestMemoryMappingError::UnmapFailed { .. })
+        ));
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("failed unmap owner should remain")),
+            vec![base_range, live_range]
+        );
+        assert_eq!(
+            tracker
+                .dirty_pages()
+                .expect("failed unmap should retain old epoch metadata"),
+            vec![live_range.start()]
+        );
+
+        mapper.set_fail_unmap(false);
+        mapping
+            .unmap_dynamic_region(live_range)
+            .expect("tracked unmap should retry after mapper recovery");
+        assert!(
+            tracker
+                .dirty_pages()
+                .expect("successful removal should drop dirty metadata")
+                .is_empty()
+        );
+        mapping.unmap_all().expect("mapping should shut down");
     }
 
     #[test]

@@ -2772,7 +2772,7 @@ mod tests {
         fn load_snapshot_v1(
             &mut self,
             _controller: &VmmController,
-            _input: &SnapshotLoadInput,
+            input: &SnapshotLoadInput,
         ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
             if !self.snapshot_operations_succeed {
                 return Err(NativeV1SnapshotLoadError::ProcessTerminal);
@@ -2787,9 +2787,9 @@ mod tests {
                         ))
                     })?;
             let commit = SnapshotV1ControllerCommit::try_new(
-                MachineConfig::default(),
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages()),
                 drive,
-                _input.resume_vm(),
+                input.resume_vm(),
             )
             .map_err(NativeV1SnapshotLoadError::ControllerCommitAllocation)?;
             Ok(SnapshotV1LoadSuccess::new(
@@ -3910,7 +3910,8 @@ mod tests {
             bangbang_api::http::StatusCode::NoContent
         );
 
-        let invalid_body = r#"{"vcpu_count":4,"mem_size_mib":512,"track_dirty_pages":true}"#;
+        let invalid_body =
+            r#"{"vcpu_count":4,"mem_size_mib":512,"smt":true,"track_dirty_pages":true}"#;
         let invalid_request = format!(
             "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{invalid_body}",
             invalid_body.len()
@@ -3924,7 +3925,7 @@ mod tests {
         );
         assert_eq!(
             response.body(),
-            r#"{"fault_message":"machine track_dirty_pages is not supported"}"#
+            r#"{"fault_message":"machine smt is not supported"}"#
         );
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
@@ -3998,25 +3999,18 @@ mod tests {
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
         assert!(!vmm.machine_config().track_dirty_pages());
 
-        let unsupported_patch_body = r#"{"track_dirty_pages":true}"#;
-        let unsupported_patch_request = format!(
-            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{unsupported_patch_body}",
-            unsupported_patch_body.len()
+        let tracking_patch_body = r#"{"track_dirty_pages":true}"#;
+        let tracking_patch_request = format!(
+            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{tracking_patch_body}",
+            tracking_patch_body.len()
         );
 
-        let response = handle_request_bytes(unsupported_patch_request.as_bytes(), &mut vmm);
+        let response = handle_request_bytes(tracking_patch_request.as_bytes(), &mut vmm);
 
-        assert_eq!(
-            response.status(),
-            bangbang_api::http::StatusCode::BadRequest
-        );
-        assert_eq!(
-            response.body(),
-            r#"{"fault_message":"machine track_dirty_pages is not supported"}"#
-        );
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::NoContent);
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
-        assert!(!vmm.machine_config().track_dirty_pages());
+        assert!(vmm.machine_config().track_dirty_pages());
     }
 
     #[test]
@@ -7419,7 +7413,7 @@ mod tests {
             &request_with_body(
                 "PUT",
                 "/snapshot/load",
-                r#"{"snapshot_path":"private-paused-state","mem_backend":{"backend_path":"private-paused-memory","backend_type":"File"}}"#,
+                r#"{"snapshot_path":"private-paused-state","mem_backend":{"backend_path":"private-paused-memory","backend_type":"File"},"track_dirty_pages":true}"#,
             ),
         );
         assert!(paused_response.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -7427,6 +7421,7 @@ mod tests {
             paused.instance_info().state,
             bangbang_runtime::InstanceState::Paused
         );
+        assert!(paused.machine_config().track_dirty_pages());
 
         let mut resumed = test_controller_with_starter(TestInstanceStarter::snapshot_success());
         let metrics_path = unique_socket_path("snapshot-public-load-metrics").with_extension("out");
@@ -7445,7 +7440,7 @@ mod tests {
             &request_with_body(
                 "PUT",
                 "/snapshot/load",
-                r#"{"snapshot_path":"private-resumed-state","mem_file_path":"private-resumed-memory","resume_vm":true}"#,
+                r#"{"snapshot_path":"private-resumed-state","mem_file_path":"private-resumed-memory","enable_diff_snapshots":true,"resume_vm":true}"#,
             ),
         );
         assert!(resumed_response.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -7453,6 +7448,7 @@ mod tests {
             resumed.instance_info().state,
             bangbang_runtime::InstanceState::Running
         );
+        assert!(resumed.machine_config().track_dirty_pages());
 
         let flush = put_action_over_socket(&mut resumed, "slf", "FlushMetrics");
         assert!(flush.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -9685,7 +9681,7 @@ mod tests {
         assert_eq!(vmm.machine_config().mem_size_mib(), 512);
 
         let mut client =
-            UnixStream::connect(&path).expect("client should connect for unsupported patch");
+            UnixStream::connect(&path).expect("client should connect for tracking patch");
         let patch_body = r#"{"track_dirty_pages":true}"#;
         let patch_request = format!(
             "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{patch_body}",
@@ -9694,23 +9690,20 @@ mod tests {
 
         client
             .write_all(patch_request.as_bytes())
-            .expect("client should write unsupported patch request");
+            .expect("client should write tracking patch request");
         server
             .serve_next(&mut vmm)
-            .expect("server should handle unsupported patch request");
+            .expect("server should handle tracking patch request");
 
         let mut response = String::new();
         client
             .read_to_string(&mut response)
-            .expect("client should read unsupported patch response");
+            .expect("client should read tracking patch response");
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(
-            response.contains(r#"{"fault_message":"machine track_dirty_pages is not supported"}"#)
-        );
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 512);
-        assert!(!vmm.machine_config().track_dirty_pages());
+        assert!(vmm.machine_config().track_dirty_pages());
     }
 
     #[test]

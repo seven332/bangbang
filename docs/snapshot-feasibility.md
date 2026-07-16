@@ -44,11 +44,12 @@ path.
   corrected request. Failures after an uncertain construction/cleanup boundary
   latch the process terminal. Create/load execution faults are typed and
   snapshot-specific while diagnostics remain path- and value-redacted.
-- `Diff`, UFFD, dirty tracking, realtime adjustment, overrides, unsupported
-  device profiles, and incompatible artifacts retain snapshot-specific
-  rejection boundaries. Parser and invalid-lifecycle failures still do not
-  record snapshot latency; admitted success, capability rejection, and
-  execution failure do.
+- `Diff`, UFFD, realtime adjustment, overrides, unsupported device profiles,
+  and incompatible artifacts retain snapshot-specific rejection boundaries.
+  Full/File load can enable a clean destination dirty epoch, independently of
+  the source, and a tracked source resets only after visible Full publication.
+  Parser and invalid-lifecycle failures still do not record snapshot latency;
+  admitted success, capability rejection, and execution failure do.
 - `--snapshot-version` prints `v1.0.0`. `--describe-snapshot <PATH>` opens a
   bounded regular file with the same nonblocking, path-redacted startup-file
   policy, fully validates the native envelope and CRC, and prints its embedded
@@ -278,7 +279,7 @@ order; it does not skip unknown future components:
 
 | Kind | Component | Native-v1 contents |
 | ---: | --- | --- |
-| 1 | machine/profile | Complete accepted `MachineConfig`: one vCPU, memory size, no SMT, dirty tracking, huge pages, or CPU template. |
+| 1 | machine/profile | Complete accepted `MachineConfig`: one vCPU, memory size, no SMT, optional active dirty tracking, no huge pages, and no CPU template. The load request independently selects destination tracking. |
 | 2 | compatibility/platform | Baseline and conditional optional CPU IDs, primary MPIDR, one atomic default-vCPU cache feature/geometry manifest, exact GIC metadata, fixed PL031 MMIO metadata, and explicit fresh-system-RTC policy. |
 | 3 | mutable vCPU | General, core-system, exception, execution-control, cache-selection, debug-control/trap, system-context, translation, pointer-authentication, thread-context, and SIMD/FP state. |
 | 4 | timer/interrupt/GIC | Normalized timer state, CPU IRQ/FIQ levels, bounded opaque Hypervisor.framework GIC bytes, and all ten EL1 ICC registers. |
@@ -966,23 +967,31 @@ The implemented low-level guest-CPU primitive instead removes WRITE from every
 mapped writable guest-RAM range with `hv_vm_protect`, records the first owned
 page exit, restores that page's original permission, and leaves the same store
 for the caller's next bounded run. Signed Apple Silicon evidence observes EC
-`0x24`, WnR set, CM/S1PTW clear, and exact DFSC `0x07` at the protected IPA.
-That DFSC is an empirical Hypervisor.framework contract, not an encoding Apple
-documents; any drift is declined and follows the existing MMIO/error path.
+`0x24`, WnR set, CM/S1PTW clear, and exact DFSC `0x07` for initial protection
+or `0x0f` after a page is re-protected for the next epoch. Those values are an
+empirical Hypervisor.framework contract, not encodings Apple documents; every
+other value is declined and follows the existing MMIO/error path.
 
 The primitive starts only after memory mapping and before any vCPU owner, and it
 stops only after every owner has joined. Activation protects complete ranges
 transactionally; an incomplete rollback, a page-unprotect failure, or an
 incomplete stop blocks further execution/mapping mutation until cleanup or VM
-unmap. One shared bitmap serializes first writers, and a different vCPU may
-consume only one stale exit already raised for the same page. Dirty handling
-does not advance PC, dispatch MMIO, or run the guest again internally.
+unmap. One backend-neutral atomic bitmap is shared with `GuestMemory`: normal
+boot installs it before kernel/initrd/FDT/device population, while snapshot load
+installs it after baseline image population and before mapping, owners, and
+VMGenID replacement. Bounded host/device writes and conservative discard
+attempts mark it directly; CPU faults mark it through a separate HVF
+restored-WRITE overlay. A different vCPU may consume only one stale exit already
+raised for the same page. Dirty handling does not advance PC, dispatch MMIO, or
+run the guest again internally.
 
-This is not yet a public dirty-tracking epoch. It observes guest-CPU writes only;
-boot-loader, VMM, device, pmem, balloon, and other userspace writes still need
-the separate bitmap union, epoch reset/commit, and live dynamic-range semantics.
-Machine/load `track_dirty_pages = true`, `Diff` artifacts, merging, and broader
-snapshot compatibility therefore remain rejected pending that integration.
+Writable dynamic RAM is installed protected and wholly dirty; removal drops its
+exact bitmap/protection metadata. After a Full pair is visibly committed inside
+snapshot-ready quiescence, restored pages are re-protected before the shared
+generation clears. Complete rollback retains the old epoch; incomplete rollback
+blocks resume and requires teardown. Machine/load tracking flags are enabled.
+`Diff` artifact serialization, merging/restore, UFFD, and broader snapshot
+compatibility remain outside native-v1.
 
 ### Implemented public native-v1 restore order
 
@@ -990,17 +999,20 @@ The public load orchestrator holds one aggregate never-run runner admission
 window and uses this order only after complete compatibility and optional-state
 validation:
 
-1. construct validated guest memory, baseline devices, the GIC, and one vCPU;
-2. restore baseline architectural register and data state in its documented
+1. construct validated guest memory and baseline devices, then create and
+   validate the GIC;
+2. when requested, attach a clean dirty bitmap after image population, map and
+   protect guest RAM, and only then create the one vCPU owner;
+3. restore baseline architectural register and data state in its documented
    dependency order, while active SVE/SME/debug optional state remains rejected;
-3. apply the compatible opaque GIC device blob;
-4. restore and validate the EL1 ICC CPU-interface state;
-5. restore normalized physical and virtual timers, taking timer-PPI state from
+4. apply the compatible opaque GIC device blob;
+5. restore and validate the EL1 ICC CPU-interface state;
+6. restore normalized physical and virtual timers, taking timer-PPI state from
    the compatible GIC image rather than replaying TVAL or ISTATUS;
-6. restore CPU IRQ/FIQ pending injection last among runner-owned state;
-7. replace the guest VMGenID buffer and inject its SPI only after every GIC
+7. restore CPU IRQ/FIQ pending injection last among runner-owned state;
+8. replace the guest VMGenID buffer and inject its SPI only after every GIC
    restore, so the notification cannot be overwritten; and
-8. commit a paused session and permit resume only after every step succeeds.
+9. commit a paused session and permit resume only after every step succeeds.
 
 The runner-owned portion is one command rather than a transaction: an HVF write
 failure may leave a prefix applied, so the destination is torn down and explicit
@@ -1080,8 +1092,9 @@ snapshot state unless a later design proves otherwise.
 
 The native-v1 baseline register inventory, GIC/device payload schemas, capture
 ownership, and lease duration through synchronous memory output are now fixed
-by the composite capture. Dirty tracking, optional resources, and
-optional-resource policy remain separate design decisions.
+by the composite capture. #1395 and #1396 subsequently complete shared public
+dirty epochs. Optional resources and optional-resource policy remain separate
+design decisions.
 The internal process owner now composes the independently implemented publisher
 and capture through one close-proven staging writer; restore
 consumes the resulting committed artifacts.
@@ -1113,15 +1126,17 @@ The supported baseline is complete. Broader snapshot support still requires:
 
 - explicit external-resource and override policy for every profile beyond one
   read-only root block device and default serial, plus optional-device state;
-- a dirty-page strategy before `Diff` can be admitted; and
+- differential image serialization, merge, and restore policy before `Diff`
+  can be admitted; and
 - compatible capture/restore and signed acceptance coverage for each expanded
   profile.
 
 The detailed list below is the pre-composite prerequisite inventory retained to
 show why the baseline was chosen. Its capture/schema gaps are superseded by
 #1270, and its baseline destination-validation/restore-orchestration gaps by
-#1272. Optional-state expansion, external resources, and dirty tracking remain
-relevant; #1276 supplies the final public routing and signed baseline proof.
+#1272. Optional-state expansion and external resources remain relevant; #1276
+supplies the public routing and signed baseline proof, while #1395 and #1396
+complete public shared dirty epochs without admitting `Diff` artifacts.
 
 - Snapshot-ready pause ownership: extend the implemented supervisor admission
   foundation to satisfy every invariant above without racing the HVF runner,
@@ -1229,8 +1244,9 @@ relevant; #1276 supplies the final public routing and signed baseline proof.
   interrupt delivery can be considered restorable.
 - Device-state persistence: every implemented device needs a stable serialized
   state model, restore validation, and rollback or terminal-failure behavior.
-- Dirty tracking decision: full snapshots can be considered separately, but
-  diff snapshots need an explicit HVF/macOS strategy.
+- Dirty tracking decision (completed by #1395/#1396): shared HVF and userspace
+  epochs support Full commit reset, while diff snapshots still need explicit
+  image serialization, merge, and restore semantics.
 - Data-format decision: bangbang must choose between Firecracker file-format
   compatibility, a bangbang-native format behind Firecracker-shaped APIs, or a
   documented unsupported boundary.
@@ -1249,7 +1265,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | --- | --- | --- |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence and complete publication transaction (implemented for native-v1 baseline) | #1162 introduced acknowledged RAII quiescence for block and entropy; #1389 added the topology-wide SMP pause barrier and PMEM guard; #1390 includes network, acquires all four failure-atomically, drains tokens only after complete acknowledgement, preserves in-flight/deferred/deadline work, and holds the worker lease through commit plus the post-publication hook. Process API/MMDS/controller and periodic work are serialized by the synchronous owner borrow. | Deterministic scheduler, supervisor, cancellation/seal, publication-visibility, process/API serialization, and fresh-retry tests plus combined signed SMP pause and one-vCPU baseline publication evidence. |
-| HVF guest-CPU dirty-write primitive (implemented, not a public epoch) | #1395 transactionally write-protects mapped guest RAM before vCPU ownership, handles only the signed-observed exact DFSC `0x07` write exit at a tracker-owned IPA, restores permission before publishing one bitmap bit, and requires owner shutdown before cleanup. Public flags, userspace/device marks, epoch reset/commit, and diff artifacts remain deferred. | Range/rollback/poisoning, exact classifier, unowned-MMIO, race, no-PC/no-hidden-run, cancellation, and cleanup unit evidence plus signed two-vCPU shared/distinct-page value and progress proofs. |
+| Complete dirty epochs and public tracking (implemented) | #1395 supplies fail-closed HVF protection/fault retry. #1396 adds the shared `GuestMemory` bitmap, exact initial/reprotected DFSC `0x07`/`0x0f` ownership checks, every current bounded host/device writer, conservative discard, protected wholly-dirty dynamic RAM, destination load ordering, and post-visible-Full reset/rollback/poison semantics. Machine and load tracking flags are enabled without adding Diff artifacts. | Exact/repeated/concurrent host and CPU union, discard, dynamic mapping, load override/VMGenID, publication/cancellation/reset failures, and public transaction tests plus signed normal boot/load, two-vCPU current-device, and two-epoch exact-set evidence. |
 | Runner general-register capture and restore (first bidirectional subset implemented) | #1164 adds a typed immutable X0-X30, PC, and CPSR value plus one failure-atomic owner-thread capture. #1228 adds ordered owner-thread restore of that complete typed value and generalizes the shared admission name from capture to operation. Hypervisor.framework does not make the 33 writes transactional: typed failure context identifies the failed register and completed prefix, and callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore, but the snapshot lease invokes neither. Core system, exception, execution-control, identification, translation, baseline SIMD/FP, schema, validation, rollback, wider ordering, and multi-vCPU coordination remain separate or deferred. | Exact 33-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed same-vCPU idle capture/restore/recapture without guest execution or value logging. |
 | Runner core system-register capture and restore (second bidirectional subset implemented) | #1170 adds a typed immutable raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 value plus one owner-thread capture. #1230 adds ordered owner-thread restore of that complete value and a reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the four writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. Exception, execution-control, identification, translation, broader system state, validation, schema, rollback, wider ordering, orchestration, and multi-vCPU coordination remain separate or deferred. | Exact four-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written known-value capture/restore/recapture without post-restore guest execution or value logging. |
 | Runner EL1 exception-register capture and restore (third bidirectional subset implemented) | #1184 adds typed immutable raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 state plus one owner-thread capture. #1232 adds ordered owner-thread restore of that complete value through the reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the six writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. Vector-table memory, coherent exception semantics, destination validation, persistence, schema, rollback, wider ordering, orchestration, and multi-vCPU coordination remain deferred. | Exact six-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written capture/restore/recapture preserving implementation-defined AFSR readback without post-restore guest execution or value logging. |
@@ -1292,9 +1308,9 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | External resource policy | Define disk, vmnet, and vsock metadata, buffering boundary, disconnect/reconnect behavior, and restore overrides. | Resource-policy unit/process tests and focused signed network/vsock coverage. |
 | Public snapshot endpoint activation (implemented) | #1276 routes create and load only for the admitted native-v1 profile, preserves Firecracker-shaped response/latency/deprecation behavior, commits load as `Paused` before applying `resume_vm`, and exposes typed redacted execution faults. | Runtime/process/API tests plus signed fresh-process public create, no-clobber, retryable load, explicit resume, automatic resume, guest-observed VMGenID replacement, and continuation coverage. |
 
-Dirty tracking and optional resources remain their own issue-sized areas. The
-public create and restore transactions are deliberately limited to the
-native-v1 baseline.
+Shared dirty epochs are complete; Diff artifacts and optional resources remain
+their own issue-sized areas. The public create and restore transactions are
+deliberately limited to the native-v1 baseline.
 
 bangbang reports unsupported only for request shapes and profiles outside that
 baseline. Accepted Full create and File load requests use the production
