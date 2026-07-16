@@ -199,17 +199,24 @@ image IDs, checksums, guest bytes, or GIC contents. CRC-64/Jones and random
 image identity detect accidental corruption or mismatched pairs, not malicious
 rewriting, confidentiality, provenance, or authorization.
 
-Private capture holds paused-worker admission, block/entropy retry quiescence,
-and all four runner operation domains through non-memory encoding and complete
-memory streaming. Cancellation is checked between fixed stages and 1 MiB
-chunks. Failure returns no binding or bundle, publishes no final state marker,
-and drops the consumed writer and auxiliary guard before admission release.
-Supervisor shutdown signals cancellation before joining, but Rust cannot
-forcibly preempt an arbitrary blocking `write`; the public request path therefore
-supplies only a publisher-owned regular staging file, never an arbitrary caller
-writer. The capture writer names no path and the publisher owns cleanup of its
-private staging entry. A partially written staging inode is never interpreted
-as committed state.
+Native-v1 publication holds paused-worker admission, block/PMEM/network/entropy
+retry quiescence, and all four runner operation domains through non-memory
+encoding, complete memory streaming, artifact verification and synchronization,
+exclusive memory-first/state-last commit, and the successful-publication hook.
+Cancellation is checked between fixed stages and 1 MiB chunks and competes with
+one atomic commit seal. Before the seal it returns no binding or bundle,
+publishes no final state marker, and drops the consumed writer and auxiliary
+guard before admission release. After the seal, signal-triggered shutdown stays
+pending while publication finishes and retains its exact typed visibility and
+cleanup result.
+
+Rust cannot forcibly preempt an arbitrary blocking `write`; the public request
+path therefore supplies only a publisher-owned regular staging file, never an
+arbitrary caller writer. The capture writer names no path and the publisher owns
+cleanup of its private staging entry. A partially written staging inode is never
+interpreted as committed state. Signal handlers only update lock-free atomics
+and the existing wakeup pipe; they do not allocate, lock, perform artifact I/O,
+or run cleanup in signal context.
 
 PL031 RTC is represented by fixed MMIO metadata and an explicit fresh-device
 policy. No mutable RTC register or alarm state is persisted, so no continuity
@@ -899,7 +906,11 @@ is resource-specific:
   value-free. Unsupported request/profile dimensions fail before artifact I/O;
   an admitted paused create opens only preflighted namespaces, temporarily
   closes ordinary boot-worker command admission, and acknowledges process-local
-  block/entropy retry quiescence through complete capture and memory streaming.
+  block/PMEM/network/entropy retry quiescence through complete capture,
+  publication, and the post-publication hook. API/MMDS/controller mutation and
+  periodic callbacks cannot re-enter the synchronously borrowed process during
+  that interval. External vmnet/vsock peers and their host/kernel buffers are
+  neither frozen nor persisted; the admitted profile excludes those devices.
   Load freshness uses
   successful configuration history plus current non-logger/metrics state, so
   explicit defaults and residual MMDS presence fail closed without treating a

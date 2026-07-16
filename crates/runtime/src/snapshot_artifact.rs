@@ -622,6 +622,14 @@ impl<E> From<SnapshotPublicationError> for SnapshotPublicationTransactionError<E
 }
 
 impl<E> SnapshotPublicationTransactionError<E> {
+    /// Creates a typed producer failure before publication owns staging.
+    ///
+    /// Cleanup dispositions are absent because no private staging artifact has
+    /// been created by the publication transaction yet.
+    pub fn from_producer(source: E) -> Self {
+        Self::Producer(SnapshotPublicationProducerError::new(source))
+    }
+
     /// Returns the infrastructure failure, when publication itself failed.
     pub const fn publication(&self) -> Option<&SnapshotPublicationError> {
         match self {

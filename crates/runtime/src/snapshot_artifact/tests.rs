@@ -35,6 +35,19 @@ fn paths_and_load_results_redact_host_paths_and_memory() {
     assert!(!debug.contains("memory.snap"));
 }
 
+#[test]
+fn pre_staging_producer_error_retains_source_without_cleanup() {
+    let error = SnapshotPublicationTransactionError::from_producer("admission closed");
+    let producer = error
+        .producer()
+        .expect("pre-staging failure should retain its producer source");
+
+    assert_eq!(producer.source(), &"admission closed");
+    assert_eq!(producer.memory_cleanup(), None);
+    assert_eq!(producer.state_cleanup(), None);
+    assert!(error.publication().is_none());
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn generalized_publication_rejects_platform_without_invoking_producer() {

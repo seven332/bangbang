@@ -2205,7 +2205,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2241,20 +2241,87 @@ mod tests {
 
     use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
-        BlockBackingUpdate, InstanceStartExecutor, NativeV1SnapshotLoadError,
-        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, SnapshotV1LoadSuccess,
+        BlockBackingUpdate, InstanceStartExecutor, NativeV1SnapshotCaptureCancellation,
+        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
+        NativeV1SnapshotPublicationProducerError, ProcessSessionDiagnostics,
+        ProcessSessionExitStatus, ProcessVmm, SnapshotV1LoadSuccess,
     };
 
     use super::*;
 
     const VERSION: &str = "0.1.0";
 
+    #[derive(Debug, Default)]
+    struct SnapshotCallGateState {
+        entered: bool,
+        cancellation_observed: bool,
+        release: bool,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct SnapshotCallGate {
+        shared: Arc<(Mutex<SnapshotCallGateState>, Condvar)>,
+    }
+
+    impl SnapshotCallGate {
+        fn enter_and_wait(&self, cancellation: &NativeV1SnapshotCaptureCancellation) {
+            let (state, changed) = &*self.shared;
+            let mut state = state.lock().expect("snapshot gate state should lock");
+            state.entered = true;
+            changed.notify_all();
+            while !state.release {
+                if cancellation.is_cancelled() {
+                    state.cancellation_observed = true;
+                    changed.notify_all();
+                }
+                state = changed
+                    .wait(state)
+                    .expect("snapshot gate wait should not be poisoned");
+            }
+        }
+
+        fn wait_for_entered(&self) {
+            let (state, changed) = &*self.shared;
+            let mut state = state.lock().expect("snapshot gate state should lock");
+            while !state.entered {
+                state = changed
+                    .wait(state)
+                    .expect("snapshot gate wait should not be poisoned");
+            }
+        }
+
+        fn notify_cancellation(&self) {
+            let (state, changed) = &*self.shared;
+            let _state = state.lock().expect("snapshot gate state should lock");
+            changed.notify_all();
+        }
+
+        fn wait_for_cancellation(&self) {
+            let (state, changed) = &*self.shared;
+            let mut state = state.lock().expect("snapshot gate state should lock");
+            while !state.cancellation_observed {
+                state = changed
+                    .wait(state)
+                    .expect("snapshot gate wait should not be poisoned");
+            }
+        }
+
+        fn release(&self) {
+            let (state, changed) = &*self.shared;
+            state
+                .lock()
+                .expect("snapshot gate state should lock")
+                .release = true;
+            changed.notify_all();
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct TestInstanceStarter {
         result: Result<TestSession, BackendError>,
         assemble_boot_resources: bool,
         snapshot_operations_succeed: bool,
+        snapshot_gate: Option<SnapshotCallGate>,
     }
 
     #[derive(Debug, Clone)]
@@ -2513,6 +2580,7 @@ mod tests {
                 result: Ok(TestSession::without_boot_run_loop_status()),
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
+                snapshot_gate: None,
             }
         }
 
@@ -2521,6 +2589,7 @@ mod tests {
                 result: Ok(TestSession::with_boot_run_loop_status(status)),
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
+                snapshot_gate: None,
             }
         }
 
@@ -2529,6 +2598,7 @@ mod tests {
                 result: Ok(TestSession::with_process_exit_signal(signal)),
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
+                snapshot_gate: None,
             }
         }
 
@@ -2541,6 +2611,7 @@ mod tests {
                 )),
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
+                snapshot_gate: None,
             }
         }
 
@@ -2549,6 +2620,7 @@ mod tests {
                 result: Err(BackendError::InvalidState("test startup failed")),
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
+                snapshot_gate: None,
             }
         }
 
@@ -2557,6 +2629,7 @@ mod tests {
                 result: Err(source),
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
+                snapshot_gate: None,
             }
         }
 
@@ -2565,6 +2638,7 @@ mod tests {
                 result: Ok(TestSession::without_boot_run_loop_status()),
                 assemble_boot_resources: true,
                 snapshot_operations_succeed: false,
+                snapshot_gate: None,
             }
         }
 
@@ -2573,6 +2647,16 @@ mod tests {
                 result: Ok(TestSession::without_boot_run_loop_status()),
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: true,
+                snapshot_gate: None,
+            }
+        }
+
+        fn snapshot_success_with_gate(snapshot_gate: SnapshotCallGate) -> Self {
+            Self {
+                result: Ok(TestSession::without_boot_run_loop_status()),
+                assemble_boot_resources: false,
+                snapshot_operations_succeed: true,
+                snapshot_gate: Some(snapshot_gate),
             }
         }
     }
@@ -2606,9 +2690,13 @@ mod tests {
             _drive_config: &DriveConfig,
             _serial_config: &SerialConfig,
             paths: &SnapshotArtifactPaths,
+            cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
             if !self.snapshot_operations_succeed {
                 return Err(NativeV1SnapshotPublicationError::SessionUnavailable);
+            }
+            if let Some(snapshot_gate) = &self.snapshot_gate {
+                snapshot_gate.enter_and_wait(&cancellation);
             }
             let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
                 .map_err(|_| NativeV1SnapshotPublicationError::ConfigurationUnavailable)?;
@@ -10249,6 +10337,177 @@ mod tests {
         drop(client);
         drop(server);
         assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn synchronous_snapshot_serializes_api_mmds_and_periodic_work_but_observes_cancellation() {
+        let socket_path = unique_socket_path("ss");
+        let state_path = unique_socket_path("sss").with_extension("state");
+        let memory_path = unique_socket_path("ssm").with_extension("memory");
+        let metrics_path = unique_socket_path("ssx").with_extension("metrics");
+        let server = ApiServer::bind(&socket_path).expect("server should bind");
+        let (mut shutdown_reader, mut shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let gate = SnapshotCallGate::default();
+        let cancellation = NativeV1SnapshotCaptureCancellation::default();
+        let mut vmm = test_controller_with_starter(
+            TestInstanceStarter::snapshot_success_with_gate(gate.clone()),
+        )
+        .with_snapshot_capture_cancellation(cancellation.clone());
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/snapshot-serialization-vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("root", "root", "/tmp/snapshot-serialization-root", true)
+                .with_is_read_only(true),
+        ))
+        .expect("root drive should configure");
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("instance should pause");
+
+        let snapshot_body = serde_json::json!({
+            "snapshot_path": state_path,
+            "mem_file_path": memory_path,
+        })
+        .to_string();
+        let snapshot_request = request_with_body("PUT", "/snapshot/create", &snapshot_body);
+        let mut snapshot_client =
+            UnixStream::connect(&socket_path).expect("snapshot client should connect");
+        snapshot_client
+            .write_all(snapshot_request.as_bytes())
+            .expect("snapshot client should write request");
+
+        let orchestrator_socket_path = socket_path.clone();
+        let orchestrator_metrics_path = metrics_path.clone();
+        let orchestrator = thread::spawn(move || {
+            gate.wait_for_entered();
+
+            let mmds_body = r#"{"transaction":"after-snapshot"}"#;
+            let mmds_request = request_with_body("PUT", "/mmds", mmds_body);
+            let mut mmds_client = UnixStream::connect(&orchestrator_socket_path)
+                .expect("MMDS client should connect while snapshot is active");
+            mmds_client
+                .write_all(mmds_request.as_bytes())
+                .expect("MMDS client should queue request");
+            mmds_client
+                .set_nonblocking(true)
+                .expect("MMDS client should become nonblocking");
+            let mut probe = [0; 1];
+            assert!(matches!(
+                mmds_client.read(&mut probe),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+            ));
+
+            let resume_request = request_with_body("PATCH", "/vm", r#"{"state":"Resumed"}"#);
+            let mut resume_client = UnixStream::connect(&orchestrator_socket_path)
+                .expect("resume client should connect while snapshot is active");
+            resume_client
+                .write_all(resume_request.as_bytes())
+                .expect("resume client should queue request");
+            resume_client
+                .set_nonblocking(true)
+                .expect("resume client should become nonblocking");
+            assert!(matches!(
+                resume_client.read(&mut probe),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+            ));
+
+            thread::sleep(Duration::from_millis(150));
+            assert_eq!(
+                fs::read_to_string(&orchestrator_metrics_path)
+                    .expect("configured metrics output should be readable"),
+                ""
+            );
+
+            cancellation.cancel();
+            gate.notify_cancellation();
+            gate.wait_for_cancellation();
+            assert!(matches!(
+                mmds_client.read(&mut probe),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            assert!(matches!(
+                resume_client.read(&mut probe),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            gate.release();
+
+            let mut snapshot_response = String::new();
+            snapshot_client
+                .read_to_string(&mut snapshot_response)
+                .expect("snapshot client should read response");
+            mmds_client
+                .set_nonblocking(false)
+                .expect("MMDS client should become blocking");
+            let mut mmds_response = String::new();
+            mmds_client
+                .read_to_string(&mut mmds_response)
+                .expect("MMDS client should read response after snapshot");
+            resume_client
+                .set_nonblocking(false)
+                .expect("resume client should become blocking");
+            let mut resume_response = String::new();
+            resume_client
+                .read_to_string(&mut resume_response)
+                .expect("resume client should read response");
+            shutdown_writer
+                .write_all(b"x")
+                .expect("test should signal server shutdown");
+
+            (snapshot_response, mmds_response, resume_response)
+        });
+
+        let now = Instant::now();
+        assert_eq!(
+            server.run_until_with_periodic_schedulers(
+                &mut vmm,
+                &mut shutdown_reader,
+                PeriodicMetricsScheduler::with_period(now, Duration::from_millis(100)),
+                PeriodicBalloonStatisticsScheduler::new(now, None),
+            ),
+            Ok(())
+        );
+        let (snapshot_response, mmds_response, resume_response) =
+            orchestrator.join().expect("orchestrator should not panic");
+
+        assert!(
+            snapshot_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "unexpected snapshot response: {snapshot_response}"
+        );
+        assert!(
+            mmds_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "unexpected MMDS response: {mmds_response}"
+        );
+        assert!(mmds_response.contains("The MMDS data store is not initialized."));
+        assert!(
+            resume_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "unexpected resume response: {resume_response}"
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+        assert!(
+            !fs::read_to_string(&metrics_path)
+                .expect("periodic metrics output should be readable")
+                .is_empty()
+        );
+        assert!(state_path.is_file());
+        assert!(memory_path.is_file());
+
+        fs::remove_file(state_path).expect("snapshot state fixture should clean up");
+        fs::remove_file(memory_path).expect("snapshot memory fixture should clean up");
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+        drop(server);
+        assert!(!socket_path.exists());
     }
 
     #[test]
