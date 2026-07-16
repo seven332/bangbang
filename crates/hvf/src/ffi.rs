@@ -20,6 +20,7 @@ pub(crate) type HvMemoryFlags = u64;
 pub(crate) type HvReg = u32;
 pub(crate) type HvSimdFpReg = u32;
 pub(crate) type HvSysReg = u16;
+pub(crate) type Arm64VcpuCacheFdtSourceRaw = (u64, [u64; 3], [[u64; 8]; 2]);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,11 +228,12 @@ mod imp {
     use bangbang_runtime::BackendError;
 
     use super::{
-        CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSimdFpValue,
-        HvSmeZt0Value, HvSysReg, HvVcpu, HvVcpuExit, HvVcpuSmeState, MachTimebaseInfo,
-        SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE, SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
-        SME_STATE_REQUIRES_MACOS_15_2_MESSAGE, SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
-        SME_ZA_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, SME_ZT0_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
+        Arm64VcpuCacheFdtSourceRaw, CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg,
+        HvSimdFpReg, HvSimdFpValue, HvSmeZt0Value, HvSysReg, HvVcpu, HvVcpuExit, HvVcpuSmeState,
+        MachTimebaseInfo, SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE,
+        SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
+        SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, SME_ZA_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
+        SME_ZT0_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
     };
 
     pub type HvReturn = i32;
@@ -283,6 +285,7 @@ mod imp {
 
     const HV_CACHE_TYPE_DATA: HvCacheType = 0;
     const HV_CACHE_TYPE_INSTRUCTION: HvCacheType = 1;
+    const HV_FEATURE_REG_ID_AA64MMFR2_EL1: HvFeatureReg = 6;
     const HV_FEATURE_REG_CTR_EL0: HvFeatureReg = 9;
     const HV_FEATURE_REG_CLIDR_EL1: HvFeatureReg = 10;
     const HV_FEATURE_REG_DCZID_EL0: HvFeatureReg = 11;
@@ -801,6 +804,47 @@ mod imp {
         )
     }
 
+    fn get_arm64_vcpu_cache_fdt_source_with(
+        create: HvVcpuConfigCreate,
+        get_feature_reg: HvVcpuConfigGetFeatureReg,
+        get_ccsidr_el1_sys_reg_values: HvVcpuConfigGetCcsidrEl1SysRegValues,
+        release: OsRelease,
+    ) -> Result<Arm64VcpuCacheFdtSourceRaw, BackendError> {
+        let config = HvVcpuConfigOwner::create_with(create, release)?;
+        let id_aa64mmfr2_el1 = get_vcpu_config_feature_reg_with(
+            &config,
+            get_feature_reg,
+            HV_FEATURE_REG_ID_AA64MMFR2_EL1,
+        )?;
+        let features = [
+            get_vcpu_config_feature_reg_with(&config, get_feature_reg, HV_FEATURE_REG_CTR_EL0)?,
+            get_vcpu_config_feature_reg_with(&config, get_feature_reg, HV_FEATURE_REG_CLIDR_EL1)?,
+            get_vcpu_config_feature_reg_with(&config, get_feature_reg, HV_FEATURE_REG_DCZID_EL0)?,
+        ];
+        let geometry = [
+            get_vcpu_config_ccsidr_el1_values_with(
+                &config,
+                get_ccsidr_el1_sys_reg_values,
+                HV_CACHE_TYPE_DATA,
+            )?,
+            get_vcpu_config_ccsidr_el1_values_with(
+                &config,
+                get_ccsidr_el1_sys_reg_values,
+                HV_CACHE_TYPE_INSTRUCTION,
+            )?,
+        ];
+        Ok((id_aa64mmfr2_el1, features, geometry))
+    }
+
+    pub fn get_arm64_vcpu_cache_fdt_source() -> Result<Arm64VcpuCacheFdtSourceRaw, BackendError> {
+        get_arm64_vcpu_cache_fdt_source_with(
+            hv_vcpu_config_create,
+            hv_vcpu_config_get_feature_reg,
+            hv_vcpu_config_get_ccsidr_el1_sys_reg_values,
+            os_release,
+        )
+    }
+
     pub fn create_vm() -> Result<(), BackendError> {
         let config = HvVmConfigOwner::with_max_ipa_size()?;
 
@@ -1236,8 +1280,9 @@ mod imp {
 
         use super::{
             HV_BAD_ARGUMENT, HV_CACHE_TYPE_DATA, HV_CACHE_TYPE_INSTRUCTION, HV_DENIED,
-            HV_FEATURE_REG_CLIDR_EL1, HV_FEATURE_REG_CTR_EL0, HV_FEATURE_REG_DCZID_EL0, HV_SUCCESS,
-            HV_UNSUPPORTED, HvVcpuConfig, HvVcpuConfigOwner, check,
+            HV_FEATURE_REG_CLIDR_EL1, HV_FEATURE_REG_CTR_EL0, HV_FEATURE_REG_DCZID_EL0,
+            HV_FEATURE_REG_ID_AA64MMFR2_EL1, HV_SUCCESS, HV_UNSUPPORTED, HvVcpuConfig,
+            HvVcpuConfigOwner, check, get_arm64_vcpu_cache_fdt_source_with,
             get_arm64_vcpu_cache_feature_registers_with, get_arm64_vcpu_cache_geometry_with,
             get_arm64_vcpu_cache_manifest_with, get_max_vcpu_count_with,
             get_sme_config_max_svl_bytes_with, get_sme_p_reg_with, get_sme_z_reg_with,
@@ -1264,6 +1309,7 @@ mod imp {
         const TEST_SME_ZA_BYTES: [u8; 9] = [0xff, 0, 1, 2, 3, 5, 8, 13, 21];
         const TEST_SME_ZA_VCPU: u64 = 0x1357_9bdf_2468_ace0;
         const TEST_SME_ZT0_VCPU: u64 = 0x89ab_cdef_0123_4567;
+        const TEST_CACHE_MMFR2_VALUE: u64 = 0xaaaa_5555_f0f0_0f0f;
         const TEST_CACHE_FEATURE_VALUES: [u64; 3] = [0, u64::MAX, 0x0123_4567_89ab_cdef];
         const TEST_CACHE_GEOMETRY: [[u64; 8]; 2] = [
             [
@@ -1404,6 +1450,7 @@ mod imp {
                 return HV_BAD_ARGUMENT;
             }
             let register_value = match feature_reg {
+                HV_FEATURE_REG_ID_AA64MMFR2_EL1 => TEST_CACHE_MMFR2_VALUE,
                 HV_FEATURE_REG_CTR_EL0 => TEST_CACHE_FEATURE_VALUES[0],
                 HV_FEATURE_REG_CLIDR_EL1 => TEST_CACHE_FEATURE_VALUES[1],
                 HV_FEATURE_REG_DCZID_EL0 => TEST_CACHE_FEATURE_VALUES[2],
@@ -1959,6 +2006,7 @@ mod imp {
 
         #[test]
         fn vcpu_cache_feature_ids_match_hvf_sdk() {
+            assert_eq!(HV_FEATURE_REG_ID_AA64MMFR2_EL1, 6);
             assert_eq!(HV_FEATURE_REG_CTR_EL0, 9);
             assert_eq!(HV_FEATURE_REG_CLIDR_EL1, 10);
             assert_eq!(HV_FEATURE_REG_DCZID_EL0, 11);
@@ -2215,6 +2263,105 @@ mod imp {
         }
 
         #[test]
+        fn vcpu_cache_fdt_source_uses_one_configuration_in_exact_order() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            reset_test_vcpu_config_state(None);
+
+            assert_eq!(
+                get_arm64_vcpu_cache_fdt_source_with(
+                    test_vcpu_config_create,
+                    test_vcpu_config_get_feature_reg,
+                    test_vcpu_config_get_ccsidr_el1_sys_reg_values,
+                    test_vcpu_config_release,
+                ),
+                Ok((
+                    TEST_CACHE_MMFR2_VALUE,
+                    TEST_CACHE_FEATURE_VALUES,
+                    TEST_CACHE_GEOMETRY,
+                ))
+            );
+            assert_eq!(
+                test_vcpu_config_calls(),
+                (
+                    vec![
+                        TestVcpuConfigCall::Create,
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_ID_AA64MMFR2_EL1),
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_CTR_EL0),
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_CLIDR_EL1),
+                        TestVcpuConfigCall::Get(HV_FEATURE_REG_DCZID_EL0),
+                        TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_DATA),
+                        TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_INSTRUCTION),
+                        TestVcpuConfigCall::Release,
+                    ],
+                    true,
+                )
+            );
+        }
+
+        #[test]
+        fn null_vcpu_configuration_stops_cache_fdt_source_without_getter_or_release() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            reset_test_vcpu_config_state(None);
+
+            assert_eq!(
+                get_arm64_vcpu_cache_fdt_source_with(
+                    test_vcpu_config_create_null,
+                    test_vcpu_config_get_feature_reg,
+                    test_vcpu_config_get_ccsidr_el1_sys_reg_values,
+                    test_vcpu_config_release,
+                ),
+                Err(BackendError::Hypervisor(
+                    "hv_vcpu_config_create returned null".to_string()
+                ))
+            );
+            assert_eq!(
+                test_vcpu_config_calls(),
+                (vec![TestVcpuConfigCall::Create], true)
+            );
+        }
+
+        #[test]
+        fn every_vcpu_cache_fdt_source_failure_stops_and_releases_one_configuration() {
+            let _lock = TEST_VCPU_CONFIG_LOCK
+                .lock()
+                .expect("test vCPU config lock should not be poisoned");
+            let operations = [
+                TestVcpuConfigCall::Get(HV_FEATURE_REG_ID_AA64MMFR2_EL1),
+                TestVcpuConfigCall::Get(HV_FEATURE_REG_CTR_EL0),
+                TestVcpuConfigCall::Get(HV_FEATURE_REG_CLIDR_EL1),
+                TestVcpuConfigCall::Get(HV_FEATURE_REG_DCZID_EL0),
+                TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_DATA),
+                TestVcpuConfigCall::GetCcsidr(HV_CACHE_TYPE_INSTRUCTION),
+            ];
+
+            for fail_on_get in 0..operations.len() {
+                reset_test_vcpu_config_state(Some(fail_on_get));
+                let error = get_arm64_vcpu_cache_fdt_source_with(
+                    test_vcpu_config_create,
+                    test_vcpu_config_get_feature_reg,
+                    test_vcpu_config_get_ccsidr_el1_sys_reg_values,
+                    test_vcpu_config_release,
+                )
+                .expect_err("configured FDT source getter should fail");
+                let expected_operation = if fail_on_get < 4 {
+                    "hv_vcpu_config_get_feature_reg"
+                } else {
+                    "hv_vcpu_config_get_ccsidr_el1_sys_reg_values"
+                };
+                assert!(error.to_string().contains(expected_operation));
+
+                let mut expected_calls = vec![TestVcpuConfigCall::Create];
+                expected_calls.extend(operations.iter().take(fail_on_get + 1).copied());
+                expected_calls.push(TestVcpuConfigCall::Release);
+                assert_eq!(test_vcpu_config_calls(), (expected_calls, true));
+            }
+        }
+
+        #[test]
         fn vcpu_configuration_guard_releases_during_unwind() {
             let _lock = TEST_VCPU_CONFIG_LOCK
                 .lock()
@@ -2250,8 +2397,8 @@ mod imp {
     use bangbang_runtime::BackendError;
 
     use super::{
-        CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg, HvSimdFpReg, HvSysReg, HvVcpu,
-        MachTimebaseInfo, UNSUPPORTED_TARGET_MESSAGE,
+        Arm64VcpuCacheFdtSourceRaw, CreatedVcpu, HvInterruptType, HvMemoryFlags, HvReg,
+        HvSimdFpReg, HvSysReg, HvVcpu, MachTimebaseInfo, UNSUPPORTED_TARGET_MESSAGE,
     };
 
     pub fn absolute_time() -> Result<u64, BackendError> {
@@ -2300,6 +2447,10 @@ mod imp {
     }
 
     pub fn get_arm64_vcpu_cache_manifest() -> Result<([u64; 3], [[u64; 8]; 2]), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_arm64_vcpu_cache_fdt_source() -> Result<Arm64VcpuCacheFdtSourceRaw, BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 

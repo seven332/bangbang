@@ -37,6 +37,14 @@ const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CACHE_FDT_GUEST_CHECK_MARKER: &[u8] = b"BANGBANG_CACHE_FDT_GUEST_CHECK_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CACHE_FDT_GUEST_FAILURE_MARKER: &[u8] = b"BANGBANG_CACHE_FDT_GUEST_CHECK_FAIL";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CACHE_REPORT_HEADER: &str = "BANGBANG_CACHE_REPORT_V1";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CACHE_REPORT_BACKING_SIZE: u64 = 64 * 1024;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ROOTFS_OS_RELEASE_ID: &[u8] = b"ID=ubuntu";
@@ -390,6 +398,69 @@ fn boots_firecracker_kernel_from_ext4_rootfs() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn boots_two_cpu_linux_and_matches_cache_sysfs_to_retained_model() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let cache_report_backing = GuestBlockBacking::zeroed_with_size(CACHE_REPORT_BACKING_SIZE);
+    let boot_args = format!("{DIRECT_ROOTFS_BOOT_ARGS} maxcpus=1 bangbang.cache-fdt-check=1");
+    let observation = run_guest_boot_without_initrd_until_marker(
+        "guest-cache-fdt-check",
+        DIRECT_ROOTFS_BOOT_MARKER,
+        &boot_args,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 128)))
+                .expect("two-vCPU cache evidence machine config should store");
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("cache evidence rootfs drive should configure");
+            controller
+                .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                    "cache_report",
+                    "cache_report",
+                    cache_report_backing.path(),
+                    false,
+                )))
+                .expect("cache evidence scratch drive should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        DIRECT_ROOTFS_BOOT_MARKER,
+        "direct rootfs boot marker",
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, CACHE_FDT_GUEST_CHECK_MARKER),
+        "cache evidence guest should flush a complete sysfs report before success\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, CACHE_FDT_GUEST_FAILURE_MARKER,),
+        "cache evidence guest should not emit its fixed failure marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert_eq!(observation.boot_diagnostics.vcpu_mpidrs, [0, 1]);
+
+    let actual = parse_guest_cache_report(&cache_report_backing.bytes());
+    let expected = expected_guest_cache_report(&observation.cache_hierarchy, 2);
+    assert_eq!(
+        actual, expected,
+        "Linux cache sysfs must exactly match the retained production FDT hierarchy"
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn boots_firecracker_kernel_exposes_vmgenid_to_guest() {
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::DriveConfigInput;
@@ -557,6 +628,10 @@ fn run_guest_boot_with_boot_source(
     ));
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
         .expect("guest boot test session should prepare");
+    let cache_hierarchy = session
+        .arm64_fdt_cache_hierarchy()
+        .expect("ordinary boot session should retain its cache hierarchy")
+        .clone();
     let boot_diagnostics =
         GuestBootDiagnostics::from_session(&session, kernel_path, initrd_path, serial_address);
     validate_pre_run_boot_metadata(&session, &boot_diagnostics);
@@ -618,6 +693,7 @@ fn run_guest_boot_with_boot_source(
         boot_diagnostics,
         run_diagnostics,
         serial_bytes,
+        cache_hierarchy,
     }
 }
 
@@ -647,6 +723,135 @@ struct GuestBootObservation {
     boot_diagnostics: GuestBootDiagnostics,
     run_diagnostics: GuestBootRunDiagnostics,
     serial_bytes: Vec<u8>,
+    cache_hierarchy: bangbang_runtime::fdt::Arm64FdtCacheHierarchy,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GuestCacheReportRecord {
+    cpu: u32,
+    level: u8,
+    cache_type: bangbang_runtime::fdt::Arm64FdtCacheType,
+    size: u32,
+    line_size: u32,
+    sets: u32,
+    ways: u32,
+    shared_cpu_list: String,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn parse_guest_cache_report(backing: &[u8]) -> Vec<GuestCacheReportRecord> {
+    let report_end = backing
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(backing.len());
+    assert!(
+        backing[report_end..].iter().all(|byte| *byte == 0),
+        "cache report scratch bytes after the bounded report should remain zero"
+    );
+    let report = std::str::from_utf8(&backing[..report_end])
+        .expect("cache report should contain only UTF-8 normalized fields");
+    let mut lines = report.lines();
+    assert_eq!(
+        lines.next(),
+        Some(CACHE_REPORT_HEADER),
+        "cache report should start with the version marker"
+    );
+
+    let mut records = Vec::new();
+    for line in lines {
+        assert!(
+            !line.is_empty(),
+            "cache report should not contain empty records"
+        );
+        let fields = line.split('|').collect::<Vec<_>>();
+        assert_eq!(
+            fields.len(),
+            8,
+            "cache report record should have eight normalized fields: {line:?}"
+        );
+        let cache_type = match fields[2] {
+            "D" => bangbang_runtime::fdt::Arm64FdtCacheType::Data,
+            "I" => bangbang_runtime::fdt::Arm64FdtCacheType::Instruction,
+            "U" => bangbang_runtime::fdt::Arm64FdtCacheType::Unified,
+            other => panic!("cache report contains unknown type {other:?}"),
+        };
+        records.push(GuestCacheReportRecord {
+            cpu: fields[0]
+                .parse()
+                .expect("cache report CPU should be an unsigned integer"),
+            level: fields[1]
+                .parse()
+                .expect("cache report level should be an unsigned integer"),
+            cache_type,
+            size: fields[3]
+                .parse()
+                .expect("cache report size should be an unsigned integer"),
+            line_size: fields[4]
+                .parse()
+                .expect("cache report line size should be an unsigned integer"),
+            sets: fields[5]
+                .parse()
+                .expect("cache report set count should be an unsigned integer"),
+            ways: fields[6]
+                .parse()
+                .expect("cache report way count should be an unsigned integer"),
+            shared_cpu_list: fields[7].to_string(),
+        });
+    }
+    assert!(
+        !records.is_empty(),
+        "cache report should contain cache records"
+    );
+    records.sort();
+    assert!(
+        records.windows(2).all(|pair| pair[0] != pair[1]),
+        "cache report should not contain duplicate normalized records"
+    );
+    records
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn expected_guest_cache_report(
+    hierarchy: &bangbang_runtime::fdt::Arm64FdtCacheHierarchy,
+    vcpu_count: u32,
+) -> Vec<GuestCacheReportRecord> {
+    let mut records = Vec::new();
+    for cpu in 0..vcpu_count {
+        for cache in hierarchy.caches() {
+            let share = cache.cpus_per_unit();
+            let first = if cache.level() == 1 {
+                cpu
+            } else {
+                (cpu / share) * share
+            };
+            let last = if cache.level() == 1 {
+                cpu
+            } else {
+                first
+                    .checked_add(share - 1)
+                    .expect("validated cache sharing should not overflow")
+                    .min(vcpu_count - 1)
+            };
+            let shared_cpu_list = if first == last {
+                first.to_string()
+            } else {
+                format!("{first}-{last}")
+            };
+            records.push(GuestCacheReportRecord {
+                cpu,
+                level: cache.level(),
+                cache_type: cache.cache_type(),
+                size: cache.size(),
+                line_size: cache.line_size(),
+                sets: cache.sets(),
+                ways: cache.ways(),
+                shared_cpu_list,
+            });
+        }
+    }
+    records.sort();
+    records
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -688,6 +893,21 @@ impl GuestBlockBacking {
 
     fn zeroed() -> Self {
         Self::new(&[])
+    }
+
+    fn zeroed_with_size(size: u64) -> Self {
+        let backing = Self::zeroed();
+        assert!(
+            size >= bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+            "guest block backing should contain at least one sector"
+        );
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&backing.path)
+            .expect("guest block backing should reopen for resize");
+        file.set_len(size)
+            .expect("guest block backing should resize");
+        backing
     }
 
     fn path(&self) -> &std::path::Path {

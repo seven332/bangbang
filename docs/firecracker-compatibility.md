@@ -135,6 +135,41 @@ exposes its latest compatible PSCI 1.0 revision; bangbang matches that runtime
 contract and coordinates it explicitly above Hypervisor.framework's per-vCPU
 owner threads.
 
+## Arm64 Guest Cache Presentation
+
+Ordinary arm64 HVF startup now establishes the guest cache hierarchy before it
+creates a VM. One retained default `hv_vcpu_config_t` supplies
+`ID_AA64MMFR2_EL1`, `CTR_EL0`, `CLIDR_EL1`, `DCZID_EL0`, and all data/unified
+then instruction `CCSIDR_EL1` slots. Only CLIDR-selected levels are decoded;
+legacy and FEAT_CCIDX field layouts are checked separately, and reserved bits,
+overflow, inconsistent minimum line sizes, invalid DC ZVA metadata, unsupported
+split outer caches, and levels above L3 fail closed.
+
+Raw HVF geometry is not sufficient to claim host sharing. Startup also reads
+the public `hw.nperflevels` and `hw.perflevelN.*` sysctls, requires exactly one
+performance level to match the L1/L2/L3 sizes, and obtains `cpusperl2` and
+`cpusperl3` only from that unique match. Missing, malformed, mismatched,
+ambiguous, or non-nested facts reject startup before VM/GIC creation or guest
+memory mapping. Performance-level physical/logical CPU counts validate those
+sharing factors but do not cap the configured guest count; a final guest cache
+group may therefore contain fewer vCPUs than the public sharing factor. No
+scheduler affinity, private Apple API, or Apple-model table is used.
+
+The runtime FDT model validates exact positive size/line/set/way geometry and a
+nested cache graph. Per-CPU nodes carry split instruction/data or unified L1
+properties. Shared unified L2/L3 nodes use deterministic names and descending
+phandles, and every CPU or inner cache links directly to its next level.
+Parsed-FDT tests cover one CPU, partial L2 groups, and nested L2/L3 groups;
+signed Linux coverage compares level, type, size, line size, sets, ways, and
+shared CPU lists from guest sysfs against the exact retained production model.
+
+The same startup cache source is retained for native-v1 capture. Capture does
+not query a new default configuration: it cross-checks the runner's
+`ID_AA64MMFR2_EL1` and encodes the retained manifest, preserving native-v1
+bytes and schema. Restored sessions reconstruct that compatibility source from
+the already-validated artifact, but expose no reconstructed FDT hierarchy
+because cache presentation is not part of the native-v1 schema.
+
 ## Internal Concurrent vCPU Run Coordination
 
 The ordered HVF topology is consumed by an internal concurrent
@@ -2396,11 +2431,14 @@ admission. Because the feature and geometry methods own independent
 configurations, their results do not form one atomic manifest. The geometry
 defines no feature mask, destination decision, synchronization, cache
 maintenance, persistence, schema, or restore behavior.
-A third internal `arm64_vcpu_cache_manifest()` query is used only by native-v1
-composite capture. It reads the feature triple and both geometry arrays from one
-retained default configuration and encodes that exact same-configuration value
-as compatibility metadata. It still defines no interpretation, cross-host
-destination decision, cache maintenance, or restore behavior.
+A distinct internal startup query reads `ID_AA64MMFR2_EL1`, the feature triple,
+and both geometry arrays from one retained default configuration. Ordinary
+arm64 boot interprets and reconciles that same-configuration source for its FDT,
+then retains both the source and validated presentation. Native-v1 capture
+reuses the retained manifest after comparing its MMFR2 value with the runner's
+guest-visible identification capture; it does not query a second default
+configuration. The original public feature and geometry methods remain
+independent raw diagnostic surfaces and do not form this atomic source.
 TPIDR values can contain
 guest TLS or kernel pointers; translation table bases, context ids, fault
 addresses, and the vector base are sensitive; pointer-authentication keys are
@@ -2575,7 +2613,9 @@ and compares them only through fixed messages without logging raw values. It
 also creates/runs no vCPU, touches no live selector, issues no live CCSIDR read
 or ISB, and performs no maintenance. The selector is not cache topology: the
 default feature triple and geometry are independent fresh-configuration
-queries, not one atomic compatibility manifest.
+queries, not one atomic compatibility manifest. #1392's combined startup
+source is a separate internal path and does not change these standalone test
+contracts.
 The SIMD getter uses an explicitly 16-byte-aligned HVF output value. The SDK
 setter instead accepts a Clang vector by value, which stable Rust cannot declare
 through `extern "C"`; one macOS arm64 C shim accepts an ordinary 16-byte pointer

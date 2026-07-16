@@ -20,6 +20,7 @@ const CPU_ADDRESS_CELLS: u32 = 2;
 const CPU_SIZE_CELLS: u32 = 0;
 const CPU_REG_MASK: u64 = 0x7f_ffff;
 const MAX_ARM64_FDT_CPUS: usize = 32;
+const LAST_CACHE_PHANDLE: u32 = 4000;
 const GIC_COMPATIBILITY: &str = "arm,gic-v3";
 const RTC_NODE_PREFIX: &str = "rtc";
 const RTC_COMPATIBILITY: &[u8] = b"arm,pl031\0arm,primecell\0";
@@ -73,6 +74,7 @@ pub struct Arm64FdtConfig<'a> {
     pub layout: &'a GuestMemoryLayout,
     pub boot: Arm64FdtBootInfo<'a>,
     pub vcpu_mpidrs: &'a [u64],
+    pub cache_hierarchy: &'a Arm64FdtCacheHierarchy,
     pub gic: Arm64FdtGic,
     pub timer: Arm64FdtTimerInterrupts,
     pub rtc_device: Option<Arm64FdtRtcDevice>,
@@ -80,6 +82,308 @@ pub struct Arm64FdtConfig<'a> {
     pub vmgenid_device: Option<Arm64FdtVmGenIdDevice>,
     pub vmclock_device: Option<Arm64FdtVmClockDevice>,
     pub virtio_mmio_devices: &'a [Arm64FdtVirtioMmioDevice],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Arm64FdtCacheType {
+    Data,
+    Instruction,
+    Unified,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Arm64FdtCache {
+    level: u8,
+    cache_type: Arm64FdtCacheType,
+    size: u32,
+    line_size: u32,
+    sets: u32,
+    ways: u32,
+    cpus_per_unit: u32,
+}
+
+impl Arm64FdtCache {
+    pub fn new(
+        level: u8,
+        cache_type: Arm64FdtCacheType,
+        size: u32,
+        line_size: u32,
+        sets: u32,
+        ways: u32,
+        cpus_per_unit: u32,
+    ) -> Result<Self, Arm64FdtCacheError> {
+        if !(1..=7).contains(&level) {
+            return Err(Arm64FdtCacheError::InvalidLevel);
+        }
+        if size == 0 || line_size == 0 || sets == 0 || ways == 0 {
+            return Err(Arm64FdtCacheError::ZeroGeometry);
+        }
+        if cpus_per_unit == 0 {
+            return Err(Arm64FdtCacheError::ZeroSharing);
+        }
+        let calculated_size = line_size
+            .checked_mul(sets)
+            .and_then(|value| value.checked_mul(ways))
+            .ok_or(Arm64FdtCacheError::GeometryOverflow)?;
+        if calculated_size != size {
+            return Err(Arm64FdtCacheError::GeometryMismatch);
+        }
+
+        Ok(Self {
+            level,
+            cache_type,
+            size,
+            line_size,
+            sets,
+            ways,
+            cpus_per_unit,
+        })
+    }
+
+    pub const fn level(self) -> u8 {
+        self.level
+    }
+
+    pub const fn cache_type(self) -> Arm64FdtCacheType {
+        self.cache_type
+    }
+
+    pub const fn size(self) -> u32 {
+        self.size
+    }
+
+    pub const fn line_size(self) -> u32 {
+        self.line_size
+    }
+
+    pub const fn sets(self) -> u32 {
+        self.sets
+    }
+
+    pub const fn ways(self) -> u32 {
+        self.ways
+    }
+
+    pub const fn cpus_per_unit(self) -> u32 {
+        self.cpus_per_unit
+    }
+}
+
+impl fmt::Debug for Arm64FdtCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Arm64FdtCache")
+            .field("cache_geometry", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct Arm64FdtCacheHierarchy {
+    caches: Vec<Arm64FdtCache>,
+}
+
+impl Arm64FdtCacheHierarchy {
+    pub fn new(mut caches: Vec<Arm64FdtCache>) -> Result<Self, Arm64FdtCacheHierarchyError> {
+        caches.sort_by_key(|cache| (cache.level, cache.cache_type));
+        validate_cache_hierarchy_shape(&caches)?;
+        Ok(Self { caches })
+    }
+
+    pub fn caches(&self) -> &[Arm64FdtCache] {
+        &self.caches
+    }
+
+    fn level_caches(&self, level: u8) -> &[Arm64FdtCache] {
+        let start = self.caches.partition_point(|cache| cache.level < level);
+        let end = self.caches.partition_point(|cache| cache.level <= level);
+        self.caches.get(start..end).unwrap_or(&[])
+    }
+
+    fn validate_for_vcpu_count(
+        &self,
+        vcpu_count: usize,
+    ) -> Result<(), Arm64FdtCacheHierarchyError> {
+        if vcpu_count == 0 {
+            return Err(Arm64FdtCacheHierarchyError::MissingCpu);
+        }
+
+        for cache in self.caches.iter().filter(|cache| cache.level > 1) {
+            let share = usize::try_from(cache.cpus_per_unit)
+                .map_err(|_| Arm64FdtCacheHierarchyError::PhandleOverflow)?;
+            let unit_count = vcpu_count
+                .checked_add(share - 1)
+                .and_then(|value| value.checked_div(share))
+                .ok_or(Arm64FdtCacheHierarchyError::PhandleOverflow)?;
+            let last_unit = unit_count
+                .checked_sub(1)
+                .ok_or(Arm64FdtCacheHierarchyError::PhandleOverflow)?;
+            cache_phandle(vcpu_count, cache.level, last_unit)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Arm64FdtCacheHierarchy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Arm64FdtCacheHierarchy")
+            .field("cache_topology", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Arm64FdtCacheError {
+    InvalidLevel,
+    ZeroGeometry,
+    ZeroSharing,
+    GeometryOverflow,
+    GeometryMismatch,
+}
+
+impl fmt::Debug for Arm64FdtCacheError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for Arm64FdtCacheError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLevel => f.write_str("cache level is outside the arm64 FDT range"),
+            Self::ZeroGeometry => f.write_str("cache geometry contains a zero field"),
+            Self::ZeroSharing => f.write_str("cache sharing count is zero"),
+            Self::GeometryOverflow => f.write_str("cache geometry overflows the FDT width"),
+            Self::GeometryMismatch => {
+                f.write_str("cache size is inconsistent with line, set, and way geometry")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64FdtCacheError {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Arm64FdtCacheHierarchyError {
+    Empty,
+    MissingL1,
+    MissingCpu,
+    LevelGap,
+    DuplicateType,
+    MixedUnifiedAndSplit,
+    NonUnifiedOuter,
+    InconsistentSharing,
+    InvalidL1Sharing,
+    InvalidNestedSharing,
+    PhandleOverflow,
+    PhandleCollision,
+}
+
+impl fmt::Debug for Arm64FdtCacheHierarchyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for Arm64FdtCacheHierarchyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("arm64 FDT cache hierarchy is empty"),
+            Self::MissingL1 => f.write_str("arm64 FDT cache hierarchy has no level-one cache"),
+            Self::MissingCpu => f.write_str("arm64 FDT cache hierarchy has no CPU"),
+            Self::LevelGap => f.write_str("arm64 FDT cache hierarchy contains a level gap"),
+            Self::DuplicateType => {
+                f.write_str("arm64 FDT cache hierarchy repeats a cache type at one level")
+            }
+            Self::MixedUnifiedAndSplit => {
+                f.write_str("arm64 FDT cache hierarchy mixes unified and split caches at one level")
+            }
+            Self::NonUnifiedOuter => f.write_str("arm64 FDT outer cache levels must be unified"),
+            Self::InconsistentSharing => {
+                f.write_str("arm64 FDT cache hierarchy uses inconsistent sharing within one level")
+            }
+            Self::InvalidL1Sharing => {
+                f.write_str("arm64 FDT level-one caches must be private to one CPU")
+            }
+            Self::InvalidNestedSharing => {
+                f.write_str("arm64 FDT cache sharing does not form nested CPU groups")
+            }
+            Self::PhandleOverflow => f.write_str("arm64 FDT cache phandle arithmetic overflowed"),
+            Self::PhandleCollision => {
+                f.write_str("arm64 FDT cache phandle collides with a reserved phandle")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64FdtCacheHierarchyError {}
+
+fn validate_cache_hierarchy_shape(
+    caches: &[Arm64FdtCache],
+) -> Result<(), Arm64FdtCacheHierarchyError> {
+    if caches.is_empty() {
+        return Err(Arm64FdtCacheHierarchyError::Empty);
+    }
+    if caches.first().is_none_or(|cache| cache.level != 1) {
+        return Err(Arm64FdtCacheHierarchyError::MissingL1);
+    }
+
+    let mut start = 0;
+    let mut expected_level = 1;
+    let mut previous_share = 1;
+    while let Some(first_cache) = caches.get(start) {
+        let level = first_cache.level;
+        if level != expected_level {
+            return Err(Arm64FdtCacheHierarchyError::LevelGap);
+        }
+        let end = caches.partition_point(|cache| cache.level <= level);
+        let level_caches = caches
+            .get(start..end)
+            .ok_or(Arm64FdtCacheHierarchyError::LevelGap)?;
+        let share = level_caches
+            .first()
+            .ok_or(Arm64FdtCacheHierarchyError::LevelGap)?
+            .cpus_per_unit;
+        let has_unified = level_caches
+            .iter()
+            .any(|cache| cache.cache_type == Arm64FdtCacheType::Unified);
+
+        for pair in level_caches.windows(2) {
+            let [first, second] = pair else {
+                continue;
+            };
+            if first.cache_type == second.cache_type {
+                return Err(Arm64FdtCacheHierarchyError::DuplicateType);
+            }
+        }
+        if has_unified && level_caches.len() != 1 {
+            return Err(Arm64FdtCacheHierarchyError::MixedUnifiedAndSplit);
+        }
+        if level > 1 && !has_unified {
+            return Err(Arm64FdtCacheHierarchyError::NonUnifiedOuter);
+        }
+        if level_caches
+            .iter()
+            .any(|cache| cache.cpus_per_unit != share)
+        {
+            return Err(Arm64FdtCacheHierarchyError::InconsistentSharing);
+        }
+        if level == 1 {
+            if share != 1 {
+                return Err(Arm64FdtCacheHierarchyError::InvalidL1Sharing);
+            }
+        } else if share < previous_share || !share.is_multiple_of(previous_share) {
+            return Err(Arm64FdtCacheHierarchyError::InvalidNestedSharing);
+        }
+
+        previous_share = share;
+        expected_level = expected_level
+            .checked_add(1)
+            .ok_or(Arm64FdtCacheHierarchyError::LevelGap)?;
+        start = end;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +538,9 @@ pub enum Arm64FdtError {
         first_index: usize,
         second_index: usize,
         reg: u64,
+    },
+    InvalidCacheHierarchy {
+        source: Arm64FdtCacheHierarchyError,
     },
     InvalidLayout {
         source: GuestMemoryError,
@@ -474,6 +781,9 @@ impl fmt::Display for Arm64FdtError {
                 f,
                 "arm64 FDT CPU reg values must be distinct: CPU {first_index} and CPU {second_index} both use 0x{reg:x}"
             ),
+            Self::InvalidCacheHierarchy { source } => {
+                write!(f, "invalid arm64 FDT cache hierarchy: {source}")
+            }
             Self::InvalidLayout { source } => {
                 write!(f, "invalid arm64 FDT memory layout: {source}")
             }
@@ -789,6 +1099,7 @@ impl std::error::Error for Arm64FdtError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidLayout { source } => Some(source),
+            Self::InvalidCacheHierarchy { source } => Some(source),
             Self::InvalidCommandLine { source } => Some(source),
             Self::InvalidInitrdRange { source } => Some(source),
             Self::InvalidVirtioMmioRegion { source, .. } => Some(source),
@@ -854,6 +1165,12 @@ impl std::error::Error for Arm64FdtError {
 impl From<VmFdtError> for Arm64FdtError {
     fn from(source: VmFdtError) -> Self {
         Self::CreateFdt { source }
+    }
+}
+
+impl From<Arm64FdtCacheHierarchyError> for Arm64FdtError {
+    fn from(source: Arm64FdtCacheHierarchyError) -> Self {
+        Self::InvalidCacheHierarchy { source }
     }
 }
 
@@ -926,7 +1243,7 @@ where
     fdt.property_u32("#size-cells", SIZE_CELLS)?;
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
 
-    create_cpu_nodes(&mut fdt, config.vcpu_mpidrs)?;
+    create_cpu_nodes(&mut fdt, config.vcpu_mpidrs, config.cache_hierarchy)?;
     create_memory_node(&mut fdt, &validated.memory_reg_cells)?;
     create_chosen_node(&mut fdt, config.boot, &rng_seed)?;
     create_gic_node(&mut fdt, config.gic)?;
@@ -988,6 +1305,10 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<ValidatedArm64FdtConfi
     }
 
     validate_cpu_regs(config.vcpu_mpidrs)?;
+    config
+        .cache_hierarchy
+        .validate_for_vcpu_count(config.vcpu_mpidrs.len())
+        .map_err(|source| Arm64FdtError::InvalidCacheHierarchy { source })?;
     validate_memory_layout(config.layout)?;
     let memory_reg_cells = memory_reg_cells(config.layout)?;
     validate_command_line(config.boot.command_line)?;
@@ -1105,23 +1426,127 @@ fn validate_command_line(command_line: &str) -> Result<(), Arm64FdtError> {
     Ok(())
 }
 
-fn create_cpu_nodes(fdt: &mut FdtWriter, mpidrs: &[u64]) -> Result<(), Arm64FdtError> {
+fn create_cpu_nodes(
+    fdt: &mut FdtWriter,
+    mpidrs: &[u64],
+    cache_hierarchy: &Arm64FdtCacheHierarchy,
+) -> Result<(), Arm64FdtError> {
     let cpus = fdt.begin_node("cpus")?;
     fdt.property_u32("#address-cells", CPU_ADDRESS_CELLS)?;
     fdt.property_u32("#size-cells", CPU_SIZE_CELLS)?;
 
-    for mpidr in mpidrs.iter().copied() {
+    for (cpu_index, mpidr) in mpidrs.iter().copied().enumerate() {
         let reg = cpu_reg(mpidr);
         let cpu = fdt.begin_node(&format!("cpu@{reg:x}"))?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "arm,arm-v8")?;
         fdt.property_string("enable-method", "psci")?;
         fdt.property_u64("reg", reg)?;
+        create_l1_cache_properties(fdt, cache_hierarchy.level_caches(1))?;
+
+        if let Some(first_outer) = cache_hierarchy.caches.iter().find(|cache| cache.level > 1) {
+            let unit = cpu_index
+                / usize::try_from(first_outer.cpus_per_unit)
+                    .map_err(|_| Arm64FdtCacheHierarchyError::PhandleOverflow)?;
+            fdt.property_u32(
+                "next-level-cache",
+                cache_phandle(mpidrs.len(), first_outer.level, unit)?,
+            )?;
+        }
+
+        let last_level = cache_hierarchy
+            .caches
+            .last()
+            .map(|cache| cache.level)
+            .unwrap_or(1);
+        for level in 2..=last_level {
+            let level_caches = cache_hierarchy.level_caches(level);
+            let level_cache = level_caches
+                .first()
+                .ok_or(Arm64FdtCacheHierarchyError::LevelGap)?;
+            let share = usize::try_from(level_cache.cpus_per_unit)
+                .map_err(|_| Arm64FdtCacheHierarchyError::PhandleOverflow)?;
+            if cpu_index % share != 0 {
+                continue;
+            }
+
+            let unit = cpu_index / share;
+            let cache_node = fdt.begin_node(&format!("l{level}-{unit}-cache"))?;
+            fdt.property_u32("phandle", cache_phandle(mpidrs.len(), level, unit)?)?;
+            fdt.property_string("compatible", "cache")?;
+            fdt.property_u32("cache-level", u32::from(level))?;
+            create_cache_geometry_properties(fdt, level_caches)?;
+
+            if level < last_level {
+                let next_caches = cache_hierarchy.level_caches(level + 1);
+                let next_cache = next_caches
+                    .first()
+                    .ok_or(Arm64FdtCacheHierarchyError::LevelGap)?;
+                let next_share = usize::try_from(next_cache.cpus_per_unit)
+                    .map_err(|_| Arm64FdtCacheHierarchyError::PhandleOverflow)?;
+                fdt.property_u32(
+                    "next-level-cache",
+                    cache_phandle(mpidrs.len(), level + 1, cpu_index / next_share)?,
+                )?;
+            }
+            fdt.end_node(cache_node)?;
+        }
         fdt.end_node(cpu)?;
     }
 
     fdt.end_node(cpus)?;
     Ok(())
+}
+
+fn create_l1_cache_properties(
+    fdt: &mut FdtWriter,
+    caches: &[Arm64FdtCache],
+) -> Result<(), Arm64FdtError> {
+    create_cache_geometry_properties(fdt, caches)
+}
+
+fn create_cache_geometry_properties(
+    fdt: &mut FdtWriter,
+    caches: &[Arm64FdtCache],
+) -> Result<(), Arm64FdtError> {
+    for cache in caches {
+        let (size_name, line_name, sets_name) = match cache.cache_type {
+            Arm64FdtCacheType::Data => ("d-cache-size", "d-cache-line-size", "d-cache-sets"),
+            Arm64FdtCacheType::Instruction => ("i-cache-size", "i-cache-line-size", "i-cache-sets"),
+            Arm64FdtCacheType::Unified => {
+                fdt.property_null("cache-unified")?;
+                ("cache-size", "cache-line-size", "cache-sets")
+            }
+        };
+        fdt.property_u32(size_name, cache.size)?;
+        fdt.property_u32(line_name, cache.line_size)?;
+        fdt.property_u32(sets_name, cache.sets)?;
+    }
+    Ok(())
+}
+
+fn cache_phandle(
+    vcpu_count: usize,
+    level: u8,
+    unit: usize,
+) -> Result<u32, Arm64FdtCacheHierarchyError> {
+    let level_offset = usize::from(
+        level
+            .checked_sub(2)
+            .ok_or(Arm64FdtCacheHierarchyError::PhandleOverflow)?,
+    );
+    let offset = vcpu_count
+        .checked_mul(level_offset)
+        .and_then(|value| value.checked_add(unit))
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(Arm64FdtCacheHierarchyError::PhandleOverflow)?;
+    let phandle = LAST_CACHE_PHANDLE
+        .checked_sub(offset)
+        .ok_or(Arm64FdtCacheHierarchyError::PhandleOverflow)?;
+    if phandle <= CLOCK_PHANDLE {
+        return Err(Arm64FdtCacheHierarchyError::PhandleCollision);
+    }
+    Ok(phandle)
 }
 
 const fn cpu_reg(mpidr: u64) -> u64 {
@@ -2383,6 +2808,8 @@ fn size_as_u64(size: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use device_tree::{DeviceTree, Node};
 
     use super::*;
@@ -2393,6 +2820,315 @@ mod tests {
     const TEST_INITRD_SIZE: u64 = 0x1000;
     const TEST_VCPU_MPIDRS: &[u64] = &[0];
     const TEST_RNG_SEED: [u8; ARM64_FDT_RNG_SEED_SIZE] = [0xa5; ARM64_FDT_RNG_SEED_SIZE];
+    static TEST_CACHE_HIERARCHY: LazyLock<Arm64FdtCacheHierarchy> = LazyLock::new(|| {
+        Arm64FdtCacheHierarchy::new(vec![
+            Arm64FdtCache::new(1, Arm64FdtCacheType::Unified, 32_768, 64, 64, 8, 1)
+                .expect("test L1 cache should be valid"),
+        ])
+        .expect("test cache hierarchy should be valid")
+    });
+
+    fn test_cache(
+        level: u8,
+        cache_type: Arm64FdtCacheType,
+        size: u32,
+        line_size: u32,
+        sets: u32,
+        ways: u32,
+        cpus_per_unit: u32,
+    ) -> Arm64FdtCache {
+        Arm64FdtCache::new(
+            level,
+            cache_type,
+            size,
+            line_size,
+            sets,
+            ways,
+            cpus_per_unit,
+        )
+        .expect("test cache should be valid")
+    }
+
+    fn split_three_level_cache_hierarchy(
+        l2_cpus_per_unit: u32,
+        l3_cpus_per_unit: u32,
+    ) -> Arm64FdtCacheHierarchy {
+        Arm64FdtCacheHierarchy::new(vec![
+            test_cache(1, Arm64FdtCacheType::Instruction, 131_072, 64, 512, 4, 1),
+            test_cache(1, Arm64FdtCacheType::Data, 65_536, 64, 128, 8, 1),
+            test_cache(
+                2,
+                Arm64FdtCacheType::Unified,
+                4_194_304,
+                128,
+                2048,
+                16,
+                l2_cpus_per_unit,
+            ),
+            test_cache(
+                3,
+                Arm64FdtCacheType::Unified,
+                8_388_608,
+                128,
+                4096,
+                16,
+                l3_cpus_per_unit,
+            ),
+        ])
+        .expect("test cache hierarchy should be valid")
+    }
+
+    #[test]
+    fn cache_geometry_validation_is_checked_and_redacted() {
+        assert_eq!(
+            Arm64FdtCache::new(0, Arm64FdtCacheType::Data, 1, 1, 1, 1, 1),
+            Err(Arm64FdtCacheError::InvalidLevel)
+        );
+        assert_eq!(
+            Arm64FdtCache::new(8, Arm64FdtCacheType::Data, 1, 1, 1, 1, 1),
+            Err(Arm64FdtCacheError::InvalidLevel)
+        );
+        for geometry in [(0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1), (1, 1, 1, 0)] {
+            let (size, line_size, sets, ways) = geometry;
+            assert_eq!(
+                Arm64FdtCache::new(1, Arm64FdtCacheType::Data, size, line_size, sets, ways, 1,),
+                Err(Arm64FdtCacheError::ZeroGeometry)
+            );
+        }
+        assert_eq!(
+            Arm64FdtCache::new(1, Arm64FdtCacheType::Data, 1, 1, 1, 1, 0),
+            Err(Arm64FdtCacheError::ZeroSharing)
+        );
+        assert_eq!(
+            Arm64FdtCache::new(1, Arm64FdtCacheType::Data, u32::MAX, u32::MAX, 2, 2, 1,),
+            Err(Arm64FdtCacheError::GeometryOverflow)
+        );
+        assert_eq!(
+            Arm64FdtCache::new(1, Arm64FdtCacheType::Data, 2, 1, 1, 1, 1),
+            Err(Arm64FdtCacheError::GeometryMismatch)
+        );
+
+        let cache = test_cache(1, Arm64FdtCacheType::Data, 65_536, 64, 128, 8, 1);
+        assert_eq!(
+            format!("{cache:?}"),
+            "Arm64FdtCache { cache_geometry: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
+    fn cache_hierarchy_rejects_every_invalid_graph_shape() {
+        assert_eq!(
+            Arm64FdtCacheHierarchy::new(vec![]),
+            Err(Arm64FdtCacheHierarchyError::Empty)
+        );
+
+        let l1d = test_cache(1, Arm64FdtCacheType::Data, 65_536, 64, 128, 8, 1);
+        let l1i = test_cache(1, Arm64FdtCacheType::Instruction, 131_072, 64, 512, 4, 1);
+        let l1u = test_cache(1, Arm64FdtCacheType::Unified, 32_768, 64, 64, 8, 1);
+        let l2 = test_cache(2, Arm64FdtCacheType::Unified, 4_194_304, 128, 2048, 16, 4);
+        let l3 = test_cache(3, Arm64FdtCacheType::Unified, 8_388_608, 128, 4096, 16, 8);
+
+        assert_eq!(
+            Arm64FdtCacheHierarchy::new(vec![l2]),
+            Err(Arm64FdtCacheHierarchyError::MissingL1)
+        );
+        assert_eq!(
+            Arm64FdtCacheHierarchy::new(vec![l1d, l3]),
+            Err(Arm64FdtCacheHierarchyError::LevelGap)
+        );
+        assert_eq!(
+            Arm64FdtCacheHierarchy::new(vec![l1d, l1d]),
+            Err(Arm64FdtCacheHierarchyError::DuplicateType)
+        );
+        assert_eq!(
+            Arm64FdtCacheHierarchy::new(vec![l1d, l1u]),
+            Err(Arm64FdtCacheHierarchyError::MixedUnifiedAndSplit)
+        );
+        assert_eq!(
+            Arm64FdtCacheHierarchy::new(vec![
+                l1d,
+                test_cache(2, Arm64FdtCacheType::Data, 65_536, 64, 128, 8, 4),
+                test_cache(2, Arm64FdtCacheType::Instruction, 131_072, 64, 512, 4, 4,),
+            ]),
+            Err(Arm64FdtCacheHierarchyError::NonUnifiedOuter)
+        );
+        assert_eq!(
+            Arm64FdtCacheHierarchy::new(vec![
+                l1d,
+                test_cache(1, Arm64FdtCacheType::Instruction, 131_072, 64, 512, 4, 2,),
+            ]),
+            Err(Arm64FdtCacheHierarchyError::InconsistentSharing)
+        );
+        assert_eq!(
+            Arm64FdtCacheHierarchy::new(vec![test_cache(
+                1,
+                Arm64FdtCacheType::Unified,
+                32_768,
+                64,
+                64,
+                8,
+                2,
+            )]),
+            Err(Arm64FdtCacheHierarchyError::InvalidL1Sharing)
+        );
+        assert_eq!(
+            Arm64FdtCacheHierarchy::new(vec![
+                l1i,
+                l1d,
+                l2,
+                test_cache(3, Arm64FdtCacheType::Unified, 8_388_608, 128, 4096, 16, 6,),
+            ]),
+            Err(Arm64FdtCacheHierarchyError::InvalidNestedSharing)
+        );
+
+        let hierarchy = Arm64FdtCacheHierarchy::new(vec![l1u]).expect("L1 should be valid");
+        assert_eq!(
+            hierarchy.validate_for_vcpu_count(0),
+            Err(Arm64FdtCacheHierarchyError::MissingCpu)
+        );
+        assert_eq!(
+            cache_phandle(usize::MAX, 7, usize::MAX),
+            Err(Arm64FdtCacheHierarchyError::PhandleOverflow)
+        );
+        assert_eq!(
+            cache_phandle(800, 7, 0),
+            Err(Arm64FdtCacheHierarchyError::PhandleCollision)
+        );
+        assert_eq!(
+            format!("{:?}", split_three_level_cache_hierarchy(4, 8)),
+            "Arm64FdtCacheHierarchy { cache_topology: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
+    fn one_cpu_fdt_contains_exact_split_l1_and_linked_outer_caches() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let hierarchy = split_three_level_cache_hierarchy(4, 8);
+        let mut config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+        config.cache_hierarchy = &hierarchy;
+
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let cpu = required_node(&tree, "/cpus/cpu@0");
+        assert_eq!(cpu.prop_u32("d-cache-size").unwrap(), 65_536);
+        assert_eq!(cpu.prop_u32("d-cache-line-size").unwrap(), 64);
+        assert_eq!(cpu.prop_u32("d-cache-sets").unwrap(), 128);
+        assert_eq!(cpu.prop_u32("i-cache-size").unwrap(), 131_072);
+        assert_eq!(cpu.prop_u32("i-cache-line-size").unwrap(), 64);
+        assert_eq!(cpu.prop_u32("i-cache-sets").unwrap(), 512);
+        assert!(!cpu.has_prop("cache-unified"));
+        assert_eq!(cpu.prop_u32("next-level-cache").unwrap(), 4000);
+
+        let l2 = required_node(&tree, "/cpus/cpu@0/l2-0-cache");
+        assert_eq!(l2.prop_u32("phandle").unwrap(), 4000);
+        assert_eq!(l2.prop_str("compatible").unwrap(), "cache");
+        assert_eq!(l2.prop_u32("cache-level").unwrap(), 2);
+        assert!(l2.has_prop("cache-unified"));
+        assert_eq!(l2.prop_u32("cache-size").unwrap(), 4_194_304);
+        assert_eq!(l2.prop_u32("cache-line-size").unwrap(), 128);
+        assert_eq!(l2.prop_u32("cache-sets").unwrap(), 2048);
+        assert_eq!(l2.prop_u32("next-level-cache").unwrap(), 3999);
+
+        let l3 = required_node(&tree, "/cpus/cpu@0/l3-0-cache");
+        assert_eq!(l3.prop_u32("phandle").unwrap(), 3999);
+        assert_eq!(l3.prop_u32("cache-level").unwrap(), 3);
+        assert!(l3.has_prop("cache-unified"));
+        assert_eq!(l3.prop_u32("cache-size").unwrap(), 8_388_608);
+        assert_eq!(l3.prop_u32("cache-line-size").unwrap(), 128);
+        assert_eq!(l3.prop_u32("cache-sets").unwrap(), 4096);
+        assert!(!l3.has_prop("next-level-cache"));
+    }
+
+    #[test]
+    fn partial_last_unit_creates_each_l2_node_once() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let hierarchy = Arm64FdtCacheHierarchy::new(vec![
+            test_cache(1, Arm64FdtCacheType::Unified, 32_768, 64, 64, 8, 1),
+            test_cache(2, Arm64FdtCacheType::Unified, 4_194_304, 128, 2048, 16, 4),
+        ])
+        .expect("test cache hierarchy should be valid");
+        let mpidrs = [0, 1, 2, 3, 4, 5];
+        let mut config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+        config.vcpu_mpidrs = &mpidrs;
+        config.cache_hierarchy = &hierarchy;
+
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        for cpu_index in 0..6 {
+            let cpu = required_node(&tree, &format!("/cpus/cpu@{cpu_index:x}"));
+            assert!(cpu.has_prop("cache-unified"));
+            assert_eq!(
+                cpu.prop_u32("next-level-cache").unwrap(),
+                if cpu_index < 4 { 4000 } else { 3999 }
+            );
+        }
+        let l2_0 = required_node(&tree, "/cpus/cpu@0/l2-0-cache");
+        let l2_1 = required_node(&tree, "/cpus/cpu@4/l2-1-cache");
+        assert_eq!(l2_0.prop_u32("phandle").unwrap(), 4000);
+        assert_eq!(l2_1.prop_u32("phandle").unwrap(), 3999);
+        for cpu_index in [1, 2, 3, 5] {
+            assert!(
+                tree.find(&format!("/cpus/cpu@{cpu_index:x}/l2-0-cache"))
+                    .is_none()
+            );
+            assert!(
+                tree.find(&format!("/cpus/cpu@{cpu_index:x}/l2-1-cache"))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn nested_l3_groups_have_exact_stable_phandles_and_links() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let hierarchy = split_three_level_cache_hierarchy(2, 4);
+        let mpidrs = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+        config.vcpu_mpidrs = &mpidrs;
+        config.cache_hierarchy = &hierarchy;
+
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        for cpu_index in 0..10 {
+            let cpu = required_node(&tree, &format!("/cpus/cpu@{cpu_index:x}"));
+            assert_eq!(
+                cpu.prop_u32("next-level-cache").unwrap(),
+                4000 - cpu_index / 2
+            );
+        }
+
+        for l2_unit in 0..5 {
+            let owner = l2_unit * 2;
+            let l2 = required_node(&tree, &format!("/cpus/cpu@{owner:x}/l2-{l2_unit}-cache"));
+            assert_eq!(l2.prop_u32("phandle").unwrap(), 4000 - l2_unit);
+            assert_eq!(l2.prop_u32("next-level-cache").unwrap(), 3990 - l2_unit / 2);
+        }
+
+        for l3_unit in 0..3 {
+            let owner = l3_unit * 4;
+            let l3 = required_node(&tree, &format!("/cpus/cpu@{owner:x}/l3-{l3_unit}-cache"));
+            assert_eq!(l3.prop_u32("phandle").unwrap(), 3990 - l3_unit);
+            assert!(!l3.has_prop("next-level-cache"));
+        }
+    }
 
     #[test]
     fn builds_minimal_firecracker_shaped_fdt_with_initrd() {
@@ -5406,6 +6142,7 @@ mod tests {
             layout,
             boot,
             vcpu_mpidrs: TEST_VCPU_MPIDRS,
+            cache_hierarchy: &TEST_CACHE_HIERARCHY,
             gic: test_gic(),
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
             rtc_device,

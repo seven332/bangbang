@@ -4634,6 +4634,10 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         restored.into_parts();
     assert!(restored_session.boot_registers().is_none());
     assert!(restored_session.runtime_resources().boot_origin.is_none());
+    assert!(
+        restored_session.arm64_fdt_cache_hierarchy().is_none(),
+        "native-v1 restore must not invent cache presentation absent from the schema"
+    );
     assert_eq!(restored_drive, controller.drive_configs()[0]);
     assert_eq!(
         restored_serial_buffer

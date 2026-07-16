@@ -199,7 +199,9 @@ Challenge checkpoints:
 - [framing Challenge Review](https://github.com/seven332/bangbang/issues/1391#issuecomment-4989728561)
 - [plan Challenge Review](https://github.com/seven332/bangbang/issues/1391#issuecomment-4989883731)
 
-CPU templates, cache FDT, register modifiers, dirty primitives, dirty epochs,
-diff snapshots, and dynamic topology remain owned by sibling issues. The exact
-2M exclusion does not certify those capabilities or the aggregate machine
-schema complete.
+CPU templates, register modifiers, dirty primitives, dirty epochs, diff
+snapshots, and dynamic topology remain owned by sibling issues. #1392's cache
+presentation consumes the configured vCPU count but neither changes these
+machine/memory bounds nor caps that count to one matched host performance
+level. The exact 2M exclusion does not certify the remaining capabilities or
+the aggregate machine schema complete.

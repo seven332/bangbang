@@ -525,6 +525,29 @@ format or log raw values. Tests must not create or run a vCPU, read or write
 maintenance, assume which array entries describe implemented levels, combine
 the result atomically with the feature triple, or infer topology or destination
 compatibility.
+Arm64 cache-presentation unit tests must keep the combined startup source and
+the public host facts independently injectable. Cover both legacy and CCIDX
+CCSIDR layouts, inactive slots, every checked reserved/overflow field,
+CTR/DCZID consistency, supported and rejected CLIDR shapes, unique performance-
+level selection, missing/mismatched/ambiguous facts, nested sharing, and vCPU
+counts through 32 without treating host physical cores as an admission cap.
+The real sysctl boundary must prove the 32-bit widths used by the public
+performance-level selectors and accept the platform's `ENOENT` or `EINVAL`
+result only as absence for optional selectors. Failure tests must assert that
+cache admission precedes VM/GIC creation and guest-memory mapping and that raw
+registers, sysctl values, and underlying host diagnostics are absent from
+`Debug` and public errors.
+
+FDT tests must parse emitted blobs rather than compare only builder calls. They
+must verify exact L1 properties on each CPU, deterministic outer-cache node
+names/phandles, direct `next-level-cache` edges, one-CPU and partial final
+sharing groups, nested L2/L3 topology, and rejection of malformed geometry or
+graphs. Signed Linux cache proof uses the normal production startup path,
+mounts the existing sysfs, boots initially with `maxcpus=1`, explicitly onlines
+CPU1, and writes one bounded normalized cache report to a scratch block device
+with `conv=fsync`. The host compares Linux level/type/size/line/sets/ways and
+shared CPU lists to the retained hierarchy. Serial output is only a fixed
+success/failure marker; neither raw host facts nor the report belongs there.
 Cache-selection signed tests must capture CSSELR_EL1 twice from an idle real
 vCPU without hard-coding or validating its architecturally unknown reset value,
 then restore and recapture the first complete value twice through fixed

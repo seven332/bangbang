@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v38"
+direct_boot_variant="direct-boot-v40"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -844,6 +844,158 @@ PY
       write_vdb_marker BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL
       ;;
   esac
+}
+
+check_cache_fdt_marker() {
+  cache_report=/dev/bangbang-cache-report
+  cache_report_limit=65536
+
+  cache_report_fail() {
+    emit_line BANGBANG_CACHE_FDT_GUEST_CHECK_FAIL
+    write_vdb_marker BANGBANG_CACHE_FDT_GUEST_CHECK_FAIL
+  }
+
+  if [ ! -b /dev/vdb ] || [ ! -d /sys/devices/system/cpu ]; then
+    cache_report_fail
+    return
+  fi
+
+  for cache_cpu_online in /sys/devices/system/cpu/cpu[0-9]*/online; do
+    if [ ! -e "$cache_cpu_online" ]; then
+      continue
+    fi
+    cache_cpu_online_value=$(tr -d '\r\n' < "$cache_cpu_online" 2>/dev/null || true)
+    if [ "$cache_cpu_online_value" = 0 ] \
+      && ! printf '1\n' > "$cache_cpu_online" 2>/dev/null; then
+      cache_report_fail
+      return
+    fi
+  done
+
+  if ! printf '%s\n' BANGBANG_CACHE_REPORT_V1 > "$cache_report"; then
+    cache_report_fail
+    return
+  fi
+
+  cache_record_count=0
+  for cache_cpu_path in /sys/devices/system/cpu/cpu[0-9]*; do
+    if [ ! -d "$cache_cpu_path/cache" ]; then
+      continue
+    fi
+    cache_cpu=${cache_cpu_path##*/cpu}
+    case "$cache_cpu" in
+      '' | *[!0-9]*)
+        cache_report_fail
+        return
+        ;;
+    esac
+
+    for cache_index_path in "$cache_cpu_path"/cache/index[0-9]*; do
+      if [ ! -d "$cache_index_path" ]; then
+        continue
+      fi
+      for cache_fact in level type size coherency_line_size number_of_sets ways_of_associativity shared_cpu_list; do
+        if [ ! -r "$cache_index_path/$cache_fact" ]; then
+          cache_report_fail
+          return
+        fi
+      done
+
+      cache_level=$(tr -d '\r\n' < "$cache_index_path/level" 2>/dev/null || true)
+      cache_type=$(tr -d '\r\n' < "$cache_index_path/type" 2>/dev/null || true)
+      cache_size=$(tr -d '\r\n' < "$cache_index_path/size" 2>/dev/null || true)
+      cache_line=$(tr -d '\r\n' < "$cache_index_path/coherency_line_size" 2>/dev/null || true)
+      cache_sets=$(tr -d '\r\n' < "$cache_index_path/number_of_sets" 2>/dev/null || true)
+      cache_ways=$(tr -d '\r\n' < "$cache_index_path/ways_of_associativity" 2>/dev/null || true)
+      cache_shared=$(tr -d '\r\n' < "$cache_index_path/shared_cpu_list" 2>/dev/null || true)
+
+      case "$cache_level:$cache_line:$cache_sets:$cache_ways" in
+        *[!0-9:]* | :* | *::*)
+          cache_report_fail
+          return
+          ;;
+      esac
+      case "$cache_shared" in
+        '' | *[!0-9,-]*)
+          cache_report_fail
+          return
+          ;;
+      esac
+      case "$cache_type" in
+        Data) cache_type=D ;;
+        Instruction) cache_type=I ;;
+        Unified) cache_type=U ;;
+        *)
+          cache_report_fail
+          return
+          ;;
+      esac
+
+      case "$cache_size" in
+        *K)
+          cache_size_number=${cache_size%K}
+          cache_size_multiplier=1024
+          ;;
+        *M)
+          cache_size_number=${cache_size%M}
+          cache_size_multiplier=1048576
+          ;;
+        *G)
+          cache_size_number=${cache_size%G}
+          cache_size_multiplier=1073741824
+          ;;
+        *)
+          cache_size_number=$cache_size
+          cache_size_multiplier=1
+          ;;
+      esac
+      case "$cache_size_number" in
+        '' | *[!0-9]*)
+          cache_report_fail
+          return
+          ;;
+      esac
+      cache_size_bytes=$((cache_size_number * cache_size_multiplier))
+
+      if ! printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$cache_cpu" \
+        "$cache_level" \
+        "$cache_type" \
+        "$cache_size_bytes" \
+        "$cache_line" \
+        "$cache_sets" \
+        "$cache_ways" \
+        "$cache_shared" \
+        >> "$cache_report"; then
+        cache_report_fail
+        return
+      fi
+      cache_record_count=$((cache_record_count + 1))
+    done
+  done
+
+  if [ "$cache_record_count" -eq 0 ]; then
+    cache_report_fail
+    return
+  fi
+  cache_report_size=$(wc -c < "$cache_report" 2>/dev/null || true)
+  cache_report_size=${cache_report_size##* }
+  case "$cache_report_size" in
+    '' | *[!0-9]*)
+      cache_report_fail
+      return
+      ;;
+  esac
+  if [ "$cache_report_size" -gt "$cache_report_limit" ]; then
+    cache_report_fail
+    return
+  fi
+
+  if ! dd if="$cache_report" of=/dev/vdb bs=4096 conv=notrunc,fsync 2>/dev/null; then
+    cache_report_fail
+    return
+  fi
+  emit_line BANGBANG_CACHE_FDT_GUEST_CHECK_OK
 }
 
 check_rtc_marker() {
@@ -1767,7 +1919,9 @@ if [ -r /proc/cmdline ]; then
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if cmdline_has bangbang.entropy-read=1; then
+if cmdline_has bangbang.cache-fdt-check=1; then
+  check_cache_fdt_marker
+elif cmdline_has bangbang.entropy-read=1; then
   read_entropy_marker
 elif cmdline_has bangbang.balloon-check=1; then
   check_balloon_marker

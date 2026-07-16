@@ -20,7 +20,7 @@ use bangbang_runtime::boot_timer::{
     BootTimerMmioLayout, BootTimerMmioRegistrationError, register_boot_timer_mmio,
 };
 use bangbang_runtime::entropy::{EntropyMmioLayout, VirtioRngOsEntropySource};
-use bangbang_runtime::fdt::Arm64FdtError;
+use bangbang_runtime::fdt::{Arm64FdtCacheHierarchy, Arm64FdtError};
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
@@ -280,6 +280,8 @@ pub struct HvfArm64BootSession<'vm> {
     backend: &'vm mut HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
+    cache_hierarchy: Option<Arm64FdtCacheHierarchy>,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     block_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
@@ -317,6 +319,8 @@ pub struct OwnedHvfArm64BootSession {
     backend: HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
+    cache_hierarchy: Option<Arm64FdtCacheHierarchy>,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     block_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
@@ -756,9 +760,7 @@ pub enum HvfArm64BootSnapshotV1StateCaptureError {
     Cancelled {
         stage: HvfArm64BootSnapshotV1CaptureStage,
     },
-    CacheManifest {
-        source: BackendError,
-    },
+    CacheIdentityMismatch,
     Runner {
         source: HvfVcpuRunnerError,
     },
@@ -801,8 +803,8 @@ impl fmt::Display for HvfArm64BootSnapshotV1StateCaptureError {
             Self::Cancelled { stage } => {
                 write!(f, "native-v1 state capture was cancelled before {stage}")
             }
-            Self::CacheManifest { source } => {
-                write!(f, "native-v1 cache compatibility capture failed: {source}")
+            Self::CacheIdentityMismatch => {
+                f.write_str("native-v1 cache compatibility identity changed after startup")
             }
             Self::Runner { source } => {
                 write!(f, "native-v1 runner capture failed: {source}")
@@ -821,11 +823,13 @@ impl fmt::Display for HvfArm64BootSnapshotV1StateCaptureError {
 impl std::error::Error for HvfArm64BootSnapshotV1StateCaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::CacheManifest { source } => Some(source),
             Self::Runner { source } => Some(source),
             Self::Device { source } => Some(source),
             Self::EncodePreflight { source } => Some(source),
-            Self::UnsupportedVcpuCount { .. } | Self::Cancelled { .. } | Self::MissingRtc => None,
+            Self::UnsupportedVcpuCount { .. }
+            | Self::Cancelled { .. }
+            | Self::CacheIdentityMismatch
+            | Self::MissingRtc => None,
         }
     }
 }
@@ -944,6 +948,17 @@ fn check_snapshot_v1_capture_cancelled(
     } else {
         Ok(())
     }
+}
+
+fn retained_snapshot_cache_manifest(
+    source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
+    runner_id_aa64mmfr2_el1: u64,
+) -> Result<crate::vcpu_config::HvfArm64VcpuCacheManifest, HvfArm64BootSnapshotV1StateCaptureError>
+{
+    if runner_id_aa64mmfr2_el1 != source.id_aa64mmfr2_el1() {
+        return Err(HvfArm64BootSnapshotV1StateCaptureError::CacheIdentityMismatch);
+    }
+    Ok(source.manifest())
 }
 
 /// Describes why a boot session could not quiesce its limiter retry wakeups.
@@ -1553,8 +1568,6 @@ impl HvfArm64BootSession<'_> {
             &mut is_cancelled,
             HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
         )?;
-        let cache_manifest = HvfBackend::arm64_vcpu_cache_manifest()
-            .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::CacheManifest { source })?;
         check_snapshot_v1_capture_cancelled(
             &mut is_cancelled,
             HvfArm64BootSnapshotV1CaptureStage::Runner,
@@ -1563,6 +1576,10 @@ impl HvfArm64BootSession<'_> {
             .runner
             .capture_arm64_snapshot_v1_state()
             .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::Runner { source })?;
+        let cache_manifest = retained_snapshot_cache_manifest(
+            self.cache_source,
+            runner_capture.identification().id_aa64mmfr2_el1(),
+        )?;
         check_snapshot_v1_capture_cancelled(
             &mut is_cancelled,
             HvfArm64BootSnapshotV1CaptureStage::Device,
@@ -1630,6 +1647,11 @@ impl HvfArm64BootSession<'_> {
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
         &self.runtime_resources
+    }
+
+    /// Return the exact validated cache presentation selected before VM creation.
+    pub fn arm64_fdt_cache_hierarchy(&self) -> Option<&Arm64FdtCacheHierarchy> {
+        self.cache_hierarchy.as_ref()
     }
 
     pub fn shared_balloon_device_metrics(&self) -> SharedBalloonDeviceMetrics {
@@ -2700,6 +2722,8 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            cache_source: prepared.cache_source,
+            cache_hierarchy: Some(prepared.cache_hierarchy),
             control_wakeup: prepared.control_wakeup,
             run_loop_wakeup: prepared.run_loop_wakeup,
             block_retry_wakeup: prepared.block_retry_wakeup,
@@ -2741,6 +2765,10 @@ impl OwnedHvfArm64BootSession {
             state.into_parts();
         let expected_gic = compatibility.gic_metadata();
         let primary_mpidr = compatibility.primary_mpidr();
+        let cache_source = crate::vcpu_config::HvfArm64VcpuCacheFdtSource::new(
+            compatibility.identification().id_aa64mmfr2_el1(),
+            compatibility.cache_manifest(),
+        );
         let restore_state = HvfArm64SnapshotV1Restore::new(
             compatibility.identification(),
             compatibility.optional_sve_sme_identification(),
@@ -2987,6 +3015,8 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher,
             runtime_resources,
+            cache_source,
+            cache_hierarchy: None,
             control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
             run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
             block_retry_wakeup,
@@ -3106,8 +3136,6 @@ impl OwnedHvfArm64BootSession {
             &mut is_cancelled,
             HvfArm64BootSnapshotV1CaptureStage::CacheManifest,
         )?;
-        let cache_manifest = HvfBackend::arm64_vcpu_cache_manifest()
-            .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::CacheManifest { source })?;
         check_snapshot_v1_capture_cancelled(
             &mut is_cancelled,
             HvfArm64BootSnapshotV1CaptureStage::Runner,
@@ -3116,6 +3144,10 @@ impl OwnedHvfArm64BootSession {
             .runner
             .capture_arm64_snapshot_v1_state()
             .map_err(|source| HvfArm64BootSnapshotV1StateCaptureError::Runner { source })?;
+        let cache_manifest = retained_snapshot_cache_manifest(
+            self.cache_source,
+            runner_capture.identification().id_aa64mmfr2_el1(),
+        )?;
         check_snapshot_v1_capture_cancelled(
             &mut is_cancelled,
             HvfArm64BootSnapshotV1CaptureStage::Device,
@@ -3203,6 +3235,11 @@ impl OwnedHvfArm64BootSession {
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
         &self.runtime_resources
+    }
+
+    /// Return the exact validated cache presentation selected before VM creation.
+    pub fn arm64_fdt_cache_hierarchy(&self) -> Option<&Arm64FdtCacheHierarchy> {
+        self.cache_hierarchy.as_ref()
     }
 
     pub fn shared_balloon_device_metrics(&self) -> SharedBalloonDeviceMetrics {
@@ -7529,6 +7566,9 @@ pub enum HvfArm64BootSessionError {
     UnsupportedVcpuCount {
         vcpu_count: u8,
     },
+    CacheTopology {
+        source: crate::cache::HvfArm64CacheTopologyError,
+    },
     CreateVm {
         source: BackendError,
     },
@@ -7594,6 +7634,9 @@ impl fmt::Display for HvfArm64BootSessionError {
                 f,
                 "HVF arm64 boot session supports exactly {SINGLE_VCPU_COUNT} vCPU, got {vcpu_count}"
             ),
+            Self::CacheTopology { source } => {
+                write!(f, "failed to admit HVF arm64 cache topology: {source}")
+            }
             Self::CreateVm { source } => write!(f, "failed to create HVF VM: {source}"),
             Self::CreateGic { source } => write!(f, "failed to create HVF GIC: {source}"),
             Self::TimerMetadata { source } => {
@@ -7676,6 +7719,7 @@ impl fmt::Display for HvfArm64BootSessionError {
 impl std::error::Error for HvfArm64BootSessionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::CacheTopology { source } => Some(source),
             Self::CreateVm { source } => Some(source),
             Self::CreateGic { source } => Some(source),
             Self::TimerMetadata { source } => Some(source),
@@ -7822,6 +7866,8 @@ struct PreparedHvfArm64BootSession<'vm> {
     runner: HvfArm64BootVcpuSession<'vm>,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
+    cache_hierarchy: Arm64FdtCacheHierarchy,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     block_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
@@ -7906,6 +7952,8 @@ impl HvfBackend {
             backend: self,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            cache_source: prepared.cache_source,
+            cache_hierarchy: Some(prepared.cache_hierarchy),
             control_wakeup: prepared.control_wakeup,
             run_loop_wakeup: prepared.run_loop_wakeup,
             block_retry_wakeup: prepared.block_retry_wakeup,
@@ -7945,6 +7993,31 @@ fn prepare_arm64_boot_session_parts<'vm>(
     config: HvfArm64BootSessionConfig,
     startup_resources: VmStartupResources,
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
+    prepare_arm64_boot_session_parts_with_cache(
+        backend,
+        controller,
+        config,
+        startup_resources,
+        crate::cache::prepare_arm64_cache,
+    )
+}
+
+fn prepare_arm64_boot_session_parts_with_cache<'vm>(
+    backend: &mut HvfBackend,
+    controller: &VmmController,
+    config: HvfArm64BootSessionConfig,
+    startup_resources: VmStartupResources,
+    prepare_cache: impl FnOnce(
+        u8,
+    ) -> Result<
+        crate::cache::PreparedHvfArm64Cache,
+        crate::cache::HvfArm64CacheTopologyError,
+    >,
+) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
+    let prepared_cache = prepare_cache(controller.machine_config().vcpu_count())
+        .map_err(|source| HvfArm64BootSessionError::CacheTopology { source })?;
+    let (cache_source, cache_hierarchy) = prepared_cache.into_parts();
+    let retained_cache_hierarchy = cache_hierarchy.clone();
     <HvfBackend as VmBackend>::create_vm(backend)
         .map_err(|source| HvfArm64BootSessionError::CreateVm { source })?;
     let gic = *backend
@@ -7991,6 +8064,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         controller,
         Arm64BootResourceConfig {
             vcpu_mpidrs: &mpidrs,
+            cache_hierarchy,
             gic: gic.arm64_fdt_gic(),
             timer,
             rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),
@@ -8123,6 +8197,8 @@ fn prepare_arm64_boot_session_parts<'vm>(
         runner,
         mmio_dispatcher,
         runtime_resources: runtime,
+        cache_source,
+        cache_hierarchy: retained_cache_hierarchy,
         control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
         run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
         block_retry_wakeup,
@@ -8322,6 +8398,7 @@ mod tests {
         ARM64_FDT_VMGENID_SIZE, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts,
         Arm64FdtVmGenIdDevice,
     };
+    use bangbang_runtime::fdt::{Arm64FdtCache, Arm64FdtCacheHierarchy, Arm64FdtCacheType};
     use bangbang_runtime::interrupt::{
         DeviceInterruptKind, GuestInterruptLine, InterruptSignalError, InterruptSink,
     };
@@ -10777,6 +10854,7 @@ mod tests {
     ) -> Arm64BootResourceConfig<'a> {
         Arm64BootResourceConfig {
             vcpu_mpidrs: &[0],
+            cache_hierarchy: test_cache_hierarchy(),
             gic: valid_fdt_gic(),
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
             rtc_device: None,
@@ -10805,6 +10883,14 @@ mod tests {
             memory_hotplug_device: None,
             entropy_device: None,
         }
+    }
+
+    fn test_cache_hierarchy() -> Arm64FdtCacheHierarchy {
+        Arm64FdtCacheHierarchy::new(vec![
+            Arm64FdtCache::new(1, Arm64FdtCacheType::Unified, 32_768, 64, 64, 8, 1)
+                .expect("test L1 cache should be valid"),
+        ])
+        .expect("test cache hierarchy should be valid")
     }
 
     fn valid_fdt_gic() -> Arm64FdtGic {
@@ -16924,6 +17010,78 @@ mod tests {
         assert!(config.serial_device.is_some());
         assert_eq!(config.network_mmio_layout, network_layout);
         assert_eq!(config.rtc_mmio_layout.base(), TEST_RTC_MMIO_BASE);
+    }
+
+    #[test]
+    fn cache_admission_failure_precedes_all_vm_owned_startup_state() {
+        let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(
+                1,
+                TEST_MEMORY_MIB,
+            )))
+            .expect("machine config should be stored");
+        let config = HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            RtcMmioLayout::new(TEST_RTC_MMIO_BASE, MmioRegionId::new(3000)),
+        );
+        let mut backend = crate::HvfBackend::new();
+
+        let error = match super::prepare_arm64_boot_session_parts_with_cache(
+            &mut backend,
+            &controller,
+            config,
+            super::VmStartupResources::default(),
+            |vcpu_count| {
+                assert_eq!(vcpu_count, 1);
+                Err(crate::cache::HvfArm64CacheTopologyError::InvalidCcidx)
+            },
+        ) {
+            Ok(_) => panic!("cache admission failure must stop startup"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            &error,
+            HvfArm64BootSessionError::CacheTopology {
+                source: crate::cache::HvfArm64CacheTopologyError::InvalidCcidx,
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "failed to admit HVF arm64 cache topology: HVF cache index format is unsupported"
+        );
+        assert!(!backend.has_created_vm());
+        assert_eq!(backend.gic_metadata(), None);
+        assert!(backend.mapped_guest_memory().is_err());
+    }
+
+    #[test]
+    fn snapshot_capture_reuses_retained_manifest_and_rejects_mmfr2_drift() {
+        let manifest = crate::vcpu_config::HvfArm64VcpuCacheManifest::new(
+            crate::vcpu_config::HvfArm64VcpuCacheConfiguration::new([1, 2, 3]),
+            crate::vcpu_config::HvfArm64VcpuCacheGeometry::new([[4; 8], [5; 8]]),
+        );
+        let source = crate::vcpu_config::HvfArm64VcpuCacheFdtSource::new(6, manifest);
+
+        assert_eq!(
+            super::retained_snapshot_cache_manifest(source, 6)
+                .expect("unchanged runner MMFR2 should reuse startup manifest"),
+            manifest
+        );
+        let error = super::retained_snapshot_cache_manifest(source, 7)
+            .expect_err("changed runner MMFR2 should reject capture");
+        assert!(matches!(
+            &error,
+            super::HvfArm64BootSnapshotV1StateCaptureError::CacheIdentityMismatch
+        ));
+        assert_eq!(
+            error.to_string(),
+            "native-v1 cache compatibility identity changed after startup"
+        );
     }
 
     #[test]
