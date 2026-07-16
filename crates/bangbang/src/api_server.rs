@@ -8072,7 +8072,7 @@ mod tests {
     }
 
     #[test]
-    fn running_state_rejects_vm_state_update_without_mutating() {
+    fn running_state_acknowledges_resume_without_mutating() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
         let boot_request = format!(
@@ -8089,12 +8089,7 @@ mod tests {
 
         let response = request_over_socket(&mut vmm, "vm-state-running", request);
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(
-            response.contains(
-                r#"{"fault_message":"The requested operation is not supported in Running state: Resume"}"#
-            )
-        );
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running
@@ -8202,6 +8197,89 @@ mod tests {
     }
 
     #[test]
+    fn configured_metrics_records_idempotent_vm_state_request_latencies() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path =
+            unique_socket_path("vm-state-idempotent-latencies").with_extension("metrics");
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PUT", "/metrics", &metrics_body).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body(
+                    "PUT",
+                    "/boot-source",
+                    r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#,
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        assert!(
+            put_action_over_socket(&mut vmm, "vil0", "InstanceStart")
+                .starts_with("HTTP/1.1 204 No Content\r\n")
+        );
+
+        let duplicate_resume = request_over_socket(
+            &mut vmm,
+            "vil1",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        );
+        assert!(duplicate_resume.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(
+            put_action_over_socket(&mut vmm, "vil2", "FlushMetrics")
+                .starts_with("HTTP/1.1 204 No Content\r\n")
+        );
+        let resumed_metrics = read_metrics_json(&metrics_path);
+        assert_latency_metric_present(&resumed_metrics, "resume_vm");
+        let resumed_latency = resumed_metrics
+            .get("latencies_us")
+            .and_then(|latencies| latencies.get("resume_vm"))
+            .and_then(serde_json::Value::as_u64)
+            .expect("resume_vm latency should be present");
+        assert!(
+            resumed_metrics
+                .get("latencies_us")
+                .and_then(|latencies| latencies.get("pause_vm"))
+                .is_none(),
+            "idempotent resume must not emit pause latency"
+        );
+
+        assert_eq!(vmm.handle_action(VmmAction::Pause), Ok(VmmData::Empty));
+
+        let duplicate_pause = request_over_socket(
+            &mut vmm,
+            "vil3",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#),
+        );
+        assert!(duplicate_pause.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(
+            put_action_over_socket(&mut vmm, "vil4", "FlushMetrics")
+                .starts_with("HTTP/1.1 204 No Content\r\n")
+        );
+        let paused_metrics = read_metrics_json(&metrics_path);
+        assert_latency_metric_present(&paused_metrics, "pause_vm");
+        assert_eq!(
+            paused_metrics
+                .get("latencies_us")
+                .and_then(|latencies| latencies.get("resume_vm"))
+                .and_then(serde_json::Value::as_u64),
+            Some(resumed_latency),
+            "idempotent pause must not change resume latency"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
     fn configured_metrics_omits_failed_vm_state_update_latencies() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let metrics_path =
@@ -8242,12 +8320,6 @@ mod tests {
         );
         let start_response = put_action_over_socket(&mut vmm, "vmlfs", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        let running_resume_response = request_over_socket(
-            &mut vmm,
-            "vmlfr",
-            &request_with_body("PATCH", "/vm", r#"{"state":"Resumed"}"#),
-        );
-        assert!(running_resume_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
 
         let flush_response = put_action_over_socket(&mut vmm, "vmlff", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));

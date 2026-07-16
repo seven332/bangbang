@@ -201,11 +201,74 @@
     {
       "id": "api-operation:PATCH /vm",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /vm.",
+      "summary": "Accept Firecracker-shaped Paused and Resumed state updates, including successful idempotent same-state requests, while preserving process-session ownership and topology-wide transition ordering.",
       "source_refs": [
         "api-operation:PATCH /vm"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PatchVmState request dispatch and successful-request latency recording"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm pause_instance and resume_instance"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "VmStateTransition and VmmController pause/resume lifecycle admission"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "VM state update and idempotent latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "runtime idempotent pause/resume session tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed single-process and dual-process SMP lifecycle scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "pause_and_resume_are_idempotent_without_mutating_other_state"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "PATCH /vm compatibility target"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-validation-matrix.md",
+          "anchor": "issue 1389 PATCH /vm validation note"
+        },
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "same-state public pause/resume ownership boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/testing.md",
+          "anchor": "signed executable idempotent lifecycle coverage"
+        },
+        {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1389#issuecomment-4988622474"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /actions",

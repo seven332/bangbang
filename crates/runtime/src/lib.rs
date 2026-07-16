@@ -53,6 +53,15 @@ impl fmt::Display for InstanceState {
     }
 }
 
+/// Whether a requested live-VM state change still needs a backend transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmStateTransition {
+    /// The VM must perform the requested backend transition before committing state.
+    Required,
+    /// The VM is already in the requested state and must not transition again.
+    AlreadyInTargetState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceInfo {
     pub id: String,
@@ -1047,37 +1056,39 @@ impl VmmController {
         Ok(VmmData::Empty)
     }
 
-    pub fn preflight_pause_instance(&self) -> Result<(), VmmActionError> {
-        if self.instance_info.state != InstanceState::Running {
-            return Err(VmmActionError::UnsupportedState {
+    pub fn preflight_pause_instance(&self) -> Result<VmStateTransition, VmmActionError> {
+        match self.instance_info.state {
+            InstanceState::Running => Ok(VmStateTransition::Required),
+            InstanceState::Paused => Ok(VmStateTransition::AlreadyInTargetState),
+            InstanceState::NotStarted => Err(VmmActionError::UnsupportedState {
                 action: VmmAction::Pause.name(),
                 state: self.instance_info.state,
-            });
+            }),
         }
-
-        Ok(())
     }
 
     pub fn pause_instance(&mut self) -> Result<VmmData, VmmActionError> {
-        self.preflight_pause_instance()?;
-        self.instance_info.state = InstanceState::Paused;
+        if self.preflight_pause_instance()? == VmStateTransition::Required {
+            self.instance_info.state = InstanceState::Paused;
+        }
         Ok(VmmData::Empty)
     }
 
-    pub fn preflight_resume_instance(&self) -> Result<(), VmmActionError> {
-        if self.instance_info.state != InstanceState::Paused {
-            return Err(VmmActionError::UnsupportedState {
+    pub fn preflight_resume_instance(&self) -> Result<VmStateTransition, VmmActionError> {
+        match self.instance_info.state {
+            InstanceState::Paused => Ok(VmStateTransition::Required),
+            InstanceState::Running => Ok(VmStateTransition::AlreadyInTargetState),
+            InstanceState::NotStarted => Err(VmmActionError::UnsupportedState {
                 action: VmmAction::Resume.name(),
                 state: self.instance_info.state,
-            });
+            }),
         }
-
-        Ok(())
     }
 
     pub fn resume_instance(&mut self) -> Result<VmmData, VmmActionError> {
-        self.preflight_resume_instance()?;
-        self.instance_info.state = InstanceState::Running;
+        if self.preflight_resume_instance()? == VmStateTransition::Required {
+            self.instance_info.state = InstanceState::Running;
+        }
         Ok(VmmData::Empty)
     }
 
@@ -1819,8 +1830,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
-        VmmActionError, VmmController, VmmData,
+        BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmStateTransition,
+        VmmAction, VmmActionError, VmmController, VmmData,
         balloon::{
             BalloonConfig, BalloonConfigError, BalloonConfigInput, BalloonHintingCommandError,
             BalloonHintingStartInput, BalloonHintingStatusError, BalloonStatsError,
@@ -2559,7 +2570,7 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_resume_reject_invalid_runtime_state_without_mutating() {
+    fn pause_and_resume_are_idempotent_without_mutating_other_state() {
         for (state, action) in [
             (InstanceState::Paused, VmmAction::Pause),
             (InstanceState::Running, VmmAction::Resume),
@@ -2570,20 +2581,54 @@ mod tests {
                 .expect("boot source config should be stored");
             controller.instance_info.state = state;
 
-            let err = controller
+            let data = controller
                 .handle_action(action.clone())
-                .expect_err("invalid VM state update should fail");
+                .expect("same-state VM update should succeed");
 
-            assert_eq!(
-                err,
-                VmmActionError::UnsupportedState {
-                    action: action.name(),
-                    state,
-                }
-            );
+            assert_eq!(data, VmmData::Empty);
             assert_eq!(controller.instance_info().state, state);
             assert!(controller.boot_source_config().is_some());
         }
+    }
+
+    #[test]
+    fn vm_state_preflight_distinguishes_transitions_from_idempotent_requests() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.preflight_pause_instance(),
+            Err(VmmActionError::UnsupportedState {
+                action: VmmAction::Pause.name(),
+                state: InstanceState::NotStarted,
+            })
+        );
+        assert_eq!(
+            controller.preflight_resume_instance(),
+            Err(VmmActionError::UnsupportedState {
+                action: VmmAction::Resume.name(),
+                state: InstanceState::NotStarted,
+            })
+        );
+
+        controller.instance_info.state = InstanceState::Running;
+        assert_eq!(
+            controller.preflight_pause_instance(),
+            Ok(VmStateTransition::Required)
+        );
+        assert_eq!(
+            controller.preflight_resume_instance(),
+            Ok(VmStateTransition::AlreadyInTargetState)
+        );
+
+        controller.instance_info.state = InstanceState::Paused;
+        assert_eq!(
+            controller.preflight_pause_instance(),
+            Ok(VmStateTransition::AlreadyInTargetState)
+        );
+        assert_eq!(
+            controller.preflight_resume_instance(),
+            Ok(VmStateTransition::Required)
+        );
     }
 
     #[test]

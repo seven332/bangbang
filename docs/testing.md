@@ -143,8 +143,12 @@ startup is covered separately by the signed executable target. Its generated
 are ready, then emits distinct non-ASCII one-byte tokens from each pinned role.
 The public test pauses one two-vCPU process, uses both token streams from an
 isolated peer as an event-driven observation window, requires the paused serial
-bytes to stay exact, and requires both streams to resume. Native-v1 multi-vCPU
-acceptance remains a separate negative gate.
+bytes to stay exact, and requires both streams to resume. It also repeats
+`Paused` while paused and `Resumed` while running, requiring `204`, stable
+public state, no extra backend generation, and continued peer isolation.
+Focused controller/process tests additionally prove these no-ops still require
+the retained session and successful HTTP requests record their own latency.
+Native-v1 multi-vCPU acceptance remains a separate negative gate.
 
 The generated `/smp-hotplug-init` mounts sysfs, takes CPU1 offline through
 Linux's CPU hotplug interface, proves the migrated worker is quiescent with a
