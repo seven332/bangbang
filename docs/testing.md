@@ -182,6 +182,18 @@ For host filesystem paths, cover missing paths, directories, unsupported file
 types, redacted error messages, cleanup ownership, and failure atomicity. A
 failed operation should not partially mutate accepted configuration, guest
 memory, or host resources.
+For `seccompiler-bin`, also cover help/version, missing/duplicate/unknown and
+attached short options, the default and explicit output paths, both target
+architectures, basic and split modes, deterministic replacement, bitcode decode
+through Firecracker's map shape, little-endian raw split decode, and independent
+classic-BPF execution. Input cases include empty, missing, oversized,
+non-UTF-8, directory, symlink, FIFO, socket, schema, and syscall failures.
+Output cases include absent/existing/mixed regular files, symlinks,
+directories, FIFOs, sockets, a replacement arriving after preflight, every
+split publication boundary, and distinct rollback/durability/cleanup outcomes.
+Fault injection stays binary-private; do not add an environment variable or
+hidden production CLI switch. A pinned upstream Linux oracle is maintainer
+evidence, not a checked build or CI dependency.
 For deferred-open paths such as serial output, also cover that parsing stores
 configuration without opening the path, and that startup wiring opens or writes
 through the selected sink with redacted errors.
@@ -599,10 +611,20 @@ Ordinary tests do not discover or require a sibling Firecracker checkout.
 Process-facing changes must also keep the checked
 [`process-contract.md`](../compat/firecracker/v1.16.0/process-contract.md)
 aligned with production code, executable tests, and the exact overlay records.
-The #1352 audit has 20 terminal and nine nonterminal process-family records;
-delivery validation permits those explicit handoffs, while final validation
-continues to reject them. Parser recognition or native snapshot output is not
-sufficient evidence for a Firecracker runtime or artifact claim.
+The current main-process audit has 21 terminal and eight nonterminal
+process-family records. #1383 separately promotes seven offline-seccompiler
+records, moving the complete 417-record delivery inventory to 33
+implemented-and-verified, 381 audit-required, and three
+missing-platform-feasible. Delivery validation permits those explicit
+handoffs, while final validation continues to reject them. Parser recognition
+or native snapshot output is not sufficient evidence for a Firecracker runtime
+or artifact claim.
+
+Run the offline compiler's focused surface with:
+
+```sh
+cargo test -p bangbang-seccompiler --all-targets --all-features --locked
+```
 
 Maintainers can compare the machine-owned manifest with a clean explicit
 checkout at the exact pinned commit:

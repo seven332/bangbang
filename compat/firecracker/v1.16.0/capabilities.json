@@ -2640,11 +2640,55 @@
     {
       "id": "corpus:seccompiler",
       "family": "isolation",
-      "summary": "Audit all applicable capability claims owned by the pinned seccompiler source corpus.",
+      "summary": "Provide the pinned seccompiler policy transform, public CLI, combined bitcode and split raw artifacts, bounded failure behavior, and host-side documentation without claiming Linux filter installation on macOS.",
       "source_refs": [
         "corpus:seccompiler"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/artifact.rs",
+          "anchor": "publish and descriptor-anchored transactional artifact helpers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/bin.rs",
+          "anchor": "Cli and main"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/lib.rs",
+          "anchor": "compile_json"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/tool.rs",
+          "anchor": "run, read_input, and build_artifacts"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/artifact.rs",
+          "anchor": "transaction, race, rollback, durability, cleanup, and unsafe-target tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/cli.rs",
+          "anchor": "seccompiler-bin process contract tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/invalid.rs",
+          "anchor": "schema and resource-bound rejection tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/semantics.rs",
+          "anchor": "independent classic-BPF semantic tests"
+        }
+      ]
     },
     {
       "id": "corpus:snapshot-editor",
@@ -4005,47 +4049,172 @@
     {
       "id": "tool-argument:seccompiler/basic",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/basic.",
+      "summary": "Accept -b/--basic and reproduce Firecracker v1.16's deprecated condition-dropping compilation mode.",
       "source_refs": [
         "tool-argument:seccompiler/basic"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/bin.rs",
+          "anchor": "Cli::basic"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/tool.rs",
+          "anchor": "CompileOptions::with_basic in run"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/cli.rs",
+          "anchor": "split_and_basic_outputs_preserve_compiled_filter_semantics"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/semantics.rs",
+          "anchor": "basic_mode_drops_conditions_and_unconditional_rules_subsume"
+        }
+      ]
     },
     {
       "id": "tool-argument:seccompiler/input-file",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/input-file.",
+      "summary": "Accept -i/--input-file, open its final component without following a symlink or blocking on a special file, and read one bounded regular UTF-8 policy.",
       "source_refs": [
         "tool-argument:seccompiler/input-file"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/bin.rs",
+          "anchor": "Cli::input_file"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/tool.rs",
+          "anchor": "read_input"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/cli.rs",
+          "anchor": "input_failures_are_bounded_redacted_and_leave_existing_output_unchanged"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/invalid.rs",
+          "anchor": "enforces_rule_and_input_bounds"
+        }
+      ]
     },
     {
       "id": "tool-argument:seccompiler/output-file",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/output-file.",
+      "summary": "Accept -o/--output-file with Firecracker's default name and publish a complete owner-only combined artifact without following or truncating unsafe targets.",
       "source_refs": [
         "tool-argument:seccompiler/output-file"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/artifact.rs",
+          "anchor": "publish"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/bin.rs",
+          "anchor": "Cli::output_file"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/tool.rs",
+          "anchor": "build_artifacts"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/artifact.rs",
+          "anchor": "publication transaction and replacement-race tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/cli.rs",
+          "anchor": "combined_output_is_deterministic_complete_and_owner_only and special_output_targets_are_rejected_without_following_or_truncating_them"
+        }
+      ]
     },
     {
       "id": "tool-argument:seccompiler/split-output",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/split-output.",
+      "summary": "Accept --split-output and publish exact vmm.bpf, api.bpf, and vcpu.bpf raw little-endian instruction files in the selected output parent.",
       "source_refs": [
         "tool-argument:seccompiler/split-output"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/bin.rs",
+          "anchor": "Cli::split_output"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/tool.rs",
+          "anchor": "SPLIT_CATEGORIES and build_artifacts"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/artifact.rs",
+          "anchor": "rolls_back_every_injected_split_publication_boundary"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/cli.rs",
+          "anchor": "split_and_basic_outputs_preserve_compiled_filter_semantics"
+        }
+      ]
     },
     {
       "id": "tool-argument:seccompiler/target-arch",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument seccompiler/target-arch.",
+      "summary": "Accept -t/--target-arch for x86_64 and aarch64 and lower the policy against the pinned target syscall and audit-architecture semantics.",
       "source_refs": [
         "tool-argument:seccompiler/target-arch"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/bin.rs",
+          "anchor": "Cli::target_arch"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/lib.rs",
+          "anchor": "TargetArch"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/cli.rs",
+          "anchor": "long_short_attached_and_default_output_forms_are_supported and split_and_basic_outputs_preserve_compiled_filter_semantics"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/semantics.rs",
+          "anchor": "compiles_representative_pinned_policy_for_both_targets and rejects_wrong_architecture_and_x32_but_allows_tracing_sentinel"
+        }
+      ]
     },
     {
       "id": "tool-argument:snapshot-editor/edit-memory/rebase/diff-path",
@@ -4194,11 +4363,45 @@
     {
       "id": "tool-operation:seccompiler/compile",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool operation seccompiler/compile.",
+      "summary": "Compile one bounded Firecracker v1.16 policy into deterministic combined bitcode or split raw classic-BPF artifacts with static failure diagnostics and transactional publication.",
       "source_refs": [
         "tool-operation:seccompiler/compile"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/artifact.rs",
+          "anchor": "publish"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/lib.rs",
+          "anchor": "compile_json"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/tool.rs",
+          "anchor": "run and serialize_combined"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/cli.rs",
+          "anchor": "seccompiler-bin process contract tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/invalid.rs",
+          "anchor": "bounded invalid policy tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/semantics.rs",
+          "anchor": "independent classic-BPF action, operator, architecture, and deterministic-layout tests"
+        }
+      ]
     },
     {
       "id": "tool-operation:snapshot-editor/edit-memory/rebase",
