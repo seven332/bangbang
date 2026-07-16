@@ -440,6 +440,22 @@ values twice within one vCPU lifetime and compare MPIDR with the existing
 owner-thread getter. They must not hard-code one Apple MIDR/feature model,
 include availability-gated or beta-only IDs, or claim that equal raw values are
 a sufficient destination compatibility policy.
+CPU-template tests add a separate mutation boundary. Unit/failure-injection
+coverage must prove that every requested baseline on every member precedes the
+first write, unrelated allowlisted identities are untouched, cross-vCPU
+baseline mismatch performs no writes, targets are computed once, and every
+write is immediately reread. Every failure position must retain only redacted
+member/completed-count context and destroy an unpublished startup topology.
+Signed lifecycle coverage must apply the canonical four-register custom
+template to two real HVF vCPUs and shut down cleanly. Signed Linux coverage must
+boot separate two-vCPU baseline and custom sessions, online and pin a no-stdlib
+EL0 reporter to each CPU, write bounded raw reports only to a scratch block
+device, and verify `custom == (baseline & !filter) | value` for every CPU and
+register without requiring a bit to change. Serial output may contain only
+fixed success/failure markers, never report values. Run both through
+`scripts/run-integration-tests.sh` without `--allow-unsupported`; the direct
+rootfs builder requires the installed stable `aarch64-unknown-linux-musl`
+target and embeds the deterministic static helper.
 SVE/SME identification signed tests require macOS 15.2 and must capture ZFR0
 and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
 must not hard-code one feature model, enable SVE/SME, enter streaming mode,

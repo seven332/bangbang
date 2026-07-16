@@ -97,18 +97,24 @@ wake. Runtime discovery reports PSCI 1.0 and a minimal safe SMCCC 1.1 surface:
 only its mandatory VERSION/self results, and optional firmware services remain
 unsupported. The FDT deliberately keeps Firecracker v1.15.1's
 `arm,psci-0.2`/HVC binding. FDT idle-state discovery and SGI/SPI/direct IRQ/FIQ
-wake are not exposed. Dynamic CPU topology, SMT, non-`None` CPU templates, and
-cross-host CPU portability remain unsupported. The native-v1 snapshot profile
-below remains restricted to exactly one vCPU.
+wake are not exposed. Dynamic CPU topology, SMT, static CPU-template execution,
+and cross-host CPU portability remain unsupported. The native-v1 snapshot
+profile below remains restricted to exactly one vCPU and no effective custom
+template.
 
-Firecracker-shaped `PUT /cpu-config` input is fully syntax-validated. Empty
-custom templates remain successful no-ops; non-empty KVM capability,
-KVM vCPU-init feature, arm register modifier, and mixed requests are reduced to
-category-only runtime actions and rejected with stable value-redacted arm64 HVF
-faults. Deprecated non-`None` machine `cpu_template` names are likewise rejected
-as Firecracker AWS/Linux CPU policies rather than HVF profiles. bangbang does
-not retain or apply their raw masks, and accepted empty/`None` input adds no CPU
-section to `GET /vm/config`.
+Firecracker-shaped `PUT /cpu-config` now retains bounded ordered values and
+applies exact expert-controlled masks for four reviewed arm64 identification
+registers on every owner-thread vCPU before boot overrides. All requested
+baselines are read and compared before the first write; every write is
+immediately reread, and any failure destroys the unpublished VM. KVM capability
+numbers, KVM vCPU-init feature words, other registers/widths, and mixed inputs
+receive distinct value-redacted platform faults. Empty custom input clears the
+selection. Machine `V1N1` remains GET-visible pending configuration and can be
+replaced by custom or `None`, but if still effective it fails before VM
+construction because Apple Silicon cannot truthfully provide Firecracker's
+documented Neoverse V1 source model. Custom contents remain omitted from GET
+and native-v1 snapshots. See the checked
+[CPU-template contract](compat/firecracker/v1.16.0/cpu-template-contract.md).
 
 The HVF runner currently exposes owner-thread capture building blocks for
 general registers, plus ordered nontransactional restore of the same typed

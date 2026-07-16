@@ -1,0 +1,163 @@
+# Firecracker v1.16.0 CPU-template contract
+
+This document is the human-owned contract for the CPU-template subset delivered
+by issue #1393. It is pinned to Firecracker v1.16.0 commit
+`d83d72b710361a10294480131377b1b00b163af8` and to the public
+Hypervisor.framework surface available to the macOS Apple Silicon backend.
+
+The implementation deliberately separates three outcomes:
+
+- exact expert-controlled masks for four reviewed arm64 identification
+  registers are implemented and verified;
+- KVM capability numbers and `kvm_vcpu_init.features` words have no
+  identity-preserving HVF namespace and receive stable platform faults; and
+- static CPU names are configuration policy, not aliases for arbitrary live
+  writes. `V1N1` remains pending configuration but cannot execute because its
+  documented Neoverse V1 source-model contract is not true on Apple Silicon.
+
+The broad `/cpu-config` operation, general register-modifier schema, CPU
+template corpora, and helper tools remain nonterminal for #1394 and Wave 7.
+
+## Request model and bounds
+
+`PUT /cpu-config` accepts Firecracker's aarch64 `kvm_capabilities`,
+`reg_modifiers`, and `vcpu_features` arrays. Missing arrays default to empty.
+Each array has a persistent maximum of 256 entries, in addition to the normal
+HTTP/config-file byte limits. Input order is preserved across the API/runtime
+action boundary.
+
+- KVM capabilities retain exact add/remove direction and the complete `u32`
+  capability number. The optional `!` prefix means remove.
+- ARM one-register entries require a KVM arm64 register identity whose encoded
+  width is exactly 32, 64, or 128 bits. Their bitmap accepts `0`, `1`, `x`, and
+  `_`: zero and one select a filtered target bit, while `x` preserves the
+  baseline bit.
+- vCPU feature entries retain an exact `u32` index plus 32-bit filter/value.
+  The valid fixed KVM feature-word domain is index `0..7`.
+
+The parser rejects unknown or duplicate JSON fields, malformed numeric or
+bitmap strings, non-arm64/invalid-width register identities, over-width
+bitmaps, value bits outside the filter, more than 256 entries in any array,
+duplicate capability numbers regardless of add/remove direction, duplicate
+register identities, and duplicate feature indexes. These duplicate/index
+checks intentionally fail earlier and more strictly than upstream's eventual
+KVM behavior.
+
+All input and executable aggregates have manual value-redacted `Debug`
+implementations. Structurally valid but unavailable KVM-only categories cross
+the runtime action boundary only long enough to return their fixed platform
+classification; they are never installed as effective controller state.
+
+## Executable custom subset
+
+Bangbang implements exact one-register semantics
+`target = (baseline & !filter) | value` for these four 64-bit identities only:
+
+- `ID_AA64PFR0_EL1`;
+- `ID_AA64ISAR0_EL1`;
+- `ID_AA64ISAR1_EL1`; and
+- `ID_AA64MMFR2_EL1`.
+
+Any ordered combination of those distinct identities is accepted, including a
+single-register template. A 32- or 128-bit modifier receives the distinct
+unsupported-width fault. Another 64-bit arm register receives the distinct
+outside-profile fault. KVM capabilities, KVM vCPU-init feature words, and a
+mixed category receive separate value-free faults.
+
+This is an expert-controlled mechanism, matching Firecracker's warning that an
+incorrect custom template can crash a guest or expose an incoherent/insecure
+feature view. The allowlist and exact readback prove mechanical application;
+they do not certify instruction compatibility, monotonic feature reduction,
+an N1 identity, or cross-host portability.
+
+## Replacement and serialization
+
+CPU selection is one transactional effective choice:
+
+- a successful custom PUT replaces any prior custom template or pending static
+  selection;
+- an empty custom PUT succeeds and clears either selection;
+- a valid machine `V1N1` update replaces custom state and remains pending;
+- explicit machine `None` clears either selection; and
+- omitted or JSON `null` machine fields preserve the current selection.
+
+Complete candidate validation precedes every replacement. A malformed,
+unsupported, or otherwise rejected candidate leaves both machine and custom
+state unchanged. Post-start requests retain the normal unsupported-state
+precedence.
+
+Pending static `V1N1` is visible as `cpu_template: "V1N1"` from
+`GET /machine-config` and in the machine section of `GET /vm/config`. Custom
+contents are deliberately omitted and serialize as no static selection, as in
+Firecracker. Config files retain machine-then-custom action order, so a valid
+custom section can replace pending `V1N1` before start.
+
+The x86 static names `C3`, `T2`, `T2S`, `T2CL`, and `T2A` are rejected during
+machine candidate validation as foreign AWS/Linux policies. `V1N1` is accepted
+as pending configuration, but an effective selection fails `InstanceStart`
+before the startup executor or HVF VM construction. Four writable registers
+cannot establish Firecracker's documented Neoverse V1-to-N1 source contract
+or its complete unmasked identity on Apple Silicon.
+
+## HVF startup and failure atomicity
+
+The backend maps the validated runtime template before creating a VM. After
+the complete fixed vCPU topology and MPIDRs exist, but before guest resources,
+memory, or PC/X0/PSTATE boot overrides are installed, it performs one bounded
+template transaction:
+
+1. every owner thread reads every requested/admitted register, with no access
+   to unrelated allowlisted identities;
+2. all reads on all vCPUs complete before the first write;
+3. every vCPU must report the same requested baseline vector;
+4. ordered targets are computed once from that common baseline; and
+5. every owner writes each target and immediately rereads it for exact
+   equality before moving to the next target.
+
+The owner-thread command has conflict/retry admission and is unavailable after
+the first vCPU run. Mapping, baseline read, baseline mismatch, write, reread,
+or readback mismatch reports only a fixed stage/category, member position, and
+completed count. Because live system-register writes are not rollback-safe,
+any failure destroys the complete unpublished topology and VM; a partially
+modified session is never returned or run.
+
+## Snapshot boundary
+
+An effective nonempty custom template is outside the native-v1 snapshot
+profile. Snapshot create fails before capture/publication, and snapshot load
+requires the existing pristine no-template profile. No CPU-template content is
+serialized, no native-v1 schema or version changes, and no custom selection
+survives a create/load boundary.
+
+Pending `V1N1` cannot reach a running or paused snapshot source because its
+start gate fires before backend construction. Empty custom or explicit `None`
+leaves the ordinary no-template snapshot profile unchanged.
+
+Wave 6 retains ownership of broader snapshot profiles, multi-vCPU/device
+schemas, and portability policy. #1394 owns the remaining reviewed arm64
+one-register classes. Wave 7 owns the five public `cpu-template-helper`
+commands and arguments.
+
+## Security and signed evidence
+
+Raw capability numbers, feature indexes, register identities, masks,
+baselines, targets, and readbacks are absent from product `Debug`, `Display`,
+HTTP faults, logs, metrics, and serial output. Stable architectural register
+names appear only in tracked documentation and tests. The implementation uses
+no private Apple API, new entitlement, root requirement, scheduler-affinity
+inference, or physical-host model table.
+
+Unit and failure-injection coverage proves bounded/lossless parsing,
+replacement atomicity, requested-set read-before-write ordering, unrelated-ID
+non-access, no-write baseline mismatch, every write/readback failure position,
+redaction, retry, and cleanup. A separately signed two-vCPU lifecycle test
+proves live write/readback and teardown. A signed two-vCPU Linux test boots one
+baseline VM and one canonical custom VM, pins a no-stdlib EL0 helper to each
+CPU, writes its bounded reports only to a scratch block device, and verifies
+for every CPU and register that the custom view equals the exact baseline mask
+result. Serial receives fixed success/failure markers only.
+
+The strict platform-exclusion evidence and alternatives for the seven narrow
+KVM/static inventory leaves are recorded in `capabilities.json`; the current
+Plan Challenge is
+<https://github.com/seven332/bangbang/issues/1393#issuecomment-4993017798>.

@@ -17,7 +17,8 @@ use bangbang_api::http::{
     ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse,
     BalloonHintingStartRequest, BalloonHintingStatusResponse, BalloonStatsResponse,
     BalloonStatsUpdateRequest, BalloonUpdateRequest, BootSourceRequest, BootSourceResponse,
-    CpuConfigRequest, CpuConfigTemplateCategory as ApiCpuConfigTemplateCategory,
+    CpuConfigArmRegisterWidth as ApiCpuConfigArmRegisterWidth,
+    CpuConfigKvmCapability as ApiCpuConfigKvmCapability, CpuConfigRequest,
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, DriveRateLimiterRequest,
     EntropyConfigRequest, EntropyConfigResponse, EntropyRateLimiterRequest,
@@ -45,7 +46,8 @@ use bangbang_runtime::block::{
 };
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
 use bangbang_runtime::cpu::{
-    CpuConfigInput, CpuConfigTemplateCategory as RuntimeCpuConfigTemplateCategory,
+    CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigInput,
+    CpuConfigKvmCapability, CpuConfigVcpuFeature,
 };
 use bangbang_runtime::entropy::{
     EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
@@ -1241,18 +1243,42 @@ fn boot_source_input_from_request(config: &BootSourceRequest) -> BootSourceConfi
 }
 
 fn cpu_config_input_from_request(config: &CpuConfigRequest) -> CpuConfigInput {
-    CpuConfigInput::new(config.category().map(|category| match category {
-        ApiCpuConfigTemplateCategory::KvmCapabilities => {
-            RuntimeCpuConfigTemplateCategory::KvmCapabilities
-        }
-        ApiCpuConfigTemplateCategory::VcpuFeatures => {
-            RuntimeCpuConfigTemplateCategory::VcpuFeatures
-        }
-        ApiCpuConfigTemplateCategory::ArmRegisterModifiers => {
-            RuntimeCpuConfigTemplateCategory::ArmRegisterModifiers
-        }
-        ApiCpuConfigTemplateCategory::Mixed => RuntimeCpuConfigTemplateCategory::Mixed,
-    }))
+    let kvm_capabilities = config
+        .kvm_capabilities()
+        .iter()
+        .copied()
+        .map(|capability| match capability {
+            ApiCpuConfigKvmCapability::Add(value) => CpuConfigKvmCapability::Add(value),
+            ApiCpuConfigKvmCapability::Remove(value) => CpuConfigKvmCapability::Remove(value),
+        })
+        .collect();
+    let reg_modifiers = config
+        .reg_modifiers()
+        .iter()
+        .copied()
+        .map(|modifier| {
+            CpuConfigArmRegisterModifier::new(
+                modifier.id(),
+                match modifier.width() {
+                    ApiCpuConfigArmRegisterWidth::U32 => CpuConfigArmRegisterWidth::U32,
+                    ApiCpuConfigArmRegisterWidth::U64 => CpuConfigArmRegisterWidth::U64,
+                    ApiCpuConfigArmRegisterWidth::U128 => CpuConfigArmRegisterWidth::U128,
+                },
+                modifier.filter(),
+                modifier.value(),
+            )
+        })
+        .collect();
+    let vcpu_features = config
+        .vcpu_features()
+        .iter()
+        .copied()
+        .map(|feature| {
+            CpuConfigVcpuFeature::new(feature.index(), feature.filter(), feature.value())
+        })
+        .collect();
+
+    CpuConfigInput::new(kvm_capabilities, reg_modifiers, vcpu_features)
 }
 
 fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
@@ -1298,13 +1324,16 @@ fn handle_machine_config(
     result: Result<VmmData, bangbang_runtime::VmmActionError>,
 ) -> HttpResponse {
     match result {
-        Ok(VmmData::MachineConfiguration(config)) => HttpResponse::machine_config(
-            config.vcpu_count(),
-            config.mem_size_mib(),
-            config.smt(),
-            config.track_dirty_pages(),
-            machine_config_huge_pages_name(config.huge_pages()),
-        ),
+        Ok(VmmData::MachineConfiguration(config)) => {
+            HttpResponse::machine_config_with_cpu_template(
+                config.vcpu_count(),
+                config.mem_size_mib(),
+                config.smt(),
+                config.track_dirty_pages(),
+                machine_config_huge_pages_name(config.huge_pages()),
+                config.cpu_template().map(machine_config_cpu_template_name),
+            )
+        }
         Ok(
             VmmData::Empty
             | VmmData::VmmVersion(_)
@@ -1625,13 +1654,19 @@ fn pmem_token_bucket_response_from_runtime(config: PmemTokenBucketConfig) -> Tok
 }
 
 fn machine_config_response_from_runtime(config: MachineConfig) -> MachineConfigResponse {
-    MachineConfigResponse::new(
+    let response = MachineConfigResponse::new(
         config.vcpu_count(),
         config.mem_size_mib(),
         config.smt(),
         config.track_dirty_pages(),
         machine_config_huge_pages_name(config.huge_pages()),
-    )
+    );
+    match config.cpu_template() {
+        Some(cpu_template) => {
+            response.with_cpu_template(machine_config_cpu_template_name(cpu_template))
+        }
+        None => response,
+    }
 }
 
 fn boot_source_response_from_runtime(config: &BootSourceConfig) -> BootSourceResponse {
@@ -1858,6 +1893,18 @@ fn machine_config_huge_pages_name(huge_pages: RuntimeMachineConfigHugePages) -> 
     match huge_pages {
         RuntimeMachineConfigHugePages::None => "None",
         RuntimeMachineConfigHugePages::TwoM => "2M",
+    }
+}
+
+fn machine_config_cpu_template_name(cpu_template: RuntimeMachineConfigCpuTemplate) -> &'static str {
+    match cpu_template {
+        RuntimeMachineConfigCpuTemplate::C3 => "C3",
+        RuntimeMachineConfigCpuTemplate::T2 => "T2",
+        RuntimeMachineConfigCpuTemplate::T2S => "T2S",
+        RuntimeMachineConfigCpuTemplate::T2CL => "T2CL",
+        RuntimeMachineConfigCpuTemplate::T2A => "T2A",
+        RuntimeMachineConfigCpuTemplate::V1N1 => "V1N1",
+        RuntimeMachineConfigCpuTemplate::None => "None",
     }
 }
 
@@ -4103,7 +4150,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_cpu_template_faults_do_not_mutate_vmm_state_over_socket() {
+    fn machine_v1n1_is_visible_and_start_gated_while_x86_template_faults_preserve_it() {
         let mut vmm = test_controller();
         let body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
         let request = format!(
@@ -4115,21 +4162,44 @@ mod tests {
             bangbang_api::http::StatusCode::NoContent
         );
 
-        let unsupported_put_body = r#"{"vcpu_count":4,"mem_size_mib":512,"cpu_template":"V1N1"}"#;
-        let unsupported_put_request = format!(
-            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{unsupported_put_body}",
-            unsupported_put_body.len()
+        let v1n1_body = r#"{"vcpu_count":4,"mem_size_mib":512,"cpu_template":"V1N1"}"#;
+        let v1n1_request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{v1n1_body}",
+            v1n1_body.len()
         );
 
-        let response = request_over_socket(&mut vmm, "mct-put", &unsupported_put_request);
+        let response = request_over_socket(&mut vmm, "mct-put", &v1n1_request);
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(vmm.machine_config().vcpu_count(), 4);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 512);
+        assert_eq!(
+            vmm.machine_config().cpu_template(),
+            Some(bangbang_runtime::machine::MachineConfigCpuTemplate::V1N1)
+        );
+        let machine = request_over_socket(
+            &mut vmm,
+            "mct-get",
+            "GET /machine-config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(machine.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(machine.contains(r#""cpu_template":"V1N1""#));
+
+        let boot_body = r#"{"kernel_image_path":"/tmp/vmlinux"}"#;
+        let boot_request = request_with_body("PUT", "/boot-source", boot_body);
         assert!(
-            response.contains(r#"{"fault_message":"machine cpu_template V1N1 is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"}"#)
+            request_over_socket(&mut vmm, "mct-boot", &boot_request)
+                .starts_with("HTTP/1.1 204 No Content\r\n")
         );
-        assert_eq!(vmm.machine_config().vcpu_count(), 2);
-        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
-        assert_eq!(vmm.machine_config().cpu_template(), None);
+        let start = put_action_over_socket(&mut vmm, "mct-start", "InstanceStart");
+        assert!(start.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(start.contains(
+            r#"{"fault_message":"machine cpu_template V1N1 requires a Neoverse V1 source model that Apple Silicon/HVF cannot represent"}"#
+        ));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
 
         let unsupported_patch_body = r#"{"mem_size_mib":512,"cpu_template":"T2A"}"#;
         let unsupported_patch_request = format!(
@@ -4143,9 +4213,12 @@ mod tests {
         assert!(
             response.contains(r#"{"fault_message":"machine cpu_template T2A is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"}"#)
         );
-        assert_eq!(vmm.machine_config().vcpu_count(), 2);
-        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
-        assert_eq!(vmm.machine_config().cpu_template(), None);
+        assert_eq!(vmm.machine_config().vcpu_count(), 4);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 512);
+        assert_eq!(
+            vmm.machine_config().cpu_template(),
+            Some(bangbang_runtime::machine::MachineConfigCpuTemplate::V1N1)
+        );
     }
 
     #[test]
@@ -7429,7 +7502,63 @@ mod tests {
     }
 
     #[test]
-    fn not_started_state_classifies_custom_cpu_config_without_mutating_or_leaking_values() {
+    fn not_started_state_stores_supported_cpu_config_and_redacts_unsupported_inputs() {
+        let supported_body =
+            r#"{"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b10100101"}]}"#;
+        let mut supported = test_controller();
+        let response = request_over_socket(
+            &mut supported,
+            "ccr-supported",
+            &request_with_body("PUT", "/cpu-config", supported_body),
+        );
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(supported.has_custom_cpu_template());
+        assert_eq!(supported.machine_config().cpu_template(), None);
+        let vm_config = request_over_socket(
+            &mut supported,
+            "ccr-supported-vm",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(vm_config.starts_with("HTTP/1.1 200 OK\r\n"));
+        for raw_value in ["0x603000000013c020", "0b10100101"] {
+            assert!(!response.contains(raw_value));
+            assert!(!vm_config.contains(raw_value));
+        }
+        let v1n1 = request_with_body(
+            "PUT",
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"}"#,
+        );
+        assert!(
+            request_over_socket(&mut supported, "ccr-v1n1", &v1n1)
+                .starts_with("HTTP/1.1 204 No Content\r\n")
+        );
+        assert!(!supported.has_custom_cpu_template());
+        assert_eq!(
+            supported.machine_config().cpu_template(),
+            Some(bangbang_runtime::machine::MachineConfigCpuTemplate::V1N1)
+        );
+        assert!(
+            request_over_socket(
+                &mut supported,
+                "ccr-replace",
+                &request_with_body("PUT", "/cpu-config", supported_body),
+            )
+            .starts_with("HTTP/1.1 204 No Content\r\n")
+        );
+        assert!(supported.has_custom_cpu_template());
+        assert_eq!(supported.machine_config().cpu_template(), None);
+        assert!(
+            request_over_socket(
+                &mut supported,
+                "ccr-clear",
+                &request_with_body("PUT", "/cpu-config", "{}"),
+            )
+            .starts_with("HTTP/1.1 204 No Content\r\n")
+        );
+        assert!(!supported.has_custom_cpu_template());
+        assert_eq!(supported.machine_config().cpu_template(), None);
+
         for (socket_name, body, expected_fault, raw_values) in [
             (
                 "cck",
@@ -7439,21 +7568,21 @@ mod tests {
             ),
             (
                 "ccr",
-                r#"{"reg_modifiers":[{"addr":"0x0030000000000000","bitmap":"0b10100101"}]}"#,
-                r#"{"fault_message":"cpu-config reg_modifiers have no safe Firecracker-equivalent feature configuration on arm64 HVF"}"#,
-                &["0x0030000000000000", "0b10100101"][..],
+                r#"{"reg_modifiers":[{"addr":"0x603000000013c021","bitmap":"0b10100101"}]}"#,
+                r#"{"fault_message":"cpu-config reg_modifiers contains a register outside the supported arm64 HVF identification-register profile"}"#,
+                &["0x603000000013c021", "0b10100101"][..],
             ),
             (
                 "ccf",
-                r#"{"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
+                r#"{"vcpu_features":[{"index":6,"bitmap":"0b11010011"}]}"#,
                 r#"{"fault_message":"cpu-config vcpu_features are KVM vCPU-init-specific and are not supported on arm64 HVF"}"#,
-                &["31415926", "0b11010011"][..],
+                &["0b11010011"][..],
             ),
             (
                 "ccm",
-                r#"{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":31415926,"bitmap":"0b11010011"}]}"#,
-                r#"{"fault_message":"mixed cpu-config categories are KVM-specific and are not supported on arm64 HVF"}"#,
-                &["4294967295", "31415926", "0b11010011"][..],
+                r#"{"kvm_capabilities":["4294967295"],"vcpu_features":[{"index":6,"bitmap":"0b11010011"}]}"#,
+                r#"{"fault_message":"mixed cpu-config categories include KVM-specific or unsupported inputs on arm64 HVF"}"#,
+                &["4294967295", "0b11010011"][..],
             ),
         ] {
             let mut vmm = test_controller();

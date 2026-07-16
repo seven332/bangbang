@@ -7591,6 +7591,9 @@ pub enum HvfArm64BootSessionError {
     StartTopology {
         source: HvfVcpuTopologyError,
     },
+    CpuTemplate {
+        source: crate::cpu_template::HvfArm64CpuTemplateError,
+    },
     PowerTopology,
     RunCoordinator {
         source: HvfVcpuRunCoordinatorError,
@@ -7663,6 +7666,9 @@ impl fmt::Display for HvfArm64BootSessionError {
             Self::StartTopology { source } => {
                 write!(f, "failed to start HVF vCPU topology: {source}")
             }
+            Self::CpuTemplate { source } => {
+                write!(f, "failed to apply HVF arm64 CPU template: {source}")
+            }
             Self::PowerTopology => f.write_str("failed to initialize HVF vCPU power topology"),
             Self::RunCoordinator { source } => {
                 write!(f, "failed to initialize HVF vCPU run coordinator: {source}")
@@ -7727,6 +7733,7 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::AllocateInterruptLine { source, .. } => Some(source),
             Self::StartRunner { source } => Some(source),
             Self::StartTopology { source } => Some(source),
+            Self::CpuTemplate { source } => Some(source),
             Self::RunCoordinator { source } => Some(source),
             Self::StartBlockRetryWakeupScheduler { source } => Some(source),
             Self::StartPmemRetryWakeupScheduler { source } => Some(source),
@@ -8014,6 +8021,9 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         crate::cache::HvfArm64CacheTopologyError,
     >,
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
+    let cpu_template = controller
+        .custom_cpu_template()
+        .map(crate::cpu_template::PreparedHvfArm64CpuTemplate::from_runtime);
     let prepared_cache = prepare_cache(controller.machine_config().vcpu_count())
         .map_err(|source| HvfArm64BootSessionError::CacheTopology { source })?;
     let (cache_source, cache_hierarchy) = prepared_cache.into_parts();
@@ -8048,6 +8058,11 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     let mpidrs = topology.mpidrs().to_vec();
     let power = PsciCpuPowerCoordinator::new(&mpidrs)
         .map_err(|_| HvfArm64BootSessionError::PowerTopology)?;
+    if let Some(template) = cpu_template.as_ref() {
+        topology
+            .apply_arm64_cpu_template(template)
+            .map_err(|source| HvfArm64BootSessionError::CpuTemplate { source })?;
+    }
     let runtime_serial = config
         .serial_device
         .zip(interrupt_lines.serial)

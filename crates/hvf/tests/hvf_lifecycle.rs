@@ -4717,6 +4717,78 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn applies_and_verifies_canonical_arm64_cpu_template_on_two_hvf_vcpus() {
+    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::cpu::{
+        CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigInput,
+        KVM_REG_ARM64_ID_AA64ISAR0_EL1, KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+        KVM_REG_ARM64_ID_AA64MMFR2_EL1, KVM_REG_ARM64_ID_AA64PFR0_EL1,
+    };
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("cpu-template-kernel", &image)
+        .expect("temporary CPU-template kernel should be created");
+    let modifier = |id, filter, value| {
+        CpuConfigArmRegisterModifier::new(id, CpuConfigArmRegisterWidth::U64, filter, value)
+    };
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 16)))
+        .expect("two-vCPU machine config should store");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("boot source config should store");
+    controller
+        .handle_action(VmmAction::PutCpuConfig(CpuConfigInput::new(
+            Vec::new(),
+            vec![
+                modifier(KVM_REG_ARM64_ID_AA64PFR0_EL1, 0x000f_000f_0000_0000, 0),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64ISAR0_EL1,
+                    0xf0ff_0fff_0000_f000,
+                    0x1000,
+                ),
+                modifier(
+                    KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+                    0x00ff_f000_00ff_f00f,
+                    0x0010_0001,
+                ),
+                modifier(KVM_REG_ARM64_ID_AA64MMFR2_EL1, 0x0000_000f_0000_0000, 0),
+            ],
+            Vec::new(),
+        )))
+        .expect("canonical CPU template should store");
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    );
+
+    let mut session = OwnedHvfArm64BootSession::new(&controller, config)
+        .expect("canonical template should write and read back on both HVF vCPUs");
+    session
+        .shutdown()
+        .expect("CPU-template session should shut down cleanly");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn owned_hvf_arm64_boot_session_cleans_up_after_prepare_error() {
     use bangbang_hvf::{
         HvfArm64BootSessionConfig, HvfArm64BootSessionError, OwnedHvfArm64BootSession,

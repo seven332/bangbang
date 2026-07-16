@@ -9,6 +9,10 @@ use bangbang_runtime::BackendError;
 use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
 
 use crate::backend::HvfBackend;
+use crate::cpu_template::{
+    HvfArm64CpuTemplateRegister, HvfArm64CpuTemplateTarget, HvfArm64CpuTemplateVcpuError,
+    apply_cpu_template_targets_with, read_cpu_template_baseline_with,
+};
 use crate::exit::{
     HvfHvcExit, HvfResolvedMmioAccess, HvfSys64Direction, HvfSys64Exit, HvfSys64Register,
     HvfVcpuExit, HvfVcpuExitResolveError,
@@ -106,6 +110,8 @@ const MPIDR_CONFIGURATION_AFTER_RUN_MESSAGE: &str =
     "vCPU runner MPIDR affinity cannot be configured after execution starts";
 const CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has core register operation in flight";
+const CPU_TEMPLATE_AFTER_RUN_MESSAGE: &str =
+    "vCPU runner CPU-template registers cannot change after execution starts";
 const TIMER_OPERATION_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has timer operation in flight";
 const INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has interrupt operation in flight";
@@ -151,6 +157,7 @@ type RunnerState = Arc<Mutex<RunnerHandleState>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfVcpuRunnerError {
     Backend(BackendError),
+    CpuTemplate(HvfArm64CpuTemplateVcpuError),
     Gic(HvfGicError),
     GicIccRegisterRestore(HvfArm64GicIccRegisterRestoreError),
     DebugTrapRestore(HvfArm64VcpuDebugTrapRestoreError),
@@ -634,6 +641,7 @@ impl fmt::Display for HvfVcpuRunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Backend(err) => write!(f, "{err}"),
+            Self::CpuTemplate(err) => write!(f, "{err}"),
             Self::Gic(err) => write!(f, "{err}"),
             Self::GicIccRegisterRestore(err) => write!(f, "{err}"),
             Self::DebugTrapRestore(err) => write!(f, "{err}"),
@@ -709,6 +717,7 @@ impl std::error::Error for HvfVcpuRunnerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(err) => Some(err),
+            Self::CpuTemplate(err) => Some(err),
             Self::Gic(err) => Some(err),
             Self::GicIccRegisterRestore(err) => Some(err),
             Self::DebugTrapRestore(err) => Some(err),
@@ -1139,6 +1148,16 @@ enum RunnerCommand {
     RestoreArm64SnapshotV1State {
         admission: InFlightSnapshotCapture,
         state: Box<HvfArm64SnapshotV1Restore>,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
+    ReadArm64CpuTemplateBaseline {
+        admission: InFlightCoreRegisterOperation,
+        registers: Vec<HvfArm64CpuTemplateRegister>,
+        response_sender: mpsc::Sender<Result<Vec<u64>, HvfVcpuRunnerError>>,
+    },
+    ApplyArm64CpuTemplateTargets {
+        admission: InFlightCoreRegisterOperation,
+        targets: Vec<HvfArm64CpuTemplateTarget>,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     CaptureArm64GeneralRegisterState {
@@ -3079,6 +3098,30 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
+    pub(crate) fn read_arm64_cpu_template_baseline(
+        &self,
+        registers: &[HvfArm64CpuTemplateRegister],
+    ) -> Result<Vec<u64>, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_cpu_template_baseline_read(registers.to_vec(), response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    pub(crate) fn apply_arm64_cpu_template_targets(
+        &self,
+        targets: &[HvfArm64CpuTemplateTarget],
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_cpu_template_target_apply(targets.to_vec(), response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
     /// Capture every native-v1 vCPU, timer, and interrupt component under one
     /// owner-thread admission window.
     pub fn capture_arm64_snapshot_v1_state(
@@ -4919,6 +4962,50 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
     }
 
+    fn start_arm64_cpu_template_baseline_read(
+        &self,
+        registers: Vec<HvfArm64CpuTemplateRegister>,
+        response_sender: mpsc::Sender<Result<Vec<u64>, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_cpu_template_operation(
+            |admission, response_sender| RunnerCommand::ReadArm64CpuTemplateBaseline {
+                admission,
+                registers,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_arm64_cpu_template_target_apply(
+        &self,
+        targets: Vec<HvfArm64CpuTemplateTarget>,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.start_cpu_template_operation(
+            |admission, response_sender| RunnerCommand::ApplyArm64CpuTemplateTargets {
+                admission,
+                targets,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_cpu_template_operation<T>(
+        &self,
+        command: impl FnOnce(
+            InFlightCoreRegisterOperation,
+            mpsc::Sender<Result<T, HvfVcpuRunnerError>>,
+        ) -> RunnerCommand,
+        response_sender: mpsc::Sender<Result<T, HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let admission = self.reserve_core_register_operation_with(true)?;
+        self.command_sender
+            .send(command(admission, response_sender))
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
+    }
+
     fn reserve_snapshot_capture(&self) -> Result<InFlightSnapshotCapture, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
@@ -5550,6 +5637,13 @@ impl<'vm> HvfVcpuRunner<'vm> {
     fn reserve_core_register_operation(
         &self,
     ) -> Result<InFlightCoreRegisterOperation, HvfVcpuRunnerError> {
+        self.reserve_core_register_operation_with(false)
+    }
+
+    fn reserve_core_register_operation_with(
+        &self,
+        require_unrun: bool,
+    ) -> Result<InFlightCoreRegisterOperation, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -5560,6 +5654,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
             ));
         }
         ensure_no_pending_psci_call(&state)?;
+        if require_unrun && state.run_started {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                CPU_TEMPLATE_AFTER_RUN_MESSAGE,
+            ));
+        }
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
@@ -6839,6 +6938,33 @@ fn run_runner_thread<C, V>(
                 admission.release();
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::ReadArm64CpuTemplateBaseline {
+                mut admission,
+                registers,
+                response_sender,
+            } => {
+                let result = read_cpu_template_baseline_with(&registers, |register| {
+                    vcpu.read_system_register(register)
+                })
+                .map_err(HvfVcpuRunnerError::CpuTemplate);
+                admission.release();
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::ApplyArm64CpuTemplateTargets {
+                mut admission,
+                targets,
+                response_sender,
+            } => {
+                let result = apply_cpu_template_targets_with(
+                    &targets,
+                    &mut vcpu,
+                    |vcpu, register, value| vcpu.write_system_register(register, value),
+                    |vcpu, register| vcpu.read_system_register(register),
+                )
+                .map_err(HvfVcpuRunnerError::CpuTemplate);
+                admission.release();
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::CaptureArm64GeneralRegisterState {
                 mut admission,
                 response_sender,
@@ -7803,7 +7929,11 @@ fn run_once_and_handle_mmio_coordinated_on_runner_thread(
             let access = exit
                 .decode_mmio_access()
                 .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
-            let mut dispatcher = lock_shared_mmio_dispatcher(dispatcher)?;
+            // A coordinated topology deliberately runs every online vCPU at
+            // once. Two members may therefore exit for MMIO together; serialize
+            // those short dispatch sections instead of treating ordinary
+            // cross-vCPU contention as a terminal runner error.
+            let mut dispatcher = lock_shared_mmio_dispatcher_coordinated(dispatcher)?;
             let access = access
                 .resolve(dispatcher.bus())
                 .map_err(|source| HvfVcpuExitResolveError::MmioResolve { source })?;
@@ -8073,6 +8203,14 @@ fn lock_shared_mmio_dispatcher(
             HvfVcpuRunnerError::InvalidState(MMIO_DISPATCHER_POISONED_MESSAGE)
         }
     })
+}
+
+fn lock_shared_mmio_dispatcher_coordinated(
+    dispatcher: &SharedMmioDispatcher,
+) -> Result<MutexGuard<'_, MmioDispatcher>, HvfVcpuRunnerError> {
+    dispatcher
+        .lock()
+        .map_err(|_| HvfVcpuRunnerError::InvalidState(MMIO_DISPATCHER_POISONED_MESSAGE))
 }
 
 fn join_runner_thread(thread: Option<JoinHandle<()>>) -> Result<(), HvfVcpuRunnerError> {
@@ -34593,6 +34731,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn coordinated_mmio_dispatcher_lock_waits_for_another_member() {
+        let dispatcher = shared_dispatcher();
+        let dispatcher_guard = dispatcher
+            .lock()
+            .expect("dispatcher lock should not be poisoned");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let dispatcher = Arc::clone(&dispatcher);
+            scope.spawn(move || {
+                started_sender
+                    .send(())
+                    .expect("coordinated lock worker should announce entry");
+                let result =
+                    super::lock_shared_mmio_dispatcher_coordinated(&dispatcher).map(|_guard| ());
+                result_sender
+                    .send(result)
+                    .expect("coordinated lock worker should report completion");
+            });
+
+            started_receiver
+                .recv()
+                .expect("coordinated lock worker should enter");
+            assert_eq!(
+                result_receiver.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            drop(dispatcher_guard);
+            assert_eq!(
+                result_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("coordinated lock should complete after release"),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
     fn concurrent_run_once_and_handle_mmio_is_rejected_without_queueing() {
         let (runner, entered_run_receiver, destroyed_receiver) = start_fake_runner();
 
@@ -35939,6 +36116,274 @@ pub(crate) mod tests {
                 "retained-vtimer test vCPU must not execute the guest"
             )))
         ));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CpuTemplateRunnerEvent {
+        Read(HvfSystemRegister),
+        Write(HvfSystemRegister, u64),
+    }
+
+    struct CpuTemplateRunnerTestVcpu {
+        raw_vcpu: crate::ffi::HvVcpu,
+        values: Vec<(HvfSystemRegister, u64)>,
+        events_sender: mpsc::Sender<CpuTemplateRunnerEvent>,
+        fail_next_write: bool,
+        mismatch_next_readback: bool,
+        last_write: Option<HvfSystemRegister>,
+        block_next_read: bool,
+        read_entered_sender: Option<mpsc::Sender<()>>,
+        read_release_receiver: Option<mpsc::Receiver<()>>,
+    }
+
+    impl RunnerVcpu for CpuTemplateRunnerTestVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(self.raw_vcpu)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+        ) -> Result<u64, BackendError> {
+            let _ = self
+                .events_sender
+                .send(CpuTemplateRunnerEvent::Read(register));
+            if self.block_next_read {
+                self.block_next_read = false;
+                if let Some(sender) = &self.read_entered_sender {
+                    let _ = sender.send(());
+                }
+                if let Some(receiver) = &self.read_release_receiver {
+                    receiver.recv().map_err(|_| {
+                        BackendError::InvalidState("test CPU-template read release closed")
+                    })?;
+                }
+            }
+            let value = self
+                .values
+                .iter()
+                .find_map(|(candidate, value)| (*candidate == register).then_some(*value))
+                .ok_or(BackendError::InvalidState(
+                    "test CPU-template register is unset",
+                ))?;
+            if self.mismatch_next_readback && self.last_write == Some(register) {
+                self.mismatch_next_readback = false;
+                self.last_write = None;
+                Ok(value ^ 1)
+            } else {
+                self.last_write = None;
+                Ok(value)
+            }
+        }
+
+        fn write_system_register(
+            &mut self,
+            register: HvfSystemRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            let _ = self
+                .events_sender
+                .send(CpuTemplateRunnerEvent::Write(register, value));
+            if self.fail_next_write {
+                self.fail_next_write = false;
+                return Err(BackendError::InvalidState(
+                    "injected CPU-template write failure",
+                ));
+            }
+            let destination = self
+                .values
+                .iter_mut()
+                .find_map(|(candidate, current)| (*candidate == register).then_some(current))
+                .ok_or(BackendError::InvalidState(
+                    "test CPU-template register is unset",
+                ))?;
+            *destination = value;
+            self.last_write = Some(register);
+            Ok(())
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    fn start_cpu_template_test_runner(vcpu: CpuTemplateRunnerTestVcpu) -> HvfVcpuRunner<'static> {
+        let started = spawn_runner_thread(move || Ok::<_, BackendError>(vcpu))
+            .expect("CPU-template test runner should start");
+        HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("CPU-template test runner should initialize")
+    }
+
+    fn cpu_template_register(
+        register: HvfSystemRegister,
+    ) -> crate::cpu_template::HvfArm64CpuTemplateRegister {
+        crate::cpu_template::HvfArm64CpuTemplateRegister::from_system_register(register)
+    }
+
+    fn cpu_template_target(
+        register: HvfSystemRegister,
+        value: u64,
+    ) -> crate::cpu_template::HvfArm64CpuTemplateTarget {
+        crate::cpu_template::HvfArm64CpuTemplateTarget::new(cpu_template_register(register), value)
+    }
+
+    fn cpu_template_test_vcpu(
+        events_sender: mpsc::Sender<CpuTemplateRunnerEvent>,
+    ) -> CpuTemplateRunnerTestVcpu {
+        CpuTemplateRunnerTestVcpu {
+            raw_vcpu: 71,
+            values: vec![
+                (HvfSystemRegister::ID_AA64PFR0_EL1, 0x1111),
+                (HvfSystemRegister::ID_AA64ISAR1_EL1, 0x2222),
+            ],
+            events_sender,
+            fail_next_write: false,
+            mismatch_next_readback: false,
+            last_write: None,
+            block_next_read: false,
+            read_entered_sender: None,
+            read_release_receiver: None,
+        }
+    }
+
+    #[test]
+    fn cpu_template_runner_reads_only_requested_registers_and_applies_with_immediate_readback() {
+        let (events_sender, events_receiver) = mpsc::channel();
+        let runner = start_cpu_template_test_runner(cpu_template_test_vcpu(events_sender));
+        let registers = [cpu_template_register(HvfSystemRegister::ID_AA64ISAR1_EL1)];
+        let targets = [cpu_template_target(
+            HvfSystemRegister::ID_AA64ISAR1_EL1,
+            0x3333,
+        )];
+
+        assert_eq!(
+            runner.read_arm64_cpu_template_baseline(&registers),
+            Ok(vec![0x2222])
+        );
+        assert_eq!(runner.apply_arm64_cpu_template_targets(&targets), Ok(()));
+        assert_eq!(
+            events_receiver.try_iter().collect::<Vec<_>>(),
+            [
+                CpuTemplateRunnerEvent::Read(HvfSystemRegister::ID_AA64ISAR1_EL1),
+                CpuTemplateRunnerEvent::Write(HvfSystemRegister::ID_AA64ISAR1_EL1, 0x3333),
+                CpuTemplateRunnerEvent::Read(HvfSystemRegister::ID_AA64ISAR1_EL1),
+            ]
+        );
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn cpu_template_runner_releases_admission_after_write_and_readback_failures() {
+        for mismatch_readback in [false, true] {
+            let (events_sender, _events_receiver) = mpsc::channel();
+            let mut vcpu = cpu_template_test_vcpu(events_sender);
+            vcpu.fail_next_write = !mismatch_readback;
+            vcpu.mismatch_next_readback = mismatch_readback;
+            let runner = start_cpu_template_test_runner(vcpu);
+            let target = cpu_template_target(HvfSystemRegister::ID_AA64PFR0_EL1, 0x4444);
+
+            let first = runner.apply_arm64_cpu_template_targets(&[target]);
+            if mismatch_readback {
+                assert!(matches!(
+                    first,
+                    Err(HvfVcpuRunnerError::CpuTemplate(
+                        crate::cpu_template::HvfArm64CpuTemplateVcpuError::RegisterReadbackMismatch {
+                            completed_modifiers: 0,
+                        }
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    first,
+                    Err(HvfVcpuRunnerError::CpuTemplate(
+                        crate::cpu_template::HvfArm64CpuTemplateVcpuError::RegisterWrite {
+                            completed_modifiers: 0,
+                            ..
+                        }
+                    ))
+                ));
+            }
+            assert_eq!(runner.apply_arm64_cpu_template_targets(&[target]), Ok(()));
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn cpu_template_runner_conflict_is_atomic_and_retryable() {
+        let (events_sender, _events_receiver) = mpsc::channel();
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let mut vcpu = cpu_template_test_vcpu(events_sender);
+        vcpu.block_next_read = true;
+        vcpu.read_entered_sender = Some(entered_sender);
+        vcpu.read_release_receiver = Some(release_receiver);
+        let runner = start_cpu_template_test_runner(vcpu);
+        let register = cpu_template_register(HvfSystemRegister::ID_AA64PFR0_EL1);
+        let target = cpu_template_target(HvfSystemRegister::ID_AA64PFR0_EL1, 0x5555);
+
+        thread::scope(|scope| {
+            let read = scope.spawn(|| runner.read_arm64_cpu_template_baseline(&[register]));
+            entered_receiver
+                .recv()
+                .expect("baseline read should enter the owner thread");
+            assert_eq!(
+                runner.apply_arm64_cpu_template_targets(&[target]),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
+                ))
+            );
+            release_sender
+                .send(())
+                .expect("blocked baseline read should release");
+            assert_eq!(
+                read.join().expect("baseline caller should not panic"),
+                Ok(vec![0x1111])
+            );
+        });
+        assert_eq!(runner.apply_arm64_cpu_template_targets(&[target]), Ok(()));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn cpu_template_runner_rejects_reads_and_writes_after_first_execution() {
+        let (events_sender, _events_receiver) = mpsc::channel();
+        let runner = start_cpu_template_test_runner(cpu_template_test_vcpu(events_sender));
+        let register = cpu_template_register(HvfSystemRegister::ID_AA64PFR0_EL1);
+        let target = cpu_template_target(HvfSystemRegister::ID_AA64PFR0_EL1, 0x5555);
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        assert_eq!(
+            runner.read_arm64_cpu_template_baseline(&[register]),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CPU_TEMPLATE_AFTER_RUN_MESSAGE,
+            ))
+        );
+        assert_eq!(
+            runner.apply_arm64_cpu_template_targets(&[target]),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::CPU_TEMPLATE_AFTER_RUN_MESSAGE,
+            ))
+        );
         runner.shutdown().expect("runner should shut down");
     }
 }

@@ -993,11 +993,89 @@
     {
       "id": "api-property:CpuConfig.kvm_capabilities",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuConfig.kvm_capabilities.",
+      "summary": "Retain bounded ordered add/remove capability numbers with strict duplicate/redaction checks, then return a stable platform fault because public arm64 Hypervisor.framework has no identity-preserving KVM capability-number namespace.",
       "source_refs": [
         "api-property:CpuConfig.kvm_capabilities"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1092-L1123"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/builder.rs#L168-L177"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L34-L48"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+          }
+        ],
+        "alternatives": [
+          "Inventing a private mapping from Linux KVM capability numbers to unrelated HVF features would not preserve the requested identities.",
+          "Passing numeric KVM capability IDs through to another process or Linux sidecar would configure a different backend and change bangbang's native HVF boundary.",
+          "Silently accepting or discarding capability requirements would report success while leaving the requested prerequisite unenforced."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/cpu.rs",
+            "anchor": "CpuConfigError::KvmCapabilitiesUnsupported"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/api/src/http.rs",
+            "anchor": "retains_ordered_cpu_config_values_for_every_register_width"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/api_server.rs",
+            "anchor": "not_started_state_stores_supported_cpu_config_and_redacts_unsupported_inputs"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/lib.rs",
+            "anchor": "put_cpu_config_stores_supported_template_and_rejects_kvm_inputs"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+            "anchor": "Request model and bounds"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Arm64 CPU-Template Subset"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Firecracker-shaped custom CPU-template values"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1393#issuecomment-4993017798"
+        }
+      }
     },
     {
       "id": "api-property:CpuConfig.msr_modifiers",
@@ -1020,11 +1098,89 @@
     {
       "id": "api-property:CpuConfig.vcpu_features",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuConfig.vcpu_features.",
+      "summary": "Retain bounded ordered seven-word-domain vCPU feature modifiers with strict index/bitmap/duplicate/redaction checks, then return a stable platform fault because HVF has no identity-preserving kvm_vcpu_init.features array.",
       "source_refs": [
         "api-property:CpuConfig.vcpu_features"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1092-L1123"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/vcpu.rs#L202-L216"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L89-L96"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_set_sys_reg%28_%3A_%3A_%3A%29"
+          }
+        ],
+        "alternatives": [
+          "Inventing an index mapping from kvm_vcpu_init.features words to unrelated HVF feature or register APIs would not preserve the requested ABI.",
+          "Reinterpreting feature-word masks as architectural register masks would change their meaning and can create an unsafe guest feature view.",
+          "Silently accepting or discarding feature words would report success while leaving the requested vCPU-init behavior unenforced."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/cpu.rs",
+            "anchor": "CpuConfigError::VcpuFeaturesUnsupported"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/api/src/http.rs",
+            "anchor": "enforces_cpu_config_collection_and_feature_bounds"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/api_server.rs",
+            "anchor": "not_started_state_stores_supported_cpu_config_and_redacts_unsupported_inputs"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/lib.rs",
+            "anchor": "put_cpu_config_stores_supported_template_and_rejects_kvm_inputs"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+            "anchor": "Request model and bounds"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Arm64 CPU-Template Subset"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Firecracker-shaped custom CPU-template values"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1393#issuecomment-4993017798"
+        }
+      }
     },
     {
       "id": "api-property:CpuidLeafModifier.flags",
@@ -1398,11 +1554,85 @@
     {
       "id": "api-property:MachineConfiguration.cpu_template",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MachineConfiguration.cpu_template.",
+      "summary": "Accept and clear Firecracker's default None policy, retain V1N1 as replaceable GET-visible pending configuration, and reject execution before backend construction because Apple Silicon cannot satisfy its documented Neoverse V1 source contract; x86 static names remain foreign policies.",
       "source_refs": [
         "api-property:MachineConfiguration.cpu_template"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/cpu_templates/cpu-templates.md#L55-L96"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1075-L1090"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_set_sys_reg%28_%3A_%3A_%3A%29"
+          }
+        ],
+        "alternatives": [
+          "Applying only Firecracker's four V1N1 masks cannot establish its complete unmasked Neoverse N1 identity on an unrelated Apple source model.",
+          "Inventing an Apple-to-N1 feature lattice or fingerprint would lack an authoritative pinned source and create a new portability contract.",
+          "Treating successful HVF writes and readback as proof of the documented Neoverse V1 source precondition confuses mechanical writability with CPU-model compatibility."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/machine.rs",
+            "anchor": "MachineConfigError::V1N1SourceModelUnsupported"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/api_server.rs",
+            "anchor": "machine_v1n1_is_visible_and_start_gated_while_x86_template_faults_preserve_it"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/process_e2e.rs",
+            "anchor": "executable_gates_v1n1_at_start_and_rejects_other_machine_options_transactionally"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/lib.rs",
+            "anchor": "effective_v1n1_fails_before_executor_and_custom_replacement_can_retry_start"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+            "anchor": "Replacement and serialization"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Arm64 CPU-Template Subset"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Firecracker-shaped custom CPU-template values"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1393#issuecomment-4993017798"
+        }
+      }
     },
     {
       "id": "api-property:MachineConfiguration.huge_pages",
@@ -2204,20 +2434,176 @@
     {
       "id": "api-property:VcpuFeatures.bitmap",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property VcpuFeatures.bitmap.",
+      "summary": "Parse and retain the exact 32-bit filter/value bitmap with value redaction, then reject execution because its meaning is tied to the unavailable kvm_vcpu_init.features array.",
       "source_refs": [
         "api-property:VcpuFeatures.bitmap"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1197-L1210"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/vcpu.rs#L202-L216"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L89-L96"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_set_sys_reg%28_%3A_%3A_%3A%29"
+          }
+        ],
+        "alternatives": [
+          "Inventing an index mapping from kvm_vcpu_init.features words to unrelated HVF feature or register APIs would not preserve the requested ABI.",
+          "Reinterpreting feature-word masks as architectural register masks would change their meaning and can create an unsafe guest feature view.",
+          "Silently accepting or discarding feature words would report success while leaving the requested vCPU-init behavior unenforced."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/cpu.rs",
+            "anchor": "CpuConfigError::VcpuFeaturesUnsupported"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/api/src/http.rs",
+            "anchor": "enforces_cpu_config_collection_and_feature_bounds"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/api_server.rs",
+            "anchor": "not_started_state_stores_supported_cpu_config_and_redacts_unsupported_inputs"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/lib.rs",
+            "anchor": "put_cpu_config_stores_supported_template_and_rejects_kvm_inputs"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+            "anchor": "Request model and bounds"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Arm64 CPU-Template Subset"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Firecracker-shaped custom CPU-template values"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1393#issuecomment-4993017798"
+        }
+      }
     },
     {
       "id": "api-property:VcpuFeatures.index",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property VcpuFeatures.index.",
+      "summary": "Validate and retain the exact fixed seven-word feature index with duplicate/value redaction checks, then reject execution because HVF has no identity-preserving kvm_vcpu_init.features index domain.",
       "source_refs": [
         "api-property:VcpuFeatures.index"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1197-L1210"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/vcpu.rs#L202-L216"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L89-L96"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_set_sys_reg%28_%3A_%3A_%3A%29"
+          }
+        ],
+        "alternatives": [
+          "Inventing an index mapping from kvm_vcpu_init.features words to unrelated HVF feature or register APIs would not preserve the requested ABI.",
+          "Reinterpreting feature-word masks as architectural register masks would change their meaning and can create an unsafe guest feature view.",
+          "Silently accepting or discarding feature words would report success while leaving the requested vCPU-init behavior unenforced."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/cpu.rs",
+            "anchor": "CpuConfigError::VcpuFeaturesUnsupported"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/api/src/http.rs",
+            "anchor": "enforces_cpu_config_collection_and_feature_bounds"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/api_server.rs",
+            "anchor": "not_started_state_stores_supported_cpu_config_and_redacts_unsupported_inputs"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/lib.rs",
+            "anchor": "put_cpu_config_stores_supported_template_and_rejects_kvm_inputs"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+            "anchor": "Request model and bounds"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Arm64 CPU-Template Subset"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Firecracker-shaped custom CPU-template values"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1393#issuecomment-4993017798"
+        }
+      }
     },
     {
       "id": "api-property:Vm.state",
@@ -2348,11 +2734,85 @@
     {
       "id": "api-schema:CpuTemplate",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema CpuTemplate.",
+      "summary": "Implement the default None serialization and strict parsing while classifying every executable static name as unavailable on arm64 macOS/HVF: x86 names are foreign and V1N1 requires a Neoverse V1 source model.",
       "source_refs": [
         "api-schema:CpuTemplate"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/cpu_templates/cpu-templates.md#L55-L96"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1075-L1090"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_set_sys_reg%28_%3A_%3A_%3A%29"
+          }
+        ],
+        "alternatives": [
+          "Applying only Firecracker's four V1N1 masks cannot establish its complete unmasked Neoverse N1 identity on an unrelated Apple source model.",
+          "Inventing an Apple-to-N1 feature lattice or fingerprint would lack an authoritative pinned source and create a new portability contract.",
+          "Treating successful HVF writes and readback as proof of the documented Neoverse V1 source precondition confuses mechanical writability with CPU-model compatibility."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/machine.rs",
+            "anchor": "MachineConfigError::V1N1SourceModelUnsupported"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/api_server.rs",
+            "anchor": "machine_v1n1_is_visible_and_start_gated_while_x86_template_faults_preserve_it"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/process_e2e.rs",
+            "anchor": "executable_gates_v1n1_at_start_and_rejects_other_machine_options_transactionally"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/machine.rs",
+            "anchor": "classifies_x86_cpu_templates_as_deprecated_platform_policies"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+            "anchor": "Replacement and serialization"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Arm64 CPU-Template Subset"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Firecracker-shaped custom CPU-template values"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1393#issuecomment-4993017798"
+        }
+      }
     },
     {
       "id": "api-schema:CpuidLeafModifier",
@@ -2627,11 +3087,89 @@
     {
       "id": "api-schema:VcpuFeatures",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema VcpuFeatures.",
+      "summary": "Implement strict lossless index/bitmap parsing and redaction, then classify execution of the complete schema as unavailable because public HVF has no identity-preserving kvm_vcpu_init.features array.",
       "source_refs": [
         "api-schema:VcpuFeatures"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1197-L1210"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/vcpu.rs#L202-L216"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L89-L96"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_set_sys_reg%28_%3A_%3A_%3A%29"
+          }
+        ],
+        "alternatives": [
+          "Inventing an index mapping from kvm_vcpu_init.features words to unrelated HVF feature or register APIs would not preserve the requested ABI.",
+          "Reinterpreting feature-word masks as architectural register masks would change their meaning and can create an unsafe guest feature view.",
+          "Silently accepting or discarding feature words would report success while leaving the requested vCPU-init behavior unenforced."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/cpu.rs",
+            "anchor": "CpuConfigError::VcpuFeaturesUnsupported"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/api/src/http.rs",
+            "anchor": "enforces_cpu_config_collection_and_feature_bounds"
+          },
+          {
+            "kind": "local",
+            "path": "crates/bangbang/src/api_server.rs",
+            "anchor": "not_started_state_stores_supported_cpu_config_and_redacts_unsupported_inputs"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/lib.rs",
+            "anchor": "put_cpu_config_stores_supported_template_and_rejects_kvm_inputs"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+            "anchor": "Request model and bounds"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Arm64 CPU-Template Subset"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Firecracker-shaped custom CPU-template values"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1393#issuecomment-4993017798"
+        }
+      }
     },
     {
       "id": "api-schema:Vm",

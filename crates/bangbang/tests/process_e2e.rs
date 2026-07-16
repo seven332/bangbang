@@ -3880,7 +3880,7 @@ fn executable_machine_config_bounds_and_fault_precedence_are_transactional() {
 }
 
 #[test]
-fn executable_rejects_unsupported_machine_config_options_without_mutating() {
+fn executable_gates_v1n1_at_start_and_rejects_other_machine_options_transactionally() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let instance_id = test_dir.instance_id();
@@ -3893,13 +3893,55 @@ fn executable_rejects_unsupported_machine_config_options_without_mutating() {
     );
     assert_no_content_response(&put_response, "PUT /machine-config original");
 
+    let v1n1_response = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":4,"mem_size_mib":512,"cpu_template":"V1N1"}"#,
+    );
+    assert_no_content_response(&v1n1_response, "PUT /machine-config V1N1");
+    let v1n1_config = http_get(&socket_path, "/machine-config");
+    assert_ok_response(&v1n1_config, "GET /machine-config V1N1");
+    for expected in [
+        r#""vcpu_count":4"#,
+        r#""mem_size_mib":512"#,
+        r#""cpu_template":"V1N1""#,
+    ] {
+        assert_response_contains(&v1n1_config, expected, "GET /machine-config V1N1");
+    }
+
+    let kernel_path = test_dir.path().join("private-vmlinux");
+    let boot_body = format!(
+        r#"{{"kernel_image_path":{}}}"#,
+        json_string(path_text(&kernel_path))
+    );
+    assert_no_content_response(
+        &http_put_json(&socket_path, "/boot-source", &boot_body),
+        "PUT /boot-source before V1N1 start",
+    );
+    let start_response = http_put_json(
+        &socket_path,
+        "/actions",
+        r#"{"action_type":"InstanceStart"}"#,
+    );
+    assert_bad_request_response(&start_response, "PUT /actions effective V1N1");
+    assert_response_contains(
+        &start_response,
+        r#"{"fault_message":"machine cpu_template V1N1 requires a Neoverse V1 source model that Apple Silicon/HVF cannot represent"}"#,
+        "PUT /actions effective V1N1",
+    );
+    assert!(
+        !start_response.contains(path_text(&kernel_path)),
+        "V1N1 start fault must not expose the private boot path; response:\n{start_response}"
+    );
+
+    let clear_response = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":2,"mem_size_mib":256,"cpu_template":"None"}"#,
+    );
+    assert_no_content_response(&clear_response, "PUT /machine-config clear V1N1");
+
     for (request_name, method, body, expected_fault) in [
-        (
-            "PUT /machine-config cpu_template",
-            "PUT",
-            r#"{"vcpu_count":4,"mem_size_mib":512,"cpu_template":"V1N1"}"#,
-            r#"{"fault_message":"machine cpu_template V1N1 is a deprecated Firecracker AWS/Linux CPU policy and is not supported on arm64 HVF"}"#,
-        ),
         (
             "PATCH /machine-config cpu_template",
             "PATCH",

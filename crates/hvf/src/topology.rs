@@ -6,6 +6,7 @@ use bangbang_runtime::machine::MAX_SUPPORTED_VCPUS;
 use bangbang_runtime::mmio::MmioDispatcher;
 
 use crate::coordinator::{HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError};
+use crate::cpu_template::{HvfArm64CpuTemplateError, PreparedHvfArm64CpuTemplate};
 use crate::runner::{HvfVcpuMpidrAffinityStage, HvfVcpuRunner, HvfVcpuRunnerError};
 
 const MAX_ORDERED_MPIDR: u64 = MAX_SUPPORTED_VCPUS as u64 - 1;
@@ -302,6 +303,15 @@ impl<'vm> HvfVcpuTopology<'vm> {
     /// Return exact owner-thread-verified MPIDRs in topology order.
     pub fn mpidrs(&self) -> &[u64] {
         &self.mpidrs
+    }
+
+    /// Preflight and apply one custom arm64 CPU template to the complete,
+    /// unpublished owner-thread topology.
+    pub(crate) fn apply_arm64_cpu_template(
+        &self,
+        template: &PreparedHvfArm64CpuTemplate,
+    ) -> Result<(), HvfArm64CpuTemplateError> {
+        crate::cpu_template::apply_arm64_cpu_template(&self.runners, &self.mpidrs, template)
     }
 
     /// Consume this ordered topology into a concurrent bounded-run coordinator.
