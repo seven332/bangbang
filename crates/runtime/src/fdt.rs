@@ -6286,6 +6286,131 @@ mod tests {
     }
 
     #[test]
+    fn pci_host_rejects_malformed_overflowing_and_overlapping_ranges() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
+                msi: Some(test_msi()),
+                ..test_gic()
+            },
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let mut host = test_pci_host();
+        host.ecam.size = 0;
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::InvalidPciHostRange { name: "ECAM", .. })
+        ));
+
+        let mut host = test_pci_host();
+        host.bar64 = Arm64FdtRegion {
+            base: u64::MAX - 1,
+            size: 2,
+        };
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::InvalidPciHostRange {
+                name: "64-bit BAR",
+                ..
+            })
+        ));
+
+        let mut host = test_pci_host();
+        host.segment = 1;
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::InvalidPciHost {
+                reason: "only segment 0 is supported"
+            })
+        ));
+
+        let mut host = test_pci_host();
+        host.bus_end = 1;
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::InvalidPciHost {
+                reason: "only bus range 0 through 0 is supported"
+            })
+        ));
+
+        let mut host = test_pci_host();
+        host.ecam.size /= 2;
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::InvalidPciHost {
+                reason: "bus-0 ECAM size must be 1 MiB"
+            })
+        ));
+
+        let mut host = test_pci_host();
+        host.ecam_reservation.size /= 2;
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::InvalidPciHost {
+                reason: "ECAM reservation size must be 256 MiB"
+            })
+        ));
+
+        let mut host = test_pci_host();
+        host.ecam.base += 0x1000;
+        host.ecam_reservation.base += 0x1000;
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::InvalidPciHost {
+                reason: "ECAM base must be aligned to its 1 MiB bus window"
+            })
+        ));
+
+        let mut host = test_pci_host();
+        host.ecam.base += PCI_ECAM_BUS_ZERO_SIZE;
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::InvalidPciHost {
+                reason: "published ECAM window must begin the reserved configuration aperture"
+            })
+        ));
+
+        let mut host = test_pci_host();
+        host.bar32 = Arm64FdtRegion {
+            base: 0xffff_f000,
+            size: 0x2000,
+        };
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::InvalidPciHost {
+                reason: "32-bit BAR window exceeds the 32-bit address space"
+            })
+        ));
+
+        let mut host = test_pci_host();
+        host.bar32 = host.ecam_reservation;
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::PciHostRangesOverlap {
+                first: "32-bit BAR",
+                second: "ECAM reservation"
+            })
+        ));
+
+        let mut host = test_pci_host();
+        host.bar64 = config.gic.distributor;
+        assert!(matches!(
+            build_test_arm64_fdt_with_pci(&config, host),
+            Err(Arm64FdtError::PciHostRangeOverlapsGic {
+                name: "64-bit BAR",
+                gic: "distributor"
+            })
+        ));
+    }
+
+    #[test]
     fn no_pci_fdt_path_preserves_existing_bytes() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let config = test_config(
