@@ -3749,6 +3749,24 @@ mod tests {
     }
 
     #[test]
+    fn msi_free_fdt_bytes_match_the_pre_msi_baseline() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+
+        let bytes = build_test_arm64_fdt(&config).expect("MSI-free FDT should build");
+
+        // Golden CRC from the fixed-seed FDT emitted by the pre-MSI base
+        // commit b6dade5f67550301521169c4f691519a6858f6c8.
+        assert_eq!(crc64::crc64(0, &bytes), 7_530_829_099_057_997_742);
+    }
+
+    #[test]
     fn rejects_overlapping_gic_regions() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let config = Arm64FdtConfig {
