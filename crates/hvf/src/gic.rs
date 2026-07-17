@@ -3960,6 +3960,16 @@ mod tests {
 
     #[test]
     fn msi_signaler_serializes_sends_and_waits_before_deactivation() {
+        struct ReleaseBlockedMsiCallsOnDrop(mpsc::SyncSender<()>);
+
+        impl Drop for ReleaseBlockedMsiCallsOnDrop {
+            fn drop(&mut self) {
+                for _ in 0..2 {
+                    let _ = self.0.try_send(());
+                }
+            }
+        }
+
         struct BlockingMsiSignalApi {
             entered: mpsc::SyncSender<()>,
             releases: Mutex<mpsc::Receiver<()>>,
@@ -4003,6 +4013,9 @@ mod tests {
         let second_interrupt = allocator.allocate().expect("second MSI should allocate");
 
         std::thread::scope(|scope| {
+            // A failed ordering assertion must release any blocked fake host
+            // calls before the scope joins its threads during unwinding.
+            let _release_on_unwind = ReleaseBlockedMsiCallsOnDrop(release_sender.clone());
             let first_signaler = signaler.clone();
             let first_interrupt_ref = &first_interrupt;
             let first_send = scope.spawn(move || first_signaler.send(first_interrupt_ref));
