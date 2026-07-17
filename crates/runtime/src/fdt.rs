@@ -10,6 +10,10 @@ use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
     GuestMemoryRange, aarch64,
 };
+use crate::pci::{
+    Arm64PciAddressPlan, PCI_BUS_ZERO, PCI_ECAM_BUS_ZERO_SIZE, PCI_ECAM_RESERVED_SIZE,
+    PCI_SEGMENT_ZERO,
+};
 
 const ROOT_COMPATIBILITY: &str = "linux,dummy-virt";
 const GIC_PHANDLE: u32 = 1;
@@ -398,6 +402,13 @@ pub struct Arm64FdtRegion {
     pub size: u64,
 }
 
+const fn fdt_region_from_range(range: GuestMemoryRange) -> Arm64FdtRegion {
+    Arm64FdtRegion {
+        base: range.start().raw_value(),
+        size: range.size(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arm64FdtInterruptRange {
     pub base: u32,
@@ -408,6 +419,31 @@ pub struct Arm64FdtInterruptRange {
 pub struct Arm64FdtMsi {
     pub region: Arm64FdtRegion,
     pub interrupt_range: Arm64FdtInterruptRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64FdtPciHost {
+    pub segment: u16,
+    pub bus_start: u8,
+    pub bus_end: u8,
+    pub ecam: Arm64FdtRegion,
+    pub ecam_reservation: Arm64FdtRegion,
+    pub bar32: Arm64FdtRegion,
+    pub bar64: Arm64FdtRegion,
+}
+
+impl Arm64FdtPciHost {
+    pub fn from_address_plan(plan: Arm64PciAddressPlan) -> Self {
+        Self {
+            segment: PCI_SEGMENT_ZERO,
+            bus_start: PCI_BUS_ZERO,
+            bus_end: PCI_BUS_ZERO,
+            ecam: fdt_region_from_range(plan.ecam()),
+            ecam_reservation: fdt_region_from_range(plan.ecam_reservation()),
+            bar32: fdt_region_from_range(plan.bar32()),
+            bar64: fdt_region_from_range(plan.bar64()),
+        }
+    }
 }
 
 impl fmt::Debug for Arm64FdtMsi {
@@ -635,6 +671,31 @@ pub enum Arm64FdtError {
         other: &'static str,
     },
     GicMsiRegionOverlapsMemory,
+    InvalidPciHost {
+        reason: &'static str,
+    },
+    InvalidPciHostRange {
+        name: &'static str,
+        region: Arm64FdtRegion,
+        source: GuestMemoryError,
+    },
+    PciHostRangesOverlap {
+        first: &'static str,
+        second: &'static str,
+    },
+    PciHostRangeOverlapsMemory {
+        name: &'static str,
+        memory_range: GuestMemoryRange,
+    },
+    PciHostRangeOverlapsGic {
+        name: &'static str,
+        gic: &'static str,
+    },
+    PciHostRangeOverlapsDevice {
+        name: &'static str,
+        device: &'static str,
+        device_region: Arm64FdtRegion,
+    },
     InvalidVirtioMmioRegion {
         index: usize,
         region: Arm64FdtRegion,
@@ -902,6 +963,37 @@ impl fmt::Display for Arm64FdtError {
             Self::GicMsiRegionOverlapsMemory => {
                 f.write_str("arm64 FDT GICv2m frame overlaps guest memory")
             }
+            Self::InvalidPciHost { reason } => {
+                write!(f, "invalid arm64 FDT PCI host: {reason}")
+            }
+            Self::InvalidPciHostRange {
+                name,
+                region,
+                source,
+            } => write!(
+                f,
+                "invalid arm64 FDT PCI {name} range base=0x{:x}, size={}: {source}",
+                region.base, region.size
+            ),
+            Self::PciHostRangesOverlap { first, second } => {
+                write!(f, "arm64 FDT PCI {first} range overlaps {second} range")
+            }
+            Self::PciHostRangeOverlapsMemory { name, memory_range } => write!(
+                f,
+                "arm64 FDT PCI {name} range overlaps guest memory range {memory_range}"
+            ),
+            Self::PciHostRangeOverlapsGic { name, gic } => {
+                write!(f, "arm64 FDT PCI {name} range overlaps GIC {gic} region")
+            }
+            Self::PciHostRangeOverlapsDevice {
+                name,
+                device,
+                device_region,
+            } => write!(
+                f,
+                "arm64 FDT PCI {name} range overlaps {device} region base=0x{:x}, size={}",
+                device_region.base, device_region.size
+            ),
             Self::InvalidVirtioMmioRegion {
                 index,
                 region,
@@ -1136,6 +1228,7 @@ impl std::error::Error for Arm64FdtError {
             Self::InvalidRtcRegion { source, .. } => Some(source),
             Self::InvalidVmGenIdRegion { source, .. } => Some(source),
             Self::InvalidVmClockRegion { source, .. } => Some(source),
+            Self::InvalidPciHostRange { source, .. } => Some(source),
             Self::RngSeed { source } => Some(source),
             Self::CreateFdt { source } => Some(source),
             Self::GuestMemoryWrite { source } => Some(source),
@@ -1161,6 +1254,11 @@ impl std::error::Error for Arm64FdtError {
             | Self::InvalidGicMsiInterruptRange
             | Self::GicMsiRegionOverlaps { .. }
             | Self::GicMsiRegionOverlapsMemory
+            | Self::InvalidPciHost { .. }
+            | Self::PciHostRangesOverlap { .. }
+            | Self::PciHostRangeOverlapsMemory { .. }
+            | Self::PciHostRangeOverlapsGic { .. }
+            | Self::PciHostRangeOverlapsDevice { .. }
             | Self::VirtioMmioRegionOverlapsMemory { .. }
             | Self::VirtioMmioRegionOverlapsGic { .. }
             | Self::VirtioMmioRegionsOverlap { .. }
@@ -1209,11 +1307,20 @@ impl From<Arm64FdtCacheHierarchyError> for Arm64FdtError {
 #[derive(Debug)]
 struct ValidatedArm64FdtConfig {
     memory_reg_cells: Vec<u64>,
+    pci_host: Option<ValidatedArm64FdtPciHost>,
     rtc_device: Option<ValidatedArm64FdtRtcDevice>,
     serial_device: Option<ValidatedArm64FdtSerialDevice>,
     vmgenid_device: Option<ValidatedArm64FdtVmGenIdDevice>,
     vmclock_device: Option<ValidatedArm64FdtVmClockDevice>,
     virtio_mmio_devices: Vec<ValidatedArm64FdtVirtioMmioDevice>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatedArm64FdtPciHost {
+    host: Arm64FdtPciHost,
+    ecam: GuestMemoryRange,
+    bar32: GuestMemoryRange,
+    bar64: GuestMemoryRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1239,6 +1346,7 @@ struct ValidatedArm64FdtVmGenIdDevice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ValidatedArm64FdtVmClockDevice {
     region: Arm64FdtRegion,
+    range: GuestMemoryRange,
     interrupt_cell: u32,
 }
 
@@ -1255,6 +1363,18 @@ pub fn build_arm64_fdt(config: &Arm64FdtConfig<'_>) -> Result<Vec<u8>, Arm64FdtE
     build_arm64_fdt_with_rng_seed_source(config, &mut rng_seed_source)
 }
 
+pub fn build_arm64_fdt_with_pci(
+    config: &Arm64FdtConfig<'_>,
+    pci_host: Arm64FdtPciHost,
+) -> Result<Vec<u8>, Arm64FdtError> {
+    let mut rng_seed_source = Arm64FdtOsRngSeedSource::new();
+    build_arm64_fdt_with_optional_pci_and_rng_seed_source(
+        config,
+        Some(pci_host),
+        &mut rng_seed_source,
+    )
+}
+
 fn build_arm64_fdt_with_rng_seed_source<Source>(
     config: &Arm64FdtConfig<'_>,
     rng_seed_source: &mut Source,
@@ -1262,7 +1382,18 @@ fn build_arm64_fdt_with_rng_seed_source<Source>(
 where
     Source: Arm64FdtRngSeedSource + ?Sized,
 {
-    let validated = validate_config(config)?;
+    build_arm64_fdt_with_optional_pci_and_rng_seed_source(config, None, rng_seed_source)
+}
+
+fn build_arm64_fdt_with_optional_pci_and_rng_seed_source<Source>(
+    config: &Arm64FdtConfig<'_>,
+    pci_host: Option<Arm64FdtPciHost>,
+    rng_seed_source: &mut Source,
+) -> Result<Vec<u8>, Arm64FdtError>
+where
+    Source: Arm64FdtRngSeedSource + ?Sized,
+{
+    let validated = validate_config(config, pci_host)?;
     let mut rng_seed = [0; ARM64_FDT_RNG_SEED_SIZE];
     rng_seed_source
         .fill_rng_seed(&mut rng_seed)
@@ -1296,6 +1427,9 @@ where
     if let Some(vmclock_device) = validated.vmclock_device {
         create_vmclock_node(&mut fdt, vmclock_device)?;
     }
+    if let Some(pci_host) = validated.pci_host {
+        create_pci_host_node(&mut fdt, pci_host)?;
+    }
     create_virtio_mmio_nodes(&mut fdt, &validated.virtio_mmio_devices)?;
 
     fdt.end_node(root)?;
@@ -1312,6 +1446,20 @@ pub fn write_arm64_fdt(
     write_arm64_fdt_with_rng_seed_source(config, memory, &mut rng_seed_source)
 }
 
+pub fn write_arm64_fdt_with_pci(
+    config: &Arm64FdtConfig<'_>,
+    pci_host: Arm64FdtPciHost,
+    memory: &mut GuestMemory,
+) -> Result<Arm64FdtGuestMemoryWrite, Arm64FdtError> {
+    let mut rng_seed_source = Arm64FdtOsRngSeedSource::new();
+    write_arm64_fdt_with_optional_pci_and_rng_seed_source(
+        config,
+        Some(pci_host),
+        memory,
+        &mut rng_seed_source,
+    )
+}
+
 fn write_arm64_fdt_with_rng_seed_source<Source>(
     config: &Arm64FdtConfig<'_>,
     memory: &mut GuestMemory,
@@ -1320,12 +1468,28 @@ fn write_arm64_fdt_with_rng_seed_source<Source>(
 where
     Source: Arm64FdtRngSeedSource + ?Sized,
 {
+    write_arm64_fdt_with_optional_pci_and_rng_seed_source(config, None, memory, rng_seed_source)
+}
+
+fn write_arm64_fdt_with_optional_pci_and_rng_seed_source<Source>(
+    config: &Arm64FdtConfig<'_>,
+    pci_host: Option<Arm64FdtPciHost>,
+    memory: &mut GuestMemory,
+    rng_seed_source: &mut Source,
+) -> Result<Arm64FdtGuestMemoryWrite, Arm64FdtError>
+where
+    Source: Arm64FdtRngSeedSource + ?Sized,
+{
     validate_guest_memory_matches_layout(config.layout, memory)?;
-    let bytes = build_arm64_fdt_with_rng_seed_source(config, rng_seed_source)?;
+    let bytes =
+        build_arm64_fdt_with_optional_pci_and_rng_seed_source(config, pci_host, rng_seed_source)?;
     write_arm64_fdt_bytes(config.layout, memory, &bytes)
 }
 
-fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<ValidatedArm64FdtConfig, Arm64FdtError> {
+fn validate_config(
+    config: &Arm64FdtConfig<'_>,
+    pci_host: Option<Arm64FdtPciHost>,
+) -> Result<ValidatedArm64FdtConfig, Arm64FdtError> {
     if config.vcpu_mpidrs.is_empty() {
         return Err(Arm64FdtError::MissingCpu);
     }
@@ -1392,12 +1556,27 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<ValidatedArm64FdtConfi
             )
         })
         .transpose()?;
+    let pci_host = pci_host
+        .map(|host| {
+            validate_pci_host(
+                config.layout,
+                config.gic,
+                host,
+                &virtio_mmio_devices,
+                rtc_device.as_ref(),
+                serial_device.as_ref(),
+                vmgenid_device.as_ref(),
+                vmclock_device.as_ref(),
+            )
+        })
+        .transpose()?;
     if let Some(initrd) = config.boot.initrd {
         validate_initrd(config.layout, initrd)?;
     }
 
     Ok(ValidatedArm64FdtConfig {
         memory_reg_cells,
+        pci_host,
         rtc_device,
         serial_device,
         vmgenid_device,
@@ -1769,6 +1948,55 @@ fn create_vmclock_node(
     Ok(())
 }
 
+fn create_pci_host_node(
+    fdt: &mut FdtWriter,
+    pci: ValidatedArm64FdtPciHost,
+) -> Result<(), Arm64FdtError> {
+    let ranges = [
+        0x0200_0000,
+        high_u32(pci.bar32.start().raw_value()),
+        low_u32(pci.bar32.start().raw_value()),
+        high_u32(pci.bar32.start().raw_value()),
+        low_u32(pci.bar32.start().raw_value()),
+        high_u32(pci.bar32.size()),
+        low_u32(pci.bar32.size()),
+        0x0300_0000,
+        high_u32(pci.bar64.start().raw_value()),
+        low_u32(pci.bar64.start().raw_value()),
+        high_u32(pci.bar64.start().raw_value()),
+        low_u32(pci.bar64.start().raw_value()),
+        high_u32(pci.bar64.size()),
+        low_u32(pci.bar64.size()),
+    ];
+    let node = fdt.begin_node(&format!("pci@{:x}", pci.ecam.start().raw_value()))?;
+    fdt.property_string("compatible", "pci-host-ecam-generic")?;
+    fdt.property_string("device_type", "pci")?;
+    fdt.property_array_u32("ranges", &ranges)?;
+    fdt.property_array_u32(
+        "bus-range",
+        &[u32::from(pci.host.bus_start), u32::from(pci.host.bus_end)],
+    )?;
+    fdt.property_u32("linux,pci-domain", u32::from(pci.host.segment))?;
+    fdt.property_u32("#address-cells", 3)?;
+    fdt.property_u32("#size-cells", 2)?;
+    fdt.property_array_u64("reg", &[pci.ecam.start().raw_value(), pci.ecam.size()])?;
+    fdt.property_u32("#interrupt-cells", 1)?;
+    fdt.property_null("interrupt-map")?;
+    fdt.property_null("interrupt-map-mask")?;
+    fdt.property_null("dma-coherent")?;
+    fdt.property_u32("msi-parent", MSI_PHANDLE)?;
+    fdt.end_node(node)?;
+    Ok(())
+}
+
+const fn high_u32(value: u64) -> u32 {
+    (value >> 32) as u32
+}
+
+const fn low_u32(value: u64) -> u32 {
+    value as u32
+}
+
 fn create_virtio_mmio_nodes(
     fdt: &mut FdtWriter,
     devices: &[ValidatedArm64FdtVirtioMmioDevice],
@@ -2103,6 +2331,181 @@ fn validate_gic_timer_ppis(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_pci_host(
+    layout: &GuestMemoryLayout,
+    gic: Arm64FdtGic,
+    host: Arm64FdtPciHost,
+    virtio_mmio_devices: &[ValidatedArm64FdtVirtioMmioDevice],
+    rtc_device: Option<&ValidatedArm64FdtRtcDevice>,
+    serial_device: Option<&ValidatedArm64FdtSerialDevice>,
+    vmgenid_device: Option<&ValidatedArm64FdtVmGenIdDevice>,
+    vmclock_device: Option<&ValidatedArm64FdtVmClockDevice>,
+) -> Result<ValidatedArm64FdtPciHost, Arm64FdtError> {
+    if host.segment != PCI_SEGMENT_ZERO {
+        return Err(Arm64FdtError::InvalidPciHost {
+            reason: "only segment 0 is supported",
+        });
+    }
+    if host.bus_start != PCI_BUS_ZERO || host.bus_end != PCI_BUS_ZERO {
+        return Err(Arm64FdtError::InvalidPciHost {
+            reason: "only bus range 0 through 0 is supported",
+        });
+    }
+    if gic.msi.is_none() {
+        return Err(Arm64FdtError::InvalidPciHost {
+            reason: "a GICv2m MSI parent is required",
+        });
+    }
+
+    let ecam = validate_pci_host_range("ECAM", host.ecam)?;
+    let ecam_reservation = validate_pci_host_range("ECAM reservation", host.ecam_reservation)?;
+    let bar32 = validate_pci_host_range("32-bit BAR", host.bar32)?;
+    let bar64 = validate_pci_host_range("64-bit BAR", host.bar64)?;
+    if ecam.size() != PCI_ECAM_BUS_ZERO_SIZE {
+        return Err(Arm64FdtError::InvalidPciHost {
+            reason: "bus-0 ECAM size must be 1 MiB",
+        });
+    }
+    if ecam_reservation.size() != PCI_ECAM_RESERVED_SIZE {
+        return Err(Arm64FdtError::InvalidPciHost {
+            reason: "ECAM reservation size must be 256 MiB",
+        });
+    }
+    if !ecam
+        .start()
+        .raw_value()
+        .is_multiple_of(PCI_ECAM_BUS_ZERO_SIZE)
+    {
+        return Err(Arm64FdtError::InvalidPciHost {
+            reason: "ECAM base must be aligned to its 1 MiB bus window",
+        });
+    }
+    if ecam.start() != ecam_reservation.start()
+        || ecam.end_exclusive() > ecam_reservation.end_exclusive()
+    {
+        return Err(Arm64FdtError::InvalidPciHost {
+            reason: "published ECAM window must begin the reserved configuration aperture",
+        });
+    }
+    if bar32.end_exclusive().raw_value() > 1_u64 << 32 {
+        return Err(Arm64FdtError::InvalidPciHost {
+            reason: "32-bit BAR window exceeds the 32-bit address space",
+        });
+    }
+
+    for (first_name, first, second_name, second) in [
+        ("32-bit BAR", bar32, "ECAM reservation", ecam_reservation),
+        ("32-bit BAR", bar32, "64-bit BAR", bar64),
+        ("ECAM reservation", ecam_reservation, "64-bit BAR", bar64),
+    ] {
+        if first.overlaps(second) {
+            return Err(Arm64FdtError::PciHostRangesOverlap {
+                first: first_name,
+                second: second_name,
+            });
+        }
+    }
+
+    for (name, range) in [
+        ("32-bit BAR", bar32),
+        ("ECAM reservation", ecam_reservation),
+        ("64-bit BAR", bar64),
+    ] {
+        validate_pci_host_range_is_unoccupied(
+            layout,
+            gic,
+            name,
+            range,
+            virtio_mmio_devices,
+            rtc_device,
+            serial_device,
+            vmgenid_device,
+            vmclock_device,
+        )?;
+    }
+
+    Ok(ValidatedArm64FdtPciHost {
+        host,
+        ecam,
+        bar32,
+        bar64,
+    })
+}
+
+fn validate_pci_host_range(
+    name: &'static str,
+    region: Arm64FdtRegion,
+) -> Result<GuestMemoryRange, Arm64FdtError> {
+    GuestMemoryRange::new(GuestAddress::new(region.base), region.size).map_err(|source| {
+        Arm64FdtError::InvalidPciHostRange {
+            name,
+            region,
+            source,
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_pci_host_range_is_unoccupied(
+    layout: &GuestMemoryLayout,
+    gic: Arm64FdtGic,
+    name: &'static str,
+    range: GuestMemoryRange,
+    virtio_mmio_devices: &[ValidatedArm64FdtVirtioMmioDevice],
+    rtc_device: Option<&ValidatedArm64FdtRtcDevice>,
+    serial_device: Option<&ValidatedArm64FdtSerialDevice>,
+    vmgenid_device: Option<&ValidatedArm64FdtVmGenIdDevice>,
+    vmclock_device: Option<&ValidatedArm64FdtVmClockDevice>,
+) -> Result<(), Arm64FdtError> {
+    for memory_range in layout.ranges().iter().copied() {
+        if range.overlaps(memory_range) {
+            return Err(Arm64FdtError::PciHostRangeOverlapsMemory { name, memory_range });
+        }
+    }
+    for (gic_name, gic_range) in validated_gic_regions(gic)?.into_iter().flatten() {
+        if range.overlaps(gic_range) {
+            return Err(Arm64FdtError::PciHostRangeOverlapsGic {
+                name,
+                gic: gic_name,
+            });
+        }
+    }
+    for device in virtio_mmio_devices {
+        reject_pci_host_device_overlap(name, range, "virtio-mmio", device.region, device.range)?;
+    }
+    for (device_name, device_region, device_range) in [
+        rtc_device.map(|device| ("RTC", device.region, device.range)),
+        serial_device.map(|device| ("serial", device.region, device.range)),
+        vmgenid_device.map(|device| ("VMGenID", device.region, device.range)),
+        vmclock_device.map(|device| ("VMClock", device.region, device.range)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        reject_pci_host_device_overlap(name, range, device_name, device_region, device_range)?;
+    }
+    Ok(())
+}
+
+fn reject_pci_host_device_overlap(
+    name: &'static str,
+    range: GuestMemoryRange,
+    device: &'static str,
+    device_region: Arm64FdtRegion,
+    device_range: GuestMemoryRange,
+) -> Result<(), Arm64FdtError> {
+    if range.overlaps(device_range) {
+        Err(Arm64FdtError::PciHostRangeOverlapsDevice {
+            name,
+            device,
+            device_region,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_gic_region(
@@ -2530,6 +2933,7 @@ fn validate_vmclock_device(
 
     Ok(ValidatedArm64FdtVmClockDevice {
         region: device.region,
+        range,
         interrupt_cell: vmclock_interrupt_cell(device.interrupt_line)?,
     })
 }
@@ -5745,6 +6149,167 @@ mod tests {
     }
 
     #[test]
+    fn pci_host_node_publishes_firecracker_ecam_ranges_and_gicv2m_parent() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
+                msi: Some(test_msi()),
+                ..test_gic()
+            },
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+        let pci_host = test_pci_host();
+
+        let bytes = build_test_arm64_fdt_with_pci(&config, pci_host)
+            .expect("valid PCI host metadata should build");
+        let tree = DeviceTree::load(&bytes).expect("PCI host FDT should parse");
+        let pci = required_node(&tree, "/pci@70000000");
+
+        assert_eq!(pci.prop_str("compatible").unwrap(), "pci-host-ecam-generic");
+        assert_eq!(pci.prop_str("device_type").unwrap(), "pci");
+        assert_eq!(prop_u64_cells(pci, "reg"), vec![0x7000_0000, 0x10_0000]);
+        assert_eq!(prop_u32_cells(pci, "bus-range"), vec![0, 0]);
+        assert_eq!(pci.prop_u32("linux,pci-domain").unwrap(), 0);
+        assert_eq!(pci.prop_u32("#address-cells").unwrap(), 3);
+        assert_eq!(pci.prop_u32("#size-cells").unwrap(), 2);
+        assert_eq!(pci.prop_u32("#interrupt-cells").unwrap(), 1);
+        assert_eq!(pci.prop_u32("msi-parent").unwrap(), MSI_PHANDLE);
+        assert_eq!(
+            prop_u32_cells(pci, "ranges"),
+            vec![
+                0x0200_0000,
+                0,
+                0x4000_3000,
+                0,
+                0x4000_3000,
+                0,
+                0x2fff_d000,
+                0x0300_0000,
+                0x40,
+                0,
+                0x40,
+                0,
+                0x40,
+                0,
+            ]
+        );
+        for property in ["interrupt-map", "interrupt-map-mask", "dma-coherent"] {
+            assert!(
+                pci.prop_raw(property)
+                    .expect("empty PCI property should exist")
+                    .is_empty()
+            );
+        }
+        assert!(!pci.has_prop("msi-map"));
+        assert!(!pci.has_prop("iommu-map"));
+    }
+
+    #[test]
+    fn pci_host_requires_gicv2m_and_rejects_address_conflicts() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+
+        let err = build_test_arm64_fdt_with_pci(&config, test_pci_host())
+            .expect_err("PCI without an MSI parent should fail");
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidPciHost {
+                reason: "a GICv2m MSI parent is required",
+            }
+        );
+
+        let devices = [virtio_mmio_device(crate::pci::PCI_BAR32_START, 0x1000, 32)];
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
+                msi: Some(test_msi()),
+                ..test_gic()
+            },
+            ..test_config_with_virtio_mmio_devices(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+                &devices,
+            )
+        };
+        let err = build_test_arm64_fdt_with_pci(&config, test_pci_host())
+            .expect_err("PCI BAR range overlapping a device should fail");
+        assert_eq!(
+            err,
+            Arm64FdtError::PciHostRangeOverlapsDevice {
+                name: "32-bit BAR",
+                device: "virtio-mmio",
+                device_region: devices[0].region,
+            }
+        );
+
+        let mut pci_host = test_pci_host();
+        pci_host.bar64 = Arm64FdtRegion {
+            base: aarch64::DRAM_MEM_START,
+            size: 0x1000,
+        };
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
+                msi: Some(test_msi()),
+                ..test_gic()
+            },
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+        let err = build_test_arm64_fdt_with_pci(&config, pci_host)
+            .expect_err("PCI BAR range overlapping guest RAM should fail");
+        assert!(matches!(
+            err,
+            Arm64FdtError::PciHostRangeOverlapsMemory {
+                name: "64-bit BAR",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn no_pci_fdt_path_preserves_existing_bytes() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+        let mut original_source = FixedRngSeedSource::new(TEST_RNG_SEED);
+        let original = build_arm64_fdt_with_rng_seed_source(&config, &mut original_source)
+            .expect("existing FDT path should build");
+        let mut optional_source = FixedRngSeedSource::new(TEST_RNG_SEED);
+        let optional = build_arm64_fdt_with_optional_pci_and_rng_seed_source(
+            &config,
+            None,
+            &mut optional_source,
+        )
+        .expect("optional PCI FDT path should build without PCI");
+
+        assert_eq!(optional, original);
+    }
+
+    #[test]
     fn rejects_invalid_gicv2m_frame_and_interrupt_range_without_raw_values() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let invalid_frames = [
@@ -6327,6 +6892,14 @@ mod tests {
         build_arm64_fdt_with_rng_seed_source(config, &mut source)
     }
 
+    fn build_test_arm64_fdt_with_pci(
+        config: &Arm64FdtConfig<'_>,
+        pci_host: Arm64FdtPciHost,
+    ) -> Result<Vec<u8>, Arm64FdtError> {
+        let mut source = FixedRngSeedSource::new(TEST_RNG_SEED);
+        build_arm64_fdt_with_optional_pci_and_rng_seed_source(config, Some(pci_host), &mut source)
+    }
+
     fn write_test_arm64_fdt(
         config: &Arm64FdtConfig<'_>,
         memory: &mut GuestMemory,
@@ -6578,6 +7151,13 @@ mod tests {
                 count: 32,
             },
         }
+    }
+
+    fn test_pci_host() -> Arm64FdtPciHost {
+        Arm64FdtPciHost::from_address_plan(
+            Arm64PciAddressPlan::firecracker_v1_16()
+                .expect("Firecracker PCI address plan should be valid"),
+        )
     }
 
     const fn test_initrd() -> LoadedInitrd {

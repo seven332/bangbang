@@ -18,6 +18,7 @@ pub mod mmds;
 pub mod mmio;
 pub mod network;
 pub(crate) mod output_file;
+pub mod pci;
 pub mod pmem;
 pub mod rtc;
 pub mod serial;

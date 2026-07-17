@@ -34,9 +34,10 @@ use crate::entropy::{
 };
 use crate::fdt::{
     ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtBootInfo, Arm64FdtCacheHierarchy,
-    Arm64FdtConfig, Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite, Arm64FdtRegion,
-    Arm64FdtRtcDevice, Arm64FdtSerialDevice, Arm64FdtTimerInterrupts, Arm64FdtVirtioMmioDevice,
-    Arm64FdtVmClockDevice, Arm64FdtVmGenIdDevice, write_arm64_fdt,
+    Arm64FdtConfig, Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite, Arm64FdtPciHost,
+    Arm64FdtRegion, Arm64FdtRtcDevice, Arm64FdtSerialDevice, Arm64FdtTimerInterrupts,
+    Arm64FdtVirtioMmioDevice, Arm64FdtVmClockDevice, Arm64FdtVmGenIdDevice, write_arm64_fdt,
+    write_arm64_fdt_with_pci,
 };
 use crate::interrupt::GuestInterruptLine;
 use crate::machine::MachineConfig;
@@ -55,7 +56,7 @@ use crate::memory_hotplug::{
 use crate::metrics::SharedRtcDeviceMetrics;
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
-    MmioRegionId,
+    MmioRegionId, MmioRegistrationError, MmioRegistrationLease, MmioRegistrationOwner,
 };
 use crate::network::{
     NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioDeviceRegistration,
@@ -63,6 +64,10 @@ use crate::network::{
     PreparedNetworkDevices, VirtioNetworkDeviceNotificationDispatch,
     VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource,
     VirtioNetworkTxPacketSink,
+};
+use crate::pci::{
+    Arm64PciAddressPlan, PciClassCode, PciFunctionLease, PciSegment, PciSegmentError,
+    PciType0Configuration, SharedPciSegment, register_ecam_handler,
 };
 use crate::pmem::{
     PmemFileBacking, PmemMmioDeviceRegistration, PmemMmioLayout, PmemMmioRegistrationError,
@@ -96,6 +101,7 @@ const ARM64_BOOT_VMCLOCK_ABI_SIZE: usize = 112;
 const ARM64_BOOT_VMCLOCK_MAGIC: u32 = 1_263_289_174;
 const ARM64_BOOT_VMCLOCK_VERSION: u16 = 1;
 const ARM64_BOOT_VMCLOCK_COUNTER_INVALID: u8 = 255;
+const ARM64_BOOT_PCI_ECAM_REGION_ID: MmioRegionId = MmioRegionId::new(u64::MAX);
 
 /// Move-only files supplied by an authority owner for one VM startup attempt.
 #[derive(Default)]
@@ -237,6 +243,33 @@ pub struct Arm64BootResourceConfig<'a> {
     pub entropy_device: Option<Arm64BootEntropyDeviceConfig>,
 }
 
+/// Explicit internal-only endpoint used by signed Linux PCI enumeration validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64BootPciValidationConfig {
+    vendor_id: u16,
+    device_id: u16,
+}
+
+impl Arm64BootPciValidationConfig {
+    pub const FIRECRACKER_TEST_VENDOR_ID: u16 = 0x1af4;
+    pub const FIRECRACKER_TEST_DEVICE_ID: u16 = 0x10ff;
+
+    pub const fn firecracker_test_endpoint() -> Self {
+        Self {
+            vendor_id: Self::FIRECRACKER_TEST_VENDOR_ID,
+            device_id: Self::FIRECRACKER_TEST_DEVICE_ID,
+        }
+    }
+
+    pub const fn vendor_id(self) -> u16 {
+        self.vendor_id
+    }
+
+    pub const fn device_id(self) -> u16 {
+        self.device_id
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arm64BootRtcDeviceConfig {
     pub mmio_layout: RtcMmioLayout,
@@ -322,6 +355,21 @@ pub struct Arm64BootResources {
     pub balloon_device: Option<Arm64BootBalloonDevice>,
     pub memory_hotplug_device: Option<Arm64BootMemoryHotplugDevice>,
     pub entropy_device: Option<Arm64BootEntropyDevice>,
+    pub pci_validation: Option<Arm64BootPciValidationResources>,
+}
+
+#[derive(Debug)]
+pub struct Arm64BootPciValidationResources {
+    segment: SharedPciSegment,
+    _function_lease: PciFunctionLease,
+    _registration_owner: MmioRegistrationOwner,
+    _registration_lease: MmioRegistrationLease,
+}
+
+impl Arm64BootPciValidationResources {
+    pub const fn segment(&self) -> &SharedPciSegment {
+        &self.segment
+    }
 }
 
 #[derive(Debug)]
@@ -354,6 +402,7 @@ pub struct Arm64BootRuntimeResources {
     pub balloon_device: Option<Arm64BootBalloonDevice>,
     pub memory_hotplug_device: Option<Arm64BootMemoryHotplugDevice>,
     pub entropy_device: Option<Arm64BootEntropyDevice>,
+    pub pci_validation: Option<Arm64BootPciValidationResources>,
 }
 
 #[derive(Debug)]
@@ -953,6 +1002,7 @@ pub fn install_snapshot_v1_runtime(
         balloon_device: None,
         memory_hotplug_device: None,
         entropy_device: None,
+        pci_validation: None,
     };
 
     Ok(InstalledSnapshotV1Runtime {
@@ -2272,6 +2322,7 @@ impl Arm64BootRuntimeResources {
             || self.balloon_device.is_some()
             || self.memory_hotplug_device.is_some()
             || self.entropy_device.is_some()
+            || self.pci_validation.is_some()
         {
             return Err(Arm64BootSnapshotV1DeviceCaptureError::UnsupportedInventory);
         }
@@ -3060,6 +3111,15 @@ pub enum Arm64BootResourceError {
     RegisterSerialMmio {
         source: Box<Arm64BootSerialMmioRegistrationError>,
     },
+    PciAddressPlan {
+        source: GuestMemoryError,
+    },
+    PreparePciValidationFunction {
+        source: PciSegmentError,
+    },
+    RegisterPciEcam {
+        source: MmioRegistrationError,
+    },
     VmGenIdRegion {
         source: GuestMemoryError,
     },
@@ -3207,6 +3267,15 @@ impl fmt::Display for Arm64BootResourceError {
             Self::RegisterSerialMmio { source } => {
                 write!(f, "failed to register serial MMIO device: {source}")
             }
+            Self::PciAddressPlan { source } => {
+                write!(f, "failed to prepare the arm64 PCI address plan: {source}")
+            }
+            Self::PreparePciValidationFunction { source } => {
+                write!(f, "failed to prepare the PCI validation function: {source}")
+            }
+            Self::RegisterPciEcam { source } => {
+                write!(f, "failed to register the PCI ECAM window: {source}")
+            }
             Self::VmGenIdRegion { source } => {
                 write!(f, "failed to prepare VMGenID guest memory range: {source}")
             }
@@ -3313,6 +3382,9 @@ impl std::error::Error for Arm64BootResourceError {
             Self::RegisterEntropyMmio { source } => Some(source.as_ref()),
             Self::RegisterRtcMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
+            Self::PciAddressPlan { source } => Some(source),
+            Self::PreparePciValidationFunction { source } => Some(source),
+            Self::RegisterPciEcam { source } => Some(source),
             Self::VmGenIdRegion { source } => Some(source),
             Self::VmGenIdGuestMemoryWrite { source } => Some(source),
             Self::VmClockRegion { source } => Some(source),
@@ -3453,6 +3525,22 @@ impl Arm64BootResources {
         controller: &VmmController,
         config: Arm64BootResourceConfig<'_>,
         startup_resources: VmStartupResources,
+    ) -> Result<Self, Arm64BootResourceError> {
+        Self::assemble_from_controller_with_startup_resources_and_pci_validation(
+            controller,
+            config,
+            startup_resources,
+            None,
+        )
+    }
+
+    /// Assembles resources with an optional internal PCI enumeration endpoint.
+    #[doc(hidden)]
+    pub fn assemble_from_controller_with_startup_resources_and_pci_validation(
+        controller: &VmmController,
+        config: Arm64BootResourceConfig<'_>,
+        startup_resources: VmStartupResources,
+        pci_validation: Option<Arm64BootPciValidationConfig>,
     ) -> Result<Self, Arm64BootResourceError> {
         let (boot_files, block_backings, pmem_backings, supplied_vsock_listener) =
             startup_resources.into_parts();
@@ -3736,26 +3824,34 @@ impl Arm64BootResources {
         let serial_device = serial_device
             .map(|serial| register_serial_mmio(&mut mmio_dispatcher, serial))
             .transpose()?;
+        let (pci_validation, pci_host) = match pci_validation {
+            Some(config) => {
+                let (resources, host) = prepare_pci_validation(&mut mmio_dispatcher, config)?;
+                (Some(resources), Some(host))
+            }
+            None => (None, None),
+        };
         let rtc_fdt_device = rtc_device.as_ref().map(|device| device.fdt_device);
         let serial_fdt_device = serial_device.as_ref().map(|device| device.fdt_device);
         let vmgenid_device = create_initial_vmgenid_device(&mut memory, vmgenid_interrupt_line)?;
         let vmclock_device = create_initial_vmclock_device(&mut memory, vmclock_interrupt_line)?;
-        let fdt = write_arm64_fdt(
-            &Arm64FdtConfig {
-                layout: &layout,
-                boot: Arm64FdtBootInfo::from(&loaded_boot_source),
-                vcpu_mpidrs,
-                cache_hierarchy: &cache_hierarchy,
-                gic,
-                timer,
-                rtc_device: rtc_fdt_device,
-                serial_device: serial_fdt_device,
-                vmgenid_device: Some(vmgenid_device.fdt_device),
-                vmclock_device: Some(vmclock_device.fdt_device),
-                virtio_mmio_devices: &fdt_devices,
-            },
-            &mut memory,
-        )
+        let fdt_config = Arm64FdtConfig {
+            layout: &layout,
+            boot: Arm64FdtBootInfo::from(&loaded_boot_source),
+            vcpu_mpidrs,
+            cache_hierarchy: &cache_hierarchy,
+            gic,
+            timer,
+            rtc_device: rtc_fdt_device,
+            serial_device: serial_fdt_device,
+            vmgenid_device: Some(vmgenid_device.fdt_device),
+            vmclock_device: Some(vmclock_device.fdt_device),
+            virtio_mmio_devices: &fdt_devices,
+        };
+        let fdt = match pci_host {
+            Some(host) => write_arm64_fdt_with_pci(&fdt_config, host, &mut memory),
+            None => write_arm64_fdt(&fdt_config, &mut memory),
+        }
         .map_err(|source| Arm64BootResourceError::Fdt { source })?;
 
         Ok(Self {
@@ -3777,6 +3873,7 @@ impl Arm64BootResources {
             balloon_device,
             memory_hotplug_device,
             entropy_device,
+            pci_validation,
         })
     }
 
@@ -3803,9 +3900,51 @@ impl Arm64BootResources {
                 balloon_device: self.balloon_device,
                 memory_hotplug_device: self.memory_hotplug_device,
                 entropy_device: self.entropy_device,
+                pci_validation: self.pci_validation,
             },
         }
     }
+}
+
+fn prepare_pci_validation(
+    dispatcher: &mut MmioDispatcher,
+    config: Arm64BootPciValidationConfig,
+) -> Result<(Arm64BootPciValidationResources, Arm64FdtPciHost), Arm64BootResourceError> {
+    let plan = Arm64PciAddressPlan::firecracker_v1_16()
+        .map_err(|source| Arm64BootResourceError::PciAddressPlan { source })?;
+    let mut segment = PciSegment::new();
+    let function_lease = segment
+        .add_function(PciType0Configuration::new(
+            config.vendor_id(),
+            config.device_id(),
+            0,
+            PciClassCode::Unclassified,
+            0,
+            0,
+            config.vendor_id(),
+            config.device_id(),
+        ))
+        .map_err(|source| Arm64BootResourceError::PreparePciValidationFunction { source })?;
+    let segment = SharedPciSegment::new(segment);
+    let registration_owner = MmioRegistrationOwner::new();
+    let registration_lease = register_ecam_handler(
+        dispatcher,
+        &registration_owner,
+        ARM64_BOOT_PCI_ECAM_REGION_ID,
+        plan,
+        segment.clone(),
+    )
+    .map_err(|source| Arm64BootResourceError::RegisterPciEcam { source })?;
+
+    Ok((
+        Arm64BootPciValidationResources {
+            segment,
+            _function_lease: function_lease,
+            _registration_owner: registration_owner,
+            _registration_lease: registration_lease,
+        },
+        Arm64FdtPciHost::from_address_plan(plan),
+    ))
 }
 
 fn memory_size_bytes(config: MachineConfig) -> Result<u64, Arm64BootResourceError> {
@@ -4359,14 +4498,14 @@ mod tests {
         ARM64_BOOT_VMGENID_SIZE, Arm64BootEntropySource, Arm64BootEntropySourceError,
         Arm64BootEntropySourceProvider, Arm64BootNetworkNotificationOutcome,
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
-        Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources,
-        Arm64BootRtcDeviceConfig, Arm64BootRtcMmioRegistrationError, Arm64BootSerialDeviceConfig,
-        Arm64BootSerialMmioRegistrationError, Arm64BootVmGenIdDevice,
+        Arm64BootPciValidationConfig, Arm64BootResourceConfig, Arm64BootResourceError,
+        Arm64BootResources, Arm64BootRtcDeviceConfig, Arm64BootRtcMmioRegistrationError,
+        Arm64BootSerialDeviceConfig, Arm64BootSerialMmioRegistrationError, Arm64BootVmGenIdDevice,
         Arm64BootVmGenIdReplacementError, MIB, VmStartupResources,
         arm64_boot_network_device_metadata, balloon_hinting_status_for_device,
         balloon_stats_for_device, block_device_metadata, ensure_nonzero_vmgenid_generation_id,
         initial_vmclock_abi_bytes, initial_vmclock_range, initial_vmgenid_range,
-        replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
+        prepare_pci_validation, replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
         stop_balloon_hinting_for_device, update_balloon_config_for_device,
         update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
     };
@@ -4397,7 +4536,8 @@ mod tests {
     };
     use crate::fdt::{
         ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtCache, Arm64FdtCacheHierarchy,
-        Arm64FdtCacheType, Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts,
+        Arm64FdtCacheType, Arm64FdtError, Arm64FdtGic, Arm64FdtInterruptRange, Arm64FdtMsi,
+        Arm64FdtRegion, Arm64FdtTimerInterrupts,
     };
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::{MachineConfig, MachineConfigInput};
@@ -4420,6 +4560,9 @@ mod tests {
         VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
         VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
         VirtioNetworkTxPacketSinkError,
+    };
+    use crate::pci::{
+        PCI_ECAM_RESERVED_START, PCI_HOST_BRIDGE_DEVICE_ID, PCI_HOST_BRIDGE_VENDOR_ID,
     };
     use crate::pmem::{
         PmemConfigInput, PmemMmioLayout, PreparedPmemDeviceError, VIRTIO_PMEM_ALIGNMENT,
@@ -4966,6 +5109,22 @@ mod tests {
             interrupt_cells: 3,
             maintenance_irq: 9,
             msi: None,
+        }
+    }
+
+    fn valid_gic_with_msi() -> Arm64FdtGic {
+        Arm64FdtGic {
+            msi: Some(Arm64FdtMsi {
+                region: Arm64FdtRegion {
+                    base: 0x3ffb_0000,
+                    size: 0x1_0000,
+                },
+                interrupt_range: Arm64FdtInterruptRange {
+                    base: 128,
+                    count: 32,
+                },
+            }),
+            ..valid_gic()
         }
     }
 
@@ -7159,6 +7318,120 @@ mod tests {
         assert!(read_fdt(&resources).find("/virtio_mmio@40006000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40007000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40008000").is_none());
+    }
+
+    #[test]
+    fn assembles_and_retains_internal_pci_validation_resources() {
+        let kernel = temp_file("kernel-with-pci-validation", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let mut config = valid_config(&[]);
+        config.gic = valid_gic_with_msi();
+        let mut resources =
+            Arm64BootResources::assemble_from_controller_with_startup_resources_and_pci_validation(
+                &controller,
+                config,
+                VmStartupResources::default(),
+                Some(Arm64BootPciValidationConfig::firecracker_test_endpoint()),
+            )
+            .expect("boot resources should assemble with PCI validation");
+
+        let tree = read_fdt(&resources);
+        let pci = tree
+            .find("/pci@70000000")
+            .expect("assembled FDT should publish the PCI host");
+        assert_eq!(
+            prop_u64_cells(pci, "reg"),
+            vec![PCI_ECAM_RESERVED_START, 1 << 20]
+        );
+        assert_eq!(pci.prop_u32("msi-parent").unwrap(), 3);
+        assert_eq!(
+            resources
+                .pci_validation
+                .as_ref()
+                .expect("PCI validation resources should be retained")
+                .segment()
+                .with_segment(|segment| segment.function_count())
+                .expect("PCI validation segment should not be poisoned"),
+            2
+        );
+
+        for (offset, expected) in [
+            (
+                0,
+                (u32::from(PCI_HOST_BRIDGE_DEVICE_ID) << 16) | u32::from(PCI_HOST_BRIDGE_VENDOR_ID),
+            ),
+            (
+                1 << 15,
+                (u32::from(Arm64BootPciValidationConfig::FIRECRACKER_TEST_DEVICE_ID) << 16)
+                    | u32::from(Arm64BootPciValidationConfig::FIRECRACKER_TEST_VENDOR_ID),
+            ),
+        ] {
+            let address = GuestAddress::new(PCI_ECAM_RESERVED_START + offset);
+            let access = resources
+                .mmio_dispatcher
+                .lookup(address, 4)
+                .expect("PCI ECAM access should resolve");
+            let outcome = resources
+                .mmio_dispatcher
+                .dispatch(MmioOperation::read(access).expect("PCI ECAM read should build"))
+                .expect("PCI ECAM read should dispatch");
+            assert_eq!(
+                outcome,
+                MmioDispatchOutcome::Read {
+                    data: MmioAccessBytes::new(&expected.to_le_bytes())
+                        .expect("expected PCI identity bytes should be valid")
+                }
+            );
+        }
+
+        let parts = resources.into_parts();
+        assert!(parts.runtime.pci_validation.is_some());
+    }
+
+    #[test]
+    fn pci_validation_requires_gicv2m_metadata() {
+        let kernel = temp_file("kernel-pci-without-msi", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+
+        let err =
+            Arm64BootResources::assemble_from_controller_with_startup_resources_and_pci_validation(
+                &controller,
+                valid_config(&[]),
+                VmStartupResources::default(),
+                Some(Arm64BootPciValidationConfig::firecracker_test_endpoint()),
+            )
+            .expect_err("PCI validation without GICv2m metadata should fail");
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::Fdt {
+                source: Arm64FdtError::InvalidPciHost {
+                    reason: "a GICv2m MSI parent is required"
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn pci_validation_ecam_collision_is_atomic() {
+        let mut dispatcher = MmioDispatcher::new();
+        let existing = dispatcher
+            .insert_region(
+                MmioRegionId::new(1),
+                GuestAddress::new(PCI_ECAM_RESERVED_START),
+                0x1000,
+            )
+            .expect("existing test region should register");
+
+        let err = prepare_pci_validation(
+            &mut dispatcher,
+            Arm64BootPciValidationConfig::firecracker_test_endpoint(),
+        )
+        .expect_err("overlapping PCI ECAM registration should fail");
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::RegisterPciEcam { .. }
+        ));
+        assert_eq!(dispatcher.regions(), &[existing]);
     }
 
     #[test]

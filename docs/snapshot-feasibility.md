@@ -26,6 +26,10 @@ path.
   load validation reject MSI-bearing GIC metadata; the frame, reserved range,
   allocator state, and any delivered or in-flight message are not persisted or
   inferred during restore.
+- The validation-only PCI segment is also outside native-v1. Capture rejects
+  its retained ECAM owner/lease and segment/function lease rather than omitting
+  them; no slot, BAR, configuration-space, or
+  guest discovery state is serialized or reconstructed on load.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
   network, and entropy retry schedulers, preflights both final namespaces,
@@ -970,7 +974,10 @@ some of the required state:
   device except separately captured CPU system registers.
   The implemented internal MSI foundation configures HVF's GICM region as a
   Linux GICv2m frame and exposes a range-bound send capability, but it does not
-  add device state, delivery rollback, or portable migration semantics.
+  add device state, delivery rollback, or portable migration semantics. The
+  validation-only PCI segment can bind its generic ECAM FDT host to that frame,
+  but its leases and configuration state likewise have no snapshot schema or
+  restore path.
 
 The inspected headers do not expose a KVM-style dirty log or dirty-page tracking
 API, so Firecracker-style diff snapshot parity is not a direct HVF API mapping.

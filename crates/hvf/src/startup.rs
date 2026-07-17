@@ -51,7 +51,7 @@ use bangbang_runtime::startup::{
     Arm64BootMemoryHotplugNotificationDispatch, Arm64BootMemoryHotplugNotificationDispatchError,
     Arm64BootMemoryHotplugNotificationDispatches, Arm64BootNetworkNotificationDispatch,
     Arm64BootNetworkNotificationDispatchError, Arm64BootNetworkNotificationDispatches,
-    Arm64BootNetworkPacketIoProvider, Arm64BootPmemFlushProvider,
+    Arm64BootNetworkPacketIoProvider, Arm64BootPciValidationConfig, Arm64BootPmemFlushProvider,
     Arm64BootPmemNotificationDispatch, Arm64BootPmemNotificationDispatchError,
     Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
     Arm64BootResourceParts, Arm64BootResources,
@@ -128,6 +128,7 @@ pub struct HvfArm64BootSessionConfig {
     pub memory_hotplug_device: Option<HvfArm64BootMemoryHotplugDeviceConfig>,
     pub serial_device: Option<HvfArm64BootSerialDeviceConfig>,
     pub gic_msi: Option<HvfGicMsiConfiguration>,
+    pub pci_validation: Option<Arm64BootPciValidationConfig>,
 }
 
 impl HvfArm64BootSessionConfig {
@@ -150,6 +151,7 @@ impl HvfArm64BootSessionConfig {
             memory_hotplug_device: None,
             serial_device: None,
             gic_msi: None,
+            pci_validation: None,
         }
     }
 
@@ -196,6 +198,16 @@ impl HvfArm64BootSessionConfig {
     /// guest-programmed MSI-X remain outside this startup profile.
     pub const fn with_gic_msi(mut self, configuration: HvfGicMsiConfiguration) -> Self {
         self.gic_msi = Some(configuration);
+        self
+    }
+
+    /// Adds the internal endpoint used by the signed Linux PCI enumeration test.
+    ///
+    /// This requires the same configuration to opt into GICv2m with
+    /// [`Self::with_gic_msi`]. It does not expose PCI through the production
+    /// process configuration.
+    pub const fn with_pci_validation(mut self, validation: Arm64BootPciValidationConfig) -> Self {
+        self.pci_validation = Some(validation);
         self
     }
 }
@@ -8155,38 +8167,40 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         .memory_hotplug_device
         .zip(interrupt_lines.memory_hotplug)
         .map(|(memory_hotplug, interrupt_line)| memory_hotplug.into_runtime(interrupt_line));
-    let resources = Arm64BootResources::assemble_from_controller_with_startup_resources(
-        controller,
-        Arm64BootResourceConfig {
-            vcpu_mpidrs: &mpidrs,
-            cache_hierarchy,
-            gic: gic.arm64_fdt_gic(),
-            timer,
-            rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),
-            serial_device: runtime_serial,
-            vmgenid_interrupt_line: interrupt_lines.vmgenid,
-            vmclock_interrupt_line: interrupt_lines.vmclock,
-            block_mmio_layout: config.block_mmio_layout,
-            block_interrupt_lines: &interrupt_lines.block,
-            pmem_mmio_layout: config.pmem_mmio_layout,
-            pmem_interrupt_lines: &interrupt_lines.pmem,
-            network_mmio_layout: config.network_mmio_layout,
-            network_interrupt_lines: &interrupt_lines.network,
-            vsock_mmio_layout: config.vsock_mmio_layout,
-            vsock_interrupt_line: interrupt_lines.vsock,
-            balloon_mmio_layout: config
-                .balloon_device
-                .map(|balloon| balloon.mmio_layout)
-                .unwrap_or_else(|| {
-                    BalloonMmioLayout::new(GuestAddress::new(0), MmioRegionId::new(0))
-                }),
-            balloon_interrupt_line: interrupt_lines.balloon,
-            memory_hotplug_device: runtime_memory_hotplug,
-            entropy_device: runtime_entropy,
-        },
-        startup_resources,
-    )
-    .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
+    let resources =
+        Arm64BootResources::assemble_from_controller_with_startup_resources_and_pci_validation(
+            controller,
+            Arm64BootResourceConfig {
+                vcpu_mpidrs: &mpidrs,
+                cache_hierarchy,
+                gic: gic.arm64_fdt_gic(),
+                timer,
+                rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),
+                serial_device: runtime_serial,
+                vmgenid_interrupt_line: interrupt_lines.vmgenid,
+                vmclock_interrupt_line: interrupt_lines.vmclock,
+                block_mmio_layout: config.block_mmio_layout,
+                block_interrupt_lines: &interrupt_lines.block,
+                pmem_mmio_layout: config.pmem_mmio_layout,
+                pmem_interrupt_lines: &interrupt_lines.pmem,
+                network_mmio_layout: config.network_mmio_layout,
+                network_interrupt_lines: &interrupt_lines.network,
+                vsock_mmio_layout: config.vsock_mmio_layout,
+                vsock_interrupt_line: interrupt_lines.vsock,
+                balloon_mmio_layout: config
+                    .balloon_device
+                    .map(|balloon| balloon.mmio_layout)
+                    .unwrap_or_else(|| {
+                        BalloonMmioLayout::new(GuestAddress::new(0), MmioRegionId::new(0))
+                    }),
+                balloon_interrupt_line: interrupt_lines.balloon,
+                memory_hotplug_device: runtime_memory_hotplug,
+                entropy_device: runtime_entropy,
+            },
+            startup_resources,
+            config.pci_validation,
+        )
+        .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
     let boot_registers = HvfArm64BootRegisters {
         kernel_entry: resources.loaded_boot_source.kernel.entry_address,
         fdt_address: resources.fdt.address,
@@ -8555,10 +8569,10 @@ mod tests {
         Arm64BootMemoryHotplugDeviceConfig, Arm64BootMemoryHotplugNotificationDispatches,
         Arm64BootNetworkNotificationDispatches, Arm64BootNetworkNotificationOutcome,
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
-        Arm64BootPmemFlushProvider, Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig,
-        Arm64BootResources, Arm64BootRuntimeResources, Arm64BootVmGenIdDevice,
-        Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatches,
-        update_memory_hotplug_config_for_device,
+        Arm64BootPciValidationConfig, Arm64BootPmemFlushProvider,
+        Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
+        Arm64BootRuntimeResources, Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError,
+        Arm64BootVsockNotificationDispatches, update_memory_hotplug_config_for_device,
     };
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -17122,7 +17136,7 @@ mod tests {
     }
 
     #[test]
-    fn session_config_opts_into_gic_msi_without_changing_the_default() {
+    fn session_config_opts_into_internal_platform_validation_without_changing_the_default() {
         let default = HvfArm64BootSessionConfig::new(
             BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
             PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
@@ -17135,9 +17149,15 @@ mod tests {
         );
 
         assert_eq!(default.gic_msi, None);
+        assert_eq!(default.pci_validation, None);
         assert_eq!(
-            default.with_gic_msi(configuration).gic_msi,
+            default.clone().with_gic_msi(configuration).gic_msi,
             Some(configuration)
+        );
+        let validation = Arm64BootPciValidationConfig::firecracker_test_endpoint();
+        assert_eq!(
+            default.with_pci_validation(validation).pci_validation,
+            Some(validation)
         );
     }
 

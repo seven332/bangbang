@@ -153,6 +153,44 @@ fn boots_firecracker_kernel_with_the_advertised_gicv2m_frame() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn boots_firecracker_kernel_and_enumerates_the_internal_pci_segment() {
+    use std::num::NonZeroU32;
+
+    use bangbang_hvf::HvfGicMsiConfiguration;
+    use bangbang_runtime::startup::Arm64BootPciValidationConfig;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let initrd_path = env_path("BANGBANG_GUEST_INITRD_PATH");
+    let observation = run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
+        "guest-pci-enumeration",
+        BOOT_MARKER,
+        Some(initrd_path),
+        INITRD_BOOT_ARGS,
+        Some(HvfGicMsiConfiguration::new(
+            NonZeroU32::new(1).expect("test MSI count should be nonzero"),
+        )),
+        Some(Arm64BootPciValidationConfig::firecracker_test_endpoint()),
+        |_| {},
+    );
+
+    assert_guest_boot_observed_marker(&observation, BOOT_MARKER, "boot marker");
+    for identity in [
+        b"pci 0000:00:00.0: [8086:0d57]",
+        b"pci 0000:00:01.0: [0042:0000]",
+    ] {
+        assert!(
+            bytes_contain_marker(&observation.serial_bytes, identity),
+            "pinned Linux did not enumerate PCI identity {:?}\nserial output:\n{}",
+            String::from_utf8_lossy(identity),
+            String::from_utf8_lossy(&observation.serial_bytes)
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn boots_firecracker_kernel_and_executes_userspace_on_secondary_cpu() {
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::cpu::{
@@ -858,6 +896,27 @@ fn run_guest_boot_with_boot_source_and_gic_msi(
     gic_msi: Option<bangbang_hvf::HvfGicMsiConfiguration>,
     configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
 ) -> GuestBootObservation {
+    run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
+        instance_id,
+        marker,
+        initrd_path,
+        boot_args,
+        gic_msi,
+        None,
+        configure_controller,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
+    instance_id: &str,
+    marker: &[u8],
+    initrd_path: Option<std::path::PathBuf>,
+    boot_args: &str,
+    gic_msi: Option<bangbang_hvf::HvfGicMsiConfiguration>,
+    pci_validation: Option<bangbang_runtime::startup::Arm64BootPciValidationConfig>,
+    configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
+) -> GuestBootObservation {
     use std::num::NonZeroUsize;
     use std::time::Instant;
 
@@ -904,6 +963,10 @@ fn run_guest_boot_with_boot_source_and_gic_msi(
     ));
     let config = match gic_msi {
         Some(configuration) => config.with_gic_msi(configuration),
+        None => config,
+    };
+    let config = match pci_validation {
+        Some(validation) => config.with_pci_validation(validation),
         None => config,
     };
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
@@ -1770,6 +1833,64 @@ fn validate_pre_run_boot_metadata(
             assert!(!intc.has_prop("#msi-cells"));
             assert!(intc.children.is_empty());
         }
+    }
+
+    match resources.pci_validation.as_ref() {
+        Some(validation) => {
+            assert_eq!(
+                validation
+                    .segment()
+                    .with_segment(|segment| segment.function_count())
+                    .expect("PCI validation segment should remain accessible"),
+                2,
+                "PCI validation segment should retain the host bridge and endpoint"
+            );
+            let pci = tree
+                .find("/pci@70000000")
+                .expect("PCI validation FDT should contain the ECAM host node");
+            assert_eq!(pci.prop_str("compatible").unwrap(), "pci-host-ecam-generic");
+            assert_eq!(pci.prop_str("device_type").unwrap(), "pci");
+            assert_eq!(prop_u64_cells(pci, "reg"), [0x7000_0000, 0x10_0000]);
+            assert_eq!(prop_u32_cells(pci, "bus-range"), [0, 0]);
+            assert_eq!(pci.prop_u32("linux,pci-domain").unwrap(), 0);
+            assert_eq!(pci.prop_u32("#address-cells").unwrap(), 3);
+            assert_eq!(pci.prop_u32("#size-cells").unwrap(), 2);
+            assert_eq!(pci.prop_u32("#interrupt-cells").unwrap(), 1);
+            assert_eq!(pci.prop_u32("msi-parent").unwrap(), 3);
+            assert_eq!(
+                prop_u32_cells(pci, "ranges"),
+                [
+                    0x0200_0000,
+                    0,
+                    0x4000_3000,
+                    0,
+                    0x4000_3000,
+                    0,
+                    0x2fff_d000,
+                    0x0300_0000,
+                    0x40,
+                    0,
+                    0x40,
+                    0,
+                    0x40,
+                    0,
+                ]
+            );
+            for property in ["interrupt-map", "interrupt-map-mask", "dma-coherent"] {
+                assert!(
+                    pci.prop_raw(property)
+                        .expect("empty PCI property should exist")
+                        .is_empty()
+                );
+            }
+            assert!(!pci.has_prop("msi-map"));
+            assert!(!pci.has_prop("iommu-map"));
+            assert!(tree.find("/intc/its").is_none());
+        }
+        None => assert!(
+            tree.find("/pci@70000000").is_none(),
+            "ordinary guest boot should not publish PCI"
+        ),
     }
 
     assert_eq!(session.vcpu_count(), diagnostics.vcpu_mpidrs.len());

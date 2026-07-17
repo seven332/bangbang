@@ -69,6 +69,19 @@ exhaustion/provenance, sender serialization/errors/redaction, teardown
 revocation of retained clones, and FDT publication without raw values in
 formatted failures.
 
+PCI foundation changes additionally require atomic MMIO registration/release,
+slot and BAR lease, type-0 configuration, ECAM, address-plan, FDT, and startup
+unit coverage. Failure cases must prove rollback for a prefix overlap or
+handler collision, reject wrong-owner/allocator/dispatcher and stale leases,
+and keep the no-PCI FDT bytes unchanged. The signed `guest_boot` case
+`boots_firecracker_kernel_and_enumerates_the_internal_pci_segment` must run
+through `scripts/run-integration-tests.sh --test guest_boot`, inspect the exact
+generic-ECAM node and GICv2m parent before execution, then require pinned Linux
+to enumerate both `0000:00:00.0 [8086:0d57]` and the identity-only
+`0000:00:01.0 [0042:0000]` before the normal boot marker. This is discovery
+evidence only; it is not an unsigned-test substitute or a product PCI,
+MSI/MSI-X, hotplug, or snapshot claim.
+
 Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` baseline
 that creates one VM and GIC before two permanent owner-thread runners, proves
 their exact ordered MPIDRs are `[0, 1]`, cancels both before their first bounded
