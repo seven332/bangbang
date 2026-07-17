@@ -1238,6 +1238,115 @@ mod tests {
     }
 
     #[test]
+    fn bar_allocator_exhaustively_reuses_fragmented_small_ranges() {
+        for start_offset in 0..16 {
+            for size in [16, 32, 64] {
+                let capacity = range(0x1000 + start_offset, 0x180);
+                let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory32, capacity);
+                let mut leases = Vec::new();
+
+                loop {
+                    let expected = allocator.available_ranges().iter().find_map(|free| {
+                        let start = align_up(free.start().raw_value(), size)?;
+                        let end = start.checked_add(size)?;
+                        (end <= free.end_exclusive().raw_value()).then(|| range(start, size))
+                    });
+                    let Some(expected) = expected else {
+                        assert!(matches!(
+                            allocator.allocate(size),
+                            Err(PciBarAllocationError::Exhausted { size: exhausted })
+                                if exhausted == size
+                        ));
+                        break;
+                    };
+                    let lease = allocator
+                        .allocate(size)
+                        .expect("reference-model PCI BAR allocation should fit");
+                    assert_eq!(lease.range(), expected);
+                    leases.push(Some(lease));
+                }
+
+                let released_count = leases.len().div_ceil(2);
+                for lease in leases.iter_mut().step_by(2) {
+                    allocator
+                        .release(
+                            lease
+                                .take()
+                                .as_ref()
+                                .expect("fragmented PCI BAR lease should exist"),
+                        )
+                        .expect("fragmented PCI BAR release should succeed");
+                }
+
+                let mut replacements = Vec::new();
+                for _ in 0..released_count {
+                    let expected = allocator
+                        .available_ranges()
+                        .iter()
+                        .find_map(|free| {
+                            let start = align_up(free.start().raw_value(), size)?;
+                            let end = start.checked_add(size)?;
+                            (end <= free.end_exclusive().raw_value()).then(|| range(start, size))
+                        })
+                        .expect("each released aligned hole should be reusable");
+                    let replacement = allocator
+                        .allocate(size)
+                        .expect("released PCI BAR hole should allocate");
+                    assert_eq!(replacement.range(), expected);
+                    replacements.push(replacement);
+                }
+
+                for lease in leases.into_iter().flatten().chain(replacements) {
+                    allocator
+                        .release(&lease)
+                        .expect("remaining PCI BAR lease should release");
+                }
+                assert_eq!(allocator.available_ranges(), &[capacity]);
+            }
+        }
+    }
+
+    #[test]
+    fn bar_allocator_overflow_generation_and_lease_mismatch_are_mutation_free() {
+        let overflow_capacity = range(u64::MAX - 7, 7);
+        let mut overflow = PciBarAllocator::new(PciBarAddressSpace::Memory64, overflow_capacity);
+        assert!(matches!(
+            overflow.allocate(16),
+            Err(PciBarAllocationError::AddressOverflow)
+        ));
+        assert_eq!(overflow.available_ranges(), &[overflow_capacity]);
+
+        let capacity = range(0x1000, 0x2000);
+        let mut exhausted = PciBarAllocator::new(PciBarAddressSpace::Memory32, capacity);
+        exhausted.next_generation = u64::MAX;
+        assert!(matches!(
+            exhausted.allocate(0x1000),
+            Err(PciBarAllocationError::GenerationExhausted)
+        ));
+        assert_eq!(exhausted.available_ranges(), &[capacity]);
+        assert!(exhausted.allocations.is_empty());
+
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory32, capacity);
+        let mut lease = allocator
+            .allocate(0x1000)
+            .expect("test PCI BAR should allocate");
+        let original_range = lease.range;
+        let free_before = allocator.available_ranges().to_vec();
+        lease.range = range(0x4000, 0x1000);
+        assert_eq!(
+            allocator.release(&lease),
+            Err(PciBarReleaseError::LeaseMismatch)
+        );
+        assert_eq!(allocator.available_ranges(), free_before);
+        assert_eq!(allocator.allocations.len(), 1);
+        lease.range = original_range;
+        allocator
+            .release(&lease)
+            .expect("original exact PCI BAR lease should still release");
+        assert_eq!(allocator.available_ranges(), &[capacity]);
+    }
+
+    #[test]
     fn bar_allocator_aligns_splits_releases_and_reuses_lowest_range() {
         let capacity = range(0x1003, 0x3ffd);
         let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory32, capacity);
@@ -1355,6 +1464,43 @@ mod tests {
     }
 
     #[test]
+    fn type0_configuration_supports_partial_little_endian_accesses_and_masks() {
+        let mut configuration = endpoint(0x1af4, 0x10ff);
+        let mut identity_slice = [0; 2];
+        configuration
+            .read_config(1, &mut identity_slice)
+            .expect("in-dword identity read should succeed");
+        assert_eq!(identity_slice, [0x1a, 0xff]);
+
+        configuration
+            .write_config(0, &[0, 0])
+            .expect("partial immutable identity write should be ignored");
+        assert_eq!(read_config_u32(&mut configuration, 0), 0x10ff_1af4);
+
+        configuration
+            .write_config(4, &[0x07])
+            .expect("command low-byte write should succeed");
+        configuration
+            .write_config(5, &[0x80])
+            .expect("command high-byte write should succeed");
+        assert_eq!(read_config_u32(&mut configuration, 4), 0x0000_8007);
+
+        configuration
+            .write_config(12, &[0x40, 0xff, 0xff, 0xff])
+            .expect("cacheline/header partial mask write should succeed");
+        assert_eq!(read_config_u32(&mut configuration, 12), 0x0000_0040);
+
+        configuration
+            .write_config(60, &[0x2a, 0xff])
+            .expect("interrupt line/pin write should succeed");
+        assert_eq!(read_config_u32(&mut configuration, 60), 0x0000_002a);
+        assert_eq!(
+            read_config_u32(&mut configuration, (PCI_CONFIG_SPACE_SIZE - 4) as u16),
+            0
+        );
+    }
+
+    #[test]
     fn type0_configuration_probes_and_preserves_32_bit_bar() {
         let mut allocator =
             PciBarAllocator::new(PciBarAddressSpace::Memory32, range(0x5000_0000, 0x20_0000));
@@ -1462,6 +1608,38 @@ mod tests {
             first.remove_function(&lease),
             Err(PciFunctionReleaseError::StaleLease { sbdf })
         );
+    }
+
+    #[test]
+    fn segment_generation_and_lease_mismatch_fail_without_mutation() {
+        let mut exhausted = PciSegment::new();
+        exhausted.next_generation = u64::MAX;
+        assert!(matches!(
+            exhausted.add_function(endpoint(0x1af4, 0x10ff)),
+            Err(PciSegmentError::GenerationExhausted)
+        ));
+        assert_eq!(exhausted.function_count(), 1);
+        assert!(exhausted.records.is_empty());
+
+        let mut segment = PciSegment::new();
+        let mut lease = segment
+            .add_function(endpoint(0x1af4, 0x10ff))
+            .expect("test PCI endpoint should allocate");
+        let original_generation = lease.generation;
+        lease.generation = lease
+            .generation
+            .checked_add(1)
+            .expect("test lease generation should increment");
+        assert_eq!(
+            segment.remove_function(&lease),
+            Err(PciFunctionReleaseError::LeaseMismatch { sbdf: lease.sbdf() })
+        );
+        assert_eq!(segment.function_count(), 2);
+        lease.generation = original_generation;
+        segment
+            .remove_function(&lease)
+            .expect("original exact PCI function lease should still release");
+        assert_eq!(segment.function_count(), 1);
     }
 
     #[test]
