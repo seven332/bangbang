@@ -71,7 +71,8 @@ use crate::coordinator::{HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuR
 use crate::dirty::{HvfDirtyWriteEpochResetError, HvfDirtyWriteTrackerStartError};
 use crate::gic::{
     HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator,
-    HvfGicMetadata, HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
+    HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiSignaler, HvfGicSpiSignalError,
+    HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions, HvfPmemFlushExecutor};
 use crate::psci::PsciCpuPowerCoordinator;
@@ -126,6 +127,7 @@ pub struct HvfArm64BootSessionConfig {
     pub entropy_device: Option<HvfArm64BootEntropyDeviceConfig>,
     pub memory_hotplug_device: Option<HvfArm64BootMemoryHotplugDeviceConfig>,
     pub serial_device: Option<HvfArm64BootSerialDeviceConfig>,
+    pub gic_msi: Option<HvfGicMsiConfiguration>,
 }
 
 impl HvfArm64BootSessionConfig {
@@ -147,6 +149,7 @@ impl HvfArm64BootSessionConfig {
             entropy_device: None,
             memory_hotplug_device: None,
             serial_device: None,
+            gic_msi: None,
         }
     }
 
@@ -184,6 +187,15 @@ impl HvfArm64BootSessionConfig {
 
     pub fn with_serial_device(mut self, serial_device: HvfArm64BootSerialDeviceConfig) -> Self {
         self.serial_device = Some(serial_device);
+        self
+    }
+
+    /// Opt into a demand-sized public-HVF GICv2m range for platform validation.
+    ///
+    /// Ordinary process construction leaves this unset. PCI admission and
+    /// guest-programmed MSI-X remain outside this startup profile.
+    pub const fn with_gic_msi(mut self, configuration: HvfGicMsiConfiguration) -> Self {
+        self.gic_msi = Some(configuration);
         self
     }
 }
@@ -1628,6 +1640,11 @@ impl HvfArm64BootSession<'_> {
 
     pub const fn gic_metadata(&self) -> HvfGicMetadata {
         self.gic
+    }
+
+    /// Return the send-only capability retained by an MSI-enabled session.
+    pub fn gic_msi_signaler(&self) -> Option<&HvfGicMsiSignaler> {
+        self.backend.gic_msi_signaler()
     }
 
     pub fn primary_mpidr(&self) -> u64 {
@@ -3253,6 +3270,11 @@ impl OwnedHvfArm64BootSession {
 
     pub const fn gic_metadata(&self) -> HvfGicMetadata {
         self.gic
+    }
+
+    /// Return the send-only capability retained by an MSI-enabled session.
+    pub fn gic_msi_signaler(&self) -> Option<&HvfGicMsiSignaler> {
+        self.backend.gic_msi_signaler()
     }
 
     pub fn primary_mpidr(&self) -> u64 {
@@ -8093,9 +8115,11 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     let retained_cache_hierarchy = cache_hierarchy.clone();
     <HvfBackend as VmBackend>::create_vm(backend)
         .map_err(|source| HvfArm64BootSessionError::CreateVm { source })?;
-    let gic = *backend
-        .create_gic()
-        .map_err(|source| HvfArm64BootSessionError::CreateGic { source })?;
+    let gic = *match config.gic_msi {
+        Some(configuration) => backend.create_gic_with_msi(configuration),
+        None => backend.create_gic(),
+    }
+    .map_err(|source| HvfArm64BootSessionError::CreateGic { source })?;
     let timer = gic
         .arm64_fdt_timer_interrupts()
         .map_err(|source| HvfArm64BootSessionError::TimerMetadata { source })?;
@@ -8456,7 +8480,7 @@ mod tests {
     use std::error::Error as _;
     use std::fs::{self, OpenOptions};
     use std::io::{self, Write};
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU32, NonZeroUsize};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
@@ -17095,6 +17119,26 @@ mod tests {
         assert!(config.serial_device.is_some());
         assert_eq!(config.network_mmio_layout, network_layout);
         assert_eq!(config.rtc_mmio_layout.base(), TEST_RTC_MMIO_BASE);
+    }
+
+    #[test]
+    fn session_config_opts_into_gic_msi_without_changing_the_default() {
+        let default = HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            RtcMmioLayout::new(TEST_RTC_MMIO_BASE, MmioRegionId::new(3000)),
+        );
+        let configuration = crate::gic::HvfGicMsiConfiguration::new(
+            NonZeroU32::new(8).expect("test MSI count should be nonzero"),
+        );
+
+        assert_eq!(default.gic_msi, None);
+        assert_eq!(
+            default.with_gic_msi(configuration).gic_msi,
+            Some(configuration)
+        );
     }
 
     #[test]

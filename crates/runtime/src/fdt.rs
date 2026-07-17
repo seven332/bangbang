@@ -14,6 +14,7 @@ use crate::memory::{
 const ROOT_COMPATIBILITY: &str = "linux,dummy-virt";
 const GIC_PHANDLE: u32 = 1;
 const CLOCK_PHANDLE: u32 = 2;
+const MSI_PHANDLE: u32 = 3;
 const ADDRESS_CELLS: u32 = 2;
 const SIZE_CELLS: u32 = 2;
 const CPU_ADDRESS_CELLS: u32 = 2;
@@ -42,6 +43,7 @@ const IRQ_TYPE_EDGE_RISING: u32 = 1;
 const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 const FIRST_PPI_INTID: u32 = 16;
 const FIRST_SPI_INTID: u32 = 32;
+const GICV2M_REGISTER_SIZE: u64 = 4;
 const MEMORY_REG_CELLS_PER_RANGE: usize = 2;
 const MEMORY_REG_CELL_SIZE: usize = 8;
 
@@ -51,6 +53,10 @@ pub const ARM64_FDT_VIRTUAL_TIMER_PPI: u32 = 11;
 pub const ARM64_FDT_HYPERVISOR_TIMER_PPI: u32 = 10;
 pub const ARM64_FDT_VMGENID_SIZE: u64 = 16;
 pub const ARM64_FDT_VMCLOCK_SIZE: u64 = 0x1000;
+pub const ARM64_GICV2M_MSI_TYPER_OFFSET: u64 = 0x8;
+pub const ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET: u64 = 0x40;
+pub const ARM64_GICV2M_MSI_IIDR_OFFSET: u64 = 0xfcc;
+pub const ARM64_GICV2M_SPI_END_EXCLUSIVE: u32 = 1019;
 const LINUX_PCI_PROBE_ONLY: u32 = 1;
 const ARM64_FDT_RNG_SEED_SIZE: usize = 64;
 
@@ -398,10 +404,19 @@ pub struct Arm64FdtInterruptRange {
     pub count: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Arm64FdtMsi {
     pub region: Arm64FdtRegion,
     pub interrupt_range: Arm64FdtInterruptRange,
+}
+
+impl fmt::Debug for Arm64FdtMsi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Arm64FdtMsi")
+            .field("region", &"<redacted>")
+            .field("interrupt_range", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,7 +629,12 @@ pub enum Arm64FdtError {
     RngSeed {
         source: Arm64FdtRngSeedError,
     },
-    UnsupportedMsi,
+    InvalidGicMsiRegion,
+    InvalidGicMsiInterruptRange,
+    GicMsiRegionOverlaps {
+        other: &'static str,
+    },
+    GicMsiRegionOverlapsMemory,
     InvalidVirtioMmioRegion {
         index: usize,
         region: Arm64FdtRegion,
@@ -872,7 +892,16 @@ impl fmt::Display for Arm64FdtError {
             Self::RngSeed { source } => {
                 write!(f, "failed to create arm64 FDT rng-seed: {source}")
             }
-            Self::UnsupportedMsi => f.write_str("arm64 FDT MSI/ITS nodes are not supported yet"),
+            Self::InvalidGicMsiRegion => f.write_str("arm64 FDT GICv2m frame is invalid"),
+            Self::InvalidGicMsiInterruptRange => {
+                f.write_str("arm64 FDT GICv2m interrupt range is invalid")
+            }
+            Self::GicMsiRegionOverlaps { other } => {
+                write!(f, "arm64 FDT GICv2m frame overlaps GIC {other} region")
+            }
+            Self::GicMsiRegionOverlapsMemory => {
+                f.write_str("arm64 FDT GICv2m frame overlaps guest memory")
+            }
             Self::InvalidVirtioMmioRegion {
                 index,
                 region,
@@ -1128,7 +1157,10 @@ impl std::error::Error for Arm64FdtError {
             | Self::InvalidPpi { .. }
             | Self::DuplicatePpi { .. }
             | Self::InvalidPpiIntid { .. }
-            | Self::UnsupportedMsi
+            | Self::InvalidGicMsiRegion
+            | Self::InvalidGicMsiInterruptRange
+            | Self::GicMsiRegionOverlaps { .. }
+            | Self::GicMsiRegionOverlapsMemory
             | Self::VirtioMmioRegionOverlapsMemory { .. }
             | Self::VirtioMmioRegionOverlapsGic { .. }
             | Self::VirtioMmioRegionsOverlap { .. }
@@ -1543,7 +1575,7 @@ fn cache_phandle(
     let phandle = LAST_CACHE_PHANDLE
         .checked_sub(offset)
         .ok_or(Arm64FdtCacheHierarchyError::PhandleOverflow)?;
-    if phandle <= CLOCK_PHANDLE {
+    if phandle <= MSI_PHANDLE {
         return Err(Arm64FdtCacheHierarchyError::PhandleCollision);
     }
     Ok(phandle)
@@ -1607,6 +1639,14 @@ fn create_gic_node(fdt: &mut FdtWriter, gic: Arm64FdtGic) -> Result<(), Arm64Fdt
             IRQ_TYPE_LEVEL_HIGH,
         ],
     )?;
+    if let Some(msi) = gic.msi {
+        let frame = fdt.begin_node(&format!("v2m@{:x}", msi.region.base))?;
+        fdt.property_string("compatible", "arm,gic-v2m-frame")?;
+        fdt.property_null("msi-controller")?;
+        fdt.property_phandle(MSI_PHANDLE)?;
+        fdt.property_array_u64("reg", &[msi.region.base, msi.region.size])?;
+        fdt.end_node(frame)?;
+    }
     fdt.end_node(interrupt)?;
     Ok(())
 }
@@ -1981,8 +2021,61 @@ fn validate_gic(layout: &GuestMemoryLayout, gic: Arm64FdtGic) -> Result<(), Arm6
 
     validate_ppi("maintenance_irq", gic.maintenance_irq)?;
 
-    if gic.msi.is_some() {
-        return Err(Arm64FdtError::UnsupportedMsi);
+    if let Some(msi) = gic.msi {
+        validate_gic_msi(layout, gic, msi)?;
+    }
+
+    Ok(())
+}
+
+fn validate_gic_msi(
+    layout: &GuestMemoryLayout,
+    gic: Arm64FdtGic,
+    msi: Arm64FdtMsi,
+) -> Result<(), Arm64FdtError> {
+    let msi_range = GuestMemoryRange::new(GuestAddress::new(msi.region.base), msi.region.size)
+        .map_err(|_| Arm64FdtError::InvalidGicMsiRegion)?;
+    for register_offset in [
+        ARM64_GICV2M_MSI_TYPER_OFFSET,
+        ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET,
+        ARM64_GICV2M_MSI_IIDR_OFFSET,
+    ] {
+        let required_frame_size = register_offset
+            .checked_add(GICV2M_REGISTER_SIZE)
+            .ok_or(Arm64FdtError::InvalidGicMsiRegion)?;
+        if msi.region.size < required_frame_size {
+            return Err(Arm64FdtError::InvalidGicMsiRegion);
+        }
+    }
+
+    for (name, region) in [
+        ("distributor", gic.distributor),
+        ("redistributor", gic.redistributor),
+    ] {
+        let range = validate_gic_region(name, region)?;
+        if msi_range.overlaps(range) {
+            return Err(Arm64FdtError::GicMsiRegionOverlaps { other: name });
+        }
+    }
+    if layout
+        .ranges()
+        .iter()
+        .copied()
+        .any(|memory_range| msi_range.overlaps(memory_range))
+    {
+        return Err(Arm64FdtError::GicMsiRegionOverlapsMemory);
+    }
+
+    let interrupt_end = msi
+        .interrupt_range
+        .base
+        .checked_add(msi.interrupt_range.count)
+        .ok_or(Arm64FdtError::InvalidGicMsiInterruptRange)?;
+    if msi.interrupt_range.base < FIRST_SPI_INTID
+        || msi.interrupt_range.count == 0
+        || interrupt_end > ARM64_GICV2M_SPI_END_EXCLUSIVE
+    {
+        return Err(Arm64FdtError::InvalidGicMsiInterruptRange);
     }
 
     Ok(())
@@ -2018,6 +2111,31 @@ fn validate_gic_region(
 ) -> Result<GuestMemoryRange, Arm64FdtError> {
     GuestMemoryRange::new(GuestAddress::new(region.base), region.size)
         .map_err(|_| Arm64FdtError::InvalidGicRegion { name, region })
+}
+
+fn validated_gic_regions(
+    gic: Arm64FdtGic,
+) -> Result<[Option<(&'static str, GuestMemoryRange)>; 3], Arm64FdtError> {
+    let msi = gic
+        .msi
+        .map(|msi| {
+            GuestMemoryRange::new(GuestAddress::new(msi.region.base), msi.region.size)
+                .map(|range| ("msi", range))
+                .map_err(|_| Arm64FdtError::InvalidGicMsiRegion)
+        })
+        .transpose()?;
+
+    Ok([
+        Some((
+            "distributor",
+            validate_gic_region("distributor", gic.distributor)?,
+        )),
+        Some((
+            "redistributor",
+            validate_gic_region("redistributor", gic.redistributor)?,
+        )),
+        msi,
+    ])
 }
 
 fn validate_gic_regions_do_not_overlap(
@@ -2119,18 +2237,7 @@ fn validate_rtc_region_does_not_overlap_gic(
     rtc_range: GuestMemoryRange,
     gic: Arm64FdtGic,
 ) -> Result<(), Arm64FdtError> {
-    let gic_ranges = [
-        (
-            "distributor",
-            validate_gic_region("distributor", gic.distributor)?,
-        ),
-        (
-            "redistributor",
-            validate_gic_region("redistributor", gic.redistributor)?,
-        ),
-    ];
-
-    for (gic_name, gic_range) in gic_ranges {
+    for (gic_name, gic_range) in validated_gic_regions(gic)?.into_iter().flatten() {
         if rtc_range.overlaps(gic_range) {
             return Err(Arm64FdtError::RtcRegionOverlapsGic {
                 region,
@@ -2187,18 +2294,7 @@ fn validate_serial_region_does_not_overlap_gic(
     serial_range: GuestMemoryRange,
     gic: Arm64FdtGic,
 ) -> Result<(), Arm64FdtError> {
-    let gic_ranges = [
-        (
-            "distributor",
-            validate_gic_region("distributor", gic.distributor)?,
-        ),
-        (
-            "redistributor",
-            validate_gic_region("redistributor", gic.redistributor)?,
-        ),
-    ];
-
-    for (gic_name, gic_range) in gic_ranges {
+    for (gic_name, gic_range) in validated_gic_regions(gic)?.into_iter().flatten() {
         if serial_range.overlaps(gic_range) {
             return Err(Arm64FdtError::SerialRegionOverlapsGic {
                 region,
@@ -2341,18 +2437,7 @@ fn validate_vmgenid_region_does_not_overlap_gic(
     vmgenid_range: GuestMemoryRange,
     gic: Arm64FdtGic,
 ) -> Result<(), Arm64FdtError> {
-    let gic_ranges = [
-        (
-            "distributor",
-            validate_gic_region("distributor", gic.distributor)?,
-        ),
-        (
-            "redistributor",
-            validate_gic_region("redistributor", gic.redistributor)?,
-        ),
-    ];
-
-    for (gic_name, gic_range) in gic_ranges {
+    for (gic_name, gic_range) in validated_gic_regions(gic)?.into_iter().flatten() {
         if vmgenid_range.overlaps(gic_range) {
             return Err(Arm64FdtError::VmGenIdRegionOverlapsGic {
                 region,
@@ -2485,18 +2570,7 @@ fn validate_vmclock_region_does_not_overlap_gic(
     vmclock_range: GuestMemoryRange,
     gic: Arm64FdtGic,
 ) -> Result<(), Arm64FdtError> {
-    let gic_ranges = [
-        (
-            "distributor",
-            validate_gic_region("distributor", gic.distributor)?,
-        ),
-        (
-            "redistributor",
-            validate_gic_region("redistributor", gic.redistributor)?,
-        ),
-    ];
-
-    for (gic_name, gic_range) in gic_ranges {
+    for (gic_name, gic_range) in validated_gic_regions(gic)?.into_iter().flatten() {
         if vmclock_range.overlaps(gic_range) {
             return Err(Arm64FdtError::VmClockRegionOverlapsGic {
                 region,
@@ -2649,18 +2723,7 @@ fn validate_virtio_mmio_region_does_not_overlap_gic(
     device_range: GuestMemoryRange,
     gic: Arm64FdtGic,
 ) -> Result<(), Arm64FdtError> {
-    let gic_ranges = [
-        (
-            "distributor",
-            validate_gic_region("distributor", gic.distributor)?,
-        ),
-        (
-            "redistributor",
-            validate_gic_region("redistributor", gic.redistributor)?,
-        ),
-    ];
-
-    for (gic_name, gic_range) in gic_ranges {
+    for (gic_name, gic_range) in validated_gic_regions(gic)?.into_iter().flatten() {
         if device_range.overlaps(gic_range) {
             return Err(Arm64FdtError::VirtioMmioRegionOverlapsGic {
                 index,
@@ -2993,6 +3056,24 @@ mod tests {
         assert_eq!(
             cache_phandle(800, 7, 0),
             Err(Arm64FdtCacheHierarchyError::PhandleCollision)
+        );
+        assert_eq!(
+            cache_phandle(
+                1,
+                2,
+                usize::try_from(LAST_CACHE_PHANDLE - MSI_PHANDLE)
+                    .expect("reserved phandle offset should fit usize"),
+            ),
+            Err(Arm64FdtCacheHierarchyError::PhandleCollision)
+        );
+        assert_eq!(
+            cache_phandle(
+                1,
+                2,
+                usize::try_from(LAST_CACHE_PHANDLE - MSI_PHANDLE - 1)
+                    .expect("first unreserved phandle offset should fit usize"),
+            ),
+            Ok(MSI_PHANDLE + 1)
         );
         assert_eq!(
             format!("{:?}", split_three_level_cache_hierarchy(4, 8)),
@@ -3660,6 +3741,10 @@ mod tests {
             vec![0x3fff_0000, 0x1_0000, 0x3ffd_0000, 0x2_0000]
         );
         assert_eq!(prop_u32_cells(intc, "interrupts"), vec![1, 9, 4]);
+        assert!(!intc.has_prop("msi-controller"));
+        assert!(!intc.has_prop("mbi-ranges"));
+        assert!(!intc.has_prop("mbi-alias"));
+        assert!(!intc.has_prop("#msi-cells"));
         assert!(intc.children.is_empty());
     }
 
@@ -5595,19 +5680,227 @@ mod tests {
     }
 
     #[test]
-    fn rejects_msi_metadata_until_its_node_is_supported() {
+    fn gic_node_publishes_hardware_described_gicv2m_child() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let config = Arm64FdtConfig {
             gic: Arm64FdtGic {
+                msi: Some(test_msi()),
+                ..test_gic()
+            },
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let bytes = build_test_arm64_fdt(&config).expect("valid GICv2m metadata should build");
+        let tree = DeviceTree::load(&bytes).expect("GICv2m FDT should parse");
+        let intc = required_node(&tree, "/intc");
+        let frame = required_node(&tree, "/intc/v2m@3ffc0000");
+
+        assert!(!intc.has_prop("msi-controller"));
+        assert!(!intc.has_prop("mbi-ranges"));
+        assert!(!intc.has_prop("mbi-alias"));
+        assert!(!intc.has_prop("#msi-cells"));
+        assert_eq!(intc.children.len(), 1);
+        assert_eq!(frame.prop_str("compatible").unwrap(), "arm,gic-v2m-frame");
+        assert!(
+            frame
+                .prop_raw("msi-controller")
+                .expect("MSI controller property should exist")
+                .is_empty()
+        );
+        assert_eq!(frame.prop_u32("phandle").unwrap(), MSI_PHANDLE);
+        assert_eq!(prop_u64_cells(frame, "reg"), vec![0x3ffc_0000, 0x1_0000]);
+        assert!(!frame.has_prop("arm,msi-base-spi"));
+        assert!(!frame.has_prop("arm,msi-num-spis"));
+        assert!(!frame.has_prop("#msi-cells"));
+        assert!(frame.children.is_empty());
+        assert!(tree.find("/intc/msic").is_none());
+        assert_eq!(
+            format!("{:?}", test_msi()),
+            "Arm64FdtMsi { region: \"<redacted>\", interrupt_range: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_gicv2m_frame_and_interrupt_range_without_raw_values() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let invalid_frames = [
+            Arm64FdtRegion {
+                base: 0x3ffc_0000,
+                size: 0,
+            },
+            Arm64FdtRegion {
+                base: 0x3ffc_0000,
+                size: ARM64_GICV2M_MSI_IIDR_OFFSET + GICV2M_REGISTER_SIZE - 1,
+            },
+            Arm64FdtRegion {
+                base: u64::MAX,
+                size: 0x1_0000,
+            },
+        ];
+        for region in invalid_frames {
+            let config = Arm64FdtConfig {
+                gic: Arm64FdtGic {
+                    msi: Some(Arm64FdtMsi {
+                        region,
+                        ..test_msi()
+                    }),
+                    ..test_gic()
+                },
+                ..test_config(
+                    &layout,
+                    Arm64FdtBootInfo {
+                        command_line: "panic=1",
+                        initrd: None,
+                    },
+                )
+            };
+
+            let err = build_test_arm64_fdt(&config).expect_err("invalid GICv2m frame should fail");
+            assert_eq!(err, Arm64FdtError::InvalidGicMsiRegion);
+            assert_eq!(err.to_string(), "arm64 FDT GICv2m frame is invalid");
+        }
+
+        let invalid_ranges = [
+            Arm64FdtInterruptRange { base: 31, count: 1 },
+            Arm64FdtInterruptRange {
+                base: FIRST_SPI_INTID,
+                count: 0,
+            },
+            Arm64FdtInterruptRange {
+                base: u32::MAX,
+                count: 2,
+            },
+            Arm64FdtInterruptRange {
+                base: ARM64_GICV2M_SPI_END_EXCLUSIVE - 1,
+                count: 2,
+            },
+        ];
+        for interrupt_range in invalid_ranges {
+            let config = Arm64FdtConfig {
+                gic: Arm64FdtGic {
+                    msi: Some(Arm64FdtMsi {
+                        interrupt_range,
+                        ..test_msi()
+                    }),
+                    ..test_gic()
+                },
+                ..test_config(
+                    &layout,
+                    Arm64FdtBootInfo {
+                        command_line: "panic=1",
+                        initrd: None,
+                    },
+                )
+            };
+
+            let err = build_test_arm64_fdt(&config)
+                .expect_err("invalid GICv2m interrupt range should fail");
+            assert_eq!(err, Arm64FdtError::InvalidGicMsiInterruptRange);
+            assert_eq!(
+                err.to_string(),
+                "arm64 FDT GICv2m interrupt range is invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_gicv2m_frame_overlapping_gic_memory_or_device_regions() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        for (region, expected) in [
+            (
+                test_gic().distributor,
+                Arm64FdtError::GicMsiRegionOverlaps {
+                    other: "distributor",
+                },
+            ),
+            (
+                test_gic().redistributor,
+                Arm64FdtError::GicMsiRegionOverlaps {
+                    other: "redistributor",
+                },
+            ),
+            (
+                Arm64FdtRegion {
+                    base: aarch64::DRAM_MEM_START,
+                    size: 0x1_0000,
+                },
+                Arm64FdtError::GicMsiRegionOverlapsMemory,
+            ),
+        ] {
+            let config = Arm64FdtConfig {
+                gic: Arm64FdtGic {
+                    msi: Some(Arm64FdtMsi {
+                        region,
+                        ..test_msi()
+                    }),
+                    ..test_gic()
+                },
+                ..test_config(
+                    &layout,
+                    Arm64FdtBootInfo {
+                        command_line: "panic=1",
+                        initrd: None,
+                    },
+                )
+            };
+            assert_eq!(
+                build_test_arm64_fdt(&config).expect_err("overlapping GICv2m frame should fail"),
+                expected
+            );
+        }
+
+        let msi = Arm64FdtMsi {
+            region: Arm64FdtRegion {
+                base: 0x4000_1000,
+                size: 0x1000,
+            },
+            ..test_msi()
+        };
+        let device = virtio_mmio_device(msi.region.base, msi.region.size, FIRST_SPI_INTID);
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
+                msi: Some(msi),
+                ..test_gic()
+            },
+            virtio_mmio_devices: &[device],
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+        assert_eq!(
+            build_test_arm64_fdt(&config).expect_err("device-overlapping GICv2m frame should fail"),
+            Arm64FdtError::VirtioMmioRegionOverlapsGic {
+                index: 0,
+                region: device.region,
+                gic: "msi",
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_gicv2m_metadata_before_guest_memory_write() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let mut memory = GuestMemory::allocate(&layout).expect("test guest memory should allocate");
+        let address = aarch64::fdt_address(&layout).expect("test FDT address should resolve");
+        let before = [0xa5; 16];
+        memory
+            .write_slice(&before, address)
+            .expect("sentinel bytes should be writable");
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
                 msi: Some(Arm64FdtMsi {
-                    region: Arm64FdtRegion {
-                        base: 0x3ffc_0000,
-                        size: 0x1_0000,
-                    },
-                    interrupt_range: Arm64FdtInterruptRange {
-                        base: 128,
-                        count: 32,
-                    },
+                    interrupt_range: Arm64FdtInterruptRange { base: 31, count: 1 },
+                    ..test_msi()
                 }),
                 ..test_gic()
             },
@@ -5620,10 +5913,16 @@ mod tests {
             )
         };
 
-        let err =
-            build_test_arm64_fdt(&config).expect_err("MSI should be explicit unsupported work");
-
-        assert_eq!(err, Arm64FdtError::UnsupportedMsi);
+        assert_eq!(
+            write_test_arm64_fdt(&config, &mut memory)
+                .expect_err("invalid GICv2m metadata should fail before writing"),
+            Arm64FdtError::InvalidGicMsiInterruptRange
+        );
+        let mut after = [0; 16];
+        memory
+            .read_slice(&mut after, address)
+            .expect("sentinel bytes should remain readable");
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -6247,6 +6546,19 @@ mod tests {
             interrupt_cells: 3,
             maintenance_irq: 9,
             msi: None,
+        }
+    }
+
+    const fn test_msi() -> Arm64FdtMsi {
+        Arm64FdtMsi {
+            region: Arm64FdtRegion {
+                base: 0x3ffc_0000,
+                size: 0x1_0000,
+            },
+            interrupt_range: Arm64FdtInterruptRange {
+                base: 128,
+                count: 32,
+            },
         }
     }
 

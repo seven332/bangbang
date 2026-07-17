@@ -1509,6 +1509,28 @@ committed with cleanup uncertain. No claim is made that three split filenames
 are one crash-atomic transaction. Normal success leaves only complete final
 files and no private stages.
 
+## Public-HVF GICv2m Capability Boundary
+
+The macOS 15+ GICv2m path is an internal, explicit startup opt-in. MSI-specific
+Hypervisor.framework symbols are loaded only after that opt-in, and the default
+backend, public process configuration, and guest FDT expose no MSI controller.
+The configured frame and interrupt range are validated before publication; the
+legacy and MSI allocators are disjoint, INTID 1019 is kept outside the pinned
+Linux driver's usable domain, and the send address is derived internally from
+the frame's `SETSPI` register. The send-only capability accepts only an opaque
+typed value produced by its matching allocator, serializes host calls, and
+redacts message details from diagnostics. VM teardown waits on that same send
+lock and revokes all clones before releasing VM-owned resources, so a stale
+capability cannot target a later VM in the process.
+
+Hypervisor.framework does not make message delivery transactional. A returned
+error cannot prove that the guest did not observe the interrupt, so a future
+device owner must define its own retry and teardown policy. Current signed
+coverage separately proves raw host-to-vCPU delivery and pinned-Linux GICv2m
+domain discovery; it does not prove PCI enumeration, MSI/MSI-X programming,
+interrupt remapping, or Firecracker's KVM ITS behavior. MSI-bearing GIC metadata
+is rejected by the native-v1 snapshot profile rather than silently omitted.
+
 ## HVF Entitlements
 
 Real Hypervisor.framework execution requires macOS support, Apple Silicon, and

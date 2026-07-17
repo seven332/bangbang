@@ -25,7 +25,7 @@ Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
 exit dispatch/completion through runtime handlers, explicit runner-thread MMIO
-handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, HVF SPI interrupt-line allocation and signaling, minimal internal
+handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata with an explicitly opt-in public-HVF GICv2m MSI frame but without ITS or PCI MSI-X, HVF SPI interrupt-line allocation and signaling, minimal internal
 arm64 FDT generation with optional RTC, serial, VMGenID, and virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership and
 controlled mapped-memory access for allocated regions, an internal MMIO region ownership registry and operation/data
@@ -92,6 +92,34 @@ recorded as pre-boot VM state and applied during startup preparation. Runtime
 `PATCH /drives/{drive_id}` can refresh the backing file of an existing active
 virtio-block device through the process-owned boot session, but public
 block-device attachment, boot selection changes, and hotplug remain deferred.
+
+## Internal GICv2m MSI Foundation
+
+On macOS 15 and later, an internal boot-session option may request a nonzero,
+demand-sized MSI interrupt range from Hypervisor.framework's public GIC API.
+The backend lazily loads the MSI-specific symbols only for that path, configures
+the host-reported frame, and partitions the host SPI range into a nonempty
+legacy prefix and a distinct MSI suffix. The pinned Linux GICv2m driver treats
+INTID 1019 as its exclusive upper boundary, so neither allocator advertises
+that terminal SPI even when HVF reports it. The ordinary GIC constructor,
+process startup path, and FDT remain unchanged and MSI-free.
+
+An enabled session advertises one `arm,gic-v2m-frame` child below the GICv3 FDT
+node and retains a typed allocator plus a serialized, send-only signaler. The
+message address is derived from the validated frame and its GICv2m `SETSPI`
+offset; callers supply only an interrupt allocated from the exact retained
+range. Message details stay out of `Debug` and errors. A failed send is
+nontransactional: callers cannot infer whether the guest observed the message
+and must apply device-specific retry or failure policy. VM teardown takes the
+same sender lock, waits for an in-flight call, and revokes every retained clone
+before unmapping or destroying VM-owned resources.
+
+This foundation is not Firecracker's KVM-backed GICv3 ITS implementation. It
+adds no public API or CLI control, PCI host bridge, enumeration, BAR layout,
+MSI/MSI-X table emulation, guest-programmed message routing, interrupt remapping,
+or guest PCI delivery claim. It is also outside the accepted native-v1 snapshot
+profile, which rejects MSI-bearing GIC metadata. The capability inventory is
+therefore not promoted by this internal foundation alone.
 
 ## Internal PSCI Power Sessions
 
@@ -2049,9 +2077,15 @@ FDT shape but does not imply PCI device support.
 Direct FDT configuration still validates that `bootargs` fits in the 2048-byte
 aarch64 command-line capacity including the trailing NUL byte and contains no
 embedded NUL bytes. The GIC node consumes backend-neutral distributor and
-redistributor metadata, advertises `arm,gic-v3`, and does not emit an ITS/MSI
-child while the HVF metadata has no MSI support. The FDT builder rejects empty
-or oversized CPU sets, duplicate CPU `reg` values, initrd ranges outside
+redistributor metadata and advertises `arm,gic-v3`. MSI-free metadata emits no
+MSI child or GICv3 MBI/ITS property. Optional HVF MSI metadata instead emits one
+hardware-described `arm,gic-v2m-frame` child with its own `msi-controller`,
+phandle, and exact MMIO `reg`; it deliberately emits no software range
+overrides. The builder requires the frame to contain the GICv2m TYPER, SETSPI,
+and IIDR registers, restricts its SPI range to Linux's accepted domain ending
+before INTID 1019, and rejects overlap with GIC, guest-memory, and device MMIO.
+The FDT builder also rejects empty or oversized CPU sets, duplicate CPU `reg`
+values, initrd ranges outside
 guest-advertised memory or overlapping the reserved FDT window, and GIC MMIO
 regions that are invalid, overlap each other, or overlap guest RAM. It also
 rejects unexpected GIC compatibility strings and PPI collisions between the GIC
@@ -2318,8 +2352,20 @@ against that supported range before setting explicit GIC SPI levels with
 `hv_gic_set_spi`. A narrow internal PPI pending primitive validates real GIC
 PPI INTIDs before writing `GICR_ISPENDR0` or `GICR_ICPENDR0` through
 `hv_gic_set_redistributor_reg` on the vCPU-owning thread. HVF timer INTIDs are
-converted to FDT PPI cells for the runtime timer node, and MSI/ITS metadata is
-intentionally absent until a later device path needs it.
+converted to FDT PPI cells for the runtime timer node.
+An explicit internal boot option additionally loads only the public HVF MSI
+geometry/configuration/send symbols, places the GICM region below the
+redistributor, and reserves a demand-sized message-only SPI suffix while
+preserving one contiguous legacy prefix. HVF reports SPIs 32 through 1019 on
+the tested host, but Linux's GICv2m driver rejects a frame reaching 1019, so the
+partition leaves that terminal INTID unallocatable and reserves downward from
+1018. Typed allocator tokens retain range provenance, and the cloneable,
+mutex-serialized sender accepts only a token from its exact configured range
+before calling `hv_gic_send_msi` at the frame's SETSPI address. Configuration,
+metadata, tokens, allocator state, and sender diagnostics redact counts,
+addresses, and INTIDs. Default creation does not query or publish MSI state;
+there is no GICv3 MBI/ITS claim, public API selection, PCI/MSI-X device
+composition, or delivery rollback guarantee.
 Separately, typed owner-thread HVF commands get or set CPU-level IRQ/FIQ pending
 injection levels, capture both in IRQ-then-FIQ order, and reapply the complete
 typed value in that same order. Those levels are not GIC state and HVF clears

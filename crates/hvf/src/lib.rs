@@ -45,7 +45,9 @@ pub use gic::{
     HvfArm64GicIccRegister, HvfArm64GicIccRegisterRestoreError,
     HvfArm64GicIccRegisterRestoreOperation, HvfArm64GicIccRegisterState, HvfGicDeviceState,
     HvfGicError, HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata,
-    HvfGicMsiMetadata, HvfGicRedistributor, HvfGicRegion, HvfGicSpiSignalError, HvfGicSpiSignaler,
+    HvfGicMsiConfiguration, HvfGicMsiInterrupt, HvfGicMsiInterruptAllocationError,
+    HvfGicMsiInterruptAllocator, HvfGicMsiMetadata, HvfGicMsiSignalError, HvfGicMsiSignaler,
+    HvfGicRedistributor, HvfGicRegion, HvfGicSpiSignalError, HvfGicSpiSignaler,
     HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
 };
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};

@@ -113,6 +113,46 @@ fn boots_firecracker_kernel_to_guest_marker() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn boots_firecracker_kernel_with_the_advertised_gicv2m_frame() {
+    use std::num::NonZeroU32;
+
+    use bangbang_hvf::HvfGicMsiConfiguration;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let observation = run_guest_boot_with_gic_msi_until_marker(
+        "guest-gicv2m",
+        BOOT_MARKER,
+        HvfGicMsiConfiguration::new(NonZeroU32::new(1).expect("test MSI count should be nonzero")),
+        |_| {},
+    );
+
+    assert_guest_boot_observed_marker(&observation, BOOT_MARKER, "boot marker");
+    let msi = observation
+        .gic_msi
+        .expect("MSI-enabled guest boot should retain GICv2m metadata");
+    let last_intid = msi
+        .interrupt_range
+        .base
+        .checked_add(msi.interrupt_range.count - 1)
+        .expect("validated GICv2m range should have an inclusive end");
+    let range_marker = format!("SPI[{}:{}]", msi.interrupt_range.base, last_intid);
+
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, b"GICv2m: range"),
+        "pinned Linux did not initialize the advertised GICv2m frame\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, range_marker.as_bytes()),
+        "pinned Linux did not recognize the exact advertised GICv2m SPI range\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn boots_firecracker_kernel_and_executes_userspace_on_secondary_cpu() {
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::cpu::{
@@ -764,6 +804,24 @@ fn run_guest_boot_until_marker(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_guest_boot_with_gic_msi_until_marker(
+    instance_id: &str,
+    marker: &[u8],
+    gic_msi: bangbang_hvf::HvfGicMsiConfiguration,
+    configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
+) -> GuestBootObservation {
+    let initrd_path = env_path("BANGBANG_GUEST_INITRD_PATH");
+    run_guest_boot_with_boot_source_and_gic_msi(
+        instance_id,
+        marker,
+        Some(initrd_path),
+        INITRD_BOOT_ARGS,
+        Some(gic_msi),
+        configure_controller,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_guest_boot_without_initrd_until_marker(
     instance_id: &str,
     marker: &[u8],
@@ -779,6 +837,25 @@ fn run_guest_boot_with_boot_source(
     marker: &[u8],
     initrd_path: Option<std::path::PathBuf>,
     boot_args: &str,
+    configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
+) -> GuestBootObservation {
+    run_guest_boot_with_boot_source_and_gic_msi(
+        instance_id,
+        marker,
+        initrd_path,
+        boot_args,
+        None,
+        configure_controller,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_guest_boot_with_boot_source_and_gic_msi(
+    instance_id: &str,
+    marker: &[u8],
+    initrd_path: Option<std::path::PathBuf>,
+    boot_args: &str,
+    gic_msi: Option<bangbang_hvf::HvfGicMsiConfiguration>,
     configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
 ) -> GuestBootObservation {
     use std::num::NonZeroUsize;
@@ -825,12 +902,17 @@ fn run_guest_boot_with_boot_source(
         serial_address,
         SharedSerialOutput::from(serial_output.clone()),
     ));
+    let config = match gic_msi {
+        Some(configuration) => config.with_gic_msi(configuration),
+        None => config,
+    };
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
         .expect("guest boot test session should prepare");
     let cache_hierarchy = session
         .arm64_fdt_cache_hierarchy()
         .expect("ordinary boot session should retain its cache hierarchy")
         .clone();
+    let gic_msi = session.gic_metadata().msi;
     let boot_diagnostics =
         GuestBootDiagnostics::from_session(&session, kernel_path, initrd_path, serial_address);
     validate_pre_run_boot_metadata(&session, &boot_diagnostics);
@@ -893,6 +975,7 @@ fn run_guest_boot_with_boot_source(
         run_diagnostics,
         serial_bytes,
         cache_hierarchy,
+        gic_msi,
     }
 }
 
@@ -923,6 +1006,7 @@ struct GuestBootObservation {
     run_diagnostics: GuestBootRunDiagnostics,
     serial_bytes: Vec<u8>,
     cache_hierarchy: bangbang_runtime::fdt::Arm64FdtCacheHierarchy,
+    gic_msi: Option<bangbang_hvf::HvfGicMsiMetadata>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1642,6 +1726,50 @@ fn validate_pre_run_boot_metadata(
             assert!(!chosen.has_prop("linux,initrd-end"));
         }
         _ => panic!("guest boot test initrd diagnostics should be internally consistent"),
+    }
+
+    let gic = session.gic_metadata();
+    let intc = tree
+        .find("/intc")
+        .expect("guest boot test FDT should contain the GIC node");
+    assert_eq!(intc.prop_str("compatible").unwrap(), "arm,gic-v3");
+    assert_eq!(session.gic_msi_signaler().is_some(), gic.msi.is_some());
+    match gic.msi {
+        Some(msi) => {
+            assert!(!intc.has_prop("msi-controller"));
+            assert!(!intc.has_prop("mbi-ranges"));
+            assert!(!intc.has_prop("mbi-alias"));
+            assert!(!intc.has_prop("#msi-cells"));
+            assert_eq!(intc.children.len(), 1);
+            let frame_path = format!("/intc/v2m@{:x}", msi.region.base);
+            let frame = tree
+                .find(&frame_path)
+                .unwrap_or_else(|| panic!("guest boot test FDT should contain {frame_path}"));
+            assert_eq!(frame.prop_str("compatible").unwrap(), "arm,gic-v2m-frame");
+            assert!(
+                frame
+                    .prop_raw("msi-controller")
+                    .expect("MSI controller property should exist")
+                    .is_empty()
+            );
+            assert_eq!(frame.prop_u32("phandle").unwrap(), 3);
+            assert_eq!(
+                prop_u64_cells(frame, "reg"),
+                [msi.region.base, msi.region.size]
+            );
+            assert!(!frame.has_prop("arm,msi-base-spi"));
+            assert!(!frame.has_prop("arm,msi-num-spis"));
+            assert!(!frame.has_prop("#msi-cells"));
+            assert!(frame.children.is_empty());
+            assert!(tree.find("/intc/its").is_none());
+        }
+        None => {
+            assert!(!intc.has_prop("msi-controller"));
+            assert!(!intc.has_prop("mbi-ranges"));
+            assert!(!intc.has_prop("mbi-alias"));
+            assert!(!intc.has_prop("#msi-cells"));
+            assert!(intc.children.is_empty());
+        }
     }
 
     assert_eq!(session.vcpu_count(), diagnostics.vcpu_mpidrs.len());

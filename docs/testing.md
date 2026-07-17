@@ -55,6 +55,20 @@ must run through
 `com.apple.security.hypervisor` entitlement. Do not add real HVF tests to the
 unsigned workspace test path.
 
+HVF GIC MSI changes require two complementary signed gates. The focused
+`hvf_lifecycle` test must create an opt-in GIC, prove the Linux-incompatible
+terminal INTID 1019 is not allocated, send the range-provenance token through
+the real `hv_gic_send_msi`, and observe that exact INTID through guest
+`ICC_IAR1_EL1` with a bounded cancellation fallback. The focused `guest_boot`
+test must parse the pre-run FDT, require one hardware-described
+`arm,gic-v2m-frame` child and no GICv3 MBI/ITS properties, boot the pinned
+Firecracker kernel, and match Linux's exact GICv2m SPI range. Unit tests must
+cover opt-in/default separation, dynamic-symbol loading, configuration order
+and cleanup, geometry/overlap/range validation, the 1019 guard, allocator
+exhaustion/provenance, sender serialization/errors/redaction, teardown
+revocation of retained clones, and FDT publication without raw values in
+formatted failures.
+
 Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` baseline
 that creates one VM and GIC before two permanent owner-thread runners, proves
 their exact ordered MPIDRs are `[0, 1]`, cancels both before their first bounded
