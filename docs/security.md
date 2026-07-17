@@ -1527,9 +1527,34 @@ Hypervisor.framework does not make message delivery transactional. A returned
 error cannot prove that the guest did not observe the interrupt, so a future
 device owner must define its own retry and teardown policy. Current signed
 coverage separately proves raw host-to-vCPU delivery and pinned-Linux GICv2m
-domain discovery; it does not prove PCI enumeration, MSI/MSI-X programming,
-interrupt remapping, or Firecracker's KVM ITS behavior. MSI-bearing GIC metadata
-is rejected by the native-v1 snapshot profile rather than silently omitted.
+domain discovery. The validation-only PCI gate additionally proves enumeration
+of its fixed host bridge and identity-only endpoint; it does not prove
+MSI/MSI-X programming, interrupt remapping, product-device transport, or
+Firecracker's KVM ITS behavior. MSI-bearing GIC metadata is rejected by the
+native-v1 snapshot profile rather than silently omitted.
+
+## Internal PCI Ownership Boundary
+
+PCI is reachable only from an explicit HVF validation-session constructor; the
+production process parser, HTTP controller, and default boot-session
+constructors never select it. That path publishes one 1 MiB ECAM handler only
+after the complete Firecracker-shaped configuration aperture and 32/64-bit BAR
+windows validate against guest RAM, GIC/GICv2m, and all configured platform and
+virtio-MMIO devices. The FDT binds the host to the validated GICv2m phandle and
+advertises neither an ITS nor an `msi-map`.
+
+MMIO publication and PCI slot/BAR allocation use opaque owner provenance plus
+monotonic generations. Registration builds a complete candidate bus before
+committing its handler and regions; failure leaves the live dispatcher
+unchanged. Release checks the originating dispatcher or allocator, owner,
+generation, and exact registered state before mutation, so a stale capability
+cannot remove a later occupant after reuse. Ownership and address details are
+redacted from capability `Debug` output.
+
+The retained `[0042:0000]` endpoint is pinned mock identity only. It grants no host
+resource authority and implements no product I/O, MSI/MSI-X table, hotplug, or
+snapshot contract. Native-v1 treats any PCI validation resources as an
+unsupported inventory rather than persisting or silently dropping them.
 
 ## HVF Entitlements
 

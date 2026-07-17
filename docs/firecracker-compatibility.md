@@ -115,11 +115,43 @@ same sender lock, waits for an in-flight call, and revokes every retained clone
 before unmapping or destroying VM-owned resources.
 
 This foundation is not Firecracker's KVM-backed GICv3 ITS implementation. It
-adds no public API or CLI control, PCI host bridge, enumeration, BAR layout,
-MSI/MSI-X table emulation, guest-programmed message routing, interrupt remapping,
-or guest PCI delivery claim. It is also outside the accepted native-v1 snapshot
-profile, which rejects MSI-bearing GIC metadata. The capability inventory is
-therefore not promoted by this internal foundation alone.
+adds no public API or CLI control, MSI/MSI-X table emulation,
+guest-programmed message routing, or interrupt remapping. It is also outside
+the accepted native-v1 snapshot profile, which rejects MSI-bearing GIC
+metadata. The capability inventory is therefore not promoted by this internal
+foundation alone.
+
+## Internal PCI Segment and Address-Space Foundation
+
+An explicit validation-only boot-session option now composes the GICv2m frame
+with a backend-neutral PCI segment 0, bus 0. Device 0 is the fixed
+`[8086:0d57]` host bridge; devices 1 through 31 use deterministic,
+generation-bound slot leases, and the signed gate installs one identity-only
+`[0042:0000]` endpoint from Firecracker's pinned PCI mock at `0000:00:01.0`.
+The endpoint has no virtio or product semantics.
+
+The arm64 plan reserves the full Firecracker configuration aperture at
+`0x70000000..0x80000000`, publishes only the bus-0 1 MiB ECAM window, uses
+`0x40003000..0x70000000` for 32-bit BAR ownership, and uses 256–512 GiB for
+64-bit BAR ownership. Local lowest-fit allocators return provenance- and
+generation-bound leases, deterministically reuse released ranges, and reject
+foreign or stale release. Type-0 configuration supports fixed 32/64-bit BAR
+encoding and one-shot all-ones size probing; guest relocation writes do not
+move an owned range.
+
+ECAM publication uses one atomic MMIO owner lease. The complete region batch,
+handler ID, owner provenance, dispatcher provenance, and generation are
+validated before mutation; checked release removes only the exact registered
+state. The FDT path validates the reserved aperture and BAR windows against
+RAM, GIC/GICv2m, and every published platform/MMIO device before emitting a
+`pci-host-ecam-generic` node with `msi-parent = <3>`. With the option absent,
+the previous FDT bytes and startup inventory are unchanged.
+
+This slice provides discovery and ownership primitives only. No process flag,
+HTTP action, modern virtio-pci device, guest-programmed MSI/MSI-X delivery,
+runtime attach/delete, hotplug, or snapshot persistence reaches production.
+Those transport and lifecycle steps remain later work, so the public capability
+inventory and the existing `--enable-pci` rejection do not change.
 
 ## Internal PSCI Power Sessions
 
