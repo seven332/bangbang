@@ -580,16 +580,12 @@ impl fmt::Debug for HvfGicMsiInterrupt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfGicMsiInterruptAllocationError {
-    InvalidMetadata(&'static str),
     Exhausted,
 }
 
 impl fmt::Display for HvfGicMsiInterruptAllocationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidMetadata(message) => {
-                write!(f, "invalid HVF GIC MSI metadata: {message}")
-            }
             Self::Exhausted => f.write_str("HVF GIC MSI interrupt range is exhausted"),
         }
     }
@@ -605,17 +601,12 @@ pub struct HvfGicMsiInterruptAllocator {
 }
 
 impl HvfGicMsiInterruptAllocator {
-    fn from_metadata(
-        metadata: HvfGicMsiMetadata,
-    ) -> Result<Self, HvfGicMsiInterruptAllocationError> {
-        validate_msi_metadata(metadata)
-            .map_err(HvfGicMsiInterruptAllocationError::InvalidMetadata)?;
-
-        Ok(Self {
+    fn from_validated_metadata(metadata: HvfGicMsiMetadata) -> Self {
+        Self {
             range: metadata.interrupt_range,
             next: Arc::new(AtomicU32::new(metadata.interrupt_range.base)),
             provenance: Arc::new(HvfGicMsiProvenance),
-        })
+        }
     }
 
     pub fn remaining(&self) -> u32 {
@@ -742,15 +733,7 @@ impl HvfGicMsiSignaler {
         api: impl HvfGicMsiSignalApi + Send + 'static,
     ) -> Result<Self, HvfGicMsiSignalError> {
         validate_msi_metadata(metadata).map_err(HvfGicMsiSignalError::InvalidMetadata)?;
-        let allocator =
-            HvfGicMsiInterruptAllocator::from_metadata(metadata).map_err(|error| match error {
-                HvfGicMsiInterruptAllocationError::InvalidMetadata(message) => {
-                    HvfGicMsiSignalError::InvalidMetadata(message)
-                }
-                HvfGicMsiInterruptAllocationError::Exhausted => {
-                    HvfGicMsiSignalError::InvalidState("validated MSI metadata has no allocator")
-                }
-            })?;
+        let allocator = HvfGicMsiInterruptAllocator::from_validated_metadata(metadata);
         let address = metadata
             .region
             .base
@@ -3827,7 +3810,7 @@ mod tests {
     }
 
     #[test]
-    fn msi_interrupt_allocator_requires_valid_metadata() {
+    fn msi_signaler_requires_valid_metadata() {
         let malformed = HvfGicMsiMetadata {
             region: HvfGicRegion {
                 base: 0x3ffc_0000,
@@ -3839,16 +3822,14 @@ mod tests {
             },
         };
         assert_eq!(
-            HvfGicMsiInterruptAllocator::from_metadata(malformed)
+            HvfGicMsiSignaler::with_api(malformed, FakeGicApi::default())
                 .expect_err("short MSI frame should fail"),
-            HvfGicMsiInterruptAllocationError::InvalidMetadata(
-                "message frame does not contain SETSPI"
-            )
+            HvfGicMsiSignalError::InvalidMetadata("message frame does not contain SETSPI")
         );
     }
 
     #[test]
-    fn msi_allocator_and_signaler_reject_the_gicv2m_terminal_spi() {
+    fn msi_signaler_rejects_the_gicv2m_terminal_spi() {
         let terminal_metadata = HvfGicMsiMetadata {
             region: HvfGicRegion {
                 base: 0x3ffc_0000,
@@ -3860,13 +3841,6 @@ mod tests {
             },
         };
 
-        assert_eq!(
-            HvfGicMsiInterruptAllocator::from_metadata(terminal_metadata)
-                .expect_err("terminal SPI should not produce an MSI allocator"),
-            HvfGicMsiInterruptAllocationError::InvalidMetadata(
-                "interrupt range exceeds the GICv2m SPI domain"
-            )
-        );
         assert_eq!(
             HvfGicMsiSignaler::with_api(terminal_metadata, FakeGicApi::default())
                 .expect_err("terminal SPI should not produce an MSI signaler"),
