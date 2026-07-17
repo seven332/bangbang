@@ -251,8 +251,8 @@ pub struct Arm64BootPciValidationConfig {
 }
 
 impl Arm64BootPciValidationConfig {
-    pub const FIRECRACKER_TEST_VENDOR_ID: u16 = 0x1af4;
-    pub const FIRECRACKER_TEST_DEVICE_ID: u16 = 0x10ff;
+    pub const FIRECRACKER_TEST_VENDOR_ID: u16 = 0x0042;
+    pub const FIRECRACKER_TEST_DEVICE_ID: u16 = 0x0000;
 
     pub const fn firecracker_test_endpoint() -> Self {
         Self {
