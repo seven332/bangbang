@@ -28,6 +28,17 @@ footprint reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
 
+On macOS 15 and later, the HVF backend also has an internal, explicitly
+opt-in foundation for a demand-sized public-HVF GICv2m MSI frame. It reserves
+the requested interrupt range from the top of Linux's usable GICv2m SPI domain,
+keeps the legacy SPI allocator disjoint, advertises an `arm,gic-v2m-frame` FDT
+child, and retains a typed send-only capability. Ordinary process startup and
+its FDT remain MSI-free. This is not Firecracker's KVM ITS path, does not expose
+a CLI or API switch, and does not implement PCI enumeration or guest-programmed
+MSI-X. Signed gates prove raw delivery of INTID 1018 and pinned Firecracker
+Linux discovery of the exact `SPI[1018:1018]` frame; native-v1 rejects
+MSI-bearing GIC metadata.
+
 ## Layout
 
 ```text

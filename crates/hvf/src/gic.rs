@@ -1,12 +1,15 @@
 //! HVF GIC v3 creation and metadata for later boot/FDT setup.
 
 use std::fmt;
-use std::sync::Mutex;
+use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::fdt::{
-    Arm64FdtError, Arm64FdtGic, Arm64FdtInterruptRange, Arm64FdtMsi, Arm64FdtRegion,
-    Arm64FdtTimerInterrupts,
+    ARM64_GICV2M_MSI_IIDR_OFFSET, ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET,
+    ARM64_GICV2M_SPI_END_EXCLUSIVE, Arm64FdtError, Arm64FdtGic, Arm64FdtInterruptRange,
+    Arm64FdtMsi, Arm64FdtRegion, Arm64FdtTimerInterrupts,
 };
 use bangbang_runtime::interrupt::{
     GuestInterruptLine, GuestInterruptLineError, InterruptSignalError, InterruptSink,
@@ -19,6 +22,9 @@ const DRAM_MEM_START: u64 = bangbang_runtime::memory::aarch64::DRAM_MEM_START;
 const DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE: &str =
     "function pointer size does not match a dynamic symbol pointer";
 const GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE: &str = "HVF GIC SPI signaler lock is poisoned";
+const GIC_MSI_SIGNALER_LOCK_POISONED_MESSAGE: &str = "HVF GIC MSI signaler lock is poisoned";
+const GIC_MSI_SIGNALER_INACTIVE_MESSAGE: &str = "HVF GIC MSI signaler is inactive";
+const GIC_MSI_REGISTER_SIZE: u64 = 4;
 const GIC_ICC_RPR_MISMATCH_MESSAGE: &str =
     "restored arm64 GIC ICC_RPR_EL1 does not match captured derived state";
 
@@ -147,10 +153,46 @@ pub struct HvfGicRedistributor {
     pub single_redistributor_size: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct HvfGicMsiMetadata {
     pub region: HvfGicRegion,
     pub interrupt_range: HvfGicInterruptRange,
+}
+
+impl fmt::Debug for HvfGicMsiMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicMsiMetadata")
+            .field("region", &"<redacted>")
+            .field("interrupt_range", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Demand for a contiguous Hypervisor.framework GIC MSI interrupt range.
+///
+/// The exact count is available to trusted platform composition through its
+/// accessor, while automatic diagnostics redact it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfGicMsiConfiguration {
+    interrupt_count: NonZeroU32,
+}
+
+impl HvfGicMsiConfiguration {
+    pub const fn new(interrupt_count: NonZeroU32) -> Self {
+        Self { interrupt_count }
+    }
+
+    pub const fn interrupt_count(self) -> NonZeroU32 {
+        self.interrupt_count
+    }
+}
+
+impl fmt::Debug for HvfGicMsiConfiguration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicMsiConfiguration")
+            .field("interrupt_count", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,6 +542,243 @@ impl HvfGicInterruptLineAllocator {
     }
 }
 
+/// One interrupt identifier allocated from a GIC MSI-only range.
+///
+/// Values can only be created by [`HvfGicMsiInterruptAllocator`]. They remain
+/// distinct from legacy [`GuestInterruptLine`] values accepted by
+/// `hv_gic_set_spi` paths.
+#[derive(Debug)]
+struct HvfGicMsiProvenance;
+
+#[derive(Clone)]
+pub struct HvfGicMsiInterrupt {
+    intid: u32,
+    provenance: Arc<HvfGicMsiProvenance>,
+}
+
+impl HvfGicMsiInterrupt {
+    pub const fn raw_value(&self) -> u32 {
+        self.intid
+    }
+}
+
+impl PartialEq for HvfGicMsiInterrupt {
+    fn eq(&self, other: &Self) -> bool {
+        self.intid == other.intid && Arc::ptr_eq(&self.provenance, &other.provenance)
+    }
+}
+
+impl Eq for HvfGicMsiInterrupt {}
+
+impl fmt::Debug for HvfGicMsiInterrupt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicMsiInterrupt")
+            .field("intid", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfGicMsiInterruptAllocationError {
+    Exhausted,
+}
+
+impl fmt::Display for HvfGicMsiInterruptAllocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exhausted => f.write_str("HVF GIC MSI interrupt range is exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for HvfGicMsiInterruptAllocationError {}
+
+#[derive(Clone)]
+pub struct HvfGicMsiInterruptAllocator {
+    range: HvfGicInterruptRange,
+    next: Arc<AtomicU32>,
+    provenance: Arc<HvfGicMsiProvenance>,
+}
+
+impl HvfGicMsiInterruptAllocator {
+    fn from_validated_metadata(metadata: HvfGicMsiMetadata) -> Self {
+        Self {
+            range: metadata.interrupt_range,
+            next: Arc::new(AtomicU32::new(metadata.interrupt_range.base)),
+            provenance: Arc::new(HvfGicMsiProvenance),
+        }
+    }
+
+    pub fn remaining(&self) -> u32 {
+        let end = self.range.base + self.range.count;
+        end.saturating_sub(self.next.load(Ordering::Relaxed))
+    }
+
+    pub const fn range(&self) -> HvfGicInterruptRange {
+        self.range
+    }
+
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    pub fn allocate(&self) -> Result<HvfGicMsiInterrupt, HvfGicMsiInterruptAllocationError> {
+        let end = self.range.base + self.range.count;
+        let intid = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (next < end).then_some(next + 1)
+            })
+            .map_err(|_| HvfGicMsiInterruptAllocationError::Exhausted)?;
+        Ok(HvfGicMsiInterrupt {
+            intid,
+            provenance: Arc::clone(&self.provenance),
+        })
+    }
+}
+
+impl fmt::Debug for HvfGicMsiInterruptAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicMsiInterruptAllocator")
+            .field("range", &"<redacted>")
+            .field("remaining", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfGicMsiSignalError {
+    InvalidMetadata(&'static str),
+    InterruptOutOfRange,
+    Signal { source: HvfGicError },
+    InvalidState(&'static str),
+}
+
+impl fmt::Display for HvfGicMsiSignalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMetadata(message) => {
+                write!(f, "invalid HVF GIC MSI signal metadata: {message}")
+            }
+            Self::InterruptOutOfRange => {
+                f.write_str("HVF GIC MSI interrupt is outside the configured range")
+            }
+            Self::Signal { source } => write!(f, "failed to send HVF GIC MSI: {source}"),
+            Self::InvalidState(message) => {
+                write!(f, "invalid HVF GIC MSI signaler state: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfGicMsiSignalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Signal { source } => Some(source),
+            Self::InvalidMetadata(_) | Self::InterruptOutOfRange | Self::InvalidState(_) => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct HvfGicMsiSignaler {
+    address: u64,
+    range: HvfGicInterruptRange,
+    allocator: HvfGicMsiInterruptAllocator,
+    state: Arc<Mutex<HvfGicMsiSignalerState>>,
+}
+
+struct HvfGicMsiSignalerState {
+    active: bool,
+    api: Box<dyn HvfGicMsiSignalApi + Send>,
+}
+
+impl HvfGicMsiSignaler {
+    /// Return a handle to the one allocation sequence shared by this signaler.
+    pub fn allocator(&self) -> HvfGicMsiInterruptAllocator {
+        self.allocator.clone()
+    }
+
+    pub fn send(&self, interrupt: &HvfGicMsiInterrupt) -> Result<(), HvfGicMsiSignalError> {
+        if !Arc::ptr_eq(&self.allocator.provenance, &interrupt.provenance)
+            || !interrupt_range_contains(self.range, interrupt.intid)
+        {
+            return Err(HvfGicMsiSignalError::InterruptOutOfRange);
+        }
+
+        let state = self.state.lock().map_err(|_| {
+            HvfGicMsiSignalError::InvalidState(GIC_MSI_SIGNALER_LOCK_POISONED_MESSAGE)
+        })?;
+        if !state.active {
+            return Err(HvfGicMsiSignalError::InvalidState(
+                GIC_MSI_SIGNALER_INACTIVE_MESSAGE,
+            ));
+        }
+        state
+            .api
+            .send_msi(self.address, interrupt.intid)
+            .map_err(|source| HvfGicMsiSignalError::Signal { source })
+    }
+
+    /// Revoke every clone after waiting for any in-flight send to finish.
+    pub(crate) fn deactivate(&self) {
+        match self.state.lock() {
+            Ok(mut state) => state.active = false,
+            Err(poisoned) => poisoned.into_inner().active = false,
+        }
+    }
+
+    fn with_api(
+        metadata: HvfGicMsiMetadata,
+        api: impl HvfGicMsiSignalApi + Send + 'static,
+    ) -> Result<Self, HvfGicMsiSignalError> {
+        validate_msi_metadata(metadata).map_err(HvfGicMsiSignalError::InvalidMetadata)?;
+        let allocator = HvfGicMsiInterruptAllocator::from_validated_metadata(metadata);
+        let address = metadata
+            .region
+            .base
+            .checked_add(ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET)
+            .ok_or(HvfGicMsiSignalError::InvalidMetadata(
+                "message address overflows",
+            ))?;
+
+        Ok(Self {
+            address,
+            range: metadata.interrupt_range,
+            allocator,
+            state: Arc::new(Mutex::new(HvfGicMsiSignalerState {
+                active: true,
+                api: Box::new(api),
+            })),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_backend_test(metadata: HvfGicMsiMetadata) -> Self {
+        Self::with_api(metadata, TestHvfGicMsiSignalApi)
+            .expect("backend test MSI metadata should be valid")
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestHvfGicMsiSignalApi;
+
+#[cfg(test)]
+impl HvfGicMsiSignalApi for TestHvfGicMsiSignalApi {
+    fn send_msi(&self, _: u64, _: u32) -> Result<(), HvfGicError> {
+        Ok(())
+    }
+}
+
+impl fmt::Debug for HvfGicMsiSignaler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicMsiSignaler")
+            .field("message", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfGicSpiSignalError {
     Backend(HvfGicError),
@@ -641,6 +920,10 @@ pub enum HvfGicError {
         name: &'static str,
         value: u64,
     },
+    InvalidMsiParameter {
+        name: &'static str,
+    },
+    InsufficientMsiInterruptCapacity,
     AddressUnderflow {
         region: &'static str,
         limit: u64,
@@ -694,6 +977,12 @@ impl fmt::Display for HvfGicError {
                     "invalid Hypervisor.framework GIC parameter {name}={value}"
                 )
             }
+            Self::InvalidMsiParameter { name } => {
+                write!(f, "invalid Hypervisor.framework GIC MSI parameter {name}")
+            }
+            Self::InsufficientMsiInterruptCapacity => {
+                f.write_str("insufficient Hypervisor.framework GIC MSI interrupt capacity")
+            }
             Self::AddressUnderflow {
                 region,
                 limit,
@@ -737,6 +1026,8 @@ impl std::error::Error for HvfGicError {
             | Self::StateAllocationFailed { .. }
             | Self::StateTooLarge { .. }
             | Self::InvalidParameter { .. }
+            | Self::InvalidMsiParameter { .. }
+            | Self::InsufficientMsiInterruptCapacity
             | Self::AddressUnderflow { .. }
             | Self::UnalignedAddress { .. }
             | Self::RegionOverlap { .. }
@@ -751,8 +1042,23 @@ impl From<BackendError> for HvfGicError {
     }
 }
 
+pub(crate) struct CreatedHvfGic {
+    pub(crate) metadata: HvfGicMetadata,
+    pub(crate) msi_signaler: Option<HvfGicMsiSignaler>,
+}
+
+impl fmt::Debug for CreatedHvfGic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreatedHvfGic")
+            .field("metadata", &self.metadata)
+            .field("msi_signaler", &self.msi_signaler)
+            .finish()
+    }
+}
+
 pub(crate) trait HvfGicCreator: fmt::Debug + Send + Sync {
-    fn create_gic(&self) -> Result<HvfGicMetadata, HvfGicError>;
+    fn create_gic(&self, msi: Option<HvfGicMsiConfiguration>)
+    -> Result<CreatedHvfGic, HvfGicError>;
 }
 
 pub(crate) struct HvfGicStateSnapshotter {
@@ -967,10 +1273,22 @@ struct HvfGicParameters {
     redistributor_alignment: u64,
     spi_interrupt_range: HvfGicInterruptRange,
     timer_interrupts: HvfGicTimerInterrupts,
+    msi: Option<HvfGicMsiParameters>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HvfGicMsiParameters {
+    region_size: u64,
+    region_alignment: u64,
+    interrupt_count: NonZeroU32,
 }
 
 trait HvfGicSpiSignalApi: fmt::Debug {
     fn set_spi(&self, intid: u32, level: bool) -> Result<(), HvfGicError>;
+}
+
+trait HvfGicMsiSignalApi: fmt::Debug {
+    fn send_msi(&self, address: u64, intid: u32) -> Result<(), HvfGicError>;
 }
 
 pub(crate) struct HvfGicPpiPendingWriter {
@@ -994,6 +1312,8 @@ trait HvfGicApi {
     fn redistributor_region_size(&self) -> Result<u64, HvfGicError>;
     fn redistributor_size(&self) -> Result<u64, HvfGicError>;
     fn redistributor_alignment(&self) -> Result<u64, HvfGicError>;
+    fn msi_region_size(&self) -> Result<u64, HvfGicError>;
+    fn msi_region_alignment(&self) -> Result<u64, HvfGicError>;
     fn spi_interrupt_range(&self) -> Result<HvfGicInterruptRange, HvfGicError>;
     fn intid(&self, interrupt: u16) -> Result<u32, HvfGicError>;
     fn create_config(&self) -> Result<Self::Config, HvfGicError>;
@@ -1004,13 +1324,22 @@ trait HvfGicApi {
         config: &mut Self::Config,
         base: u64,
     ) -> Result<(), HvfGicError>;
+    fn set_msi_region_base(&self, config: &mut Self::Config, base: u64) -> Result<(), HvfGicError>;
+    fn set_msi_interrupt_range(
+        &self,
+        config: &mut Self::Config,
+        range: HvfGicInterruptRange,
+    ) -> Result<(), HvfGicError>;
     fn create_gic(&self, config: &Self::Config) -> Result<(), HvfGicError>;
     fn release_config(&self, config: Self::Config);
 }
 
 impl HvfGicCreator for RealHvfGicCreator {
-    fn create_gic(&self) -> Result<HvfGicMetadata, HvfGicError> {
-        create_real_gic()
+    fn create_gic(
+        &self,
+        msi: Option<HvfGicMsiConfiguration>,
+    ) -> Result<CreatedHvfGic, HvfGicError> {
+        create_real_gic(msi)
     }
 }
 
@@ -1098,19 +1427,54 @@ impl HvfGicPpiPendingApi for UnsupportedHvfGicPpiPendingApi {
     }
 }
 
-fn create_gic_with_api(api: &impl HvfGicApi) -> Result<HvfGicMetadata, HvfGicError> {
-    let parameters = query_parameters(api)?;
-    let metadata = metadata_from_parameters(parameters)?;
+#[cfg(test)]
+fn create_gic_with_api(
+    api: &impl HvfGicApi,
+    msi: Option<HvfGicMsiConfiguration>,
+) -> Result<HvfGicMetadata, HvfGicError> {
+    let metadata = prepare_gic_metadata_with_api(api, msi)?;
+    configure_gic_with_api(api, metadata)?;
+    Ok(metadata)
+}
+
+fn prepare_gic_metadata_with_api(
+    api: &impl HvfGicApi,
+    msi: Option<HvfGicMsiConfiguration>,
+) -> Result<HvfGicMetadata, HvfGicError> {
+    let parameters = query_parameters(api, msi)?;
+    metadata_from_parameters(parameters)
+}
+
+fn configure_gic_with_api(
+    api: &impl HvfGicApi,
+    metadata: HvfGicMetadata,
+) -> Result<(), HvfGicError> {
     let mut config = GicConfigGuard::new(api)?;
 
     api.set_distributor_base(config.config_mut()?, metadata.distributor.base)?;
     api.set_redistributor_base(config.config_mut()?, metadata.redistributor.region.base)?;
+    if let Some(msi) = metadata.msi {
+        api.set_msi_region_base(config.config_mut()?, msi.region.base)?;
+        api.set_msi_interrupt_range(config.config_mut()?, msi.interrupt_range)?;
+    }
     api.create_gic(config.config()?)?;
-
-    Ok(metadata)
+    Ok(())
 }
 
-fn query_parameters(api: &impl HvfGicApi) -> Result<HvfGicParameters, HvfGicError> {
+fn query_parameters(
+    api: &impl HvfGicApi,
+    msi: Option<HvfGicMsiConfiguration>,
+) -> Result<HvfGicParameters, HvfGicError> {
+    let msi = msi
+        .map(|configuration| {
+            Ok::<HvfGicMsiParameters, HvfGicError>(HvfGicMsiParameters {
+                region_size: api.msi_region_size()?,
+                region_alignment: api.msi_region_alignment()?,
+                interrupt_count: configuration.interrupt_count(),
+            })
+        })
+        .transpose()?;
+
     Ok(HvfGicParameters {
         distributor_size: api.distributor_size()?,
         distributor_alignment: api.distributor_alignment()?,
@@ -1122,6 +1486,7 @@ fn query_parameters(api: &impl HvfGicApi) -> Result<HvfGicParameters, HvfGicErro
             el1_virtual_timer_intid: api.intid(HV_GIC_INT_EL1_VIRTUAL_TIMER)?,
             el1_physical_timer_intid: api.intid(HV_GIC_INT_EL1_PHYSICAL_TIMER)?,
         },
+        msi,
     })
 }
 
@@ -1160,6 +1525,31 @@ fn metadata_from_parameters(parameters: HvfGicParameters) -> Result<HvfGicMetada
     validate_spi_interrupt_range(parameters.spi_interrupt_range)?;
     validate_timer_interrupts(parameters.timer_interrupts)?;
 
+    let (spi_interrupt_range, msi_interrupt_range) = parameters.msi.map_or_else(
+        || Ok((parameters.spi_interrupt_range, None)),
+        |msi| {
+            validate_msi_parameter("region_size", msi.region_size, ParameterRule::NonZero)?;
+            validate_msi_parameter(
+                "region_base_alignment",
+                msi.region_alignment,
+                ParameterRule::PowerOfTwo,
+            )?;
+            let minimum_size = ARM64_GICV2M_MSI_IIDR_OFFSET
+                .checked_add(GIC_MSI_REGISTER_SIZE)
+                .ok_or(HvfGicError::InvalidMsiParameter {
+                    name: "region_size",
+                })?;
+            if msi.region_size < minimum_size {
+                return Err(HvfGicError::InvalidMsiParameter {
+                    name: "region_size",
+                });
+            }
+            let (legacy, reserved) =
+                partition_spi_interrupt_range(parameters.spi_interrupt_range, msi.interrupt_count)?;
+            Ok((legacy, Some(reserved)))
+        },
+    )?;
+
     let distributor = aligned_region_below(
         "distributor",
         MMIO32_MEM_START,
@@ -1177,15 +1567,53 @@ fn metadata_from_parameters(parameters: HvfGicParameters) -> Result<HvfGicMetada
     validate_region_below_dram("distributor", distributor)?;
     validate_region_below_dram("redistributor", redistributor)?;
 
+    let msi = match (parameters.msi, msi_interrupt_range) {
+        (Some(parameters), Some(interrupt_range)) => {
+            let region = aligned_region_below(
+                "msi",
+                redistributor.base,
+                parameters.region_size,
+                parameters.region_alignment,
+            )
+            .map_err(|_| HvfGicError::InvalidMsiParameter {
+                name: "region_placement",
+            })?;
+            validate_regions_do_not_overlap("distributor", distributor, "msi", region).map_err(
+                |_| HvfGicError::InvalidMsiParameter {
+                    name: "region_overlap",
+                },
+            )?;
+            validate_regions_do_not_overlap("redistributor", redistributor, "msi", region)
+                .map_err(|_| HvfGicError::InvalidMsiParameter {
+                    name: "region_overlap",
+                })?;
+            validate_region_below_dram("msi", region).map_err(|_| {
+                HvfGicError::InvalidMsiParameter {
+                    name: "region_placement",
+                }
+            })?;
+            Some(HvfGicMsiMetadata {
+                region,
+                interrupt_range,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(HvfGicError::InvalidState(
+                "GIC MSI parameters and interrupt range disagree",
+            ));
+        }
+    };
+
     Ok(HvfGicMetadata {
         distributor,
         redistributor: HvfGicRedistributor {
             region: redistributor,
             single_redistributor_size: parameters.redistributor_size,
         },
-        spi_interrupt_range: parameters.spi_interrupt_range,
+        spi_interrupt_range,
         timer_interrupts: parameters.timer_interrupts,
-        msi: None,
+        msi,
     })
 }
 
@@ -1212,6 +1640,23 @@ fn validate_parameter(
     }
 }
 
+fn validate_msi_parameter(
+    name: &'static str,
+    value: u64,
+    rule: ParameterRule,
+) -> Result<(), HvfGicError> {
+    let valid = match rule {
+        ParameterRule::NonZero => value != 0,
+        ParameterRule::PowerOfTwo => value != 0 && value.is_power_of_two(),
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(HvfGicError::InvalidMsiParameter { name })
+    }
+}
+
 fn validate_spi_interrupt_range(range: HvfGicInterruptRange) -> Result<(), HvfGicError> {
     if range.base < FIRST_SPI_INTID {
         return Err(HvfGicError::InvalidParameter {
@@ -1233,6 +1678,94 @@ fn validate_spi_interrupt_range(range: HvfGicInterruptRange) -> Result<(), HvfGi
     }
 
     Ok(())
+}
+
+fn partition_spi_interrupt_range(
+    complete: HvfGicInterruptRange,
+    msi_count: NonZeroU32,
+) -> Result<(HvfGicInterruptRange, HvfGicInterruptRange), HvfGicError> {
+    validate_spi_interrupt_range(complete)?;
+    let complete_end =
+        complete
+            .base
+            .checked_add(complete.count)
+            .ok_or(HvfGicError::InvalidMsiParameter {
+                name: "interrupt_range",
+            })?;
+    let usable_end = complete_end.min(ARM64_GICV2M_SPI_END_EXCLUSIVE);
+    let Some(usable_count) = usable_end.checked_sub(complete.base) else {
+        return Err(HvfGicError::InsufficientMsiInterruptCapacity);
+    };
+    let msi_count = msi_count.get();
+    if msi_count >= usable_count {
+        return Err(HvfGicError::InsufficientMsiInterruptCapacity);
+    }
+
+    let msi_base = usable_end - msi_count;
+    let legacy_count = msi_base - complete.base;
+    let legacy = HvfGicInterruptRange {
+        base: complete.base,
+        count: legacy_count,
+    };
+    let msi = HvfGicInterruptRange {
+        base: msi_base,
+        count: msi_count,
+    };
+    validate_spi_interrupt_range(legacy).map_err(|_| HvfGicError::InvalidMsiParameter {
+        name: "legacy_interrupt_range",
+    })?;
+    validate_spi_interrupt_range(msi).map_err(|_| HvfGicError::InvalidMsiParameter {
+        name: "interrupt_range",
+    })?;
+
+    Ok((legacy, msi))
+}
+
+fn validate_msi_metadata(metadata: HvfGicMsiMetadata) -> Result<(), &'static str> {
+    if metadata.region.size == 0 {
+        return Err("message frame is empty");
+    }
+    let Some(region_end) = metadata.region.base.checked_add(metadata.region.size) else {
+        return Err("message frame overflows");
+    };
+    let Some(message_address) = metadata
+        .region
+        .base
+        .checked_add(ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET)
+    else {
+        return Err("message address overflows");
+    };
+    let Some(message_end) = message_address.checked_add(GIC_MSI_REGISTER_SIZE) else {
+        return Err("message register overflows");
+    };
+    if message_end > region_end {
+        return Err("message frame does not contain SETSPI");
+    }
+    if metadata.interrupt_range.base < FIRST_SPI_INTID {
+        return Err("interrupt range starts below the SPI domain");
+    }
+    if metadata.interrupt_range.count == 0 {
+        return Err("interrupt range is empty");
+    }
+    let Some(interrupt_end) = metadata
+        .interrupt_range
+        .base
+        .checked_add(metadata.interrupt_range.count)
+    else {
+        return Err("interrupt range overflows");
+    };
+    if interrupt_end > ARM64_GICV2M_SPI_END_EXCLUSIVE {
+        return Err("interrupt range exceeds the GICv2m SPI domain");
+    }
+
+    Ok(())
+}
+
+fn interrupt_range_contains(range: HvfGicInterruptRange, intid: u32) -> bool {
+    range
+        .base
+        .checked_add(range.count)
+        .is_some_and(|end| (range.base..end).contains(&intid))
 }
 
 fn validate_spi_signal_line(
@@ -1538,13 +2071,32 @@ pub(crate) fn restore_arm64_gic_icc_register_state_with(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn create_real_gic() -> Result<HvfGicMetadata, HvfGicError> {
-    let api = LoadedHvfGicApi::load()?;
-    create_gic_with_api(&api)
+fn create_real_gic(msi: Option<HvfGicMsiConfiguration>) -> Result<CreatedHvfGic, HvfGicError> {
+    let api = LoadedHvfGicApi::load(msi.is_some())?;
+    let msi_api = msi.map(|_| LoadedHvfGicMsiSignalApi::load()).transpose()?;
+    let metadata = prepare_gic_metadata_with_api(&api, msi)?;
+    let msi_signaler = match (metadata.msi, msi_api) {
+        (Some(metadata), Some(api)) => Some(
+            HvfGicMsiSignaler::with_api(metadata, api)
+                .map_err(|_| HvfGicError::InvalidMsiParameter { name: "metadata" })?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(HvfGicError::InvalidState(
+                "GIC MSI metadata and send capability disagree",
+            ));
+        }
+    };
+    configure_gic_with_api(&api, metadata)?;
+
+    Ok(CreatedHvfGic {
+        metadata,
+        msi_signaler,
+    })
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn create_real_gic() -> Result<HvfGicMetadata, HvfGicError> {
+fn create_real_gic(_: Option<HvfGicMsiConfiguration>) -> Result<CreatedHvfGic, HvfGicError> {
     Err(HvfGicError::Unsupported(
         crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
     ))
@@ -1568,8 +2120,10 @@ mod dynamic {
     type HvGicConfig = NonNull<c_void>;
     type HvGicConfigCreate = unsafe extern "C" fn() -> *mut c_void;
     type HvGicSetBase = unsafe extern "C" fn(*mut c_void, u64) -> HvReturn;
+    type HvGicSetMsiRange = unsafe extern "C" fn(*mut c_void, u32, u32) -> HvReturn;
     type HvGicCreate = unsafe extern "C" fn(*mut c_void) -> HvReturn;
     type HvGicSetSpi = unsafe extern "C" fn(u32, bool) -> HvReturn;
+    type HvGicSendMsi = unsafe extern "C" fn(u64, u32) -> HvReturn;
     type HvGicSetRedistributorReg = unsafe extern "C" fn(u64, u32, u64) -> HvReturn;
     type HvGicStateCreate = unsafe extern "C" fn() -> *mut c_void;
     type HvGicStateGetSize = unsafe extern "C" fn(*mut c_void, *mut usize) -> HvReturn;
@@ -1593,6 +2147,11 @@ mod dynamic {
     pub(super) struct LoadedHvfGicSpiSignalApi {
         _library: DynamicLibrary,
         symbols: HvfGicSpiSignalSymbols,
+    }
+
+    pub(super) struct LoadedHvfGicMsiSignalApi {
+        _library: DynamicLibrary,
+        symbols: HvfGicMsiSignalSymbols,
     }
 
     pub(super) struct LoadedHvfGicPpiPendingApi {
@@ -1642,12 +2201,26 @@ mod dynamic {
         get_redistributor_base_alignment: HvGicGetSize,
         get_spi_interrupt_range: HvGicGetSpiRange,
         get_intid: HvGicGetIntid,
+        msi: Option<HvfGicMsiConfigSymbols>,
         os_release: OsRelease,
+    }
+
+    #[derive(Clone, Copy)]
+    struct HvfGicMsiConfigSymbols {
+        get_region_size: HvGicGetSize,
+        get_region_base_alignment: HvGicGetSize,
+        config_set_region_base: HvGicSetBase,
+        config_set_interrupt_range: HvGicSetMsiRange,
     }
 
     #[derive(Clone, Copy)]
     struct HvfGicSpiSignalSymbols {
         set_spi: HvGicSetSpi,
+    }
+
+    #[derive(Clone, Copy)]
+    struct HvfGicMsiSignalSymbols {
+        send_msi: HvGicSendMsi,
     }
 
     #[derive(Clone, Copy)]
@@ -1679,9 +2252,9 @@ mod dynamic {
     }
 
     impl LoadedHvfGicApi {
-        pub(super) fn load() -> Result<Self, HvfGicError> {
+        pub(super) fn load(include_msi: bool) -> Result<Self, HvfGicError> {
             let library = DynamicLibrary::open(HYPERVISOR_FRAMEWORK_PATH)?;
-            let symbols = HvfGicSymbols::load(library.handle())?;
+            let symbols = HvfGicSymbols::load(library.handle(), include_msi)?;
 
             Ok(Self {
                 _library: library,
@@ -1708,6 +2281,25 @@ mod dynamic {
     impl fmt::Debug for LoadedHvfGicApi {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("LoadedHvfGicApi").finish_non_exhaustive()
+        }
+    }
+
+    impl LoadedHvfGicMsiSignalApi {
+        pub(super) fn load() -> Result<Self, HvfGicError> {
+            let library = DynamicLibrary::open(HYPERVISOR_FRAMEWORK_PATH)?;
+            let symbols = HvfGicMsiSignalSymbols::load(library.handle())?;
+
+            Ok(Self {
+                _library: library,
+                symbols,
+            })
+        }
+    }
+
+    impl fmt::Debug for LoadedHvfGicMsiSignalApi {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("LoadedHvfGicMsiSignalApi")
+                .finish_non_exhaustive()
         }
     }
 
@@ -1859,7 +2451,10 @@ mod dynamic {
     }
 
     impl HvfGicSymbols {
-        fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
+        fn load(library: NonNull<c_void>, include_msi: bool) -> Result<Self, HvfGicError> {
+            let msi = include_msi
+                .then(|| HvfGicMsiConfigSymbols::load(library))
+                .transpose()?;
             Ok(Self {
                 config_create: load_symbol(
                     library,
@@ -1908,6 +2503,7 @@ mod dynamic {
                     "hv_gic_get_spi_interrupt_range",
                 )?,
                 get_intid: load_symbol(library, c"hv_gic_get_intid", "hv_gic_get_intid")?,
+                msi,
                 os_release: load_symbol(
                     NonNull::new(libc::RTLD_DEFAULT)
                         .ok_or(HvfGicError::MissingSymbol("os_release"))?,
@@ -1918,10 +2514,45 @@ mod dynamic {
         }
     }
 
+    impl HvfGicMsiConfigSymbols {
+        fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
+            Ok(Self {
+                get_region_size: load_symbol(
+                    library,
+                    c"hv_gic_get_msi_region_size",
+                    "hv_gic_get_msi_region_size",
+                )?,
+                get_region_base_alignment: load_symbol(
+                    library,
+                    c"hv_gic_get_msi_region_base_alignment",
+                    "hv_gic_get_msi_region_base_alignment",
+                )?,
+                config_set_region_base: load_symbol(
+                    library,
+                    c"hv_gic_config_set_msi_region_base",
+                    "hv_gic_config_set_msi_region_base",
+                )?,
+                config_set_interrupt_range: load_symbol(
+                    library,
+                    c"hv_gic_config_set_msi_interrupt_range",
+                    "hv_gic_config_set_msi_interrupt_range",
+                )?,
+            })
+        }
+    }
+
     impl HvfGicSpiSignalSymbols {
         fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
             Ok(Self {
                 set_spi: load_symbol(library, c"hv_gic_set_spi", "hv_gic_set_spi")?,
+            })
+        }
+    }
+
+    impl HvfGicMsiSignalSymbols {
+        fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
+            Ok(Self {
+                send_msi: load_symbol(library, c"hv_gic_send_msi", "hv_gic_send_msi")?,
             })
         }
     }
@@ -2048,6 +2679,23 @@ mod dynamic {
             )
         }
 
+        fn msi_region_size(&self) -> Result<u64, HvfGicError> {
+            let symbols = self.symbols.msi.as_ref().ok_or(HvfGicError::InvalidState(
+                "GIC MSI configuration symbols were not loaded",
+            ))?;
+            self.get_size(symbols.get_region_size, "hv_gic_get_msi_region_size")
+        }
+
+        fn msi_region_alignment(&self) -> Result<u64, HvfGicError> {
+            let symbols = self.symbols.msi.as_ref().ok_or(HvfGicError::InvalidState(
+                "GIC MSI configuration symbols were not loaded",
+            ))?;
+            self.get_size(
+                symbols.get_region_base_alignment,
+                "hv_gic_get_msi_region_base_alignment",
+            )
+        }
+
         fn spi_interrupt_range(&self) -> Result<HvfGicInterruptRange, HvfGicError> {
             let mut base = 0;
             let mut count = 0;
@@ -2111,6 +2759,44 @@ mod dynamic {
             Ok(())
         }
 
+        fn set_msi_region_base(
+            &self,
+            config: &mut Self::Config,
+            base: u64,
+        ) -> Result<(), HvfGicError> {
+            let symbols = self.symbols.msi.as_ref().ok_or(HvfGicError::InvalidState(
+                "GIC MSI configuration symbols were not loaded",
+            ))?;
+            // SAFETY: `config` is live and `base` was validated against the
+            // host-reported MSI frame geometry before this call.
+            unsafe {
+                crate::ffi::check(
+                    (symbols.config_set_region_base)(config.as_ptr(), base),
+                    "hv_gic_config_set_msi_region_base",
+                )?
+            };
+            Ok(())
+        }
+
+        fn set_msi_interrupt_range(
+            &self,
+            config: &mut Self::Config,
+            range: HvfGicInterruptRange,
+        ) -> Result<(), HvfGicError> {
+            let symbols = self.symbols.msi.as_ref().ok_or(HvfGicError::InvalidState(
+                "GIC MSI configuration symbols were not loaded",
+            ))?;
+            // SAFETY: `config` is live and the range is a validated suffix of
+            // the host-reported SPI domain.
+            unsafe {
+                crate::ffi::check(
+                    (symbols.config_set_interrupt_range)(config.as_ptr(), range.base, range.count),
+                    "hv_gic_config_set_msi_interrupt_range",
+                )?
+            };
+            Ok(())
+        }
+
         fn create_gic(&self, config: &Self::Config) -> Result<(), HvfGicError> {
             // SAFETY: The VM is live, and `config` has valid distributor and
             // redistributor bases configured before this call.
@@ -2132,6 +2818,17 @@ mod dynamic {
             // SAFETY: `intid` and `level` are plain values, and range validation
             // is performed before public callers reach this wrapper.
             unsafe { crate::ffi::check((self.symbols.set_spi)(intid, level), "hv_gic_set_spi")? };
+            Ok(())
+        }
+    }
+
+    impl super::HvfGicMsiSignalApi for LoadedHvfGicMsiSignalApi {
+        fn send_msi(&self, address: u64, intid: u32) -> Result<(), HvfGicError> {
+            // SAFETY: the signaler derives `address` from validated metadata
+            // and accepts only an allocated INTID inside the configured range.
+            unsafe {
+                crate::ffi::check((self.symbols.send_msi)(address, intid), "hv_gic_send_msi")?
+            };
             Ok(())
         }
     }
@@ -2311,21 +3008,25 @@ mod dynamic {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use dynamic::{
     LoadedHvfGicApi, LoadedHvfGicIccRegisterApi, LoadedHvfGicIccRegisterWriteApi,
-    LoadedHvfGicPpiPendingApi, LoadedHvfGicSpiSignalApi, LoadedHvfGicStateCaptureApi,
-    LoadedHvfGicStateRestoreApi,
+    LoadedHvfGicMsiSignalApi, LoadedHvfGicPpiPendingApi, LoadedHvfGicSpiSignalApi,
+    LoadedHvfGicStateCaptureApi, LoadedHvfGicStateRestoreApi,
 };
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::error::Error as _;
+    use std::fmt;
+    use std::num::NonZeroU32;
     use std::panic::{self, AssertUnwindSafe};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
+    use std::time::Duration;
 
     use bangbang_runtime::BackendError;
     use bangbang_runtime::fdt::{
         ARM64_FDT_HYPERVISOR_TIMER_PPI, ARM64_FDT_NON_SECURE_PHYSICAL_TIMER_PPI,
-        ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI, ARM64_FDT_VIRTUAL_TIMER_PPI, Arm64FdtError,
+        ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI, ARM64_FDT_VIRTUAL_TIMER_PPI,
+        ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET, ARM64_GICV2M_SPI_END_EXCLUSIVE, Arm64FdtError,
         Arm64FdtInterruptRange, Arm64FdtMsi, Arm64FdtRegion, Arm64FdtTimerInterrupts,
     };
     use bangbang_runtime::interrupt::{GuestInterruptLine, GuestInterruptLineError, InterruptSink};
@@ -2342,7 +3043,9 @@ mod tests {
         HvfArm64GicIccRegisterState, HvfGicApi, HvfGicDeviceState, HvfGicError,
         HvfGicIccRegisterApi, HvfGicIccRegisterReader, HvfGicIccRegisterRestorer,
         HvfGicIccRegisterWriteApi, HvfGicInterruptLineAllocator, HvfGicInterruptRange,
-        HvfGicMetadata, HvfGicMsiMetadata, HvfGicParameters, HvfGicPpiPendingWriter, HvfGicRegion,
+        HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiInterruptAllocationError,
+        HvfGicMsiInterruptAllocator, HvfGicMsiMetadata, HvfGicMsiParameters, HvfGicMsiSignalError,
+        HvfGicMsiSignaler, HvfGicParameters, HvfGicPpiPendingWriter, HvfGicRegion,
         HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicStateApi, HvfGicStateRestoreApi,
         HvfGicStateRestorer, HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
         capture_gic_device_state_with_api, capture_gic_device_state_with_api_bounded,
@@ -2950,6 +3653,479 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn msi_metadata_reserves_the_highest_usable_host_spis() {
+        let metadata = metadata_from_parameters(parameters_with_msi(8))
+            .expect("valid MSI demand should produce GIC metadata");
+
+        assert_eq!(
+            metadata.spi_interrupt_range,
+            HvfGicInterruptRange {
+                base: 32,
+                count: 88,
+            }
+        );
+        assert_eq!(
+            metadata.msi,
+            Some(HvfGicMsiMetadata {
+                region: HvfGicRegion {
+                    base: 0x3ffc_0000,
+                    size: 0x1_0000,
+                },
+                interrupt_range: HvfGicInterruptRange {
+                    base: 120,
+                    count: 8,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn msi_metadata_excludes_the_gicv2m_terminal_spi_from_both_ranges() {
+        let mut parameters = parameters_with_msi(1);
+        parameters.spi_interrupt_range = HvfGicInterruptRange {
+            base: 32,
+            count: 988,
+        };
+
+        let metadata = metadata_from_parameters(parameters)
+            .expect("host range with a terminal guard should produce GIC metadata");
+
+        assert_eq!(
+            metadata.spi_interrupt_range,
+            HvfGicInterruptRange {
+                base: 32,
+                count: 986,
+            }
+        );
+        assert_eq!(
+            metadata.msi,
+            Some(HvfGicMsiMetadata {
+                region: HvfGicRegion {
+                    base: 0x3ffc_0000,
+                    size: 0x1_0000,
+                },
+                interrupt_range: HvfGicInterruptRange {
+                    base: ARM64_GICV2M_SPI_END_EXCLUSIVE - 1,
+                    count: 1,
+                },
+            })
+        );
+        assert_eq!(
+            metadata.spi_interrupt_range.base + metadata.spi_interrupt_range.count,
+            ARM64_GICV2M_SPI_END_EXCLUSIVE - 1
+        );
+    }
+
+    #[test]
+    fn msi_metadata_rejects_demand_that_consumes_the_usable_gicv2m_domain() {
+        let mut parameters = parameters_with_msi(987);
+        parameters.spi_interrupt_range = HvfGicInterruptRange {
+            base: 32,
+            count: 988,
+        };
+
+        assert_eq!(
+            metadata_from_parameters(parameters),
+            Err(HvfGicError::InsufficientMsiInterruptCapacity)
+        );
+    }
+
+    #[test]
+    fn msi_metadata_rejects_demand_that_would_empty_the_legacy_range() {
+        assert_eq!(
+            metadata_from_parameters(parameters_with_msi(96)),
+            Err(HvfGicError::InsufficientMsiInterruptCapacity)
+        );
+    }
+
+    #[test]
+    fn msi_metadata_rejects_invalid_frame_geometry_without_values_in_error() {
+        for (region_size, region_alignment, expected_name) in [
+            (0, 0x1_0000, "region_size"),
+            (0x40, 0x1_0000, "region_size"),
+            (0x1_0000, 3, "region_base_alignment"),
+        ] {
+            let mut parameters = parameters_with_msi(1);
+            let msi = parameters
+                .msi
+                .as_mut()
+                .expect("MSI parameters should exist");
+            msi.region_size = region_size;
+            msi.region_alignment = region_alignment;
+
+            let error = metadata_from_parameters(parameters)
+                .expect_err("invalid MSI frame geometry should fail");
+            assert_eq!(
+                error,
+                HvfGicError::InvalidMsiParameter {
+                    name: expected_name,
+                }
+            );
+            assert!(!error.to_string().contains(&region_size.to_string()));
+        }
+    }
+
+    #[test]
+    fn msi_interrupt_allocator_allocates_only_the_reserved_range() {
+        let metadata = metadata_from_parameters(parameters_with_msi(2))
+            .expect("valid MSI demand should produce metadata");
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            FakeGicApi::default(),
+        )
+        .expect("MSI metadata should produce a signaler");
+        let allocator = signaler.allocator();
+        let peer_allocator = signaler.allocator();
+
+        assert_eq!(
+            allocator.range(),
+            HvfGicInterruptRange {
+                base: 126,
+                count: 2,
+            }
+        );
+        assert_eq!(
+            allocator
+                .allocate()
+                .expect("first MSI should allocate")
+                .raw_value(),
+            126
+        );
+        assert_eq!(
+            peer_allocator
+                .allocate()
+                .expect("last MSI should allocate")
+                .raw_value(),
+            127
+        );
+        assert!(allocator.is_exhausted());
+        assert!(peer_allocator.is_exhausted());
+        assert_eq!(
+            allocator.allocate(),
+            Err(HvfGicMsiInterruptAllocationError::Exhausted)
+        );
+    }
+
+    #[test]
+    fn msi_signaler_requires_valid_metadata() {
+        let malformed = HvfGicMsiMetadata {
+            region: HvfGicRegion {
+                base: 0x3ffc_0000,
+                size: 0x40,
+            },
+            interrupt_range: HvfGicInterruptRange {
+                base: 127,
+                count: 1,
+            },
+        };
+        assert_eq!(
+            HvfGicMsiSignaler::with_api(malformed, FakeGicApi::default())
+                .expect_err("short MSI frame should fail"),
+            HvfGicMsiSignalError::InvalidMetadata("message frame does not contain SETSPI")
+        );
+    }
+
+    #[test]
+    fn msi_signaler_rejects_the_gicv2m_terminal_spi() {
+        let terminal_metadata = HvfGicMsiMetadata {
+            region: HvfGicRegion {
+                base: 0x3ffc_0000,
+                size: 0x1_0000,
+            },
+            interrupt_range: HvfGicInterruptRange {
+                base: ARM64_GICV2M_SPI_END_EXCLUSIVE,
+                count: 1,
+            },
+        };
+
+        assert_eq!(
+            HvfGicMsiSignaler::with_api(terminal_metadata, FakeGicApi::default())
+                .expect_err("terminal SPI should not produce an MSI signaler"),
+            HvfGicMsiSignalError::InvalidMetadata("interrupt range exceeds the GICv2m SPI domain")
+        );
+    }
+
+    #[test]
+    fn msi_signaler_uses_set_spi_nsr_address_and_allocated_intid() {
+        let metadata = metadata_from_parameters(parameters_with_msi(2))
+            .expect("valid MSI demand should produce metadata");
+        let api = FakeGicApi::default();
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            api.clone(),
+        )
+        .expect("valid MSI metadata should produce a signaler");
+        let allocator = signaler.allocator();
+        let interrupt = allocator.allocate().expect("MSI should allocate");
+
+        signaler
+            .send(&interrupt)
+            .expect("allocated MSI should signal");
+
+        assert_eq!(
+            api.msi_signals(),
+            vec![(0x3ffc_0000 + ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET, 126,)]
+        );
+        assert_eq!(api.calls(), vec!["hv_gic_send_msi"]);
+    }
+
+    #[test]
+    fn msi_signaler_rejects_interrupt_from_a_different_capability() {
+        let metadata = metadata_from_parameters(parameters_with_msi(2))
+            .expect("valid MSI demand should produce metadata");
+        let signaler_api = FakeGicApi::default();
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            signaler_api.clone(),
+        )
+        .expect("valid MSI metadata should produce a signaler");
+        let other_signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("alternate MSI metadata should exist"),
+            FakeGicApi::default(),
+        )
+        .expect("alternate metadata should produce a signaler");
+        let interrupt = other_signaler
+            .allocator()
+            .allocate()
+            .expect("alternate MSI should allocate");
+
+        assert_eq!(
+            signaler
+                .send(&interrupt)
+                .expect_err("capability provenance mismatch should fail"),
+            HvfGicMsiSignalError::InterruptOutOfRange
+        );
+        assert!(signaler_api.calls().is_empty());
+        assert!(signaler_api.msi_signals().is_empty());
+    }
+
+    #[test]
+    fn msi_signaler_deactivation_revokes_every_clone() {
+        let metadata = metadata_from_parameters(parameters_with_msi(1))
+            .expect("valid MSI demand should produce metadata");
+        let api = FakeGicApi::default();
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            api.clone(),
+        )
+        .expect("valid MSI metadata should produce a signaler");
+        let clone = signaler.clone();
+        let interrupt = signaler
+            .allocator()
+            .allocate()
+            .expect("MSI should allocate");
+
+        signaler.deactivate();
+
+        for revoked in [&signaler, &clone] {
+            assert_eq!(
+                revoked
+                    .send(&interrupt)
+                    .expect_err("revoked signaler should reject sends"),
+                HvfGicMsiSignalError::InvalidState("HVF GIC MSI signaler is inactive")
+            );
+        }
+        assert!(api.calls().is_empty());
+        assert!(api.msi_signals().is_empty());
+    }
+
+    #[test]
+    fn msi_signaler_serializes_sends_and_waits_before_deactivation() {
+        struct ReleaseBlockedMsiCallsOnDrop(mpsc::SyncSender<()>);
+
+        impl Drop for ReleaseBlockedMsiCallsOnDrop {
+            fn drop(&mut self) {
+                for _ in 0..2 {
+                    let _ = self.0.try_send(());
+                }
+            }
+        }
+
+        struct BlockingMsiSignalApi {
+            entered: mpsc::SyncSender<()>,
+            releases: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl fmt::Debug for BlockingMsiSignalApi {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("BlockingMsiSignalApi")
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl super::HvfGicMsiSignalApi for BlockingMsiSignalApi {
+            fn send_msi(&self, _: u64, _: u32) -> Result<(), HvfGicError> {
+                self.entered
+                    .send(())
+                    .expect("test should observe each entered send");
+                self.releases
+                    .lock()
+                    .expect("test release receiver should be lockable")
+                    .recv()
+                    .expect("test should release each entered send");
+                Ok(())
+            }
+        }
+
+        let metadata = metadata_from_parameters(parameters_with_msi(2))
+            .expect("valid MSI demand should produce metadata");
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(2);
+        let (release_sender, release_receiver) = mpsc::sync_channel(2);
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            BlockingMsiSignalApi {
+                entered: entered_sender,
+                releases: Mutex::new(release_receiver),
+            },
+        )
+        .expect("valid MSI metadata should produce a signaler");
+        let allocator = signaler.allocator();
+        let first_interrupt = allocator.allocate().expect("first MSI should allocate");
+        let second_interrupt = allocator.allocate().expect("second MSI should allocate");
+
+        std::thread::scope(|scope| {
+            // A failed ordering assertion must release any blocked fake host
+            // calls before the scope joins its threads during unwinding.
+            let _release_on_unwind = ReleaseBlockedMsiCallsOnDrop(release_sender.clone());
+            let first_signaler = signaler.clone();
+            let first_interrupt_ref = &first_interrupt;
+            let first_send = scope.spawn(move || first_signaler.send(first_interrupt_ref));
+            entered_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first send should enter the host API");
+
+            let (second_started_sender, second_started_receiver) = mpsc::sync_channel(1);
+            let second_signaler = signaler.clone();
+            let second_send = scope.spawn(move || {
+                second_started_sender
+                    .send(())
+                    .expect("second send start should be observable");
+                second_signaler.send(&second_interrupt)
+            });
+            second_started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second send should start while the first is blocked");
+            assert!(matches!(
+                entered_receiver.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+
+            release_sender
+                .send(())
+                .expect("first host send should be released");
+            first_send
+                .join()
+                .expect("first send thread should not panic")
+                .expect("first send should succeed");
+            entered_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second send should enter after the first releases the signaler lock");
+
+            let (deactivate_started_sender, deactivate_started_receiver) = mpsc::sync_channel(1);
+            let (deactivated_sender, deactivated_receiver) = mpsc::sync_channel(1);
+            let retained_signaler = signaler.clone();
+            let deactivate = scope.spawn(move || {
+                deactivate_started_sender
+                    .send(())
+                    .expect("deactivation start should be observable");
+                retained_signaler.deactivate();
+                deactivated_sender
+                    .send(())
+                    .expect("deactivation completion should be observable");
+            });
+            deactivate_started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("deactivation should start while the second send is blocked");
+            assert!(matches!(
+                deactivated_receiver.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+
+            release_sender
+                .send(())
+                .expect("second host send should be released");
+            second_send
+                .join()
+                .expect("second send thread should not panic")
+                .expect("second send should succeed");
+            deactivate
+                .join()
+                .expect("deactivation thread should not panic");
+            deactivated_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("deactivation should complete after the in-flight send");
+        });
+
+        assert_eq!(
+            signaler
+                .send(&first_interrupt)
+                .expect_err("deactivation should revoke later sends"),
+            HvfGicMsiSignalError::InvalidState("HVF GIC MSI signaler is inactive")
+        );
+    }
+
+    #[test]
+    fn msi_signaler_preserves_hvf_failure_source() {
+        let metadata = metadata_from_parameters(parameters_with_msi(1))
+            .expect("valid MSI demand should produce metadata");
+        let api = FakeGicApi::default().with_failure("hv_gic_send_msi");
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            api.clone(),
+        )
+        .expect("valid MSI metadata should produce a signaler");
+        let interrupt = signaler
+            .allocator()
+            .allocate()
+            .expect("MSI should allocate");
+
+        let error = signaler
+            .send(&interrupt)
+            .expect_err("injected send failure should propagate");
+
+        assert_eq!(
+            error,
+            HvfGicMsiSignalError::Signal {
+                source: HvfGicError::Backend(BackendError::Hypervisor(
+                    "injected hv_gic_send_msi failure".to_string(),
+                )),
+            }
+        );
+        assert!(error.source().is_some());
+        assert!(api.msi_signals().is_empty());
+    }
+
+    #[test]
+    fn msi_debug_output_redacts_configuration_and_capability_values() {
+        let metadata = metadata_from_parameters(parameters_with_msi(7))
+            .expect("valid MSI demand should produce metadata");
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            FakeGicApi::default(),
+        )
+        .expect("valid MSI metadata should produce a signaler");
+        let allocator = signaler.allocator();
+        let interrupt = allocator.allocate().expect("MSI should allocate");
+
+        assert_eq!(
+            format!("{:?}", msi_configuration(7)),
+            "HvfGicMsiConfiguration { interrupt_count: \"<redacted>\" }"
+        );
+        assert!(!format!("{:?}", metadata.msi).contains("121"));
+        assert!(!format!("{allocator:?}").contains("121"));
+        assert!(!format!("{interrupt:?}").contains("121"));
+        assert!(!format!("{signaler:?}").contains("3ffc0040"));
+    }
+
+    #[test]
+    fn msi_allocator_and_signaler_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<HvfGicMsiInterruptAllocator>();
+        assert_send_sync::<HvfGicMsiSignaler>();
     }
 
     #[test]
@@ -3655,7 +4831,7 @@ mod tests {
         });
 
         assert_eq!(
-            create_gic_with_api(&api),
+            create_gic_with_api(&api, None),
             Err(HvfGicError::InvalidParameter {
                 name: "distributor_size",
                 value: 0,
@@ -3724,7 +4900,7 @@ mod tests {
         });
 
         assert_eq!(
-            create_gic_with_api(&api),
+            create_gic_with_api(&api, None),
             Err(HvfGicError::InvalidParameter {
                 name: "spi_interrupt_range.count",
                 value: 0,
@@ -3764,7 +4940,7 @@ mod tests {
         });
 
         assert_eq!(
-            create_gic_with_api(&api),
+            create_gic_with_api(&api, None),
             Err(HvfGicError::InvalidParameter {
                 name: "el1_virtual_timer_intid",
                 value: 15,
@@ -3835,7 +5011,7 @@ mod tests {
     fn create_gic_configures_hvf_before_returning_metadata() {
         let api = FakeGicApi::default();
 
-        let metadata = create_gic_with_api(&api).expect("GIC should be created");
+        let metadata = create_gic_with_api(&api, None).expect("GIC should be created");
 
         assert_eq!(metadata.distributor.base, 0x3fff_0000);
         assert_eq!(
@@ -3860,11 +5036,98 @@ mod tests {
     }
 
     #[test]
+    fn create_gic_with_msi_configures_exact_tail_range_and_frame() {
+        let api = FakeGicApi::new(parameters_with_msi(1));
+
+        let metadata = create_gic_with_api(&api, Some(msi_configuration(8)))
+            .expect("valid MSI GIC should be created");
+
+        assert_eq!(
+            metadata.spi_interrupt_range,
+            HvfGicInterruptRange {
+                base: 32,
+                count: 88,
+            }
+        );
+        assert_eq!(
+            metadata
+                .msi
+                .expect("MSI metadata should exist")
+                .interrupt_range,
+            HvfGicInterruptRange {
+                base: 120,
+                count: 8,
+            }
+        );
+        assert_eq!(api.msi_region_bases(), vec![0x3ffc_0000]);
+        assert_eq!(
+            api.msi_ranges(),
+            vec![HvfGicInterruptRange {
+                base: 120,
+                count: 8,
+            }]
+        );
+        assert_eq!(
+            api.calls(),
+            vec![
+                "hv_gic_get_msi_region_size",
+                "hv_gic_get_msi_region_base_alignment",
+                "hv_gic_get_distributor_size",
+                "hv_gic_get_distributor_base_alignment",
+                "hv_gic_get_redistributor_region_size",
+                "hv_gic_get_redistributor_size",
+                "hv_gic_get_redistributor_base_alignment",
+                "hv_gic_get_spi_interrupt_range",
+                "hv_gic_get_intid",
+                "hv_gic_get_intid",
+                "hv_gic_config_create",
+                "hv_gic_config_set_distributor_base",
+                "hv_gic_config_set_redistributor_base",
+                "hv_gic_config_set_msi_region_base",
+                "hv_gic_config_set_msi_interrupt_range",
+                "hv_gic_create",
+                "os_release",
+            ]
+        );
+        assert_eq!(api.released_configs(), vec![1]);
+    }
+
+    #[test]
+    fn invalid_msi_demand_fails_before_config_creation() {
+        let api = FakeGicApi::new(parameters_with_msi(1));
+
+        assert_eq!(
+            create_gic_with_api(&api, Some(msi_configuration(96))),
+            Err(HvfGicError::InsufficientMsiInterruptCapacity)
+        );
+        assert!(!api.created_config());
+        assert!(api.msi_region_bases().is_empty());
+        assert!(api.msi_ranges().is_empty());
+    }
+
+    #[test]
+    fn msi_configuration_failure_releases_config_without_creating_gic() {
+        let api = FakeGicApi::new(parameters_with_msi(1))
+            .with_failure("hv_gic_config_set_msi_interrupt_range");
+
+        assert_eq!(
+            create_gic_with_api(&api, Some(msi_configuration(8))),
+            Err(HvfGicError::Backend(BackendError::Hypervisor(
+                "injected hv_gic_config_set_msi_interrupt_range failure".to_string()
+            )))
+        );
+        assert_eq!(api.msi_region_bases(), vec![0x3ffc_0000]);
+        assert!(api.msi_ranges().is_empty());
+        assert!(!api.calls().contains(&"hv_gic_create"));
+        assert_eq!(api.released_configs(), vec![1]);
+    }
+
+    #[test]
     fn create_gic_releases_config_after_set_failure() {
         let api = FakeGicApi::default().with_failure("hv_gic_config_set_redistributor_base");
 
         assert_eq!(
-            create_gic_with_api(&api),
+            create_gic_with_api(&api, None),
             Err(HvfGicError::Backend(BackendError::Hypervisor(
                 "injected hv_gic_config_set_redistributor_base failure".to_string()
             )))
@@ -3893,7 +5156,7 @@ mod tests {
         let api = FakeGicApi::default().with_failure("hv_gic_create");
 
         assert_eq!(
-            create_gic_with_api(&api),
+            create_gic_with_api(&api, None),
             Err(HvfGicError::Backend(BackendError::Hypervisor(
                 "injected hv_gic_create failure".to_string()
             )))
@@ -3945,6 +5208,25 @@ mod tests {
                 el1_virtual_timer_intid: 27,
                 el1_physical_timer_intid: 30,
             },
+            msi: None,
+        }
+    }
+
+    fn msi_configuration(interrupt_count: u32) -> HvfGicMsiConfiguration {
+        HvfGicMsiConfiguration::new(
+            NonZeroU32::new(interrupt_count).expect("test MSI count should be nonzero"),
+        )
+    }
+
+    fn parameters_with_msi(interrupt_count: u32) -> HvfGicParameters {
+        HvfGicParameters {
+            msi: Some(HvfGicMsiParameters {
+                region_size: 0x1_0000,
+                region_alignment: 0x1_0000,
+                interrupt_count: NonZeroU32::new(interrupt_count)
+                    .expect("test MSI count should be nonzero"),
+            }),
+            ..default_parameters()
         }
     }
 
@@ -4315,6 +5597,9 @@ mod tests {
                     next_config: 1,
                     released_configs: Vec::new(),
                     spi_signals: Vec::new(),
+                    msi_region_bases: Vec::new(),
+                    msi_ranges: Vec::new(),
+                    msi_signals: Vec::new(),
                     ppi_pending_writes: Vec::new(),
                     failure: None,
                     created_config: false,
@@ -4351,6 +5636,30 @@ mod tests {
                 .lock()
                 .expect("fake GIC API state should be lockable")
                 .spi_signals
+                .clone()
+        }
+
+        fn msi_region_bases(&self) -> Vec<u64> {
+            self.state
+                .lock()
+                .expect("fake GIC API state should be lockable")
+                .msi_region_bases
+                .clone()
+        }
+
+        fn msi_ranges(&self) -> Vec<HvfGicInterruptRange> {
+            self.state
+                .lock()
+                .expect("fake GIC API state should be lockable")
+                .msi_ranges
+                .clone()
+        }
+
+        fn msi_signals(&self) -> Vec<(u64, u32)> {
+            self.state
+                .lock()
+                .expect("fake GIC API state should be lockable")
+                .msi_signals
                 .clone()
         }
 
@@ -4400,6 +5709,25 @@ mod tests {
                 )))
             } else {
                 state.spi_signals.push((intid, level));
+                Ok(())
+            }
+        }
+    }
+
+    impl super::HvfGicMsiSignalApi for FakeGicApi {
+        fn send_msi(&self, address: u64, intid: u32) -> Result<(), HvfGicError> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("fake GIC API state should be lockable");
+            state.calls.push("hv_gic_send_msi");
+
+            if state.failure == Some("hv_gic_send_msi") {
+                Err(HvfGicError::Backend(BackendError::Hypervisor(
+                    "injected hv_gic_send_msi failure".to_string(),
+                )))
+            } else {
+                state.msi_signals.push((address, intid));
                 Ok(())
             }
         }
@@ -4466,6 +5794,26 @@ mod tests {
             Ok(self.parameters.redistributor_alignment)
         }
 
+        fn msi_region_size(&self) -> Result<u64, HvfGicError> {
+            self.record("hv_gic_get_msi_region_size")?;
+            self.parameters
+                .msi
+                .map(|parameters| parameters.region_size)
+                .ok_or(HvfGicError::InvalidMsiParameter {
+                    name: "region_size",
+                })
+        }
+
+        fn msi_region_alignment(&self) -> Result<u64, HvfGicError> {
+            self.record("hv_gic_get_msi_region_base_alignment")?;
+            self.parameters
+                .msi
+                .map(|parameters| parameters.region_alignment)
+                .ok_or(HvfGicError::InvalidMsiParameter {
+                    name: "region_base_alignment",
+                })
+        }
+
         fn spi_interrupt_range(&self) -> Result<HvfGicInterruptRange, HvfGicError> {
             self.record("hv_gic_get_spi_interrupt_range")?;
             Ok(self.parameters.spi_interrupt_range)
@@ -4507,6 +5855,30 @@ mod tests {
             self.record("hv_gic_config_set_redistributor_base")
         }
 
+        fn set_msi_region_base(&self, _: &mut Self::Config, base: u64) -> Result<(), HvfGicError> {
+            self.record("hv_gic_config_set_msi_region_base")?;
+            self.state
+                .lock()
+                .expect("fake GIC API state should be lockable")
+                .msi_region_bases
+                .push(base);
+            Ok(())
+        }
+
+        fn set_msi_interrupt_range(
+            &self,
+            _: &mut Self::Config,
+            range: HvfGicInterruptRange,
+        ) -> Result<(), HvfGicError> {
+            self.record("hv_gic_config_set_msi_interrupt_range")?;
+            self.state
+                .lock()
+                .expect("fake GIC API state should be lockable")
+                .msi_ranges
+                .push(range);
+            Ok(())
+        }
+
         fn create_gic(&self, _: &Self::Config) -> Result<(), HvfGicError> {
             self.record("hv_gic_create")
         }
@@ -4527,6 +5899,9 @@ mod tests {
         next_config: u64,
         released_configs: Vec<u64>,
         spi_signals: Vec<(u32, bool)>,
+        msi_region_bases: Vec<u64>,
+        msi_ranges: Vec<HvfGicInterruptRange>,
+        msi_signals: Vec<(u64, u32)>,
         ppi_pending_writes: Vec<(crate::ffi::HvVcpu, u32, u64)>,
         failure: Option<&'static str>,
         created_config: bool,

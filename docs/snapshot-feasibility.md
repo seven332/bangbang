@@ -22,6 +22,10 @@ path.
 - Create is paused-state-only and supports only `Full` for one vCPU, exactly
   one regular read-only root drive, default serial, and no optional devices or
   MMDS. Unsupported modes and profiles fail before artifact or capture work.
+- The optional internal GICv2m foundation is outside native-v1. Capture and
+  load validation reject MSI-bearing GIC metadata; the frame, reserved range,
+  allocator state, and any delivered or in-flight message are not persisted or
+  inferred during restore.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
   network, and entropy retry schedulers, preflights both final namespaces,
@@ -298,7 +302,11 @@ added; Wave 6 owns any broader template-bearing profile.
 Construction and decode cross-check the machine memory size and one canonical
 DRAM range against the memory binding, the primary MPIDR against CPU identity,
 optional-feature absence/inactivity, the baseline GIC topology, fixed RTC
-mapping, and every nested device queue/platform range. The cache values come
+mapping, and every nested device queue/platform range. The native-v1
+compatibility gate requires MSI-free GIC metadata; an opt-in GICv2m session is
+rejected before capture publication or destination construction because no
+message-delivery or consuming-device state belongs to this profile. The cache
+values come
 from one retained default `hv_vcpu_config_t`; they describe same-environment
 compatibility and are not a cross-host portability claim. The opaque GIC blob
 is bounded before allocation and can still be rejected by Hypervisor.framework
@@ -960,6 +968,9 @@ some of the required state:
   and SPI state access and interrupt injection primitives. They also expose a
   retained state object whose stable, versioned opaque bytes cover the GIC
   device except separately captured CPU system registers.
+  The implemented internal MSI foundation configures HVF's GICM region as a
+  Linux GICv2m frame and exposes a range-bound send capability, but it does not
+  add device state, delivery rollback, or portable migration semantics.
 
 The inspected headers do not expose a KVM-style dirty log or dirty-page tracking
 API, so Firecracker-style diff snapshot parity is not a direct HVF API mapping.

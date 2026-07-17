@@ -520,6 +520,92 @@ const GIC_ICC_REGISTER_GUEST_CODE: [u32; 15] = [
     0xd400_0002, // hvc #0
 ];
 
+// Bare EL1 setup for one message-only SPI. X0 points at four little-endian
+// values: distributor base, redistributor base, INTID, and VBAR. The code
+// wakes redistributor 0, programs the SPI as Group-1 edge-triggered and routed
+// to affinity 0, enables the GICv3 system-register interface, then publishes
+// readiness with HVC #0 and waits for the message.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GIC_MSI_GUEST_CODE: [u32; 69] = [
+    0xaa00_03f3, // mov x19, x0
+    0xf940_0274, // ldr x20, [x19]                 (GICD)
+    0xf940_0675, // ldr x21, [x19, #8]             (GICR)
+    0xb940_1276, // ldr w22, [x19, #16]            (INTID)
+    0xf940_0e77, // ldr x23, [x19, #24]            (VBAR)
+    0xd518_c017, // msr VBAR_EL1, x23
+    0xd503_3fdf, // isb
+    0x9100_52a1, // add x1, x21, #0x14             (GICR_WAKER)
+    0xb940_0022, // ldr w2, [x1]
+    0x121e_7842, // bic w2, w2, #2                 (ProcessorSleep)
+    0xb900_0022, // str w2, [x1]
+    0xb940_0022, // ldr w2, [x1]
+    0x3717_ffe2, // tbnz w2, #2, .-4               (ChildrenAsleep)
+    0x1200_12c3, // and w3, w22, #31
+    0x5280_0024, // mov w4, #1
+    0x1ac3_2084, // lsl w4, w4, w3
+    0x5305_7ec5, // lsr w5, w22, #5
+    0x9102_0286, // add x6, x20, #0x80             (GICD_IGROUPR)
+    0x8b05_08c6, // add x6, x6, x5, lsl #2
+    0xb940_00c7, // ldr w7, [x6]
+    0x2a04_00e7, // orr w7, w7, w4
+    0xb900_00c7, // str w7, [x6]
+    0x1200_0ec3, // and w3, w22, #15
+    0x531f_7863, // lsl w3, w3, #1
+    0x1100_0463, // add w3, w3, #1
+    0x5280_0024, // mov w4, #1
+    0x1ac3_2084, // lsl w4, w4, w3
+    0x9130_0286, // add x6, x20, #0xc00            (GICD_ICFGR)
+    0x5304_7ec5, // lsr w5, w22, #4
+    0x8b05_08c6, // add x6, x6, x5, lsl #2
+    0xb940_00c7, // ldr w7, [x6]
+    0x2a04_00e7, // orr w7, w7, w4
+    0xb900_00c7, // str w7, [x6]
+    0x9110_0286, // add x6, x20, #0x400            (GICD_IPRIORITYR)
+    0x8b16_00c6, // add x6, x6, x22
+    0x5280_1007, // mov w7, #0x80
+    0x3900_00c7, // strb w7, [x6]
+    0x9140_1a86, // add x6, x20, #0x6000           (GICD_IROUTER)
+    0x8b16_0cc6, // add x6, x6, x22, lsl #3
+    0xf900_00df, // str xzr, [x6]
+    0x1200_12c3, // and w3, w22, #31
+    0x5280_0024, // mov w4, #1
+    0x1ac3_2084, // lsl w4, w4, w3
+    0x5305_7ec5, // lsr w5, w22, #5
+    0x9104_0286, // add x6, x20, #0x100            (GICD_ISENABLER)
+    0x8b05_08c6, // add x6, x6, x5, lsl #2
+    0xb900_00c4, // str w4, [x6]
+    0xb940_0287, // ldr w7, [x20]                  (GICD_CTLR)
+    0x5280_0248, // mov w8, #0x12                  (ARE_NS | EnableGrp1NS)
+    0x2a08_00e7, // orr w7, w7, w8
+    0xb900_0287, // str w7, [x20]
+    0xd503_3f9f, // dsb sy
+    0xb940_0287, // ldr w7, [x20]
+    0x37ff_ffe7, // tbnz w7, #31, .-4              (RWP)
+    0xd538_cca1, // mrs x1, ICC_SRE_EL1
+    0xb240_0021, // orr x1, x1, #1
+    0xd518_cca1, // msr ICC_SRE_EL1, x1
+    0xd503_3fdf, // isb
+    0xd280_1fe1, // mov x1, #0xff
+    0xd518_4601, // msr ICC_PMR_EL1, x1
+    0xd518_cc7f, // msr ICC_BPR1_EL1, xzr
+    0xd280_0021, // mov x1, #1
+    0xd518_cce1, // msr ICC_IGRPEN1_EL1, x1
+    0xd503_3fdf, // isb
+    0xd503_42ff, // msr DAIFClr, #2
+    0xb940_0681, // ldr w1, [x20, #4]              (GICD_TYPER evidence)
+    0xd400_0002, // hvc #0                         (ready)
+    0xd503_207f, // wfi
+    0x17ff_ffff, // b .-4
+];
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GIC_MSI_IRQ_HANDLER: [u32; 4] = [
+    0xd538_cc00, // mrs x0, ICC_IAR1_EL1
+    0xd518_cc20, // msr ICC_EOIR1_EL1, x0
+    0xd400_0022, // hvc #1
+    0x1400_0000, // b .
+];
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn test_rtc_mmio_layout() -> bangbang_runtime::rtc::RtcMmioLayout {
     bangbang_runtime::rtc::RtcMmioLayout::new(
@@ -2279,6 +2365,172 @@ fn creates_hvf_gic_before_vcpu() {
         vcpu.destroy().expect("vCPU should be destroyed");
     }
     backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn delivers_hvf_gic_msi_to_the_allocated_guest_intid() {
+    use std::num::NonZeroU32;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use bangbang_hvf::{
+        HvfArm64BootRegisters, HvfBackend, HvfGicMsiConfiguration, HvfMemoryPermissions,
+        HvfVcpuExit,
+    };
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::fdt::ARM64_GICV2M_SPI_END_EXCLUSIVE;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    let metadata = *backend
+        .create_gic_with_msi(HvfGicMsiConfiguration::new(
+            NonZeroU32::new(1).expect("test MSI count should be nonzero"),
+        ))
+        .expect("MSI-enabled GIC should be created");
+    let signaler = backend
+        .gic_msi_signaler()
+        .expect("MSI-enabled GIC should retain its sender")
+        .clone();
+    let interrupt = signaler
+        .allocator()
+        .allocate()
+        .expect("one MSI should allocate");
+    assert_eq!(
+        interrupt.raw_value(),
+        ARM64_GICV2M_SPI_END_EXCLUSIVE - 1,
+        "the host terminal SPI should remain outside the GICv2m allocation"
+    );
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let vector_base = guest_entry
+        .checked_add(0x800)
+        .expect("guest vector address should fit");
+    let irq_handler = vector_base
+        .checked_add(0x280)
+        .expect("current-EL SPx IRQ vector should fit");
+    let config_address = guest_entry
+        .checked_add(0x1000)
+        .expect("guest MSI config address should fit");
+    let guest_code = GIC_MSI_GUEST_CODE
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let irq_code = GIC_MSI_IRQ_HANDLER
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("MSI guest setup code should be written");
+    memory
+        .write_slice(&irq_code, irq_handler)
+        .expect("MSI guest IRQ handler should be written");
+
+    let mut guest_config = Vec::with_capacity(32);
+    guest_config.extend_from_slice(&metadata.distributor.base.to_le_bytes());
+    guest_config.extend_from_slice(&metadata.redistributor.region.base.to_le_bytes());
+    guest_config.extend_from_slice(&interrupt.raw_value().to_le_bytes());
+    guest_config.extend_from_slice(&0_u32.to_le_bytes());
+    guest_config.extend_from_slice(&vector_base.raw_value().to_le_bytes());
+    memory
+        .write_slice(&guest_config, config_address)
+        .expect("MSI guest configuration should be written");
+
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: config_address,
+            })
+            .expect("MSI guest boot registers should be configured");
+
+        let HvfVcpuExit::Exception(ready) = runner
+            .run_once()
+            .expect("MSI guest should publish readiness through HVC")
+        else {
+            panic!("MSI guest readiness should produce an exception exit");
+        };
+        assert_eq!(
+            ready
+                .decode_hvc()
+                .expect("MSI guest readiness should decode as HVC")
+                .immediate(),
+            0
+        );
+        let ready_registers = runner
+            .capture_arm64_general_register_state()
+            .expect("MSI readiness registers should be captured");
+        assert_eq!(
+            ready_registers
+                .general_purpose_register(1)
+                .expect("X1 should contain GICD_TYPER")
+                & (1 << 17),
+            0,
+            "the validated GICv2m path requires a distributor without LPIs",
+        );
+
+        signaler
+            .send(&interrupt)
+            .expect("real Hypervisor.framework MSI should be sent");
+        let cancel = runner.run_cancel_handle();
+        let delivered = std::thread::scope(|scope| {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let runner_ref = &runner;
+            scope.spawn(move || {
+                let _ = sender.send(runner_ref.run_once());
+            });
+
+            match receiver.recv_timeout(Duration::from_secs(5)) {
+                Ok(result) => result.expect("MSI guest run should succeed"),
+                Err(error) => {
+                    cancel
+                        .cancel()
+                        .expect("timed-out MSI guest run should cancel");
+                    let _ = receiver.recv_timeout(Duration::from_secs(5));
+                    panic!("MSI guest did not observe an IRQ before the deadline: {error}");
+                }
+            }
+        });
+        let HvfVcpuExit::Exception(delivered) = delivered else {
+            panic!("delivered MSI should produce an exception exit");
+        };
+        assert_eq!(
+            delivered
+                .decode_hvc()
+                .expect("MSI IRQ handler exit should decode as HVC")
+                .immediate(),
+            1
+        );
+        let registers = runner
+            .capture_arm64_general_register_state()
+            .expect("MSI IRQ result registers should be captured");
+        assert_eq!(
+            registers.general_purpose_register(0),
+            Some(u64::from(interrupt.raw_value()))
+        );
+
+        runner
+            .shutdown()
+            .expect("MSI guest runner should shut down");
+    }
+    drop(signaler);
+    backend
+        .destroy_vm()
+        .expect("MSI guest VM should be destroyed");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

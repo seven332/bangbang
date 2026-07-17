@@ -10,7 +10,10 @@ use crate::dirty::{
     HvfDirtyWriteEpochResetError, HvfDirtyWriteTracker, HvfDirtyWriteTrackerStartError,
     HvfDirtyWriteTrackerStopError,
 };
-use crate::gic::{HvfGicCreator, HvfGicError, HvfGicMetadata, RealHvfGicCreator};
+use crate::gic::{
+    HvfGicCreator, HvfGicError, HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiSignaler,
+    RealHvfGicCreator,
+};
 use crate::memory::{
     HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping, HvfMemoryMapper,
     HvfMemoryPermissions, HvfPmemFlushExecutor, HvfVirtioMemMutationExecutor, RealHvfMemoryMapper,
@@ -35,6 +38,7 @@ pub struct HvfBackend {
     vm_created: bool,
     guest_memory: Option<HvfGuestMemoryMapping>,
     gic: Option<HvfGicMetadata>,
+    gic_msi_signaler: Option<HvfGicMsiSignaler>,
     vcpu_topology_started: bool,
     memory_mapper: Arc<dyn HvfMemoryMapper>,
     gic_creator: Arc<dyn HvfGicCreator>,
@@ -46,6 +50,7 @@ impl Default for HvfBackend {
             vm_created: false,
             guest_memory: None,
             gic: None,
+            gic_msi_signaler: None,
             vcpu_topology_started: false,
             memory_mapper: Arc::new(RealHvfMemoryMapper),
             gic_creator: Arc::new(RealHvfGicCreator),
@@ -253,11 +258,33 @@ impl HvfBackend {
             ));
         }
 
-        self.create_gic_with_configured_creator()
+        self.create_gic_with_configured_creator(None)
+    }
+
+    /// Create a GIC with one demand-sized, message-only SPI range.
+    ///
+    /// The ordinary [`Self::create_gic`] path remains MSI-free. Callers must
+    /// select this before creating any vCPU.
+    pub fn create_gic_with_msi(
+        &mut self,
+        configuration: HvfGicMsiConfiguration,
+    ) -> Result<&HvfGicMetadata, HvfGicError> {
+        if !Self::is_supported_target() {
+            return Err(HvfGicError::Unsupported(
+                crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+            ));
+        }
+
+        self.create_gic_with_configured_creator(Some(configuration))
     }
 
     pub fn gic_metadata(&self) -> Option<&HvfGicMetadata> {
         self.gic.as_ref()
+    }
+
+    /// Return the send-only MSI capability retained by an MSI-enabled GIC.
+    pub fn gic_msi_signaler(&self) -> Option<&HvfGicMsiSignaler> {
+        self.gic_msi_signaler.as_ref()
     }
 
     pub(crate) const fn has_created_vm(&self) -> bool {
@@ -401,7 +428,10 @@ impl HvfBackend {
         Ok(())
     }
 
-    fn create_gic_with_configured_creator(&mut self) -> Result<&HvfGicMetadata, HvfGicError> {
+    fn create_gic_with_configured_creator(
+        &mut self,
+        msi: Option<HvfGicMsiConfiguration>,
+    ) -> Result<&HvfGicMetadata, HvfGicError> {
         if !self.vm_created {
             return Err(HvfGicError::InvalidState(VM_NOT_CREATED_FOR_GIC_MESSAGE));
         }
@@ -416,8 +446,17 @@ impl HvfBackend {
             ));
         }
 
-        let metadata = self.gic_creator.create_gic()?;
-        self.gic = Some(metadata);
+        let requested_msi = msi.is_some();
+        let created = self.gic_creator.create_gic(msi)?;
+        if created.metadata.msi.is_some() != requested_msi
+            || created.msi_signaler.is_some() != requested_msi
+        {
+            return Err(HvfGicError::InvalidState(
+                "GIC MSI request, metadata, and send capability disagree",
+            ));
+        }
+        self.gic = Some(created.metadata);
+        self.gic_msi_signaler = created.msi_signaler;
 
         self.gic
             .as_ref()
@@ -425,7 +464,11 @@ impl HvfBackend {
     }
 
     fn clear_vm_owned_state(&mut self) {
+        if let Some(signaler) = &self.gic_msi_signaler {
+            signaler.deactivate();
+        }
         self.gic = None;
+        self.gic_msi_signaler = None;
         self.vcpu_topology_started = false;
     }
 
@@ -499,6 +542,7 @@ impl HvfBackend {
             vm_created: false,
             guest_memory: None,
             gic: None,
+            gic_msi_signaler: None,
             vcpu_topology_started: false,
             memory_mapper,
             gic_creator: Arc::new(RealHvfGicCreator),
@@ -511,6 +555,7 @@ impl HvfBackend {
             vm_created: false,
             guest_memory: None,
             gic: None,
+            gic_msi_signaler: None,
             vcpu_topology_started: false,
             memory_mapper: Arc::new(RealHvfMemoryMapper),
             gic_creator,
@@ -736,6 +781,9 @@ impl VmBackend for HvfBackend {
 
     fn destroy_vm(&mut self) -> Result<(), BackendError> {
         if self.vm_created {
+            if let Some(signaler) = &self.gic_msi_signaler {
+                signaler.deactivate();
+            }
             self.unmap_guest_memory()
                 .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
             crate::ffi::destroy_vm()?;
@@ -751,6 +799,9 @@ impl Drop for HvfBackend {
         if self.vm_created {
             let mut mapping_after_failed_unmap = None;
 
+            if let Some(signaler) = &self.gic_msi_signaler {
+                signaler.deactivate();
+            }
             if let Some(mut mapping) = self.guest_memory.take()
                 && mapping.unmap_all().is_err()
                 && mapping.has_mapped_regions()
@@ -771,6 +822,7 @@ impl Drop for HvfBackend {
 #[cfg(test)]
 mod tests {
     use std::io::{Seek, SeekFrom, Write};
+    use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -831,6 +883,26 @@ mod tests {
                 el1_physical_timer_intid: 30,
             },
             msi: None,
+        }
+    }
+
+    fn gic_metadata_with_msi() -> crate::gic::HvfGicMetadata {
+        crate::gic::HvfGicMetadata {
+            spi_interrupt_range: crate::gic::HvfGicInterruptRange {
+                base: 32,
+                count: 95,
+            },
+            msi: Some(crate::gic::HvfGicMsiMetadata {
+                region: crate::gic::HvfGicRegion {
+                    base: 0x3ffc_0000,
+                    size: 0x1_0000,
+                },
+                interrupt_range: crate::gic::HvfGicInterruptRange {
+                    base: 127,
+                    count: 1,
+                },
+            }),
+            ..gic_metadata()
         }
     }
 
@@ -1071,7 +1143,7 @@ mod tests {
         let mut backend = HvfBackend::new_with_gic_creator(creator.clone());
 
         assert_eq!(
-            backend.create_gic_with_configured_creator(),
+            backend.create_gic_with_configured_creator(None),
             Err(crate::gic::HvfGicError::InvalidState(
                 super::VM_NOT_CREATED_FOR_GIC_MESSAGE
             ))
@@ -1087,17 +1159,57 @@ mod tests {
         backend.vm_created = true;
 
         assert_eq!(
-            backend.create_gic_with_configured_creator(),
+            backend.create_gic_with_configured_creator(None),
             Ok(&gic_metadata())
         );
         assert_eq!(
-            backend.create_gic_with_configured_creator(),
+            backend.create_gic_with_configured_creator(None),
             Err(crate::gic::HvfGicError::InvalidState(
                 super::GIC_ALREADY_CREATED_MESSAGE
             ))
         );
         assert_eq!(creator.create_count(), 1);
         assert_eq!(backend.gic_metadata(), Some(&gic_metadata()));
+    }
+
+    #[test]
+    fn explicit_msi_configuration_is_forwarded_once_to_the_creator() {
+        let expected_metadata = gic_metadata_with_msi();
+        let creator = Arc::new(RecordingGicCreator::with_msi_metadata(expected_metadata));
+        let mut backend = HvfBackend::new_with_gic_creator(creator.clone());
+        backend.vm_created = true;
+        let configuration = crate::gic::HvfGicMsiConfiguration::new(
+            NonZeroU32::new(8).expect("test MSI count should be nonzero"),
+        );
+
+        assert_eq!(
+            backend.create_gic_with_configured_creator(Some(configuration)),
+            Ok(&expected_metadata)
+        );
+        assert_eq!(creator.requests(), vec![Some(configuration)]);
+        assert_eq!(creator.create_count(), 1);
+        assert_eq!(backend.gic_metadata(), Some(&expected_metadata));
+        assert!(backend.gic_msi_signaler().is_some());
+    }
+
+    #[test]
+    fn inconsistent_msi_creator_result_is_not_published() {
+        let creator = Arc::new(RecordingGicCreator::with_metadata(gic_metadata()));
+        let mut backend = HvfBackend::new_with_gic_creator(creator.clone());
+        backend.vm_created = true;
+        let configuration = crate::gic::HvfGicMsiConfiguration::new(
+            NonZeroU32::new(1).expect("test MSI count should be nonzero"),
+        );
+
+        assert_eq!(
+            backend.create_gic_with_configured_creator(Some(configuration)),
+            Err(crate::gic::HvfGicError::InvalidState(
+                "GIC MSI request, metadata, and send capability disagree"
+            ))
+        );
+        assert_eq!(creator.requests(), vec![Some(configuration)]);
+        assert_eq!(backend.gic_metadata(), None);
+        assert!(backend.gic_msi_signaler().is_none());
     }
 
     #[test]
@@ -1111,7 +1223,7 @@ mod tests {
         backend.vm_created = true;
 
         assert_eq!(
-            backend.create_gic_with_configured_creator(),
+            backend.create_gic_with_configured_creator(None),
             Err(crate::gic::HvfGicError::Backend(BackendError::Hypervisor(
                 "injected GIC failure".to_string()
             )))
@@ -1128,7 +1240,7 @@ mod tests {
         backend.vcpu_topology_started = true;
 
         assert_eq!(
-            backend.create_gic_with_configured_creator(),
+            backend.create_gic_with_configured_creator(None),
             Err(crate::gic::HvfGicError::InvalidState(
                 super::VCPU_TOPOLOGY_ALREADY_STARTED_MESSAGE
             ))
@@ -1140,13 +1252,30 @@ mod tests {
     #[test]
     fn clearing_vm_owned_state_removes_gic_metadata_and_topology_flag() {
         let mut backend = HvfBackend::new();
-        backend.gic = Some(gic_metadata());
+        let metadata = gic_metadata_with_msi();
+        backend.gic = Some(metadata);
+        let signaler = crate::gic::HvfGicMsiSignaler::for_backend_test(
+            metadata.msi.expect("test MSI metadata should exist"),
+        );
+        let retained_signaler = signaler.clone();
+        let interrupt = signaler
+            .allocator()
+            .allocate()
+            .expect("test MSI should allocate");
+        backend.gic_msi_signaler = Some(signaler);
         backend.vcpu_topology_started = true;
 
         backend.clear_vm_owned_state();
 
         assert_eq!(backend.gic_metadata(), None);
+        assert!(backend.gic_msi_signaler().is_none());
         assert!(!backend.vcpu_topology_started);
+        assert_eq!(
+            retained_signaler
+                .send(&interrupt)
+                .expect_err("cleared VM state should revoke retained MSI clones"),
+            crate::gic::HvfGicMsiSignalError::InvalidState("HVF GIC MSI signaler is inactive")
+        );
     }
 
     #[test]
@@ -1878,21 +2007,36 @@ mod tests {
     #[derive(Debug)]
     struct RecordingGicCreator {
         result: Result<crate::gic::HvfGicMetadata, crate::gic::HvfGicError>,
+        publish_signaler: bool,
         create_count: Mutex<usize>,
+        requests: Mutex<Vec<Option<crate::gic::HvfGicMsiConfiguration>>>,
     }
 
     impl RecordingGicCreator {
         fn with_metadata(metadata: crate::gic::HvfGicMetadata) -> Self {
             Self {
                 result: Ok(metadata),
+                publish_signaler: false,
                 create_count: Mutex::new(0),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_msi_metadata(metadata: crate::gic::HvfGicMetadata) -> Self {
+            Self {
+                result: Ok(metadata),
+                publish_signaler: true,
+                create_count: Mutex::new(0),
+                requests: Mutex::new(Vec::new()),
             }
         }
 
         fn with_error(error: crate::gic::HvfGicError) -> Self {
             Self {
                 result: Err(error),
+                publish_signaler: false,
                 create_count: Mutex::new(0),
+                requests: Mutex::new(Vec::new()),
             }
         }
 
@@ -1902,15 +2046,38 @@ mod tests {
                 .lock()
                 .expect("create count lock should not be poisoned")
         }
+
+        fn requests(&self) -> Vec<Option<crate::gic::HvfGicMsiConfiguration>> {
+            self.requests
+                .lock()
+                .expect("GIC request lock should not be poisoned")
+                .clone()
+        }
     }
 
     impl crate::gic::HvfGicCreator for RecordingGicCreator {
-        fn create_gic(&self) -> Result<crate::gic::HvfGicMetadata, crate::gic::HvfGicError> {
+        fn create_gic(
+            &self,
+            msi: Option<crate::gic::HvfGicMsiConfiguration>,
+        ) -> Result<crate::gic::CreatedHvfGic, crate::gic::HvfGicError> {
             *self
                 .create_count
                 .lock()
                 .expect("create count lock should not be poisoned") += 1;
-            self.result.clone()
+            self.requests
+                .lock()
+                .expect("GIC request lock should not be poisoned")
+                .push(msi);
+            self.result
+                .clone()
+                .map(|metadata| crate::gic::CreatedHvfGic {
+                    msi_signaler: self.publish_signaler.then(|| {
+                        crate::gic::HvfGicMsiSignaler::for_backend_test(
+                            metadata.msi.expect("test MSI metadata should exist"),
+                        )
+                    }),
+                    metadata,
+                })
         }
     }
 }
