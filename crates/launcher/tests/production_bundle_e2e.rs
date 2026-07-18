@@ -157,6 +157,7 @@ const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 const PROCESS_FAILURE_EXIT_CODE: i32 = 1;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
 fn production_bundle() -> PathBuf {
@@ -4359,8 +4360,30 @@ impl RunningApiLauncher {
 impl Drop for RunningApiLauncher {
     fn drop(&mut self) {
         if !self.completed {
-            kill_child_group(&mut self.child);
-            let _ = self.child.wait();
+            let pid = i32::try_from(self.child.id()).expect("launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this PID. Give it a bounded
+            // chance to cancel and reap its worker so namespace cleanup runs.
+            let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+            let deadline = Instant::now() + DROP_CLEANUP_TIMEOUT;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) | Err(_) => {
+                        kill_child_group(&mut self.child);
+                        let _ = self.child.wait();
+                        break;
+                    }
+                }
+            }
+            if let Some(reader) = self.stdout_reader.take() {
+                let _ = reader.join();
+            }
+            if let Some(reader) = self.stderr_reader.take() {
+                let _ = reader.join();
+            }
         }
     }
 }
