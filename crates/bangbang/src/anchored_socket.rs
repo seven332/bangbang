@@ -1235,6 +1235,26 @@ struct OwnedHelper {
     reaped: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperExitRegistrationRecovery {
+    Reaped(i32),
+    ReapBlocking,
+    Error(io::ErrorKind),
+}
+
+fn helper_exit_registration_recovery(
+    error: &io::Error,
+    reaped: Option<i32>,
+) -> HelperExitRegistrationRecovery {
+    match reaped {
+        Some(status) => HelperExitRegistrationRecovery::Reaped(status),
+        None if error.raw_os_error() == Some(libc::ESRCH) => {
+            HelperExitRegistrationRecovery::ReapBlocking
+        }
+        None => HelperExitRegistrationRecovery::Error(error.kind()),
+    }
+}
+
 impl OwnedHelper {
     const fn new(pid: libc::pid_t) -> Self {
         Self { pid, reaped: false }
@@ -1279,10 +1299,13 @@ impl OwnedHelper {
             )
         } != 0
         {
-            let error = io::Error::last_os_error().kind();
-            return match self.try_reap()? {
-                Some(status) => helper_status(status),
-                None => Err(AnchoredSocketError::Io(error)),
+            let error = io::Error::last_os_error();
+            return match helper_exit_registration_recovery(&error, self.try_reap()?) {
+                HelperExitRegistrationRecovery::Reaped(status) => helper_status(status),
+                HelperExitRegistrationRecovery::ReapBlocking => {
+                    helper_status(self.reap_blocking()?)
+                }
+                HelperExitRegistrationRecovery::Error(kind) => Err(AnchoredSocketError::Io(kind)),
             };
         }
 
@@ -1323,7 +1346,7 @@ impl OwnedHelper {
             {
                 return Err(AnchoredSocketError::Binder);
             }
-            return helper_status(self.reap_after_exit()?);
+            return helper_status(self.reap_blocking()?);
         }
     }
 
@@ -1346,11 +1369,11 @@ impl OwnedHelper {
         }
     }
 
-    fn reap_after_exit(&mut self) -> Result<i32, AnchoredSocketError> {
+    fn reap_blocking(&mut self) -> Result<i32, AnchoredSocketError> {
         loop {
             let mut status = 0;
-            // SAFETY: NOTE_EXIT established that this owned child exited;
-            // `status` remains writable while it is synchronously reaped.
+            // SAFETY: NOTE_EXIT or an ESRCH registration race established that
+            // this owned child exited; status is writable for the blocking reap.
             let result = unsafe { libc::waitpid(self.pid, &raw mut status, 0) };
             if result == self.pid {
                 self.reaped = true;
@@ -1544,6 +1567,25 @@ mod tests {
         assert_eq!(
             AnchoredSocketError::Invalid.to_string(),
             "private anchored socket operation failed"
+        );
+    }
+
+    #[test]
+    fn missing_fast_helper_registration_falls_back_to_blocking_reap() {
+        let missing = io::Error::from_raw_os_error(libc::ESRCH);
+        assert_eq!(
+            helper_exit_registration_recovery(&missing, None),
+            HelperExitRegistrationRecovery::ReapBlocking
+        );
+        assert_eq!(
+            helper_exit_registration_recovery(&missing, Some(0)),
+            HelperExitRegistrationRecovery::Reaped(0)
+        );
+
+        let invalid = io::Error::from_raw_os_error(libc::EINVAL);
+        assert_eq!(
+            helper_exit_registration_recovery(&invalid, None),
+            HelperExitRegistrationRecovery::Error(io::ErrorKind::InvalidInput)
         );
     }
 }
