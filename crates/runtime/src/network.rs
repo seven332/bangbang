@@ -5,7 +5,6 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
 };
@@ -3005,22 +3004,12 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
                 drained_notifications,
                 tx_sink,
             );
-        let needs_queue_interrupt = match &dispatch {
-            Ok(dispatch) => dispatch.needs_queue_interrupt(),
-            Err(error) => {
-                error
-                    .completed_tx_dispatch()
-                    .is_some_and(VirtioNetworkTxQueueDispatch::needs_queue_interrupt)
-                    || error
-                        .completed_initial_rx_dispatch()
-                        .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
-                    || error
-                        .completed_rx_dispatch()
-                        .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
-            }
-        };
-        if needs_queue_interrupt {
-            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        let (rx_interrupt, tx_interrupt) = network_queue_interrupts(&dispatch);
+        if rx_interrupt && let Ok(queue_index) = u16::try_from(VIRTIO_NET_RX_QUEUE_INDEX) {
+            self.mark_queue_interrupt_pending(queue_index);
+        }
+        if tx_interrupt && let Ok(queue_index) = u16::try_from(VIRTIO_NET_TX_QUEUE_INDEX) {
+            self.mark_queue_interrupt_pending(queue_index);
         }
 
         dispatch
@@ -3041,25 +3030,47 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
                 tx_sink,
                 rx_source,
             );
-        let needs_queue_interrupt = match &dispatch {
-            Ok(dispatch) => dispatch.needs_queue_interrupt(),
-            Err(error) => {
-                error
-                    .completed_tx_dispatch()
-                    .is_some_and(VirtioNetworkTxQueueDispatch::needs_queue_interrupt)
-                    || error
-                        .completed_initial_rx_dispatch()
-                        .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
-                    || error
-                        .completed_rx_dispatch()
-                        .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
-            }
-        };
-        if needs_queue_interrupt {
-            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        let (rx_interrupt, tx_interrupt) = network_queue_interrupts(&dispatch);
+        if rx_interrupt && let Ok(queue_index) = u16::try_from(VIRTIO_NET_RX_QUEUE_INDEX) {
+            self.mark_queue_interrupt_pending(queue_index);
+        }
+        if tx_interrupt && let Ok(queue_index) = u16::try_from(VIRTIO_NET_TX_QUEUE_INDEX) {
+            self.mark_queue_interrupt_pending(queue_index);
         }
 
         dispatch
+    }
+}
+
+fn network_queue_interrupts(
+    dispatch: &Result<
+        VirtioNetworkDeviceNotificationDispatch,
+        VirtioNetworkDeviceNotificationError,
+    >,
+) -> (bool, bool) {
+    match dispatch {
+        Ok(dispatch) => (
+            dispatch
+                .rx_queue_dispatch()
+                .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
+                || dispatch
+                    .post_tx_rx_queue_dispatch()
+                    .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt),
+            dispatch
+                .tx_queue_dispatch()
+                .is_some_and(VirtioNetworkTxQueueDispatch::needs_queue_interrupt),
+        ),
+        Err(error) => (
+            error
+                .completed_initial_rx_dispatch()
+                .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
+                || error
+                    .completed_rx_dispatch()
+                    .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt),
+            error
+                .completed_tx_dispatch()
+                .is_some_and(VirtioNetworkTxQueueDispatch::needs_queue_interrupt),
+        ),
     }
 }
 

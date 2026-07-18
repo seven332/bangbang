@@ -19,7 +19,11 @@ use bangbang_runtime::boot::BootSourceFiles;
 use bangbang_runtime::boot_timer::{
     BootTimerMmioLayout, BootTimerMmioRegistrationError, register_boot_timer_mmio,
 };
-use bangbang_runtime::entropy::{EntropyMmioLayout, VirtioRngOsEntropySource};
+use bangbang_runtime::entropy::{
+    EntropyMmioLayout, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_QUEUE_SIZES, VirtioRngDevice,
+    VirtioRngDeviceNotificationError, VirtioRngEntropySource, VirtioRngEntropySourceError,
+    VirtioRngOsEntropySource,
+};
 use bangbang_runtime::fdt::{Arm64FdtCacheHierarchy, Arm64FdtError};
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
@@ -34,8 +38,9 @@ use bangbang_runtime::metrics::{
     SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
     SharedVsockDeviceMetrics,
 };
-use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
+use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
+use bangbang_runtime::pci::{PCI_FIRST_ENDPOINT_DEVICE, PciClassCode, PciType0Configuration};
 use bangbang_runtime::pmem::{PmemMmioDeviceRegistration, PmemMmioLayout, VirtioPmemFlushStatus};
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{SerialConfig, SharedSerialOutput, SharedSerialOutputBuffer};
@@ -63,6 +68,15 @@ use bangbang_runtime::startup::{
     memory_hotplug_status_for_device, replace_arm64_boot_vmgenid,
     update_memory_hotplug_config_for_device,
 };
+use bangbang_runtime::virtio::{
+    UnsupportedVirtioDeviceConfig, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioDeviceActivation,
+    VirtioDeviceActivationError, VirtioDeviceActivationHandler, VirtioDeviceResetError,
+    VirtioDeviceResetOutcome, VirtioDeviceType, VirtioDeviceTypeError, VirtioInterruptIntent,
+};
+use bangbang_runtime::virtio_pci::{
+    PublishedVirtioPciEndpoint, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciDiagnostics,
+    VirtioPciEndpointError, VirtioPciEndpointPhase, VirtioPciIdentity, VirtioPciPublicationError,
+};
 use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
@@ -71,8 +85,9 @@ use crate::coordinator::{HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuR
 use crate::dirty::{HvfDirtyWriteEpochResetError, HvfDirtyWriteTrackerStartError};
 use crate::gic::{
     HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator,
-    HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiSignaler, HvfGicSpiSignalError,
-    HvfGicSpiSignaler, HvfInterruptLineAllocationError,
+    HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiDeviceInterruptResourceError,
+    HvfGicMsiDeviceInterruptResources, HvfGicMsiSignaler, HvfGicSpiSignalError, HvfGicSpiSignaler,
+    HvfInterruptLineAllocationError,
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions, HvfPmemFlushExecutor};
 use crate::psci::PsciCpuPowerCoordinator;
@@ -114,6 +129,9 @@ const NETWORK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME: &str = "bangbang-hvf-network-r
 const VSOCK_WAKEUP_MONITOR_THREAD_NAME: &str = "bangbang-hvf-vsock-wakeup";
 const VSOCK_WAKEUP_MONITOR_STOP_BYTE: [u8; 1] = [0];
 const POLL_FOREVER: libc::c_int = -1;
+const PCI_VALIDATION_VIRTIO_RNG_BAR_REGION_ID: MmioRegionId = MmioRegionId::new(4001);
+const PCI_VALIDATION_VIRTIO_RNG_VECTOR_COUNT: usize = 2;
+const PCI_VALIDATION_VIRTIO_RNG_ENTROPY_BYTE: u8 = 0xa5;
 
 #[derive(Debug, Clone)]
 pub struct HvfArm64BootSessionConfig {
@@ -299,12 +317,476 @@ impl HvfArm64BootSerialDeviceConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SharedPciValidationVirtioRngDevice {
+    inner: Arc<Mutex<VirtioRngDevice>>,
+}
+
+impl SharedPciValidationVirtioRngDevice {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VirtioRngDevice::new())),
+        }
+    }
+
+    fn dispatch(
+        &self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+    ) -> Result<
+        bangbang_runtime::entropy::VirtioRngDeviceNotificationDispatch,
+        HvfArm64BootPciValidationError,
+    > {
+        let mut device = self
+            .inner
+            .lock()
+            .map_err(|_| HvfArm64BootPciValidationError::DeviceStatePoisoned)?;
+        let mut source = PciValidationVirtioRngEntropySource;
+        device
+            .dispatch_drained_queue_notifications(memory, drained_notifications, &mut source)
+            .map_err(|source| HvfArm64BootPciValidationError::Dispatch { source })
+    }
+}
+
+impl VirtioDeviceActivationHandler for SharedPciValidationVirtioRngDevice {
+    fn activate(
+        &mut self,
+        activation: VirtioDeviceActivation<'_>,
+    ) -> Result<(), VirtioDeviceActivationError> {
+        self.inner
+            .lock()
+            .map_err(|_| MmioHandlerError::new("PCI validation virtio-rng state is unavailable"))?
+            .activate_rng(activation)
+            .map_err(|source| MmioHandlerError::new(source.to_string()).into())
+    }
+
+    fn reset(&mut self) {
+        if let Ok(mut device) = self.inner.lock() {
+            device.reset();
+        }
+    }
+
+    fn reset_outcome(&mut self) -> Result<VirtioDeviceResetOutcome, VirtioDeviceResetError> {
+        self.inner
+            .lock()
+            .map_err(|_| MmioHandlerError::new("PCI validation virtio-rng state is unavailable"))?
+            .reset();
+        Ok(VirtioDeviceResetOutcome::Reset)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PciValidationVirtioRngEntropySource;
+
+impl VirtioRngEntropySource for PciValidationVirtioRngEntropySource {
+    fn fill_entropy(&mut self, destination: &mut [u8]) -> Result<(), VirtioRngEntropySourceError> {
+        destination.fill(PCI_VALIDATION_VIRTIO_RNG_ENTROPY_BYTE);
+        Ok(())
+    }
+}
+
+type PublishedPciValidationVirtioRng = PublishedVirtioPciEndpoint<
+    UnsupportedVirtioDeviceConfig,
+    SharedPciValidationVirtioRngDevice,
+    HvfGicMsiDeviceInterruptResources,
+>;
+
+#[derive(Debug)]
+struct HvfArm64BootPciValidationEndpoint {
+    published: PublishedPciValidationVirtioRng,
+    device: SharedPciValidationVirtioRngDevice,
+    queue_deliveries: usize,
+    config_deliveries: usize,
+    config_interrupt_triggered: bool,
+}
+
+impl HvfArm64BootPciValidationEndpoint {
+    fn dispatch(&mut self, memory: &mut GuestMemory) -> Result<(), HvfArm64BootPciValidationError> {
+        let work = self
+            .published
+            .endpoint()
+            .admit_device_work()
+            .map_err(|source| HvfArm64BootPciValidationError::Endpoint { source })?;
+        let drained = work
+            .take_pending_queue_notifications()
+            .map_err(|source| HvfArm64BootPciValidationError::Endpoint { source })?;
+        if drained.is_empty() {
+            return Ok(());
+        }
+        let dispatch = self.device.dispatch(memory, drained)?;
+        if !dispatch.needs_queue_interrupt() {
+            return Ok(());
+        }
+
+        let diagnostics = self
+            .published
+            .endpoint()
+            .diagnostics()
+            .map_err(|source| HvfArm64BootPciValidationError::Endpoint { source })?;
+        let queue_vector = diagnostics
+            .queue_vectors
+            .first()
+            .copied()
+            .flatten()
+            .ok_or(HvfArm64BootPciValidationError::MissingQueueVector)?;
+        let config_vector = diagnostics
+            .config_vector
+            .ok_or(HvfArm64BootPciValidationError::MissingConfigVector)?;
+        if queue_vector == config_vector {
+            return Err(HvfArm64BootPciValidationError::SharedQueueAndConfigVector);
+        }
+
+        work.trigger(VirtioInterruptIntent::Queue { queue_index: 0 })
+            .map_err(|source| HvfArm64BootPciValidationError::Endpoint { source })?;
+        self.queue_deliveries = self
+            .queue_deliveries
+            .checked_add(1)
+            .ok_or(HvfArm64BootPciValidationError::DeliveryCountOverflow)?;
+        Ok(())
+    }
+
+    fn trigger_config_once(&mut self) -> Result<(), HvfArm64BootPciValidationError> {
+        if self.config_interrupt_triggered {
+            return Ok(());
+        }
+        let work = self
+            .published
+            .endpoint()
+            .admit_device_work()
+            .map_err(|source| HvfArm64BootPciValidationError::Endpoint { source })?;
+        let diagnostics = self
+            .published
+            .endpoint()
+            .diagnostics()
+            .map_err(|source| HvfArm64BootPciValidationError::Endpoint { source })?;
+        let queue_vector = diagnostics
+            .queue_vectors
+            .first()
+            .copied()
+            .flatten()
+            .ok_or(HvfArm64BootPciValidationError::MissingQueueVector)?;
+        let config_vector = diagnostics
+            .config_vector
+            .ok_or(HvfArm64BootPciValidationError::MissingConfigVector)?;
+        if queue_vector == config_vector {
+            return Err(HvfArm64BootPciValidationError::SharedQueueAndConfigVector);
+        }
+        work.increment_config_generation_and_trigger()
+            .map_err(|source| HvfArm64BootPciValidationError::Endpoint { source })?;
+        self.config_interrupt_triggered = true;
+        self.config_deliveries = self
+            .config_deliveries
+            .checked_add(1)
+            .ok_or(HvfArm64BootPciValidationError::DeliveryCountOverflow)?;
+        Ok(())
+    }
+
+    fn diagnostics(
+        &self,
+    ) -> Result<HvfArm64BootPciValidationDiagnostics, HvfArm64BootPciValidationError> {
+        Ok(HvfArm64BootPciValidationDiagnostics {
+            transport: self
+                .published
+                .endpoint()
+                .diagnostics()
+                .map_err(|source| HvfArm64BootPciValidationError::Endpoint { source })?,
+            queue_deliveries: self.queue_deliveries,
+            config_deliveries: self.config_deliveries,
+        })
+    }
+}
+
+fn dispatch_pci_validation_notifications(
+    backend: &mut HvfBackend,
+    endpoint: Option<&mut HvfArm64BootPciValidationEndpoint>,
+) -> Result<(), HvfArm64BootPciValidationError> {
+    let Some(endpoint) = endpoint else {
+        return Ok(());
+    };
+    let memory = backend
+        .mapped_guest_memory_mut()
+        .map_err(|source| HvfArm64BootPciValidationError::GuestMemory { source })?;
+    endpoint.dispatch(memory)
+}
+
+fn trigger_pci_validation_config_interrupt(
+    endpoint: Option<&mut HvfArm64BootPciValidationEndpoint>,
+) -> Result<(), HvfArm64BootPciValidationError> {
+    match endpoint {
+        Some(endpoint) => endpoint.trigger_config_once(),
+        None => Ok(()),
+    }
+}
+
+fn teardown_pci_validation_endpoint_and_verify_reuse(
+    endpoint_slot: &mut Option<HvfArm64BootPciValidationEndpoint>,
+    runtime: &mut Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    signaler: Option<HvfGicMsiSignaler>,
+) -> Result<Option<HvfArm64BootPciValidationTeardownEvidence>, HvfArm64BootPciValidationTeardownError>
+{
+    let Some(mut endpoint) = endpoint_slot.take() else {
+        return Ok(None);
+    };
+
+    let result = (|| {
+        let validation = runtime.pci_validation.as_mut().ok_or_else(|| {
+            HvfArm64BootPciValidationTeardownError::new(
+                "PCI validation runtime resources are unavailable",
+            )
+        })?;
+        let segment = validation.segment().clone();
+        let old_bar = endpoint.published.bar_range().ok_or_else(|| {
+            HvfArm64BootPciValidationTeardownError::new(
+                "PCI validation endpoint no longer owns its BAR before teardown",
+            )
+        })?;
+        let mut dispatcher = dispatcher.lock().map_err(|_| {
+            HvfArm64BootPciValidationTeardownError::new(
+                "PCI validation MMIO dispatcher state is unavailable",
+            )
+        })?;
+        endpoint
+            .published
+            .teardown(&mut dispatcher, validation.bar_allocator_mut())
+            .map_err(|source| {
+                HvfArm64BootPciValidationTeardownError::new(format!(
+                    "PCI validation endpoint teardown failed: {source}"
+                ))
+            })?;
+
+        let endpoint_released = endpoint.published.endpoint().phase().map_err(|source| {
+            HvfArm64BootPciValidationTeardownError::new(format!(
+                "PCI validation endpoint phase is unavailable: {source}"
+            ))
+        })? == VirtioPciEndpointPhase::Released;
+        let stale_endpoint_rejected = matches!(
+            endpoint
+                .published
+                .endpoint()
+                .trigger(VirtioInterruptIntent::Queue { queue_index: 0 }),
+            Err(VirtioPciEndpointError::NotActive {
+                phase: VirtioPciEndpointPhase::Released
+            })
+        );
+        let guest_bar_unpublished = dispatcher.lookup(old_bar.start(), 4).is_err();
+
+        let replacement_bar = validation
+            .bar_allocator_mut()
+            .allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+            .map_err(|source| {
+                HvfArm64BootPciValidationTeardownError::new(format!(
+                    "PCI validation BAR reuse failed: {source}"
+                ))
+            })?;
+        let bar_range_reused = replacement_bar.range() == old_bar;
+        validation
+            .bar_allocator_mut()
+            .release(&replacement_bar)
+            .map_err(|source| {
+                HvfArm64BootPciValidationTeardownError::new(format!(
+                    "PCI validation replacement BAR release failed: {source}"
+                ))
+            })?;
+
+        let replacement_function =
+            PciType0Configuration::new(0x0042, 0, 0, PciClassCode::Unclassified, 0, 0, 0x0042, 0);
+        let replacement_lease = segment
+            .with_segment(|segment| segment.add_function(replacement_function))
+            .map_err(|source| {
+                HvfArm64BootPciValidationTeardownError::new(format!(
+                    "PCI validation segment lock failed during reuse: {source}"
+                ))
+            })?
+            .map_err(|source| {
+                HvfArm64BootPciValidationTeardownError::new(format!(
+                    "PCI validation slot reuse failed: {source}"
+                ))
+            })?;
+        let pci_slot_reused = replacement_lease.sbdf().device() == PCI_FIRST_ENDPOINT_DEVICE;
+        segment
+            .with_segment(|segment| segment.remove_function(&replacement_lease))
+            .map_err(|source| {
+                HvfArm64BootPciValidationTeardownError::new(format!(
+                    "PCI validation segment lock failed during replacement release: {source}"
+                ))
+            })?
+            .map_err(|source| {
+                HvfArm64BootPciValidationTeardownError::new(format!(
+                    "PCI validation replacement slot release failed: {source}"
+                ))
+            })?;
+
+        let signaler = signaler.ok_or_else(|| {
+            HvfArm64BootPciValidationTeardownError::new(
+                "PCI validation MSI signal capability is unavailable during teardown",
+            )
+        })?;
+        let allocator = signaler.allocator();
+        let replacements = allocator
+            .allocate_many(PCI_VALIDATION_VIRTIO_RNG_VECTOR_COUNT)
+            .map_err(|source| {
+                HvfArm64BootPciValidationTeardownError::new(format!(
+                    "PCI validation message-vector reuse failed: {source}"
+                ))
+            })?;
+        let message_vectors_reused = replacements.len() == PCI_VALIDATION_VIRTIO_RNG_VECTOR_COUNT;
+        allocator.release_many(&replacements).map_err(|source| {
+            HvfArm64BootPciValidationTeardownError::new(format!(
+                "PCI validation replacement message-vector release failed: {source}"
+            ))
+        })?;
+
+        let evidence = HvfArm64BootPciValidationTeardownEvidence {
+            endpoint_released,
+            guest_bar_unpublished,
+            pci_slot_reused,
+            bar_range_reused,
+            message_vectors_reused,
+            stale_endpoint_rejected,
+        };
+        if !endpoint_released
+            || !guest_bar_unpublished
+            || !pci_slot_reused
+            || !bar_range_reused
+            || !message_vectors_reused
+            || !stale_endpoint_rejected
+        {
+            return Err(HvfArm64BootPciValidationTeardownError::new(
+                "PCI validation teardown reuse evidence was incomplete",
+            ));
+        }
+        Ok(evidence)
+    })();
+
+    match result {
+        Ok(evidence) => Ok(Some(evidence)),
+        Err(error) => {
+            // A partially completed publication teardown retains its remaining
+            // leases and is safe to retry. Once teardown itself completed,
+            // however, reinserting the released endpoint would make a later
+            // shutdown retry fail before it can make progress because its BAR
+            // lease is intentionally gone.
+            if !endpoint.published.is_released() {
+                *endpoint_slot = Some(endpoint);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Redacted evidence retained by the internal signed modern virtio-pci proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64BootPciValidationDiagnostics {
+    pub transport: VirtioPciDiagnostics,
+    pub queue_deliveries: usize,
+    pub config_deliveries: usize,
+}
+
+/// Completion evidence for the internal PCI endpoint's normative teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64BootPciValidationTeardownEvidence {
+    pub endpoint_released: bool,
+    pub guest_bar_unpublished: bool,
+    pub pci_slot_reused: bool,
+    pub bar_range_reused: bool,
+    pub message_vectors_reused: bool,
+    pub stale_endpoint_rejected: bool,
+}
+
+/// Value-redacted failure while tearing down the internal PCI proof endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64BootPciValidationTeardownError {
+    message: String,
+}
+
+impl HvfArm64BootPciValidationTeardownError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for HvfArm64BootPciValidationTeardownError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HvfArm64BootPciValidationTeardownError {}
+
+#[derive(Debug)]
+pub enum HvfArm64BootPciValidationError {
+    DeviceStatePoisoned,
+    Dispatch {
+        source: VirtioRngDeviceNotificationError,
+    },
+    Endpoint {
+        source: VirtioPciEndpointError,
+    },
+    MissingQueueVector,
+    MissingConfigVector,
+    SharedQueueAndConfigVector,
+    DeliveryCountOverflow,
+    GuestMemory {
+        source: HvfGuestMemoryMappingError,
+    },
+}
+
+impl fmt::Display for HvfArm64BootPciValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceStatePoisoned => {
+                f.write_str("PCI validation virtio-rng device state is unavailable")
+            }
+            Self::Dispatch { source } => {
+                write!(f, "PCI validation virtio-rng dispatch failed: {source}")
+            }
+            Self::Endpoint { source } => {
+                write!(f, "PCI validation virtio-pci endpoint failed: {source}")
+            }
+            Self::MissingQueueVector => {
+                f.write_str("PCI validation guest did not assign a queue MSI-X vector")
+            }
+            Self::MissingConfigVector => {
+                f.write_str("PCI validation guest did not assign a configuration MSI-X vector")
+            }
+            Self::SharedQueueAndConfigVector => f.write_str(
+                "PCI validation guest assigned the same MSI-X table index to queue and configuration",
+            ),
+            Self::DeliveryCountOverflow => {
+                f.write_str("PCI validation interrupt delivery count overflowed")
+            }
+            Self::GuestMemory { source } => {
+                write!(f, "PCI validation guest memory is unavailable: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootPciValidationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Dispatch { source } => Some(source),
+            Self::Endpoint { source } => Some(source),
+            Self::GuestMemory { source } => Some(source),
+            Self::DeviceStatePoisoned
+            | Self::MissingQueueVector
+            | Self::MissingConfigVector
+            | Self::SharedQueueAndConfigVector
+            | Self::DeliveryCountOverflow => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct HvfArm64BootSession<'vm> {
     runner: HvfArm64BootVcpuSession<'vm>,
     backend: &'vm mut HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
     cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
     cache_hierarchy: Option<Arm64FdtCacheHierarchy>,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
@@ -344,6 +826,7 @@ pub struct OwnedHvfArm64BootSession {
     backend: HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
     cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
     cache_hierarchy: Option<Arm64FdtCacheHierarchy>,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
@@ -1640,13 +2123,19 @@ impl HvfArm64BootSession<'_> {
         self.pmem_retry_wakeup_scheduler.stop();
         self.network_retry_wakeup_scheduler.stop();
         self.entropy_retry_wakeup_scheduler.stop();
+        let pci_result = self.teardown_pci_validation_endpoint();
         let runner_result = self.runner.shutdown();
         let destroy_result = <HvfBackend as VmBackend>::destroy_vm(self.backend);
 
-        match (runner_result, destroy_result) {
-            (Err(source), _) => Err(HvfArm64BootSessionShutdownError::Vcpu { source }),
-            (Ok(()), Err(source)) => Err(HvfArm64BootSessionShutdownError::DestroyVm { source }),
-            (Ok(()), Ok(())) => Ok(()),
+        match (runner_result, pci_result, destroy_result) {
+            (Err(source), _, _) => Err(HvfArm64BootSessionShutdownError::Vcpu { source }),
+            (Ok(()), Err(source), _) => {
+                Err(HvfArm64BootSessionShutdownError::PciValidation { source })
+            }
+            (Ok(()), Ok(_), Err(source)) => {
+                Err(HvfArm64BootSessionShutdownError::DestroyVm { source })
+            }
+            (Ok(()), Ok(_), Ok(())) => Ok(()),
         }
     }
 
@@ -1657,6 +2146,49 @@ impl HvfArm64BootSession<'_> {
     /// Return the send-only capability retained by an MSI-enabled session.
     pub fn gic_msi_signaler(&self) -> Option<&HvfGicMsiSignaler> {
         self.backend.gic_msi_signaler()
+    }
+
+    /// Dispatches the internal modern virtio-pci validation device, if present.
+    #[doc(hidden)]
+    pub fn dispatch_pci_validation_notifications(
+        &mut self,
+    ) -> Result<(), HvfArm64BootPciValidationError> {
+        dispatch_pci_validation_notifications(self.backend, self.pci_validation_endpoint.as_mut())
+    }
+
+    /// Triggers the validation device's configuration vector exactly once.
+    #[doc(hidden)]
+    pub fn trigger_pci_validation_config_interrupt(
+        &mut self,
+    ) -> Result<(), HvfArm64BootPciValidationError> {
+        trigger_pci_validation_config_interrupt(self.pci_validation_endpoint.as_mut())
+    }
+
+    /// Returns value-redacted state from the internal modern PCI proof.
+    #[doc(hidden)]
+    pub fn pci_validation_diagnostics(
+        &self,
+    ) -> Option<Result<HvfArm64BootPciValidationDiagnostics, HvfArm64BootPciValidationError>> {
+        self.pci_validation_endpoint
+            .as_ref()
+            .map(HvfArm64BootPciValidationEndpoint::diagnostics)
+    }
+
+    /// Tears down the internal endpoint and proves released capacity is reusable.
+    #[doc(hidden)]
+    pub fn teardown_pci_validation_endpoint(
+        &mut self,
+    ) -> Result<
+        Option<HvfArm64BootPciValidationTeardownEvidence>,
+        HvfArm64BootPciValidationTeardownError,
+    > {
+        let signaler = self.backend.gic_msi_signaler().cloned();
+        teardown_pci_validation_endpoint_and_verify_reuse(
+            &mut self.pci_validation_endpoint,
+            &mut self.runtime_resources,
+            &self.mmio_dispatcher,
+            signaler,
+        )
     }
 
     pub fn primary_mpidr(&self) -> u64 {
@@ -2767,6 +3299,7 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            pci_validation_endpoint: prepared.pci_validation_endpoint,
             cache_source: prepared.cache_source,
             cache_hierarchy: Some(prepared.cache_hierarchy),
             control_wakeup: prepared.control_wakeup,
@@ -3082,6 +3615,7 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher,
             runtime_resources,
+            pci_validation_endpoint: None,
             cache_source,
             cache_hierarchy: None,
             control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
@@ -3250,13 +3784,19 @@ impl OwnedHvfArm64BootSession {
         self.pmem_retry_wakeup_scheduler.stop();
         self.network_retry_wakeup_scheduler.stop();
         self.entropy_retry_wakeup_scheduler.stop();
+        let pci_result = self.teardown_pci_validation_endpoint();
         let runner_result = self.runner.shutdown();
         let destroy_result = <HvfBackend as VmBackend>::destroy_vm(&mut self.backend);
 
-        match (runner_result, destroy_result) {
-            (Err(source), _) => Err(HvfArm64BootSessionShutdownError::Vcpu { source }),
-            (Ok(()), Err(source)) => Err(HvfArm64BootSessionShutdownError::DestroyVm { source }),
-            (Ok(()), Ok(())) => Ok(()),
+        match (runner_result, pci_result, destroy_result) {
+            (Err(source), _, _) => Err(HvfArm64BootSessionShutdownError::Vcpu { source }),
+            (Ok(()), Err(source), _) => {
+                Err(HvfArm64BootSessionShutdownError::PciValidation { source })
+            }
+            (Ok(()), Ok(_), Err(source)) => {
+                Err(HvfArm64BootSessionShutdownError::DestroyVm { source })
+            }
+            (Ok(()), Ok(_), Ok(())) => Ok(()),
         }
     }
 
@@ -3287,6 +3827,52 @@ impl OwnedHvfArm64BootSession {
     /// Return the send-only capability retained by an MSI-enabled session.
     pub fn gic_msi_signaler(&self) -> Option<&HvfGicMsiSignaler> {
         self.backend.gic_msi_signaler()
+    }
+
+    /// Dispatches the internal modern virtio-pci validation device, if present.
+    #[doc(hidden)]
+    pub fn dispatch_pci_validation_notifications(
+        &mut self,
+    ) -> Result<(), HvfArm64BootPciValidationError> {
+        dispatch_pci_validation_notifications(
+            &mut self.backend,
+            self.pci_validation_endpoint.as_mut(),
+        )
+    }
+
+    /// Triggers the validation device's configuration vector exactly once.
+    #[doc(hidden)]
+    pub fn trigger_pci_validation_config_interrupt(
+        &mut self,
+    ) -> Result<(), HvfArm64BootPciValidationError> {
+        trigger_pci_validation_config_interrupt(self.pci_validation_endpoint.as_mut())
+    }
+
+    /// Returns value-redacted state from the internal modern PCI proof.
+    #[doc(hidden)]
+    pub fn pci_validation_diagnostics(
+        &self,
+    ) -> Option<Result<HvfArm64BootPciValidationDiagnostics, HvfArm64BootPciValidationError>> {
+        self.pci_validation_endpoint
+            .as_ref()
+            .map(HvfArm64BootPciValidationEndpoint::diagnostics)
+    }
+
+    /// Tears down the internal endpoint and proves released capacity is reusable.
+    #[doc(hidden)]
+    pub fn teardown_pci_validation_endpoint(
+        &mut self,
+    ) -> Result<
+        Option<HvfArm64BootPciValidationTeardownEvidence>,
+        HvfArm64BootPciValidationTeardownError,
+    > {
+        let signaler = self.backend.gic_msi_signaler().cloned();
+        teardown_pci_validation_endpoint_and_verify_reuse(
+            &mut self.pci_validation_endpoint,
+            &mut self.runtime_resources,
+            &self.mmio_dispatcher,
+            signaler,
+        )
     }
 
     pub fn primary_mpidr(&self) -> u64 {
@@ -7710,6 +8296,17 @@ pub enum HvfArm64BootSessionError {
     RegisterBootTimerMmio {
         source: BootTimerMmioRegistrationError,
     },
+    MissingPciValidationMsiSignaler,
+    PciValidationDeviceType {
+        source: VirtioDeviceTypeError,
+    },
+    PreparePciValidationInterrupts {
+        source: HvfGicMsiDeviceInterruptResourceError,
+    },
+    PciValidationMmioDispatcherPoisoned,
+    PublishPciValidationEndpoint {
+        source: VirtioPciPublicationError,
+    },
     MapGuestMemory {
         source: HvfGuestMemoryMappingError,
     },
@@ -7800,6 +8397,25 @@ impl fmt::Display for HvfArm64BootSessionError {
             Self::RegisterBootTimerMmio { source } => {
                 write!(f, "failed to register boot timer MMIO: {source}")
             }
+            Self::MissingPciValidationMsiSignaler => f.write_str(
+                "modern virtio-pci validation requires this VM's GICv2m signal capability",
+            ),
+            Self::PciValidationDeviceType { source } => {
+                write!(
+                    f,
+                    "failed to prepare PCI validation virtio device type: {source}"
+                )
+            }
+            Self::PreparePciValidationInterrupts { source } => write!(
+                f,
+                "failed to prepare PCI validation MSI-X interrupt resources: {source}"
+            ),
+            Self::PciValidationMmioDispatcherPoisoned => {
+                f.write_str("PCI validation MMIO dispatcher state is unavailable")
+            }
+            Self::PublishPciValidationEndpoint { source } => {
+                write!(f, "failed to publish PCI validation endpoint: {source}")
+            }
             Self::MapGuestMemory { source } => {
                 write!(
                     f,
@@ -7837,11 +8453,16 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::ReadMpidr { source } => Some(source),
             Self::AssembleResources { source } => Some(source),
             Self::RegisterBootTimerMmio { source } => Some(source),
+            Self::PciValidationDeviceType { source } => Some(source),
+            Self::PreparePciValidationInterrupts { source } => Some(source),
+            Self::PublishPciValidationEndpoint { source } => Some(source),
             Self::MapGuestMemory { source } => Some(source),
             Self::ConfigureBootRegisters { source } => Some(source),
             Self::BackendAlreadyInitialized
             | Self::UnsupportedVcpuCount { .. }
-            | Self::PowerTopology => None,
+            | Self::PowerTopology
+            | Self::MissingPciValidationMsiSignaler
+            | Self::PciValidationMmioDispatcherPoisoned => None,
         }
     }
 }
@@ -7934,8 +8555,15 @@ impl std::error::Error for HvfArm64BootVmGenIdRestoreError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfArm64BootSessionShutdownError {
-    Vcpu { source: HvfVcpuRunCoordinatorError },
-    DestroyVm { source: BackendError },
+    Vcpu {
+        source: HvfVcpuRunCoordinatorError,
+    },
+    PciValidation {
+        source: HvfArm64BootPciValidationTeardownError,
+    },
+    DestroyVm {
+        source: BackendError,
+    },
 }
 
 impl fmt::Display for HvfArm64BootSessionShutdownError {
@@ -7946,6 +8574,9 @@ impl fmt::Display for HvfArm64BootSessionShutdownError {
                     f,
                     "failed to shut down HVF boot-session vCPU topology: {source}"
                 )
+            }
+            Self::PciValidation { source } => {
+                write!(f, "failed to tear down PCI validation endpoint: {source}")
             }
             Self::DestroyVm { source } => {
                 write!(f, "failed to destroy HVF boot-session VM: {source}")
@@ -7958,6 +8589,7 @@ impl std::error::Error for HvfArm64BootSessionShutdownError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Vcpu { source } => Some(source),
+            Self::PciValidation { source } => Some(source),
             Self::DestroyVm { source } => Some(source),
         }
     }
@@ -7968,6 +8600,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     runner: HvfArm64BootVcpuSession<'vm>,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
     cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
     cache_hierarchy: Arm64FdtCacheHierarchy,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
@@ -8054,6 +8687,7 @@ impl HvfBackend {
             backend: self,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            pci_validation_endpoint: prepared.pci_validation_endpoint,
             cache_source: prepared.cache_source,
             cache_hierarchy: Some(prepared.cache_hierarchy),
             control_wakeup: prepared.control_wakeup,
@@ -8208,7 +8842,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     let Arm64BootResourceParts {
         memory,
         mut mmio_dispatcher,
-        runtime,
+        mut runtime,
     } = resources.into_parts();
     if let Some(boot_timer) = config.boot_timer_device {
         register_boot_timer_mmio(
@@ -8315,11 +8949,14 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         )
         .map_err(|source| HvfArm64BootSessionError::StartNetworkRetryWakeupScheduler { source })?
     };
+    let pci_validation_endpoint =
+        prepare_pci_validation_virtio_rng_endpoint(backend, &mut runtime, &mmio_dispatcher)?;
 
     Ok(PreparedHvfArm64BootSession {
         runner,
         mmio_dispatcher,
         runtime_resources: runtime,
+        pci_validation_endpoint,
         cache_source,
         cache_hierarchy: retained_cache_hierarchy,
         control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
@@ -8351,6 +8988,56 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         vmclock_interrupt_line: interrupt_lines.vmclock,
         boot_registers: Some(boot_registers),
     })
+}
+
+fn prepare_pci_validation_virtio_rng_endpoint(
+    backend: &HvfBackend,
+    runtime: &mut Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+) -> Result<Option<HvfArm64BootPciValidationEndpoint>, HvfArm64BootSessionError> {
+    let Some(validation) = runtime.pci_validation.as_mut() else {
+        return Ok(None);
+    };
+    if !validation.config().is_modern_virtio_rng() {
+        return Ok(None);
+    }
+
+    let signaler = backend
+        .gic_msi_signaler()
+        .ok_or(HvfArm64BootSessionError::MissingPciValidationMsiSignaler)?;
+    let device_type = VirtioDeviceType::new(VIRTIO_RNG_DEVICE_ID)
+        .map_err(|source| HvfArm64BootSessionError::PciValidationDeviceType { source })?;
+    let device = SharedPciValidationVirtioRngDevice::new();
+    let segment = validation.segment().clone();
+    let mut dispatcher = dispatcher
+        .lock()
+        .map_err(|_| HvfArm64BootSessionError::PciValidationMmioDispatcherPoisoned)?;
+    let interrupts = HvfGicMsiDeviceInterruptResources::allocate(
+        signaler,
+        PCI_VALIDATION_VIRTIO_RNG_VECTOR_COUNT,
+    )
+    .map_err(|source| HvfArm64BootSessionError::PreparePciValidationInterrupts { source })?;
+    let published = PublishedVirtioPciEndpoint::publish(
+        VirtioPciIdentity::new(device_type, VIRTIO_MMIO_VERSION_1_FEATURE),
+        &VIRTIO_RNG_QUEUE_SIZES,
+        UnsupportedVirtioDeviceConfig,
+        device.clone(),
+        false,
+        validation.bar_allocator_mut(),
+        segment,
+        &mut dispatcher,
+        PCI_VALIDATION_VIRTIO_RNG_BAR_REGION_ID,
+        interrupts,
+    )
+    .map_err(|source| HvfArm64BootSessionError::PublishPciValidationEndpoint { source })?;
+
+    Ok(Some(HvfArm64BootPciValidationEndpoint {
+        published,
+        device,
+        queue_deliveries: 0,
+        config_deliveries: 0,
+        config_interrupt_triggered: false,
+    }))
 }
 
 fn allocate_interrupt_lines(

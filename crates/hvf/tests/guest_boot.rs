@@ -13,6 +13,22 @@ static GUEST_BOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BOOT_MARKER: &[u8] = b"BANGBANG_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_PCI_RNG_BOUND_MARKER: &[u8] = b"BANGBANG_VIRTIO_PCI_RNG_BOUND";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_PCI_RNG_IO_MARKER: &[u8] = b"BANGBANG_VIRTIO_PCI_RNG_IO_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_PCI_RNG_SUCCESS_MARKER: &[u8] = b"BANGBANG_VIRTIO_PCI_RNG_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_PCI_RNG_FAILURE_MARKER: &[u8] = b"BANGBANG_VIRTIO_PCI_RNG_FAIL";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_PCI_RNG_IRQ_BEFORE_BEGIN: &[u8] = b"BANGBANG_VIRTIO_PCI_RNG_IRQ_BEFORE_BEGIN";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_PCI_RNG_IRQ_BEFORE_END: &[u8] = b"BANGBANG_VIRTIO_PCI_RNG_IRQ_BEFORE_END";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_PCI_RNG_IRQ_AFTER_BEGIN: &[u8] = b"BANGBANG_VIRTIO_PCI_RNG_IRQ_AFTER_BEGIN";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_PCI_RNG_IRQ_AFTER_END: &[u8] = b"BANGBANG_VIRTIO_PCI_RNG_IRQ_AFTER_END";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BLOCK_READ_MARKER: &[u8] = b"BANGBANG_BLOCK_READ_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BLOCK_WRITE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITE_OK";
@@ -62,6 +78,8 @@ const CMDLINE_BEGIN_MARKER: &[u8] = b"BANGBANG_CMDLINE_BEGIN";
 const CMDLINE_END_MARKER: &[u8] = b"BANGBANG_CMDLINE_END";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const INITRD_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_PCI_RNG_INITRD_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/pci-rng-init";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const SMP_INITRD_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/smp-init";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -187,6 +205,109 @@ fn boots_firecracker_kernel_and_enumerates_the_internal_pci_segment() {
             String::from_utf8_lossy(&observation.serial_bytes)
         );
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_with_modern_virtio_pci_rng_and_distinct_msix_vectors() {
+    use std::num::NonZeroU32;
+
+    use bangbang_hvf::HvfGicMsiConfiguration;
+    use bangbang_runtime::startup::Arm64BootPciValidationConfig;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let initrd_path = env_path("BANGBANG_GUEST_INITRD_PATH");
+    let observation = run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
+        "guest-modern-virtio-pci-rng",
+        VIRTIO_PCI_RNG_SUCCESS_MARKER,
+        Some(initrd_path),
+        VIRTIO_PCI_RNG_INITRD_BOOT_ARGS,
+        Some(HvfGicMsiConfiguration::new(
+            NonZeroU32::new(2).expect("queue and config vectors should be nonzero"),
+        )),
+        Some(Arm64BootPciValidationConfig::modern_virtio_rng()),
+        |_| {},
+    );
+
+    for (marker, name) in [
+        (
+            VIRTIO_PCI_RNG_BOUND_MARKER,
+            "virtio-pci/virtio-rng binding marker",
+        ),
+        (
+            VIRTIO_PCI_RNG_IO_MARKER,
+            "deterministic virtio-rng I/O marker",
+        ),
+        (
+            VIRTIO_PCI_RNG_SUCCESS_MARKER,
+            "modern virtio-pci success marker",
+        ),
+    ] {
+        assert_guest_boot_observed_marker(&observation, marker, name);
+    }
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, VIRTIO_PCI_RNG_FAILURE_MARKER),
+        "modern virtio-pci guest emitted failure marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, b"pci 0000:00:01.0: [1af4:1044]"),
+        "pinned Linux did not enumerate the modern virtio-rng PCI identity\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+
+    let diagnostics = observation
+        .pci_validation
+        .as_ref()
+        .expect("modern PCI validation should retain endpoint diagnostics");
+    assert!(diagnostics.transport.device_activated);
+    assert!(diagnostics.transport.driver_ready);
+    assert!(diagnostics.transport.msix_enabled);
+    assert!(!diagnostics.transport.msix_function_masked);
+    assert!(diagnostics.transport.programmed_msix_entries >= 2);
+    assert!(diagnostics.transport.unmasked_msix_entries >= 2);
+    let queue_vector = diagnostics.transport.queue_vectors[0]
+        .expect("Linux should assign the virtio-rng queue vector");
+    let config_vector = diagnostics
+        .transport
+        .config_vector
+        .expect("Linux should assign the virtio configuration vector");
+    assert_ne!(queue_vector, config_vector);
+    assert!(diagnostics.queue_deliveries >= 1);
+    assert_eq!(diagnostics.config_deliveries, 1);
+    let teardown = observation
+        .pci_validation_teardown
+        .expect("modern PCI validation should retain teardown evidence");
+    assert!(teardown.endpoint_released);
+    assert!(teardown.guest_bar_unpublished);
+    assert!(teardown.pci_slot_reused);
+    assert!(teardown.bar_range_reused);
+    assert!(teardown.message_vectors_reused);
+    assert!(teardown.stale_endpoint_rejected);
+
+    let before = interrupt_counts_between(
+        &observation.serial_bytes,
+        VIRTIO_PCI_RNG_IRQ_BEFORE_BEGIN,
+        VIRTIO_PCI_RNG_IRQ_BEFORE_END,
+    );
+    let after = interrupt_counts_between(
+        &observation.serial_bytes,
+        VIRTIO_PCI_RNG_IRQ_AFTER_BEGIN,
+        VIRTIO_PCI_RNG_IRQ_AFTER_END,
+    );
+    let increased = after
+        .iter()
+        .filter(|(name, count)| {
+            name.contains("virtio") && **count > before.get(*name).copied().unwrap_or(0)
+        })
+        .count();
+    assert!(
+        increased >= 2,
+        "queue and configuration MSI-X counters should increase independently; before={before:?}, after={after:?}\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -998,6 +1119,14 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
             })
             .expect("guest boot test run-loop should not fail before marker");
         run_diagnostics.record_loop_outcome(&outcome);
+        session
+            .dispatch_pci_validation_notifications()
+            .expect("PCI validation device dispatch should succeed");
+        if serial_contains_marker(&serial_output, VIRTIO_PCI_RNG_IO_MARKER) {
+            session
+                .trigger_pci_validation_config_interrupt()
+                .expect("PCI validation configuration interrupt should succeed");
+        }
 
         if serial_contains_marker(&serial_output, marker) {
             break;
@@ -1029,6 +1158,12 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
         &serial_bytes,
         terminal_outcome.as_ref(),
     );
+    let pci_validation = session
+        .pci_validation_diagnostics()
+        .map(|diagnostics| diagnostics.expect("PCI validation diagnostics should be available"));
+    let pci_validation_teardown = session
+        .teardown_pci_validation_endpoint()
+        .expect("PCI validation endpoint teardown should succeed");
     session
         .shutdown()
         .expect("guest boot test session should shut down");
@@ -1039,6 +1174,8 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
         serial_bytes,
         cache_hierarchy,
         gic_msi,
+        pci_validation,
+        pci_validation_teardown,
     }
 }
 
@@ -1070,6 +1207,8 @@ struct GuestBootObservation {
     serial_bytes: Vec<u8>,
     cache_hierarchy: bangbang_runtime::fdt::Arm64FdtCacheHierarchy,
     gic_msi: Option<bangbang_hvf::HvfGicMsiMetadata>,
+    pci_validation: Option<bangbang_hvf::HvfArm64BootPciValidationDiagnostics>,
+    pci_validation_teardown: Option<bangbang_hvf::HvfArm64BootPciValidationTeardownEvidence>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1978,6 +2117,32 @@ fn serial_contains_marker(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn bytes_contain_marker(bytes: &[u8], marker: &[u8]) -> bool {
     bytes.windows(marker.len()).any(|window| window == marker)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn interrupt_counts_between(
+    bytes: &[u8],
+    begin: &[u8],
+    end: &[u8],
+) -> std::collections::BTreeMap<String, u64> {
+    let snapshot = bytes_between_markers(bytes, begin, end).unwrap_or_else(|| {
+        panic!(
+            "guest serial output did not contain marker-bounded /proc/interrupts snapshot\nserial output:\n{}",
+            String::from_utf8_lossy(bytes)
+        )
+    });
+    let snapshot = String::from_utf8_lossy(snapshot);
+    snapshot
+        .trim_matches(char::from(0))
+        .lines()
+        .filter_map(|line| {
+            let (_irq, values) = line.split_once(':')?;
+            let mut fields = values.split_whitespace();
+            let count = fields.next()?.parse::<u64>().ok()?;
+            let name = fields.last()?.to_string();
+            Some((name, count))
+        })
+        .collect()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -27,9 +27,12 @@ path.
   allocator state, and any delivered or in-flight message are not persisted or
   inferred during restore.
 - The validation-only PCI segment is also outside native-v1. Capture rejects
-  its retained ECAM owner/lease and segment/function lease rather than omitting
-  them; no slot, BAR, configuration-space, or
-  guest discovery state is serialized or reconstructed on load.
+  its retained ECAM owner/lease, segment/function lease, and any modern
+  virtio-pci endpoint rather than omitting them. No slot, BAR, capability/common
+  configuration, queue selection, MSI-X table/PBA/vector, pending-message,
+  endpoint lifecycle, or guest discovery state is serialized or reconstructed
+  on load. The validation endpoint's checked teardown/reuse proof is not a
+  snapshot schema or restore contract.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
   network, and entropy retry schedulers, preflights both final namespaces,

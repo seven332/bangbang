@@ -105,30 +105,40 @@ that terminal SPI even when HVF reports it. The ordinary GIC constructor,
 process startup path, and FDT remain unchanged and MSI-free.
 
 An enabled session advertises one `arm,gic-v2m-frame` child below the GICv3 FDT
-node and retains a typed allocator plus a serialized, send-only signaler. The
+node and retains a generation-bound allocator plus a serialized, send-only
+signaler. A device atomically reserves its complete vector count and receives a
+registry that maps only those exact guest message address/data tuples to live
+interrupt capabilities. Ambiguous duplicate registry routes, foreign or stale
+capabilities, and quiescing or released registries are rejected without
+exposing tuple values in `Debug` or errors. The
 message address is derived from the validated frame and its GICv2m `SETSPI`
-offset; callers supply only an interrupt allocated from the exact retained
-range. Message details stay out of `Debug` and errors. A failed send is
-nontransactional: callers cannot infer whether the guest observed the message
-and must apply device-specific retry or failure policy. VM teardown takes the
-same sender lock, waits for an in-flight call, and revokes every retained clone
-before unmapping or destroying VM-owned resources.
+offset; callers never gain arbitrary host interrupt authority. Device teardown
+closes admission, drains in-flight sends, revokes the registry, and releases the
+complete allocation so the same range may be reused under a new generation.
+
+A failed Hypervisor.framework send remains nontransactional: callers cannot
+infer whether the guest observed the message and must not blindly retry. The
+transport records pending MSI-X state where the virtio specification permits
+later delivery; otherwise a device-specific failure policy owns the ambiguity.
+VM teardown takes the same sender lock and revokes every retained clone before
+unmapping or destroying VM-owned resources.
 
 This foundation is not Firecracker's KVM-backed GICv3 ITS implementation. It
-adds no public API or CLI control, MSI/MSI-X table emulation,
-guest-programmed message routing, or interrupt remapping. It is also outside
-the accepted native-v1 snapshot profile, which rejects MSI-bearing GIC
-metadata. The capability inventory is therefore not promoted by this internal
-foundation alone.
+adds no public API or CLI control and no interrupt remapping. Its MSI-X use is
+confined to the validation-only modern virtio-pci endpoint described below. It
+is also outside the accepted native-v1 snapshot profile, which rejects
+MSI-bearing GIC metadata. The capability inventory is therefore not promoted
+by this internal foundation alone.
 
 ## Internal PCI Segment and Address-Space Foundation
 
-An explicit validation-only boot-session option now composes the GICv2m frame
-with a backend-neutral PCI segment 0, bus 0. Device 0 is the fixed
-`[8086:0d57]` host bridge; devices 1 through 31 use deterministic,
-generation-bound slot leases, and the signed gate installs one identity-only
-`[0042:0000]` endpoint from Firecracker's pinned PCI mock at `0000:00:01.0`.
-The endpoint has no virtio or product semantics.
+An explicit validation-only boot-session option composes the GICv2m frame with
+a backend-neutral PCI segment 0, bus 0. Device 0 is the fixed `[8086:0d57]`
+host bridge, and devices 1 through 31 use deterministic, generation-bound slot
+leases. One signed gate installs the identity-only `[0042:0000]` endpoint from
+Firecracker's pinned PCI mock at `0000:00:01.0`; a separate mode publishes a
+standard modern non-transitional virtio-rng endpoint as `[1af4:1044]` at the
+same deterministic slot.
 
 The arm64 plan reserves the full Firecracker configuration aperture at
 `0x70000000..0x80000000`, publishes only the bus-0 1 MiB ECAM window, uses
@@ -147,11 +157,27 @@ RAM, GIC/GICv2m, and every published platform/MMIO device before emitting a
 `pci-host-ecam-generic` node with `msi-parent = <3>`. With the option absent,
 the previous FDT bytes and startup inventory are unchanged.
 
-This slice provides discovery and ownership primitives only. No process flag,
-HTTP action, modern virtio-pci device, guest-programmed MSI/MSI-X delivery,
-runtime attach/delete, hotplug, or snapshot persistence reaches production.
-Those transport and lifecycle steps remain later work, so the public capability
-inventory and the existing `--enable-pci` rejection do not change.
+The backend-neutral virtio core now owns feature negotiation, queue state,
+activation, reset, and exact queue/config interrupt intents; virtio-MMIO is an
+adapter over that core. The modern PCI adapter publishes Firecracker's 512-KiB
+capability BAR with common, ISR, device, notification, PCI-config, MSI-X table,
+and PBA regions. It supports checked capability chaining, guest feature and
+queue programming, notification decoding, ISR semantics, arbitrary guest
+MSI-X address/data programming constrained by the device registry, masking and
+pending-bit delivery, and ordered publication/teardown. Existing block,
+network, balloon, rng, pmem, memory-hotplug, and vsock devices emit the same
+transport-neutral queue/config intents while their production attachment
+remains virtio-MMIO.
+
+The signed Linux conformance gate binds the standard `virtio_rng` driver,
+programs distinct queue and configuration MSI-X vectors, consumes deterministic
+bytes through `/dev/hwrng`, and observes both vectors independently. It then
+unpublishes the function and BAR, rejects the stale endpoint, and proves exact
+slot, BAR, and GICv2m vector reuse. This is internal transport evidence, not a
+public device claim. No process flag, HTTP action, product virtio-pci adapter,
+runtime attach/delete, guest rescan/removal protocol, hotplug, or snapshot
+persistence reaches production, so the public capability inventory and the
+existing `--enable-pci` rejection do not change.
 
 ## Internal PSCI Power Sessions
 

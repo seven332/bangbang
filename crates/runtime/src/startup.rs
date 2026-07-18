@@ -66,8 +66,8 @@ use crate::network::{
     VirtioNetworkTxPacketSink,
 };
 use crate::pci::{
-    Arm64PciAddressPlan, PciClassCode, PciFunctionLease, PciSegment, PciSegmentError,
-    PciType0Configuration, SharedPciSegment, register_ecam_handler,
+    Arm64PciAddressPlan, PciBarAddressSpace, PciBarAllocator, PciClassCode, PciFunctionLease,
+    PciSegment, PciSegmentError, PciType0Configuration, SharedPciSegment, register_ecam_handler,
 };
 use crate::pmem::{
     PmemFileBacking, PmemMmioDeviceRegistration, PmemMmioLayout, PmemMmioRegistrationError,
@@ -248,6 +248,7 @@ pub struct Arm64BootResourceConfig<'a> {
 pub struct Arm64BootPciValidationConfig {
     vendor_id: u16,
     device_id: u16,
+    modern_virtio_rng: bool,
 }
 
 impl Arm64BootPciValidationConfig {
@@ -258,6 +259,20 @@ impl Arm64BootPciValidationConfig {
         Self {
             vendor_id: Self::FIRECRACKER_TEST_VENDOR_ID,
             device_id: Self::FIRECRACKER_TEST_DEVICE_ID,
+            modern_virtio_rng: false,
+        }
+    }
+
+    /// Selects the internal signed-Linux modern virtio-pci/MSI-X proof.
+    ///
+    /// This remains test infrastructure: no process, API, or production
+    /// device configuration can select it.
+    #[doc(hidden)]
+    pub const fn modern_virtio_rng() -> Self {
+        Self {
+            vendor_id: crate::virtio_pci::VIRTIO_PCI_VENDOR_ID,
+            device_id: 0x1044,
+            modern_virtio_rng: true,
         }
     }
 
@@ -267,6 +282,11 @@ impl Arm64BootPciValidationConfig {
 
     pub const fn device_id(self) -> u16 {
         self.device_id
+    }
+
+    #[doc(hidden)]
+    pub const fn is_modern_virtio_rng(self) -> bool {
+        self.modern_virtio_rng
     }
 }
 
@@ -361,7 +381,9 @@ pub struct Arm64BootResources {
 #[derive(Debug)]
 pub struct Arm64BootPciValidationResources {
     segment: SharedPciSegment,
-    _function_lease: PciFunctionLease,
+    bar_allocator: PciBarAllocator,
+    config: Arm64BootPciValidationConfig,
+    _function_lease: Option<PciFunctionLease>,
     _registration_owner: MmioRegistrationOwner,
     _registration_lease: MmioRegistrationLease,
 }
@@ -369,6 +391,16 @@ pub struct Arm64BootPciValidationResources {
 impl Arm64BootPciValidationResources {
     pub const fn segment(&self) -> &SharedPciSegment {
         &self.segment
+    }
+
+    #[doc(hidden)]
+    pub const fn config(&self) -> Arm64BootPciValidationConfig {
+        self.config
+    }
+
+    #[doc(hidden)]
+    pub fn bar_allocator_mut(&mut self) -> &mut PciBarAllocator {
+        &mut self.bar_allocator
     }
 }
 
@@ -3913,19 +3945,28 @@ fn prepare_pci_validation(
     let plan = Arm64PciAddressPlan::firecracker_v1_16()
         .map_err(|source| Arm64BootResourceError::PciAddressPlan { source })?;
     let mut segment = PciSegment::new();
-    let function_lease = segment
-        .add_function(PciType0Configuration::new(
-            config.vendor_id(),
-            config.device_id(),
-            0,
-            PciClassCode::Unclassified,
-            0,
-            0,
-            config.vendor_id(),
-            config.device_id(),
-        ))
-        .map_err(|source| Arm64BootResourceError::PreparePciValidationFunction { source })?;
+    let function_lease = if config.is_modern_virtio_rng() {
+        None
+    } else {
+        Some(
+            segment
+                .add_function(PciType0Configuration::new(
+                    config.vendor_id(),
+                    config.device_id(),
+                    0,
+                    PciClassCode::Unclassified,
+                    0,
+                    0,
+                    config.vendor_id(),
+                    config.device_id(),
+                ))
+                .map_err(
+                    |source| Arm64BootResourceError::PreparePciValidationFunction { source },
+                )?,
+        )
+    };
     let segment = SharedPciSegment::new(segment);
+    let bar_allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, plan.bar64());
     let registration_owner = MmioRegistrationOwner::new();
     let registration_lease = register_ecam_handler(
         dispatcher,
@@ -3939,6 +3980,8 @@ fn prepare_pci_validation(
     Ok((
         Arm64BootPciValidationResources {
             segment,
+            bar_allocator,
+            config,
             _function_lease: function_lease,
             _registration_owner: registration_owner,
             _registration_lease: registration_lease,

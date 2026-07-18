@@ -36,6 +36,10 @@ const PCI_BAR_MINIMUM_SIZE: u64 = 16;
 const PCI_COMMAND_WRITABLE_MASK: u32 = 0x0000_ffff;
 const PCI_CACHELINE_WRITABLE_MASK: u32 = 0x0000_00ff;
 const PCI_INTERRUPT_LINE_WRITABLE_MASK: u32 = 0x0000_00ff;
+const PCI_STATUS_CAPABILITY_LIST_MASK: u32 = 0x0010_0000;
+const PCI_CAPABILITY_LIST_HEAD_OFFSET: usize = 0x34;
+const PCI_FIRST_CAPABILITY_OFFSET: usize = 0x40;
+const PCI_CAPABILITY_END_EXCLUSIVE: usize = 0xc0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PciSbdf {
@@ -446,7 +450,17 @@ pub trait PciConfigFunction: fmt::Debug + Send {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PciClassCode {
     Unclassified = 0x00,
+    MassStorage = 0x01,
+    Network = 0x02,
     Bridge = 0x06,
+    Unassigned = 0xff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PciCapabilityId {
+    VendorSpecific = 0x09,
+    MsiX = 0x11,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,6 +480,7 @@ pub struct PciType0Configuration {
     registers: Vec<u32>,
     writable_masks: Vec<u32>,
     bars: BTreeMap<u8, PciBarRegister>,
+    last_capability: Option<(u8, u8)>,
 }
 
 impl fmt::Debug for PciType0Configuration {
@@ -473,6 +488,7 @@ impl fmt::Debug for PciType0Configuration {
         f.debug_struct("PciType0Configuration")
             .field("configuration", &"<redacted>")
             .field("configured_bar_registers", &self.bars.len())
+            .field("capability_count", &self.capability_count())
             .finish()
     }
 }
@@ -493,6 +509,7 @@ impl PciType0Configuration {
             registers: vec![0; PCI_CONFIG_REGISTER_COUNT],
             writable_masks: vec![0; PCI_CONFIG_REGISTER_COUNT],
             bars: BTreeMap::new(),
+            last_capability: None,
         };
         configuration.set_register(0, (u32::from(device_id) << 16) | u32::from(vendor_id));
         configuration.set_register(
@@ -586,6 +603,108 @@ impl PciType0Configuration {
             );
         }
         Ok(())
+    }
+
+    /// Add one conventional PCI capability and return its byte offset.
+    ///
+    /// `body` excludes the standard capability ID/next-pointer header.
+    /// `body_writable_mask` has the same length and controls guest-writable
+    /// bits. Header identity and links are always immutable.
+    pub fn add_capability(
+        &mut self,
+        id: PciCapabilityId,
+        body: &[u8],
+        body_writable_mask: &[u8],
+    ) -> Result<u8, PciCapabilityError> {
+        if body.len() != body_writable_mask.len() {
+            return Err(PciCapabilityError::WritableMaskLength {
+                body: body.len(),
+                mask: body_writable_mask.len(),
+            });
+        }
+        let total_len = body
+            .len()
+            .checked_add(2)
+            .ok_or(PciCapabilityError::LengthOverflow)?;
+        let total_len_u8 =
+            u8::try_from(total_len).map_err(|_| PciCapabilityError::LengthOverflow)?;
+        let (offset, previous_next_pointer) = match self.last_capability {
+            Some((previous_offset, previous_len)) => {
+                let next = usize::from(previous_offset)
+                    .checked_add(usize::from(previous_len))
+                    .and_then(|offset| offset.checked_add(3))
+                    .map(|offset| offset & !3)
+                    .ok_or(PciCapabilityError::LengthOverflow)?;
+                (next, usize::from(previous_offset) + 1)
+            }
+            None => (PCI_FIRST_CAPABILITY_OFFSET, PCI_CAPABILITY_LIST_HEAD_OFFSET),
+        };
+        let end = offset
+            .checked_add(total_len)
+            .ok_or(PciCapabilityError::LengthOverflow)?;
+        if end > PCI_CAPABILITY_END_EXCLUSIVE {
+            return Err(PciCapabilityError::NoSpace {
+                offset,
+                length: total_len,
+            });
+        }
+        let offset_u8 =
+            u8::try_from(offset).map_err(|_| PciCapabilityError::InvalidOffset { offset })?;
+
+        // All validation precedes mutation so a rejected capability cannot
+        // damage the existing chain or writable masks.
+        self.set_configuration_byte(previous_next_pointer, offset_u8);
+        self.set_configuration_byte(offset, id as u8);
+        self.set_configuration_byte(offset + 1, 0);
+        self.set_writable_configuration_byte(offset, 0);
+        self.set_writable_configuration_byte(offset + 1, 0);
+        for (index, byte) in body.iter().copied().enumerate() {
+            self.set_configuration_byte(offset + 2 + index, byte);
+        }
+        for (index, mask) in body_writable_mask.iter().copied().enumerate() {
+            self.set_writable_configuration_byte(offset + 2 + index, mask);
+        }
+        let status =
+            self.registers.get(1).copied().unwrap_or_default() | PCI_STATUS_CAPABILITY_LIST_MASK;
+        self.set_register(1, status);
+        self.last_capability = Some((offset_u8, total_len_u8));
+        Ok(offset_u8)
+    }
+
+    pub fn capability_count(&self) -> usize {
+        let mut count = 0;
+        let mut offset = self.configuration_byte(PCI_CAPABILITY_LIST_HEAD_OFFSET);
+        while offset != 0 && count < 64 {
+            count += 1;
+            offset = self.configuration_byte(usize::from(offset) + 1);
+        }
+        count
+    }
+
+    fn configuration_byte(&self, offset: usize) -> u8 {
+        let register = self
+            .registers
+            .get(offset / PCI_CONFIG_REGISTER_SIZE)
+            .copied()
+            .unwrap_or(0);
+        ((register >> ((offset % PCI_CONFIG_REGISTER_SIZE) * 8)) & 0xff) as u8
+    }
+
+    fn set_configuration_byte(&mut self, offset: usize, value: u8) {
+        if let Some(register) = self.registers.get_mut(offset / PCI_CONFIG_REGISTER_SIZE) {
+            let shift = (offset % PCI_CONFIG_REGISTER_SIZE) * 8;
+            *register = (*register & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+        }
+    }
+
+    fn set_writable_configuration_byte(&mut self, offset: usize, value: u8) {
+        if let Some(mask) = self
+            .writable_masks
+            .get_mut(offset / PCI_CONFIG_REGISTER_SIZE)
+        {
+            let shift = (offset % PCI_CONFIG_REGISTER_SIZE) * 8;
+            *mask = (*mask & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+        }
     }
 
     fn set_register(&mut self, index: usize, value: u32) {
@@ -691,6 +810,7 @@ pub enum PciConfigAccessError {
     InvalidWidth { len: usize },
     OutsideConfigurationSpace { offset: u16, len: usize },
     CrossesRegister { offset: u16, len: usize },
+    Handler { message: String },
 }
 
 impl fmt::Display for PciConfigAccessError {
@@ -708,11 +828,41 @@ impl fmt::Display for PciConfigAccessError {
                 f,
                 "PCI configuration access offset 0x{offset:x} width {len} crosses a dword boundary"
             ),
+            Self::Handler { message } => f.write_str(message),
         }
     }
 }
 
 impl std::error::Error for PciConfigAccessError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PciCapabilityError {
+    WritableMaskLength { body: usize, mask: usize },
+    LengthOverflow,
+    InvalidOffset { offset: usize },
+    NoSpace { offset: usize, length: usize },
+}
+
+impl fmt::Display for PciCapabilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WritableMaskLength { body, mask } => write!(
+                f,
+                "PCI capability body length {body} does not match writable mask length {mask}"
+            ),
+            Self::LengthOverflow => f.write_str("PCI capability length overflows"),
+            Self::InvalidOffset { offset } => {
+                write!(f, "PCI capability offset 0x{offset:x} is not representable")
+            }
+            Self::NoSpace { offset, length } => write!(
+                f,
+                "PCI capability at offset 0x{offset:x} with length {length} exceeds the conventional capability area"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PciCapabilityError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PciBarConfigurationError {
@@ -1433,6 +1583,66 @@ mod tests {
     }
 
     #[test]
+    fn type0_capability_chain_is_aligned_linked_and_header_immutable() {
+        let mut configuration = endpoint(0x1af4, 0x1044);
+        let first_body = [14, 1, 0, 0, 0, 0, 0, 0, 56, 0, 0, 0, 0, 0];
+        let first = configuration
+            .add_capability(PciCapabilityId::VendorSpecific, &first_body, &[0; 14])
+            .expect("first capability should fit");
+        let second_body = [0x01, 0x80, 0x00, 0x80, 0, 0, 0, 0x80, 4, 0];
+        let mut second_mask = [0; 10];
+        second_mask[1] = 0xc0;
+        let second = configuration
+            .add_capability(PciCapabilityId::MsiX, &second_body, &second_mask)
+            .expect("second capability should fit");
+
+        assert_eq!(first, 0x40);
+        assert_eq!(second, 0x50);
+        assert_eq!(configuration.capability_count(), 2);
+        assert_ne!(
+            read_config_u32(&mut configuration, 4) & PCI_STATUS_CAPABILITY_LIST_MASK,
+            0
+        );
+        assert_eq!(read_config_u32(&mut configuration, 0x34) & 0xff, 0x40);
+        assert_eq!(read_config_u32(&mut configuration, 0x40), 0x010e_5009);
+        assert_eq!(read_config_u32(&mut configuration, 0x50), 0x8001_0011);
+
+        configuration
+            .write_config(0x40, &[0xff, 0xff, 0xff, 0xff])
+            .expect("capability header write should be accepted as a no-op");
+        assert_eq!(read_config_u32(&mut configuration, 0x40), 0x010e_5009);
+        configuration
+            .write_config(0x52, &0x4001_u16.to_le_bytes())
+            .expect("MSI-X control write should be accepted");
+        assert_eq!(read_config_u32(&mut configuration, 0x50), 0x4001_0011);
+    }
+
+    #[test]
+    fn type0_capability_failures_leave_existing_chain_unchanged() {
+        let mut configuration = endpoint(0x1af4, 0x1044);
+        let first_body = vec![0; PCI_CAPABILITY_END_EXCLUSIVE - PCI_FIRST_CAPABILITY_OFFSET - 2];
+        let first_mask = vec![0; first_body.len()];
+        let first = configuration
+            .add_capability(PciCapabilityId::VendorSpecific, &first_body, &first_mask)
+            .expect("one maximum capability should fit");
+        assert_eq!(first, 0x40);
+        let before_head = read_config_u32(&mut configuration, 0x34);
+        let before_first = read_config_u32(&mut configuration, 0x40);
+
+        assert_eq!(
+            configuration.add_capability(PciCapabilityId::MsiX, &[0; 10], &[0; 9]),
+            Err(PciCapabilityError::WritableMaskLength { body: 10, mask: 9 })
+        );
+        assert!(matches!(
+            configuration.add_capability(PciCapabilityId::MsiX, &[0; 10], &[0; 10]),
+            Err(PciCapabilityError::NoSpace { .. })
+        ));
+        assert_eq!(read_config_u32(&mut configuration, 0x34), before_head);
+        assert_eq!(read_config_u32(&mut configuration, 0x40), before_first);
+        assert_eq!(configuration.capability_count(), 1);
+    }
+
+    #[test]
     fn type0_configuration_rejects_invalid_width_and_crossing() {
         let mut configuration = endpoint(0x1af4, 0x10ff);
         let mut three = [0; 3];
@@ -1810,7 +2020,7 @@ mod tests {
             .expect("test PCI BAR should install");
         assert_eq!(
             format!("{configuration:?}"),
-            "PciType0Configuration { configuration: \"<redacted>\", configured_bar_registers: 1 }"
+            "PciType0Configuration { configuration: \"<redacted>\", configured_bar_registers: 1, capability_count: 0 }"
         );
     }
 }

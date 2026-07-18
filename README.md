@@ -32,21 +32,25 @@ On macOS 15 and later, the HVF backend also has an internal, explicitly
 opt-in foundation for a demand-sized public-HVF GICv2m MSI frame. It reserves
 the requested interrupt range from the top of Linux's usable GICv2m SPI domain,
 keeps the legacy SPI allocator disjoint, advertises an `arm,gic-v2m-frame` FDT
-child, and retains a typed send-only capability. Ordinary process startup and
-its FDT remain MSI-free. This is not Firecracker's KVM ITS path, does not expose
-a CLI or API switch, and does not implement guest-programmed MSI-X. Signed
-gates prove raw delivery of INTID 1018 and pinned Firecracker Linux discovery
-of the exact `SPI[1018:1018]` frame; native-v1 rejects MSI-bearing GIC metadata.
+child, and retains generation-bound device vector resources behind an exact,
+value-redacted message-routing capability. Ordinary process startup and its FDT
+remain MSI-free. This is not Firecracker's KVM ITS path and exposes no CLI or
+API switch. Signed gates prove raw delivery, pinned Firecracker Linux discovery,
+and validation-only guest-programmed MSI-X delivery; native-v1 rejects
+MSI-bearing GIC metadata.
 
 An additional validation-only boot-session option composes a backend-neutral
 PCI segment-0/bus-0 foundation with that frame. It reserves Firecracker's
 configuration and 32/64-bit BAR apertures, publishes a 1 MiB ECAM window through
 an atomically owned MMIO lease, and emits a generic ECAM FDT host. The pinned
-Linux gate enumerates the fixed `[8086:0d57]` host bridge and one identity-only
-`[0042:0000]` test endpoint from Firecracker's pinned PCI mock. Default process
-startup remains byte-for-byte PCI-free: there is no public flag or API path,
-modern virtio-pci device,
-guest-programmed MSI/MSI-X delivery, hotplug, or PCI snapshot state yet.
+Linux gates enumerate the fixed `[8086:0d57]` host bridge, an identity-only
+`[0042:0000]` test endpoint from Firecracker's pinned PCI mock, and—under a
+separate internal mode—a standard non-transitional `[1af4:1044]` virtio-rng
+endpoint. That endpoint exercises Firecracker-shaped modern capability/BAR
+layout, deterministic guest I/O, and distinct queue/config MSI-X vectors through
+GICv2m, followed by checked teardown and resource reuse. Default process startup
+remains byte-for-byte PCI-free: there is no public flag or API path, product
+device adapter, runtime attach/delete, hotplug, or PCI snapshot state yet.
 
 ## Layout
 

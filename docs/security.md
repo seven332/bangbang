@@ -1517,19 +1517,24 @@ backend, public process configuration, and guest FDT expose no MSI controller.
 The configured frame and interrupt range are validated before publication; the
 legacy and MSI allocators are disjoint, INTID 1019 is kept outside the pinned
 Linux driver's usable domain, and the send address is derived internally from
-the frame's `SETSPI` register. The send-only capability accepts only an opaque
-typed value produced by its matching allocator, serializes host calls, and
-redacts message details from diagnostics. VM teardown waits on that same send
-lock and revokes all clones before releasing VM-owned resources, so a stale
-capability cannot target a later VM in the process.
+the frame's `SETSPI` register. Device resources atomically reserve a complete
+vector set and expose only an exact address/data registry backed by opaque,
+generation-bound interrupt capabilities. Ambiguous duplicate registry routes,
+foreign allocators, and stale generations fail closed; multiple table entries
+may still use the same one valid tuple. Registry and signaler diagnostics
+redact message values. Quiesce closes new admission and drains in-flight sends
+before revocation; release returns the complete vector set under the allocation
+lock, so a stale capability cannot target a later device or VM after reuse.
 
 Hypervisor.framework does not make message delivery transactional. A returned
 error cannot prove that the guest did not observe the interrupt, so a future
-device owner must define its own retry and teardown policy. Current signed
-coverage separately proves raw host-to-vCPU delivery and pinned-Linux GICv2m
-domain discovery. The validation-only PCI gate additionally proves enumeration
-of its fixed host bridge and identity-only endpoint; it does not prove
-MSI/MSI-X programming, interrupt remapping, product-device transport, or
+device owner must define its own retry and teardown policy. The modern
+virtio-pci transport does not blindly retry an ambiguous host send; its
+spec-defined masking path retains pending state for later unmask delivery.
+Current signed coverage separately proves raw host-to-vCPU delivery,
+pinned-Linux GICv2m discovery, identity-only PCI enumeration, and standard
+virtio-rng use of independently programmed queue/configuration MSI-X vectors.
+It does not prove interrupt remapping, production product-device transport, or
 Firecracker's KVM ITS behavior. MSI-bearing GIC metadata is rejected by the
 native-v1 snapshot profile rather than silently omitted.
 
@@ -1551,10 +1556,20 @@ generation, and exact registered state before mutation, so a stale capability
 cannot remove a later occupant after reuse. Ownership and address details are
 redacted from capability `Debug` output.
 
-The retained `[0042:0000]` endpoint is pinned mock identity only. It grants no host
-resource authority and implements no product I/O, MSI/MSI-X table, hotplug, or
-snapshot contract. Native-v1 treats any PCI validation resources as an
-unsupported inventory rather than persisting or silently dropping them.
+The identity-only `[0042:0000]` endpoint remains a pinned mock. A separate
+validation mode publishes `[1af4:1044]` behind a single exact 512-KiB BAR and
+two device-owned GICv2m vectors. PCI configuration, BAR publication, MSI-X
+routing, and the virtio device share one ordered endpoint lifecycle: teardown
+first removes the exact MMIO/function registrations, then closes and drains
+device work, revokes message routes, and releases BAR and vector leases. Signed
+teardown proves stale rejection and exact slot, BAR, and vector reuse,
+preventing an old endpoint from signaling or unpublishing its successor.
+
+The endpoint's deterministic entropy source and diagnostic view exist only for
+the signed conformance harness. They grant no arbitrary host resource authority
+and establish no public product I/O, hotplug, attach/delete, or snapshot
+contract. Native-v1 treats any PCI validation resources as an unsupported
+inventory rather than persisting or silently dropping them.
 
 ## HVF Entitlements
 
