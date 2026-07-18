@@ -565,16 +565,26 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler>
     }
 
     pub fn drain_interrupt_intents(&self) -> Result<(), VirtioPciEndpointError> {
-        let messages = {
+        let (messages, first_trigger_error) = {
             let mut state = self.endpoint.lock_active()?;
             let intents = state.core.take_interrupt_intents();
             let mut messages = Vec::new();
+            let mut first_error = None;
             for intent in intents {
-                messages.extend(state.msix.trigger(intent)?);
+                match state.msix.trigger(intent) {
+                    Ok(triggered) => messages.extend(triggered),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
-            messages
+            (messages, first_error)
         };
-        self.endpoint.inner.signal_messages(messages)
+        self.endpoint.inner.signal_messages(messages)?;
+        if let Some(error) = first_trigger_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn increment_config_generation_and_trigger(&self) -> Result<(), VirtioPciEndpointError> {
@@ -1751,6 +1761,7 @@ pub struct PublishedVirtioPciEndpoint<C, A, I> {
     owner: MmioRegistrationOwner,
     mmio_lease: Option<MmioRegistrationLease>,
     function_lease: Option<PciFunctionLease>,
+    function_published: bool,
     bar_lease: Option<PciBarLease>,
     interrupts: I,
     released: bool,
@@ -1888,6 +1899,7 @@ where
             owner,
             mmio_lease: Some(mmio_lease),
             function_lease: Some(function_lease),
+            function_published: true,
             bar_lease: Some(bar_lease),
             interrupts,
             released: false,
@@ -1921,12 +1933,14 @@ where
                 .map_err(|source| VirtioPciPublicationError::MmioRelease { source })?;
             self.mmio_lease = None;
         }
-        if let Some(lease) = self.function_lease.as_ref() {
+        if self.function_published
+            && let Some(lease) = self.function_lease.as_ref()
+        {
             self.segment
-                .with_segment(|segment| segment.remove_function(lease))
+                .with_segment(|segment| segment.unpublish_function(lease))
                 .map_err(|source| VirtioPciPublicationError::SegmentLock { source })?
                 .map_err(|source| VirtioPciPublicationError::FunctionRelease { source })?;
-            self.function_lease = None;
+            self.function_published = false;
         }
         self.endpoint
             .release()
@@ -1939,6 +1953,13 @@ where
                 .release(lease)
                 .map_err(|source| VirtioPciPublicationError::BarRelease { source })?;
             self.bar_lease = None;
+        }
+        if let Some(lease) = self.function_lease.as_ref() {
+            self.segment
+                .with_segment(|segment| segment.release_function_lease(lease))
+                .map_err(|source| VirtioPciPublicationError::SegmentLock { source })?
+                .map_err(|source| VirtioPciPublicationError::FunctionRelease { source })?;
+            self.function_lease = None;
         }
         self.released = true;
         Ok(())
@@ -2294,7 +2315,7 @@ mod tests {
     use std::sync::mpsc::{self, TryRecvError};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::memory::GuestMemoryRange;
@@ -2689,6 +2710,118 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_preflight_rejects_invalid_queue_vector_bar_and_registry_shapes() {
+        let range = GuestMemoryRange::new(
+            GuestAddress::new(0x1_1000_0000),
+            VIRTIO_PCI_CAPABILITY_BAR_SIZE * 2,
+        )
+        .unwrap();
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, range);
+        let bar = allocator.allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE).unwrap();
+        let identity = VirtioPciIdentity::new(VirtioDeviceType::new(4).unwrap(), 0);
+
+        assert!(matches!(
+            VirtioPciEndpoint::new(
+                identity,
+                &[],
+                UnsupportedVirtioDeviceConfig,
+                NoopVirtioDeviceActivation,
+                false,
+                &bar,
+                registry_resources(1).registry(),
+            ),
+            Err(VirtioPciEndpointError::QueueInitialization { .. })
+        ));
+        assert!(matches!(
+            VirtioPciEndpoint::new(
+                identity,
+                &[8],
+                UnsupportedVirtioDeviceConfig,
+                NoopVirtioDeviceActivation,
+                false,
+                &bar,
+                registry_resources(1).registry(),
+            ),
+            Err(VirtioPciEndpointError::MessageRouteCount {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert!(matches!(
+            VirtioPciEndpoint::new(
+                identity,
+                &vec![1; VIRTIO_PCI_MAX_MSIX_VECTORS],
+                UnsupportedVirtioDeviceConfig,
+                NoopVirtioDeviceActivation,
+                false,
+                &bar,
+                registry_resources(1).registry(),
+            ),
+            Err(VirtioPciEndpointError::TooManyVectors { vector_count })
+                if vector_count == VIRTIO_PCI_MAX_MSIX_VECTORS + 1
+        ));
+
+        let small_bar = allocator
+            .allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE / 2)
+            .unwrap();
+        assert!(matches!(
+            VirtioPciEndpoint::new(
+                identity,
+                &[8],
+                UnsupportedVirtioDeviceConfig,
+                NoopVirtioDeviceActivation,
+                false,
+                &small_bar,
+                registry_resources(2).registry(),
+            ),
+            Err(VirtioPciEndpointError::CapabilityBarSize { .. })
+        ));
+
+        let range32 = GuestMemoryRange::new(
+            GuestAddress::new(0x6000_0000),
+            VIRTIO_PCI_CAPABILITY_BAR_SIZE,
+        )
+        .unwrap();
+        let mut allocator32 = PciBarAllocator::new(PciBarAddressSpace::Memory32, range32);
+        let bar32 = allocator32
+            .allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+            .unwrap();
+        assert!(matches!(
+            VirtioPciEndpoint::new(
+                identity,
+                &[8],
+                UnsupportedVirtioDeviceConfig,
+                NoopVirtioDeviceActivation,
+                false,
+                &bar32,
+                registry_resources(2).registry(),
+            ),
+            Err(VirtioPciEndpointError::CapabilityBarAddressSpace {
+                actual: PciBarAddressSpace::Memory32
+            })
+        ));
+
+        let released_registry = registry_resources(2).registry();
+        released_registry.release().unwrap();
+        assert!(matches!(
+            VirtioPciEndpoint::new(
+                identity,
+                &[8],
+                UnsupportedVirtioDeviceConfig,
+                NoopVirtioDeviceActivation,
+                false,
+                &bar,
+                released_registry,
+            ),
+            Err(VirtioPciEndpointError::MessageRegistry {
+                source: GuestMessageInterruptRegistryError::NotActive {
+                    phase: GuestMessageInterruptRegistryPhase::Released
+                }
+            })
+        ));
+    }
+
+    #[test]
     fn common_config_negotiates_queues_activates_and_records_notifications() {
         let fixture = fixture(&[8]);
         let bus = bar_bus(&fixture);
@@ -2866,6 +2999,101 @@ mod tests {
             .trigger(VirtioInterruptIntent::Configuration)
             .unwrap();
         assert_eq!(fixture.signals[0].lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn msix_function_mask_and_disable_retain_pending_delivery_until_reenabled() {
+        let fixture = fixture(&[8]);
+        let bus = bar_bus(&fixture);
+        let base = fixture.bar.range().start();
+        let mut bar = fixture.endpoint.bar_handler();
+        let mut config = fixture.endpoint.config_function();
+        let message = fixture.messages[0];
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &message.address().to_le_bytes(),
+        )
+        .unwrap();
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET + 8,
+            &u64::from(message.data()).to_le_bytes(),
+        )
+        .unwrap();
+        bar_write(&mut bar, &bus, base, 0x10, &0_u16.to_le_bytes()).unwrap();
+
+        config_write(&mut config, 0x9a, &0xc001_u16.to_le_bytes());
+        fixture
+            .endpoint
+            .trigger(VirtioInterruptIntent::Configuration)
+            .unwrap();
+        assert!(fixture.signals[0].lock().unwrap().is_empty());
+        assert_eq!(
+            u64::from_le_bytes(
+                bar_read(&mut bar, &bus, base, VIRTIO_PCI_MSIX_PBA_OFFSET, 8)
+                    .try_into()
+                    .unwrap()
+            ),
+            1
+        );
+
+        config_write(&mut config, 0x9a, &0x8001_u16.to_le_bytes());
+        assert_eq!(fixture.signals[0].lock().unwrap().as_slice(), [message]);
+        assert_eq!(
+            u64::from_le_bytes(
+                bar_read(&mut bar, &bus, base, VIRTIO_PCI_MSIX_PBA_OFFSET, 8)
+                    .try_into()
+                    .unwrap()
+            ),
+            0
+        );
+
+        config_write(&mut config, 0x9a, &0x0001_u16.to_le_bytes());
+        fixture
+            .endpoint
+            .trigger(VirtioInterruptIntent::Configuration)
+            .unwrap();
+        assert_eq!(fixture.signals[0].lock().unwrap().len(), 1);
+        assert_eq!(
+            u64::from_le_bytes(
+                bar_read(&mut bar, &bus, base, VIRTIO_PCI_MSIX_PBA_OFFSET, 8)
+                    .try_into()
+                    .unwrap()
+            ),
+            1
+        );
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_PBA_OFFSET,
+            &u64::MAX.to_le_bytes(),
+        )
+        .expect("PBA writes should be ignored");
+        assert_eq!(
+            u64::from_le_bytes(
+                bar_read(&mut bar, &bus, base, VIRTIO_PCI_MSIX_PBA_OFFSET, 8)
+                    .try_into()
+                    .unwrap()
+            ),
+            1
+        );
+
+        config_write(&mut config, 0x9a, &0x8001_u16.to_le_bytes());
+        assert_eq!(fixture.signals[0].lock().unwrap().as_slice(), [message; 2]);
+        assert_eq!(
+            u64::from_le_bytes(
+                bar_read(&mut bar, &bus, base, VIRTIO_PCI_MSIX_PBA_OFFSET, 8)
+                    .try_into()
+                    .unwrap()
+            ),
+            0
+        );
     }
 
     #[test]
@@ -3129,6 +3357,61 @@ mod tests {
     }
 
     #[test]
+    fn draining_interrupt_intents_preserves_valid_delivery_before_a_later_error() {
+        let fixture = fixture(&[8]);
+        let bus = bar_bus(&fixture);
+        let base = fixture.bar.range().start();
+        let mut bar = fixture.endpoint.bar_handler();
+        let message = fixture.messages[0];
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &message.address().to_le_bytes(),
+        )
+        .unwrap();
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET + 8,
+            &u64::from(message.data()).to_le_bytes(),
+        )
+        .unwrap();
+        bar_write(&mut bar, &bus, base, 0x10, &0_u16.to_le_bytes()).unwrap();
+        let mut config = fixture.endpoint.config_function();
+        config_write(&mut config, 0x9a, &0x8001_u16.to_le_bytes());
+        {
+            let mut state = fixture.endpoint.inner.state.lock().unwrap();
+            state
+                .core
+                .record_interrupt_intent(VirtioInterruptIntent::Configuration);
+            state
+                .core
+                .record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 9 });
+        }
+
+        let error = fixture
+            .endpoint
+            .drain_interrupt_intents()
+            .expect_err("invalid queue intent should remain a typed error");
+        assert!(matches!(
+            error,
+            VirtioPciEndpointError::InvalidQueueIndex {
+                queue_index: 9,
+                queue_count: 1
+            }
+        ));
+        assert_eq!(fixture.signals[0].lock().unwrap().as_slice(), [message]);
+        fixture
+            .endpoint
+            .drain_interrupt_intents()
+            .expect("drained intents should not repeat");
+        assert_eq!(fixture.signals[0].lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn publication_teardown_unpublishes_paths_before_reusing_leases() {
         let capacity = GuestMemoryRange::new(
             GuestAddress::new(0x2_0000_0000),
@@ -3175,6 +3458,97 @@ mod tests {
             .allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE)
             .expect("released BAR should be reusable");
         assert_eq!(reused.range(), published_range);
+    }
+
+    #[test]
+    fn publication_teardown_reserves_the_slot_until_admitted_work_drains() {
+        let capacity = GuestMemoryRange::new(
+            GuestAddress::new(0x2_1000_0000),
+            VIRTIO_PCI_CAPABILITY_BAR_SIZE,
+        )
+        .unwrap();
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, capacity);
+        let segment = SharedPciSegment::new(crate::pci::PciSegment::new());
+        let mut dispatcher = MmioDispatcher::new();
+        let mut published = PublishedVirtioPciEndpoint::publish(
+            VirtioPciIdentity::new(VirtioDeviceType::new(4).unwrap(), 0),
+            &[8],
+            UnsupportedVirtioDeviceConfig,
+            NoopVirtioDeviceActivation,
+            false,
+            &mut allocator,
+            segment.clone(),
+            &mut dispatcher,
+            crate::mmio::MmioRegionId::new(93),
+            registry_resources(2),
+        )
+        .expect("endpoint publication should succeed");
+        let sbdf = published
+            .function_lease
+            .as_ref()
+            .expect("published endpoint should retain its function lease")
+            .sbdf();
+        let endpoint = published.endpoint().clone();
+        let work = endpoint
+            .admit_device_work()
+            .expect("published endpoint should admit device work");
+
+        thread::scope(|scope| {
+            let teardown = scope.spawn(|| published.teardown(&mut dispatcher, &mut allocator));
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let guest_path_unpublished = loop {
+                let unpublished = segment
+                    .with_segment(|segment| segment.function_count() == 1)
+                    .expect("test PCI segment should remain available");
+                if unpublished || Instant::now() >= deadline {
+                    break unpublished;
+                }
+                thread::yield_now();
+            };
+            assert!(
+                guest_path_unpublished,
+                "teardown should remove the ECAM path before waiting for work"
+            );
+
+            let replacement = PciType0Configuration::new(
+                0x0042,
+                0,
+                0,
+                PciClassCode::Unclassified,
+                0,
+                0,
+                0x0042,
+                0,
+            );
+            assert!(matches!(
+                segment
+                    .with_segment(|segment| segment.add_function_at(sbdf, replacement))
+                    .expect("test PCI segment should remain available"),
+                Err(PciSegmentError::DuplicateIdentity { sbdf: duplicate }) if duplicate == sbdf
+            ));
+            assert!(
+                !teardown.is_finished(),
+                "teardown must wait for already admitted device work"
+            );
+            work.trigger(VirtioInterruptIntent::Configuration)
+                .expect("already admitted work should complete after guest unpublication");
+            drop(work);
+            teardown
+                .join()
+                .expect("teardown thread should finish")
+                .expect("teardown should succeed after work drains");
+        });
+
+        let replacement =
+            PciType0Configuration::new(0x0042, 0, 0, PciClassCode::Unclassified, 0, 0, 0x0042, 0);
+        let replacement_lease = segment
+            .with_segment(|segment| segment.add_function_at(sbdf, replacement))
+            .expect("test PCI segment should remain available")
+            .expect("slot should become reusable only after teardown completes");
+        segment
+            .with_segment(|segment| segment.remove_function(&replacement_lease))
+            .expect("test PCI segment should remain available")
+            .expect("replacement slot should release");
     }
 
     #[test]

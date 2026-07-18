@@ -948,7 +948,7 @@ impl PciSegment {
         function: impl PciConfigFunction + 'static,
     ) -> Result<PciFunctionLease, PciSegmentError> {
         let device = (PCI_FIRST_ENDPOINT_DEVICE..=PCI_LAST_ENDPOINT_DEVICE)
-            .find(|device| !self.functions.contains_key(device))
+            .find(|device| !self.records.contains_key(device))
             .ok_or(PciSegmentError::NoDeviceSlot)?;
         let sbdf = PciSbdf::new(PCI_SEGMENT_ZERO, PCI_BUS_ZERO, device, PCI_FUNCTION_ZERO)
             .map_err(|source| PciSegmentError::InvalidIdentity { source })?;
@@ -967,7 +967,8 @@ impl PciSegment {
         {
             return Err(PciSegmentError::UnsupportedIdentity { sbdf });
         }
-        if self.functions.contains_key(&sbdf.device()) {
+        if self.functions.contains_key(&sbdf.device()) || self.records.contains_key(&sbdf.device())
+        {
             return Err(PciSegmentError::DuplicateIdentity { sbdf });
         }
         let next_generation = self
@@ -993,6 +994,18 @@ impl PciSegment {
         &mut self,
         lease: &PciFunctionLease,
     ) -> Result<(), PciFunctionReleaseError> {
+        self.unpublish_function(lease)?;
+        self.release_function_lease(lease)
+    }
+
+    /// Makes a leased function unreachable through ECAM while retaining its slot.
+    ///
+    /// The retained lease prevents a replacement function from reusing the
+    /// same SBDF until device work and interrupt resources have drained.
+    pub fn unpublish_function(
+        &mut self,
+        lease: &PciFunctionLease,
+    ) -> Result<(), PciFunctionReleaseError> {
         if !Arc::ptr_eq(&self.provenance, &lease.segment) {
             return Err(PciFunctionReleaseError::WrongSegment);
         }
@@ -1006,6 +1019,26 @@ impl PciSegment {
             return Err(PciFunctionReleaseError::LeaseMismatch { sbdf: lease.sbdf });
         }
         self.functions.remove(&device);
+        Ok(())
+    }
+
+    /// Returns a previously unpublished function slot to the segment.
+    pub fn release_function_lease(
+        &mut self,
+        lease: &PciFunctionLease,
+    ) -> Result<(), PciFunctionReleaseError> {
+        if !Arc::ptr_eq(&self.provenance, &lease.segment) {
+            return Err(PciFunctionReleaseError::WrongSegment);
+        }
+        let device = lease.sbdf.device();
+        let record = self
+            .records
+            .get(&device)
+            .copied()
+            .ok_or(PciFunctionReleaseError::StaleLease { sbdf: lease.sbdf })?;
+        if record.generation != lease.generation || self.functions.contains_key(&device) {
+            return Err(PciFunctionReleaseError::LeaseMismatch { sbdf: lease.sbdf });
+        }
         self.records.remove(&device);
         Ok(())
     }
@@ -1787,6 +1820,47 @@ mod tests {
             .add_function(endpoint(0x1af4, 0x10ff))
             .expect("released PCI function slot should be reused");
         assert_eq!(reused.sbdf().device(), 8);
+    }
+
+    #[test]
+    fn segment_unpublishes_before_releasing_a_reserved_slot() {
+        let mut segment = PciSegment::new();
+        let lease = segment
+            .add_function(endpoint(0x1af4, 0x10ff))
+            .expect("test endpoint should insert");
+        let sbdf = lease.sbdf();
+
+        segment
+            .unpublish_function(&lease)
+            .expect("test endpoint should become unreachable");
+        assert_eq!(segment.function_count(), 1);
+        assert_eq!(
+            read_ecam_u32(&mut segment, u64::from(sbdf.ecam_offset())),
+            u32::MAX
+        );
+        assert!(matches!(
+            segment.add_function_at(sbdf, endpoint(0x1af4, 0x10ff)),
+            Err(PciSegmentError::DuplicateIdentity { sbdf: duplicate }) if duplicate == sbdf
+        ));
+        let next = segment
+            .add_function(endpoint(0x1af4, 0x10ff))
+            .expect("reserved slot should be skipped by automatic allocation");
+        assert_eq!(next.sbdf().device(), sbdf.device() + 1);
+        segment
+            .remove_function(&next)
+            .expect("temporary next slot should release");
+        assert_eq!(
+            segment.remove_function(&lease),
+            Err(PciFunctionReleaseError::LeaseMismatch { sbdf })
+        );
+
+        segment
+            .release_function_lease(&lease)
+            .expect("unpublished slot should release");
+        let replacement = segment
+            .add_function_at(sbdf, endpoint(0x1af4, 0x10ff))
+            .expect("released slot should be reusable");
+        assert_eq!(replacement.sbdf(), sbdf);
     }
 
     #[test]
