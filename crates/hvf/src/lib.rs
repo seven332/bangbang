@@ -45,10 +45,12 @@ pub use gic::{
     HvfArm64GicIccRegister, HvfArm64GicIccRegisterRestoreError,
     HvfArm64GicIccRegisterRestoreOperation, HvfArm64GicIccRegisterState, HvfGicDeviceState,
     HvfGicError, HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata,
-    HvfGicMsiConfiguration, HvfGicMsiInterrupt, HvfGicMsiInterruptAllocationError,
-    HvfGicMsiInterruptAllocator, HvfGicMsiMetadata, HvfGicMsiSignalError, HvfGicMsiSignaler,
-    HvfGicRedistributor, HvfGicRegion, HvfGicSpiSignalError, HvfGicSpiSignaler,
-    HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
+    HvfGicMsiConfiguration, HvfGicMsiDeviceInterruptResourceError,
+    HvfGicMsiDeviceInterruptResources, HvfGicMsiInterrupt, HvfGicMsiInterruptAllocationError,
+    HvfGicMsiInterruptAllocator, HvfGicMsiInterruptReleaseError, HvfGicMsiMetadata, HvfGicMsiRoute,
+    HvfGicMsiSignalError, HvfGicMsiSignaler, HvfGicRedistributor, HvfGicRegion,
+    HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicTimerInterrupts,
+    HvfInterruptLineAllocationError,
 };
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
@@ -87,6 +89,8 @@ pub use startup::{
     HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugDeviceConfig,
     HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatch,
     HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootNetworkNotificationDispatches,
+    HvfArm64BootPciValidationDiagnostics, HvfArm64BootPciValidationError,
+    HvfArm64BootPciValidationTeardownError, HvfArm64BootPciValidationTeardownEvidence,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSession,
     HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootSessionShutdownError,

@@ -2,7 +2,6 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
@@ -782,8 +781,11 @@ impl VirtioRngDevice {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn dispatch_drained_queue_notifications(
+    /// Dispatches queue indices already drained by any virtio transport.
+    ///
+    /// The caller remains responsible for translating the returned queue
+    /// interrupt intent through its transport-specific interrupt mechanism.
+    pub fn dispatch_drained_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
@@ -895,7 +897,7 @@ impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevic
                 .is_some_and(VirtioRngQueueDispatch::needs_queue_interrupt),
         };
         if needs_queue_interrupt {
-            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+            self.mark_queue_interrupt_pending(0);
         }
 
         dispatch

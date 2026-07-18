@@ -13,7 +13,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
 };
@@ -8699,19 +8698,29 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioVsockD
         let dispatch = self
             .activation_handler_mut()
             .dispatch_drained_queue_notifications_at(memory, drained_notifications, now);
-        let needs_queue_interrupt = match &dispatch {
-            Ok(dispatch) => dispatch.needs_queue_interrupt(),
-            Err(error) => {
+        let (rx_interrupt, tx_interrupt) = match &dispatch {
+            Ok(dispatch) => (
+                dispatch
+                    .rx_queue_dispatch()
+                    .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt),
+                dispatch
+                    .tx_queue_dispatch()
+                    .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt),
+            ),
+            Err(error) => (
+                error
+                    .completed_rx_dispatch()
+                    .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt),
                 error
                     .completed_tx_dispatch()
-                    .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt)
-                    || error
-                        .completed_rx_dispatch()
-                        .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt)
-            }
+                    .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt),
+            ),
         };
-        if needs_queue_interrupt {
-            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        if rx_interrupt && let Ok(queue_index) = u16::try_from(VIRTIO_VSOCK_RX_QUEUE_INDEX) {
+            self.mark_queue_interrupt_pending(queue_index);
+        }
+        if tx_interrupt && let Ok(queue_index) = u16::try_from(VIRTIO_VSOCK_TX_QUEUE_INDEX) {
+            self.mark_queue_interrupt_pending(queue_index);
         }
 
         dispatch

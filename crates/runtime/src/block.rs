@@ -11,7 +11,6 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
 };
@@ -4620,7 +4619,7 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockD
                 .is_some_and(VirtioBlockQueueDispatch::needs_queue_interrupt),
         };
         if needs_queue_interrupt {
-            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+            self.mark_queue_interrupt_pending(0);
         }
 
         dispatch
@@ -4650,7 +4649,7 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
         self.activation_handler_mut().refresh_backing(backing);
         *self.device_config_handler_mut() = config_space;
         self.increment_config_generation();
-        self.mark_interrupt_pending(DeviceInterruptKind::Config);
+        self.mark_config_interrupt_pending();
     }
 
     pub fn update_block_rate_limiter(&mut self, rate_limiter: DriveRateLimiterConfig) {

@@ -65,9 +65,10 @@ test must parse the pre-run FDT, require one hardware-described
 Firecracker kernel, and match Linux's exact GICv2m SPI range. Unit tests must
 cover opt-in/default separation, dynamic-symbol loading, configuration order
 and cleanup, geometry/overlap/range validation, the 1019 guard, allocator
-exhaustion/provenance, sender serialization/errors/redaction, teardown
-revocation of retained clones, and FDT publication without raw values in
-formatted failures.
+exhaustion/provenance/generation, atomic device-vector allocation and rollback,
+exact message routing, sender serialization/errors/redaction, quiesce/drain,
+teardown revocation and deterministic reuse, and FDT publication without raw
+values in formatted failures.
 
 PCI foundation changes additionally require atomic MMIO registration/release,
 slot and BAR lease, type-0 configuration, ECAM, address-plan, FDT, and startup
@@ -79,8 +80,22 @@ through `scripts/run-integration-tests.sh --test guest_boot`, inspect the exact
 generic-ECAM node and GICv2m parent before execution, then require pinned Linux
 to enumerate both `0000:00:00.0 [8086:0d57]` and the identity-only
 `0000:00:01.0 [0042:0000]` before the normal boot marker. This is discovery
-evidence only; it is not an unsigned-test substitute or a product PCI,
-MSI/MSI-X, hotplug, or snapshot claim.
+evidence only.
+
+Modern virtio-pci changes additionally require neutral-core/MMIO regression,
+capability-chain and BAR-layout, common/device/ISR/notification access, queue
+validation, MSI-X table/PBA masking and pending, exact tuple-registry, ordered
+publication/rollback, and stale-handle teardown unit coverage. The signed
+`guest_boot` case
+`boots_firecracker_kernel_with_modern_virtio_pci_rng_and_distinct_msix_vectors`
+must run through the same wrapper. It boots the pinned Firecracker kernel,
+requires `[1af4:1044]` and the standard `virtio_rng` driver, reads a bounded
+deterministic payload from `/dev/hwrng`, and compares marker-bounded
+`/proc/interrupts` snapshots proving independent queue and configuration MSI-X
+delivery. Before VM destruction it must unpublish the endpoint and prove stale
+rejection plus exact slot, BAR, and GICv2m vector reuse. Both signed cases are
+internal conformance evidence, not unsigned-test substitutes or product PCI,
+runtime attach/delete, hotplug, or snapshot claims.
 
 Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` baseline
 that creates one VM and GIC before two permanent owner-thread runners, proves

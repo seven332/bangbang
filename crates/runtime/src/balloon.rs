@@ -3,7 +3,6 @@
 use std::collections::TryReserveError;
 use std::fmt;
 
-use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryDiscardAdviser,
     GuestMemoryDiscardOutcome, GuestMemoryError, GuestMemoryRange, SystemGuestMemoryDiscardAdviser,
@@ -4202,20 +4201,16 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
         let dispatch = self
             .activation_handler_mut()
             .dispatch_drained_queue_notifications(memory, drained_notifications);
-        let needs_queue_interrupt = match &dispatch {
-            Ok(dispatch) => dispatch.needs_queue_interrupt(),
-            Err(error) => error
-                .completed_notification_dispatch()
-                .is_some_and(VirtioBalloonDeviceNotificationDispatch::needs_queue_interrupt),
-        };
+        let queue_layout = self.activation_handler().queue_layout();
+        let queue_interrupts = balloon_queue_interrupts(&dispatch, queue_layout);
         let hinting_completed_run = match &dispatch {
             Ok(dispatch) => dispatch.hinting_completed_run(),
             Err(error) => error
                 .completed_notification_dispatch()
                 .is_some_and(VirtioBalloonDeviceNotificationDispatch::hinting_completed_run),
         };
-        if needs_queue_interrupt {
-            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        for queue_index in queue_interrupts {
+            self.mark_queue_interrupt_pending(queue_index);
         }
         if hinting_completed_run
             && let Some(cmd_id) = self
@@ -4241,8 +4236,14 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
                 .completed_notification_dispatch()
                 .is_some_and(VirtioBalloonDeviceNotificationDispatch::needs_queue_interrupt),
         };
-        if needs_queue_interrupt {
-            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        if needs_queue_interrupt
+            && let Some(queue_index) = self
+                .activation_handler()
+                .queue_layout()
+                .statistics()
+                .and_then(|queue| u16::try_from(queue.index()).ok())
+        {
+            self.mark_queue_interrupt_pending(queue_index);
         }
 
         dispatch
@@ -4258,7 +4259,7 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
         let config_space = self.device_config_handler().with_num_pages(num_pages);
         *self.device_config_handler_mut() = config_space;
         self.increment_config_generation();
-        self.mark_interrupt_pending(DeviceInterruptKind::Config);
+        self.mark_config_interrupt_pending();
 
         Ok(())
     }
@@ -4277,8 +4278,47 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
             .with_free_page_hint_cmd_id(cmd_id);
         *self.device_config_handler_mut() = config_space;
         self.increment_config_generation();
-        self.mark_interrupt_pending(DeviceInterruptKind::Config);
+        self.mark_config_interrupt_pending();
     }
+}
+
+fn balloon_queue_interrupts(
+    dispatch: &Result<
+        VirtioBalloonDeviceNotificationDispatch,
+        VirtioBalloonDeviceNotificationError,
+    >,
+    layout: VirtioBalloonQueueLayout,
+) -> Vec<u16> {
+    let completed = match dispatch {
+        Ok(dispatch) => Some(dispatch),
+        Err(error) => error.completed_notification_dispatch(),
+    };
+    let Some(completed) = completed else {
+        return Vec::new();
+    };
+    let candidates = [
+        (Some(layout.inflate()), completed.inflate_queue_dispatch()),
+        (Some(layout.deflate()), completed.deflate_queue_dispatch()),
+        (layout.statistics(), completed.statistics_queue_dispatch()),
+        (
+            layout.free_page_hinting(),
+            completed.hinting_queue_dispatch(),
+        ),
+        (
+            layout.free_page_reporting(),
+            completed.reporting_queue_dispatch(),
+        ),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(|(queue, dispatch)| {
+            dispatch
+                .is_some_and(VirtioBalloonQueueDispatch::needs_queue_interrupt)
+                .then_some(queue)
+                .flatten()
+        })
+        .filter_map(|queue| u16::try_from(queue.index()).ok())
+        .collect()
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioBalloonDevice {

@@ -3,7 +3,6 @@
 use std::collections::TryReserveError;
 use std::fmt;
 
-use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange, aarch64,
 };
@@ -2462,7 +2461,7 @@ impl VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice> {
                 .is_some_and(VirtioMemQueueDispatch::needs_queue_interrupt),
         };
         if needs_queue_interrupt {
-            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+            self.mark_queue_interrupt_pending(0);
         }
 
         dispatch
@@ -2477,7 +2476,7 @@ impl VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice> {
             .updated_requested_size(update)?;
         *self.device_config_handler_mut() = config_space;
         self.increment_config_generation();
-        self.mark_interrupt_pending(DeviceInterruptKind::Config);
+        self.mark_config_interrupt_pending();
 
         Ok(())
     }
@@ -3020,6 +3019,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange};
     use crate::mmio::{MmioAccess, MmioBus, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{

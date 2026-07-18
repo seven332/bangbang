@@ -1,6 +1,7 @@
 //! Backend-neutral virtio-mmio register access decoding.
 
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 
 use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatus, DeviceInterruptStatusError};
 use crate::memory::GuestAddress;
@@ -8,6 +9,7 @@ use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError,
     MmioOperation, MmioOperationError, MmioOperationKind,
 };
+use crate::virtio::{VirtioDeviceCore, VirtioInterruptIntent};
 use crate::virtio_queue::{
     VIRTQUEUE_AVAILABLE_RING_ALIGNMENT, VIRTQUEUE_DESCRIPTOR_ALIGNMENT,
     VIRTQUEUE_USED_RING_ALIGNMENT,
@@ -233,7 +235,7 @@ impl VirtioMmioDeviceRegisters {
         self.status = VIRTIO_DEVICE_STATUS_INIT;
     }
 
-    fn mark_device_needs_reset(&mut self) {
+    pub(crate) fn mark_device_needs_reset(&mut self) {
         self.status |= VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET;
     }
 
@@ -1444,7 +1446,19 @@ pub trait VirtioMmioDeviceActivationHandler: fmt::Debug + Send {
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMmioDeviceActivationError>;
 
+    /// Reset backend-owned device state.
+    ///
+    /// Existing stateless and reset-capable handlers use the default successful
+    /// outcome. A transport that must distinguish an active backend without a
+    /// reset implementation can override [`Self::reset_outcome`].
     fn reset(&mut self) {}
+
+    fn reset_outcome(
+        &mut self,
+    ) -> Result<VirtioMmioDeviceResetOutcome, VirtioMmioDeviceResetError> {
+        self.reset();
+        Ok(VirtioMmioDeviceResetOutcome::Reset)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1456,6 +1470,39 @@ impl VirtioMmioDeviceActivationHandler for NoopVirtioMmioDeviceActivation {
         _activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMmioDeviceActivationError> {
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioMmioDeviceResetOutcome {
+    Reset,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtioMmioDeviceResetError {
+    Handler { source: MmioHandlerError },
+}
+
+impl From<MmioHandlerError> for VirtioMmioDeviceResetError {
+    fn from(source: MmioHandlerError) -> Self {
+        Self::Handler { source }
+    }
+}
+
+impl fmt::Display for VirtioMmioDeviceResetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Handler { source } => write!(f, "virtio device reset failed: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioMmioDeviceResetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Handler { source } => Some(source),
+        }
     }
 }
 
@@ -1493,14 +1540,22 @@ pub struct VirtioMmioRegisterHandler<
     C = UnsupportedVirtioMmioDeviceConfig,
     A = NoopVirtioMmioDeviceActivation,
 > {
-    device: VirtioMmioDeviceRegisters,
-    queues: VirtioMmioQueueRegisters,
-    queue_notifications: VirtioMmioQueueNotificationRegisters,
+    core: VirtioDeviceCore<C, A>,
     interrupts: VirtioMmioInterruptRegisters,
-    device_config: C,
-    activation: A,
-    device_activated: bool,
-    requires_device_config_write_status: bool,
+}
+
+impl<C, A> Deref for VirtioMmioRegisterHandler<C, A> {
+    type Target = VirtioDeviceCore<C, A>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl<C, A> DerefMut for VirtioMmioRegisterHandler<C, A> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1719,33 +1774,43 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
                 VirtioMmioRegisterHandlerError::QueueNotificationInitialization { source }
             })?;
 
+        let device = VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(
+            identity.device_id,
+            identity.vendor_id,
+            identity.device_features,
+            identity.config_generation,
+        );
         Ok(Self {
-            device: VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(
-                identity.device_id,
-                identity.vendor_id,
-                identity.device_features,
-                identity.config_generation,
+            core: VirtioDeviceCore::from_parts(
+                device,
+                queues,
+                queue_notifications,
+                device_config,
+                activation,
+                requires_device_config_write_status,
             ),
-            queues,
-            queue_notifications,
             interrupts: VirtioMmioInterruptRegisters::new(),
-            device_config,
-            activation,
-            device_activated: false,
-            requires_device_config_write_status,
         })
     }
 
+    pub const fn core(&self) -> &VirtioDeviceCore<C, A> {
+        &self.core
+    }
+
     pub const fn device_registers(&self) -> &VirtioMmioDeviceRegisters {
-        &self.device
+        &self.core.device
+    }
+
+    pub fn core_mut(&mut self) -> &mut VirtioDeviceCore<C, A> {
+        &mut self.core
     }
 
     pub const fn queue_registers(&self) -> &VirtioMmioQueueRegisters {
-        &self.queues
+        &self.core.queues
     }
 
     pub const fn queue_notification_registers(&self) -> &VirtioMmioQueueNotificationRegisters {
-        &self.queue_notifications
+        &self.core.queue_notifications
     }
 
     pub fn is_queue_notification_pending(
@@ -1773,7 +1838,7 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
     }
 
     pub const fn device_config_handler(&self) -> &C {
-        &self.device_config
+        &self.core.device_config
     }
 
     pub(crate) fn device_config_handler_mut(&mut self) -> &mut C {
@@ -1781,7 +1846,7 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
     }
 
     pub const fn activation_handler(&self) -> &A {
-        &self.activation
+        &self.core.activation
     }
 
     pub(crate) fn activation_handler_mut(&mut self) -> &mut A {
@@ -1789,7 +1854,7 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
     }
 
     pub const fn is_device_activated(&self) -> bool {
-        self.device_activated
+        self.core.device_activated
     }
 
     pub fn increment_config_generation(&mut self) {
@@ -1798,6 +1863,18 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
 
     pub fn mark_interrupt_pending(&mut self, kind: DeviceInterruptKind) {
         self.interrupts.mark_pending(kind);
+    }
+
+    pub fn mark_queue_interrupt_pending(&mut self, queue_index: u16) {
+        self.core
+            .record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index });
+        self.interrupts.mark_pending(DeviceInterruptKind::Queue);
+    }
+
+    pub fn mark_config_interrupt_pending(&mut self) {
+        self.core
+            .record_interrupt_intent(VirtioInterruptIntent::Configuration);
+        self.interrupts.mark_pending(DeviceInterruptKind::Config);
     }
 
     pub fn transport_state(&self) -> VirtioMmioTransportState {
@@ -1818,18 +1895,20 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
     ) -> Result<(), VirtioMmioTransportStateError> {
         self.validate_transport_state(state, activation_is_active)?;
 
-        self.device = state.device;
-        self.queues = VirtioMmioQueueRegisters {
-            queue_select: state.queue_select,
-            queues: state.queues.clone(),
-        };
-        self.queue_notifications = VirtioMmioQueueNotificationRegisters {
-            pending_notifications: state.pending_notifications.clone(),
-        };
+        self.core.replace_common_state(
+            state.device,
+            VirtioMmioQueueRegisters {
+                queue_select: state.queue_select,
+                queues: state.queues.clone(),
+            },
+            VirtioMmioQueueNotificationRegisters {
+                pending_notifications: state.pending_notifications.clone(),
+            },
+            state.device_activated,
+        );
         self.interrupts = VirtioMmioInterruptRegisters {
             pending_status: state.interrupt_status,
         };
-        self.device_activated = state.device_activated;
         Ok(())
     }
 
@@ -1926,6 +2005,7 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
         register: VirtioMmioRegister,
         value: u32,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        let status = self.core.device.status();
         match register {
             VirtioMmioRegister::DeviceFeaturesSel
             | VirtioMmioRegister::DriverFeatures
@@ -1940,8 +2020,9 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
             | VirtioMmioRegister::QueueDriverHigh
             | VirtioMmioRegister::QueueDeviceLow
             | VirtioMmioRegister::QueueDeviceHigh => self
+                .core
                 .queues
-                .write_register(register, value, self.device.status())
+                .write_register(register, value, status)
                 .map_err(
                     |source| VirtioMmioRegisterHandlerError::QueueRegisterWrite {
                         register,
@@ -1949,8 +2030,9 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
                     },
                 ),
             VirtioMmioRegister::QueueNotify => self
+                .core
                 .queue_notifications
-                .write_register(register, value, self.device.status())
+                .write_register(register, value, status)
                 .map_err(
                     |source| VirtioMmioRegisterHandlerError::QueueNotificationWrite {
                         register,
@@ -1985,11 +2067,8 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
     }
 
     fn reset_active_state(&mut self) {
-        self.queues.reset();
-        self.queue_notifications.reset();
         self.interrupts.reset();
-        self.device_activated = false;
-        self.activation.reset();
+        self.core.reset_common_state();
     }
 
     fn write_device_register(
@@ -2018,16 +2097,17 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
     }
 
     fn activate_device(&mut self) -> Result<(), VirtioMmioRegisterHandlerError> {
-        let activation = VirtioMmioDeviceActivation::new(&self.device, &self.queues);
-        match self.activation.activate(activation) {
+        let core = &mut self.core;
+        let activation = VirtioMmioDeviceActivation::new(&core.device, &core.queues);
+        match core.activation.activate(activation) {
             Ok(()) => {
-                self.device_activated = true;
+                core.device_activated = true;
                 Ok(())
             }
             Err(source) => {
-                self.device.mark_device_needs_reset();
+                core.device.mark_device_needs_reset();
                 Err(VirtioMmioRegisterHandlerError::DeviceActivation {
-                    status: self.device.status(),
+                    status: core.device.status(),
                     source,
                 })
             }
@@ -2583,6 +2663,14 @@ pub struct VirtioMmioDeviceConfigAccess {
 }
 
 impl VirtioMmioDeviceConfigAccess {
+    pub(crate) const fn from_transport_parts(
+        kind: MmioOperationKind,
+        offset: u64,
+        len: usize,
+    ) -> Self {
+        Self { kind, offset, len }
+    }
+
     pub const fn kind(self) -> MmioOperationKind {
         self.kind
     }

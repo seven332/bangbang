@@ -13,6 +13,7 @@ pub mod machine;
 pub mod memory;
 pub mod memory_dirty;
 pub mod memory_hotplug;
+pub mod message_interrupt;
 pub mod metrics;
 pub mod mmds;
 pub mod mmio;
@@ -30,7 +31,9 @@ pub mod snapshot_format;
 pub mod snapshot_memory;
 pub mod startup;
 pub(crate) mod token_bucket;
+pub mod virtio;
 pub mod virtio_mmio;
+pub mod virtio_pci;
 pub mod virtio_queue;
 pub mod vsock;
 

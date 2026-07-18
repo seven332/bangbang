@@ -28,14 +28,30 @@ SMP_HOTPLUG_QUIESCENCE_ITERATIONS = 4095
 ROOTFS_OS_RELEASE_READ_SIZE = 256
 CMDLINE_BEGIN_MARKER = b"BANGBANG_CMDLINE_BEGIN\n"
 CMDLINE_END_MARKER = b"BANGBANG_CMDLINE_END\n"
+VIRTIO_PCI_RNG_BOUND_MARKER = b"BANGBANG_VIRTIO_PCI_RNG_BOUND\n"
+VIRTIO_PCI_RNG_IO_MARKER = b"BANGBANG_VIRTIO_PCI_RNG_IO_OK\n"
+VIRTIO_PCI_RNG_IRQ_BEFORE_BEGIN = b"BANGBANG_VIRTIO_PCI_RNG_IRQ_BEFORE_BEGIN\n"
+VIRTIO_PCI_RNG_IRQ_BEFORE_END = b"BANGBANG_VIRTIO_PCI_RNG_IRQ_BEFORE_END\n"
+VIRTIO_PCI_RNG_IRQ_AFTER_BEGIN = b"BANGBANG_VIRTIO_PCI_RNG_IRQ_AFTER_BEGIN\n"
+VIRTIO_PCI_RNG_IRQ_AFTER_END = b"BANGBANG_VIRTIO_PCI_RNG_IRQ_AFTER_END\n"
+VIRTIO_PCI_RNG_SUCCESS_MARKER = b"BANGBANG_VIRTIO_PCI_RNG_OK\n"
+VIRTIO_PCI_RNG_FAILURE_MARKER = b"BANGBANG_VIRTIO_PCI_RNG_FAIL\n"
+VIRTIO_PCI_RNG_EXPECTED_DRIVER = b"virtio_rng"
+VIRTIO_PCI_RNG_ENTROPY_BYTE = 0xA5
+VIRTIO_PCI_RNG_READ_SIZE = 32
+VIRTIO_PCI_RNG_PROC_BUFFER_SIZE = 2048
+VIRTIO_PCI_RNG_YIELD_COUNT = 64
 DEV_TMPFS_NAME = b"devtmpfs\0"
 DEV_PATH = b"/dev\0"
 MNT_PATH = b"/mnt\0"
 PROC_FS_NAME = b"proc\0"
 PROC_PATH = b"/proc\0"
 PROC_CMDLINE_PATH = b"/proc/cmdline\0"
+PROC_INTERRUPTS_PATH = b"/proc/interrupts\0"
 SYS_FS_NAME = b"sysfs\0"
 SYS_PATH = b"/sys\0"
+VIRTIO_PCI_RNG_CURRENT_PATH = b"/sys/class/misc/hw_random/rng_current\0"
+VIRTIO_PCI_RNG_DEVICE_PATH = b"/dev/hwrng\0"
 CPU1_ONLINE_PATH = b"/sys/devices/system/cpu/cpu1/online\0"
 SQUASHFS_NAME = b"squashfs\0"
 VDA_PATH = b"/dev/vda\0"
@@ -138,6 +154,18 @@ def add_imm_32(destination: int, source: int, immediate: int) -> bytes:
     return struct.pack("<I", instruction)
 
 
+def add_imm_64(destination: int, source: int, immediate: int) -> bytes:
+    if not 0 <= immediate <= 0xFFF:
+        raise RuntimeError(f"unsupported ADD immediate: {immediate}")
+    instruction = (
+        0x91000000
+        | ((immediate & 0xFFF) << 10)
+        | (source << 5)
+        | destination
+    )
+    return struct.pack("<I", instruction)
+
+
 def sub_imm_64(destination: int, source: int, immediate: int) -> bytes:
     if not 0 <= immediate <= 0xFFF:
         raise RuntimeError(f"unsupported SUB immediate: {immediate}")
@@ -157,6 +185,11 @@ def cmp_reg_32(left: int, right: int) -> bytes:
 
 def ldr_u32(destination: int, base: int) -> bytes:
     instruction = 0xB9400000 | (base << 5) | destination
+    return struct.pack("<I", instruction)
+
+
+def ldrb_u32(destination: int, base: int) -> bytes:
+    instruction = 0x39400000 | (base << 5) | destination
     return struct.pack("<I", instruction)
 
 
@@ -510,6 +543,314 @@ def build_guest_init_elf() -> bytes:
         raise RuntimeError("guest init code size changed after address assignment")
 
     data = b"".join(data for _name, data in guest_init_data())
+    return build_guest_elf(code, data)
+
+
+def emit_mount(
+    code: Aarch64CodeBuilder,
+    source_vaddr: int,
+    target_vaddr: int,
+    filesystem_vaddr: int,
+    failure_label: str,
+) -> None:
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, source_vaddr),
+                mov_imm_64(1, target_vaddr),
+                mov_imm_64(2, filesystem_vaddr),
+                movz_64(3, 0),
+                movz_64(4, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_MOUNT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond(failure_label, AARCH64_COND_NE)
+
+
+def emit_open_and_read(
+    code: Aarch64CodeBuilder,
+    path_vaddr: int,
+    buffer_vaddr: int,
+    size: int,
+    failure_label: str,
+) -> None:
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, path_vaddr),
+                movz_64(2, 0),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond(failure_label, AARCH64_COND_MI)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(1, buffer_vaddr),
+                movz_64(2, size),
+                movz_64(8, LINUX_AARCH64_SYSCALL_READ),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond(failure_label, AARCH64_COND_EQ)
+    code.branch_cond(failure_label, AARCH64_COND_MI)
+
+
+def build_pci_rng_init_code(addresses: dict[str, int]) -> bytes:
+    code = Aarch64CodeBuilder()
+    emit_mount(
+        code,
+        addresses["devtmpfs"],
+        addresses["dev"],
+        addresses["devtmpfs"],
+        "failure",
+    )
+    emit_mount(
+        code,
+        addresses["procfs"],
+        addresses["proc"],
+        addresses["procfs"],
+        "failure",
+    )
+    emit_mount(
+        code,
+        addresses["sysfs"],
+        addresses["sys"],
+        addresses["sysfs"],
+        "failure",
+    )
+
+    emit_open_and_read(
+        code,
+        addresses["rng_current_path"],
+        addresses["rng_current_buffer"],
+        32,
+        "failure",
+    )
+    code.emit(mov_imm_64(20, addresses["rng_current_buffer"]))
+    for expected in VIRTIO_PCI_RNG_EXPECTED_DRIVER:
+        code.emit(
+            b"".join(
+                (
+                    ldrb_u32(21, 20),
+                    movz_64(22, expected),
+                    cmp_reg_32(21, 22),
+                )
+            )
+        )
+        code.branch_cond("failure", AARCH64_COND_NE)
+        code.emit(add_imm_64(20, 20, 1))
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["bound_marker"],
+            len(VIRTIO_PCI_RNG_BOUND_MARKER),
+        )
+    )
+
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["irq_before_begin"],
+            len(VIRTIO_PCI_RNG_IRQ_BEFORE_BEGIN),
+        )
+    )
+    emit_open_and_read(
+        code,
+        addresses["proc_interrupts_path"],
+        addresses["irq_before_buffer"],
+        VIRTIO_PCI_RNG_PROC_BUFFER_SIZE,
+        "failure",
+    )
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["irq_before_buffer"],
+            VIRTIO_PCI_RNG_PROC_BUFFER_SIZE,
+        )
+    )
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["irq_before_end"],
+            len(VIRTIO_PCI_RNG_IRQ_BEFORE_END),
+        )
+    )
+
+    emit_open_and_read(
+        code,
+        addresses["hwrng_path"],
+        addresses["entropy_buffer"],
+        VIRTIO_PCI_RNG_READ_SIZE,
+        "failure",
+    )
+    code.emit(cmp_imm_64(0, VIRTIO_PCI_RNG_READ_SIZE))
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(20, addresses["entropy_buffer"]),
+                movz_64(21, VIRTIO_PCI_RNG_READ_SIZE),
+            )
+        )
+    )
+    code.label("check_entropy")
+    code.emit(
+        b"".join(
+            (
+                ldrb_u32(22, 20),
+                movz_64(23, VIRTIO_PCI_RNG_ENTROPY_BYTE),
+                cmp_reg_32(22, 23),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                add_imm_64(20, 20, 1),
+                sub_imm_64(21, 21, 1),
+                cmp_imm_64(21, 0),
+            )
+        )
+    )
+    code.branch_cond("check_entropy", AARCH64_COND_NE)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["io_marker"],
+            len(VIRTIO_PCI_RNG_IO_MARKER),
+        )
+    )
+
+    code.emit(movz_64(20, VIRTIO_PCI_RNG_YIELD_COUNT))
+    code.label("yield_for_config_irq")
+    code.emit(
+        b"".join(
+            (
+                movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_YIELD),
+                svc_0(),
+                sub_imm_64(20, 20, 1),
+                cmp_imm_64(20, 0),
+            )
+        )
+    )
+    code.branch_cond("yield_for_config_irq", AARCH64_COND_NE)
+
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["irq_after_begin"],
+            len(VIRTIO_PCI_RNG_IRQ_AFTER_BEGIN),
+        )
+    )
+    emit_open_and_read(
+        code,
+        addresses["proc_interrupts_path"],
+        addresses["irq_after_buffer"],
+        VIRTIO_PCI_RNG_PROC_BUFFER_SIZE,
+        "failure",
+    )
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["irq_after_buffer"],
+            VIRTIO_PCI_RNG_PROC_BUFFER_SIZE,
+        )
+    )
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["irq_after_end"],
+            len(VIRTIO_PCI_RNG_IRQ_AFTER_END),
+        )
+    )
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["success_marker"],
+            len(VIRTIO_PCI_RNG_SUCCESS_MARKER),
+        )
+    )
+    code.branch("exit")
+
+    code.label("failure")
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["failure_marker"],
+            len(VIRTIO_PCI_RNG_FAILURE_MARKER),
+        )
+    )
+    code.label("exit")
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_EXIT),
+                svc_0(),
+                branch_to_self(),
+            )
+        )
+    )
+    return code.build()
+
+
+def pci_rng_init_data() -> list[tuple[str, bytes]]:
+    return [
+        ("devtmpfs", DEV_TMPFS_NAME),
+        ("dev", DEV_PATH),
+        ("procfs", PROC_FS_NAME),
+        ("proc", PROC_PATH),
+        ("sysfs", SYS_FS_NAME),
+        ("sys", SYS_PATH),
+        ("rng_current_path", VIRTIO_PCI_RNG_CURRENT_PATH),
+        ("hwrng_path", VIRTIO_PCI_RNG_DEVICE_PATH),
+        ("proc_interrupts_path", PROC_INTERRUPTS_PATH),
+        ("bound_marker", VIRTIO_PCI_RNG_BOUND_MARKER),
+        ("io_marker", VIRTIO_PCI_RNG_IO_MARKER),
+        ("irq_before_begin", VIRTIO_PCI_RNG_IRQ_BEFORE_BEGIN),
+        ("irq_before_end", VIRTIO_PCI_RNG_IRQ_BEFORE_END),
+        ("irq_after_begin", VIRTIO_PCI_RNG_IRQ_AFTER_BEGIN),
+        ("irq_after_end", VIRTIO_PCI_RNG_IRQ_AFTER_END),
+        ("success_marker", VIRTIO_PCI_RNG_SUCCESS_MARKER),
+        ("failure_marker", VIRTIO_PCI_RNG_FAILURE_MARKER),
+        ("rng_current_buffer", bytes(32)),
+        ("entropy_buffer", bytes(VIRTIO_PCI_RNG_READ_SIZE)),
+        ("irq_before_buffer", bytes(VIRTIO_PCI_RNG_PROC_BUFFER_SIZE)),
+        ("irq_after_buffer", bytes(VIRTIO_PCI_RNG_PROC_BUFFER_SIZE)),
+    ]
+
+
+def pci_rng_init_addresses(code_size: int) -> dict[str, int]:
+    addresses: dict[str, int] = {}
+    data_offset = ELF_CODE_OFFSET + code_size
+    for name, data in pci_rng_init_data():
+        addresses[name] = ELF_BASE_VADDR + data_offset
+        data_offset += len(data)
+    return addresses
+
+
+def build_pci_rng_init_elf() -> bytes:
+    placeholder_addresses = {
+        name: ELF_BASE_VADDR for name, _data in pci_rng_init_data()
+    }
+    code_size = len(build_pci_rng_init_code(placeholder_addresses))
+    addresses = pci_rng_init_addresses(code_size)
+    code = build_pci_rng_init_code(addresses)
+    if len(code) != code_size:
+        raise RuntimeError("PCI rng init code size changed after address assignment")
+    data = b"".join(data for _name, data in pci_rng_init_data())
     return build_guest_elf(code, data)
 
 
@@ -1244,6 +1585,7 @@ def cpio_entry(
 
 def build_initrd() -> bytes:
     guest_init = build_guest_init_elf()
+    pci_rng_init = build_pci_rng_init_elf()
     smp_init = build_smp_init_elf()
     smp_progress_init = build_smp_progress_init_elf()
     smp_hotplug_init = build_smp_hotplug_init_elf()
@@ -1293,7 +1635,13 @@ def build_initrd() -> bytes:
                 mode=S_IFREG | 0o755,
                 data=smp_hotplug_init,
             ),
-            cpio_entry(name="TRAILER!!!", ino=12, mode=0, nlink=1),
+            cpio_entry(
+                name="pci-rng-init",
+                ino=12,
+                mode=S_IFREG | 0o755,
+                data=pci_rng_init,
+            ),
+            cpio_entry(name="TRAILER!!!", ino=13, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -1552,6 +1900,7 @@ def validate_initrd(data: bytes) -> None:
         "smp-init",
         "smp-progress-init",
         "smp-hotplug-init",
+        "pci-rng-init",
         CPIO_TRAILER,
     ]
     if names != expected_names:
@@ -1614,6 +1963,46 @@ def validate_initrd(data: bytes) -> None:
             raise RuntimeError(
                 f"guest initrd init payload does not contain {guest_path!r}"
             )
+
+    pci_rng_init = required_entry(entries, "pci-rng-init")
+    if file_type(pci_rng_init["mode"]) != S_IFREG:
+        raise RuntimeError("guest initrd pci-rng-init entry is not a regular file")
+    pci_rng_payload = bytes(pci_rng_init["payload"])
+    if not pci_rng_payload.startswith(b"\x7fELF"):
+        raise RuntimeError("guest initrd pci-rng-init payload is not an ELF file")
+    for marker in (
+        VIRTIO_PCI_RNG_BOUND_MARKER,
+        VIRTIO_PCI_RNG_IO_MARKER,
+        VIRTIO_PCI_RNG_IRQ_BEFORE_BEGIN,
+        VIRTIO_PCI_RNG_IRQ_BEFORE_END,
+        VIRTIO_PCI_RNG_IRQ_AFTER_BEGIN,
+        VIRTIO_PCI_RNG_IRQ_AFTER_END,
+        VIRTIO_PCI_RNG_SUCCESS_MARKER,
+        VIRTIO_PCI_RNG_FAILURE_MARKER,
+    ):
+        if marker not in pci_rng_payload:
+            raise RuntimeError(
+                f"guest initrd pci-rng-init payload does not contain {marker!r}"
+            )
+    for guest_path in (
+        DEV_TMPFS_NAME,
+        DEV_PATH,
+        PROC_FS_NAME,
+        PROC_PATH,
+        SYS_FS_NAME,
+        SYS_PATH,
+        VIRTIO_PCI_RNG_CURRENT_PATH,
+        VIRTIO_PCI_RNG_DEVICE_PATH,
+        PROC_INTERRUPTS_PATH,
+    ):
+        if guest_path not in pci_rng_payload:
+            raise RuntimeError(
+                f"guest initrd pci-rng-init payload does not contain {guest_path!r}"
+            )
+    if bytes([VIRTIO_PCI_RNG_ENTROPY_BYTE]) * VIRTIO_PCI_RNG_READ_SIZE in pci_rng_payload:
+        raise RuntimeError(
+            "guest initrd pci-rng-init must validate host-provided bytes instead of embedding them"
+        )
 
     validate_reboot_init_entry(
         entries,
