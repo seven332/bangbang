@@ -3220,7 +3220,11 @@ fn tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation() {
                         );
                     }
                     Ok(HvfVcpuRunMemberOutcome::Handled(HvfVcpuRunStepOutcome::Hvc { .. })) => {
-                        reached_hvc[result.index()] = true;
+                        let index = result.index();
+                        reached_hvc[index] = true;
+                        coordinator
+                            .set_online(index, false)
+                            .expect("an idle epoch-complete member should go offline");
                     }
                     outcome => panic!("unexpected tracked member outcome: {outcome:?}"),
                 }
@@ -3271,6 +3275,11 @@ fn tracks_concurrent_guest_writes_with_exact_retry_and_bounded_cancellation() {
                     .expect("advanced epoch should be clean")
                     .is_empty()
             );
+            for index in 0..2 {
+                coordinator
+                    .set_online(index, true)
+                    .expect("an idle epoch-complete member should return online");
+            }
             if epoch_index == 0 {
                 assert_eq!(
                     coordinator.dispatch_online(),
