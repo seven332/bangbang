@@ -8545,6 +8545,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeSession {
         id: u64,
+        runtime_device_events: Vec<String>,
         pause_count: usize,
         pause_result: Option<BackendError>,
         resume_count: usize,
@@ -8614,6 +8615,7 @@ mod tests {
         const fn new(id: u64) -> Self {
             Self {
                 id,
+                runtime_device_events: Vec::new(),
                 pause_count: 0,
                 pause_result: None,
                 resume_count: 0,
@@ -8870,6 +8872,8 @@ mod tests {
         ) -> Result<(), DriveRuntimeMutationError> {
             self.block_insert_count += 1;
             self.last_block_insert = Some(prepared.drive_id().to_string());
+            self.runtime_device_events
+                .push(format!("block:insert:{}", prepared.drive_id()));
             match self.block_insert_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
@@ -8882,6 +8886,8 @@ mod tests {
         ) -> Result<(), DriveRuntimeMutationError> {
             self.block_remove_count += 1;
             self.last_block_remove = Some(drive_id.to_string());
+            self.runtime_device_events
+                .push(format!("block:remove:{drive_id}"));
             match self.block_remove_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
@@ -8896,6 +8902,8 @@ mod tests {
             self.network_insert_count += 1;
             self.last_network_insert = Some(config.iface_id().to_string());
             self.last_network_authority = Some(authority);
+            self.runtime_device_events
+                .push(format!("network:insert:{}", config.iface_id()));
             match self.network_insert_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
@@ -8908,6 +8916,8 @@ mod tests {
         ) -> Result<(), NetworkRuntimeMutationError> {
             self.network_remove_count += 1;
             self.last_network_remove = Some(iface_id.to_string());
+            self.runtime_device_events
+                .push(format!("network:remove:{iface_id}"));
             match self.network_remove_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
@@ -8942,6 +8952,8 @@ mod tests {
         ) -> Result<(), PmemRuntimeMutationError> {
             self.pmem_insert_count += 1;
             self.last_pmem_insert = Some(config.id().to_string());
+            self.runtime_device_events
+                .push(format!("pmem:insert:{}", config.id()));
             match self.pmem_insert_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
@@ -8954,6 +8966,8 @@ mod tests {
         ) -> Result<(), PmemRuntimeMutationError> {
             self.pmem_remove_count += 1;
             self.last_pmem_remove = Some(pmem_id.to_string());
+            self.runtime_device_events
+                .push(format!("pmem:remove:{pmem_id}"));
             match self.pmem_remove_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
@@ -9603,6 +9617,7 @@ mod tests {
         max_steps_sender: mpsc::Sender<usize>,
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
+        runtime_device_events: Arc<Mutex<Vec<String>>>,
         runtime_block_events: Arc<Mutex<Vec<String>>>,
         runtime_block_insert_result: Option<DriveRuntimeMutationError>,
         runtime_block_remove_result: Option<DriveRuntimeMutationError>,
@@ -9652,6 +9667,7 @@ mod tests {
                     FakeRunLoopOutcome::Terminal,
                 )]))),
                 block_device_updater: None,
+                runtime_device_events: Arc::default(),
                 runtime_block_events: Arc::default(),
                 runtime_block_insert_result: None,
                 runtime_block_remove_result: None,
@@ -9795,6 +9811,10 @@ mod tests {
 
         fn runtime_block_events(&self) -> Arc<Mutex<Vec<String>>> {
             Arc::clone(&self.runtime_block_events)
+        }
+
+        fn runtime_device_events(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.runtime_device_events)
         }
 
         fn with_runtime_block_insert_result(mut self, result: DriveRuntimeMutationError) -> Self {
@@ -9972,6 +9992,10 @@ mod tests {
             &mut self,
             prepared: PreparedBlockDevice,
         ) -> Result<(), DriveRuntimeMutationError> {
+            self.runtime_device_events
+                .lock()
+                .expect("fake runtime device events should lock")
+                .push(format!("block:insert:{}", prepared.drive_id()));
             self.runtime_block_events
                 .lock()
                 .expect("fake runtime block events should lock")
@@ -9986,6 +10010,10 @@ mod tests {
             &mut self,
             drive_id: &str,
         ) -> Result<(), DriveRuntimeMutationError> {
+            self.runtime_device_events
+                .lock()
+                .expect("fake runtime device events should lock")
+                .push(format!("block:remove:{drive_id}"));
             self.runtime_block_events
                 .lock()
                 .expect("fake runtime block events should lock")
@@ -10001,6 +10029,10 @@ mod tests {
             config: PmemConfig,
             _backing: PmemFileBacking,
         ) -> Result<(), PmemRuntimeMutationError> {
+            self.runtime_device_events
+                .lock()
+                .expect("fake runtime device events should lock")
+                .push(format!("pmem:insert:{}", config.id()));
             self.runtime_pmem_events
                 .lock()
                 .expect("fake runtime pmem events should lock")
@@ -10015,6 +10047,10 @@ mod tests {
             &mut self,
             pmem_id: &str,
         ) -> Result<(), PmemRuntimeMutationError> {
+            self.runtime_device_events
+                .lock()
+                .expect("fake runtime device events should lock")
+                .push(format!("pmem:remove:{pmem_id}"));
             self.runtime_pmem_events
                 .lock()
                 .expect("fake runtime pmem events should lock")
@@ -10030,6 +10066,10 @@ mod tests {
             config: NetworkInterfaceConfig,
             _authority: ProcessVmnetAuthority,
         ) -> Result<(), NetworkRuntimeMutationError> {
+            self.runtime_device_events
+                .lock()
+                .expect("fake runtime device events should lock")
+                .push(format!("network:insert:{}", config.iface_id()));
             self.runtime_network_events
                 .lock()
                 .expect("fake runtime network events should lock")
@@ -10044,6 +10084,10 @@ mod tests {
             &mut self,
             iface_id: &str,
         ) -> Result<(), NetworkRuntimeMutationError> {
+            self.runtime_device_events
+                .lock()
+                .expect("fake runtime device events should lock")
+                .push(format!("network:remove:{iface_id}"));
             self.runtime_network_events
                 .lock()
                 .expect("fake runtime network events should lock")
@@ -14976,6 +15020,105 @@ mod tests {
     }
 
     #[test]
+    fn boot_run_loop_supervisor_serializes_concurrent_mixed_runtime_mutations() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+        let events = session.runtime_device_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(42).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            42
+        );
+        supervisor.pause().expect("worker should pause");
+        let command_handle = supervisor.command_handle();
+
+        let block_path = TempFilePath::create("concurrent-mixed-runtime-block");
+        let block_config = DriveConfigInput::new("shared", "shared", block_path.path(), false)
+            .validate()
+            .expect("runtime block config should validate");
+        let prepared_block = PreparedBlockDevice::from_config_with_backing(&block_config, None)
+            .expect("runtime block backing should prepare");
+        let (pmem_config, pmem_backing) =
+            runtime_pmem_fixture("concurrent-mixed-runtime-pmem", "shared");
+        let network_config = network_configs([("shared", "vmnet:shared")]).remove(0);
+
+        std::thread::scope(|scope| {
+            let block_handle = command_handle.clone();
+            let block = scope.spawn(move || {
+                block_handle.run(move |session| session.insert_runtime_block_device(prepared_block))
+            });
+            let pmem_handle = command_handle.clone();
+            let pmem = scope.spawn(move || {
+                pmem_handle.run(move |session| {
+                    session.insert_runtime_pmem_device(pmem_config, pmem_backing)
+                })
+            });
+            let network_handle = command_handle.clone();
+            let network = scope.spawn(move || {
+                network_handle.run(move |session| {
+                    session.insert_runtime_network_device(
+                        network_config,
+                        ProcessVmnetAuthority::Direct,
+                    )
+                })
+            });
+
+            block
+                .join()
+                .expect("block caller should not panic")
+                .expect("block command should succeed");
+            pmem.join()
+                .expect("pmem caller should not panic")
+                .expect("pmem command should succeed");
+            network
+                .join()
+                .expect("network caller should not panic")
+                .expect("network command should succeed");
+        });
+
+        let mut events = events
+            .lock()
+            .expect("mixed runtime events should lock")
+            .clone();
+        events.sort_unstable();
+        assert_eq!(
+            events,
+            [
+                "block:insert:shared".to_string(),
+                "network:insert:shared".to_string(),
+                "pmem:insert:shared".to_string(),
+            ]
+        );
+        assert_eq!(
+            supervisor
+                .run_command(|session| {
+                    Ok::<_, FakeRunLoopCommandError>(session.run_count.load(Ordering::SeqCst))
+                })
+                .expect("mixed commands should leave the owner usable"),
+            1
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn boot_run_loop_supervisor_updates_drive_backing_on_worker_after_wakeup() {
         let original = TempFilePath::create_with_bytes("run-loop-drive-original", &[0x11; 512]);
         let replacement =
@@ -17317,6 +17460,180 @@ mod tests {
             .expect("started session should remain available");
         assert_eq!(session.pmem_insert_count, 0);
         assert_eq!(session.pmem_remove_count, 0);
+    }
+
+    #[test]
+    fn runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration() {
+        const SHARED_ID: &str = "shared";
+        const SHARED_MAC: &str = "12:34:56:78:9a:bc";
+
+        let root = TempFilePath::create("mixed-runtime-root");
+        let block = TempFilePath::create("mixed-runtime-block");
+        let second_block = TempFilePath::create("mixed-runtime-second-block");
+        let pmem = TempFilePath::create_with_bytes("mixed-runtime-pmem", b"pmem");
+        let mut vmm = configured_vmm(FakeStarter::success(88));
+        vmm.pci_enabled = true;
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "rootfs",
+            "rootfs",
+            root.path(),
+            true,
+        )))
+        .expect("root drive should configure before startup");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let network_input = || {
+            NetworkInterfaceConfigInput::new(SHARED_ID, SHARED_ID, "vmnet:shared")
+                .with_guest_mac(SHARED_MAC)
+        };
+        let block_input = || DriveConfigInput::new(SHARED_ID, SHARED_ID, block.path(), false);
+        let pmem_input = || PmemConfigInput::new(SHARED_ID, pmem.path().display().to_string());
+
+        vmm.handle_action(VmmAction::PutNetworkInterface(network_input()))
+            .expect("network should accept an identity unused by its own type");
+        vmm.handle_action(VmmAction::PutDrive(block_input()))
+            .expect("block should accept the same cross-type identity");
+        vmm.handle_action(VmmAction::PutPmem(pmem_input()))
+            .expect("pmem should accept the same cross-type identity");
+
+        assert!(matches!(
+            vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                SHARED_ID,
+                SHARED_ID,
+                second_block.path(),
+                false,
+            ))),
+            Err(VmmActionError::DriveRuntimeMutation(
+                DriveRuntimeMutationError::DuplicateDrive { .. }
+            ))
+        ));
+        assert_eq!(
+            vmm.handle_action(VmmAction::PutPmem(pmem_input())),
+            Err(VmmActionError::PmemRuntimeMutation(
+                PmemRuntimeMutationError::DuplicatePmem
+            ))
+        );
+        assert!(matches!(
+            vmm.handle_action(VmmAction::PutNetworkInterface(network_input())),
+            Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::DuplicateInterface { .. }
+            ))
+        ));
+        assert!(matches!(
+            vmm.handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("other", "other", "vmnet:shared")
+                    .with_guest_mac(SHARED_MAC),
+            )),
+            Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::InvalidConfig(
+                    NetworkInterfaceConfigError::GuestMacAddressInUse { .. }
+                )
+            ))
+        ));
+
+        let VmmData::VmConfiguration(config) = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("mixed live configuration should be readable")
+        else {
+            panic!("expected live VM configuration");
+        };
+        assert_eq!(
+            config
+                .drive_configs()
+                .iter()
+                .map(DriveConfig::drive_id)
+                .collect::<Vec<_>>(),
+            ["rootfs", SHARED_ID]
+        );
+        assert_eq!(
+            config
+                .network_interface_configs()
+                .iter()
+                .map(NetworkInterfaceConfig::iface_id)
+                .collect::<Vec<_>>(),
+            [SHARED_ID]
+        );
+        assert_eq!(
+            config
+                .pmem_configs()
+                .iter()
+                .map(PmemConfig::id)
+                .collect::<Vec<_>>(),
+            [SHARED_ID]
+        );
+
+        vmm.handle_action(VmmAction::Pause)
+            .expect("mixed runtime session should pause");
+        for kind in [
+            HotUnplugDeviceKind::Pmem,
+            HotUnplugDeviceKind::Drive,
+            HotUnplugDeviceKind::NetworkInterface,
+        ] {
+            vmm.handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                kind, SHARED_ID,
+            )))
+            .expect("paused mixed removal should succeed");
+        }
+
+        vmm.handle_action(VmmAction::PutPmem(pmem_input()))
+            .expect("released mixed capacity should accept pmem again");
+        vmm.handle_action(VmmAction::PutNetworkInterface(network_input()))
+            .expect("released mixed capacity should accept network again");
+        vmm.handle_action(VmmAction::PutDrive(block_input()))
+            .expect("released mixed capacity should accept block again");
+
+        let VmmData::VmConfiguration(config) = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("reused mixed live configuration should be readable")
+        else {
+            panic!("expected reused live VM configuration");
+        };
+        assert_eq!(config.drive_configs().len(), 2);
+        assert_eq!(config.network_interface_configs().len(), 1);
+        assert_eq!(config.pmem_configs().len(), 1);
+
+        for kind in [
+            HotUnplugDeviceKind::NetworkInterface,
+            HotUnplugDeviceKind::Pmem,
+            HotUnplugDeviceKind::Drive,
+        ] {
+            vmm.handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                kind, SHARED_ID,
+            )))
+            .expect("second mixed removal should succeed");
+        }
+        let VmmData::VmConfiguration(config) = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("final live configuration should be readable")
+        else {
+            panic!("expected final live VM configuration");
+        };
+        assert_eq!(config.drive_configs().len(), 1);
+        assert!(config.network_interface_configs().is_empty());
+        assert!(config.pmem_configs().is_empty());
+
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(
+            session.runtime_device_events,
+            [
+                "network:insert:shared",
+                "block:insert:shared",
+                "pmem:insert:shared",
+                "pmem:remove:shared",
+                "block:remove:shared",
+                "network:remove:shared",
+                "pmem:insert:shared",
+                "network:insert:shared",
+                "block:insert:shared",
+                "network:remove:shared",
+                "pmem:remove:shared",
+                "block:remove:shared",
+            ]
+        );
     }
 
     #[test]

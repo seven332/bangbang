@@ -1,7 +1,7 @@
 # Firecracker v1.16.0 runtime device hotplug contract
 
-This ledger records the exact #1420 block, #1421 pmem, and #1422 network
-promotions inside the
+This ledger records the exact #1420 block, #1421 pmem, #1422 network, and
+#1423 aggregate promotions inside the
 broader pinned `docs/device-hotplug.md` corpus. Block promotes
 `api-operation:PUT /drives/{drive_id}` and
 `non-swagger-route:DELETE /drives/{drive_id}`. Pmem promotes
@@ -10,8 +10,10 @@ broader pinned `docs/device-hotplug.md` corpus. Block promotes
 now complete for the supported non-root profile. Network promotes
 `api-operation:PUT /network-interfaces/{iface_id}` and
 `non-swagger-route:DELETE /network-interfaces/{iface_id}`. The aggregate
-`semantic.hotplug:runtime-device-manager` and `corpus:device-hotplug` records
-remain `audit-required` for the independent #1423 reconciliation.
+`semantic.hotplug:runtime-device-manager`, `corpus:device-hotplug`, and
+`semantic.transport:pci-msi-and-coexistence` records are
+`implemented-and-verified` after #1423's pinned-source differential audit and
+cross-device certification.
 
 ## Public boundary
 
@@ -81,8 +83,10 @@ any failed restoration/commit is terminal. Successful removal releases queue,
 limiter deadline, scheduler, metrics, MMDS detour or vmnet, PCI, and live-config
 ownership before the same identity and slot can be reused.
 
-The product profile reserves one 512-KiB BAR and the maximum three MSI-X routes
-for every one of the 31 endpoint slots. Startup and runtime endpoints allocate
+The product profile preflights one 512-KiB BAR and dispatcher identity for
+every one of the 31 endpoint slots. It reserves exact routes for configured
+fixed endpoints plus the maximum three MSI-X routes used by any supported
+runtime class for every remaining slot. Startup and runtime endpoints allocate
 from the same bounded pools. Removal tests prove that a slot, BAR, vector set,
 dispatcher identity, metrics entry, device ID, and—where applicable—pmem guest
 range can be reused only after the old endpoint commits teardown.
@@ -151,6 +155,19 @@ authority counting, publication cleanup, dynamic map/take/restore, failed map
 and unmap isolation, work/message draining, guest-path republish, terminal
 commit handling, snapshot/shutdown admission conflicts, paused FIFO ordering,
 default-MMIO rejection, and exact capacity and range reuse.
+
+The #1423 aggregate tests additionally give block, pmem, and network the same
+string ID in one public-PCI session, reject same-type duplicates and a second
+network identity with the live MAC, mutate the three classes in different
+Running/Paused orders across two rounds, and verify the complete live
+configuration after each boundary. A concurrent test submits all three classes
+through cloned handles and proves exactly-once serialization on the one paused
+owner. Shared accounting tests compose fixed and dynamic classes to exactly 31
+endpoints, reopen one slot by removing any runtime class, and prove the mixed
+demand fits the fixed-plus-worst-case-runtime MSI-X reservation. These focused
+tests compose with the signed product all-class startup and separate direct and
+contained runtime verticals; they do not replace real guest or containment
+evidence.
 
 ## Explicit exclusions
 

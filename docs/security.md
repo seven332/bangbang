@@ -1595,12 +1595,13 @@ profile rather than silently omitted.
 The production process selects PCI only through exact `--enable-pci` syntax on
 the supported macOS arm64/HVF path. Unsupported targets or missing GIC/MSI
 symbols fail before readiness. Configuration-dependent endpoint, slot,
-512-KiB BAR, dispatcher-region, and maximum queue-plus-config vector demand is
-checked before any endpoint is guest-visible. The path publishes one 1 MiB ECAM
-handler only after the Firecracker-shaped configuration and 32/64-bit BAR
-windows validate against guest RAM, GIC/GICv2m, and platform devices. The FDT
-binds the host to the validated GICv2m phandle and advertises neither an ITS nor
-an `msi-map`; every virtio legacy SPI/MMIO/FDT node is structurally suppressed.
+512-KiB BAR, and dispatcher-region demand plus exact fixed vector demand and
+worst-case three-vector headroom for every remaining runtime slot is checked
+before any endpoint is guest-visible. The path publishes one 1 MiB ECAM handler
+only after the Firecracker-shaped configuration and 32/64-bit BAR windows
+validate against guest RAM, GIC/GICv2m, and platform devices. The FDT binds the
+host to the validated GICv2m phandle and advertises neither an ITS nor an
+`msi-map`; every virtio legacy SPI/MMIO/FDT node is structurally suppressed.
 
 MMIO publication and PCI slot/BAR allocation use opaque owner provenance plus
 monotonic generations. Registration builds a complete candidate bus before
@@ -1616,6 +1617,18 @@ balloon, block, network, pmem, vsock, entropy, and virtio-mem in deterministic
 Firecracker order and allows no mixed virtio transport. Platform devices remain
 MMIO, while default process startup remains wholly virtio-MMIO and retains
 `pci=off`.
+
+All fixed and runtime data devices consume one fail-closed 31-endpoint budget;
+removing block, pmem, or network returns that class's exact generation-bound
+slot to the same shared pool. Runtime IDs are scoped by device type, so equal
+block, pmem, and network IDs can coexist, while duplicate IDs within one type
+and duplicate network MAC addresses are rejected before owner mutation. Mixed
+commands submitted through concurrent handles execute exactly once on the
+single VM owner thread, and the committed `/vm/config` projection follows the
+same successful insertion/removal order. This aggregate contract composes the
+class-specific signed guest gates; it does not replace their backing, mapping,
+packet-I/O, teardown, or reuse evidence.
+
 PCI configuration, BAR publication, MSI-X routing, and each virtio device share
 one ordered endpoint lifecycle: reverse teardown first removes the exact
 MMIO/function registrations, then closes and drains device work, revokes

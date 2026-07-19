@@ -754,6 +754,11 @@ that authority without ambient path fallback. Pmem removal flushes and unmaps
 only its exact dynamic HVF shadow before releasing the guest range. Incomplete
 cleanup is terminal rather than leaving a damaged worker live. See the
 [runtime device hotplug contract](compat/firecracker/v1.16.0/device-hotplug-contract.md).
+Aggregate certification also pins one shared 31-endpoint budget across fixed,
+block, pmem, and network functions; equal ID strings remain type-scoped,
+duplicate network MACs remain global, and concurrent mutations serialize on
+the VM owner while live configuration stays success-authoritative. PCI state
+is still rejected by the native-v1 snapshot profile rather than persisted.
 
 Create a supported full native-v1 snapshot after the VM is paused:
 
@@ -1006,7 +1011,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 78 implemented-and-verified, 320 audit-required, three
+delivery overlay with 81 implemented-and-verified, 317 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7

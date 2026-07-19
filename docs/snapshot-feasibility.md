@@ -34,7 +34,10 @@ path.
   guest discovery state is serialized or reconstructed. This covers product
   balloon, block, network, pmem, vsock, entropy, and virtio-mem functions as
   well as focused hidden endpoints and their host-adapter state. Signed
-  teardown/reuse proofs are not a snapshot schema or restore contract.
+  teardown/reuse proofs are not a snapshot schema or restore contract. The
+  #1423 aggregate certification covers only the live shared runtime manager,
+  mixed identity/capacity semantics, and owner-thread serialization; it neither
+  changes this rejection nor promotes PCI persistence.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
   network, and entropy retry schedulers, preflights both final namespaces,
