@@ -4,8 +4,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::balloon::{VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDiscardOutcome};
 use crate::block::{
@@ -1781,25 +1781,323 @@ impl Default for SharedBlockDeviceMetricsInner {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SharedBlockDeviceMetricsRegistry {
     aggregate: SharedBlockDeviceMetrics,
-    per_drive: Arc<BTreeMap<String, SharedBlockDeviceMetrics>>,
+    per_drive: Arc<Mutex<BlockDeviceMetricsRegistryState>>,
+}
+
+#[derive(Debug, Default)]
+struct BlockDeviceMetricsRegistryState {
+    entries: Vec<BlockDeviceMetricsRegistryEntry>,
+    reservations: Vec<BlockDeviceMetricsReservation>,
+    next_generation: u64,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct BlockDeviceMetricsRegistryEntry {
+    generation: u64,
+    drive_id: String,
+    metrics: SharedBlockDeviceMetrics,
+    lease_claimed: bool,
+}
+
+#[derive(Debug)]
+struct BlockDeviceMetricsReservation {
+    generation: u64,
+    drive_id: String,
+}
+
+/// Prepared per-drive metrics ownership that is not visible until publication.
+pub struct PreparedBlockDeviceMetrics {
+    registry: SharedBlockDeviceMetricsRegistry,
+    generation: u64,
+    drive_id: String,
+    metrics: SharedBlockDeviceMetrics,
+    reserved: bool,
+}
+
+/// Exact live per-drive metrics ownership removed automatically on drop.
+pub struct BlockDeviceMetricsLease {
+    registry: SharedBlockDeviceMetricsRegistry,
+    generation: u64,
+    drive_id: String,
+    registered: bool,
+}
+
+impl fmt::Debug for BlockDeviceMetricsLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockDeviceMetricsLease")
+            .field("ownership", &"<redacted>")
+            .field("registered", &self.registered)
+            .finish()
+    }
+}
+
+impl fmt::Debug for PreparedBlockDeviceMetrics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedBlockDeviceMetrics")
+            .field("ownership", &"<redacted>")
+            .field("reserved", &self.reserved)
+            .finish()
+    }
+}
+
+impl PreparedBlockDeviceMetrics {
+    pub fn publish(mut self) -> BlockDeviceMetricsLease {
+        let mut state = lock_block_metrics_registry(&self.registry.per_drive);
+        let reservation_count = state.reservations.len();
+        state.reservations.retain(|reservation| {
+            reservation.generation != self.generation || reservation.drive_id != self.drive_id
+        });
+        debug_assert_eq!(
+            state.reservations.len().checked_add(1),
+            Some(reservation_count)
+        );
+        self.reserved = false;
+        debug_assert!(state.entries.len() < state.capacity);
+        debug_assert!(
+            !state
+                .entries
+                .iter()
+                .any(|entry| entry.drive_id == self.drive_id)
+        );
+        state.entries.push(BlockDeviceMetricsRegistryEntry {
+            generation: self.generation,
+            drive_id: self.drive_id.clone(),
+            metrics: self.metrics.clone(),
+            lease_claimed: true,
+        });
+        drop(state);
+        BlockDeviceMetricsLease {
+            registry: self.registry.clone(),
+            generation: self.generation,
+            drive_id: self.drive_id.clone(),
+            registered: true,
+        }
+    }
+}
+
+impl Drop for PreparedBlockDeviceMetrics {
+    fn drop(&mut self) {
+        if !self.reserved {
+            return;
+        }
+        let mut state = lock_block_metrics_registry(&self.registry.per_drive);
+        if let Some(index) = state.reservations.iter().position(|reservation| {
+            reservation.generation == self.generation && reservation.drive_id == self.drive_id
+        }) {
+            state.reservations.remove(index);
+        }
+        self.reserved = false;
+    }
+}
+
+impl Drop for BlockDeviceMetricsLease {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut state = lock_block_metrics_registry(&self.registry.per_drive);
+        if let Some(index) = state.entries.iter().position(|entry| {
+            entry.generation == self.generation && entry.drive_id == self.drive_id
+        }) {
+            state.entries.remove(index);
+        }
+        self.registered = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockDeviceMetricsRegistryError {
+    DuplicateDrive,
+    UnknownDrive,
+    LeaseAlreadyClaimed,
+    Capacity,
+    GenerationExhausted,
+}
+
+impl fmt::Display for BlockDeviceMetricsRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateDrive => {
+                formatter.write_str("block metrics drive is already registered")
+            }
+            Self::UnknownDrive => formatter.write_str("block metrics drive is not registered"),
+            Self::LeaseAlreadyClaimed => {
+                formatter.write_str("block metrics drive lease is already claimed")
+            }
+            Self::Capacity => formatter.write_str("failed to reserve block metrics capacity"),
+            Self::GenerationExhausted => {
+                formatter.write_str("block metrics ownership generation is exhausted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlockDeviceMetricsRegistryError {}
+
+impl Default for SharedBlockDeviceMetricsRegistry {
+    fn default() -> Self {
+        Self {
+            aggregate: SharedBlockDeviceMetrics::default(),
+            per_drive: Arc::new(Mutex::new(BlockDeviceMetricsRegistryState::default())),
+        }
+    }
 }
 
 impl SharedBlockDeviceMetricsRegistry {
     pub fn from_drive_ids<'a>(drive_ids: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut per_drive = BTreeMap::new();
+        let mut entries = Vec::new();
         for drive_id in drive_ids {
-            per_drive
-                .entry(drive_id.to_string())
-                .or_insert_with(SharedBlockDeviceMetrics::default);
+            if entries
+                .iter()
+                .any(|entry: &BlockDeviceMetricsRegistryEntry| entry.drive_id == drive_id)
+            {
+                continue;
+            }
+            let generation = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+            entries.push(BlockDeviceMetricsRegistryEntry {
+                generation,
+                drive_id: drive_id.to_string(),
+                metrics: SharedBlockDeviceMetrics::default(),
+                lease_claimed: false,
+            });
         }
+        let next_generation = u64::try_from(entries.len()).unwrap_or(u64::MAX);
 
         Self {
             aggregate: SharedBlockDeviceMetrics::default(),
-            per_drive: Arc::new(per_drive),
+            per_drive: Arc::new(Mutex::new(BlockDeviceMetricsRegistryState {
+                capacity: entries.len(),
+                entries,
+                reservations: Vec::new(),
+                next_generation,
+            })),
         }
+    }
+
+    pub fn from_drive_ids_with_capacity<'a>(
+        drive_ids: impl IntoIterator<Item = &'a str>,
+        capacity: usize,
+    ) -> Result<Self, BlockDeviceMetricsRegistryError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| BlockDeviceMetricsRegistryError::Capacity)?;
+        let mut reservations = Vec::new();
+        reservations
+            .try_reserve_exact(capacity)
+            .map_err(|_| BlockDeviceMetricsRegistryError::Capacity)?;
+        for drive_id in drive_ids {
+            if entries
+                .iter()
+                .any(|entry: &BlockDeviceMetricsRegistryEntry| entry.drive_id == drive_id)
+            {
+                continue;
+            }
+            if entries.len() == capacity {
+                return Err(BlockDeviceMetricsRegistryError::Capacity);
+            }
+            let generation = u64::try_from(entries.len())
+                .map_err(|_| BlockDeviceMetricsRegistryError::GenerationExhausted)?;
+            entries.push(BlockDeviceMetricsRegistryEntry {
+                generation,
+                drive_id: drive_id.to_string(),
+                metrics: SharedBlockDeviceMetrics::default(),
+                lease_claimed: false,
+            });
+        }
+        let next_generation = u64::try_from(entries.len())
+            .map_err(|_| BlockDeviceMetricsRegistryError::GenerationExhausted)?;
+        Ok(Self {
+            aggregate: SharedBlockDeviceMetrics::default(),
+            per_drive: Arc::new(Mutex::new(BlockDeviceMetricsRegistryState {
+                entries,
+                reservations,
+                next_generation,
+                capacity,
+            })),
+        })
+    }
+
+    pub fn prepare_drive(
+        &self,
+        drive_id: impl Into<String>,
+    ) -> Result<PreparedBlockDeviceMetrics, BlockDeviceMetricsRegistryError> {
+        let drive_id = drive_id.into();
+        let mut state = lock_block_metrics_registry(&self.per_drive);
+        if state.entries.iter().any(|entry| entry.drive_id == drive_id)
+            || state
+                .reservations
+                .iter()
+                .any(|reservation| reservation.drive_id == drive_id)
+        {
+            return Err(BlockDeviceMetricsRegistryError::DuplicateDrive);
+        }
+        let claimed_capacity = state
+            .entries
+            .len()
+            .checked_add(state.reservations.len())
+            .ok_or(BlockDeviceMetricsRegistryError::Capacity)?;
+        if claimed_capacity >= state.capacity {
+            return Err(BlockDeviceMetricsRegistryError::Capacity);
+        }
+        state
+            .entries
+            .try_reserve_exact(1)
+            .map_err(|_| BlockDeviceMetricsRegistryError::Capacity)?;
+        state
+            .reservations
+            .try_reserve_exact(1)
+            .map_err(|_| BlockDeviceMetricsRegistryError::Capacity)?;
+        let next_generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or(BlockDeviceMetricsRegistryError::GenerationExhausted)?;
+        let generation = state.next_generation;
+        state.next_generation = next_generation;
+        state.reservations.push(BlockDeviceMetricsReservation {
+            generation,
+            drive_id: drive_id.clone(),
+        });
+        drop(state);
+        Ok(PreparedBlockDeviceMetrics {
+            registry: self.clone(),
+            generation,
+            drive_id,
+            metrics: SharedBlockDeviceMetrics::default(),
+            reserved: true,
+        })
+    }
+
+    /// Claims exact drop ownership for a drive that was registered when the
+    /// bounded inventory was constructed.
+    pub fn claim_drive_lease(
+        &self,
+        drive_id: &str,
+    ) -> Result<BlockDeviceMetricsLease, BlockDeviceMetricsRegistryError> {
+        let mut state = lock_block_metrics_registry(&self.per_drive);
+        let entry = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.drive_id == drive_id)
+            .ok_or(BlockDeviceMetricsRegistryError::UnknownDrive)?;
+        if entry.lease_claimed {
+            return Err(BlockDeviceMetricsRegistryError::LeaseAlreadyClaimed);
+        }
+        entry.lease_claimed = true;
+        let generation = entry.generation;
+        drop(state);
+        Ok(BlockDeviceMetricsLease {
+            registry: self.clone(),
+            generation,
+            drive_id: drive_id.to_string(),
+            registered: true,
+        })
     }
 
     pub fn aggregate(&self) -> SharedBlockDeviceMetrics {
@@ -1807,7 +2105,10 @@ impl SharedBlockDeviceMetricsRegistry {
     }
 
     pub fn per_drive(&self, drive_id: &str) -> Option<SharedBlockDeviceMetrics> {
-        self.per_drive.get(drive_id).cloned()
+        lock_block_metrics_registry(&self.per_drive)
+            .entries
+            .iter()
+            .find_map(|entry| (entry.drive_id == drive_id).then(|| entry.metrics.clone()))
     }
 
     pub fn record_notification_dispatch_for_drive(
@@ -1870,13 +2171,22 @@ impl SharedBlockDeviceMetricsRegistry {
 
     pub fn per_drive_snapshot(&self) -> BlockDeviceMetricsByDrive {
         let mut snapshot = BlockDeviceMetricsByDrive::new();
-        for (drive_id, metrics) in self.per_drive.iter() {
-            let metrics = metrics.snapshot();
+        for entry in &lock_block_metrics_registry(&self.per_drive).entries {
+            let metrics = entry.metrics.snapshot();
             if !metrics.is_empty() {
-                snapshot.insert_drive_metrics(drive_id.clone(), metrics);
+                snapshot.insert_drive_metrics(entry.drive_id.clone(), metrics);
             }
         }
         snapshot
+    }
+}
+
+fn lock_block_metrics_registry(
+    registry: &Mutex<BlockDeviceMetricsRegistryState>,
+) -> MutexGuard<'_, BlockDeviceMetricsRegistryState> {
+    match registry.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -5952,13 +6262,13 @@ mod tests {
 
     use super::{
         BalloonDeviceMetrics, BalloonDiscardMetrics, BalloonFreePageReportMetrics,
-        BlockDeviceMetrics, BlockDeviceMetricsByDrive, BootRunLoopMetricStatus,
-        EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
-        MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics, NetworkInterfaceMetrics,
-        NetworkInterfaceMetricsByInterface, PmemDeviceMetrics, PmemDeviceMetricsByDevice,
-        RtcDeviceMetrics, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMmdsMetrics,
-        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        BlockDeviceMetrics, BlockDeviceMetricsByDrive, BlockDeviceMetricsRegistryError,
+        BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
+        MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics,
+        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
+        PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
         SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
         SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
@@ -6803,6 +7113,86 @@ mod tests {
         );
         assert_eq!(second.aggregate_snapshot(), BlockDeviceMetrics::default());
         assert!(second.per_drive_snapshot().is_empty());
+    }
+
+    #[test]
+    fn block_metrics_preparation_is_invisible_and_published_lease_removes_exact_entry() {
+        let registry =
+            SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(["rootfs"], 2)
+                .expect("bounded metrics registry should allocate");
+        let prepared = registry
+            .prepare_drive("data")
+            .expect("second metrics entry should prepare");
+        assert!(registry.per_drive("data").is_none());
+        assert_eq!(
+            registry.prepare_drive("data").unwrap_err(),
+            BlockDeviceMetricsRegistryError::DuplicateDrive
+        );
+        assert_eq!(
+            registry.prepare_drive("other").unwrap_err(),
+            BlockDeviceMetricsRegistryError::Capacity
+        );
+        drop(prepared);
+
+        let prepared = registry
+            .prepare_drive("data")
+            .expect("abandoned metrics reservation should release its identity and capacity");
+
+        let lease = prepared.publish();
+        assert!(registry.per_drive("data").is_some());
+        assert_eq!(
+            registry.prepare_drive("data").unwrap_err(),
+            BlockDeviceMetricsRegistryError::DuplicateDrive
+        );
+        drop(lease);
+        assert!(registry.per_drive("data").is_none());
+
+        let replacement = registry
+            .prepare_drive("data")
+            .expect("released metrics capacity should be reusable")
+            .publish();
+        assert!(registry.per_drive("data").is_some());
+        drop(replacement);
+    }
+
+    #[test]
+    fn block_metrics_registry_enforces_configured_capacity() {
+        let registry =
+            SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(["rootfs"], 1)
+                .expect("single-entry registry should allocate");
+
+        assert_eq!(
+            registry.prepare_drive("data").unwrap_err(),
+            BlockDeviceMetricsRegistryError::Capacity
+        );
+        assert!(registry.per_drive("rootfs").is_some());
+    }
+
+    #[test]
+    fn block_metrics_startup_lease_releases_exact_entry_for_same_id_reuse() {
+        let registry =
+            SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(["rootfs", "data"], 2)
+                .expect("bounded startup metrics registry should allocate");
+        let lease = registry
+            .claim_drive_lease("data")
+            .expect("startup data metrics should have exact ownership");
+        assert_eq!(
+            registry.claim_drive_lease("data").unwrap_err(),
+            BlockDeviceMetricsRegistryError::LeaseAlreadyClaimed
+        );
+        assert_eq!(
+            registry.claim_drive_lease("missing").unwrap_err(),
+            BlockDeviceMetricsRegistryError::UnknownDrive
+        );
+
+        drop(lease);
+        assert!(registry.per_drive("data").is_none());
+        let replacement = registry
+            .prepare_drive("data")
+            .expect("released startup metrics identity should be reusable")
+            .publish();
+        assert!(registry.per_drive("data").is_some());
+        drop(replacement);
     }
 
     #[test]

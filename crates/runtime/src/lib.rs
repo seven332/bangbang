@@ -397,6 +397,7 @@ pub enum VmmActionError {
     BootSourceConfig(boot::BootSourceConfigError),
     CpuConfig(cpu::CpuConfigError),
     DriveConfig(block::DriveConfigError),
+    DriveRuntimeMutation(block::DriveRuntimeMutationError),
     DriveUpdate(block::DriveUpdateError),
     DriveUpdateUnsupported,
     EntropyConfig(entropy::EntropyConfigError),
@@ -453,6 +454,7 @@ impl fmt::Display for VmmActionError {
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::CpuConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
+            Self::DriveRuntimeMutation(err) => write!(f, "{err}"),
             Self::DriveUpdate(err) => write!(f, "{err}"),
             Self::DriveUpdateUnsupported => f.write_str("Drive updates are not supported."),
             Self::EntropyConfig(err) => write!(f, "{err}"),
@@ -498,6 +500,7 @@ impl std::error::Error for VmmActionError {
             Self::BalloonHintingStatus(err) => Some(err),
             Self::BalloonUpdate(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
+            Self::DriveRuntimeMutation(err) => Some(err),
             Self::DriveUpdate(err) => Some(err),
             Self::EntropyConfig(err) => Some(err),
             Self::LoggerConfig(err) => Some(err),
@@ -716,6 +719,46 @@ impl VmmController {
 
     pub fn commit_drive_config(&mut self, config: block::DriveConfig) {
         self.drive_configs.commit_insert(config);
+        self.snapshot_load_history_fresh = false;
+    }
+
+    pub fn prepare_runtime_drive_insert(
+        &mut self,
+        input: block::DriveConfigInput,
+    ) -> Result<block::PreparedDriveConfigInsert, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutDrive",
+                state: self.instance_info.state,
+            });
+        }
+        self.drive_configs
+            .prepare_runtime_insert(input)
+            .map_err(VmmActionError::DriveRuntimeMutation)
+    }
+
+    pub fn commit_runtime_drive_insert(&mut self, prepared: block::PreparedDriveConfigInsert) {
+        self.drive_configs.commit_runtime_insert(prepared);
+        self.snapshot_load_history_fresh = false;
+    }
+
+    pub fn prepare_runtime_drive_removal(
+        &self,
+        drive_id: &str,
+    ) -> Result<block::PreparedDriveConfigRemoval, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "HotUnplugDevice",
+                state: self.instance_info.state,
+            });
+        }
+        self.drive_configs
+            .prepare_runtime_removal(drive_id)
+            .map_err(VmmActionError::DriveRuntimeMutation)
+    }
+
+    pub fn commit_runtime_drive_removal(&mut self, prepared: block::PreparedDriveConfigRemoval) {
+        self.drive_configs.commit_runtime_removal(prepared);
         self.snapshot_load_history_fresh = false;
     }
 

@@ -924,6 +924,7 @@ struct PciFunctionRecord {
 pub struct PciSegment {
     provenance: Arc<PciSegmentProvenance>,
     functions: BTreeMap<u8, Box<dyn PciConfigFunction>>,
+    suspended_functions: BTreeMap<u8, Box<dyn PciConfigFunction>>,
     records: BTreeMap<u8, PciFunctionRecord>,
     next_generation: u64,
 }
@@ -938,6 +939,7 @@ impl PciSegment {
         Self {
             provenance: Arc::new(PciSegmentProvenance),
             functions,
+            suspended_functions: BTreeMap::new(),
             records: BTreeMap::new(),
             next_generation: 0,
         }
@@ -967,7 +969,9 @@ impl PciSegment {
         {
             return Err(PciSegmentError::UnsupportedIdentity { sbdf });
         }
-        if self.functions.contains_key(&sbdf.device()) || self.records.contains_key(&sbdf.device())
+        if self.functions.contains_key(&sbdf.device())
+            || self.suspended_functions.contains_key(&sbdf.device())
+            || self.records.contains_key(&sbdf.device())
         {
             return Err(PciSegmentError::DuplicateIdentity { sbdf });
         }
@@ -1018,7 +1022,41 @@ impl PciSegment {
         if record.generation != lease.generation || !self.functions.contains_key(&device) {
             return Err(PciFunctionReleaseError::LeaseMismatch { sbdf: lease.sbdf });
         }
-        self.functions.remove(&device);
+        let function = self
+            .functions
+            .remove(&device)
+            .ok_or(PciFunctionReleaseError::LeaseMismatch { sbdf: lease.sbdf })?;
+        let previous = self.suspended_functions.insert(device, function);
+        debug_assert!(previous.is_none());
+        Ok(())
+    }
+
+    /// Restores one exact leased function after a recoverable removal aborts.
+    pub fn republish_function(
+        &mut self,
+        lease: &PciFunctionLease,
+    ) -> Result<(), PciFunctionReleaseError> {
+        if !Arc::ptr_eq(&self.provenance, &lease.segment) {
+            return Err(PciFunctionReleaseError::WrongSegment);
+        }
+        let device = lease.sbdf.device();
+        let record = self
+            .records
+            .get(&device)
+            .copied()
+            .ok_or(PciFunctionReleaseError::StaleLease { sbdf: lease.sbdf })?;
+        if record.generation != lease.generation
+            || self.functions.contains_key(&device)
+            || !self.suspended_functions.contains_key(&device)
+        {
+            return Err(PciFunctionReleaseError::LeaseMismatch { sbdf: lease.sbdf });
+        }
+        let function = self
+            .suspended_functions
+            .remove(&device)
+            .ok_or(PciFunctionReleaseError::LeaseMismatch { sbdf: lease.sbdf })?;
+        let previous = self.functions.insert(device, function);
+        debug_assert!(previous.is_none());
         Ok(())
     }
 
@@ -1036,9 +1074,13 @@ impl PciSegment {
             .get(&device)
             .copied()
             .ok_or(PciFunctionReleaseError::StaleLease { sbdf: lease.sbdf })?;
-        if record.generation != lease.generation || self.functions.contains_key(&device) {
+        if record.generation != lease.generation
+            || self.functions.contains_key(&device)
+            || !self.suspended_functions.contains_key(&device)
+        {
             return Err(PciFunctionReleaseError::LeaseMismatch { sbdf: lease.sbdf });
         }
+        self.suspended_functions.remove(&device);
         self.records.remove(&device);
         Ok(())
     }
@@ -1860,6 +1902,18 @@ mod tests {
             segment.remove_function(&lease),
             Err(PciFunctionReleaseError::LeaseMismatch { sbdf })
         );
+
+        segment
+            .republish_function(&lease)
+            .expect("suspended function should republish with the same lease");
+        assert_eq!(segment.function_count(), 2);
+        assert_eq!(
+            read_ecam_u32(&mut segment, u64::from(sbdf.ecam_offset())),
+            0x10ff_1af4
+        );
+        segment
+            .unpublish_function(&lease)
+            .expect("republished function should suspend again");
 
         segment
             .release_function_lease(&lease)

@@ -192,6 +192,55 @@ impl GuestMessageInterruptRegistry {
         }
     }
 
+    /// Closes admission and waits for every already admitted signal while
+    /// retaining the exact routes for a possible resume.
+    pub fn quiesce_and_wait(&self) -> Result<(), GuestMessageInterruptRegistryError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| GuestMessageInterruptRegistryError::StatePoisoned)?;
+        match state.phase {
+            GuestMessageInterruptRegistryPhase::Active => {
+                state.phase = GuestMessageInterruptRegistryPhase::Quiescing;
+            }
+            GuestMessageInterruptRegistryPhase::Quiescing => {}
+            GuestMessageInterruptRegistryPhase::Released => {
+                return Err(GuestMessageInterruptRegistryError::NotActive { phase: state.phase });
+            }
+        }
+        while state.in_flight != 0 {
+            state = self
+                .inner
+                .drained
+                .wait(state)
+                .map_err(|_| GuestMessageInterruptRegistryError::StatePoisoned)?;
+        }
+        Ok(())
+    }
+
+    /// Reopens a quiescing registry after a recoverable endpoint removal abort.
+    pub fn resume(&self) -> Result<(), GuestMessageInterruptRegistryError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| GuestMessageInterruptRegistryError::StatePoisoned)?;
+        match state.phase {
+            GuestMessageInterruptRegistryPhase::Quiescing if state.in_flight == 0 => {
+                state.phase = GuestMessageInterruptRegistryPhase::Active;
+                Ok(())
+            }
+            GuestMessageInterruptRegistryPhase::Active => Ok(()),
+            GuestMessageInterruptRegistryPhase::Quiescing => {
+                Err(GuestMessageInterruptRegistryError::InFlightSignalsRemain)
+            }
+            GuestMessageInterruptRegistryPhase::Released => {
+                Err(GuestMessageInterruptRegistryError::NotActive { phase: state.phase })
+            }
+        }
+    }
+
     /// Close admission, wait for all admitted sends, and invalidate the set.
     pub fn release(&self) -> Result<(), GuestMessageInterruptRegistryError> {
         let mut state = self
@@ -246,6 +295,7 @@ pub enum GuestMessageInterruptRegistryError {
     Empty,
     StatePoisoned,
     InFlightOverflow,
+    InFlightSignalsRemain,
     NotActive {
         phase: GuestMessageInterruptRegistryPhase,
     },
@@ -265,6 +315,9 @@ impl fmt::Display for GuestMessageInterruptRegistryError {
             }
             Self::InFlightOverflow => {
                 f.write_str("guest-message interrupt registry in-flight count overflowed")
+            }
+            Self::InFlightSignalsRemain => {
+                f.write_str("guest-message interrupt registry still has in-flight signals")
             }
             Self::NotActive { phase } => {
                 write!(
@@ -292,6 +345,7 @@ impl std::error::Error for GuestMessageInterruptRegistryError {
             Self::Empty
             | Self::StatePoisoned
             | Self::InFlightOverflow
+            | Self::InFlightSignalsRemain
             | Self::NotActive { .. }
             | Self::UnknownMessage
             | Self::AmbiguousMessage => None,
@@ -525,12 +579,75 @@ mod tests {
                 phase: GuestMessageInterruptRegistryPhase::Quiescing,
             })
         );
+        registry
+            .resume()
+            .expect("drained quiescing registry should resume");
+        registry
+            .signal(message)
+            .expect("resumed registry should admit signals");
+        registry.begin_quiesce().expect("quiesce should restart");
         registry.release().expect("release should finish");
         registry.release().expect("release should be idempotent");
         assert_eq!(
             registry.phase().expect("phase should be available"),
             GuestMessageInterruptRegistryPhase::Released
         );
+    }
+
+    #[test]
+    fn reversible_quiesce_waits_for_in_flight_signals_before_resume() {
+        let message = GuestMessage::new(0x1000, 32);
+        let (_, route) = route(message);
+        let registry = GuestMessageInterruptRegistry::new(vec![route])
+            .expect("registry should build for injected in-flight state");
+        registry
+            .inner
+            .state
+            .lock()
+            .expect("registry state should lock")
+            .in_flight = 1;
+
+        std::thread::scope(|scope| {
+            let quiescing = registry.clone();
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            let waiter = scope.spawn(move || {
+                let result = quiescing.quiesce_and_wait();
+                done_tx
+                    .send(())
+                    .expect("quiesce completion should be observed");
+                result
+            });
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            {
+                let mut state = registry
+                    .inner
+                    .state
+                    .lock()
+                    .expect("registry state should lock for injected drain");
+                state.in_flight = 0;
+                registry.inner.drained.notify_all();
+            }
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("quiesce should finish after the injected signal drains");
+            waiter
+                .join()
+                .expect("quiesce thread should finish")
+                .expect("reversible quiesce should succeed");
+        });
+        assert_eq!(
+            registry.phase().expect("phase should read"),
+            GuestMessageInterruptRegistryPhase::Quiescing
+        );
+        registry
+            .resume()
+            .expect("drained reversible quiesce should resume");
+        registry
+            .signal(message)
+            .expect("resumed registry should retain its exact route");
     }
 
     #[test]

@@ -284,7 +284,7 @@ mod platform {
     };
     use bangbang_session::macos::grant_registry::{
         CommittedGrantBatch, DirectoryGrantRegistry, FileGrantRegistry, GrantRegistry,
-        GrantedDirectory, StagedGrantBatch,
+        GrantedDirectory, GrantedFile, StagedGrantBatch,
     };
     use bangbang_session::macos::grant_transport::receive_grant;
     use bangbang_session::macos::runtime::{
@@ -370,6 +370,51 @@ mod platform {
         registry: Arc<Mutex<Option<FileGrantRegistry>>>,
     }
 
+    /// One exact file grant reserved for a failure-atomic runtime transaction.
+    pub(crate) struct PreparedFileGrantClaim {
+        registry: Arc<Mutex<Option<FileGrantRegistry>>>,
+        id: GrantId,
+        original: Option<GrantedFile>,
+        duplicate: Option<File>,
+    }
+
+    impl std::fmt::Debug for PreparedFileGrantClaim {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PreparedFileGrantClaim")
+                .field("authority", &"<redacted>")
+                .field("original", &self.original.as_ref().map(|_| "<reserved>"))
+                .field("duplicate", &self.duplicate.as_ref().map(|_| "<owned>"))
+                .finish()
+        }
+    }
+
+    impl PreparedFileGrantClaim {
+        pub(crate) fn take_file(&mut self) -> Result<File, GrantClaimError> {
+            self.duplicate.take().ok_or(GrantClaimError)
+        }
+
+        pub(crate) fn commit(mut self) {
+            self.original.take();
+        }
+    }
+
+    impl Drop for PreparedFileGrantClaim {
+        fn drop(&mut self) {
+            let Some(original) = self.original.take() else {
+                return;
+            };
+            let mut registry = match self.registry.lock() {
+                Ok(registry) => registry,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(registry) = registry.as_mut() else {
+                return;
+            };
+            let _ = registry.restore_file(self.id.clone(), original);
+        }
+    }
+
     impl std::fmt::Debug for GrantAuthority {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -410,6 +455,33 @@ mod platform {
                 .take_file(&id, role, access)
                 .map_err(|_| GrantClaimError)?;
             Ok(Some(File::from(grant.into_owned_fd())))
+        }
+
+        pub(crate) fn prepare_file_claim(
+            &self,
+            reference: &Path,
+            role: ResourceRole,
+            access: GrantAccess,
+        ) -> Result<Option<PreparedFileGrantClaim>, GrantClaimError> {
+            let Some(id) = grant_reference_id(reference)? else {
+                return Ok(None);
+            };
+            let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            let registry = registry.as_mut().ok_or(GrantClaimError)?;
+            let mut duplicates = registry
+                .duplicate_files(&[(id.clone(), role, access)])
+                .map_err(|_| GrantClaimError)?;
+            let duplicate = duplicates.pop().ok_or(GrantClaimError)?;
+            debug_assert!(duplicates.is_empty());
+            let original = registry
+                .take_file(&id, role, access)
+                .map_err(|_| GrantClaimError)?;
+            Ok(Some(PreparedFileGrantClaim {
+                registry: Arc::clone(&self.registry),
+                id,
+                original: Some(original),
+                duplicate: Some(File::from(duplicate.into_owned_fd())),
+            }))
         }
 
         pub(crate) fn claim_boot_files(
@@ -1943,6 +2015,61 @@ mod platform {
         }
 
         #[test]
+        fn prepared_file_claim_restores_exact_authority_on_abort_and_consumes_on_commit() {
+            let mut registry = file_registry();
+            let authority = GrantAuthority::new(registry.take_file_registry());
+            let mut prepared = authority
+                .prepare_file_claim(
+                    Path::new("bangbang-grant:drive-rw"),
+                    ResourceRole::DriveBacking,
+                    GrantAccess::ReadWrite,
+                )
+                .expect("exact runtime grant should prepare")
+                .expect("explicit reference should reserve a grant");
+            let duplicate = prepared
+                .take_file()
+                .expect("prepared claim should expose one duplicate");
+            drop(duplicate);
+            drop(prepared);
+            assert!(
+                authority
+                    .claim_file(
+                        Path::new("bangbang-grant:drive-rw"),
+                        ResourceRole::DriveBacking,
+                        GrantAccess::ReadWrite,
+                    )
+                    .expect("aborted claim should restore authority")
+                    .is_some()
+            );
+
+            let mut commit_registry = file_registry();
+            let commit_authority = GrantAuthority::new(commit_registry.take_file_registry());
+            let mut committed = commit_authority
+                .prepare_file_claim(
+                    Path::new("bangbang-grant:drive-rw"),
+                    ResourceRole::DriveBacking,
+                    GrantAccess::ReadWrite,
+                )
+                .expect("exact runtime grant should prepare")
+                .expect("explicit reference should reserve a grant");
+            drop(
+                committed
+                    .take_file()
+                    .expect("committed claim should expose one duplicate"),
+            );
+            committed.commit();
+            assert!(
+                commit_authority
+                    .claim_file(
+                        Path::new("bangbang-grant:drive-rw"),
+                        ResourceRole::DriveBacking,
+                        GrantAccess::ReadWrite,
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
         fn file_authority_invalidation_serializes_with_a_claim() {
             let mut registry = file_registry();
             let authority = GrantAuthority::new(registry.take_file_registry());
@@ -1997,6 +2124,17 @@ mod platform {
     #[derive(Debug, Clone)]
     pub(crate) struct GrantAuthority;
 
+    #[derive(Debug)]
+    pub(crate) struct PreparedFileGrantClaim;
+
+    impl PreparedFileGrantClaim {
+        pub(crate) fn take_file(&mut self) -> Result<std::fs::File, GrantClaimError> {
+            Err(GrantClaimError)
+        }
+
+        pub(crate) fn commit(self) {}
+    }
+
     #[derive(Debug, Clone)]
     pub(crate) struct DirectoryGrantAuthority;
 
@@ -2018,6 +2156,18 @@ mod platform {
             _role: ResourceRole,
             _access: GrantAccess,
         ) -> Result<Option<std::fs::File>, GrantClaimError> {
+            match grant_reference_id(reference)? {
+                Some(_) => Err(GrantClaimError),
+                None => Ok(None),
+            }
+        }
+
+        pub(crate) fn prepare_file_claim(
+            &self,
+            reference: &Path,
+            _role: ResourceRole,
+            _access: GrantAccess,
+        ) -> Result<Option<PreparedFileGrantClaim>, GrantClaimError> {
             match grant_reference_id(reference)? {
                 Some(_) => Err(GrantClaimError),
                 None => Ok(None),
@@ -2110,6 +2260,7 @@ mod platform {
 
 pub(crate) use platform::{
     ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
+    PreparedFileGrantClaim,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use platform::{

@@ -172,6 +172,20 @@ impl VirtioDeviceWorkGate {
         Ok(())
     }
 
+    /// Reopens a fully drained gate after a recoverable teardown abort.
+    pub fn resume(&self) -> Result<(), VirtioDeviceWorkGateError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| VirtioDeviceWorkGateError::Poisoned)?;
+        if state.in_flight != 0 {
+            return Err(VirtioDeviceWorkGateError::InFlightWorkRemains);
+        }
+        state.accepting = true;
+        Ok(())
+    }
+
     /// Returns whether new device work is currently accepted.
     pub fn is_accepting(&self) -> Result<bool, VirtioDeviceWorkGateError> {
         self.inner
@@ -206,6 +220,7 @@ impl Drop for VirtioDeviceWorkGuard {
 pub enum VirtioDeviceWorkGateError {
     Quiescing,
     InFlightOverflow,
+    InFlightWorkRemains,
     Poisoned,
 }
 
@@ -214,6 +229,7 @@ impl fmt::Display for VirtioDeviceWorkGateError {
         match self {
             Self::Quiescing => f.write_str("virtio device work is quiescing"),
             Self::InFlightOverflow => f.write_str("virtio device in-flight work count overflowed"),
+            Self::InFlightWorkRemains => f.write_str("virtio device still has in-flight work"),
             Self::Poisoned => f.write_str("virtio device work gate is poisoned"),
         }
     }
@@ -411,10 +427,16 @@ mod tests {
             gate.admit(),
             Err(VirtioDeviceWorkGateError::Quiescing)
         ));
+        assert_eq!(
+            gate.resume(),
+            Err(VirtioDeviceWorkGateError::InFlightWorkRemains)
+        );
         drop(guard);
         waiter
             .join()
             .expect("quiesce thread should join")
             .expect("admitted work should drain");
+        gate.resume().expect("drained gate should resume");
+        assert!(gate.admit().is_ok());
     }
 }

@@ -9483,7 +9483,7 @@ mod tests {
             (
                 "drive-delete-running",
                 "DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n",
-                "Drive updates are not supported.",
+                "runtime drive insertion and removal require PCI transport",
                 "rootfs",
             ),
             (

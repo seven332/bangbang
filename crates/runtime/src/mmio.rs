@@ -425,6 +425,7 @@ struct MmioRegistrationRecord {
     owner: Arc<MmioRegistrationOwnerProvenance>,
     region_id: MmioRegionId,
     regions: Vec<MmioRegion>,
+    suspended_handler: Option<Box<dyn StoredMmioHandler>>,
 }
 
 impl fmt::Debug for MmioRegistrationRecord {
@@ -465,6 +466,7 @@ impl MmioDispatcher {
     #[doc(hidden)]
     pub fn contains_region_or_handler(&self, region_id: MmioRegionId) -> bool {
         self.handlers.contains_key(&region_id)
+            || self.has_leased_region_id(region_id)
             || self
                 .bus
                 .regions()
@@ -563,6 +565,7 @@ impl MmioDispatcher {
                 owner: Arc::clone(&owner.provenance),
                 region_id,
                 regions: record_regions,
+                suspended_handler: None,
             },
         );
         debug_assert!(replaced_registration.is_none());
@@ -582,6 +585,21 @@ impl MmioDispatcher {
         owner: &MmioRegistrationOwner,
         lease: &MmioRegistrationLease,
     ) -> Result<(), MmioRegistrationReleaseError> {
+        self.unpublish_owned_handler(owner, lease)?;
+        if let Err(source) = self.release_unpublished_handler(owner, lease) {
+            let _ = self.republish_owned_handler(owner, lease);
+            return Err(source);
+        }
+        Ok(())
+    }
+
+    /// Makes one exact owned registration unreachable while retaining its
+    /// handler, regions, identity, and ownership generation for rollback.
+    pub fn unpublish_owned_handler(
+        &mut self,
+        owner: &MmioRegistrationOwner,
+        lease: &MmioRegistrationLease,
+    ) -> Result<(), MmioRegistrationReleaseError> {
         if !Arc::ptr_eq(&self.provenance, &lease.dispatcher) {
             return Err(MmioRegistrationReleaseError::WrongDispatcher);
         }
@@ -589,7 +607,7 @@ impl MmioDispatcher {
             return Err(MmioRegistrationReleaseError::WrongOwner);
         }
 
-        let record = self.registrations.get(&lease.generation).ok_or(
+        let record = self.registrations.get_mut(&lease.generation).ok_or(
             MmioRegistrationReleaseError::StaleLease {
                 region_id: lease.region_id,
             },
@@ -602,7 +620,8 @@ impl MmioDispatcher {
                 region_id: lease.region_id,
             });
         }
-        if !self.handlers.contains_key(&record.region_id)
+        if record.suspended_handler.is_some()
+            || !self.handlers.contains_key(&record.region_id)
             || !self
                 .bus
                 .contains_exact_regions(record.region_id, &record.regions)
@@ -613,10 +632,106 @@ impl MmioDispatcher {
         }
 
         self.bus.remove_exact_regions(&record.regions);
-        let removed_handler = self.handlers.remove(&record.region_id);
-        debug_assert!(removed_handler.is_some());
-        let removed_record = self.registrations.remove(&lease.generation);
-        debug_assert!(removed_record.is_some());
+        let removed_handler = self.handlers.remove(&record.region_id).ok_or(
+            MmioRegistrationReleaseError::RegistrationMismatch {
+                region_id: lease.region_id,
+            },
+        )?;
+        record.suspended_handler = Some(removed_handler);
+        Ok(())
+    }
+
+    /// Republishes the exact suspended registration after a recoverable abort.
+    pub fn republish_owned_handler(
+        &mut self,
+        owner: &MmioRegistrationOwner,
+        lease: &MmioRegistrationLease,
+    ) -> Result<(), MmioRegistrationReleaseError> {
+        if !Arc::ptr_eq(&self.provenance, &lease.dispatcher) {
+            return Err(MmioRegistrationReleaseError::WrongDispatcher);
+        }
+        if !Arc::ptr_eq(&owner.provenance, &lease.owner) {
+            return Err(MmioRegistrationReleaseError::WrongOwner);
+        }
+        let record = self.registrations.get(&lease.generation).ok_or(
+            MmioRegistrationReleaseError::StaleLease {
+                region_id: lease.region_id,
+            },
+        )?;
+        if !Arc::ptr_eq(&record.owner, &owner.provenance) {
+            return Err(MmioRegistrationReleaseError::WrongOwner);
+        }
+        if record.region_id != lease.region_id
+            || record.regions != lease.regions
+            || record.suspended_handler.is_none()
+            || self.handlers.contains_key(&record.region_id)
+            || self
+                .bus
+                .regions()
+                .iter()
+                .any(|region| region.id() == record.region_id)
+        {
+            return Err(MmioRegistrationReleaseError::RegistrationMismatch {
+                region_id: lease.region_id,
+            });
+        }
+
+        let mut candidate_bus = self.bus.clone();
+        for region in &lease.regions {
+            candidate_bus
+                .insert(region.id(), region.range().start(), region.range().size())
+                .map_err(|_| MmioRegistrationReleaseError::RegistrationMismatch {
+                    region_id: lease.region_id,
+                })?;
+        }
+        let handler = self
+            .registrations
+            .get_mut(&lease.generation)
+            .and_then(|record| record.suspended_handler.take())
+            .ok_or(MmioRegistrationReleaseError::RegistrationMismatch {
+                region_id: lease.region_id,
+            })?;
+        self.bus = candidate_bus;
+        let previous = self.handlers.insert(lease.region_id, handler);
+        debug_assert!(previous.is_none());
+        Ok(())
+    }
+
+    /// Drops a suspended handler and releases its retained region identity.
+    pub fn release_unpublished_handler(
+        &mut self,
+        owner: &MmioRegistrationOwner,
+        lease: &MmioRegistrationLease,
+    ) -> Result<(), MmioRegistrationReleaseError> {
+        if !Arc::ptr_eq(&self.provenance, &lease.dispatcher) {
+            return Err(MmioRegistrationReleaseError::WrongDispatcher);
+        }
+        if !Arc::ptr_eq(&owner.provenance, &lease.owner) {
+            return Err(MmioRegistrationReleaseError::WrongOwner);
+        }
+        let record = self.registrations.get(&lease.generation).ok_or(
+            MmioRegistrationReleaseError::StaleLease {
+                region_id: lease.region_id,
+            },
+        )?;
+        if !Arc::ptr_eq(&record.owner, &owner.provenance) {
+            return Err(MmioRegistrationReleaseError::WrongOwner);
+        }
+        if record.region_id != lease.region_id
+            || record.regions != lease.regions
+            || record.suspended_handler.is_none()
+            || self.handlers.contains_key(&record.region_id)
+            || self
+                .bus
+                .regions()
+                .iter()
+                .any(|region| region.id() == record.region_id)
+        {
+            return Err(MmioRegistrationReleaseError::RegistrationMismatch {
+                region_id: lease.region_id,
+            });
+        }
+        self.registrations.remove(&lease.generation);
         Ok(())
     }
 
@@ -2333,6 +2448,33 @@ mod tests {
                 MmioDispatchOutcome::Read {
                     data: MmioAccessBytes::new(&[0x5a])
                         .expect("leased response bytes should be valid")
+                }
+            );
+        }
+
+        dispatcher
+            .unpublish_owned_handler(&owner, &lease)
+            .expect("owned MMIO registration should suspend");
+        assert!(dispatcher.contains_region_or_handler(id(40)));
+        assert!(dispatcher.regions().is_empty());
+        assert!(matches!(
+            dispatcher.handler_mut::<ScriptedHandler>(id(40)),
+            Err(MmioHandlerLookupError::MissingHandler { region_id }) if region_id == id(40)
+        ));
+        dispatcher
+            .republish_owned_handler(&owner, &lease)
+            .expect("suspended MMIO registration should republish");
+        for start in [0x4000, 0x6000] {
+            let access = dispatcher
+                .lookup(address(start), 1)
+                .expect("republished MMIO region should resolve");
+            assert_eq!(
+                dispatcher
+                    .dispatch(MmioOperation::read(access).expect("republished read should build"))
+                    .expect("republished read should dispatch"),
+                MmioDispatchOutcome::Read {
+                    data: MmioAccessBytes::new(&[0x5a])
+                        .expect("republished response bytes should be valid")
                 }
             );
         }

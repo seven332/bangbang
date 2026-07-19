@@ -126,9 +126,29 @@ block backing/limiter, network limiter, and pmem limiter PATCH paths still
 operate through PCI handles. Default signed MMIO cases, exact/attached/
 duplicate parser tests, supported-host pre-readiness process startup,
 unsupported-target compilation, complete capacity/rollback unit tests, and
-native-v1 PCI rejection are mandatory companions. This gate does not certify
-runtime attach/delete, guest rescan/removal, PCI snapshot persistence, or
-external vmnet connectivity.
+native-v1 PCI rejection are mandatory companions. This startup gate does not
+by itself certify runtime attach/delete, guest rescan/removal, PCI snapshot
+persistence, or external vmnet connectivity.
+
+Runtime block hotplug changes additionally require both
+`macos_arm64::signed_executable_hotplugs_and_reuses_runtime_block_over_product_pci`
+and
+`normal_bundle_hotplugs_runtime_block_from_exact_unused_grants` through the
+signed wrapper. Each test starts with a permanent PCI control drive and no
+runtime target, performs a Running-state PUT, waits for Linux PCI rescan plus
+guest read/write/fsync and sysfs removal, then pauses the VM, DELETEs the first
+endpoint, PUTs a second backing through the released capacity, resumes, and
+repeats guest I/O/removal before a final DELETE and clean stop. The contained
+case must use two exact initially unused manifest grants, replace their source
+pathnames after launcher preparation, inject a failed access claim, reuse that
+same authority successfully, and prove guest writes reached only the
+launcher-opened inodes. Unit companions must cover projection commit order,
+default-MMIO rejection before backing use, bounded metrics generations,
+publication cleanup, terminal incomplete-publication handling, prepared teardown
+rollback, work/message drain, terminal commit handling, paused FIFO admission,
+and slot/BAR/vector/dispatcher reuse.
+The guest/operator rescan and sysfs-removal handshake is part of this gate; it
+is not an automatic notification claim.
 
 Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` baseline
 that creates one VM and GIC before two permanent owner-thread runners, proves
@@ -1618,14 +1638,19 @@ network snapshot state.
 For block specifically, this evidence validates the supported public file-backed
 subset over MMIO by default or PCI with `--enable-pci`, including initial
 attachment, guest I/O, root/data ordering,
-cache/flush behavior, runtime refresh and limiter updates, and stable rejected
-runtime PUT/DELETE and vhost-user paths. Normal production-bundle evidence also
-validates exact read-only/read-write drive-grant adoption, one-time identity,
-failure-atomic public state, and preauthorized live refresh without ambient
-path reopening. It does not execute Firecracker
-v1.16.0's optional PCI hotplug/hot-unplug flow or an external vhost-user backend.
-The hidden static and product all-virtio PCI cases prove the same canonical
-block devices through modern virtio-pci but do not expose runtime attach/delete.
+cache/flush behavior, runtime refresh and limiter updates, PCI-only non-root
+runtime PUT/bodyless DELETE, and stable rejected MMIO-runtime and vhost-user
+paths. Normal production-bundle evidence also validates exact read-only/
+read-write drive-grant adoption, one-time identity, failure-atomic public
+state, preauthorized live refresh, and runtime attach from exact unused initial
+grants without ambient path reopening. The two-round direct and contained
+hotplug cases prove guest PCI rescan, seed read, write/readback/fsync, sysfs
+removal, Paused DELETE/PUT ordering, exact capacity reuse, success-only config
+projection, and clean shutdown. Root runtime mutation, automatic guest
+notification, external vhost-user-block execution, async/io_uring, and PCI
+snapshot state remain outside this subset. The hidden static and product
+all-virtio startup cases remain complementary coverage for the same canonical
+block device before runtime mutation.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.

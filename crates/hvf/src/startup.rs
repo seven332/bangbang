@@ -19,8 +19,9 @@ use bangbang_runtime::balloon::{
     VirtioBalloonQueueLayout,
 };
 use bangbang_runtime::block::{
-    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveRateLimiterConfig, DriveUpdateError,
-    VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_QUEUE_SIZES, VirtioBlockConfigSpace, VirtioBlockDevice,
+    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveRateLimiterConfig,
+    DriveRuntimeMutationError, DriveUpdateError, PreparedBlockDevice, VIRTIO_BLOCK_DEVICE_ID,
+    VIRTIO_BLOCK_QUEUE_SIZES, VirtioBlockConfigSpace, VirtioBlockDevice,
     VirtioBlockDeviceNotificationError,
 };
 use bangbang_runtime::boot::BootSourceFiles;
@@ -44,9 +45,9 @@ use bangbang_runtime::memory_hotplug::{
 };
 use bangbang_runtime::message_interrupt::GuestMessageInterruptResources;
 use bangbang_runtime::metrics::{
-    SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
-    SharedVsockDeviceMetrics,
+    BlockDeviceMetricsLease, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+    SharedEntropyDeviceMetrics, SharedNetworkInterfaceMetricsRegistry,
+    SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegionId};
 use bangbang_runtime::network::{
@@ -55,8 +56,8 @@ use bangbang_runtime::network::{
     VirtioNetworkDeviceNotificationError,
 };
 use bangbang_runtime::pci::{
-    PCI_FIRST_ENDPOINT_DEVICE, PciBarAddressSpace, PciBarAllocator, PciClassCode,
-    PciType0Configuration,
+    PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE, PciBarAddressSpace, PciBarAllocator,
+    PciClassCode, PciType0Configuration,
 };
 use bangbang_runtime::pmem::{
     PmemMmioLayout, PmemUpdate, PmemUpdateError, VIRTIO_PMEM_DEVICE_ID, VIRTIO_PMEM_QUEUE_SIZES,
@@ -158,6 +159,8 @@ const PCI_VALIDATION_VIRTIO_RNG_BAR_REGION_ID: MmioRegionId = MmioRegionId::new(
 const PCI_VALIDATION_VIRTIO_RNG_VECTOR_COUNT: usize = 2;
 const PCI_VALIDATION_VIRTIO_RNG_ENTROPY_BYTE: u8 = 0xa5;
 const PCI_DATA_DEVICE_BAR_REGION_ID_BASE: u64 = 4100;
+const PCI_ENDPOINT_SLOT_COUNT: usize =
+    (PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1) as usize;
 
 #[derive(Debug, Clone)]
 pub struct HvfArm64BootSessionConfig {
@@ -570,8 +573,11 @@ type PublishedPciMemoryHotplug = PublishedVirtioPciEndpoint<
 #[derive(Debug)]
 struct HvfArm64BootPciBlockDevice {
     drive_id: String,
+    is_root_device: bool,
     published: PublishedPciBlock,
     queue_deliveries: usize,
+    retry_deadline: Option<Instant>,
+    _metrics_lease: Option<BlockDeviceMetricsLease>,
 }
 
 #[derive(Debug)]
@@ -669,6 +675,7 @@ struct HvfArm64BootPciDataDevices {
     vsock: Option<HvfArm64BootPciVsockDevice>,
     entropy: Option<HvfArm64BootPciEntropyDevice>,
     memory_hotplug: Option<HvfArm64BootPciMemoryHotplugDevice>,
+    runtime_hotplug: bool,
 }
 
 impl HvfArm64BootPciDataDevices {
@@ -688,6 +695,204 @@ impl HvfArm64BootPciDataDevices {
                     "failed to share PCI data GICv2m routes: {source}"
                 ))
             })
+    }
+
+    fn endpoint_count(&self) -> usize {
+        self.block.len()
+            + self.network.len()
+            + self.pmem.len()
+            + usize::from(self.balloon.is_some())
+            + usize::from(self.vsock.is_some())
+            + usize::from(self.entropy.is_some())
+            + usize::from(self.memory_hotplug.is_some())
+    }
+
+    fn available_region_id(
+        dispatcher: &MmioDispatcher,
+    ) -> Result<MmioRegionId, HvfArm64BootPciDataError> {
+        (0..PCI_ENDPOINT_SLOT_COUNT)
+            .map(pci_data_region_id)
+            .find_map(|region_id| match region_id {
+                Ok(region_id) if !dispatcher.contains_region_or_handler(region_id) => {
+                    Some(Ok(region_id))
+                }
+                Ok(_) => None,
+                Err(source) => Some(Err(source)),
+            })
+            .unwrap_or_else(|| {
+                Err(HvfArm64BootPciDataError::new(
+                    "PCI data MMIO region capacity is exhausted",
+                ))
+            })
+    }
+
+    fn insert_runtime_block(
+        &mut self,
+        prepared: PreparedBlockDevice,
+        metrics: &SharedBlockDeviceMetricsRegistry,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        if !self.runtime_hotplug {
+            return Err(DriveRuntimeMutationError::PciNotEnabled);
+        }
+        if prepared.is_root_device() {
+            return Err(DriveRuntimeMutationError::RootInsertUnsupported);
+        }
+        if self
+            .block
+            .iter()
+            .any(|device| device.drive_id == prepared.drive_id())
+        {
+            return Err(DriveRuntimeMutationError::DuplicateDrive {
+                drive_id: prepared.drive_id().to_string(),
+            });
+        }
+        if self.endpoint_count() >= PCI_ENDPOINT_SLOT_COUNT {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI endpoint capacity is exhausted".to_string(),
+            });
+        }
+        if self.block.len() == self.block.capacity() {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime block inventory capacity is exhausted".to_string(),
+            });
+        }
+
+        let drive_id = prepared.drive_id().to_string();
+        let prepared_metrics = metrics.prepare_drive(drive_id.clone()).map_err(|source| {
+            DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        let interrupts = self.shared_msi_registry().map_err(|source| {
+            DriveRuntimeMutationError::TerminalInsertion {
+                message: source.to_string(),
+            }
+        })?;
+        let segment = self.validation.segment().clone();
+        let block_type = VirtioDeviceType::new(VIRTIO_BLOCK_DEVICE_ID).map_err(|source| {
+            DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        let (published_drive_id, is_root_device, config_space, device) = prepared.into_parts();
+        debug_assert_eq!(published_drive_id, drive_id);
+        debug_assert!(!is_root_device);
+        let published = {
+            let mut dispatcher = self.dispatcher.lock().map_err(|_| {
+                DriveRuntimeMutationError::TerminalInsertion {
+                    message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                }
+            })?;
+            let region_id = Self::available_region_id(&dispatcher).map_err(|source| {
+                DriveRuntimeMutationError::PrepareDevice {
+                    message: source.to_string(),
+                }
+            })?;
+            PublishedVirtioPciEndpoint::publish(
+                VirtioPciIdentity::new(block_type, config_space.available_features()),
+                &VIRTIO_BLOCK_QUEUE_SIZES,
+                config_space,
+                device,
+                false,
+                self.validation.bar_allocator_mut(),
+                segment,
+                &mut dispatcher,
+                region_id,
+                interrupts,
+            )
+            .map_err(runtime_block_publication_error)?
+        };
+        let metrics_lease = prepared_metrics.publish();
+        debug_assert!(self.block.len() < self.block.capacity());
+        self.block.push(HvfArm64BootPciBlockDevice {
+            drive_id,
+            is_root_device,
+            published,
+            queue_deliveries: 0,
+            retry_deadline: None,
+            _metrics_lease: Some(metrics_lease),
+        });
+        Ok(())
+    }
+
+    fn update_runtime_block(
+        &self,
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+    ) -> Result<(), DriveUpdateError> {
+        let device = self
+            .block
+            .iter()
+            .find(|device| device.drive_id == config.drive_id())
+            .ok_or_else(|| DriveUpdateError::UnknownDrive {
+                drive_id: config.drive_id().to_string(),
+            })?;
+        device
+            .published
+            .endpoint()
+            .update_block_device_with_opened(config, backing, rate_limiter_update)
+            .map_err(|source| DriveUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            })
+    }
+
+    fn remove_runtime_block(&mut self, drive_id: &str) -> Result<(), DriveRuntimeMutationError> {
+        if !self.runtime_hotplug {
+            return Err(DriveRuntimeMutationError::PciNotEnabled);
+        }
+        let index = self
+            .block
+            .iter()
+            .position(|device| device.drive_id == drive_id)
+            .ok_or_else(|| DriveRuntimeMutationError::UnknownDrive {
+                drive_id: drive_id.to_string(),
+            })?;
+        if self
+            .block
+            .get(index)
+            .is_some_and(|device| device.is_root_device)
+        {
+            return Err(DriveRuntimeMutationError::RootRemovalUnsupported {
+                drive_id: drive_id.to_string(),
+            });
+        }
+        {
+            let mut dispatcher =
+                self.dispatcher
+                    .lock()
+                    .map_err(|_| DriveRuntimeMutationError::TerminalRemoval {
+                        message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                    })?;
+            let device = self.block.get_mut(index).ok_or_else(|| {
+                DriveRuntimeMutationError::UnknownDrive {
+                    drive_id: drive_id.to_string(),
+                }
+            })?;
+            if let Err(source) = device.published.prepare_teardown(&mut dispatcher) {
+                let message = source.to_string();
+                return Err(
+                    if matches!(
+                        source,
+                        VirtioPciPublicationError::Rollback { .. }
+                            | VirtioPciPublicationError::SegmentLock { .. }
+                            | VirtioPciPublicationError::EndpointRelease { .. }
+                    ) {
+                        DriveRuntimeMutationError::TerminalRemoval { message }
+                    } else {
+                        DriveRuntimeMutationError::RemoveDevice { message }
+                    },
+                );
+            }
+            device
+                .published
+                .commit_prepared_teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| DriveRuntimeMutationError::TerminalRemoval {
+                    message: source.to_string(),
+                })?;
+        }
+        self.block.remove(index);
+        Ok(())
     }
 
     fn diagnostics(
@@ -801,8 +1006,8 @@ impl HvfArm64BootPciDataDevices {
         memory: &mut GuestMemory,
         metrics: &SharedBlockDeviceMetricsRegistry,
     ) -> Option<Duration> {
-        let mut retry_after = None;
         for device in &mut self.block {
+            let mut retry_after = None;
             let result = device
                 .published
                 .endpoint()
@@ -847,8 +1052,17 @@ impl HvfArm64BootPciDataDevices {
                     }
                 }
             }
+            device.retry_deadline = retry_after.map(limiter_retry_deadline_after);
         }
-        retry_after
+        self.block_retry_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn block_retry_deadline(&self) -> Option<Instant> {
+        self.block
+            .iter()
+            .filter_map(|device| device.retry_deadline)
+            .min()
     }
 
     fn dispatch_pmem(
@@ -2113,11 +2327,14 @@ impl HvfArm64BootLimiterRetryWakeupScheduler {
     }
 
     fn schedule_after(&self, retry_after: Option<Duration>) {
+        self.schedule_deadline(retry_after.map(limiter_retry_deadline_after));
+    }
+
+    fn schedule_deadline(&self, deadline: Option<Instant>) {
         if self.thread.is_none() {
             return;
         }
 
-        let deadline = retry_after.map(limiter_retry_deadline_after);
         let mut state = lock_limiter_retry_wakeup_state(&self.shared);
         if matches!(
             state.status,
@@ -2126,7 +2343,7 @@ impl HvfArm64BootLimiterRetryWakeupScheduler {
             return;
         }
         state.deadline = deadline;
-        if retry_after.is_none() {
+        if deadline.is_none() {
             state.deferred_publication = false;
         }
         self.shared.condvar.notify_one();
@@ -3347,6 +3564,49 @@ impl HvfArm64BootSession<'_> {
         self.pci_data_devices
             .as_ref()
             .and_then(HvfArm64BootPciDataDevices::block_updater)
+    }
+
+    /// Reports whether block operations belong to the retained PCI inventory.
+    pub const fn uses_pci_data_devices(&self) -> bool {
+        self.pci_data_devices.is_some()
+    }
+
+    /// Publishes one fully prepared block endpoint into the owner-thread PCI inventory.
+    pub fn insert_runtime_block_device(
+        &mut self,
+        prepared: PreparedBlockDevice,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        let metrics = self.block_device_metrics.clone();
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(DriveRuntimeMutationError::PciNotEnabled)?
+            .insert_runtime_block(prepared, &metrics)
+    }
+
+    /// Updates one entry by resolving it from the current owner-thread inventory.
+    pub fn update_runtime_block_device_with_opened(
+        &mut self,
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+    ) -> Result<(), DriveUpdateError> {
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(DriveUpdateError::ActiveSessionUnavailable)?
+            .update_runtime_block(config, backing, rate_limiter_update)
+    }
+
+    /// Removes one non-root block endpoint from the owner-thread PCI inventory.
+    pub fn remove_runtime_block_device(
+        &mut self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        remove_runtime_pci_block_device_and_refresh_retry(
+            &mut self.pci_data_devices,
+            &self.block_retry_wakeup,
+            &self.block_retry_wakeup_scheduler,
+            drive_id,
+        )
     }
 
     pub fn pci_network_device_updater(&self) -> Option<HvfArm64BootPciNetworkDeviceUpdater> {
@@ -5197,6 +5457,49 @@ impl OwnedHvfArm64BootSession {
         self.pci_data_devices
             .as_ref()
             .and_then(HvfArm64BootPciDataDevices::block_updater)
+    }
+
+    /// Reports whether block operations belong to the retained PCI inventory.
+    pub const fn uses_pci_data_devices(&self) -> bool {
+        self.pci_data_devices.is_some()
+    }
+
+    /// Publishes one fully prepared block endpoint into the owner-thread PCI inventory.
+    pub fn insert_runtime_block_device(
+        &mut self,
+        prepared: PreparedBlockDevice,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        let metrics = self.block_device_metrics.clone();
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(DriveRuntimeMutationError::PciNotEnabled)?
+            .insert_runtime_block(prepared, &metrics)
+    }
+
+    /// Updates one entry by resolving it from the current owner-thread inventory.
+    pub fn update_runtime_block_device_with_opened(
+        &mut self,
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+    ) -> Result<(), DriveUpdateError> {
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(DriveUpdateError::ActiveSessionUnavailable)?
+            .update_runtime_block(config, backing, rate_limiter_update)
+    }
+
+    /// Removes one non-root block endpoint from the owner-thread PCI inventory.
+    pub fn remove_runtime_block_device(
+        &mut self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        remove_runtime_pci_block_device_and_refresh_retry(
+            &mut self.pci_data_devices,
+            &self.block_retry_wakeup,
+            &self.block_retry_wakeup_scheduler,
+            drive_id,
+        )
     }
 
     pub fn pci_network_device_updater(&self) -> Option<HvfArm64BootPciNetworkDeviceUpdater> {
@@ -8959,6 +9262,52 @@ fn dispatch_pci_block_notifications(
     ))
 }
 
+fn runtime_block_publication_error(source: VirtioPciPublicationError) -> DriveRuntimeMutationError {
+    let terminal = matches!(
+        source,
+        VirtioPciPublicationError::Rollback { .. } | VirtioPciPublicationError::SegmentLock { .. }
+    );
+    let message = source.to_string();
+    if terminal {
+        DriveRuntimeMutationError::TerminalInsertion { message }
+    } else {
+        DriveRuntimeMutationError::PublishDevice { message }
+    }
+}
+
+fn remove_runtime_pci_block_device_and_refresh_retry(
+    pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
+    retry_wakeup: &HvfArm64BootLimiterRetryWakeupToken,
+    retry_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    drive_id: &str,
+) -> Result<(), DriveRuntimeMutationError> {
+    let devices = pci_data_devices
+        .as_mut()
+        .ok_or(DriveRuntimeMutationError::PciNotEnabled)?;
+    devices.remove_runtime_block(drive_id)?;
+
+    refresh_block_retry_wakeup_after_inventory_change(
+        retry_wakeup,
+        retry_scheduler,
+        devices.block_retry_deadline(),
+    );
+    Ok(())
+}
+
+fn refresh_block_retry_wakeup_after_inventory_change(
+    retry_wakeup: &HvfArm64BootLimiterRetryWakeupToken,
+    retry_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    retry_deadline: Option<Instant>,
+) {
+    // The shared scheduler holds the earliest retry across the live block
+    // inventory. Once an endpoint disappears, its deadline cannot be
+    // distinguished from deadlines owned by survivors, so synchronously
+    // discard it and derive the replacement from the remaining endpoints.
+    retry_scheduler.cancel_and_wait();
+    let _ = retry_wakeup.take_wakeup_request();
+    retry_scheduler.schedule_deadline(retry_deadline);
+}
+
 fn dispatch_pci_pmem_notifications(
     backend: &mut HvfBackend,
     devices: &mut HvfArm64BootPciDataDevices,
@@ -10548,18 +10897,43 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         power,
         gic.timer_interrupts.el1_virtual_timer_intid,
     );
-    let block_device_metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(
-        runtime
-            .block_devices
-            .iter()
-            .map(|device| device.registration.drive_id())
-            .chain(
-                runtime
-                    .pci_block_devices
-                    .iter()
-                    .map(|device| device.drive_id()),
-            ),
-    );
+    let runtime_block_hotplug = runtime
+        .pci_validation
+        .as_ref()
+        .is_some_and(|validation| validation.config().is_all_virtio_devices());
+    let block_device_metrics = if runtime_block_hotplug {
+        SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(
+            runtime
+                .block_devices
+                .iter()
+                .map(|device| device.registration.drive_id())
+                .chain(
+                    runtime
+                        .pci_block_devices
+                        .iter()
+                        .map(|device| device.drive_id()),
+                ),
+            PCI_ENDPOINT_SLOT_COUNT,
+        )
+        .map_err(|source| HvfArm64BootSessionError::PciData {
+            source: HvfArm64BootPciDataError::new(format!(
+                "failed to reserve live block metrics inventory: {source}"
+            )),
+        })?
+    } else {
+        SharedBlockDeviceMetricsRegistry::from_drive_ids(
+            runtime
+                .block_devices
+                .iter()
+                .map(|device| device.registration.drive_id())
+                .chain(
+                    runtime
+                        .pci_block_devices
+                        .iter()
+                        .map(|device| device.drive_id()),
+                ),
+        )
+    };
     let pmem_device_metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(
         runtime.pmem_devices.iter().map(|device| device.id()),
     );
@@ -10579,10 +10953,15 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         !runtime.block_devices.is_empty() || !runtime.pci_block_devices.is_empty();
     let has_network_devices =
         !runtime.network_devices.is_empty() || !runtime.pci_network_devices.is_empty();
-    let pci_data_devices = prepare_pci_data_devices(backend, &mut runtime, &mmio_dispatcher)
-        .map_err(|source| HvfArm64BootSessionError::PciData { source })?;
+    let pci_data_devices = prepare_pci_data_devices(
+        backend,
+        &mut runtime,
+        &mmio_dispatcher,
+        &block_device_metrics,
+    )
+    .map_err(|source| HvfArm64BootSessionError::PciData { source })?;
     let block_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
-    let block_retry_wakeup_scheduler = if !has_block_devices {
+    let block_retry_wakeup_scheduler = if !has_block_devices && !runtime_block_hotplug {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
     } else {
         let vcpu_control = runner.control();
@@ -10799,7 +11178,7 @@ fn pci_all_virtio_gic_msi_configuration(
     let balloon_queue_count = controller
         .balloon_config()
         .map(|balloon| VirtioBalloonQueueLayout::from_config(balloon).queue_count());
-    let demand = pci_all_virtio_resource_demand(
+    let startup_demand = pci_all_virtio_resource_demand(
         controller.drive_configs().len(),
         controller.network_interface_configs().len(),
         controller.pmem_configs().len(),
@@ -10808,7 +11187,39 @@ fn pci_all_virtio_gic_msi_configuration(
         config.entropy_device.is_some(),
         controller.memory_hotplug_config().is_some(),
     )?;
-    let routes = u32::try_from(demand.routes.max(1)).map_err(|_| {
+    if startup_demand.endpoints > PCI_ENDPOINT_SLOT_COUNT {
+        return Err(HvfArm64BootPciDataError::new(format!(
+            "PCI all-virtio endpoint count {} exceeds segment capacity {PCI_ENDPOINT_SLOT_COUNT}",
+            startup_demand.endpoints
+        )));
+    }
+    let fixed_demand = pci_all_virtio_resource_demand(
+        0,
+        0,
+        0,
+        balloon_queue_count,
+        controller.vsock_config().is_some(),
+        config.entropy_device.is_some(),
+        controller.memory_hotplug_config().is_some(),
+    )?;
+    let dynamic_slots = PCI_ENDPOINT_SLOT_COUNT
+        .checked_sub(fixed_demand.endpoints)
+        .ok_or_else(|| {
+            HvfArm64BootPciDataError::new("fixed PCI all-virtio endpoints exceed segment capacity")
+        })?;
+    let dynamic_routes = dynamic_slots
+        .checked_mul(VIRTIO_NET_QUEUE_SIZES.len() + 1)
+        .ok_or_else(|| {
+            HvfArm64BootPciDataError::new("PCI all-virtio hotplug route count overflowed")
+        })?;
+    let routes = fixed_demand
+        .routes
+        .checked_add(dynamic_routes)
+        .ok_or_else(|| {
+            HvfArm64BootPciDataError::new("PCI all-virtio hotplug route count overflowed")
+        })?;
+    debug_assert!(routes >= startup_demand.routes);
+    let routes = u32::try_from(routes.max(1)).map_err(|_| {
         HvfArm64BootPciDataError::new("PCI all-virtio MSI-X route count does not fit u32")
     })?;
     let routes = NonZeroU32::new(routes)
@@ -10938,6 +11349,7 @@ fn prepare_pci_data_devices(
     backend: &HvfBackend,
     runtime: &mut Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    block_device_metrics: &SharedBlockDeviceMetricsRegistry,
 ) -> Result<Option<HvfArm64BootPciDataDevices>, HvfArm64BootPciDataError> {
     let Some(validation) = runtime.pci_validation.as_ref() else {
         return Ok(None);
@@ -10974,20 +11386,23 @@ fn prepare_pci_data_devices(
                 "failed to preflight PCI data endpoint slots: {source}"
             ))
         })?;
-    if demand.endpoints > available_slots {
+    let reserved_endpoint_capacity = if all_virtio {
+        PCI_ENDPOINT_SLOT_COUNT
+    } else {
+        demand.endpoints
+    };
+    if reserved_endpoint_capacity > available_slots {
         return Err(HvfArm64BootPciDataError::new(format!(
-            "PCI data endpoint count {} exceeds available segment capacity {available_slots}",
-            demand.endpoints
+            "PCI data endpoint reservation {reserved_endpoint_capacity} exceeds available segment capacity {available_slots}"
         )));
     }
     let available_bars = pci_data_available_bar_count(validation.bar_allocator())?;
-    if demand.endpoints > available_bars {
+    if reserved_endpoint_capacity > available_bars {
         return Err(HvfArm64BootPciDataError::new(format!(
-            "PCI data endpoint count {} exceeds available capability BAR capacity {available_bars}",
-            demand.endpoints
+            "PCI data endpoint reservation {reserved_endpoint_capacity} exceeds available capability BAR capacity {available_bars}"
         )));
     }
-    let bar_plan = pci_data_bar_plan(validation.bar_allocator(), demand.endpoints)?;
+    let bar_plan = pci_data_bar_plan(validation.bar_allocator(), reserved_endpoint_capacity)?;
     {
         let dispatcher = dispatcher.lock().map_err(|_| {
             HvfArm64BootPciDataError::new(
@@ -11007,6 +11422,11 @@ fn prepare_pci_data_devices(
             demand.routes
         )));
     }
+    let reserved_routes = if all_virtio {
+        remaining_routes
+    } else {
+        demand.routes
+    };
 
     let validation = runtime.pci_validation.take().ok_or_else(|| {
         HvfArm64BootPciDataError::new("PCI data validation resources disappeared during prepare")
@@ -11022,10 +11442,11 @@ fn prepare_pci_data_devices(
         vsock: None,
         entropy: None,
         memory_hotplug: None,
+        runtime_hotplug: all_virtio,
     };
-    if demand.routes != 0 {
+    if reserved_routes != 0 {
         manager.msi_interrupts = Some(
-            HvfGicMsiDeviceInterruptResources::allocate(signaler, demand.routes).map_err(
+            HvfGicMsiDeviceInterruptResources::allocate(signaler, reserved_routes).map_err(
                 |source| {
                     HvfArm64BootPciDataError::new(format!(
                         "failed to allocate shared PCI data MSI-X routes: {source}"
@@ -11036,7 +11457,11 @@ fn prepare_pci_data_devices(
     }
     manager
         .block
-        .try_reserve_exact(block_count)
+        .try_reserve_exact(if all_virtio {
+            PCI_ENDPOINT_SLOT_COUNT
+        } else {
+            block_count
+        })
         .map_err(|source| {
             HvfArm64BootPciDataError::new(format!(
                 "failed to reserve PCI block endpoint storage: {source}"
@@ -11044,7 +11469,11 @@ fn prepare_pci_data_devices(
         })?;
     manager
         .network
-        .try_reserve_exact(network_count)
+        .try_reserve_exact(if all_virtio {
+            PCI_ENDPOINT_SLOT_COUNT
+        } else {
+            network_count
+        })
         .map_err(|source| {
             HvfArm64BootPciDataError::new(format!(
                 "failed to reserve PCI network endpoint storage: {source}"
@@ -11052,7 +11481,11 @@ fn prepare_pci_data_devices(
         })?;
     manager
         .pmem
-        .try_reserve_exact(pmem_count)
+        .try_reserve_exact(if all_virtio {
+            PCI_ENDPOINT_SLOT_COUNT
+        } else {
+            pmem_count
+        })
         .map_err(|source| {
             HvfArm64BootPciDataError::new(format!(
                 "failed to reserve PCI pmem endpoint storage: {source}"
@@ -11119,7 +11552,20 @@ fn prepare_pci_data_devices(
         }
 
         for prepared in blocks {
-            let (drive_id, config_space, device) = prepared.into_parts();
+            let (drive_id, is_root_device, config_space, device) = prepared.into_parts();
+            let metrics_lease = if all_virtio {
+                Some(
+                    block_device_metrics
+                        .claim_drive_lease(&drive_id)
+                        .map_err(|source| {
+                            HvfArm64BootPciDataError::new(format!(
+                                "failed to claim PCI block metrics ownership: {source}"
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
             let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
@@ -11148,8 +11594,11 @@ fn prepare_pci_data_devices(
             };
             manager.block.push(HvfArm64BootPciBlockDevice {
                 drive_id,
+                is_root_device,
                 published,
                 queue_deliveries: 0,
+                retry_deadline: None,
+                _metrics_lease: metrics_lease,
             });
             endpoint_index += 1;
         }
@@ -11549,10 +11998,11 @@ mod tests {
     };
     use bangbang_runtime::network::{
         NetworkInterfaceConfigInput, NetworkMmioLayout, NetworkRateLimiterConfig,
-        NetworkTokenBucketConfig, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
-        VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-        VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition,
-        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+        NetworkTokenBucketConfig, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_QUEUE_INDEX,
+        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRxPacket,
+        VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
+        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+        VirtioNetworkTxPacketSinkError,
     };
     use bangbang_runtime::pci::{PciBarAddressSpace, PciBarAllocator};
     use bangbang_runtime::pmem::{
@@ -11603,18 +12053,19 @@ mod tests {
         HvfArm64BootRunLoopControlWakeupToken, HvfArm64BootRunLoopOutcome,
         HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
         HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig, HvfArm64BootVmGenIdRestoreError,
-        HvfArm64BootVsockNotificationDispatchError, allocate_interrupt_lines,
-        collect_balloon_notification_dispatches, collect_block_notification_dispatches,
-        collect_entropy_notification_dispatches, collect_memory_hotplug_notification_dispatches,
-        collect_network_notification_dispatches, collect_vsock_notification_dispatches,
+        HvfArm64BootVsockNotificationDispatchError, PCI_ENDPOINT_SLOT_COUNT,
+        allocate_interrupt_lines, collect_balloon_notification_dispatches,
+        collect_block_notification_dispatches, collect_entropy_notification_dispatches,
+        collect_memory_hotplug_notification_dispatches, collect_network_notification_dispatches,
+        collect_vsock_notification_dispatches,
         dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
-        lock_boot_mmio_dispatcher_runtime, pci_all_virtio_resource_demand,
-        pci_data_available_bar_count, pci_data_bar_plan, pci_data_region_id,
-        pci_data_resource_demand, preflight_pci_data_dispatcher, quiesce_limiter_retry_wakeups,
-        record_entropy_dispatch_metrics, record_pmem_dispatch_metrics,
-        replace_vmgenid_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
-        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        lock_boot_mmio_dispatcher_runtime, pci_all_virtio_gic_msi_configuration,
+        pci_all_virtio_resource_demand, pci_data_available_bar_count, pci_data_bar_plan,
+        pci_data_region_id, pci_data_resource_demand, preflight_pci_data_dispatcher,
+        quiesce_limiter_retry_wakeups, record_entropy_dispatch_metrics,
+        record_pmem_dispatch_metrics, replace_vmgenid_and_signal_with, run_boot_session_loop,
+        run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
         signal_network_queue_interrupts, signal_pmem_queue_interrupts,
         signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at,
@@ -12336,6 +12787,62 @@ mod tests {
         assert!(later > first);
         assert!(earlier < first);
         scheduler.stop();
+    }
+
+    #[test]
+    fn runtime_block_inventory_change_replaces_stale_retry_from_survivors() {
+        let wakeup_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let mut scheduler = HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+            "bangbang-hvf-test-runtime-block-retry-refresh",
+            wakeup_token.clone(),
+            || {},
+        )
+        .expect("test retry wakeup scheduler should start");
+        scheduler.schedule_after(Some(Duration::from_secs(3_600)));
+        let removed_device_deadline = super::lock_limiter_retry_wakeup_state(&scheduler.shared)
+            .deadline
+            .expect("removed device deadline should be stored");
+        let survivor_deadline = removed_device_deadline
+            .checked_add(Duration::from_secs(3_600))
+            .expect("survivor deadline should fit");
+        wakeup_token.request_wakeup();
+
+        super::refresh_block_retry_wakeup_after_inventory_change(
+            &wakeup_token,
+            &scheduler,
+            Some(survivor_deadline),
+        );
+
+        assert!(!wakeup_token.take_wakeup_request());
+        assert_eq!(
+            super::lock_limiter_retry_wakeup_state(&scheduler.shared).deadline,
+            Some(survivor_deadline)
+        );
+
+        wakeup_token.request_wakeup();
+        super::refresh_block_retry_wakeup_after_inventory_change(&wakeup_token, &scheduler, None);
+
+        assert!(!wakeup_token.take_wakeup_request());
+        assert_eq!(
+            super::lock_limiter_retry_wakeup_state(&scheduler.shared).deadline,
+            None
+        );
+        scheduler.stop();
+    }
+
+    #[test]
+    fn runtime_block_publication_rollback_is_terminal() {
+        let error =
+            super::runtime_block_publication_error(super::VirtioPciPublicationError::Rollback {
+                primary: "injected publication failure".to_string(),
+                cleanup: "injected cleanup failure".to_string(),
+            });
+
+        assert!(matches!(
+            error,
+            bangbang_runtime::block::DriveRuntimeMutationError::TerminalInsertion { message }
+                if message.contains("injected cleanup failure")
+        ));
     }
 
     #[test]
@@ -20196,6 +20703,51 @@ mod tests {
             balloon_overflow.to_string(),
             "PCI all-virtio balloon MSI-X route count overflowed"
         );
+    }
+
+    #[test]
+    fn product_pci_msi_configuration_reserves_bounded_dynamic_slot_headroom() {
+        let controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+        let config = HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            RtcMmioLayout::new(TEST_RTC_MMIO_BASE, MmioRegionId::new(3000)),
+        )
+        .with_pci_enabled();
+
+        let configuration = pci_all_virtio_gic_msi_configuration(&controller, &config)
+            .expect("bounded product PCI capacity should produce an MSI configuration");
+        assert_eq!(
+            configuration.interrupt_count().get(),
+            u32::try_from(PCI_ENDPOINT_SLOT_COUNT * (VIRTIO_NET_QUEUE_SIZES.len() + 1))
+                .expect("bounded route count should fit u32")
+        );
+    }
+
+    #[test]
+    fn product_pci_preflights_every_endpoint_bar_and_dispatcher_identity() {
+        let endpoint_count =
+            u64::try_from(PCI_ENDPOINT_SLOT_COUNT).expect("bounded endpoint count should fit u64");
+        let bar_capacity = GuestMemoryRange::new(
+            GuestAddress::new(0x40_0000_0000),
+            endpoint_count * super::VIRTIO_PCI_CAPABILITY_BAR_SIZE,
+        )
+        .expect("full product PCI BAR capacity should be valid");
+        let allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, bar_capacity);
+        let plan = pci_data_bar_plan(&allocator, PCI_ENDPOINT_SLOT_COUNT)
+            .expect("all product PCI endpoint BARs should preflight");
+
+        assert_eq!(plan.len(), PCI_ENDPOINT_SLOT_COUNT);
+        assert_eq!(
+            pci_data_available_bar_count(&allocator)
+                .expect("full product PCI BAR capacity should be countable"),
+            PCI_ENDPOINT_SLOT_COUNT
+        );
+        preflight_pci_data_dispatcher(&MmioDispatcher::new(), &plan)
+            .expect("all product PCI dispatcher identities should preflight");
+        assert!(pci_data_bar_plan(&allocator, PCI_ENDPOINT_SLOT_COUNT + 1).is_err());
     }
 
     #[test]

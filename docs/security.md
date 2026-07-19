@@ -862,22 +862,41 @@ is resource-specific:
   successfully claimed replacement grant remains consumed. Limiter-only
   runtime updates do not reopen host backing paths; configured limiter buckets
   update only process-local active device state and stored drive configuration.
-  It does not implement block-device hotplug or removal. Block rate limiters are
-  process-local runtime state created during startup preparation or runtime
-  drive update. Exhausted limiters leave the descriptor pending for a later
-  dispatch opportunity instead of sleeping, busy-waiting, writing request
-  status, publishing a used-ring entry, or mutating the backing file. Active
-  HVF boot sessions schedule block retry wakeups with per-session state so one
-  VM cannot wake or share limiter state with another VM. Firecracker v1.16.0's
-  optional runtime drive attach/remove instead requires PCI transport, a guest
-  rescan after attach, and guest removal before host DELETE. bangbang's current
-  MMIO path rejects runtime PUT and DELETE without using a proposed backing or
-  mutating device state; a future PCI design must make that guest/operator
-  coordination an explicit lifecycle boundary. Configured vhost-user sockets
-  also remain rejected. A future vhost-user frontend would grant an external
-  backend access to guest-memory mappings and queue notifications, so it needs
-  separate shared-memory authorization, backend containment, lifecycle,
-  cleanup, and failure policy rather than only accepting a socket path.
+  PCI-mode post-start PUT prepares a non-root backing before entering the
+  owner-thread command and commits public configuration only after the live
+  endpoint publishes. Direct mode opens the proposed regular file on the API
+  thread. Contained mode instead requires an exact still-unused initial
+  `DriveBacking` grant with matching access, duplicates its already-opened file
+  for the candidate, and retains the original grant in a rollback claim until
+  publication commits. Invalid backing, admission, capacity, or publication
+  failure therefore restores usable authority and never falls back to ambient
+  path opening. Successful rollback leaves the worker live; incomplete
+  publication cleanup closes admission and makes the worker terminal. A
+  successful insertion consumes the grant once.
+
+  Bodyless PCI-mode DELETE first removes MMIO and ECAM visibility, closes work
+  and message admission, and drains admitted operations while retaining exact
+  generation-bound leases. Recoverable failure republishes the same usable
+  endpoint. Only then does the irreversible phase release device, MSI-X, BAR,
+  PCI function, dispatcher, backing, metrics, and configuration ownership;
+  a failed preparation rollback or corruption after that boundary is terminal.
+  Linux must rescan PCI after PUT and remove the function through guest sysfs
+  before host DELETE. The API does not automate or attest that guest
+  coordination. Default MMIO rejects runtime PUT and DELETE before using the
+  proposed backing or mutating live/public state. Root insertion/removal
+  remains rejected. Successful removal closes the active backing but does not
+  recreate already-consumed contained grant authority.
+
+  Block rate limiters remain process-local runtime state. Exhausted limiters
+  leave the descriptor pending for a later dispatch opportunity instead of
+  sleeping, busy-waiting, writing request status, publishing a used-ring entry,
+  or mutating the backing file. Active HVF boot sessions schedule block retry
+  wakeups with per-session state so one VM cannot wake or share limiter state
+  with another VM. Configured vhost-user sockets remain rejected. A future
+  vhost-user frontend would grant an external backend access to guest-memory
+  mappings and queue notifications, so it needs separate shared-memory
+  authorization, backend containment, lifecycle, cleanup, and failure policy
+  rather than only accepting a socket path.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. In contained mode an exact pmem grant tag is claimed during
@@ -1538,10 +1557,12 @@ spec-defined masking path retains pending state for later unmask delivery.
 Current signed coverage separately proves raw host-to-vCPU delivery,
 pinned-Linux GICv2m discovery, focused identity/virtio-rng/data-device
 conformance, and the signed product process booting every configured virtio
-class with positive queue/configuration MSI-X and real I/O. It does not prove
-interrupt remapping, runtime PCI attach/delete, external vmnet connectivity, or
-Firecracker's KVM ITS behavior. MSI-bearing GIC metadata is rejected by the
-native-v1 snapshot profile rather than silently omitted.
+class with positive queue/configuration MSI-X and real I/O. Separate direct
+and contained signed block gates prove the retained PCI manager's manual
+rescan/removal lifecycle and capacity reuse. This evidence does not prove
+interrupt remapping, runtime PCI pmem/network attach/delete, external vmnet
+connectivity, or Firecracker's KVM ITS behavior. MSI-bearing GIC metadata is
+rejected by the native-v1 snapshot profile rather than silently omitted.
 
 ## PCI Ownership Boundary
 

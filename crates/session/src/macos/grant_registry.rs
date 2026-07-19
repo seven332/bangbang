@@ -192,6 +192,21 @@ impl FileGrantRegistry {
     ) -> Result<Vec<GrantedFile>, GrantRegistryError> {
         duplicate_files(&self.entries, requests)
     }
+
+    /// Returns one reserved file grant to the same registry after an aborted
+    /// consumer transaction.
+    pub fn restore_file(
+        &mut self,
+        id: GrantId,
+        file: GrantedFile,
+    ) -> Result<(), GrantRegistryError> {
+        if self.entries.contains_key(&id) {
+            return Err(GrantRegistryError);
+        }
+        let previous = self.entries.insert(id, file);
+        debug_assert!(previous.is_none());
+        Ok(())
+    }
 }
 
 /// One-time owner-thread registry containing active directory scopes.
@@ -1269,6 +1284,26 @@ mod tests {
         assert!(files.duplicate_files(&wrong_second).is_err());
         assert!(files.duplicate_files(&duplicate).is_err());
         assert_eq!(files.len(), 2);
+
+        let reserved = files
+            .take_file(&kernel_id, ResourceRole::KernelImage, GrantAccess::ReadOnly)
+            .expect("matching grant should reserve");
+        assert_eq!(files.len(), 1);
+        files
+            .restore_file(kernel_id.clone(), reserved)
+            .expect("aborted reservation should restore exact authority");
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files
+                .duplicate_files(&[(
+                    kernel_id.clone(),
+                    ResourceRole::KernelImage,
+                    GrantAccess::ReadOnly,
+                )])
+                .expect("restored authority should remain usable")
+                .len(),
+            1
+        );
 
         let adopted = files
             .take_files(&[
