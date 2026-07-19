@@ -68,7 +68,8 @@ use bangbang_runtime::network::{
     VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
 use bangbang_runtime::pmem::{
-    PmemConfigInput, PmemFileBacking, PmemMmioLayout, PmemUpdate, PmemUpdateError, PmemUpdateInput,
+    PmemConfig, PmemConfigInput, PmemFileBacking, PmemMmioLayout, PmemRuntimeMutationError,
+    PmemUpdate, PmemUpdateError, PmemUpdateInput,
 };
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
@@ -510,6 +511,21 @@ pub(crate) trait ProcessSessionDiagnostics {
         _drive_id: &str,
     ) -> Result<(), DriveRuntimeMutationError> {
         Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn insert_runtime_pmem_device(
+        &mut self,
+        _config: PmemConfig,
+        _backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn remove_runtime_pmem_device(
+        &mut self,
+        _pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
     }
 
     fn update_network_interface(
@@ -1718,6 +1734,9 @@ where
             VmmAction::HotUnplugDevice(input) if input.kind() == HotUnplugDeviceKind::Drive => {
                 self.remove_drive(input.id())
             }
+            VmmAction::HotUnplugDevice(input) if input.kind() == HotUnplugDeviceKind::Pmem => {
+                self.remove_pmem(input.id())
+            }
             VmmAction::UpdateNetworkInterface(input) => self.update_network_interface(input),
             VmmAction::PatchPmem(input) => self.update_pmem(input),
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
@@ -2135,6 +2154,9 @@ where
     }
 
     fn put_pmem(&mut self, input: PmemConfigInput) -> Result<VmmData, VmmActionError> {
+        if self.controller.instance_info().state != bangbang_runtime::InstanceState::NotStarted {
+            return self.insert_runtime_pmem(input);
+        }
         let config = self.controller.prepare_pmem_config(input)?;
         let backing = match &self.grant_authority {
             Some(authority) => authority
@@ -2161,6 +2183,80 @@ where
                 self.pmem_grant_states.remove(&pmem_id);
             }
         }
+        Ok(VmmData::Empty)
+    }
+
+    fn insert_runtime_pmem(&mut self, input: PmemConfigInput) -> Result<VmmData, VmmActionError> {
+        if !self.pci_enabled {
+            return Err(VmmActionError::PmemRuntimeMutation(
+                PmemRuntimeMutationError::PciNotEnabled,
+            ));
+        }
+        let prepared_config = self.controller.prepare_runtime_pmem_insert(input)?;
+        let config = prepared_config.config();
+        let mut grant_claim: Option<PreparedFileGrantClaim> = match &self.grant_authority {
+            Some(authority) => Some(
+                authority
+                    .prepare_file_claim(
+                        std::path::Path::new(config.path_on_host()),
+                        ResourceRole::PmemBacking,
+                        grant_access_for_read_only(config.read_only()),
+                    )
+                    .map_err(|_| VmmActionError::ResourceGrant)?
+                    .ok_or(VmmActionError::ResourceGrant)?,
+            ),
+            None => None,
+        };
+        let backing = match grant_claim.as_mut() {
+            Some(claim) => PmemFileBacking::from_file(
+                claim
+                    .take_file()
+                    .map_err(|_| VmmActionError::ResourceGrant)?,
+                config.read_only(),
+            )
+            .map_err(|_| VmmActionError::ResourceGrant)?,
+            None => PmemFileBacking::open(config).map_err(|source| {
+                VmmActionError::PmemRuntimeMutation(PmemRuntimeMutationError::PrepareDevice {
+                    message: source.to_string(),
+                })
+            })?,
+        };
+        let config = config.clone();
+        let session = self.started_session.as_mut().ok_or({
+            VmmActionError::PmemRuntimeMutation(PmemRuntimeMutationError::ActiveSessionUnavailable)
+        })?;
+        session
+            .insert_runtime_pmem_device(config, backing)
+            .map_err(VmmActionError::PmemRuntimeMutation)?;
+        if let Some(claim) = grant_claim {
+            claim.commit();
+        }
+        self.controller.commit_runtime_pmem_insert(prepared_config);
+        Ok(VmmData::Empty)
+    }
+
+    fn remove_pmem(&mut self, pmem_id: &str) -> Result<VmmData, VmmActionError> {
+        let state = self.controller.instance_info().state;
+        if state == bangbang_runtime::InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "HotUnplugDevice",
+                state,
+            });
+        }
+        if !self.pci_enabled {
+            return Err(VmmActionError::PmemRuntimeMutation(
+                PmemRuntimeMutationError::PciNotEnabled,
+            ));
+        }
+        let prepared = self.controller.prepare_runtime_pmem_removal(pmem_id)?;
+        let session = self.started_session.as_mut().ok_or({
+            VmmActionError::PmemRuntimeMutation(PmemRuntimeMutationError::ActiveSessionUnavailable)
+        })?;
+        session
+            .remove_runtime_pmem_device(prepared.pmem_id())
+            .map_err(VmmActionError::PmemRuntimeMutation)?;
+        self.pmem_grant_states.remove(prepared.pmem_id());
+        self.controller.commit_runtime_pmem_removal(prepared);
         Ok(VmmData::Empty)
     }
 
@@ -4158,12 +4254,33 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
     }
 
+    fn insert_runtime_pmem_device(
+        &mut self,
+        _config: PmemConfig,
+        _backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn remove_runtime_pmem_device(
+        &mut self,
+        _pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
         None
     }
 
     fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
         None
+    }
+
+    fn update_pmem_device(&mut self, update: &PmemUpdate) -> Result<bool, PmemUpdateError> {
+        self.pmem_device_updater()
+            .ok_or(PmemUpdateError::ActiveSessionUnavailable)?
+            .update_pmem(update)
     }
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
@@ -4291,6 +4408,21 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         OwnedHvfArm64BootSession::remove_runtime_block_device(self, drive_id)
     }
 
+    fn insert_runtime_pmem_device(
+        &mut self,
+        config: PmemConfig,
+        backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        OwnedHvfArm64BootSession::insert_runtime_pmem_device(self, &config, backing)
+    }
+
+    fn remove_runtime_pmem_device(
+        &mut self,
+        pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        OwnedHvfArm64BootSession::remove_runtime_pmem_device(self, pmem_id)
+    }
+
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
         self.pci_network_device_updater()
             .map(BootRunLoopNetworkInterfaceUpdater::from_pci)
@@ -4311,6 +4443,15 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
                     self.mmio_dispatcher(),
                 ))
             })
+    }
+
+    fn update_pmem_device(&mut self, update: &PmemUpdate) -> Result<bool, PmemUpdateError> {
+        if self.uses_pci_data_devices() {
+            return OwnedHvfArm64BootSession::update_runtime_pmem_device(self, update);
+        }
+        NetworkPacketIoRunLoopSession::pmem_device_updater(self)
+            .ok_or(PmemUpdateError::ActiveSessionUnavailable)?
+            .update_pmem(update)
     }
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
@@ -4480,12 +4621,33 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
     }
 
+    fn insert_runtime_pmem_device(
+        &mut self,
+        _config: PmemConfig,
+        _backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn remove_runtime_pmem_device(
+        &mut self,
+        _pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
         None
     }
 
     fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
         None
+    }
+
+    fn update_pmem_device(&mut self, update: &PmemUpdate) -> Result<bool, PmemUpdateError> {
+        self.pmem_device_updater()
+            .ok_or(PmemUpdateError::ActiveSessionUnavailable)?
+            .update_pmem(update)
     }
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
@@ -4614,6 +4776,21 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         OwnedHvfArm64BootSession::remove_runtime_block_device(self, drive_id)
     }
 
+    fn insert_runtime_pmem_device(
+        &mut self,
+        config: PmemConfig,
+        backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        OwnedHvfArm64BootSession::insert_runtime_pmem_device(self, &config, backing)
+    }
+
+    fn remove_runtime_pmem_device(
+        &mut self,
+        pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        OwnedHvfArm64BootSession::remove_runtime_pmem_device(self, pmem_id)
+    }
+
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
         self.pci_network_device_updater()
             .map(BootRunLoopNetworkInterfaceUpdater::from_pci)
@@ -4634,6 +4811,15 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
                     self.mmio_dispatcher(),
                 ))
             })
+    }
+
+    fn update_pmem_device(&mut self, update: &PmemUpdate) -> Result<bool, PmemUpdateError> {
+        if self.uses_pci_data_devices() {
+            return OwnedHvfArm64BootSession::update_runtime_pmem_device(self, update);
+        }
+        BootRunLoopSession::pmem_device_updater(self)
+            .ok_or(PmemUpdateError::ActiveSessionUnavailable)?
+            .update_pmem(update)
     }
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
@@ -4780,12 +4966,31 @@ where
         self.session.remove_runtime_block_device(drive_id)
     }
 
+    fn insert_runtime_pmem_device(
+        &mut self,
+        config: PmemConfig,
+        backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        self.session.insert_runtime_pmem_device(config, backing)
+    }
+
+    fn remove_runtime_pmem_device(
+        &mut self,
+        pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        self.session.remove_runtime_pmem_device(pmem_id)
+    }
+
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
         self.session.network_interface_updater()
     }
 
     fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
         self.session.pmem_device_updater()
+    }
+
+    fn update_pmem_device(&mut self, update: &PmemUpdate) -> Result<bool, PmemUpdateError> {
+        self.session.update_pmem_device(update)
     }
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
@@ -5348,6 +5553,20 @@ where
     }
 }
 
+fn pmem_runtime_mutation_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, PmemRuntimeMutationError>,
+) -> PmemRuntimeMutationError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        other => PmemRuntimeMutationError::ActiveSessionCommand {
+            message: other.to_string(),
+        },
+    }
+}
+
 fn network_interface_update_error_from_boot_run_loop_command<C>(
     err: BootRunLoopCommandError<C, NetworkInterfaceUpdateError>,
 ) -> NetworkInterfaceUpdateError
@@ -5735,7 +5954,6 @@ where
 {
     control: S::Control,
     network_interface_updater: Option<BootRunLoopNetworkInterfaceUpdater>,
-    pmem_device_updater: Option<BootRunLoopPmemDeviceUpdater>,
     balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
     block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
     pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
@@ -5833,7 +6051,6 @@ where
     ) -> Result<Self, BootRunLoopStartError<S>> {
         let control = session.run_loop_control();
         let network_interface_updater = session.network_interface_updater();
-        let pmem_device_updater = session.pmem_device_updater();
         let balloon_device_updater = session.balloon_device_updater();
         let block_device_metrics = session.shared_block_device_metrics();
         let pmem_device_metrics = session.shared_pmem_device_metrics();
@@ -5967,7 +6184,6 @@ where
         Ok(Self {
             control,
             network_interface_updater,
-            pmem_device_updater,
             balloon_device_updater,
             block_device_metrics,
             pmem_device_metrics,
@@ -6138,6 +6354,14 @@ where
     }
 
     fn fail_runtime_block_mutation(&self, error: &DriveRuntimeMutationError) {
+        self.status
+            .record(BootRunLoopWorkerStatus::Failed(error.to_string()));
+        self.admission.shutdown();
+        self.pause_gate.shutdown();
+        let _ = self.control.request_stop();
+    }
+
+    fn fail_runtime_pmem_mutation(&self, error: &PmemRuntimeMutationError) {
         self.status
             .record(BootRunLoopWorkerStatus::Failed(error.to_string()));
         self.admission.shutdown();
@@ -6655,6 +6879,46 @@ where
         result
     }
 
+    fn insert_runtime_pmem_device(
+        &mut self,
+        config: PmemConfig,
+        backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(PmemRuntimeMutationError::ActiveSessionUnavailable);
+        }
+        let result = self
+            .run_command(move |session| session.insert_runtime_pmem_device(config, backing))
+            .map_err(pmem_runtime_mutation_error_from_boot_run_loop_command);
+        if let Err(error @ PmemRuntimeMutationError::TerminalInsertion { .. }) = &result {
+            self.fail_runtime_pmem_mutation(error);
+        }
+        result
+    }
+
+    fn remove_runtime_pmem_device(
+        &mut self,
+        pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(PmemRuntimeMutationError::ActiveSessionUnavailable);
+        }
+        let pmem_id = pmem_id.to_string();
+        let result = self
+            .run_command(move |session| session.remove_runtime_pmem_device(&pmem_id))
+            .map_err(pmem_runtime_mutation_error_from_boot_run_loop_command);
+        if let Err(error @ PmemRuntimeMutationError::TerminalRemoval { .. }) = &result {
+            self.fail_runtime_pmem_mutation(error);
+        }
+        result
+    }
+
     fn update_network_interface(
         &mut self,
         update: NetworkInterfaceUpdate,
@@ -6676,10 +6940,6 @@ where
     }
 
     fn update_pmem(&mut self, update: PmemUpdate) -> Result<(), PmemUpdateError> {
-        let Some(updater) = self.pmem_device_updater.as_ref() else {
-            return Err(PmemUpdateError::ActiveSessionUnavailable);
-        };
-
         if !matches!(
             self.status(),
             BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
@@ -6687,9 +6947,8 @@ where
             return Err(PmemUpdateError::ActiveSessionUnavailable);
         }
 
-        let updater = updater.clone();
         self.run_command(move |session| {
-            let has_pending_work = updater.update_pmem(&update)?;
+            let has_pending_work = session.update_pmem_device(&update)?;
             session.schedule_pmem_retry_wakeup_after_live_update(has_pending_work);
             Ok(())
         })
@@ -6973,8 +7232,8 @@ mod tests {
     };
     use bangbang_runtime::pmem::{
         PmemConfig, PmemConfigInput, PmemConfigs, PmemFileBacking, PmemMmioLayout,
-        PmemRateLimiterConfig, PmemTokenBucketConfig, PmemUpdate, PmemUpdateError, PmemUpdateInput,
-        PreparedPmemDevices,
+        PmemRateLimiterConfig, PmemRuntimeMutationError, PmemTokenBucketConfig, PmemUpdate,
+        PmemUpdateError, PmemUpdateInput, PreparedPmemDevices,
     };
     use bangbang_runtime::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialConfigInput, SerialOutput,
@@ -7368,6 +7627,17 @@ mod tests {
         BootRunLoopPmemDeviceUpdater::new(pmem_devices, Arc::new(Mutex::new(dispatcher)))
     }
 
+    fn runtime_pmem_fixture(name: &str, pmem_id: &str) -> (PmemConfig, PmemFileBacking) {
+        let path = TempFilePath::create_with_bytes(name, b"pmem");
+        let config = PmemConfig::try_from(PmemConfigInput::new(
+            pmem_id,
+            path.path().display().to_string(),
+        ))
+        .expect("runtime pmem config should validate");
+        let backing = PmemFileBacking::open(&config).expect("runtime pmem backing should open");
+        (config, backing)
+    }
+
     impl Drop for TempFilePath {
         fn drop(&mut self) {
             let _ = remove_file(&self.path);
@@ -7409,6 +7679,12 @@ mod tests {
         pmem_update_count: usize,
         last_pmem_update: Option<PmemUpdate>,
         pmem_update_result: Option<PmemUpdateError>,
+        pmem_insert_count: usize,
+        last_pmem_insert: Option<String>,
+        pmem_insert_result: Option<PmemRuntimeMutationError>,
+        pmem_remove_count: usize,
+        last_pmem_remove: Option<String>,
+        pmem_remove_result: Option<PmemRuntimeMutationError>,
         balloon_update_count: usize,
         last_balloon_update_mib: Option<u32>,
         balloon_update_result: Option<BalloonUpdateError>,
@@ -7465,6 +7741,12 @@ mod tests {
                 pmem_update_count: 0,
                 last_pmem_update: None,
                 pmem_update_result: None,
+                pmem_insert_count: 0,
+                last_pmem_insert: None,
+                pmem_insert_result: None,
+                pmem_remove_count: 0,
+                last_pmem_remove: None,
+                pmem_remove_result: None,
                 balloon_update_count: 0,
                 last_balloon_update_mib: None,
                 balloon_update_result: None,
@@ -7519,6 +7801,18 @@ mod tests {
         fn with_pmem_update_result(id: u64, result: PmemUpdateError) -> Self {
             let mut session = Self::new(id);
             session.pmem_update_result = Some(result);
+            session
+        }
+
+        fn with_pmem_insert_result(id: u64, result: PmemRuntimeMutationError) -> Self {
+            let mut session = Self::new(id);
+            session.pmem_insert_result = Some(result);
+            session
+        }
+
+        fn with_pmem_remove_result(id: u64, result: PmemRuntimeMutationError) -> Self {
+            let mut session = Self::new(id);
+            session.pmem_remove_result = Some(result);
             session
         }
 
@@ -7693,6 +7987,31 @@ mod tests {
             self.pmem_update_count += 1;
             self.last_pmem_update = Some(update);
             match self.pmem_update_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn insert_runtime_pmem_device(
+            &mut self,
+            config: PmemConfig,
+            _backing: PmemFileBacking,
+        ) -> Result<(), PmemRuntimeMutationError> {
+            self.pmem_insert_count += 1;
+            self.last_pmem_insert = Some(config.id().to_string());
+            match self.pmem_insert_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn remove_runtime_pmem_device(
+            &mut self,
+            pmem_id: &str,
+        ) -> Result<(), PmemRuntimeMutationError> {
+            self.pmem_remove_count += 1;
+            self.last_pmem_remove = Some(pmem_id.to_string());
+            match self.pmem_remove_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
             }
@@ -8344,6 +8663,9 @@ mod tests {
         runtime_block_events: Arc<Mutex<Vec<String>>>,
         runtime_block_insert_result: Option<DriveRuntimeMutationError>,
         runtime_block_remove_result: Option<DriveRuntimeMutationError>,
+        runtime_pmem_events: Arc<Mutex<Vec<String>>>,
+        runtime_pmem_insert_result: Option<PmemRuntimeMutationError>,
+        runtime_pmem_remove_result: Option<PmemRuntimeMutationError>,
         network_interface_updater: Option<BootRunLoopNetworkInterfaceUpdater>,
         pmem_device_updater: Option<BootRunLoopPmemDeviceUpdater>,
         pmem_retry_wakeup_after_updates: Arc<Mutex<Vec<bool>>>,
@@ -8387,6 +8709,9 @@ mod tests {
                 runtime_block_events: Arc::default(),
                 runtime_block_insert_result: None,
                 runtime_block_remove_result: None,
+                runtime_pmem_events: Arc::default(),
+                runtime_pmem_insert_result: None,
+                runtime_pmem_remove_result: None,
                 network_interface_updater: None,
                 pmem_device_updater: None,
                 pmem_retry_wakeup_after_updates: Arc::default(),
@@ -8530,6 +8855,20 @@ mod tests {
 
         fn with_runtime_block_remove_result(mut self, result: DriveRuntimeMutationError) -> Self {
             self.runtime_block_remove_result = Some(result);
+            self
+        }
+
+        fn runtime_pmem_events(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.runtime_pmem_events)
+        }
+
+        fn with_runtime_pmem_insert_result(mut self, result: PmemRuntimeMutationError) -> Self {
+            self.runtime_pmem_insert_result = Some(result);
+            self
+        }
+
+        fn with_runtime_pmem_remove_result(mut self, result: PmemRuntimeMutationError) -> Self {
+            self.runtime_pmem_remove_result = Some(result);
             self
         }
 
@@ -8683,6 +9022,35 @@ mod tests {
                 .expect("fake runtime block events should lock")
                 .push(format!("remove:{drive_id}"));
             match self.runtime_block_remove_result.clone() {
+                Some(source) => Err(source),
+                None => Ok(()),
+            }
+        }
+
+        fn insert_runtime_pmem_device(
+            &mut self,
+            config: PmemConfig,
+            _backing: PmemFileBacking,
+        ) -> Result<(), PmemRuntimeMutationError> {
+            self.runtime_pmem_events
+                .lock()
+                .expect("fake runtime pmem events should lock")
+                .push(format!("insert:{}", config.id()));
+            match self.runtime_pmem_insert_result.clone() {
+                Some(source) => Err(source),
+                None => Ok(()),
+            }
+        }
+
+        fn remove_runtime_pmem_device(
+            &mut self,
+            pmem_id: &str,
+        ) -> Result<(), PmemRuntimeMutationError> {
+            self.runtime_pmem_events
+                .lock()
+                .expect("fake runtime pmem events should lock")
+                .push(format!("remove:{pmem_id}"));
+            match self.runtime_pmem_remove_result.clone() {
                 Some(source) => Err(source),
                 None => Ok(()),
             }
@@ -10339,6 +10707,7 @@ mod tests {
             | VmmActionError::MemoryHotplugUpdate(_)
             | VmmActionError::MemoryHotplugUnsupported
             | VmmActionError::PmemConfig(_)
+            | VmmActionError::PmemRuntimeMutation(_)
             | VmmActionError::PmemUpdate(_)
             | VmmActionError::PmemUpdateUnsupported
             | VmmActionError::PmemUnsupported
@@ -12276,6 +12645,200 @@ mod tests {
 
         drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_orders_runtime_pmem_mutations_while_paused() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true)
+            .with_outcomes([
+                Ok(FakeRunLoopOutcome::Wakeup),
+                Ok(FakeRunLoopOutcome::Terminal),
+            ]);
+        let events = session.runtime_pmem_events();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(34).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            34
+        );
+        supervisor.pause().expect("worker should pause");
+
+        let (config, backing) = runtime_pmem_fixture("paused-runtime-pmem", "pmem0");
+        supervisor
+            .insert_runtime_pmem_device(config, backing)
+            .expect("paused worker should insert pmem device");
+        supervisor
+            .remove_runtime_pmem_device("pmem0")
+            .expect("paused worker should remove pmem device");
+
+        assert_eq!(
+            *events.lock().expect("runtime pmem events should lock"),
+            ["insert:pmem0".to_string(), "remove:pmem0".to_string()]
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_keeps_recoverable_runtime_pmem_insert_failure_live() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_runtime_pmem_insert_result(PmemRuntimeMutationError::PublishDevice {
+                message: "injected pmem publication failure".to_string(),
+            })
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true)
+            .with_outcomes([
+                Ok(FakeRunLoopOutcome::Wakeup),
+                Ok(FakeRunLoopOutcome::Terminal),
+            ]);
+        let events = session.runtime_pmem_events();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(35).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            35
+        );
+
+        let (config, backing) = runtime_pmem_fixture("failed-runtime-pmem", "pmem0");
+        let error = supervisor
+            .insert_runtime_pmem_device(config, backing)
+            .expect_err("injected pmem publication failure should be returned");
+
+        assert!(matches!(
+            error,
+            PmemRuntimeMutationError::PublishDevice { message }
+                if message == "injected pmem publication failure"
+        ));
+        assert_eq!(
+            *events.lock().expect("runtime pmem events should lock"),
+            ["insert:pmem0".to_string()]
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Running);
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_marks_terminal_runtime_pmem_mutations_failed() {
+        {
+            let control = FakeRunLoopControl::default();
+            let drop_count = Arc::new(AtomicU64::new(0));
+            let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+            let session =
+                FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                    .with_runtime_pmem_insert_result(PmemRuntimeMutationError::TerminalInsertion {
+                        message: "injected pmem publication rollback failure".to_string(),
+                    })
+                    .with_wait_for_stop(false)
+                    .with_wait_for_wakeup(true)
+                    .with_outcomes([
+                        Ok(FakeRunLoopOutcome::Wakeup),
+                        Ok(FakeRunLoopOutcome::Terminal),
+                    ]);
+            let mut supervisor = BootRunLoopSupervisor::start(
+                session,
+                NonZeroUsize::new(36).expect("non-zero limit"),
+            )
+            .expect("supervisor should start");
+            assert_eq!(
+                max_steps_receiver
+                    .recv()
+                    .expect("worker should enter run loop"),
+                36
+            );
+            let (config, backing) = runtime_pmem_fixture("terminal-runtime-pmem", "pmem0");
+
+            let error = supervisor
+                .insert_runtime_pmem_device(config, backing)
+                .expect_err("terminal pmem insertion failure should be returned");
+
+            assert!(matches!(
+                error,
+                PmemRuntimeMutationError::TerminalInsertion { message }
+                    if message == "injected pmem publication rollback failure"
+            ));
+            assert!(matches!(
+                supervisor.status(),
+                BootRunLoopWorkerStatus::Failed(message)
+                    if message.contains("injected pmem publication rollback failure")
+            ));
+            assert_eq!(
+                supervisor.admission_state(),
+                BootRunLoopCommandAdmissionState::Shutdown
+            );
+            assert_eq!(control.request_stop_count(), 1);
+            drop(supervisor);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        }
+
+        {
+            let control = FakeRunLoopControl::default();
+            let drop_count = Arc::new(AtomicU64::new(0));
+            let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+            let session =
+                FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                    .with_runtime_pmem_remove_result(PmemRuntimeMutationError::TerminalRemoval {
+                        message: "injected pmem removal commit failure".to_string(),
+                    })
+                    .with_wait_for_stop(false)
+                    .with_wait_for_wakeup(true)
+                    .with_outcomes([
+                        Ok(FakeRunLoopOutcome::Wakeup),
+                        Ok(FakeRunLoopOutcome::Terminal),
+                    ]);
+            let mut supervisor = BootRunLoopSupervisor::start(
+                session,
+                NonZeroUsize::new(37).expect("non-zero limit"),
+            )
+            .expect("supervisor should start");
+            assert_eq!(
+                max_steps_receiver
+                    .recv()
+                    .expect("worker should enter run loop"),
+                37
+            );
+
+            let error = supervisor
+                .remove_runtime_pmem_device("pmem0")
+                .expect_err("terminal pmem removal failure should be returned");
+
+            assert!(matches!(
+                error,
+                PmemRuntimeMutationError::TerminalRemoval { message }
+                    if message == "injected pmem removal commit failure"
+            ));
+            assert!(matches!(
+                supervisor.status(),
+                BootRunLoopWorkerStatus::Failed(message)
+                    if message.contains("injected pmem removal commit failure")
+            ));
+            assert_eq!(
+                supervisor.admission_state(),
+                BootRunLoopCommandAdmissionState::Shutdown
+            );
+            assert_eq!(control.request_stop_count(), 1);
+            drop(supervisor);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
@@ -14540,6 +15103,138 @@ mod tests {
             .expect("started session should remain available");
         assert_eq!(session.block_insert_count, 0);
         assert_eq!(session.block_remove_count, 0);
+    }
+
+    #[test]
+    fn runtime_pmem_insert_and_remove_commit_configuration_after_session_success() {
+        let backing = TempFilePath::create_with_bytes("runtime-hotplug-pmem", b"pmem");
+        let mut vmm = configured_vmm(FakeStarter::success(74));
+        vmm.pci_enabled = true;
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            backing.path().display().to_string(),
+        )))
+        .expect("runtime pmem should publish");
+        assert_eq!(vmm.controller.pmem_configs().len(), 1);
+        assert_eq!(vmm.controller.pmem_configs()[0].id(), "pmem0");
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pmem_insert_count, 1);
+        assert_eq!(session.last_pmem_insert.as_deref(), Some("pmem0"));
+
+        vmm.handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+            HotUnplugDeviceKind::Pmem,
+            "pmem0",
+        )))
+        .expect("runtime pmem should remove");
+        assert!(vmm.controller.pmem_configs().is_empty());
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pmem_remove_count, 1);
+        assert_eq!(session.last_pmem_remove.as_deref(), Some("pmem0"));
+    }
+
+    #[test]
+    fn runtime_pmem_session_failures_preserve_configuration_projection() {
+        let backing = TempFilePath::create_with_bytes("runtime-hotplug-pmem-failure", b"pmem");
+        let mut insert_vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_pmem_insert_result(
+                75,
+                PmemRuntimeMutationError::PublishDevice {
+                    message: "injected publication failure".to_string(),
+                },
+            ),
+        ));
+        insert_vmm.pci_enabled = true;
+        insert_vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        assert!(matches!(
+            insert_vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                "pmem0",
+                backing.path().display().to_string(),
+            ))),
+            Err(VmmActionError::PmemRuntimeMutation(
+                PmemRuntimeMutationError::PublishDevice { .. }
+            ))
+        ));
+        assert!(insert_vmm.controller.pmem_configs().is_empty());
+
+        let mut remove_vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_pmem_remove_result(
+                76,
+                PmemRuntimeMutationError::RemoveDevice {
+                    message: "injected recoverable removal failure".to_string(),
+                },
+            ),
+        ));
+        remove_vmm.pci_enabled = true;
+        remove_vmm
+            .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                "pmem0",
+                backing.path().display().to_string(),
+            )))
+            .expect("pmem should configure before startup");
+        remove_vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        assert!(matches!(
+            remove_vmm.handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                HotUnplugDeviceKind::Pmem,
+                "pmem0",
+            ))),
+            Err(VmmActionError::PmemRuntimeMutation(
+                PmemRuntimeMutationError::RemoveDevice { .. }
+            ))
+        ));
+        assert_eq!(remove_vmm.controller.pmem_configs().len(), 1);
+        assert_eq!(remove_vmm.controller.pmem_configs()[0].id(), "pmem0");
+    }
+
+    #[test]
+    fn default_mmio_runtime_pmem_mutation_is_nonmutating_rejection() {
+        let backing = TempFilePath::create_with_bytes("runtime-hotplug-pmem-mmio", b"pmem");
+        let mut vmm = configured_vmm(FakeStarter::success(77));
+        vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            backing.path().display().to_string(),
+        )))
+        .expect("pmem should configure before startup");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                "pmem1",
+                "/private/path-that-must-not-open",
+            ))),
+            Err(VmmActionError::PmemRuntimeMutation(
+                PmemRuntimeMutationError::PciNotEnabled
+            ))
+        );
+        assert_eq!(
+            vmm.handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                HotUnplugDeviceKind::Pmem,
+                "pmem0",
+            ))),
+            Err(VmmActionError::PmemRuntimeMutation(
+                PmemRuntimeMutationError::PciNotEnabled
+            ))
+        );
+        assert_eq!(vmm.controller.pmem_configs().len(), 1);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pmem_insert_count, 0);
+        assert_eq!(session.pmem_remove_count, 0);
     }
 
     #[test]

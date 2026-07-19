@@ -689,11 +689,55 @@
     {
       "id": "api-operation:PUT /pmem/{id}",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /pmem/{id}.",
+      "summary": "Configure a validated file-backed virtio-pmem device before startup, or transactionally attach one non-root pmem device after startup when public all-virtio PCI transport is enabled. Running and Paused insertion opens or reserves the exact contained grant before owner-thread mapping, assigns the first reusable aligned guest range, registers an exact writable or read-only HVF shadow, publishes the PCI endpoint, and commits configuration and grant consumption only after every live owner succeeds. Default MMIO, duplicate, root, invalid backing, grant, mapping, and capacity failures are stable, redacted, and nonmutating.",
       "source_refs": [
         "api-operation:PUT /pmem/{id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::insert_runtime_pmem"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "HvfGuestMemoryMapping::map_runtime_pmem_mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "HvfArm64BootPciDataDevices::insert_runtime_pmem"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemConfigs::prepare_runtime_insert and PreparedPmemDevice::from_config_with_backing_and_reserved_ranges"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "runtime pmem projection, paused FIFO, recoverable failure, and terminal-state tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_hotplugs_flushes_and_reuses_runtime_pmem_over_product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "runtime pmem mapping rollback, flush, take, restore, and retry tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_hotplugs_flushes_and_reuses_runtime_pmem_from_exact_unused_grants"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /serial",
@@ -1028,11 +1072,55 @@
     {
       "id": "api-path:/pmem/{id}",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /pmem/{id}.",
+      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs and strict fields, preserves the public configuration projection until live commits succeed, redacts backing and grant details on failure, and retains default-MMIO and root mutation as stable nonmutating rejections. Pmem root boot/direct host mapping, dirty tracking, and snapshot state remain separately audited semantic work.",
       "source_refs": [
         "api-path:/pmem/{id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PUT, PATCH, and bodyless DELETE /pmem/{id} routing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm pmem configure, insert, update, and remove transactions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "live PCI pmem insert, update, retry, and removal ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "pmem configuration, limiter, device, mapping, and runtime mutation models"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict pmem PUT, PATCH, and DELETE parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "pre-boot and runtime pmem configuration, mutation, and limiter tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed pmem startup, limiter, flush, hotplug, delete, and reuse gates"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained pmem startup and runtime grant-identity gates"
+        }
+      ]
     },
     {
       "id": "api-path:/serial",
@@ -4552,7 +4640,7 @@
     {
       "id": "corpus:device-hotplug",
       "family": "runtime-device-management",
-      "summary": "Audit all applicable capability claims owned by the pinned device-hotplug source corpus.",
+      "summary": "The pinned developer-preview contract is implemented and signed for transactional non-root virtio-block and virtio-pmem Running/Paused PUT/DELETE under public PCI, including manual guest rescan/removal, failure rollback, exact direct or contained backing authority, flush/I/O, cleanup, and generation-safe capacity reuse. Continue auditing this broad corpus until the independent virtio-net attach/remove slice and all aggregate limitations are resolved.",
       "source_refs": [
         "corpus:device-hotplug"
       ],
@@ -4780,7 +4868,7 @@
     {
       "id": "corpus:pmem",
       "family": "storage",
-      "summary": "Audit all applicable capability claims owned by the pinned pmem source corpus.",
+      "summary": "The non-root runtime PCI subset now includes transactional PUT/PATCH/DELETE, exact direct and contained backing ownership, aligned first-fit guest-range allocation, dynamic HVF shadow registration, targeted flush before unmap, rollback, metrics, cleanup, and signed same-ID/slot/range reuse. Continue auditing the broad pmem corpus for root-device boot, direct host-file mapping, dirty policy, sharing/huge-page guidance, performance, and snapshot state.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -5779,11 +5867,55 @@
     {
       "id": "non-swagger-route:DELETE /pmem/{id}",
       "family": "storage",
-      "summary": "Audit the pinned non-Swagger runtime route DELETE /pmem/{id}.",
+      "summary": "Remove one non-root live virtio-pmem endpoint through the pinned bodyless Firecracker route when public all-virtio PCI transport is enabled. Owner-thread teardown first removes endpoint reachability while retaining exact leases, flushes and unregisters only that device's dynamic HVF shadow, then irreversibly releases endpoint, MSI-X, BAR, function, dispatcher, mapping, backing, metrics generation, guest range, and configuration ownership. Pre-commit mapping failure restores the same endpoint; failed restoration or post-boundary corruption is terminal. Missing, root, and default-MMIO requests are nonmutating.",
       "source_refs": [
         "non-swagger-route:DELETE /pmem/{id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::remove_pmem"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "take_runtime_pmem_mapping and restore_runtime_pmem_mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "HvfArm64BootPciDataDevices::remove_runtime_pmem"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "prepare_teardown, rollback_prepared_teardown, and commit_prepared_teardown"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "bodyless pmem DELETE parsing and malformed-body tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_hotplugs_flushes_and_reuses_runtime_pmem_over_product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "exact runtime pmem flush, unmap failure retry, restore, and shadow isolation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_hotplugs_flushes_and_reuses_runtime_pmem_from_exact_unused_grants"
+        }
+      ]
     },
     {
       "id": "semantic.boot:arm64-cache-fdt",
@@ -5974,7 +6106,7 @@
     {
       "id": "semantic.hotplug:runtime-device-manager",
       "family": "runtime-device-management",
-      "summary": "The failure-atomic owner-thread inventory and complete block attach/remove vertical slice are implemented and verified for public all-virtio PCI, including guest preconditions, rollback, contained authority, metrics, cleanup, and reuse. Continue auditing the aggregate record until pmem and network attach/remove complete their independent slices.",
+      "summary": "The failure-atomic owner-thread inventory and complete block and pmem attach/remove vertical slices are implemented and verified for public all-virtio PCI, including manual guest preconditions, rollback, exact direct/contained authority, dynamic pmem host mapping, flush, metrics, cleanup, and generation-safe slot/BAR/vector/dispatcher/ID/guest-range reuse. Continue auditing the aggregate record until network attach/remove completes its independent slice.",
       "source_refs": [
         "corpus:device-hotplug"
       ],
@@ -6415,7 +6547,7 @@
     {
       "id": "semantic.storage:pmem-root-mapping-flush-and-state",
       "family": "storage",
-      "summary": "Audit pmem root/direct mapping, persistence/flush, limiting, dirty policy, cleanup, PCI activation, and snapshot state.",
+      "summary": "Non-root startup and runtime pmem now provide selected MMIO-or-PCI activation, runtime PCI attach/update/delete, aligned shadow mapping, targeted persistence flush, limiting/retry, exact cleanup, contained authority, metrics, and signed same-range reuse. Continue auditing root-device boot, direct host-file HVF mapping, dirty policy, sharing/performance outcomes, and snapshot state before promoting this aggregate storage record.",
       "source_refs": [
         "corpus:pmem"
       ],

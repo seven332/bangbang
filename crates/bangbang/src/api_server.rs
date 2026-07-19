@@ -9433,7 +9433,7 @@ mod tests {
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","path_on_host":"/private/tmp/pmem.img","root_device":true,"read_only":false,"rate_limiter":{"bandwidth":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
                 ),
-                "The requested operation is not supported in Running state: PutPmem",
+                "runtime pmem insertion and removal require PCI transport",
             ),
             (
                 "pm-prl-run",
@@ -9495,7 +9495,7 @@ mod tests {
             (
                 "pmem-delete-running",
                 "DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
-                "Pmem device is not supported.",
+                "runtime pmem insertion and removal require PCI transport",
                 "pmem0",
             ),
         ] {

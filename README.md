@@ -21,9 +21,10 @@ virtio-balloon reporting and zero-safe best-effort Darwin discard, bounded
 virtio-rng, targeted and rate-limited virtio-pmem flush, a block-granular
 virtio-mem plug/unplug lifecycle, the no-interrupt aarch64 PL031 RTC,
 DeviceTree VMGenID including native-v1 replacement notification, and startup
-VMClock discovery. Runtime PCI pmem/network attach/delete, ARM PVTime, pmem
-root or direct file-backed mapping, optional-device snapshots, and mutable
-VMClock restore remain explicit limits. Host discard never promises
+VMClock discovery. Non-root PCI pmem attach/delete now includes exact dynamic
+mapping, flush, teardown, and range reuse; runtime PCI network attach/delete,
+ARM PVTime, pmem root or direct file-backed mapping, optional-device snapshots,
+and mutable VMClock restore remain explicit limits. Host discard never promises
 synchronous RSS or footprint reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
@@ -46,10 +47,11 @@ Silicon coverage boots pinned Firecracker Linux with all seven device classes,
 checks stable identities, and performs real block, MMDS/network, pmem, vsock,
 balloon, entropy, and virtio-mem interrupt/I/O operations. Runtime block,
 network, and pmem in-place PATCH keeps working in either startup transport;
-PCI-mode block PUT/DELETE now uses one failure-atomic owner-thread transaction
-in Running or Paused state, with explicit guest rescan/removal and exact
-capacity reuse. Runtime network/pmem attach/delete, automatic guest hotplug
-notification, PCI snapshot persistence, external vmnet connectivity
+PCI-mode block and non-root pmem PUT/DELETE use failure-atomic owner-thread
+transactions in Running or Paused state, with explicit guest rescan/removal and
+exact capacity reuse. Pmem additionally owns a dynamic HVF shadow, targeted
+flush/unmap, and reusable aligned guest range. Runtime network attach/delete,
+automatic guest hotplug notification, PCI snapshot persistence, external vmnet connectivity
 certification, and Firecracker's KVM ITS identity remain explicit limits.
 Native-v1 create/load rejects PCI profiles before artifact or VM mutation,
 while the default MMIO snapshot profile is unchanged.
@@ -724,15 +726,31 @@ curl --unix-socket /tmp/bangbang.socket \
   -X DELETE http://localhost/drives/data
 ```
 
-Runtime block PUT and bodyless DELETE are accepted in `Running` and `Paused`.
-They commit `/vm/config` only after the live owner-thread operation succeeds;
-root, duplicate, missing, capacity, backing, or publication failures leave the
-prior configuration intact. Default MMIO sessions reject both operations
-before opening the proposed path. In production-contained mode, runtime PUT
-can consume only an exact still-unused `drive-backing` grant from the initial
-manifest; an aborted insertion restores that authority without ambient path
-fallback. Incomplete publication cleanup is terminal rather than leaving a
-damaged worker live. See the [runtime block hotplug contract](compat/firecracker/v1.16.0/device-hotplug-contract.md).
+The same public PCI profile supports a non-root pmem lifecycle:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket \
+  -X PUT http://localhost/pmem/pmem0 \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"pmem0","path_on_host":"/tmp/pmem.img","read_only":false}'
+
+# Rescan PCI inside Linux, flush /dev/pmem*, and remove its PCI function before
+# releasing the exact host mapping and endpoint.
+curl --unix-socket /tmp/bangbang.socket \
+  -X DELETE http://localhost/pmem/pmem0
+```
+
+Runtime block and pmem PUT plus bodyless DELETE are accepted in `Running` and
+`Paused`. They commit `/vm/config` only after the live owner-thread operation
+succeeds; root, duplicate, missing, capacity, backing, mapping, or publication
+failures leave the prior configuration intact. Default MMIO sessions reject
+the operations before opening the proposed path. In production-contained mode,
+runtime PUT can consume only an exact still-unused `drive-backing` or
+`pmem-backing` grant from the initial manifest; an aborted insertion restores
+that authority without ambient path fallback. Pmem removal flushes and unmaps
+only its exact dynamic HVF shadow before releasing the guest range. Incomplete
+cleanup is terminal rather than leaving a damaged worker live. See the
+[runtime device hotplug contract](compat/firecracker/v1.16.0/device-hotplug-contract.md).
 
 Create a supported full native-v1 snapshot after the VM is paused:
 
@@ -968,7 +986,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 73 implemented-and-verified, 325 audit-required, three
+delivery overlay with 76 implemented-and-verified, 322 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7

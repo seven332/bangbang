@@ -416,6 +416,7 @@ pub enum VmmActionError {
     MemoryHotplugUpdate(memory_hotplug::MemoryHotplugUpdateError),
     MemoryHotplugUnsupported,
     PmemConfig(pmem::PmemConfigError),
+    PmemRuntimeMutation(pmem::PmemRuntimeMutationError),
     PmemUpdate(pmem::PmemUpdateError),
     PmemUpdateUnsupported,
     PmemUnsupported,
@@ -475,6 +476,7 @@ impl fmt::Display for VmmActionError {
             Self::MemoryHotplugUpdate(err) => write!(f, "{err}"),
             Self::MemoryHotplugUnsupported => f.write_str("Memory hotplug is not supported."),
             Self::PmemConfig(err) => write!(f, "{err}"),
+            Self::PmemRuntimeMutation(err) => write!(f, "{err}"),
             Self::PmemUpdate(err) => write!(f, "{err}"),
             Self::PmemUpdateUnsupported => f.write_str("Pmem updates are not supported."),
             Self::PmemUnsupported => f.write_str("Pmem device is not supported."),
@@ -516,6 +518,7 @@ impl std::error::Error for VmmActionError {
             Self::MemoryHotplugStatus(err) => Some(err),
             Self::MemoryHotplugUpdate(err) => Some(err),
             Self::PmemConfig(err) => Some(err),
+            Self::PmemRuntimeMutation(err) => Some(err),
             Self::PmemUpdate(err) => Some(err),
             Self::SerialConfig(err) => Some(err),
             Self::SnapshotCreate(err) => Some(err),
@@ -820,6 +823,46 @@ impl VmmController {
 
     pub fn commit_pmem_config(&mut self, config: pmem::PmemConfig) {
         self.pmem_configs.upsert(config);
+        self.snapshot_load_history_fresh = false;
+    }
+
+    pub fn prepare_runtime_pmem_insert(
+        &mut self,
+        input: pmem::PmemConfigInput,
+    ) -> Result<pmem::PreparedPmemConfigInsert, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutPmem",
+                state: self.instance_info.state,
+            });
+        }
+        self.pmem_configs
+            .prepare_runtime_insert(input)
+            .map_err(VmmActionError::PmemRuntimeMutation)
+    }
+
+    pub fn commit_runtime_pmem_insert(&mut self, prepared: pmem::PreparedPmemConfigInsert) {
+        self.pmem_configs.commit_runtime_insert(prepared);
+        self.snapshot_load_history_fresh = false;
+    }
+
+    pub fn prepare_runtime_pmem_removal(
+        &self,
+        pmem_id: &str,
+    ) -> Result<pmem::PreparedPmemConfigRemoval, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "HotUnplugDevice",
+                state: self.instance_info.state,
+            });
+        }
+        self.pmem_configs
+            .prepare_runtime_removal(pmem_id)
+            .map_err(VmmActionError::PmemRuntimeMutation)
+    }
+
+    pub fn commit_runtime_pmem_removal(&mut self, prepared: pmem::PreparedPmemConfigRemoval) {
+        self.pmem_configs.commit_runtime_removal(prepared);
         self.snapshot_load_history_fresh = false;
     }
 

@@ -62,12 +62,14 @@ const GUEST_DATA_ID: &str = "grant-guest-data-1362";
 const GUEST_REPLACEMENT_ID: &str = "grant-guest-replacement-1362";
 const GUEST_HOTPLUG_REUSE_ID: &str = "grant-guest-hotplug-reuse-1420";
 const GUEST_PMEM_ID: &str = "grant-guest-pmem-1362";
+const GUEST_PMEM_REUSE_ID: &str = "grant-guest-pmem-reuse-1421";
 const GUEST_READ_ONLY_DATA_ID: &str = "grant-guest-read-only-data-1362";
 const GUEST_ROOTFS_REF: &str = "bangbang-grant:grant-guest-rootfs-1362";
 const GUEST_DATA_REF: &str = "bangbang-grant:grant-guest-data-1362";
 const GUEST_REPLACEMENT_REF: &str = "bangbang-grant:grant-guest-replacement-1362";
 const GUEST_HOTPLUG_REUSE_REF: &str = "bangbang-grant:grant-guest-hotplug-reuse-1420";
 const GUEST_PMEM_REF: &str = "bangbang-grant:grant-guest-pmem-1362";
+const GUEST_PMEM_REUSE_REF: &str = "bangbang-grant:grant-guest-pmem-reuse-1421";
 const GUEST_READ_ONLY_DATA_REF: &str = "bangbang-grant:grant-guest-read-only-data-1362";
 const GUEST_MISSING_REF: &str = "bangbang-grant:grant-guest-missing-1362";
 const OUTPUT_LOGGER_ID: &str = "grant-logger-sink-1364";
@@ -147,6 +149,7 @@ const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet
 const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
 const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
 const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
+const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
 const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
 const BLOCK_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_ONE";
 const BLOCK_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_ONE";
@@ -155,6 +158,14 @@ const BLOCK_HOTPLUG_CONTINUE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_CONTINUE";
 const BLOCK_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_TWO";
 const BLOCK_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_TWO";
 const BLOCK_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_SUCCESS";
+const PMEM_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_READY";
+const PMEM_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_HOST_ONE";
+const PMEM_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_GUEST_ONE";
+const PMEM_HOTPLUG_FIRST_REMOVED_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_FIRST_REMOVED";
+const PMEM_HOTPLUG_CONTINUE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_CONTINUE";
+const PMEM_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_HOST_TWO";
+const PMEM_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_GUEST_TWO";
+const PMEM_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_SUCCESS";
 const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
 const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
 const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
@@ -2601,6 +2612,242 @@ fn normal_bundle_hotplugs_runtime_block_from_exact_unused_grants() {
 }
 
 #[test]
+fn normal_bundle_hotplugs_flushes_and_reuses_runtime_pmem_from_exact_unused_grants() {
+    let bundle = production_bundle();
+    let fixture = GuestDeviceGrantFixture::new("runtime-pmem-hotplug");
+    resize_and_write_file_marker_at(&fixture.data, 1024, 0, &[]);
+    resize_and_write_file_marker_at(
+        &fixture.pmem,
+        PMEM_BACKING_LEN,
+        0,
+        PMEM_HOTPLUG_HOST_ONE_MARKER,
+    );
+    resize_and_write_file_marker_at(
+        &fixture.pmem_reuse,
+        PMEM_BACKING_LEN,
+        0,
+        PMEM_HOTPLUG_HOST_TWO_MARKER,
+    );
+    let mut running = spawn_ready_device_grant_api_launcher_with_extra_args(
+        &bundle,
+        &fixture,
+        "runtime-pmem-hotplug",
+        &["--enable-pci"],
+    );
+    fixture.replace_source_pathnames();
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT contained pmem-hotplug machine config",
+    );
+    let sealed_kernel = worker_bundle(&bundle).join("Contents/Resources/guest-kernel");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&sealed_kernel),
+        "boot_args": DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot request should serialize"),
+        ),
+        204,
+        "PUT contained pmem-hotplug boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": GUEST_ROOTFS_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT contained pmem-hotplug rootfs",
+        ),
+        (
+            "/drives/control",
+            serde_json::json!({
+                "drive_id": "control",
+                "path_on_host": GUEST_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+            }),
+            "PUT contained pmem-hotplug control drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("drive request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start contained pmem-hotplug guest",
+    );
+    wait_for_file_prefix(
+        &fixture.opened_data,
+        PMEM_HOTPLUG_READY_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("contained pmem-hotplug guest should become ready: {error}"));
+
+    let wrong_access = serde_json::json!({
+        "id": "hotpmem",
+        "path_on_host": GUEST_PMEM_REF,
+        "read_only": true,
+    });
+    let wrong_access_response = http_put(
+        &running.socket,
+        "/pmem/hotpmem",
+        &serde_json::to_string(&wrong_access).expect("wrong-access request should serialize"),
+    );
+    assert_device_private_grant_fault(&wrong_access_response, &fixture);
+    let unchanged = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &unchanged,
+        200,
+        "GET /vm/config after failed contained runtime pmem grant claim",
+    );
+    assert!(!unchanged.contains(r#""id":"hotpmem""#));
+
+    let first = serde_json::json!({
+        "id": "hotpmem",
+        "path_on_host": GUEST_PMEM_REF,
+        "read_only": false,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/pmem/hotpmem",
+            &serde_json::to_string(&first).expect("first runtime pmem should serialize"),
+        ),
+        204,
+        "runtime PUT contained first pmem after retained grant failure",
+    );
+    wait_for_file_prefix(
+        &fixture.opened_data,
+        PMEM_HOTPLUG_FIRST_REMOVED_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("contained first runtime pmem should flush: {error}"));
+    assert_eq!(
+        file_bytes_at(
+            &fixture.opened_pmem,
+            PMEM_GUEST_FLUSH_OFFSET,
+            PMEM_HOTPLUG_GUEST_ONE_MARKER.len(),
+        ),
+        PMEM_HOTPLUG_GUEST_ONE_MARKER,
+        "first contained runtime pmem flush should reach the granted object"
+    );
+
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause contained guest before pmem reuse",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/pmem/hotpmem", ""),
+        204,
+        "paused DELETE contained first runtime pmem",
+    );
+    let removed = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &removed,
+        200,
+        "GET /vm/config after contained runtime pmem DELETE",
+    );
+    assert!(!removed.contains(r#""id":"hotpmem""#));
+
+    let second = serde_json::json!({
+        "id": "hotpmem",
+        "path_on_host": GUEST_PMEM_REUSE_REF,
+        "read_only": false,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/pmem/hotpmem",
+            &serde_json::to_string(&second).expect("reused runtime pmem should serialize"),
+        ),
+        204,
+        "paused PUT contained reused runtime pmem",
+    );
+    let reused = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &reused,
+        200,
+        "GET /vm/config after contained runtime pmem reuse",
+    );
+    assert!(reused.contains(GUEST_PMEM_REUSE_REF));
+    assert!(!reused.contains(GUEST_PMEM_REF));
+    resize_and_write_file_marker_at(
+        &fixture.opened_data,
+        1024,
+        512,
+        PMEM_HOTPLUG_CONTINUE_MARKER,
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume contained guest after pmem reuse",
+    );
+
+    wait_for_file_prefix(
+        &fixture.opened_data,
+        PMEM_HOTPLUG_SUCCESS_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("contained reused runtime pmem should preserve slot and range: {error}")
+    });
+    assert_eq!(
+        file_bytes_at(
+            &fixture.opened_pmem_reuse,
+            PMEM_GUEST_FLUSH_OFFSET,
+            PMEM_HOTPLUG_GUEST_TWO_MARKER.len(),
+        ),
+        PMEM_HOTPLUG_GUEST_TWO_MARKER,
+        "reused contained runtime pmem flush should reach the second granted object"
+    );
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/pmem/hotpmem", ""),
+        204,
+        "final DELETE contained runtime pmem",
+    );
+
+    for (planted, marker) in [
+        (&fixture.data, PMEM_HOTPLUG_SUCCESS_MARKER),
+        (&fixture.pmem, PMEM_HOTPLUG_GUEST_ONE_MARKER),
+        (&fixture.pmem_reuse, PMEM_HOTPLUG_GUEST_TWO_MARKER),
+    ] {
+        assert_eq!(
+            file_bytes_at(planted, 0, marker.len()),
+            vec![0; marker.len()],
+            "replacement source pathname must not receive contained runtime pmem writes"
+        );
+    }
+
+    stop_running_launcher(&mut running, "contained runtime pmem hotplug guest");
+}
+
+#[test]
 fn normal_bundle_enforces_read_only_drive_grant_against_guest_writes() {
     let bundle = production_bundle();
     let fixture = GuestDeviceGrantFixture::new("read-only-block");
@@ -3677,12 +3924,14 @@ struct GuestDeviceGrantFixture {
     replacement: PathBuf,
     hotplug_reuse: PathBuf,
     pmem: PathBuf,
+    pmem_reuse: PathBuf,
     read_only_data: PathBuf,
     opened_rootfs: PathBuf,
     opened_data: PathBuf,
     opened_replacement: PathBuf,
     opened_hotplug_reuse: PathBuf,
     opened_pmem: PathBuf,
+    opened_pmem_reuse: PathBuf,
     opened_read_only_data: PathBuf,
     manifest: PathBuf,
 }
@@ -3697,12 +3946,14 @@ impl GuestDeviceGrantFixture {
         let replacement = canonical_root.join("external-replacement.img");
         let hotplug_reuse = canonical_root.join("external-hotplug-reuse.img");
         let pmem = canonical_root.join("external-pmem.img");
+        let pmem_reuse = canonical_root.join("external-pmem-reuse.img");
         let read_only_data = canonical_root.join("external-read-only-data.img");
         let opened_rootfs = canonical_root.join("opened-rootfs.ext4");
         let opened_data = canonical_root.join("opened-data.img");
         let opened_replacement = canonical_root.join("opened-replacement.img");
         let opened_hotplug_reuse = canonical_root.join("opened-hotplug-reuse.img");
         let opened_pmem = canonical_root.join("opened-pmem.img");
+        let opened_pmem_reuse = canonical_root.join("opened-pmem-reuse.img");
         let opened_read_only_data = canonical_root.join("opened-read-only-data.img");
         let manifest = canonical_root.join("grant-manifest.json");
 
@@ -3711,6 +3962,7 @@ impl GuestDeviceGrantFixture {
         create_sized_file(&replacement, 512);
         create_sized_file(&hotplug_reuse, 512);
         create_pmem_file(&pmem, PMEM_HOST_MARKER);
+        create_pmem_file(&pmem_reuse, PMEM_HOTPLUG_HOST_TWO_MARKER);
         create_sized_file(&read_only_data, 512);
 
         let manifest_json = serde_json::json!({
@@ -3747,6 +3999,12 @@ impl GuestDeviceGrantFixture {
                     "source": path_text(&pmem),
                 },
                 {
+                    "id": GUEST_PMEM_REUSE_ID,
+                    "role": "pmem-backing",
+                    "access": "read-write",
+                    "source": path_text(&pmem_reuse),
+                },
+                {
                     "id": GUEST_READ_ONLY_DATA_ID,
                     "role": "drive-backing",
                     "access": "read-only",
@@ -3767,12 +4025,14 @@ impl GuestDeviceGrantFixture {
             replacement,
             hotplug_reuse,
             pmem,
+            pmem_reuse,
             read_only_data,
             opened_rootfs,
             opened_data,
             opened_replacement,
             opened_hotplug_reuse,
             opened_pmem,
+            opened_pmem_reuse,
             opened_read_only_data,
             manifest,
         }
@@ -3785,6 +4045,7 @@ impl GuestDeviceGrantFixture {
             (&self.replacement, &self.opened_replacement),
             (&self.hotplug_reuse, &self.opened_hotplug_reuse),
             (&self.pmem, &self.opened_pmem),
+            (&self.pmem_reuse, &self.opened_pmem_reuse),
             (&self.read_only_data, &self.opened_read_only_data),
         ] {
             fs::rename(source, opened).expect("launcher-opened source should move");
@@ -3794,6 +4055,7 @@ impl GuestDeviceGrantFixture {
         create_sized_file(&self.replacement, 512);
         create_sized_file(&self.hotplug_reuse, 512);
         create_sized_file(&self.pmem, PMEM_BACKING_LEN);
+        create_sized_file(&self.pmem_reuse, PMEM_BACKING_LEN);
         create_sized_file(&self.read_only_data, 512);
     }
 
@@ -3804,12 +4066,14 @@ impl GuestDeviceGrantFixture {
             path_text(&self.replacement),
             path_text(&self.hotplug_reuse),
             path_text(&self.pmem),
+            path_text(&self.pmem_reuse),
             path_text(&self.read_only_data),
             path_text(&self.opened_rootfs),
             path_text(&self.opened_data),
             path_text(&self.opened_replacement),
             path_text(&self.opened_hotplug_reuse),
             path_text(&self.opened_pmem),
+            path_text(&self.opened_pmem_reuse),
             path_text(&self.opened_read_only_data),
             path_text(&self.manifest),
             GUEST_ROOTFS_ID,
@@ -3817,12 +4081,14 @@ impl GuestDeviceGrantFixture {
             GUEST_REPLACEMENT_ID,
             GUEST_HOTPLUG_REUSE_ID,
             GUEST_PMEM_ID,
+            GUEST_PMEM_REUSE_ID,
             GUEST_READ_ONLY_DATA_ID,
             GUEST_ROOTFS_REF,
             GUEST_DATA_REF,
             GUEST_REPLACEMENT_REF,
             GUEST_HOTPLUG_REUSE_REF,
             GUEST_PMEM_REF,
+            GUEST_PMEM_REUSE_REF,
             GUEST_READ_ONLY_DATA_REF,
             std::str::from_utf8(PMEM_HOST_MARKER).expect("pmem marker should be UTF-8"),
         ]

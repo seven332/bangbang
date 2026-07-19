@@ -934,8 +934,14 @@ is resource-specific:
   bucket values or backing paths. An operator can deliberately configure the
   same external file for multiple devices or processes; that alias is outside
   bangbang's isolation guarantee and requires operator-owned access and
-  coordination. Root-device boot semantics, direct file-backed HVF mapping,
-  dirty-range tracking, and hot-unplug remain deferred.
+  coordination. Public PCI runtime PUT opens or reserves one exact direct or
+  contained backing before owner publication, allocates a non-overlapping
+  aligned guest range, and registers only its private shadow. DELETE first
+  removes endpoint reachability, then flushes/unregisters that exact shadow and
+  releases the backing, range, and metrics generation; pre-commit failure
+  restores reachability or mapping, while incomplete restoration is terminal.
+  Consumed contained authority is never recreated. Root-device boot semantics,
+  direct file-backed HVF mapping, and dirty-range tracking remain deferred.
 - `/entropy` accepts Firecracker-shaped bandwidth and ops rate-limiter buckets.
   The limiter is process-local runtime state, is applied before host entropy is
   read or guest memory is written, and must not sleep or busy-wait while budget
@@ -1558,11 +1564,12 @@ Current signed coverage separately proves raw host-to-vCPU delivery,
 pinned-Linux GICv2m discovery, focused identity/virtio-rng/data-device
 conformance, and the signed product process booting every configured virtio
 class with positive queue/configuration MSI-X and real I/O. Separate direct
-and contained signed block gates prove the retained PCI manager's manual
-rescan/removal lifecycle and capacity reuse. This evidence does not prove
-interrupt remapping, runtime PCI pmem/network attach/delete, external vmnet
-connectivity, or Firecracker's KVM ITS behavior. MSI-bearing GIC metadata is
-rejected by the native-v1 snapshot profile rather than silently omitted.
+and contained signed block and pmem gates prove the retained PCI manager's
+manual rescan/removal lifecycle, capacity reuse, exact pmem shadow ownership,
+and same-range reuse. This evidence does not prove interrupt remapping, runtime
+PCI network attach/delete, external vmnet connectivity, or Firecracker's KVM
+ITS behavior. MSI-bearing GIC metadata is rejected by the native-v1 snapshot
+profile rather than silently omitted.
 
 ## PCI Ownership Boundary
 

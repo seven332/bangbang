@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v46"
+direct_boot_variant="direct-boot-v47"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -578,6 +578,159 @@ check_block_hotplug_marker() {
     BANGBANG_BLOCK_HOTPLUG_HOST_TWO \
     BANGBANG_BLOCK_HOTPLUG_GUEST_TWO \
     BANGBANG_BLOCK_HOTPLUG_SUCCESS \
+    SECOND; then
+    return
+  fi
+}
+
+pmem_hotplug_fail() {
+  reason=$1
+  marker="BANGBANG_PMEM_HOTPLUG_FAIL_$reason"
+  emit_line "$marker"
+  write_vdb_marker "$marker"
+  sync /dev/vdb 2>/dev/null || sync
+}
+
+find_runtime_pmem() {
+  runtime_pmem_device=
+  runtime_pmem_pci_path=
+  runtime_pmem_resource=
+
+  for function_path in /sys/bus/pci/devices/*; do
+    [ -d "$function_path" ] || continue
+    function=${function_path##*/}
+    pci_function_has_identity "$function" 0x105b || continue
+    for block_path in "$function_path"/virtio*/ndbus*/region*/namespace*/block/*; do
+      [ -e "$block_path" ] || continue
+      namespace_path=${block_path%/block/*}
+      resource=$(cat "$namespace_path/resource" 2>/dev/null || true)
+      [ -n "$resource" ] || continue
+      device="/dev/${block_path##*/}"
+      [ -b "$device" ] || continue
+      runtime_pmem_device=$device
+      runtime_pmem_pci_path=$function_path
+      runtime_pmem_resource=$resource
+      return 0
+    done
+  done
+
+  return 1
+}
+
+wait_for_runtime_pmem() {
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    printf '1\n' > /sys/bus/pci/rescan 2>/dev/null || return 1
+    sleep 1
+    if find_runtime_pmem; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+runtime_pmem_marker_at_offset() {
+  marker=$1
+  offset=$2
+  actual=$(dd if="$runtime_pmem_device" bs=1 skip="$offset" count="${#marker}" 2>/dev/null || true)
+  [ "$actual" = "$marker" ]
+}
+
+run_runtime_pmem_round() {
+  expected=$1
+  written=$2
+  removed=$3
+  phase=$4
+
+  if ! wait_for_runtime_pmem; then
+    pmem_hotplug_fail "${phase}_RESCAN"
+    return 1
+  fi
+  if ! runtime_pmem_marker_at_offset "$expected" 0; then
+    pmem_hotplug_fail "${phase}_READ"
+    return 1
+  fi
+
+  if [ "$phase" = FIRST ]; then
+    pmem_hotplug_first_pci_path=$runtime_pmem_pci_path
+    pmem_hotplug_first_resource=$runtime_pmem_resource
+  elif [ "$runtime_pmem_pci_path" != "$pmem_hotplug_first_pci_path" ]; then
+    pmem_hotplug_fail "${phase}_SLOT_REUSE"
+    return 1
+  elif [ "$runtime_pmem_resource" != "$pmem_hotplug_first_resource" ]; then
+    pmem_hotplug_fail "${phase}_RANGE_REUSE"
+    return 1
+  fi
+
+  if ! printf '%s' "$written" \
+    | dd of="$runtime_pmem_device" bs=1 seek=4096 conv=notrunc 2>/dev/null; then
+    pmem_hotplug_fail "${phase}_WRITE"
+    return 1
+  fi
+  if ! sync "$runtime_pmem_device" 2>/dev/null; then
+    pmem_hotplug_fail "${phase}_FLUSH"
+    return 1
+  fi
+  if ! runtime_pmem_marker_at_offset "$written" 4096; then
+    pmem_hotplug_fail "${phase}_VERIFY"
+    return 1
+  fi
+
+  removed_device=$runtime_pmem_device
+  if ! printf '1\n' > "$runtime_pmem_pci_path/remove" 2>/dev/null; then
+    pmem_hotplug_fail "${phase}_REMOVE"
+    return 1
+  fi
+  attempts=0
+  while [ -b "$removed_device" ] && [ "$attempts" -lt 30 ]; do
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  if [ -b "$removed_device" ]; then
+    pmem_hotplug_fail "${phase}_REMOVE_WAIT"
+    return 1
+  fi
+
+  write_vdb_marker "$removed"
+  sync /dev/vdb 2>/dev/null || sync
+  emit_line "$removed"
+}
+
+check_pmem_hotplug_marker() {
+  if [ ! -b /dev/vdb ] || [ ! -e /sys/bus/pci/rescan ]; then
+    pmem_hotplug_fail PREREQUISITES
+    return
+  fi
+
+  pmem_hotplug_first_pci_path=
+  pmem_hotplug_first_resource=
+  write_vdb_marker BANGBANG_PMEM_HOTPLUG_READY
+  sync /dev/vdb 2>/dev/null || sync
+  emit_line BANGBANG_PMEM_HOTPLUG_READY
+
+  if ! run_runtime_pmem_round \
+    BANGBANG_PMEM_HOTPLUG_HOST_ONE \
+    BANGBANG_PMEM_HOTPLUG_GUEST_ONE \
+    BANGBANG_PMEM_HOTPLUG_FIRST_REMOVED \
+    FIRST; then
+    return
+  fi
+
+  attempts=0
+  while ! vdb_sector_starts_with_marker BANGBANG_PMEM_HOTPLUG_CONTINUE 1; do
+    if [ "$attempts" -ge 60 ]; then
+      pmem_hotplug_fail CONTINUE
+      return
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+
+  if ! run_runtime_pmem_round \
+    BANGBANG_PMEM_HOTPLUG_HOST_TWO \
+    BANGBANG_PMEM_HOTPLUG_GUEST_TWO \
+    BANGBANG_PMEM_HOTPLUG_SUCCESS \
     SECOND; then
     return
   fi
@@ -2327,7 +2480,9 @@ if [ -r /proc/cmdline ]; then
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if cmdline_has bangbang.block-hotplug=1; then
+if cmdline_has bangbang.pmem-hotplug=1; then
+  check_pmem_hotplug_marker
+elif cmdline_has bangbang.block-hotplug=1; then
   check_block_hotplug_marker
 elif cmdline_has bangbang.pci-all-virtio=1; then
   check_all_virtio_pci_marker

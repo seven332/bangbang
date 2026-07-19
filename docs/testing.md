@@ -128,7 +128,8 @@ duplicate parser tests, supported-host pre-readiness process startup,
 unsupported-target compilation, complete capacity/rollback unit tests, and
 native-v1 PCI rejection are mandatory companions. This startup gate does not
 by itself certify runtime attach/delete, guest rescan/removal, PCI snapshot
-persistence, or external vmnet connectivity.
+persistence, or external vmnet connectivity; separate signed hotplug gates own
+the block and pmem runtime claims.
 
 Runtime block hotplug changes additionally require both
 `macos_arm64::signed_executable_hotplugs_and_reuses_runtime_block_over_product_pci`
@@ -149,6 +150,23 @@ rollback, work/message drain, terminal commit handling, paused FIFO admission,
 and slot/BAR/vector/dispatcher reuse.
 The guest/operator rescan and sysfs-removal handshake is part of this gate; it
 is not an automatic notification claim.
+
+Runtime pmem hotplug changes additionally require both
+`macos_arm64::signed_executable_hotplugs_flushes_and_reuses_runtime_pmem_over_product_pci`
+and
+`normal_bundle_hotplugs_flushes_and_reuses_runtime_pmem_from_exact_unused_grants`
+through the signed wrapper. Each test starts without pmem, performs two
+Running/Paused PUT/DELETE rounds around manual PCI rescan and sysfs removal,
+and requires guest reads plus queue-driven flushes to reach the exact first and
+second host backings. The guest records the first PCI BDF and pmem namespace
+resource and accepts the second round only when both are reused. The contained
+case must inject a failed access claim without consuming the exact pmem grant,
+then consume two distinct initially unused grants and prove pathname
+replacement cannot redirect either writeback. Unit companions must cover
+transactional configuration projection, first-fit range exclusion and reuse,
+generation-safe metrics ownership, dynamic HVF map/take/restore, failed
+map/unmap isolation, endpoint rollback, recoverable versus terminal owner
+failures, paused FIFO admission, and default-MMIO rejection before backing use.
 
 Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` baseline
 that creates one VM and GIC before two permanent owner-thread runners, proves
