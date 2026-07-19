@@ -1195,6 +1195,10 @@ where
     pub const fn is_started(&self) -> bool {
         self.started.is_started()
     }
+
+    pub fn stop(&mut self) -> Result<(), VmnetError> {
+        self.started.stop()
+    }
 }
 
 impl<B> VmnetPacketIoBackend for StartedVmnetPacketIoBackend<B>

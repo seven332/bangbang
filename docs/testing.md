@@ -129,7 +129,7 @@ unsupported-target compilation, complete capacity/rollback unit tests, and
 native-v1 PCI rejection are mandatory companions. This startup gate does not
 by itself certify runtime attach/delete, guest rescan/removal, PCI snapshot
 persistence, or external vmnet connectivity; separate signed hotplug gates own
-the block and pmem runtime claims.
+the block, pmem, and network runtime claims.
 
 Runtime block hotplug changes additionally require both
 `macos_arm64::signed_executable_hotplugs_and_reuses_runtime_block_over_product_pci`
@@ -167,6 +167,25 @@ transactional configuration projection, first-fit range exclusion and reuse,
 generation-safe metrics ownership, dynamic HVF map/take/restore, failed
 map/unmap isolation, endpoint rollback, recoverable versus terminal owner
 failures, paused FIFO admission, and default-MMIO rejection before backing use.
+
+Runtime network hotplug changes additionally require both
+`macos_arm64::signed_executable_hotplugs_mmds_network_and_reuses_product_pci_slot`
+and `normal_bundle_hotplugs_mmds_network_without_vmnet_authority` through the
+signed wrapper. Each starts with one MMDS-selected PCI network and a permanent
+control drive, lets Linux remove the startup function, then performs two
+host-DELETE/runtime-PUT rounds. The guest must rescan, find modern virtio-net by
+the configured MAC, require the original BDF, bring the link up, complete a
+real MMDS request, and remove the function through sysfs before each host
+DELETE. The second PUT occurs while Paused. The normal production bundle must
+retain its exact networkless signature and no vmnet authority, reject one
+non-MMDS bridged runtime request without live-config mutation, and still finish
+both MMDS-only rounds. Unit companions must cover duplicate ID/MAC and capacity,
+generation-safe metrics reuse, independent provider classes, actual-live-vmnet
+authority counting, explicit vmnet stop/drop, packet-I/O and endpoint
+take/restore, publication/removal injection, terminal cleanup, snapshot and
+shutdown admission, paused FIFO ordering, default-MMIO rejection, redaction,
+and exact PCI lease reuse. Apple-approved vmnet credentials and real external
+connectivity remain separate #1351/#1378 gates.
 
 Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` baseline
 that creates one VM and GIC before two permanent owner-thread runners, proves
@@ -1518,6 +1537,13 @@ paths, and raw worker output are excluded from failure diagnostics. Both
 interfaces are completely covered by their process-local MMDS configuration,
 so this concurrent scenario also stays on MMDS-only packet I/O without the
 restricted networking entitlement. When the boot args include
+`bangbang.network-hotplug=1`, the init script records the startup network BDF,
+removes that function, and uses fixed control-drive sectors to coordinate two
+host mutation rounds. For each round it rescans PCI, finds the configured MAC
+and `1af4:1041` identity, requires the original BDF, configures a link-local
+route, fetches the expected MMDS value with bounded curl timeouts, removes the
+function through sysfs, and publishes only a static success/failure marker.
+When the boot args include
 `bangbang.entropy-read=1`, the same
 init script checks `/sys/class/misc/hw_random/rng_current` for `virtio_rng`,
 reads bytes from `/dev/hwrng`, and writes
@@ -1647,11 +1673,14 @@ private values and diagnostics, select every configured interface in MMDS
 config, and therefore do not open vmnet or require its restricted entitlement.
 The separate hidden PCI conformance case and the product all-virtio case reuse
 the same authority-free MMDS packet implementation and prove a modern
-virtio-pci network endpoint. The tests do not execute
-direct-vmnet external connectivity, returned MAC, MTU, or
-maximum-packet reconciliation, packet-available callbacks, Firecracker v1.16.0
-PCI attach/remove, broader MMDS TCP behavior, limiter-specific metrics, or
-network snapshot state.
+virtio-pci network endpoint. The direct and contained two-round hotplug gates
+add Running/Paused PUT, rescan, real MMDS exchange, sysfs removal, DELETE,
+live-config projection, exact BDF/capacity reuse, and clean shutdown; the
+contained case proves this needs no vmnet entitlement and that unauthorized
+non-MMDS insertion rolls back. The tests do not execute direct-vmnet external
+connectivity, returned MAC/MTU/maximum-packet reconciliation, packet-available
+callbacks, broader MMDS TCP behavior, limiter-specific metrics, automatic PCI
+notification, or network snapshot state.
 
 For block specifically, this evidence validates the supported public file-backed
 subset over MMIO by default or PCI with `--enable-pci`, including initial

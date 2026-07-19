@@ -409,6 +409,7 @@ pub enum VmmActionError {
     MmdsDataStore(mmds::MmdsDataStoreError),
     MmdsState(mmds::MmdsStateLockError),
     NetworkInterfaceConfig(network::NetworkInterfaceConfigError),
+    NetworkRuntimeMutation(network::NetworkRuntimeMutationError),
     NetworkInterfaceUpdate(network::NetworkInterfaceUpdateError),
     NetworkInterfaceUpdateUnsupported,
     MemoryHotplugConfig(memory_hotplug::MemoryHotplugConfigError),
@@ -467,6 +468,7 @@ impl fmt::Display for VmmActionError {
             Self::MmdsDataStore(err) => write!(f, "{err}"),
             Self::MmdsState(err) => write!(f, "{err}"),
             Self::NetworkInterfaceConfig(err) => write!(f, "{err}"),
+            Self::NetworkRuntimeMutation(err) => write!(f, "{err}"),
             Self::NetworkInterfaceUpdate(err) => write!(f, "{err}"),
             Self::NetworkInterfaceUpdateUnsupported => {
                 f.write_str("Network interface updates are not supported.")
@@ -513,6 +515,7 @@ impl std::error::Error for VmmActionError {
             Self::MmdsDataStore(err) => Some(err),
             Self::MmdsState(err) => Some(err),
             Self::NetworkInterfaceConfig(err) => Some(err),
+            Self::NetworkRuntimeMutation(err) => Some(err),
             Self::NetworkInterfaceUpdate(err) => Some(err),
             Self::MemoryHotplugConfig(err) => Some(err),
             Self::MemoryHotplugStatus(err) => Some(err),
@@ -796,6 +799,54 @@ impl VmmController {
         self.network_interface_configs
             .commit_update(config)
             .map_err(VmmActionError::NetworkInterfaceUpdate)
+    }
+
+    pub fn prepare_runtime_network_interface_insert(
+        &mut self,
+        input: network::NetworkInterfaceConfigInput,
+    ) -> Result<network::PreparedNetworkInterfaceConfigInsert, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutNetworkInterface",
+                state: self.instance_info.state,
+            });
+        }
+        self.network_interface_configs
+            .prepare_runtime_insert(input)
+            .map_err(VmmActionError::NetworkRuntimeMutation)
+    }
+
+    pub fn commit_runtime_network_interface_insert(
+        &mut self,
+        prepared: network::PreparedNetworkInterfaceConfigInsert,
+    ) {
+        self.network_interface_configs
+            .commit_runtime_insert(prepared);
+        self.snapshot_load_history_fresh = false;
+    }
+
+    pub fn prepare_runtime_network_interface_removal(
+        &self,
+        iface_id: &str,
+    ) -> Result<network::PreparedNetworkInterfaceConfigRemoval, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "HotUnplugDevice",
+                state: self.instance_info.state,
+            });
+        }
+        self.network_interface_configs
+            .prepare_runtime_removal(iface_id)
+            .map_err(VmmActionError::NetworkRuntimeMutation)
+    }
+
+    pub fn commit_runtime_network_interface_removal(
+        &mut self,
+        prepared: network::PreparedNetworkInterfaceConfigRemoval,
+    ) {
+        self.network_interface_configs
+            .commit_runtime_removal(prepared);
+        self.snapshot_load_history_fresh = false;
     }
 
     pub fn prepare_pmem_update(
@@ -1988,7 +2039,7 @@ mod tests {
         network::{
             GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
             NetworkInterfaceConfigInput, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
-            NetworkRateLimiterConfig, NetworkTokenBucketConfig,
+            NetworkRateLimiterConfig, NetworkRuntimeMutationError, NetworkTokenBucketConfig,
         },
         pmem::{
             PmemConfigError, PmemConfigInput, PmemRateLimiterConfig, PmemTokenBucketConfig,
@@ -6939,6 +6990,88 @@ mod tests {
             }
         );
         assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn runtime_network_controller_insert_and_removal_commit_only_after_live_success() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller.instance_info.state = state;
+
+            let prepared = controller
+                .prepare_runtime_network_interface_insert(
+                    network_input("eth0", "vmnet:shared").with_guest_mac("12:34:56:78:9a:bc"),
+                )
+                .expect("runtime network insertion should prepare");
+            assert!(controller.network_interface_configs().is_empty());
+            controller.commit_runtime_network_interface_insert(prepared);
+            assert_eq!(controller.network_interface_configs().len(), 1);
+            assert_eq!(controller.network_interface_configs()[0].iface_id(), "eth0");
+
+            let prepared = controller
+                .prepare_runtime_network_interface_removal("eth0")
+                .expect("runtime network removal should prepare");
+            assert_eq!(controller.network_interface_configs().len(), 1);
+            controller.commit_runtime_network_interface_removal(prepared);
+            assert!(controller.network_interface_configs().is_empty());
+        }
+    }
+
+    #[test]
+    fn runtime_network_controller_rejects_preboot_transactions_without_mutation() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert!(matches!(
+            controller.prepare_runtime_network_interface_insert(network_input(
+                "private_iface",
+                "vmnet:shared",
+            )),
+            Err(VmmActionError::UnsupportedState {
+                action: "PutNetworkInterface",
+                state: InstanceState::NotStarted,
+            })
+        ));
+        assert!(matches!(
+            controller.prepare_runtime_network_interface_removal("private_iface"),
+            Err(VmmActionError::UnsupportedState {
+                action: "HotUnplugDevice",
+                state: InstanceState::NotStarted,
+            })
+        ));
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn runtime_network_controller_rejects_duplicate_and_missing_ids_without_mutation() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(network_input(
+                "eth0",
+                "vmnet:shared",
+            )))
+            .expect("initial network config should insert");
+        controller.instance_info.state = InstanceState::Running;
+
+        assert!(matches!(
+            controller.prepare_runtime_network_interface_insert(network_input(
+                "eth0",
+                "vmnet:host",
+            )),
+            Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::DuplicateInterface { iface_id }
+            )) if iface_id == "eth0"
+        ));
+        assert!(matches!(
+            controller.prepare_runtime_network_interface_removal("missing"),
+            Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::UnknownInterface { iface_id }
+            )) if iface_id == "missing"
+        ));
+        assert_eq!(controller.network_interface_configs().len(), 1);
+        assert_eq!(
+            controller.network_interface_configs()[0].host_dev_name(),
+            "vmnet:shared"
+        );
     }
 
     #[test]

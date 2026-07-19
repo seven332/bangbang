@@ -45,14 +45,15 @@ use bangbang_runtime::memory_hotplug::{
 };
 use bangbang_runtime::message_interrupt::GuestMessageInterruptResources;
 use bangbang_runtime::metrics::{
-    BlockDeviceMetricsLease, PmemDeviceMetricsLease, SharedBalloonDeviceMetrics,
-    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+    BlockDeviceMetricsLease, NetworkInterfaceMetricsLease, PmemDeviceMetricsLease,
+    SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
     SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
     SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegionId};
 use bangbang_runtime::network::{
-    NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioLayout, VIRTIO_NET_DEVICE_ID,
+    NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioLayout,
+    NetworkRuntimeMutationError, PreparedNetworkDevice, VIRTIO_NET_DEVICE_ID,
     VIRTIO_NET_QUEUE_SIZES, VirtioNetworkConfigSpace, VirtioNetworkDevice,
     VirtioNetworkDeviceNotificationError,
 };
@@ -588,6 +589,8 @@ struct HvfArm64BootPciNetworkDevice {
     host_dev_name: String,
     published: PublishedPciNetwork,
     queue_deliveries: usize,
+    retry_deadline: Option<Instant>,
+    _metrics_lease: Option<NetworkInterfaceMetricsLease>,
 }
 
 #[derive(Debug)]
@@ -666,6 +669,27 @@ impl fmt::Display for HvfArm64BootPciDataError {
 }
 
 impl std::error::Error for HvfArm64BootPciDataError {}
+
+/// Exact reversible teardown state for one runtime PCI network endpoint.
+pub struct PreparedHvfArm64BootPciNetworkRemoval {
+    iface_id: String,
+    index: usize,
+}
+
+impl PreparedHvfArm64BootPciNetworkRemoval {
+    pub fn iface_id(&self) -> &str {
+        &self.iface_id
+    }
+}
+
+impl fmt::Debug for PreparedHvfArm64BootPciNetworkRemoval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedHvfArm64BootPciNetworkRemoval")
+            .field("ownership", &"<redacted>")
+            .finish()
+    }
+}
 
 #[derive(Debug)]
 struct HvfArm64BootPciDataDevices {
@@ -897,6 +921,216 @@ impl HvfArm64BootPciDataDevices {
                 })?;
         }
         self.block.remove(index);
+        Ok(())
+    }
+
+    fn insert_runtime_network(
+        &mut self,
+        prepared: PreparedNetworkDevice,
+        metrics: &SharedNetworkInterfaceMetricsRegistry,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        if !self.runtime_hotplug {
+            return Err(NetworkRuntimeMutationError::PciNotEnabled);
+        }
+        if self
+            .network
+            .iter()
+            .any(|device| device.iface_id == prepared.iface_id())
+        {
+            return Err(NetworkRuntimeMutationError::DuplicateInterface {
+                iface_id: prepared.iface_id().to_string(),
+            });
+        }
+        if self.endpoint_count() >= PCI_ENDPOINT_SLOT_COUNT {
+            return Err(NetworkRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI endpoint capacity is exhausted".to_string(),
+            });
+        }
+        if self.network.len() == self.network.capacity() {
+            return Err(NetworkRuntimeMutationError::PrepareDevice {
+                message: "runtime network inventory capacity is exhausted".to_string(),
+            });
+        }
+
+        let iface_id = prepared.iface_id().to_string();
+        let prepared_metrics = metrics
+            .prepare_interface(iface_id.clone())
+            .map_err(|source| NetworkRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            })?;
+        let interrupts = self.shared_msi_registry().map_err(|source| {
+            NetworkRuntimeMutationError::TerminalInsertion {
+                message: source.to_string(),
+            }
+        })?;
+        let segment = self.validation.segment().clone();
+        let network_type = VirtioDeviceType::new(VIRTIO_NET_DEVICE_ID).map_err(|source| {
+            NetworkRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        let (published_iface_id, host_dev_name, config_space, device) = prepared.into_parts();
+        debug_assert_eq!(published_iface_id, iface_id);
+        let published = {
+            let mut dispatcher = self.dispatcher.lock().map_err(|_| {
+                NetworkRuntimeMutationError::TerminalInsertion {
+                    message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                }
+            })?;
+            let region_id = Self::available_region_id(&dispatcher).map_err(|source| {
+                NetworkRuntimeMutationError::PrepareDevice {
+                    message: source.to_string(),
+                }
+            })?;
+            PublishedVirtioPciEndpoint::publish(
+                VirtioPciIdentity::new(network_type, config_space.available_features()),
+                &VIRTIO_NET_QUEUE_SIZES,
+                config_space,
+                device,
+                false,
+                self.validation.bar_allocator_mut(),
+                segment,
+                &mut dispatcher,
+                region_id,
+                interrupts,
+            )
+            .map_err(runtime_network_publication_error)?
+        };
+        let metrics_lease = prepared_metrics.publish();
+        debug_assert!(self.network.len() < self.network.capacity());
+        self.network.push(HvfArm64BootPciNetworkDevice {
+            iface_id,
+            host_dev_name,
+            published,
+            queue_deliveries: 0,
+            retry_deadline: None,
+            _metrics_lease: Some(metrics_lease),
+        });
+        Ok(())
+    }
+
+    fn update_runtime_network(
+        &self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        let device = self
+            .network
+            .iter()
+            .find(|device| device.iface_id == update.iface_id())
+            .ok_or_else(|| NetworkInterfaceUpdateError::UnknownInterface {
+                iface_id: update.iface_id().to_string(),
+            })?;
+        device
+            .published
+            .endpoint()
+            .update_network_rate_limiters(update)
+            .map_err(|source| NetworkInterfaceUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            })
+    }
+
+    fn prepare_runtime_network_removal(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<PreparedHvfArm64BootPciNetworkRemoval, NetworkRuntimeMutationError> {
+        if !self.runtime_hotplug {
+            return Err(NetworkRuntimeMutationError::PciNotEnabled);
+        }
+        let index = self
+            .network
+            .iter()
+            .position(|device| device.iface_id == iface_id)
+            .ok_or_else(|| NetworkRuntimeMutationError::UnknownInterface {
+                iface_id: iface_id.to_string(),
+            })?;
+        let mut dispatcher =
+            self.dispatcher
+                .lock()
+                .map_err(|_| NetworkRuntimeMutationError::TerminalRemoval {
+                    message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                })?;
+        let device = self.network.get_mut(index).ok_or_else(|| {
+            NetworkRuntimeMutationError::UnknownInterface {
+                iface_id: iface_id.to_string(),
+            }
+        })?;
+        if let Err(source) = device.published.prepare_teardown(&mut dispatcher) {
+            let message = source.to_string();
+            return Err(
+                if matches!(
+                    source,
+                    VirtioPciPublicationError::Rollback { .. }
+                        | VirtioPciPublicationError::SegmentLock { .. }
+                        | VirtioPciPublicationError::EndpointRelease { .. }
+                ) {
+                    NetworkRuntimeMutationError::TerminalRemoval { message }
+                } else {
+                    NetworkRuntimeMutationError::RemoveDevice { message }
+                },
+            );
+        }
+        Ok(PreparedHvfArm64BootPciNetworkRemoval {
+            iface_id: iface_id.to_string(),
+            index,
+        })
+    }
+
+    fn rollback_runtime_network_removal(
+        &mut self,
+        prepared: PreparedHvfArm64BootPciNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        let mut dispatcher =
+            self.dispatcher
+                .lock()
+                .map_err(|_| NetworkRuntimeMutationError::TerminalRemoval {
+                    message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                })?;
+        let device = self.network.get_mut(prepared.index).ok_or_else(|| {
+            NetworkRuntimeMutationError::TerminalRemoval {
+                message: "runtime network endpoint disappeared during rollback".to_string(),
+            }
+        })?;
+        if device.iface_id != prepared.iface_id {
+            return Err(NetworkRuntimeMutationError::TerminalRemoval {
+                message: "runtime network endpoint identity changed during rollback".to_string(),
+            });
+        }
+        device
+            .published
+            .rollback_prepared_teardown(&mut dispatcher)
+            .map_err(|source| NetworkRuntimeMutationError::TerminalRemoval {
+                message: source.to_string(),
+            })
+    }
+
+    fn commit_runtime_network_removal(
+        &mut self,
+        prepared: PreparedHvfArm64BootPciNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        {
+            let mut dispatcher = self.dispatcher.lock().map_err(|_| {
+                NetworkRuntimeMutationError::TerminalRemoval {
+                    message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                }
+            })?;
+            let device = self.network.get_mut(prepared.index).ok_or_else(|| {
+                NetworkRuntimeMutationError::TerminalRemoval {
+                    message: "runtime network endpoint disappeared during commit".to_string(),
+                }
+            })?;
+            if device.iface_id != prepared.iface_id {
+                return Err(NetworkRuntimeMutationError::TerminalRemoval {
+                    message: "runtime network endpoint identity changed during commit".to_string(),
+                });
+            }
+            device
+                .published
+                .commit_prepared_teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| NetworkRuntimeMutationError::TerminalRemoval {
+                    message: source.to_string(),
+                })?;
+        }
+        self.network.remove(prepared.index);
         Ok(())
     }
 
@@ -1402,13 +1636,14 @@ impl HvfArm64BootPciDataDevices {
         mut packet_io: Option<&mut dyn Arm64BootNetworkPacketIoProvider>,
         metrics: &SharedNetworkInterfaceMetricsRegistry,
     ) -> Option<Duration> {
-        let mut retry_after = None;
         for device in &mut self.network {
+            let mut retry_after = None;
             let endpoint = device.published.endpoint();
             let has_pending = match endpoint.has_pending_network_queue_work() {
                 Ok(has_pending) => has_pending,
                 Err(_) => {
                     metrics.record_event_failure_for_interface(&device.iface_id);
+                    device.retry_deadline = None;
                     continue;
                 }
             };
@@ -1426,6 +1661,7 @@ impl HvfArm64BootPciDataDevices {
                         }
                         Err(_) => {
                             metrics.record_event_failure_for_interface(&device.iface_id);
+                            device.retry_deadline = None;
                             continue;
                         }
                     },
@@ -1467,8 +1703,17 @@ impl HvfArm64BootPciDataDevices {
                     }
                 }
             }
+            device.retry_deadline = retry_after.map(limiter_retry_deadline_after);
         }
-        retry_after
+        self.network_retry_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn network_retry_deadline(&self) -> Option<Instant> {
+        self.network
+            .iter()
+            .filter_map(|device| device.retry_deadline)
+            .min()
     }
 
     fn dispatch_vsock(&mut self, memory: &mut GuestMemory, metrics: &SharedVsockDeviceMetrics) {
@@ -3936,6 +4181,69 @@ impl HvfArm64BootSession<'_> {
         )
     }
 
+    /// Publishes one prepared network endpoint into the owner-thread PCI inventory.
+    pub fn insert_runtime_network_device(
+        &mut self,
+        prepared: PreparedNetworkDevice,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        let metrics = self.network_interface_metrics.clone();
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(NetworkRuntimeMutationError::PciNotEnabled)?
+            .insert_runtime_network(prepared, &metrics)
+    }
+
+    /// Updates one network entry by resolving it from the current live inventory.
+    pub fn update_runtime_network_interface(
+        &mut self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(NetworkInterfaceUpdateError::ActiveSessionUnavailable)?
+            .update_runtime_network(update)
+    }
+
+    /// Makes one network endpoint reversibly unreachable before packet-I/O teardown.
+    pub fn prepare_runtime_network_device_removal(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<PreparedHvfArm64BootPciNetworkRemoval, NetworkRuntimeMutationError> {
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(NetworkRuntimeMutationError::PciNotEnabled)?
+            .prepare_runtime_network_removal(iface_id)
+    }
+
+    /// Restores one reversibly removed network endpoint.
+    pub fn rollback_runtime_network_device_removal(
+        &mut self,
+        prepared: PreparedHvfArm64BootPciNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(NetworkRuntimeMutationError::PciNotEnabled)?
+            .rollback_runtime_network_removal(prepared)
+    }
+
+    /// Commits endpoint teardown after packet-I/O cleanup succeeds.
+    pub fn commit_runtime_network_device_removal(
+        &mut self,
+        prepared: PreparedHvfArm64BootPciNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        let devices = self
+            .pci_data_devices
+            .as_mut()
+            .ok_or(NetworkRuntimeMutationError::PciNotEnabled)?;
+        devices.commit_runtime_network_removal(prepared)?;
+        refresh_network_retry_wakeup_after_inventory_change(
+            &self.network_retry_wakeup,
+            &self.network_retry_wakeup_scheduler,
+            devices.network_retry_deadline(),
+        );
+        Ok(())
+    }
+
     pub fn pci_network_device_updater(&self) -> Option<HvfArm64BootPciNetworkDeviceUpdater> {
         self.pci_data_devices
             .as_ref()
@@ -5872,6 +6180,69 @@ impl OwnedHvfArm64BootSession {
             &self.pmem_retry_wakeup_scheduler,
             pmem_id,
         )
+    }
+
+    /// Publishes one prepared network endpoint into the owner-thread PCI inventory.
+    pub fn insert_runtime_network_device(
+        &mut self,
+        prepared: PreparedNetworkDevice,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        let metrics = self.network_interface_metrics.clone();
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(NetworkRuntimeMutationError::PciNotEnabled)?
+            .insert_runtime_network(prepared, &metrics)
+    }
+
+    /// Updates one network entry by resolving it from the current live inventory.
+    pub fn update_runtime_network_interface(
+        &mut self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(NetworkInterfaceUpdateError::ActiveSessionUnavailable)?
+            .update_runtime_network(update)
+    }
+
+    /// Makes one network endpoint reversibly unreachable before packet-I/O teardown.
+    pub fn prepare_runtime_network_device_removal(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<PreparedHvfArm64BootPciNetworkRemoval, NetworkRuntimeMutationError> {
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(NetworkRuntimeMutationError::PciNotEnabled)?
+            .prepare_runtime_network_removal(iface_id)
+    }
+
+    /// Restores one reversibly removed network endpoint.
+    pub fn rollback_runtime_network_device_removal(
+        &mut self,
+        prepared: PreparedHvfArm64BootPciNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(NetworkRuntimeMutationError::PciNotEnabled)?
+            .rollback_runtime_network_removal(prepared)
+    }
+
+    /// Commits endpoint teardown after packet-I/O cleanup succeeds.
+    pub fn commit_runtime_network_device_removal(
+        &mut self,
+        prepared: PreparedHvfArm64BootPciNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        let devices = self
+            .pci_data_devices
+            .as_mut()
+            .ok_or(NetworkRuntimeMutationError::PciNotEnabled)?;
+        devices.commit_runtime_network_removal(prepared)?;
+        refresh_network_retry_wakeup_after_inventory_change(
+            &self.network_retry_wakeup,
+            &self.network_retry_wakeup_scheduler,
+            devices.network_retry_deadline(),
+        );
+        Ok(())
     }
 
     pub fn pci_network_device_updater(&self) -> Option<HvfArm64BootPciNetworkDeviceUpdater> {
@@ -9660,6 +10031,21 @@ fn runtime_pmem_publication_error(source: VirtioPciPublicationError) -> PmemRunt
     }
 }
 
+fn runtime_network_publication_error(
+    source: VirtioPciPublicationError,
+) -> NetworkRuntimeMutationError {
+    let terminal = matches!(
+        source,
+        VirtioPciPublicationError::Rollback { .. } | VirtioPciPublicationError::SegmentLock { .. }
+    );
+    let message = source.to_string();
+    if terminal {
+        NetworkRuntimeMutationError::TerminalInsertion { message }
+    } else {
+        NetworkRuntimeMutationError::PublishDevice { message }
+    }
+}
+
 fn remove_runtime_pci_block_device_and_refresh_retry(
     pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
     retry_wakeup: &HvfArm64BootLimiterRetryWakeupToken,
@@ -9714,6 +10100,16 @@ fn remove_runtime_pci_pmem_device_and_refresh_retry(
 }
 
 fn refresh_pmem_retry_wakeup_after_inventory_change(
+    retry_wakeup: &HvfArm64BootLimiterRetryWakeupToken,
+    retry_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    retry_deadline: Option<Instant>,
+) {
+    retry_scheduler.cancel_and_wait();
+    let _ = retry_wakeup.take_wakeup_request();
+    retry_scheduler.schedule_deadline(retry_deadline);
+}
+
+fn refresh_network_retry_wakeup_after_inventory_change(
     retry_wakeup: &HvfArm64BootLimiterRetryWakeupToken,
     retry_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     retry_deadline: Option<Instant>,
@@ -11364,18 +11760,29 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
             runtime.pmem_devices.iter().map(|device| device.id()),
         )
     };
-    let network_interface_metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(
-        runtime
-            .network_devices
-            .iter()
-            .map(|device| device.registration.iface_id())
-            .chain(
-                runtime
-                    .pci_network_devices
-                    .iter()
-                    .map(|device| device.iface_id()),
-            ),
-    );
+    let network_interface_ids = runtime
+        .network_devices
+        .iter()
+        .map(|device| device.registration.iface_id())
+        .chain(
+            runtime
+                .pci_network_devices
+                .iter()
+                .map(|device| device.iface_id()),
+        );
+    let network_interface_metrics = if runtime_pci_hotplug {
+        SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(
+            network_interface_ids,
+            PCI_ENDPOINT_SLOT_COUNT,
+        )
+        .map_err(|source| HvfArm64BootSessionError::PciData {
+            source: HvfArm64BootPciDataError::new(format!(
+                "failed to reserve live network metrics inventory: {source}"
+            )),
+        })?
+    } else {
+        SharedNetworkInterfaceMetricsRegistry::from_interface_ids(network_interface_ids)
+    };
     let has_block_devices =
         !runtime.block_devices.is_empty() || !runtime.pci_block_devices.is_empty();
     let has_network_devices =
@@ -11385,6 +11792,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         &mut runtime,
         &mmio_dispatcher,
         &block_device_metrics,
+        &network_interface_metrics,
         &pmem_device_metrics,
     )
     .map_err(|source| HvfArm64BootSessionError::PciData { source })?;
@@ -11429,7 +11837,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         .map_err(|source| HvfArm64BootSessionError::StartEntropyRetryWakeupScheduler { source })?
     };
     let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
-    let network_retry_wakeup_scheduler = if !has_network_devices {
+    let network_retry_wakeup_scheduler = if !has_network_devices && !runtime_pci_hotplug {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
     } else {
         let vcpu_control = runner.control();
@@ -11778,6 +12186,7 @@ fn prepare_pci_data_devices(
     runtime: &mut Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
     block_device_metrics: &SharedBlockDeviceMetricsRegistry,
+    network_interface_metrics: &SharedNetworkInterfaceMetricsRegistry,
     pmem_device_metrics: &SharedPmemDeviceMetricsRegistry,
 ) -> Result<Option<HvfArm64BootPciDataDevices>, HvfArm64BootPciDataError> {
     let Some(validation) = runtime.pci_validation.as_ref() else {
@@ -12073,6 +12482,19 @@ fn prepare_pci_data_devices(
 
         for prepared in networks {
             let (iface_id, host_dev_name, config_space, device) = prepared.into_parts();
+            let metrics_lease = if all_virtio {
+                Some(
+                    network_interface_metrics
+                        .claim_interface_lease(&iface_id)
+                        .map_err(|source| {
+                            HvfArm64BootPciDataError::new(format!(
+                                "failed to claim PCI network metrics ownership: {source}"
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
             let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
@@ -12104,6 +12526,8 @@ fn prepare_pci_data_devices(
                 host_dev_name,
                 published,
                 queue_deliveries: 0,
+                retry_deadline: None,
+                _metrics_lease: metrics_lease,
             });
             endpoint_index += 1;
         }

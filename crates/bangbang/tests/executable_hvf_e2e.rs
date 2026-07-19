@@ -51,6 +51,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_MARKER: &[u8] = b"BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
     const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
+    const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
     const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
     const BLOCK_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_ONE";
     const BLOCK_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_ONE";
@@ -67,6 +68,12 @@ mod macos_arm64 {
     const PMEM_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_HOST_TWO";
     const PMEM_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_GUEST_TWO";
     const PMEM_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_SUCCESS";
+    const NETWORK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_NETWORK_HOTPLUG_READY";
+    const NETWORK_HOTPLUG_FIRST_CONTINUE_MARKER: &[u8] = b"BANGBANG_NETWORK_HOTPLUG_FIRST_CONTINUE";
+    const NETWORK_HOTPLUG_FIRST_REMOVED_MARKER: &[u8] = b"BANGBANG_NETWORK_HOTPLUG_FIRST_REMOVED";
+    const NETWORK_HOTPLUG_SECOND_CONTINUE_MARKER: &[u8] =
+        b"BANGBANG_NETWORK_HOTPLUG_SECOND_CONTINUE";
+    const NETWORK_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_NETWORK_HOTPLUG_SUCCESS";
     const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
     const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
     const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
@@ -427,7 +434,7 @@ mod macos_arm64 {
             (
                 "DELETE /network-interfaces/private_hot_unplug_iface after InstanceStart",
                 "/network-interfaces/private_hot_unplug_iface",
-                r#"{"fault_message":"Network interface updates are not supported."}"#,
+                r#"{"fault_message":"runtime network insertion and removal require PCI transport"}"#,
                 "private_hot_unplug_iface",
             ),
             (
@@ -631,7 +638,7 @@ mod macos_arm64 {
         );
         assert_response_contains(
             &network_update_response,
-            r#"{"fault_message":"The requested operation is not supported in Running state: PutNetworkInterface"}"#,
+            r#"{"fault_message":"runtime network insertion and removal require PCI transport"}"#,
             "PUT /network-interfaces/eth0 after InstanceStart",
         );
 
@@ -3307,6 +3314,239 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang runtime block hotplug product PCI",
+        );
+    }
+
+    #[test]
+    fn signed_executable_hotplugs_mmds_network_and_reuses_product_pci_slot() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let control_backing_path = test_dir.path().join("network-hotplug-control.img");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+        let network_body =
+            r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:42"}"#;
+
+        create_block_backing_with_prefix(&control_backing_path, 3, &[]);
+
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT /machine-config network hotplug",
+        );
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/boot-source", &boot_body),
+            "PUT /boot-source network hotplug",
+        );
+        let rootfs_body = format!(
+            r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+            json_string(path_text(&rootfs_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/rootfs", &rootfs_body),
+            "PUT /drives/rootfs network hotplug",
+        );
+        let control_body = format!(
+            r#"{{"drive_id":"control","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+            json_string(path_text(&control_backing_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/control", &control_body),
+            "PUT /drives/control network hotplug",
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/network-interfaces/eth0", network_body),
+            "PUT /network-interfaces/eth0 before network hotplug",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/mmds/config",
+                r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
+            ),
+            "PUT /mmds/config network hotplug",
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/mmds", DIRECT_ROOTFS_MMDS_CONTENT),
+            "PUT /mmds network hotplug",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "PUT /actions InstanceStart network hotplug",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            NETWORK_HOTPLUG_READY_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "network hotplug guest did not remove its startup function: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/network-interfaces/eth0"),
+            "DELETE startup /network-interfaces/eth0",
+        );
+        let removed_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(
+            &removed_config,
+            "GET /vm/config after startup network DELETE",
+        );
+        assert_response_contains(
+            &removed_config,
+            r#""network-interfaces":[]"#,
+            "GET /vm/config after startup network DELETE",
+        );
+
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/network-interfaces/eth0", network_body),
+            "runtime PUT /network-interfaces/eth0 first MMDS network",
+        );
+        let duplicate_id = http_put_json(
+            &socket_path,
+            "/network-interfaces/eth0",
+            r#"{"iface_id":"eth0","host_dev_name":"vmnet:bridged:private_bridge","guest_mac":"06:00:00:00:00:43"}"#,
+        );
+        assert_bad_request_response(&duplicate_id, "duplicate runtime network ID");
+        assert_response_contains(
+            &duplicate_id,
+            r#"{"fault_message":"network interface is already configured"}"#,
+            "duplicate runtime network ID",
+        );
+        assert!(!duplicate_id.contains("private_bridge"));
+        assert!(!duplicate_id.contains("06:00:00:00:00:43"));
+
+        let duplicate_mac = http_put_json(
+            &socket_path,
+            "/network-interfaces/private_iface",
+            r#"{"iface_id":"private_iface","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:42"}"#,
+        );
+        assert_bad_request_response(&duplicate_mac, "duplicate runtime network MAC");
+        assert_response_contains(
+            &duplicate_mac,
+            r#"{"fault_message":"network guest_mac is already in use"}"#,
+            "duplicate runtime network MAC",
+        );
+        assert!(!duplicate_mac.contains("private_iface"));
+        assert!(!duplicate_mac.contains("06:00:00:00:00:42"));
+
+        let first_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&first_config, "GET /vm/config after runtime network PUT");
+        assert_response_contains(
+            &first_config,
+            r#""iface_id":"eth0""#,
+            "GET /vm/config after runtime network PUT",
+        );
+        assert_response_contains(
+            &first_config,
+            r#""guest_mac":"06:00:00:00:00:42""#,
+            "GET /vm/config after runtime network PUT",
+        );
+        write_block_marker_at(
+            &control_backing_path,
+            bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+            NETWORK_HOTPLUG_FIRST_CONTINUE_MARKER,
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            NETWORK_HOTPLUG_FIRST_REMOVED_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "first runtime network did not exchange MMDS traffic and leave the guest: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/network-interfaces/eth0"),
+            "DELETE first runtime /network-interfaces/eth0",
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause before runtime network reuse",
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/network-interfaces/eth0", network_body),
+            "paused runtime PUT /network-interfaces/eth0 reused MMDS network",
+        );
+        let reused_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&reused_config, "GET /vm/config after network reuse");
+        assert_response_contains(
+            &reused_config,
+            r#""iface_id":"eth0""#,
+            "GET /vm/config after network reuse",
+        );
+        write_block_marker_at(
+            &control_backing_path,
+            bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE * 2,
+            NETWORK_HOTPLUG_SECOND_CONTINUE_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume after runtime network reuse",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            NETWORK_HOTPLUG_SUCCESS_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "reused runtime network did not preserve its PCI slot and MMDS path: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/network-interfaces/eth0"),
+            "final DELETE /network-interfaces/eth0",
+        );
+        let final_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&final_config, "GET /vm/config after final network DELETE");
+        assert_response_contains(
+            &final_config,
+            r#""network-interfaces":[]"#,
+            "GET /vm/config after final network DELETE",
+        );
+        let missing = http_no_body(
+            &socket_path,
+            "DELETE",
+            "/network-interfaces/private_missing",
+        );
+        assert_bad_request_response(&missing, "DELETE missing runtime network");
+        assert_response_contains(
+            &missing,
+            r#"{"fault_message":"network interface is not configured"}"#,
+            "DELETE missing runtime network",
+        );
+        assert!(!missing.contains("private_missing"));
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang MMDS network hotplug product PCI",
         );
     }
 

@@ -443,6 +443,33 @@ pub struct NetworkInterfaceConfigs {
     configs: Vec<NetworkInterfaceConfig>,
 }
 
+/// A validated runtime-only network insertion whose packet I/O and endpoint are
+/// not yet live.
+#[derive(Debug)]
+pub struct PreparedNetworkInterfaceConfigInsert {
+    config: NetworkInterfaceConfig,
+}
+
+impl PreparedNetworkInterfaceConfigInsert {
+    pub const fn config(&self) -> &NetworkInterfaceConfig {
+        &self.config
+    }
+}
+
+/// A validated runtime-only network removal whose live device is not yet
+/// removed.
+#[derive(Debug)]
+pub struct PreparedNetworkInterfaceConfigRemoval {
+    iface_id: String,
+    index: usize,
+}
+
+impl PreparedNetworkInterfaceConfigRemoval {
+    pub fn iface_id(&self) -> &str {
+        &self.iface_id
+    }
+}
+
 impl NetworkInterfaceConfigs {
     pub fn new() -> Self {
         Self::default()
@@ -481,6 +508,104 @@ impl NetworkInterfaceConfigs {
         self.configs.push(config);
 
         Ok(())
+    }
+
+    /// Validates and reserves storage for a post-start insertion without
+    /// changing the configured network projection.
+    pub fn prepare_runtime_insert(
+        &mut self,
+        input: NetworkInterfaceConfigInput,
+    ) -> Result<PreparedNetworkInterfaceConfigInsert, NetworkRuntimeMutationError> {
+        let config = input
+            .validate()
+            .map_err(NetworkRuntimeMutationError::InvalidConfig)?;
+        if self
+            .configs
+            .iter()
+            .any(|existing| existing.iface_id() == config.iface_id())
+        {
+            return Err(NetworkRuntimeMutationError::DuplicateInterface {
+                iface_id: config.iface_id().to_string(),
+            });
+        }
+        if let Some(guest_mac) = config.guest_mac()
+            && self
+                .configs
+                .iter()
+                .any(|existing| existing.guest_mac() == Some(guest_mac))
+        {
+            return Err(NetworkRuntimeMutationError::InvalidConfig(
+                NetworkInterfaceConfigError::GuestMacAddressInUse { guest_mac },
+            ));
+        }
+        validate_network_interface_count(self.configs.len().saturating_add(1))
+            .map_err(NetworkRuntimeMutationError::InvalidConfig)?;
+        self.configs
+            .try_reserve_exact(1)
+            .map_err(|_| NetworkRuntimeMutationError::ConfigurationAllocation)?;
+        Ok(PreparedNetworkInterfaceConfigInsert { config })
+    }
+
+    /// Publishes a prepared runtime insertion after its packet I/O and live
+    /// endpoint have committed successfully.
+    pub fn commit_runtime_insert(&mut self, prepared: PreparedNetworkInterfaceConfigInsert) {
+        debug_assert!(
+            !self
+                .configs
+                .iter()
+                .any(|existing| existing.iface_id() == prepared.config.iface_id())
+        );
+        debug_assert!(self.configs.len() < self.configs.capacity());
+        self.configs.push(prepared.config);
+    }
+
+    /// Validates a post-start removal without changing the configured network
+    /// projection.
+    pub fn prepare_runtime_removal(
+        &self,
+        iface_id: &str,
+    ) -> Result<PreparedNetworkInterfaceConfigRemoval, NetworkRuntimeMutationError> {
+        match validate_interface_id(InterfaceIdSource::Path, iface_id) {
+            Ok(()) => {}
+            Err(NetworkInterfaceConfigError::EmptyInterfaceId { .. }) => {
+                return Err(NetworkRuntimeMutationError::EmptyInterfaceId);
+            }
+            Err(NetworkInterfaceConfigError::InvalidInterfaceId { .. }) => {
+                return Err(NetworkRuntimeMutationError::InvalidInterfaceId {
+                    iface_id: iface_id.to_string(),
+                });
+            }
+            Err(_) => {
+                return Err(NetworkRuntimeMutationError::InvalidInterfaceId {
+                    iface_id: iface_id.to_string(),
+                });
+            }
+        }
+        let Some((index, _)) = self
+            .configs
+            .iter()
+            .enumerate()
+            .find(|(_, config)| config.iface_id() == iface_id)
+        else {
+            return Err(NetworkRuntimeMutationError::UnknownInterface {
+                iface_id: iface_id.to_string(),
+            });
+        };
+        Ok(PreparedNetworkInterfaceConfigRemoval {
+            iface_id: iface_id.to_string(),
+            index,
+        })
+    }
+
+    /// Commits a prepared removal after live teardown succeeds.
+    pub fn commit_runtime_removal(&mut self, prepared: PreparedNetworkInterfaceConfigRemoval) {
+        debug_assert_eq!(
+            self.configs
+                .get(prepared.index)
+                .map(NetworkInterfaceConfig::iface_id),
+            Some(prepared.iface_id.as_str())
+        );
+        self.configs.remove(prepared.index);
     }
 
     pub fn validate_update(
@@ -3209,7 +3334,7 @@ pub struct PreparedNetworkDevice {
 }
 
 impl PreparedNetworkDevice {
-    fn from_config(config: &NetworkInterfaceConfig) -> Self {
+    pub fn from_config(config: &NetworkInterfaceConfig) -> Self {
         Self {
             iface_id: config.iface_id().to_string(),
             host_dev_name: config.host_dev_name().to_string(),
@@ -4499,6 +4624,28 @@ pub enum NetworkInterfaceConfigError {
     HostNetworkNotAuthorized,
 }
 
+/// Redacted failure while preparing or committing a post-start network
+/// insertion or removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkRuntimeMutationError {
+    InvalidConfig(NetworkInterfaceConfigError),
+    EmptyInterfaceId,
+    InvalidInterfaceId { iface_id: String },
+    DuplicateInterface { iface_id: String },
+    UnknownInterface { iface_id: String },
+    ConfigurationAllocation,
+    PciNotEnabled,
+    HostNetworkNotAuthorized,
+    ActiveSessionUnavailable,
+    ActiveSessionCommand { message: String },
+    PreparePacketIo { message: String },
+    PrepareDevice { message: String },
+    PublishDevice { message: String },
+    TerminalInsertion { message: String },
+    RemoveDevice { message: String },
+    TerminalRemoval { message: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkInterfaceUpdateError {
     EmptyInterfaceId {
@@ -4562,6 +4709,80 @@ impl fmt::Display for NetworkInterfaceConfigError {
 }
 
 impl std::error::Error for NetworkInterfaceConfigError {}
+
+impl fmt::Display for NetworkRuntimeMutationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(source) => write!(f, "{source}"),
+            Self::EmptyInterfaceId => f.write_str("path iface_id must not be empty"),
+            Self::InvalidInterfaceId { .. } => {
+                f.write_str("path iface_id must contain only alphanumeric characters or '_'")
+            }
+            Self::DuplicateInterface { .. } => {
+                f.write_str("network interface is already configured")
+            }
+            Self::UnknownInterface { .. } => f.write_str("network interface is not configured"),
+            Self::ConfigurationAllocation => {
+                f.write_str("failed to reserve runtime network configuration storage")
+            }
+            Self::PciNotEnabled => {
+                f.write_str("runtime network insertion and removal require PCI transport")
+            }
+            Self::HostNetworkNotAuthorized => {
+                f.write_str("system host networking is not authorized")
+            }
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active runtime network session is unavailable")
+            }
+            Self::ActiveSessionCommand { message } => {
+                write!(f, "runtime network command failed: {message}")
+            }
+            Self::PreparePacketIo { message } => {
+                write!(f, "failed to prepare runtime network packet I/O: {message}")
+            }
+            Self::PrepareDevice { message } => {
+                write!(f, "failed to prepare runtime network device: {message}")
+            }
+            Self::PublishDevice { message } => {
+                write!(f, "failed to publish runtime network device: {message}")
+            }
+            Self::TerminalInsertion { message } => write!(
+                f,
+                "runtime network insertion entered terminal cleanup: {message}"
+            ),
+            Self::RemoveDevice { message } => {
+                write!(f, "failed to remove runtime network device: {message}")
+            }
+            Self::TerminalRemoval { message } => write!(
+                f,
+                "runtime network removal entered terminal cleanup: {message}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NetworkRuntimeMutationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidConfig(source) => Some(source),
+            Self::EmptyInterfaceId
+            | Self::InvalidInterfaceId { .. }
+            | Self::DuplicateInterface { .. }
+            | Self::UnknownInterface { .. }
+            | Self::ConfigurationAllocation
+            | Self::PciNotEnabled
+            | Self::HostNetworkNotAuthorized
+            | Self::ActiveSessionUnavailable
+            | Self::ActiveSessionCommand { .. }
+            | Self::PreparePacketIo { .. }
+            | Self::PrepareDevice { .. }
+            | Self::PublishDevice { .. }
+            | Self::TerminalInsertion { .. }
+            | Self::RemoveDevice { .. }
+            | Self::TerminalRemoval { .. } => None,
+        }
+    }
+}
 
 impl fmt::Display for NetworkInterfaceUpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -4688,20 +4909,20 @@ mod tests {
         NetworkInterfaceConfigError, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
         NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput, NetworkMmioDevices,
         NetworkMmioLayout, NetworkMmioRegistrationError, NetworkRateLimiterConfig,
-        NetworkTokenBucketConfig, PreparedNetworkDevices, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_CONFIG_MTU_OFFSET, VIRTIO_NET_CONFIG_MTU_SIZE,
-        VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU, VIRTIO_NET_MAX_BUFFER_SIZE,
-        VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE,
-        VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX,
-        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace, VirtioNetworkDevice,
-        VirtioNetworkDeviceActivationError, VirtioNetworkDeviceNotificationError,
-        VirtioNetworkMmioHandler, VirtioNetworkRateLimiter, VirtioNetworkRxBuffer,
-        VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-        VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
-        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketDisposition,
-        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
-        VirtioNetworkTxQueueDispatchError,
+        NetworkRuntimeMutationError, NetworkTokenBucketConfig, PreparedNetworkDevices,
+        VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_CONFIG_MTU_OFFSET,
+        VIRTIO_NET_CONFIG_MTU_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU,
+        VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT,
+        VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE,
+        VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace,
+        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
+        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRateLimiter,
+        VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket,
+        VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
+        VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
+        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+        VirtioNetworkTxPacketSinkError, VirtioNetworkTxQueueDispatchError,
     };
 
     const TEST_MMIO_BASE: GuestAddress = GuestAddress::new(0x1000);
@@ -6507,6 +6728,140 @@ mod tests {
         assert_eq!(config.iface_id(), "eth0");
         assert_eq!(config.host_dev_name(), "tap1");
         assert_eq!(config.guest_mac(), None);
+    }
+
+    #[test]
+    fn runtime_network_insert_prepares_without_mutation_and_commits_once_live() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input().with_guest_mac("12:34:56:78:9a:bc"))
+            .expect("initial interface should be stored");
+
+        let prepared = configs
+            .prepare_runtime_insert(
+                NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:shared")
+                    .with_guest_mac("12:34:56:78:9a:bd"),
+            )
+            .expect("runtime interface should prepare");
+        assert_eq!(prepared.config().iface_id(), "eth1");
+        assert_eq!(configs.as_slice().len(), 1);
+
+        configs.commit_runtime_insert(prepared);
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
+        assert_eq!(configs.as_slice()[1].iface_id(), "eth1");
+    }
+
+    #[test]
+    fn runtime_network_insert_rejects_duplicate_identity_without_mutation() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input().with_guest_mac("12:34:56:78:9a:bc"))
+            .expect("initial interface should be stored");
+
+        assert!(matches!(
+            configs.prepare_runtime_insert(NetworkInterfaceConfigInput::new(
+                "eth0",
+                "eth0",
+                "vmnet:host",
+            )),
+            Err(NetworkRuntimeMutationError::DuplicateInterface { iface_id })
+                if iface_id == "eth0"
+        ));
+        assert!(matches!(
+            configs.prepare_runtime_insert(
+                NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:host")
+                    .with_guest_mac("12:34:56:78:9a:bc"),
+            ),
+            Err(NetworkRuntimeMutationError::InvalidConfig(
+                NetworkInterfaceConfigError::GuestMacAddressInUse { .. }
+            ))
+        ));
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].host_dev_name(), "tap0");
+    }
+
+    #[test]
+    fn runtime_network_insert_enforces_capacity_without_mutation() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        for index in 0..MAX_NETWORK_INTERFACE_COUNT {
+            configs
+                .insert(NetworkInterfaceConfigInput::new(
+                    format!("eth{index}"),
+                    format!("eth{index}"),
+                    "vmnet:shared",
+                ))
+                .expect("interface within the limit should insert");
+        }
+
+        assert!(matches!(
+            configs.prepare_runtime_insert(NetworkInterfaceConfigInput::new(
+                "overflow",
+                "overflow",
+                "vmnet:shared",
+            )),
+            Err(NetworkRuntimeMutationError::InvalidConfig(
+                NetworkInterfaceConfigError::TooManyNetworkInterfaces { count, max }
+            )) if count == MAX_NETWORK_INTERFACE_COUNT + 1 && max == MAX_NETWORK_INTERFACE_COUNT
+        ));
+        assert_eq!(configs.as_slice().len(), MAX_NETWORK_INTERFACE_COUNT);
+    }
+
+    #[test]
+    fn runtime_network_removal_prepares_without_mutation_and_preserves_peer_order() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        for iface_id in ["eth0", "eth1", "eth2"] {
+            configs
+                .insert(NetworkInterfaceConfigInput::new(
+                    iface_id,
+                    iface_id,
+                    "vmnet:shared",
+                ))
+                .expect("interface should insert");
+        }
+
+        let prepared = configs
+            .prepare_runtime_removal("eth1")
+            .expect("existing interface should prepare for removal");
+        assert_eq!(prepared.iface_id(), "eth1");
+        assert_eq!(configs.as_slice().len(), 3);
+
+        configs.commit_runtime_removal(prepared);
+        assert_eq!(
+            configs
+                .as_slice()
+                .iter()
+                .map(NetworkInterfaceConfig::iface_id)
+                .collect::<Vec<_>>(),
+            ["eth0", "eth2"]
+        );
+        assert!(matches!(
+            configs.prepare_runtime_removal("missing"),
+            Err(NetworkRuntimeMutationError::UnknownInterface { iface_id })
+                if iface_id == "missing"
+        ));
+        assert!(matches!(
+            configs.prepare_runtime_removal("eth-2"),
+            Err(NetworkRuntimeMutationError::InvalidInterfaceId { iface_id })
+                if iface_id == "eth-2"
+        ));
+    }
+
+    #[test]
+    fn runtime_network_errors_redact_identity_and_host_details() {
+        for error in [
+            NetworkRuntimeMutationError::DuplicateInterface {
+                iface_id: "private_iface".to_string(),
+            },
+            NetworkRuntimeMutationError::UnknownInterface {
+                iface_id: "private_missing".to_string(),
+            },
+            NetworkRuntimeMutationError::HostNetworkNotAuthorized,
+        ] {
+            let message = error.to_string();
+            assert!(!message.contains("private_"));
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 
     #[test]

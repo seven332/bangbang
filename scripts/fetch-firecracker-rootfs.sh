@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v47"
+direct_boot_variant="direct-boot-v48"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -734,6 +734,179 @@ check_pmem_hotplug_marker() {
     SECOND; then
     return
   fi
+}
+
+network_hotplug_fail() {
+  reason=$1
+  marker="BANGBANG_NETWORK_HOTPLUG_FAIL_$reason"
+  emit_line "$marker"
+  write_vdb_marker "$marker"
+  sync /dev/vdb 2>/dev/null || sync
+}
+
+find_runtime_network() {
+  expected_mac=$1
+  runtime_network_iface=
+  runtime_network_pci_path=
+
+  for iface_path in /sys/class/net/*; do
+    [ -d "$iface_path" ] || continue
+    iface=${iface_path##*/}
+    [ "$iface" != lo ] || continue
+    actual_mac=$(cat "$iface_path/address" 2>/dev/null || true)
+    [ "$actual_mac" = "$expected_mac" ] || continue
+
+    path=$(readlink -f "$iface_path/device" 2>/dev/null || true)
+    while [ -n "$path" ] && [ "$path" != / ]; do
+      if [ -e "$path/remove" ] && [ -r "$path/vendor" ] && [ -r "$path/device" ]; then
+        vendor=$(cat "$path/vendor" 2>/dev/null || true)
+        device=$(cat "$path/device" 2>/dev/null || true)
+        if [ "$vendor" = 0x1af4 ] && [ "$device" = 0x1041 ]; then
+          runtime_network_iface=$iface
+          runtime_network_pci_path=$path
+          return 0
+        fi
+      fi
+      parent=${path%/*}
+      [ "$parent" != "$path" ] || break
+      path=$parent
+    done
+  done
+
+  return 1
+}
+
+wait_for_runtime_network() {
+  expected_mac=$1
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    printf '1\n' > /sys/bus/pci/rescan 2>/dev/null || return 1
+    sleep 1
+    if find_runtime_network "$expected_mac"; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+remove_runtime_network() {
+  removed_iface=$runtime_network_iface
+  if ! printf '1\n' > "$runtime_network_pci_path/remove" 2>/dev/null; then
+    return 1
+  fi
+
+  attempts=0
+  while [ -e "/sys/class/net/$removed_iface" ] && [ "$attempts" -lt 30 ]; do
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  [ ! -e "/sys/class/net/$removed_iface" ]
+}
+
+fetch_runtime_network_mmds() {
+  if ! ip link set dev "$runtime_network_iface" up 2>/dev/null; then
+    return 1
+  fi
+  ip addr add 169.254.100.2/16 dev "$runtime_network_iface" 2>/dev/null || true
+  if ! ip route replace 169.254.169.254/32 \
+    dev "$runtime_network_iface" src 169.254.100.2 2>/dev/null; then
+    return 1
+  fi
+
+  mmds_value=$(
+    curl \
+      --fail \
+      --silent \
+      --show-error \
+      --connect-timeout 2 \
+      --max-time 5 \
+      --interface "$runtime_network_iface" \
+      http://169.254.169.254/meta-data/bangbang-marker \
+      2>/dev/null || true
+  )
+  [ "$mmds_value" = BANGBANG_MMDS_GUEST_VALUE ]
+}
+
+run_runtime_network_round() {
+  expected_mac=$1
+  removed_marker=$2
+  phase=$3
+
+  if ! wait_for_runtime_network "$expected_mac"; then
+    network_hotplug_fail "${phase}_RESCAN"
+    return 1
+  fi
+  if [ "$runtime_network_pci_path" != "$network_hotplug_first_pci_path" ]; then
+    network_hotplug_fail "${phase}_SLOT_REUSE"
+    return 1
+  fi
+  if ! fetch_runtime_network_mmds; then
+    network_hotplug_fail "${phase}_MMDS"
+    return 1
+  fi
+  if ! remove_runtime_network; then
+    network_hotplug_fail "${phase}_REMOVE"
+    return 1
+  fi
+
+  write_vdb_marker "$removed_marker"
+  sync /dev/vdb 2>/dev/null || sync
+  emit_line "$removed_marker"
+}
+
+check_network_hotplug_marker() {
+  if [ ! -b /dev/vdb ] || [ ! -e /sys/bus/pci/rescan ]; then
+    network_hotplug_fail PREREQUISITES
+    return
+  fi
+  if ! command -v ip >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    network_hotplug_fail TOOLS
+    return
+  fi
+  if ! find_runtime_network 06:00:00:00:00:42; then
+    network_hotplug_fail STARTUP_NETWORK
+    return
+  fi
+
+  network_hotplug_first_pci_path=$runtime_network_pci_path
+  if ! remove_runtime_network; then
+    network_hotplug_fail STARTUP_REMOVE
+    return
+  fi
+  write_vdb_marker BANGBANG_NETWORK_HOTPLUG_READY
+  sync /dev/vdb 2>/dev/null || sync
+  emit_line BANGBANG_NETWORK_HOTPLUG_READY
+
+  attempts=0
+  while ! vdb_sector_starts_with_marker BANGBANG_NETWORK_HOTPLUG_FIRST_CONTINUE 1; do
+    if [ "$attempts" -ge 60 ]; then
+      network_hotplug_fail FIRST_CONTINUE
+      return
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  if ! run_runtime_network_round \
+    06:00:00:00:00:42 \
+    BANGBANG_NETWORK_HOTPLUG_FIRST_REMOVED \
+    FIRST; then
+    return
+  fi
+
+  attempts=0
+  while ! vdb_sector_starts_with_marker BANGBANG_NETWORK_HOTPLUG_SECOND_CONTINUE 2; do
+    if [ "$attempts" -ge 60 ]; then
+      network_hotplug_fail SECOND_CONTINUE
+      return
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  run_runtime_network_round \
+    06:00:00:00:00:42 \
+    BANGBANG_NETWORK_HOTPLUG_SUCCESS \
+    SECOND
 }
 
 pci_all_virtio_fail() {
@@ -2480,7 +2653,9 @@ if [ -r /proc/cmdline ]; then
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if cmdline_has bangbang.pmem-hotplug=1; then
+if cmdline_has bangbang.network-hotplug=1; then
+  check_network_hotplug_marker
+elif cmdline_has bangbang.pmem-hotplug=1; then
   check_pmem_hotplug_marker
 elif cmdline_has bangbang.block-hotplug=1; then
   check_block_hotplug_marker

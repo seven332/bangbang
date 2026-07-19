@@ -40,10 +40,11 @@ claims mechanically visible.
   closure ledger. It accounts for the original 28 Wave 2 records, directly
   related API aggregates, exact evidence, count arithmetic, and explicit Wave
   6/7/8 ownership without changing the generated source manifest.
-- [`device-hotplug-contract.md`](device-hotplug-contract.md) is the #1420/#1421
-  runtime block and pmem ledger. It binds the promoted PUT/path/DELETE
-  identities to owner-thread transactions, contained grant rollback, dynamic
-  pmem mapping, guest lifecycle, signed evidence, and the still-open network
+- [`device-hotplug-contract.md`](device-hotplug-contract.md) is the
+  #1420/#1421/#1422 runtime block, pmem, and network ledger. It binds the
+  promoted PUT/path/DELETE identities to owner-thread transactions, contained
+  grant or vmnet-authority rollback, dynamic pmem mapping, per-entry network
+  packet I/O, guest lifecycle, signed evidence, and the still-open #1423
   aggregate boundary.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
@@ -199,11 +200,23 @@ slices. The exact boundary is recorded in
 DELETE supported profile is now complete, and the pinned non-Swagger bodyless
 `DELETE /pmem/{id}` route. Transactional direct and contained signed gates
 prove dynamic HVF mapping, guest flush, teardown, and exact same-ID/PCI-slot/
-guest-range reuse. The current overlay is therefore 76
+guest-range reuse. At that checkpoint the overlay was 76
 `implemented-and-verified`, 322 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` records. The
-broad device-hotplug corpus and aggregate semantic record remain nonterminal
-pending the independent network slice.
+broad device-hotplug corpus and aggregate semantic record were nonterminal at
+that checkpoint pending the independent network slice.
+
+#1422 subsequently promotes exactly two network API identities: the Swagger
+`PUT /network-interfaces/{iface_id}` operation and the pinned non-Swagger
+bodyless `DELETE /network-interfaces/{iface_id}` route. Transactional direct
+and networkless-production signed gates prove Running/Paused attach, guest PCI
+rescan, real MMDS exchange, sysfs removal, teardown, contained non-MMDS denial,
+and exact same-ID/MAC/PCI-slot reuse without vmnet authority. The current
+overlay is therefore 78 `implemented-and-verified`, 320 `audit-required`,
+three `missing-platform-feasible`, and 17 `proven-platform-impossible`
+records. The broad device-hotplug corpus and aggregate semantic record remain
+nonterminal for #1423 reconciliation; external vmnet evidence remains
+#1351/#1378-owned.
 
 ## Commands
 

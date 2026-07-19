@@ -202,7 +202,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
-| Network and vmnet | Implemented virtio-MMIO/MMDS-only subset; direct vmnet conditional; contained lifecycle-v4 authority and closed networkless/vmnet signing profiles enforced | Keep supported `host_dev_name` forms, exact mode/bridge/count admission, startup validation, MMDS-only behavior, entitlement/profile requirements, and non-goals documented when network behavior changes. |
+| Network and vmnet | Implemented virtio-MMIO/all-PCI startup plus PCI-only runtime PUT/DELETE; direct vmnet conditional; contained lifecycle-v4 authority and closed networkless/vmnet signing profiles enforced | Keep supported `host_dev_name` forms, exact mode/bridge/actual-live-count admission, per-entry cleanup, MMDS-only behavior, entitlement/profile requirements, and non-goals documented when network behavior changes. |
 | macOS App Sandbox | Production nested worker implemented for container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, API-socket, and vsock-socket resources | Keep the ordinary CLI explicitly uncontained and prove package identity plus real ungranted denial and granted operation behavior without adding ambient network authority. |
 | Launcher and resource broker | Authenticated lifecycle v4 credential/resource-limit/vmnet policy, closed exec environment and descriptor set, bounded atomic startup grants, signed daemon handoff, adopted file and socket-directory consumers, and one fixed session-bound vsock connection facet implemented; general dynamic brokerage missing | Require exact policy/profile/role/access/anchor/identity checks, one-time registry adoption, closed session/sequence/rights framing, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
 
@@ -727,6 +727,17 @@ opening vmnet resources. Otherwise, startup opens vmnet resources for the
 configured interfaces and retains stop-on-drop cleanup ownership inside the
 process.
 
+Public PCI sessions retain those owners in a bounded per-interface registry.
+Runtime PUT prepares a complete independent MMDS-only or vmnet entry, publishes
+it immediately before the matching PCI endpoint on the VM owner thread, and
+commits public configuration last. Existing entries are not rebuilt. Runtime
+DELETE first makes the PCI endpoint reversibly unreachable, takes the exact
+packet-I/O generation, and explicitly stops vmnet before endpoint commit.
+Successful removal releases queue, callback/event, limiter retry, metrics,
+MMDS detour or vmnet, and PCI ownership. An uncertain system vmnet stop, failed
+owner restoration, or post-boundary failure is terminal; the process does not
+claim a damaged network remains usable.
+
 Contained mode adds a separate authenticated admission boundary without
 changing direct mode. The outer jailer accepts repeated exact
 `--vmnet-allow host|shared|bridged:<interface>` plus one required
@@ -746,6 +757,13 @@ is deliberate: an interface must be configured before MMDS can name it, so a
 PUT-time denial would make the same all-MMDS zero-resource configuration depend
 on API ordering. Denial is a fieldless error that reveals no interface ID,
 bridge name, count, limit, or session value.
+
+After startup, contained runtime insertion applies the same immutable authority
+on the owner thread. MMDS-only entries consume no vmnet authority. A vmnet entry
+must match the requested mode/bridge and fit the maximum after counting actual
+live vmnet entries rather than all configured MMDS-only interfaces. Denial
+occurs before backend start or live publication and leaves the configuration
+projection unchanged.
 
 Static authority is a separate gate. Static and suspended/live code validation
 classify only two closed shapes. `Networkless` is exactly Boolean App Sandbox
@@ -809,8 +827,8 @@ with retained work and session-owned retry wakeups. They are not packet
 filters, a host firewall, or a NAT policy, and current signed limiter evidence
 uses MMDS-only packet I/O rather than direct vmnet. The boundary still lacks
 packet filtering, production network isolation, a repository-owned approved
-credential and real contained vmnet evidence, runtime network hotplug,
-limiter-specific metrics, network snapshot state, and full Firecracker public
+credential and real contained vmnet evidence, limiter-specific metrics,
+network snapshot state, and full Firecracker public
 packet-movement parity.
 
 ## API Socket Handling
@@ -1564,11 +1582,12 @@ Current signed coverage separately proves raw host-to-vCPU delivery,
 pinned-Linux GICv2m discovery, focused identity/virtio-rng/data-device
 conformance, and the signed product process booting every configured virtio
 class with positive queue/configuration MSI-X and real I/O. Separate direct
-and contained signed block and pmem gates prove the retained PCI manager's
-manual rescan/removal lifecycle, capacity reuse, exact pmem shadow ownership,
-and same-range reuse. This evidence does not prove interrupt remapping, runtime
-PCI network attach/delete, external vmnet connectivity, or Firecracker's KVM
-ITS behavior. MSI-bearing GIC metadata is rejected by the native-v1 snapshot
+and contained signed block, pmem, and all-MMDS network gates prove the retained
+PCI manager's manual rescan/removal lifecycle and capacity reuse; pmem adds
+exact shadow/range reuse, while network adds packet-I/O/metrics teardown and
+real MMDS exchange without vmnet authority. This evidence does not prove
+interrupt remapping, external vmnet connectivity, or Firecracker's KVM ITS
+behavior. MSI-bearing GIC metadata is rejected by the native-v1 snapshot
 profile rather than silently omitted.
 
 ## PCI Ownership Boundary
@@ -1607,10 +1626,11 @@ its successor. The PCI MMDS proof uses only process-local runtime packet state
 and opens no vmnet resource or extra host authority.
 
 The hidden selectors and redacted diagnostic views grant no arbitrary host
-resource authority. Public PCI is a startup transport only: runtime
-attach/delete and guest rescan/removal remain rejected, and native-v1 rejects
-the immutable PCI profile before capture/load work rather than persisting or
-silently dropping its state.
+resource authority. Public PCI supports the documented block, pmem, and network
+runtime transactions, but guest rescan/removal remains an explicit operator
+step and there is no automatic notification. Native-v1 rejects the immutable
+PCI profile before capture/load work rather than persisting or silently
+dropping its state.
 
 ## HVF Entitlements
 
@@ -2053,16 +2073,20 @@ The current scaffold does not implement:
   response queues, and expose queued responses through virtio-net RX with
   bounded post-TX retry, plus an MMDS-only adapter that can reuse those queues
   without opening vmnet when every configured interface is listed in MMDS
-  config, plus internal providers that can select prebuilt adapters by
-  configured interface ID and an internal `host_dev_name` mapping for
+  config, plus a bounded per-interface registry that owns independent adapters,
+  explicit vmnet stop/drop, and exact generation take/restore, and an internal `host_dev_name` mapping for
   `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
   model stores at most 16 configured network interfaces. Startup revalidates
   that limit before selecting packet I/O, opens vmnet resources only for
   non-MMDS-only startup when configured interfaces use the supported names,
-  keeps no-network startup on a no-op TX sink plus empty RX source, and still
-  enforces bounded lifecycle-v4 vmnet authority for contained startup. The
+  keeps no-network startup on an empty hotplug-capable registry, and enforces
+  bounded lifecycle-v4 vmnet authority for contained startup and runtime
+  insertion. Public PCI PUT/DELETE coordinates that registry with exact PCI,
+  metrics, retry, and live-config ownership; MMDS-only runtime entries require
+  no vmnet authority, while actual live vmnet entries are charged to the bound.
+  The
   default networkless code-sign profile rejects every positive authority
-  before worker spawn. Explicit vmnet packaging can bind a caller-approved
+  before worker spawn but supports the signed all-MMDS hotplug path. Explicit vmnet packaging can bind a caller-approved
   profile to a positive authority only after exact inspection and current-host
   authorization, while real production connectivity policy and full public
   vmnet packet-movement proof beyond the documented operator-owned boundary
