@@ -1717,6 +1717,31 @@ pub struct PmemConfigs {
     configs: Vec<PmemConfig>,
 }
 
+/// A validated runtime-only pmem insertion whose backing and endpoint are not live.
+#[derive(Debug)]
+pub struct PreparedPmemConfigInsert {
+    config: PmemConfig,
+}
+
+impl PreparedPmemConfigInsert {
+    pub const fn config(&self) -> &PmemConfig {
+        &self.config
+    }
+}
+
+/// A validated runtime-only pmem removal whose live device is not yet removed.
+#[derive(Debug)]
+pub struct PreparedPmemConfigRemoval {
+    pmem_id: String,
+    index: usize,
+}
+
+impl PreparedPmemConfigRemoval {
+    pub fn pmem_id(&self) -> &str {
+        &self.pmem_id
+    }
+}
+
 impl PmemConfigs {
     pub const fn new() -> Self {
         Self {
@@ -1739,6 +1764,84 @@ impl PmemConfigs {
         }
 
         self.configs.push(config);
+    }
+
+    /// Validates and reserves storage for a post-start insertion without changing
+    /// the configured pmem projection.
+    pub fn prepare_runtime_insert(
+        &mut self,
+        input: PmemConfigInput,
+    ) -> Result<PreparedPmemConfigInsert, PmemRuntimeMutationError> {
+        if input.root_device {
+            return Err(PmemRuntimeMutationError::RootInsertUnsupported);
+        }
+        let config: PmemConfig = input
+            .try_into()
+            .map_err(PmemRuntimeMutationError::InvalidConfig)?;
+        if self
+            .configs
+            .iter()
+            .any(|existing| existing.id() == config.id())
+        {
+            return Err(PmemRuntimeMutationError::DuplicatePmem);
+        }
+        self.configs
+            .try_reserve_exact(1)
+            .map_err(|_| PmemRuntimeMutationError::ConfigurationAllocation)?;
+        Ok(PreparedPmemConfigInsert { config })
+    }
+
+    /// Publishes a prepared runtime insertion after its live endpoint commits.
+    pub fn commit_runtime_insert(&mut self, prepared: PreparedPmemConfigInsert) {
+        debug_assert!(!prepared.config.root_device());
+        debug_assert!(
+            !self
+                .configs
+                .iter()
+                .any(|existing| existing.id() == prepared.config.id())
+        );
+        debug_assert!(self.configs.len() < self.configs.capacity());
+        self.configs.push(prepared.config);
+    }
+
+    /// Validates a post-start removal without changing the configured projection.
+    pub fn prepare_runtime_removal(
+        &self,
+        pmem_id: &str,
+    ) -> Result<PreparedPmemConfigRemoval, PmemRuntimeMutationError> {
+        if pmem_id.is_empty() {
+            return Err(PmemRuntimeMutationError::EmptyPmemId);
+        }
+        if !pmem_id
+            .chars()
+            .all(|character| character == '_' || character.is_alphanumeric())
+        {
+            return Err(PmemRuntimeMutationError::InvalidPmemId);
+        }
+        let Some((index, config)) = self
+            .configs
+            .iter()
+            .enumerate()
+            .find(|(_, config)| config.id() == pmem_id)
+        else {
+            return Err(PmemRuntimeMutationError::UnknownPmem);
+        };
+        if config.root_device() {
+            return Err(PmemRuntimeMutationError::RootRemovalUnsupported);
+        }
+        Ok(PreparedPmemConfigRemoval {
+            pmem_id: pmem_id.to_string(),
+            index,
+        })
+    }
+
+    /// Commits a prepared removal after live teardown succeeds.
+    pub fn commit_runtime_removal(&mut self, prepared: PreparedPmemConfigRemoval) {
+        debug_assert_eq!(
+            self.configs.get(prepared.index).map(PmemConfig::id),
+            Some(prepared.pmem_id.as_str())
+        );
+        self.configs.remove(prepared.index);
     }
 
     pub fn validate_update(&self, input: PmemUpdateInput) -> Result<PmemUpdate, PmemUpdateError> {
@@ -2333,6 +2436,26 @@ pub struct PreparedPmemDevice {
 }
 
 impl PreparedPmemDevice {
+    /// Prepares one runtime pmem device from an already-opened backing and the
+    /// owner thread's current reserved guest ranges.
+    pub fn from_config_with_backing_and_reserved_ranges(
+        config: &PmemConfig,
+        backing: PmemFileBacking,
+        reserved_ranges: &[GuestMemoryRange],
+    ) -> Result<Self, PreparedPmemDeviceError> {
+        let mut mapper = SystemPmemBackingMapper;
+        let mut allocator = PmemGuestRangeAllocator {
+            next_start: aarch64::FIRST_ADDR_PAST_64BITS_MMIO,
+            reserved_ranges,
+        };
+        Self::from_config_with_backing_mapper_and_allocator(
+            config,
+            Some(backing),
+            &mut mapper,
+            &mut allocator,
+        )
+    }
+
     fn from_config_with_backing_mapper_and_allocator(
         config: &PmemConfig,
         backing: Option<PmemFileBacking>,
@@ -3228,6 +3351,27 @@ pub enum PmemConfigError {
     UnsupportedRootDevice,
 }
 
+/// Redacted failure while preparing or committing a post-start pmem mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PmemRuntimeMutationError {
+    InvalidConfig(PmemConfigError),
+    EmptyPmemId,
+    InvalidPmemId,
+    DuplicatePmem,
+    RootInsertUnsupported,
+    RootRemovalUnsupported,
+    UnknownPmem,
+    ConfigurationAllocation,
+    PciNotEnabled,
+    ActiveSessionUnavailable,
+    ActiveSessionCommand { message: String },
+    PrepareDevice { message: String },
+    PublishDevice { message: String },
+    TerminalInsertion { message: String },
+    RemoveDevice { message: String },
+    TerminalRemoval { message: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmemIdSource {
     Path,
@@ -3279,6 +3423,80 @@ impl fmt::Display for PmemConfigError {
 }
 
 impl std::error::Error for PmemConfigError {}
+
+impl fmt::Display for PmemRuntimeMutationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(source) => write!(f, "{source}"),
+            Self::EmptyPmemId => f.write_str("path pmem id must not be empty"),
+            Self::InvalidPmemId => {
+                f.write_str("path pmem id must contain only alphanumeric characters or '_'")
+            }
+            Self::DuplicatePmem => f.write_str("pmem device is already configured"),
+            Self::RootInsertUnsupported => {
+                f.write_str("a root pmem device cannot be inserted after the microVM starts")
+            }
+            Self::RootRemovalUnsupported => f.write_str("root pmem device cannot be removed"),
+            Self::UnknownPmem => f.write_str("pmem device is not configured"),
+            Self::ConfigurationAllocation => {
+                f.write_str("failed to reserve runtime pmem configuration storage")
+            }
+            Self::PciNotEnabled => {
+                f.write_str("runtime pmem insertion and removal require PCI transport")
+            }
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active runtime pmem session is unavailable")
+            }
+            Self::ActiveSessionCommand { message } => {
+                write!(f, "runtime pmem command failed: {message}")
+            }
+            Self::PrepareDevice { message } => {
+                write!(f, "failed to prepare runtime pmem device: {message}")
+            }
+            Self::PublishDevice { message } => {
+                write!(f, "failed to publish runtime pmem device: {message}")
+            }
+            Self::TerminalInsertion { message } => {
+                write!(
+                    f,
+                    "runtime pmem insertion entered terminal cleanup: {message}"
+                )
+            }
+            Self::RemoveDevice { message } => {
+                write!(f, "failed to remove runtime pmem device: {message}")
+            }
+            Self::TerminalRemoval { message } => {
+                write!(
+                    f,
+                    "runtime pmem removal entered terminal cleanup: {message}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PmemRuntimeMutationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidConfig(source) => Some(source),
+            Self::EmptyPmemId
+            | Self::InvalidPmemId
+            | Self::DuplicatePmem
+            | Self::RootInsertUnsupported
+            | Self::RootRemovalUnsupported
+            | Self::UnknownPmem
+            | Self::ConfigurationAllocation
+            | Self::PciNotEnabled
+            | Self::ActiveSessionUnavailable
+            | Self::ActiveSessionCommand { .. }
+            | Self::PrepareDevice { .. }
+            | Self::PublishDevice { .. }
+            | Self::TerminalInsertion { .. }
+            | Self::RemoveDevice { .. }
+            | Self::TerminalRemoval { .. } => None,
+        }
+    }
+}
 
 impl fmt::Display for PmemUpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -4864,6 +5082,108 @@ mod tests {
         let config = pmem_config(PmemConfigInput::new("pmem_\u{00e9}1", "/tmp/pmem.img"));
 
         assert_eq!(config.id(), "pmem_\u{00e9}1");
+    }
+
+    #[test]
+    fn runtime_pmem_config_insert_is_invisible_until_commit_and_rejects_duplicates_and_root() {
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new(
+            "startup",
+            "/tmp/startup.pmem",
+        )));
+
+        let prepared = configs
+            .prepare_runtime_insert(PmemConfigInput::new("data", "/tmp/data.pmem"))
+            .expect("runtime pmem should prepare");
+        assert_eq!(prepared.config().id(), "data");
+        assert_eq!(configs.as_slice().len(), 1);
+        configs.commit_runtime_insert(prepared);
+        assert_eq!(configs.as_slice().len(), 2);
+
+        assert!(matches!(
+            configs.prepare_runtime_insert(PmemConfigInput::new("data", "/tmp/replacement.pmem",)),
+            Err(PmemRuntimeMutationError::DuplicatePmem)
+        ));
+        assert!(matches!(
+            configs.prepare_runtime_insert(
+                PmemConfigInput::new("late_root", "/tmp/root.pmem").with_root_device(true),
+            ),
+            Err(PmemRuntimeMutationError::RootInsertUnsupported)
+        ));
+        assert_eq!(configs.as_slice().len(), 2);
+    }
+
+    #[test]
+    fn runtime_pmem_config_removal_is_invisible_until_commit_and_allows_id_reuse() {
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new(
+            "pmem0",
+            "/tmp/first.pmem",
+        )));
+
+        assert!(matches!(
+            configs.prepare_runtime_removal("missing"),
+            Err(PmemRuntimeMutationError::UnknownPmem)
+        ));
+        let prepared = configs
+            .prepare_runtime_removal("pmem0")
+            .expect("runtime pmem removal should prepare");
+        assert_eq!(prepared.pmem_id(), "pmem0");
+        assert_eq!(configs.as_slice().len(), 1);
+        configs.commit_runtime_removal(prepared);
+        assert!(configs.as_slice().is_empty());
+
+        let replacement = configs
+            .prepare_runtime_insert(PmemConfigInput::new("pmem0", "/tmp/replacement.pmem"))
+            .expect("released pmem id should prepare again");
+        configs.commit_runtime_insert(replacement);
+        assert_eq!(
+            configs.as_slice()[0].path_on_host(),
+            "/tmp/replacement.pmem"
+        );
+    }
+
+    #[test]
+    fn runtime_pmem_preparation_skips_every_live_reserved_range() {
+        let file = temp_sized_file("runtime-range.img", VIRTIO_PMEM_ALIGNMENT);
+        let config = pmem_config(PmemConfigInput::new(
+            "pmem0",
+            file.as_path().display().to_string(),
+        ));
+        let first =
+            GuestMemoryRange::new(GuestAddress::new(TEST_PMEM_START), VIRTIO_PMEM_ALIGNMENT)
+                .expect("first reservation should be valid");
+        let second = GuestMemoryRange::new(first.end_exclusive(), VIRTIO_PMEM_ALIGNMENT * 2)
+            .expect("second reservation should be valid");
+        let prepared = PreparedPmemDevice::from_config_with_backing_and_reserved_ranges(
+            &config,
+            PmemFileBacking::open(&config).expect("runtime backing should open"),
+            &[second, first],
+        )
+        .expect("runtime pmem should select a free range");
+
+        assert_eq!(prepared.guest_range().start(), second.end_exclusive());
+        assert!(!prepared.guest_range().overlaps(first));
+        assert!(!prepared.guest_range().overlaps(second));
+    }
+
+    #[test]
+    fn runtime_pmem_mutation_diagnostics_redact_ids_paths_and_grant_references() {
+        let sensitive = "private/pmem\nsecret";
+        for error in [
+            PmemRuntimeMutationError::InvalidConfig(PmemConfigError::InvalidPmemId),
+            PmemRuntimeMutationError::InvalidPmemId,
+            PmemRuntimeMutationError::DuplicatePmem,
+            PmemRuntimeMutationError::PrepareDevice {
+                message: "regular-file validation failed".to_string(),
+            },
+        ] {
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(!display.contains(sensitive));
+            assert!(!debug.contains(sensitive));
+            assert!(!display.contains("/tmp/private"));
+        }
     }
 
     #[test]

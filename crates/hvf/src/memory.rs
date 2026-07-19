@@ -561,6 +561,21 @@ impl HvfGuestMemoryMapping {
         state.unmap_dynamic_region(memory, range)
     }
 
+    pub(crate) fn map_runtime_pmem_mapping(
+        &mut self,
+        mapping: HvfHostMemoryMapping,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.state.map_runtime_pmem_mapping(mapping)
+    }
+
+    pub(crate) fn take_runtime_pmem_mapping(
+        &mut self,
+        range: GuestMemoryRange,
+        flush: bool,
+    ) -> Result<HvfHostMemoryMapping, HvfGuestMemoryMappingError> {
+        self.state.take_runtime_pmem_mapping(range, flush)
+    }
+
     pub(crate) fn memory_and_virtio_mem_executor_mut(
         &mut self,
         permissions: HvfMemoryPermissions,
@@ -950,6 +965,98 @@ impl HvfGuestMemoryMappingState {
         }
 
         Ok(self.mapped_regions.len())
+    }
+
+    fn map_runtime_pmem_mapping(
+        &mut self,
+        mapping: HvfHostMemoryMapping,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.validate_dirty_write_mutation_state()?;
+        let range = mapping
+            .pmem_shadow_range()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "runtime pmem shadow has no guest range",
+            ))?;
+        let page_size = host_page_size()?;
+        let mut requests = validated_host_map_requests(std::slice::from_ref(&mapping), page_size)?;
+        if requests.len() != 1 {
+            return Err(HvfGuestMemoryMappingError::InvalidState(
+                "runtime pmem shadow must contain exactly one region",
+            ));
+        }
+        let request = requests
+            .pop()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "runtime pmem shadow map request is missing",
+            ))?;
+        debug_assert_eq!(request.request.range, range);
+        let insert_index = self.validate_dynamic_map_range(range)?;
+        self.mapped_regions.try_reserve_exact(1).map_err(|source| {
+            HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source }
+        })?;
+        self.host_memory.try_reserve_exact(1).map_err(|source| {
+            HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source }
+        })?;
+
+        let mapped_region = request.request.mapped_region(request.permissions);
+        self.mapper
+            .map_region(request.request, request.permissions)
+            .map_err(|source| {
+                HvfGuestMemoryMappingError::host_mapping(
+                    &request.label,
+                    range,
+                    HvfGuestMemoryMappingError::MapFailed {
+                        range,
+                        source,
+                        cleanup_failures: Vec::new(),
+                    },
+                )
+            })?;
+
+        self.mapped_regions.insert(insert_index, mapped_region);
+        self.host_memory.push(mapping);
+        self.host_memory_should_flush = true;
+        self.host_memory_flushed = false;
+        Ok(())
+    }
+
+    fn take_runtime_pmem_mapping(
+        &mut self,
+        range: GuestMemoryRange,
+        flush: bool,
+    ) -> Result<HvfHostMemoryMapping, HvfGuestMemoryMappingError> {
+        self.validate_dirty_write_mutation_state()?;
+        let host_index = self
+            .host_memory
+            .iter()
+            .position(|mapping| mapping.pmem_shadow_range() == Some(range))
+            .ok_or(HvfGuestMemoryMappingError::PmemShadowMissing { range })?;
+        let mapped_index = self
+            .mapped_regions
+            .iter()
+            .position(|mapped| mapped.range == range)
+            .ok_or(HvfGuestMemoryMappingError::PmemShadowMissing { range })?;
+        if flush {
+            self.host_memory
+                .get(host_index)
+                .ok_or(HvfGuestMemoryMappingError::PmemShadowMissing { range })?
+                .flush()
+                .map_err(|failure| HvfGuestMemoryMappingError::FlushFailed {
+                    failures: vec![failure],
+                })?;
+        }
+        let mapped = self
+            .mapped_regions
+            .get(mapped_index)
+            .copied()
+            .ok_or(HvfGuestMemoryMappingError::PmemShadowMissing { range })?;
+        self.mapper.unmap_region(mapped).map_err(|source| {
+            HvfGuestMemoryMappingError::UnmapFailed {
+                failures: vec![HvfGuestMemoryUnmapFailure { range, source }],
+            }
+        })?;
+        self.mapped_regions.remove(mapped_index);
+        Ok(self.host_memory.remove(host_index))
     }
 
     fn remove_dynamic_owner_after_failed_map(
@@ -3406,6 +3513,135 @@ mod tests {
                 if range == missing_range
         ));
         assert_eq!(file.read_all(), b"before");
+    }
+
+    #[test]
+    fn runtime_pmem_mapping_add_flush_take_and_restore_preserve_exact_shadow() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let pmem_range = range(page_size * 8, page_size);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory_for_ranges(vec![base_range]),
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("base guest memory should map");
+        let file = TempFile::with_bytes("runtime-pmem-map", b"before");
+        let host = host_pmem_mapping(
+            "pmem device `runtime`",
+            memory_for_ranges(vec![pmem_range]),
+            pmem_range,
+            b"after!",
+            &file,
+            false,
+        );
+
+        mapping
+            .map_runtime_pmem_mapping(host)
+            .expect("runtime pmem shadow should map");
+        assert_eq!(mapper.map_count(), 2);
+        let retained = mapping
+            .take_runtime_pmem_mapping(pmem_range, true)
+            .expect("runtime pmem shadow should flush and unmap");
+        assert_eq!(file.read_all(), b"after!");
+        assert_eq!(mapper.unmap_count(), 1);
+        assert!(matches!(
+            mapping.take_runtime_pmem_mapping(pmem_range, false),
+            Err(HvfGuestMemoryMappingError::PmemShadowMissing { range })
+                if range == pmem_range
+        ));
+
+        mapping
+            .map_runtime_pmem_mapping(retained)
+            .expect("the exact retained shadow should remap");
+        let retained = mapping
+            .take_runtime_pmem_mapping(pmem_range, false)
+            .expect("unpublished rollback should discard without flushing");
+        drop(retained);
+        mapping.unmap_all().expect("base memory should unmap");
+    }
+
+    #[test]
+    fn runtime_pmem_map_failure_keeps_base_mapping_and_publishes_no_shadow() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let pmem_range = range(page_size * 8, page_size);
+        let mapper = Arc::new(RecordingMapper::new(Some(2), false));
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory_for_ranges(vec![base_range]),
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("base guest memory should map");
+        let file = TempFile::with_bytes("runtime-pmem-map-failure", b"before");
+        let host = host_pmem_mapping(
+            "pmem device `runtime`",
+            memory_for_ranges(vec![pmem_range]),
+            pmem_range,
+            b"after!",
+            &file,
+            false,
+        );
+
+        assert!(matches!(
+            mapping.map_runtime_pmem_mapping(host),
+            Err(HvfGuestMemoryMappingError::HostMapping { range, .. })
+                if range == pmem_range
+        ));
+        assert_eq!(mapping.state.mapped_regions.len(), 1);
+        assert!(mapping.state.host_memory.is_empty());
+        assert_eq!(file.read_all(), b"before");
+        mapping
+            .unmap_all()
+            .expect("base mapping should remain usable");
+    }
+
+    #[test]
+    fn runtime_pmem_unmap_failure_retains_mapping_for_retry() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let pmem_range = range(page_size * 8, page_size);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory_for_ranges(vec![base_range]),
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("base guest memory should map");
+        let file = TempFile::with_bytes("runtime-pmem-unmap-failure", b"before");
+        mapping
+            .map_runtime_pmem_mapping(host_pmem_mapping(
+                "pmem device `runtime`",
+                memory_for_ranges(vec![pmem_range]),
+                pmem_range,
+                b"after!",
+                &file,
+                false,
+            ))
+            .expect("runtime pmem should map");
+
+        mapper.set_fail_unmap(true);
+        assert!(matches!(
+            mapping.take_runtime_pmem_mapping(pmem_range, false),
+            Err(HvfGuestMemoryMappingError::UnmapFailed { .. })
+        ));
+        assert_eq!(mapping.state.host_memory.len(), 1);
+        assert!(
+            mapping
+                .state
+                .mapped_regions
+                .iter()
+                .any(|mapped| mapped.range == pmem_range)
+        );
+
+        mapper.set_fail_unmap(false);
+        drop(
+            mapping
+                .take_runtime_pmem_mapping(pmem_range, false)
+                .expect("retained runtime pmem mapping should retry"),
+        );
+        mapping.unmap_all().expect("base mapping should unmap");
     }
 
     #[test]

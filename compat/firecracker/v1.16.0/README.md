@@ -40,10 +40,11 @@ claims mechanically visible.
   closure ledger. It accounts for the original 28 Wave 2 records, directly
   related API aggregates, exact evidence, count arithmetic, and explicit Wave
   6/7/8 ownership without changing the generated source manifest.
-- [`device-hotplug-contract.md`](device-hotplug-contract.md) is the #1420
-  runtime block ledger. It binds the two promoted drive PUT/DELETE identities
-  to the owner-thread transaction, contained grant rollback, guest lifecycle,
-  signed evidence, and the still-open pmem/network aggregate boundary.
+- [`device-hotplug-contract.md`](device-hotplug-contract.md) is the #1420/#1421
+  runtime block and pmem ledger. It binds the promoted PUT/path/DELETE
+  identities to owner-thread transactions, contained grant rollback, dynamic
+  pmem mapping, guest lifecycle, signed evidence, and the still-open network
+  aggregate boundary.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -175,8 +176,8 @@ shared dirty epochs, including public machine/load activation and Full commit
 reset. #1408 then performs the final #1388 audit: it promotes the three
 remaining bounded boot/lifecycle records and 18 single-purpose boot-source,
 machine, CPU, and VM-state API identities. The generated manifest remains 381
-identities; with 37 local semantic records, the current 418-record delivery
-overlay is 73 `implemented-and-verified`, 325 `audit-required`, three
+identities; with 37 local semantic records, the #1408 418-record delivery
+overlay was 73 `implemented-and-verified`, 325 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` records. Wave
 6 retains generalized snapshots and portability, Wave 7 retains the broad
 CPU/rootfs corpora, public `cpu-template-helper`, and applicable specification
@@ -192,6 +193,17 @@ two-round guest attach/remove/reuse. The broad device-hotplug corpus and
 aggregate semantic record remain nonterminal pending the pmem and network
 slices. The exact boundary is recorded in
 [`device-hotplug-contract.md`](device-hotplug-contract.md).
+
+#1421 subsequently promotes exactly three pmem API identities: the Swagger
+`PUT /pmem/{id}` operation, the aggregate `/pmem/{id}` path whose PUT/PATCH/
+DELETE supported profile is now complete, and the pinned non-Swagger bodyless
+`DELETE /pmem/{id}` route. Transactional direct and contained signed gates
+prove dynamic HVF mapping, guest flush, teardown, and exact same-ID/PCI-slot/
+guest-range reuse. The current overlay is therefore 76
+`implemented-and-verified`, 322 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` records. The
+broad device-hotplug corpus and aggregate semantic record remain nonterminal
+pending the independent network slice.
 
 ## Commands
 

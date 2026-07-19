@@ -112,6 +112,44 @@ impl HvfBackend {
         )
     }
 
+    pub(crate) fn map_runtime_pmem_device(
+        &mut self,
+        device: &PreparedPmemDevice,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let mapping = pmem_host_memory_mapping(device)?;
+        self.guest_memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory is not mapped",
+            ))?
+            .map_runtime_pmem_mapping(mapping)
+    }
+
+    pub(crate) fn take_runtime_pmem_mapping(
+        &mut self,
+        range: bangbang_runtime::memory::GuestMemoryRange,
+        flush: bool,
+    ) -> Result<HvfHostMemoryMapping, HvfGuestMemoryMappingError> {
+        self.guest_memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory is not mapped",
+            ))?
+            .take_runtime_pmem_mapping(range, flush)
+    }
+
+    pub(crate) fn restore_runtime_pmem_mapping(
+        &mut self,
+        mapping: HvfHostMemoryMapping,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.guest_memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory is not mapped",
+            ))?
+            .map_runtime_pmem_mapping(mapping)
+    }
+
     pub fn unmap_guest_memory(&mut self) -> Result<(), HvfGuestMemoryMappingError> {
         if let Some(mapping) = self.guest_memory.as_mut() {
             mapping.unmap_all()?;
@@ -588,27 +626,33 @@ fn pmem_host_memory_mappings(
         .map_err(|source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source })?;
 
     for device in pmem_devices {
-        let label = pmem_mapping_label(device);
-        let memory = pmem_shadow_memory(device).map_err(|source| {
-            HvfGuestMemoryMappingError::host_mapping(&label, device.guest_range(), source)
-        })?;
-        let backing = device.backing().file().try_clone().map_err(|source| {
-            BackendError::Hypervisor(format!(
-                "failed to clone HVF pmem backing handle for {label} at range {}: {source}",
-                device.guest_range(),
-            ))
-        })?;
-        host_mappings.push(HvfHostMemoryMapping::new_pmem_shadow(
-            label,
-            memory,
-            pmem_memory_permissions(device.mapping().is_read_only()),
-            backing,
-            device.mapping().file_len(),
-            device.mapping().is_read_only(),
-        ));
+        host_mappings.push(pmem_host_memory_mapping(device)?);
     }
 
     Ok(host_mappings)
+}
+
+fn pmem_host_memory_mapping(
+    device: &PreparedPmemDevice,
+) -> Result<HvfHostMemoryMapping, HvfGuestMemoryMappingError> {
+    let label = pmem_mapping_label(device);
+    let memory = pmem_shadow_memory(device).map_err(|source| {
+        HvfGuestMemoryMappingError::host_mapping(&label, device.guest_range(), source)
+    })?;
+    let backing = device.backing().file().try_clone().map_err(|source| {
+        BackendError::Hypervisor(format!(
+            "failed to clone HVF pmem backing handle for {label} at range {}: {source}",
+            device.guest_range(),
+        ))
+    })?;
+    Ok(HvfHostMemoryMapping::new_pmem_shadow(
+        label,
+        memory,
+        pmem_memory_permissions(device.mapping().is_read_only()),
+        backing,
+        device.mapping().file_len(),
+        device.mapping().is_read_only(),
+    ))
 }
 
 fn pmem_shadow_memory(

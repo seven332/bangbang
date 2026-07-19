@@ -45,9 +45,10 @@ use bangbang_runtime::memory_hotplug::{
 };
 use bangbang_runtime::message_interrupt::GuestMessageInterruptResources;
 use bangbang_runtime::metrics::{
-    BlockDeviceMetricsLease, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
-    SharedEntropyDeviceMetrics, SharedNetworkInterfaceMetricsRegistry,
-    SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedVsockDeviceMetrics,
+    BlockDeviceMetricsLease, PmemDeviceMetricsLease, SharedBalloonDeviceMetrics,
+    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
+    SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegionId};
 use bangbang_runtime::network::{
@@ -60,7 +61,8 @@ use bangbang_runtime::pci::{
     PciClassCode, PciType0Configuration,
 };
 use bangbang_runtime::pmem::{
-    PmemMmioLayout, PmemUpdate, PmemUpdateError, VIRTIO_PMEM_DEVICE_ID, VIRTIO_PMEM_QUEUE_SIZES,
+    PmemConfig, PmemFileBacking, PmemMmioLayout, PmemRuntimeMutationError, PmemUpdate,
+    PmemUpdateError, PreparedPmemDevice, VIRTIO_PMEM_DEVICE_ID, VIRTIO_PMEM_QUEUE_SIZES,
     VirtioPmemConfigSpace, VirtioPmemDevice, VirtioPmemFlushStatus,
 };
 use bangbang_runtime::rtc::RtcMmioLayout;
@@ -594,6 +596,8 @@ struct HvfArm64BootPciPmemDevice {
     guest_range: GuestMemoryRange,
     published: PublishedPciPmem,
     queue_deliveries: usize,
+    retry_deadline: Option<Instant>,
+    _metrics_lease: Option<PmemDeviceMetricsLease>,
 }
 
 #[derive(Debug)]
@@ -675,6 +679,7 @@ struct HvfArm64BootPciDataDevices {
     vsock: Option<HvfArm64BootPciVsockDevice>,
     entropy: Option<HvfArm64BootPciEntropyDevice>,
     memory_hotplug: Option<HvfArm64BootPciMemoryHotplugDevice>,
+    pmem_static_reserved_ranges: Vec<GuestMemoryRange>,
     runtime_hotplug: bool,
 }
 
@@ -895,6 +900,274 @@ impl HvfArm64BootPciDataDevices {
         Ok(())
     }
 
+    fn insert_runtime_pmem(
+        &mut self,
+        backend: &mut HvfBackend,
+        runtime_pmem_devices: &mut Vec<PreparedPmemDevice>,
+        config: &PmemConfig,
+        backing: PmemFileBacking,
+        metrics: &SharedPmemDeviceMetricsRegistry,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        if !self.runtime_hotplug {
+            return Err(PmemRuntimeMutationError::PciNotEnabled);
+        }
+        if config.root_device() {
+            return Err(PmemRuntimeMutationError::RootInsertUnsupported);
+        }
+        if self.pmem.iter().any(|device| device.pmem_id == config.id()) {
+            return Err(PmemRuntimeMutationError::DuplicatePmem);
+        }
+        if self.endpoint_count() >= PCI_ENDPOINT_SLOT_COUNT {
+            return Err(PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI endpoint capacity is exhausted".to_string(),
+            });
+        }
+        if self.pmem.len() == self.pmem.capacity()
+            || runtime_pmem_devices.len() == runtime_pmem_devices.capacity()
+        {
+            return Err(PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime pmem inventory capacity is exhausted".to_string(),
+            });
+        }
+
+        let reserved_count = self
+            .pmem_static_reserved_ranges
+            .len()
+            .checked_add(self.pmem.len())
+            .ok_or_else(|| PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime pmem guest-range inventory is too large".to_string(),
+            })?;
+        let mut reserved_ranges = Vec::new();
+        reserved_ranges
+            .try_reserve_exact(reserved_count)
+            .map_err(|_| PmemRuntimeMutationError::PrepareDevice {
+                message: "failed to reserve runtime pmem guest-range storage".to_string(),
+            })?;
+        reserved_ranges.extend(self.pmem_static_reserved_ranges.iter().copied());
+        reserved_ranges.extend(self.pmem.iter().map(|device| device.guest_range));
+        let prepared = PreparedPmemDevice::from_config_with_backing_and_reserved_ranges(
+            config,
+            backing,
+            &reserved_ranges,
+        )
+        .map_err(|source| PmemRuntimeMutationError::PrepareDevice {
+            message: source.to_string(),
+        })?;
+        let pmem_id = prepared.id().to_string();
+        let guest_range = prepared.guest_range();
+        let config_space = prepared.config_space();
+        let device = VirtioPmemDevice::with_rate_limiter(
+            prepared.mapping().file_len(),
+            prepared.rate_limiter(),
+        );
+        let prepared_metrics = metrics.prepare_device(pmem_id.clone()).map_err(|source| {
+            PmemRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        let interrupts = self.shared_msi_registry().map_err(|source| {
+            PmemRuntimeMutationError::TerminalInsertion {
+                message: source.to_string(),
+            }
+        })?;
+        let segment = self.validation.segment().clone();
+        let pmem_type = VirtioDeviceType::new(VIRTIO_PMEM_DEVICE_ID).map_err(|source| {
+            PmemRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+
+        backend
+            .map_runtime_pmem_device(&prepared)
+            .map_err(|source| PmemRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            })?;
+        let publication = (|| {
+            let mut dispatcher = self.dispatcher.lock().map_err(|_| {
+                PmemRuntimeMutationError::TerminalInsertion {
+                    message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                }
+            })?;
+            let region_id = Self::available_region_id(&dispatcher).map_err(|source| {
+                PmemRuntimeMutationError::PrepareDevice {
+                    message: source.to_string(),
+                }
+            })?;
+            PublishedVirtioPciEndpoint::publish(
+                VirtioPciIdentity::new(pmem_type, config_space.available_features()),
+                &VIRTIO_PMEM_QUEUE_SIZES,
+                config_space,
+                device,
+                false,
+                self.validation.bar_allocator_mut(),
+                segment,
+                &mut dispatcher,
+                region_id,
+                interrupts,
+            )
+            .map_err(runtime_pmem_publication_error)
+        })();
+        let published = match publication {
+            Ok(published) => published,
+            Err(primary) => {
+                return match backend.take_runtime_pmem_mapping(guest_range, false) {
+                    Ok(mapping) => {
+                        drop(mapping);
+                        Err(primary)
+                    }
+                    Err(cleanup) => Err(PmemRuntimeMutationError::TerminalInsertion {
+                        message: format!(
+                            "{primary}; also failed to discard unpublished pmem mapping: {cleanup}"
+                        ),
+                    }),
+                };
+            }
+        };
+
+        let metrics_lease = prepared_metrics.publish();
+        debug_assert!(self.pmem.len() < self.pmem.capacity());
+        debug_assert!(runtime_pmem_devices.len() < runtime_pmem_devices.capacity());
+        self.pmem.push(HvfArm64BootPciPmemDevice {
+            pmem_id,
+            guest_range,
+            published,
+            queue_deliveries: 0,
+            retry_deadline: None,
+            _metrics_lease: Some(metrics_lease),
+        });
+        runtime_pmem_devices.push(prepared);
+        Ok(())
+    }
+
+    fn update_runtime_pmem(&self, update: &PmemUpdate) -> Result<bool, PmemUpdateError> {
+        let device = self
+            .pmem
+            .iter()
+            .find(|device| device.pmem_id == update.id())
+            .ok_or(PmemUpdateError::UnknownPmem)?;
+        device
+            .published
+            .endpoint()
+            .update_pmem_rate_limiter(update)
+            .map_err(|source| PmemUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            })
+    }
+
+    fn remove_runtime_pmem(
+        &mut self,
+        backend: &mut HvfBackend,
+        runtime_pmem_devices: &mut Vec<PreparedPmemDevice>,
+        pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        if !self.runtime_hotplug {
+            return Err(PmemRuntimeMutationError::PciNotEnabled);
+        }
+        let index = self
+            .pmem
+            .iter()
+            .position(|device| device.pmem_id == pmem_id)
+            .ok_or(PmemRuntimeMutationError::UnknownPmem)?;
+        let resource_index = runtime_pmem_devices
+            .iter()
+            .position(|device| device.id() == pmem_id)
+            .ok_or_else(|| PmemRuntimeMutationError::TerminalRemoval {
+                message: "runtime pmem backing owner is missing".to_string(),
+            })?;
+        let guest_range = self
+            .pmem
+            .get(index)
+            .map(|device| device.guest_range)
+            .ok_or(PmemRuntimeMutationError::UnknownPmem)?;
+
+        {
+            let mut dispatcher =
+                self.dispatcher
+                    .lock()
+                    .map_err(|_| PmemRuntimeMutationError::TerminalRemoval {
+                        message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                    })?;
+            let device = self
+                .pmem
+                .get_mut(index)
+                .ok_or(PmemRuntimeMutationError::UnknownPmem)?;
+            if let Err(source) = device.published.prepare_teardown(&mut dispatcher) {
+                let message = source.to_string();
+                return Err(
+                    if matches!(
+                        source,
+                        VirtioPciPublicationError::Rollback { .. }
+                            | VirtioPciPublicationError::SegmentLock { .. }
+                            | VirtioPciPublicationError::EndpointRelease { .. }
+                    ) {
+                        PmemRuntimeMutationError::TerminalRemoval { message }
+                    } else {
+                        PmemRuntimeMutationError::RemoveDevice { message }
+                    },
+                );
+            }
+        }
+
+        let removed_mapping = match backend.take_runtime_pmem_mapping(guest_range, true) {
+            Ok(mapping) => mapping,
+            Err(primary) => {
+                let rollback = (|| {
+                    let mut dispatcher = self.dispatcher.lock().map_err(|_| {
+                        "PCI data-device MMIO dispatcher is unavailable".to_string()
+                    })?;
+                    self.pmem
+                        .get_mut(index)
+                        .ok_or_else(|| "runtime pmem endpoint disappeared".to_string())?
+                        .published
+                        .rollback_prepared_teardown(&mut dispatcher)
+                        .map_err(|source| source.to_string())
+                })();
+                return match rollback {
+                    Ok(()) => Err(PmemRuntimeMutationError::RemoveDevice {
+                        message: primary.to_string(),
+                    }),
+                    Err(rollback) => Err(PmemRuntimeMutationError::TerminalRemoval {
+                        message: format!(
+                            "{primary}; also failed to restore runtime pmem endpoint: {rollback}"
+                        ),
+                    }),
+                };
+            }
+        };
+
+        let commit = (|| {
+            let mut dispatcher =
+                self.dispatcher
+                    .lock()
+                    .map_err(|_| PmemRuntimeMutationError::TerminalRemoval {
+                        message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                    })?;
+            self.pmem
+                .get_mut(index)
+                .ok_or(PmemRuntimeMutationError::UnknownPmem)?
+                .published
+                .commit_prepared_teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| PmemRuntimeMutationError::TerminalRemoval {
+                    message: source.to_string(),
+                })
+        })();
+        if let Err(primary) = commit {
+            return match backend.restore_runtime_pmem_mapping(removed_mapping) {
+                Ok(()) => Err(primary),
+                Err(restore) => Err(PmemRuntimeMutationError::TerminalRemoval {
+                    message: format!(
+                        "{primary}; also failed to restore runtime pmem mapping: {restore}"
+                    ),
+                }),
+            };
+        }
+
+        drop(removed_mapping);
+        self.pmem.remove(index);
+        runtime_pmem_devices.remove(resource_index);
+        Ok(())
+    }
+
     fn diagnostics(
         &self,
     ) -> Result<Vec<HvfArm64BootPciDataDeviceDiagnostics>, HvfArm64BootPciDataError> {
@@ -1071,8 +1344,8 @@ impl HvfArm64BootPciDataDevices {
         flush_provider: &mut impl Arm64BootPmemFlushProvider,
         metrics: &SharedPmemDeviceMetricsRegistry,
     ) -> Option<Duration> {
-        let mut retry_after = None;
         for device in &mut self.pmem {
+            let mut retry_after = None;
             let mut flush = || flush_provider.flush(device.guest_range);
             let result = device
                 .published
@@ -1110,8 +1383,17 @@ impl HvfArm64BootPciDataDevices {
                     }
                 }
             }
+            device.retry_deadline = retry_after.map(limiter_retry_deadline_after);
         }
-        retry_after
+        self.pmem_retry_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn pmem_retry_deadline(&self) -> Option<Instant> {
+        self.pmem
+            .iter()
+            .filter_map(|device| device.retry_deadline)
+            .min()
     }
 
     fn dispatch_network(
@@ -3609,6 +3891,51 @@ impl HvfArm64BootSession<'_> {
         )
     }
 
+    /// Maps and publishes one pmem endpoint in the owner-thread PCI inventory.
+    pub fn insert_runtime_pmem_device(
+        &mut self,
+        config: &PmemConfig,
+        backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        let metrics = self.pmem_device_metrics.clone();
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(PmemRuntimeMutationError::PciNotEnabled)?
+            .insert_runtime_pmem(
+                self.backend,
+                &mut self.runtime_resources.pmem_devices,
+                config,
+                backing,
+                &metrics,
+            )
+    }
+
+    /// Updates a pmem endpoint by resolving its current live owner entry.
+    pub fn update_runtime_pmem_device(
+        &mut self,
+        update: &PmemUpdate,
+    ) -> Result<bool, PmemUpdateError> {
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(PmemUpdateError::ActiveSessionUnavailable)?
+            .update_runtime_pmem(update)
+    }
+
+    /// Flushes and removes one pmem endpoint from the owner-thread inventory.
+    pub fn remove_runtime_pmem_device(
+        &mut self,
+        pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        remove_runtime_pci_pmem_device_and_refresh_retry(
+            &mut self.pci_data_devices,
+            self.backend,
+            &mut self.runtime_resources.pmem_devices,
+            &self.pmem_retry_wakeup,
+            &self.pmem_retry_wakeup_scheduler,
+            pmem_id,
+        )
+    }
+
     pub fn pci_network_device_updater(&self) -> Option<HvfArm64BootPciNetworkDeviceUpdater> {
         self.pci_data_devices
             .as_ref()
@@ -5499,6 +5826,51 @@ impl OwnedHvfArm64BootSession {
             &self.block_retry_wakeup,
             &self.block_retry_wakeup_scheduler,
             drive_id,
+        )
+    }
+
+    /// Maps and publishes one pmem endpoint in the owner-thread PCI inventory.
+    pub fn insert_runtime_pmem_device(
+        &mut self,
+        config: &PmemConfig,
+        backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        let metrics = self.pmem_device_metrics.clone();
+        self.pci_data_devices
+            .as_mut()
+            .ok_or(PmemRuntimeMutationError::PciNotEnabled)?
+            .insert_runtime_pmem(
+                &mut self.backend,
+                &mut self.runtime_resources.pmem_devices,
+                config,
+                backing,
+                &metrics,
+            )
+    }
+
+    /// Updates a pmem endpoint by resolving its current live owner entry.
+    pub fn update_runtime_pmem_device(
+        &mut self,
+        update: &PmemUpdate,
+    ) -> Result<bool, PmemUpdateError> {
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(PmemUpdateError::ActiveSessionUnavailable)?
+            .update_runtime_pmem(update)
+    }
+
+    /// Flushes and removes one pmem endpoint from the owner-thread inventory.
+    pub fn remove_runtime_pmem_device(
+        &mut self,
+        pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        remove_runtime_pci_pmem_device_and_refresh_retry(
+            &mut self.pci_data_devices,
+            &mut self.backend,
+            &mut self.runtime_resources.pmem_devices,
+            &self.pmem_retry_wakeup,
+            &self.pmem_retry_wakeup_scheduler,
+            pmem_id,
         )
     }
 
@@ -9275,6 +9647,19 @@ fn runtime_block_publication_error(source: VirtioPciPublicationError) -> DriveRu
     }
 }
 
+fn runtime_pmem_publication_error(source: VirtioPciPublicationError) -> PmemRuntimeMutationError {
+    let terminal = matches!(
+        source,
+        VirtioPciPublicationError::Rollback { .. } | VirtioPciPublicationError::SegmentLock { .. }
+    );
+    let message = source.to_string();
+    if terminal {
+        PmemRuntimeMutationError::TerminalInsertion { message }
+    } else {
+        PmemRuntimeMutationError::PublishDevice { message }
+    }
+}
+
 fn remove_runtime_pci_block_device_and_refresh_retry(
     pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
     retry_wakeup: &HvfArm64BootLimiterRetryWakeupToken,
@@ -9303,6 +9688,36 @@ fn refresh_block_retry_wakeup_after_inventory_change(
     // inventory. Once an endpoint disappears, its deadline cannot be
     // distinguished from deadlines owned by survivors, so synchronously
     // discard it and derive the replacement from the remaining endpoints.
+    retry_scheduler.cancel_and_wait();
+    let _ = retry_wakeup.take_wakeup_request();
+    retry_scheduler.schedule_deadline(retry_deadline);
+}
+
+fn remove_runtime_pci_pmem_device_and_refresh_retry(
+    pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
+    backend: &mut HvfBackend,
+    runtime_pmem_devices: &mut Vec<PreparedPmemDevice>,
+    retry_wakeup: &HvfArm64BootLimiterRetryWakeupToken,
+    retry_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    pmem_id: &str,
+) -> Result<(), PmemRuntimeMutationError> {
+    let devices = pci_data_devices
+        .as_mut()
+        .ok_or(PmemRuntimeMutationError::PciNotEnabled)?;
+    devices.remove_runtime_pmem(backend, runtime_pmem_devices, pmem_id)?;
+    refresh_pmem_retry_wakeup_after_inventory_change(
+        retry_wakeup,
+        retry_scheduler,
+        devices.pmem_retry_deadline(),
+    );
+    Ok(())
+}
+
+fn refresh_pmem_retry_wakeup_after_inventory_change(
+    retry_wakeup: &HvfArm64BootLimiterRetryWakeupToken,
+    retry_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    retry_deadline: Option<Instant>,
+) {
     retry_scheduler.cancel_and_wait();
     let _ = retry_wakeup.take_wakeup_request();
     retry_scheduler.schedule_deadline(retry_deadline);
@@ -10897,11 +11312,11 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         power,
         gic.timer_interrupts.el1_virtual_timer_intid,
     );
-    let runtime_block_hotplug = runtime
+    let runtime_pci_hotplug = runtime
         .pci_validation
         .as_ref()
         .is_some_and(|validation| validation.config().is_all_virtio_devices());
-    let block_device_metrics = if runtime_block_hotplug {
+    let block_device_metrics = if runtime_pci_hotplug {
         SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(
             runtime
                 .block_devices
@@ -10934,9 +11349,21 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
                 ),
         )
     };
-    let pmem_device_metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(
-        runtime.pmem_devices.iter().map(|device| device.id()),
-    );
+    let pmem_device_metrics = if runtime_pci_hotplug {
+        SharedPmemDeviceMetricsRegistry::from_device_ids_with_capacity(
+            runtime.pmem_devices.iter().map(|device| device.id()),
+            PCI_ENDPOINT_SLOT_COUNT,
+        )
+        .map_err(|source| HvfArm64BootSessionError::PciData {
+            source: HvfArm64BootPciDataError::new(format!(
+                "failed to reserve live pmem metrics inventory: {source}"
+            )),
+        })?
+    } else {
+        SharedPmemDeviceMetricsRegistry::from_device_ids(
+            runtime.pmem_devices.iter().map(|device| device.id()),
+        )
+    };
     let network_interface_metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(
         runtime
             .network_devices
@@ -10958,10 +11385,11 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         &mut runtime,
         &mmio_dispatcher,
         &block_device_metrics,
+        &pmem_device_metrics,
     )
     .map_err(|source| HvfArm64BootSessionError::PciData { source })?;
     let block_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
-    let block_retry_wakeup_scheduler = if !has_block_devices && !runtime_block_hotplug {
+    let block_retry_wakeup_scheduler = if !has_block_devices && !runtime_pci_hotplug {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
     } else {
         let vcpu_control = runner.control();
@@ -10973,7 +11401,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         .map_err(|source| HvfArm64BootSessionError::StartBlockRetryWakeupScheduler { source })?
     };
     let pmem_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
-    let pmem_retry_wakeup_scheduler = if runtime.pmem_devices.is_empty() {
+    let pmem_retry_wakeup_scheduler = if runtime.pmem_devices.is_empty() && !runtime_pci_hotplug {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
     } else {
         let vcpu_control = runner.control();
@@ -11350,6 +11778,7 @@ fn prepare_pci_data_devices(
     runtime: &mut Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
     block_device_metrics: &SharedBlockDeviceMetricsRegistry,
+    pmem_device_metrics: &SharedPmemDeviceMetricsRegistry,
 ) -> Result<Option<HvfArm64BootPciDataDevices>, HvfArm64BootPciDataError> {
     let Some(validation) = runtime.pci_validation.as_ref() else {
         return Ok(None);
@@ -11428,6 +11857,44 @@ fn prepare_pci_data_devices(
         demand.routes
     };
 
+    if all_virtio && runtime.pmem_devices.len() < PCI_ENDPOINT_SLOT_COUNT {
+        runtime
+            .pmem_devices
+            .try_reserve_exact(PCI_ENDPOINT_SLOT_COUNT - runtime.pmem_devices.len())
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to reserve runtime pmem backing inventory: {source}"
+                ))
+            })?;
+    }
+    let static_range_capacity = runtime
+        .layout
+        .ranges()
+        .len()
+        .checked_add(usize::from(runtime.pci_memory_hotplug_device.is_some()))
+        .ok_or_else(|| {
+            HvfArm64BootPciDataError::new("runtime pmem reserved-range capacity overflow")
+        })?;
+    let mut pmem_static_reserved_ranges = Vec::new();
+    pmem_static_reserved_ranges
+        .try_reserve_exact(static_range_capacity)
+        .map_err(|source| {
+            HvfArm64BootPciDataError::new(format!(
+                "failed to reserve runtime pmem guest-range inventory: {source}"
+            ))
+        })?;
+    pmem_static_reserved_ranges.extend(runtime.layout.ranges().iter().copied());
+    if let Some(memory_hotplug) = runtime.pci_memory_hotplug_device.as_ref() {
+        let config = memory_hotplug.config_space();
+        let range = GuestMemoryRange::new(GuestAddress::new(config.addr()), config.region_size())
+            .map_err(|source| {
+            HvfArm64BootPciDataError::new(format!(
+                "failed to retain the virtio-mem reservation for runtime pmem: {source}"
+            ))
+        })?;
+        pmem_static_reserved_ranges.push(range);
+    }
+
     let validation = runtime.pci_validation.take().ok_or_else(|| {
         HvfArm64BootPciDataError::new("PCI data validation resources disappeared during prepare")
     })?;
@@ -11442,6 +11909,7 @@ fn prepare_pci_data_devices(
         vsock: None,
         entropy: None,
         memory_hotplug: None,
+        pmem_static_reserved_ranges,
         runtime_hotplug: all_virtio,
     };
     if reserved_routes != 0 {
@@ -11642,6 +12110,19 @@ fn prepare_pci_data_devices(
 
         for prepared in &runtime.pmem_devices {
             let pmem_id = prepared.id().to_string();
+            let metrics_lease = if all_virtio {
+                Some(
+                    pmem_device_metrics
+                        .claim_device_lease(&pmem_id)
+                        .map_err(|source| {
+                            HvfArm64BootPciDataError::new(format!(
+                                "failed to claim PCI pmem metrics ownership: {source}"
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
             let guest_range = prepared.guest_range();
             let config_space = prepared.config_space();
             let device = VirtioPmemDevice::with_rate_limiter(
@@ -11679,6 +12160,8 @@ fn prepare_pci_data_devices(
                 guest_range,
                 published,
                 queue_deliveries: 0,
+                retry_deadline: None,
+                _metrics_lease: metrics_lease,
             });
             endpoint_index += 1;
         }

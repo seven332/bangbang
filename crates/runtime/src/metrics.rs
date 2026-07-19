@@ -2459,25 +2459,324 @@ struct SharedPmemDeviceMetricsInner {
     rate_limiter_event_count: AtomicU64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SharedPmemDeviceMetricsRegistry {
     aggregate: SharedPmemDeviceMetrics,
-    per_device: Arc<BTreeMap<String, SharedPmemDeviceMetrics>>,
+    per_device: Arc<Mutex<PmemDeviceMetricsRegistryState>>,
+}
+
+#[derive(Debug, Default)]
+struct PmemDeviceMetricsRegistryState {
+    entries: Vec<PmemDeviceMetricsRegistryEntry>,
+    reservations: Vec<PmemDeviceMetricsReservation>,
+    next_generation: u64,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct PmemDeviceMetricsRegistryEntry {
+    generation: u64,
+    device_id: String,
+    metrics: SharedPmemDeviceMetrics,
+    lease_claimed: bool,
+}
+
+#[derive(Debug)]
+struct PmemDeviceMetricsReservation {
+    generation: u64,
+    device_id: String,
+}
+
+/// Prepared per-device pmem metrics ownership that is invisible until publication.
+pub struct PreparedPmemDeviceMetrics {
+    registry: SharedPmemDeviceMetricsRegistry,
+    generation: u64,
+    device_id: String,
+    metrics: SharedPmemDeviceMetrics,
+    reserved: bool,
+}
+
+/// Exact live per-device pmem metrics ownership removed automatically on drop.
+pub struct PmemDeviceMetricsLease {
+    registry: SharedPmemDeviceMetricsRegistry,
+    generation: u64,
+    device_id: String,
+    registered: bool,
+}
+
+impl fmt::Debug for PreparedPmemDeviceMetrics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedPmemDeviceMetrics")
+            .field("ownership", &"<redacted>")
+            .field("reserved", &self.reserved)
+            .finish()
+    }
+}
+
+impl fmt::Debug for PmemDeviceMetricsLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmemDeviceMetricsLease")
+            .field("ownership", &"<redacted>")
+            .field("registered", &self.registered)
+            .finish()
+    }
+}
+
+impl PreparedPmemDeviceMetrics {
+    pub fn publish(mut self) -> PmemDeviceMetricsLease {
+        let mut state = lock_pmem_metrics_registry(&self.registry.per_device);
+        let reservation_count = state.reservations.len();
+        state.reservations.retain(|reservation| {
+            reservation.generation != self.generation || reservation.device_id != self.device_id
+        });
+        debug_assert_eq!(
+            state.reservations.len().checked_add(1),
+            Some(reservation_count)
+        );
+        self.reserved = false;
+        debug_assert!(state.entries.len() < state.capacity);
+        debug_assert!(
+            !state
+                .entries
+                .iter()
+                .any(|entry| entry.device_id == self.device_id)
+        );
+        state.entries.push(PmemDeviceMetricsRegistryEntry {
+            generation: self.generation,
+            device_id: self.device_id.clone(),
+            metrics: self.metrics.clone(),
+            lease_claimed: true,
+        });
+        drop(state);
+        PmemDeviceMetricsLease {
+            registry: self.registry.clone(),
+            generation: self.generation,
+            device_id: self.device_id.clone(),
+            registered: true,
+        }
+    }
+}
+
+impl Drop for PreparedPmemDeviceMetrics {
+    fn drop(&mut self) {
+        if !self.reserved {
+            return;
+        }
+        let mut state = lock_pmem_metrics_registry(&self.registry.per_device);
+        if let Some(index) = state.reservations.iter().position(|reservation| {
+            reservation.generation == self.generation && reservation.device_id == self.device_id
+        }) {
+            state.reservations.remove(index);
+        }
+        self.reserved = false;
+    }
+}
+
+impl Drop for PmemDeviceMetricsLease {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut state = lock_pmem_metrics_registry(&self.registry.per_device);
+        if let Some(index) = state.entries.iter().position(|entry| {
+            entry.generation == self.generation && entry.device_id == self.device_id
+        }) {
+            state.entries.remove(index);
+        }
+        self.registered = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmemDeviceMetricsRegistryError {
+    DuplicateDevice,
+    UnknownDevice,
+    LeaseAlreadyClaimed,
+    Capacity,
+    GenerationExhausted,
+}
+
+impl fmt::Display for PmemDeviceMetricsRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateDevice => {
+                formatter.write_str("pmem metrics device is already registered")
+            }
+            Self::UnknownDevice => formatter.write_str("pmem metrics device is not registered"),
+            Self::LeaseAlreadyClaimed => {
+                formatter.write_str("pmem metrics device lease is already claimed")
+            }
+            Self::Capacity => formatter.write_str("failed to reserve pmem metrics capacity"),
+            Self::GenerationExhausted => {
+                formatter.write_str("pmem metrics ownership generation is exhausted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PmemDeviceMetricsRegistryError {}
+
+impl Default for SharedPmemDeviceMetricsRegistry {
+    fn default() -> Self {
+        Self {
+            aggregate: SharedPmemDeviceMetrics::default(),
+            per_device: Arc::new(Mutex::new(PmemDeviceMetricsRegistryState::default())),
+        }
+    }
 }
 
 impl SharedPmemDeviceMetricsRegistry {
     pub fn from_device_ids<'a>(device_ids: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut per_device = BTreeMap::new();
+        let mut entries = Vec::new();
         for device_id in device_ids {
-            per_device
-                .entry(device_id.to_string())
-                .or_insert_with(SharedPmemDeviceMetrics::default);
+            if entries
+                .iter()
+                .any(|entry: &PmemDeviceMetricsRegistryEntry| entry.device_id == device_id)
+            {
+                continue;
+            }
+            let generation = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+            entries.push(PmemDeviceMetricsRegistryEntry {
+                generation,
+                device_id: device_id.to_string(),
+                metrics: SharedPmemDeviceMetrics::default(),
+                lease_claimed: false,
+            });
         }
-
+        let next_generation = u64::try_from(entries.len()).unwrap_or(u64::MAX);
         Self {
             aggregate: SharedPmemDeviceMetrics::default(),
-            per_device: Arc::new(per_device),
+            per_device: Arc::new(Mutex::new(PmemDeviceMetricsRegistryState {
+                capacity: entries.len(),
+                entries,
+                reservations: Vec::new(),
+                next_generation,
+            })),
         }
+    }
+
+    pub fn from_device_ids_with_capacity<'a>(
+        device_ids: impl IntoIterator<Item = &'a str>,
+        capacity: usize,
+    ) -> Result<Self, PmemDeviceMetricsRegistryError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| PmemDeviceMetricsRegistryError::Capacity)?;
+        let mut reservations = Vec::new();
+        reservations
+            .try_reserve_exact(capacity)
+            .map_err(|_| PmemDeviceMetricsRegistryError::Capacity)?;
+        for device_id in device_ids {
+            if entries
+                .iter()
+                .any(|entry: &PmemDeviceMetricsRegistryEntry| entry.device_id == device_id)
+            {
+                continue;
+            }
+            if entries.len() == capacity {
+                return Err(PmemDeviceMetricsRegistryError::Capacity);
+            }
+            let generation = u64::try_from(entries.len())
+                .map_err(|_| PmemDeviceMetricsRegistryError::GenerationExhausted)?;
+            entries.push(PmemDeviceMetricsRegistryEntry {
+                generation,
+                device_id: device_id.to_string(),
+                metrics: SharedPmemDeviceMetrics::default(),
+                lease_claimed: false,
+            });
+        }
+        let next_generation = u64::try_from(entries.len())
+            .map_err(|_| PmemDeviceMetricsRegistryError::GenerationExhausted)?;
+        Ok(Self {
+            aggregate: SharedPmemDeviceMetrics::default(),
+            per_device: Arc::new(Mutex::new(PmemDeviceMetricsRegistryState {
+                entries,
+                reservations,
+                next_generation,
+                capacity,
+            })),
+        })
+    }
+
+    pub fn prepare_device(
+        &self,
+        device_id: impl Into<String>,
+    ) -> Result<PreparedPmemDeviceMetrics, PmemDeviceMetricsRegistryError> {
+        let device_id = device_id.into();
+        let mut state = lock_pmem_metrics_registry(&self.per_device);
+        if state
+            .entries
+            .iter()
+            .any(|entry| entry.device_id == device_id)
+            || state
+                .reservations
+                .iter()
+                .any(|reservation| reservation.device_id == device_id)
+        {
+            return Err(PmemDeviceMetricsRegistryError::DuplicateDevice);
+        }
+        let claimed_capacity = state
+            .entries
+            .len()
+            .checked_add(state.reservations.len())
+            .ok_or(PmemDeviceMetricsRegistryError::Capacity)?;
+        if claimed_capacity >= state.capacity {
+            return Err(PmemDeviceMetricsRegistryError::Capacity);
+        }
+        state
+            .entries
+            .try_reserve_exact(1)
+            .map_err(|_| PmemDeviceMetricsRegistryError::Capacity)?;
+        state
+            .reservations
+            .try_reserve_exact(1)
+            .map_err(|_| PmemDeviceMetricsRegistryError::Capacity)?;
+        let next_generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or(PmemDeviceMetricsRegistryError::GenerationExhausted)?;
+        let generation = state.next_generation;
+        state.next_generation = next_generation;
+        state.reservations.push(PmemDeviceMetricsReservation {
+            generation,
+            device_id: device_id.clone(),
+        });
+        drop(state);
+        Ok(PreparedPmemDeviceMetrics {
+            registry: self.clone(),
+            generation,
+            device_id,
+            metrics: SharedPmemDeviceMetrics::default(),
+            reserved: true,
+        })
+    }
+
+    /// Claims drop ownership for one device registered during bounded startup.
+    pub fn claim_device_lease(
+        &self,
+        device_id: &str,
+    ) -> Result<PmemDeviceMetricsLease, PmemDeviceMetricsRegistryError> {
+        let mut state = lock_pmem_metrics_registry(&self.per_device);
+        let entry = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.device_id == device_id)
+            .ok_or(PmemDeviceMetricsRegistryError::UnknownDevice)?;
+        if entry.lease_claimed {
+            return Err(PmemDeviceMetricsRegistryError::LeaseAlreadyClaimed);
+        }
+        entry.lease_claimed = true;
+        let generation = entry.generation;
+        drop(state);
+        Ok(PmemDeviceMetricsLease {
+            registry: self.clone(),
+            generation,
+            device_id: device_id.to_string(),
+            registered: true,
+        })
     }
 
     pub fn aggregate(&self) -> SharedPmemDeviceMetrics {
@@ -2485,7 +2784,10 @@ impl SharedPmemDeviceMetricsRegistry {
     }
 
     pub fn per_device(&self, device_id: &str) -> Option<SharedPmemDeviceMetrics> {
-        self.per_device.get(device_id).cloned()
+        lock_pmem_metrics_registry(&self.per_device)
+            .entries
+            .iter()
+            .find_map(|entry| (entry.device_id == device_id).then(|| entry.metrics.clone()))
     }
 
     pub fn record_notification_dispatch_for_device(
@@ -2534,13 +2836,22 @@ impl SharedPmemDeviceMetricsRegistry {
 
     pub fn per_device_snapshot(&self) -> PmemDeviceMetricsByDevice {
         let mut snapshot = PmemDeviceMetricsByDevice::new();
-        for (device_id, metrics) in self.per_device.iter() {
-            let metrics = metrics.snapshot();
+        for entry in &lock_pmem_metrics_registry(&self.per_device).entries {
+            let metrics = entry.metrics.snapshot();
             if !metrics.is_empty() {
-                snapshot.insert_device_metrics(device_id.clone(), metrics);
+                snapshot.insert_device_metrics(entry.device_id.clone(), metrics);
             }
         }
         snapshot
+    }
+}
+
+fn lock_pmem_metrics_registry(
+    registry: &Mutex<PmemDeviceMetricsRegistryState>,
+) -> MutexGuard<'_, PmemDeviceMetricsRegistryState> {
+    match registry.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -6266,11 +6577,12 @@ mod tests {
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
         MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
-        PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
-        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
-        SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
+        PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError, RtcDeviceMetrics,
+        SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+        SharedEntropyDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetrics,
+        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetrics,
+        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
+        SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::logger::SharedLoggerMetrics;
@@ -7410,6 +7722,68 @@ mod tests {
         );
         assert_eq!(second.aggregate_snapshot(), PmemDeviceMetrics::default());
         assert!(second.per_device_snapshot().is_empty());
+    }
+
+    #[test]
+    fn pmem_metrics_runtime_reservation_is_invisible_and_drop_reuses_capacity() {
+        let registry = SharedPmemDeviceMetricsRegistry::from_device_ids_with_capacity([], 1)
+            .expect("bounded pmem metrics should construct");
+        let prepared = registry
+            .prepare_device("pmem0")
+            .expect("pmem metrics should reserve");
+        assert!(registry.per_device("pmem0").is_none());
+        assert_eq!(
+            registry.prepare_device("pmem1").unwrap_err(),
+            PmemDeviceMetricsRegistryError::Capacity
+        );
+
+        let lease = prepared.publish();
+        registry.record_queue_events_for_device("pmem0", 2);
+        assert_eq!(
+            registry.per_device_snapshot(),
+            PmemDeviceMetricsByDevice::new().with_device_metrics(
+                "pmem0",
+                PmemDeviceMetrics::default().with_queue_event_count(2),
+            )
+        );
+        drop(lease);
+        assert!(registry.per_device("pmem0").is_none());
+
+        let replacement = registry
+            .prepare_device("pmem1")
+            .expect("released capacity should be reusable")
+            .publish();
+        assert!(registry.per_device("pmem1").is_some());
+        drop(replacement);
+    }
+
+    #[test]
+    fn pmem_metrics_startup_lease_removes_only_its_exact_generation() {
+        let registry = SharedPmemDeviceMetricsRegistry::from_device_ids_with_capacity(["pmem0"], 1)
+            .expect("startup pmem metrics should construct");
+        let startup = registry
+            .claim_device_lease("pmem0")
+            .expect("startup lease should claim");
+        assert_eq!(
+            registry.claim_device_lease("pmem0").unwrap_err(),
+            PmemDeviceMetricsRegistryError::LeaseAlreadyClaimed
+        );
+        drop(startup);
+        assert!(registry.per_device("pmem0").is_none());
+
+        let replacement = registry
+            .prepare_device("pmem0")
+            .expect("same id should reserve after exact lease drop")
+            .publish();
+        registry.record_event_failure_for_device("pmem0");
+        assert_eq!(
+            registry
+                .per_device("pmem0")
+                .expect("replacement metrics should remain")
+                .snapshot(),
+            PmemDeviceMetrics::default().with_event_fails(1)
+        );
+        drop(replacement);
     }
 
     #[test]

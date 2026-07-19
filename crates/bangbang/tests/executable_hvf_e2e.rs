@@ -50,6 +50,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.pci-all-virtio=1";
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_MARKER: &[u8] = b"BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
+    const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
     const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
     const BLOCK_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_ONE";
     const BLOCK_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_ONE";
@@ -58,6 +59,14 @@ mod macos_arm64 {
     const BLOCK_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_TWO";
     const BLOCK_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_TWO";
     const BLOCK_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_SUCCESS";
+    const PMEM_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_READY";
+    const PMEM_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_HOST_ONE";
+    const PMEM_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_GUEST_ONE";
+    const PMEM_HOTPLUG_FIRST_REMOVED_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_FIRST_REMOVED";
+    const PMEM_HOTPLUG_CONTINUE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_CONTINUE";
+    const PMEM_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_HOST_TWO";
+    const PMEM_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_GUEST_TWO";
+    const PMEM_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_SUCCESS";
     const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
     const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
     const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
@@ -424,7 +433,7 @@ mod macos_arm64 {
             (
                 "DELETE /pmem/private_hot_unplug_pmem after InstanceStart",
                 "/pmem/private_hot_unplug_pmem",
-                r#"{"fault_message":"Pmem device is not supported."}"#,
+                r#"{"fault_message":"runtime pmem insertion and removal require PCI transport"}"#,
                 "private_hot_unplug_pmem",
             ),
         ] {
@@ -3298,6 +3307,189 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang runtime block hotplug product PCI",
+        );
+    }
+
+    #[test]
+    fn signed_executable_hotplugs_flushes_and_reuses_runtime_pmem_over_product_pci() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let control_backing_path = test_dir.path().join("pmem-hotplug-control.img");
+        let first_backing_path = test_dir.path().join("pmem-hotplug-first.img");
+        let second_backing_path = test_dir.path().join("pmem-hotplug-second.img");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_block_backing_with_prefix(&control_backing_path, 2, &[]);
+        create_pmem_backing(&first_backing_path, PMEM_HOTPLUG_HOST_ONE_MARKER);
+        create_pmem_backing(&second_backing_path, PMEM_HOTPLUG_HOST_TWO_MARKER);
+
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT /machine-config pmem hotplug",
+        );
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/boot-source", &boot_body),
+            "PUT /boot-source pmem hotplug",
+        );
+        let rootfs_body = format!(
+            r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+            json_string(path_text(&rootfs_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/rootfs", &rootfs_body),
+            "PUT /drives/rootfs pmem hotplug",
+        );
+        let control_body = format!(
+            r#"{{"drive_id":"control","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+            json_string(path_text(&control_backing_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/control", &control_body),
+            "PUT /drives/control pmem hotplug",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "PUT /actions InstanceStart pmem hotplug",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            PMEM_HOTPLUG_READY_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "pmem hotplug guest did not become ready: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        let first_body = format!(
+            r#"{{"id":"hotpmem","path_on_host":{},"read_only":false}}"#,
+            json_string(path_text(&first_backing_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/pmem/hotpmem", &first_body),
+            "runtime PUT /pmem/hotpmem first backing",
+        );
+        let second_body = format!(
+            r#"{{"id":"hotpmem","path_on_host":{},"read_only":false}}"#,
+            json_string(path_text(&second_backing_path)),
+        );
+        let duplicate = http_put_json(&socket_path, "/pmem/hotpmem", &second_body);
+        assert_bad_request_response(&duplicate, "duplicate runtime PUT /pmem/hotpmem");
+        assert_response_contains(
+            &duplicate,
+            r#"{"fault_message":"pmem device is already configured"}"#,
+            "duplicate runtime PUT /pmem/hotpmem",
+        );
+        assert!(
+            !duplicate.contains(path_text(&second_backing_path)),
+            "duplicate runtime pmem response must redact the rejected backing path: {duplicate}"
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            PMEM_HOTPLUG_FIRST_REMOVED_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "first runtime pmem did not flush and leave the guest: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_eq!(
+            file_bytes_at(
+                &first_backing_path,
+                PMEM_GUEST_FLUSH_OFFSET,
+                PMEM_HOTPLUG_GUEST_ONE_MARKER.len(),
+            ),
+            PMEM_HOTPLUG_GUEST_ONE_MARKER,
+            "first runtime pmem flush should persist before removal"
+        );
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause before runtime pmem reuse",
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/pmem/hotpmem"),
+            "paused DELETE /pmem/hotpmem",
+        );
+        let removed_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&removed_config, "GET /vm/config after pmem DELETE");
+        assert!(
+            !removed_config.contains(r#""id":"hotpmem""#),
+            "successful pmem DELETE must remove the configuration projection: {removed_config}"
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/pmem/hotpmem", &second_body),
+            "paused runtime PUT /pmem/hotpmem reused backing",
+        );
+        let reused_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&reused_config, "GET /vm/config after pmem reuse");
+        assert_response_contains(
+            &reused_config,
+            path_text(&second_backing_path),
+            "GET /vm/config after pmem reuse",
+        );
+        write_block_marker_at(
+            &control_backing_path,
+            bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+            PMEM_HOTPLUG_CONTINUE_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume after runtime pmem reuse",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            PMEM_HOTPLUG_SUCCESS_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "reused runtime pmem did not preserve its PCI slot and guest range: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_eq!(
+            file_bytes_at(
+                &second_backing_path,
+                PMEM_GUEST_FLUSH_OFFSET,
+                PMEM_HOTPLUG_GUEST_TWO_MARKER.len(),
+            ),
+            PMEM_HOTPLUG_GUEST_TWO_MARKER,
+            "reused runtime pmem flush should persist before final removal"
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/pmem/hotpmem"),
+            "final DELETE /pmem/hotpmem",
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang runtime pmem hotplug product PCI",
         );
     }
 

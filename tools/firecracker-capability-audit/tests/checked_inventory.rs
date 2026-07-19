@@ -102,6 +102,11 @@ fn machine_lifecycle_closure_policy_is_stable() {
         "api-operation:PUT /drives/{drive_id}",
         "non-swagger-route:DELETE /drives/{drive_id}",
     ];
+    const RUNTIME_PMEM_HOTPLUG: [&str; 3] = [
+        "api-operation:PUT /pmem/{id}",
+        "api-path:/pmem/{id}",
+        "non-swagger-route:DELETE /pmem/{id}",
+    ];
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -150,8 +155,8 @@ fn machine_lifecycle_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 73);
-    assert_eq!(count(Disposition::AuditRequired), 325);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 76);
+    assert_eq!(count(Disposition::AuditRequired), 322);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -215,6 +220,17 @@ fn machine_lifecycle_closure_policy_is_stable() {
                 .disposition,
             Disposition::ImplementedAndVerified,
             "runtime block hotplug record must remain implemented: {id}"
+        );
+    }
+
+    for id in RUNTIME_PMEM_HOTPLUG {
+        assert_eq!(
+            by_id
+                .get(id)
+                .expect("runtime pmem hotplug record must exist")
+                .disposition,
+            Disposition::ImplementedAndVerified,
+            "runtime pmem hotplug record must remain implemented: {id}"
         );
     }
 
