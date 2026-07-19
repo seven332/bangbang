@@ -3,11 +3,14 @@
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use bangbang_hvf::{HvfBackend, HvfMemoryPermissions};
+use bangbang_runtime::VmBackend;
+use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryBacking, aarch64};
 use bangbang_session::{GrantAccess, GrantId, ResourceRole};
 
 use crate::contained_session::{ContainedSession, ContainedSessionError};
@@ -145,6 +148,10 @@ pub(crate) fn run(
         .and_then(|mut file| file.write_all(expected_write.as_bytes()))
         .map_err(|_| ContainedSessionError)?;
 
+    if probe.verifies_shared_memory() {
+        verify_shared_guest_memory_in_containment()?;
+    }
+
     if probe.hold {
         println!("{READY_LINE}");
         std::io::stdout()
@@ -159,6 +166,77 @@ pub(crate) fn run(
         }
     }
     Ok(())
+}
+
+fn verify_shared_guest_memory_in_containment() -> Result<(), ContainedSessionError> {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = u64::try_from(page_size).map_err(|_| ContainedSessionError)?;
+    let layout = aarch64::dram_layout(page_size).map_err(|_| ContainedSessionError)?;
+    let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+        .map_err(|_| ContainedSessionError)?;
+    let guest_start = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let export = memory
+        .regions()
+        .first()
+        .ok_or(ContainedSessionError)?
+        .try_clone_shared_backing()
+        .map_err(|_| ContainedSessionError)?
+        .ok_or(ContainedSessionError)?;
+
+    let from_memory = [0x11_u8, 0x22, 0x33, 0x44];
+    memory
+        .write_slice(&from_memory, guest_start)
+        .map_err(|_| ContainedSessionError)?;
+    let mut descriptor_read = [0_u8; 4];
+    // SAFETY: the exported descriptor and output buffer remain live for this
+    // exact synchronous read from the validated region offset.
+    let read = unsafe {
+        libc::pread(
+            export.as_fd().as_raw_fd(),
+            descriptor_read.as_mut_ptr().cast(),
+            descriptor_read.len(),
+            0,
+        )
+    };
+    if usize::try_from(read).ok() != Some(descriptor_read.len()) || descriptor_read != from_memory {
+        return Err(ContainedSessionError);
+    }
+
+    let from_descriptor = [0xaa_u8, 0xbb, 0xcc, 0xdd];
+    // SAFETY: the exported descriptor and input bytes remain live for this
+    // exact synchronous write within the validated shared object.
+    let written = unsafe {
+        libc::pwrite(
+            export.as_fd().as_raw_fd(),
+            from_descriptor.as_ptr().cast(),
+            from_descriptor.len(),
+            8,
+        )
+    };
+    if usize::try_from(written).ok() != Some(from_descriptor.len()) {
+        return Err(ContainedSessionError);
+    }
+    let mut memory_read = [0_u8; 4];
+    memory
+        .read_slice(
+            &mut memory_read,
+            guest_start.checked_add(8).ok_or(ContainedSessionError)?,
+        )
+        .map_err(|_| ContainedSessionError)?;
+    if memory_read != from_descriptor {
+        return Err(ContainedSessionError);
+    }
+
+    let mut backend = HvfBackend::new();
+    backend.create_vm().map_err(|_| ContainedSessionError)?;
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .map_err(|_| ContainedSessionError)?;
+    backend
+        .unmap_guest_memory()
+        .map_err(|_| ContainedSessionError)?;
+    backend.destroy_vm().map_err(|_| ContainedSessionError)
 }
 
 fn verify_no_file_enforcement(source: RawFd, limit: u64) -> Result<(), ContainedSessionError> {
@@ -287,6 +365,12 @@ impl ProbeCase {
                 expected_no_file: 1024,
                 expected_file_size: Some(4096),
             }),
+            Some("shared-memory") => Ok(Self {
+                name: "shared-memory",
+                hold: false,
+                expected_no_file: 2048,
+                expected_file_size: None,
+            }),
             _ => Err(ContainedSessionError),
         }
     }
@@ -297,6 +381,10 @@ impl ProbeCase {
 
     fn exhausts_file_size(self) -> bool {
         self.name == "policy-fsize-exhaustion"
+    }
+
+    fn verifies_shared_memory(self) -> bool {
+        self.name == "shared-memory"
     }
 }
 

@@ -192,6 +192,18 @@ not classified as impossible. The complete sources, local probe result,
 alternatives, tests, and Challenge references are in the checked
 [machine-memory contract](../compat/firecracker/v1.16.0/machine-memory-contract.md).
 
+The internal descriptor-backed guest-memory profile is opt-in and the public
+default remains private anonymous memory. Shared regions use exact-sized `0600`
+files with unpredictable names, unlink the name before mapping/publication,
+retain one close-on-exec descriptor per region, and reserve all descriptors
+before any mapping. `RLIMIT_FSIZE` and `RLIMIT_NOFILE` failures are typed and
+value-bounded. Exports clone only descriptor/offset/length metadata and redact
+the descriptor number, host address, and transient name. Darwin has no Linux
+`memfd` seal parity: any future external process that receives such a writable
+descriptor is therefore an operator-trusted capability and availability
+boundary. The current foundation sends no descriptor outside the VMM and keeps
+public vhost-user sockets rejected.
+
 ## Isolation Compatibility Checklist
 
 Use this checklist when reviewing Firecracker-facing host isolation changes:
@@ -912,9 +924,11 @@ is resource-specific:
   wakeups with per-session state so one VM cannot wake or share limiter state
   with another VM. Configured vhost-user sockets remain rejected. A future
   vhost-user frontend would grant an external backend access to guest-memory
-  mappings and queue notifications, so it needs separate shared-memory
-  authorization, backend containment, lifecycle, cleanup, and failure policy
-  rather than only accepting a socket path.
+  mappings and queue notifications. The runtime now has an unlinked
+  descriptor-backed shared-RAM owner and exact export metadata, but public
+  activation still needs separate socket authorization, backend trust and
+  containment, protocol lifecycle, cleanup, and failure policy rather than
+  only accepting a socket path.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. In contained mode an exact pmem grant tag is claimed during
@@ -1807,8 +1821,9 @@ generic no-ops.
 The current virtio-mem device treats every guest request as untrusted dynamic
 memory ownership input. It validates block alignment, count, overflow, usable
 range, requested-size capacity, and prior block state before invoking the HVF
-owner. Plug work creates exact anonymous guest-memory regions and maps them into
-the active VM; unplug work can split or combine block-owned ranges while
+owner. Plug work creates exact guest-memory regions in the VM's selected
+anonymous or shared profile and maps them into the active VM; unplug work can
+split or combine block-owned ranges while
 removing only complete owned mappings. Device block state and `plugged_size`
 commit only after backend mutation and guest-visible response publication both
 succeed. If a later subrange or used-ring publication fails, already-applied

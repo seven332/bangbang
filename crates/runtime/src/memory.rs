@@ -1,7 +1,12 @@
-use std::collections::TryReserveError;
+use std::collections::{TryReserveError, VecDeque};
 use std::ffi::c_void;
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 
@@ -172,6 +177,8 @@ pub enum GuestMemoryDiscardFailureKind {
     ZeroAdvice,
     /// Marking a successfully zeroed interior as free failed.
     FreeAdvice,
+    /// Zeroing and deallocating a descriptor-backed shared range failed.
+    SharedReclaim,
 }
 
 /// Redacted failure counts from one guest-memory discard attempt.
@@ -183,6 +190,7 @@ pub struct GuestMemoryDiscardFailures {
     host_address: u64,
     zero_advice: u64,
     free_advice: u64,
+    shared_reclaim: u64,
 }
 
 impl GuestMemoryDiscardFailures {
@@ -195,6 +203,7 @@ impl GuestMemoryDiscardFailures {
             GuestMemoryDiscardFailureKind::HostAddress => self.host_address,
             GuestMemoryDiscardFailureKind::ZeroAdvice => self.zero_advice,
             GuestMemoryDiscardFailureKind::FreeAdvice => self.free_advice,
+            GuestMemoryDiscardFailureKind::SharedReclaim => self.shared_reclaim,
         }
     }
 
@@ -206,6 +215,7 @@ impl GuestMemoryDiscardFailures {
             .saturating_add(self.host_address)
             .saturating_add(self.zero_advice)
             .saturating_add(self.free_advice)
+            .saturating_add(self.shared_reclaim)
     }
 
     const fn with_failure(mut self, kind: GuestMemoryDiscardFailureKind) -> Self {
@@ -228,6 +238,9 @@ impl GuestMemoryDiscardFailures {
             GuestMemoryDiscardFailureKind::FreeAdvice => {
                 self.free_advice = self.free_advice.saturating_add(1);
             }
+            GuestMemoryDiscardFailureKind::SharedReclaim => {
+                self.shared_reclaim = self.shared_reclaim.saturating_add(1);
+            }
         }
         self
     }
@@ -237,13 +250,14 @@ impl fmt::Display for GuestMemoryDiscardFailures {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "guest memory discard failures: range_validation={}, unsupported_target={}, invalid_host_page_size={}, host_address={}, zero_advice={}, free_advice={}",
+            "guest memory discard failures: range_validation={}, unsupported_target={}, invalid_host_page_size={}, host_address={}, zero_advice={}, free_advice={}, shared_reclaim={}",
             self.range_validation,
             self.unsupported_target,
             self.invalid_host_page_size,
             self.host_address,
             self.zero_advice,
-            self.free_advice
+            self.free_advice,
+            self.shared_reclaim
         )
     }
 }
@@ -272,6 +286,7 @@ impl GuestMemoryDiscardOutcome {
                 host_address: 0,
                 zero_advice: 0,
                 free_advice: 0,
+                shared_reclaim: 0,
             },
         }
     }
@@ -281,7 +296,7 @@ impl GuestMemoryDiscardOutcome {
         self.requested_bytes
     }
 
-    /// Returns bytes whose aligned host interiors completed zero and free advice.
+    /// Returns bytes whose aligned host interiors completed zero-safe reclaim.
     pub const fn advised_bytes(self) -> u64 {
         self.advised_bytes
     }
@@ -291,7 +306,7 @@ impl GuestMemoryDiscardOutcome {
         self.skipped_bytes
     }
 
-    /// Returns bytes that could not complete the zero-and-free sequence.
+    /// Returns bytes that could not complete the selected reclaim operation.
     pub const fn failed_bytes(self) -> u64 {
         self.failed_bytes
     }
@@ -332,21 +347,61 @@ pub(crate) trait GuestMemoryDiscardAdviser {
     fn zero(&mut self, address: NonNull<c_void>, size: usize) -> io::Result<()>;
 
     fn free(&mut self, address: NonNull<c_void>, size: usize) -> io::Result<()>;
+
+    fn reclaim(
+        &mut self,
+        mapping: &GuestMemoryMapping,
+        offset: usize,
+        address: NonNull<c_void>,
+        size: usize,
+    ) -> Result<(), GuestMemoryDiscardFailureKind> {
+        let _ = (mapping, offset);
+        self.zero(address, size)
+            .map_err(|_| GuestMemoryDiscardFailureKind::ZeroAdvice)?;
+        self.free(address, size)
+            .map_err(|_| GuestMemoryDiscardFailureKind::FreeAdvice)
+    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct SystemGuestMemoryDiscardAdviser;
 
+/// Selects how process-owned guest memory is backed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GuestMemoryBacking {
+    /// Private anonymous mappings retained entirely by this process.
+    #[default]
+    Anonymous,
+    /// Shared mappings backed by unlinked, owner-only file descriptors.
+    Shared,
+}
+
 #[derive(Debug)]
 pub struct GuestMemory {
     regions: Vec<GuestMemoryRegion>,
     dirty_tracker: Option<Arc<GuestMemoryDirtyTracker>>,
+    backing: GuestMemoryBacking,
 }
 
 impl GuestMemory {
     pub fn allocate(layout: &GuestMemoryLayout) -> Result<Self, GuestMemoryAllocationError> {
+        Self::allocate_with_backing(layout, GuestMemoryBacking::Anonymous)
+    }
+
+    /// Allocate every region using one explicit backing profile.
+    pub fn allocate_with_backing(
+        layout: &GuestMemoryLayout,
+        backing: GuestMemoryBacking,
+    ) -> Result<Self, GuestMemoryAllocationError> {
         let page_size = host_page_size()?;
-        let mut mapper = SystemAnonymousMapper;
+        validate_allocation_ranges(layout, page_size)?;
+        let mut mapper = match backing {
+            GuestMemoryBacking::Anonymous => SystemGuestMemoryMapper::anonymous(),
+            GuestMemoryBacking::Shared => {
+                preflight_shared_memory_resources(layout.ranges().len(), layout.ranges())?;
+                SystemGuestMemoryMapper::shared(prepare_shared_memory_files(layout.ranges())?)
+            }
+        };
 
         Self::allocate_with_mapper(layout, page_size, &mut mapper)
     }
@@ -354,8 +409,9 @@ impl GuestMemory {
     fn allocate_with_mapper(
         layout: &GuestMemoryLayout,
         page_size: u64,
-        mapper: &mut impl AnonymousMapper,
+        mapper: &mut impl GuestMemoryMapper,
     ) -> Result<Self, GuestMemoryAllocationError> {
+        let backing = mapper.backing();
         validate_allocation_ranges(layout, page_size)?;
         let mut regions = Vec::new();
         regions
@@ -375,7 +431,13 @@ impl GuestMemory {
         Ok(Self {
             regions,
             dirty_tracker: None,
+            backing,
         })
+    }
+
+    /// Return the backing profile inherited by dynamically inserted regions.
+    pub const fn backing(&self) -> GuestMemoryBacking {
+        self.backing
     }
 
     /// Install one shared dirty-page generation over every current region.
@@ -413,7 +475,16 @@ impl GuestMemory {
         range: GuestMemoryRange,
     ) -> Result<(), GuestMemoryAllocationError> {
         let page_size = host_page_size()?;
-        let mut mapper = SystemAnonymousMapper;
+        self.validate_insert_region(range, page_size)?;
+        let mut mapper = match self.backing {
+            GuestMemoryBacking::Anonymous => SystemGuestMemoryMapper::anonymous(),
+            GuestMemoryBacking::Shared => {
+                preflight_shared_memory_resources(1, std::slice::from_ref(&range))?;
+                SystemGuestMemoryMapper::shared(prepare_shared_memory_files(std::slice::from_ref(
+                    &range,
+                ))?)
+            }
+        };
 
         self.insert_region_with_mapper(range, page_size, &mut mapper)
     }
@@ -422,7 +493,7 @@ impl GuestMemory {
         &mut self,
         range: GuestMemoryRange,
         page_size: u64,
-        mapper: &mut impl AnonymousMapper,
+        mapper: &mut impl GuestMemoryMapper,
     ) -> Result<(), GuestMemoryAllocationError> {
         let insert_index = self.validate_insert_region(range, page_size)?;
         self.regions.try_reserve_exact(1).map_err(|source| {
@@ -501,7 +572,7 @@ impl GuestMemory {
     /// Makes the host-page-aligned interior of one mapped guest range zero-safe
     /// and reclaimable when the current target supports that operation.
     ///
-    /// The complete guest range is validated before host advice. Partial host
+    /// The complete guest range is validated before host reclaim. Partial host
     /// pages at each owned mapping edge are skipped, and failures are reported
     /// without exposing host addresses or changing guest-memory ownership.
     pub fn discard_range(&self, range: GuestMemoryRange) -> GuestMemoryDiscardOutcome {
@@ -607,12 +678,11 @@ impl GuestMemory {
                     continue;
                 }
             }
-            if adviser.zero(advice_address, advice_size).is_err() {
-                outcome.record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::ZeroAdvice);
-                continue;
-            }
-            if adviser.free(advice_address, advice_size).is_err() {
-                outcome.record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::FreeAdvice);
+            let mapping_offset = advice_start_address - mapping_start.addr();
+            if let Err(kind) =
+                adviser.reclaim(&region.mapping, mapping_offset, advice_address, advice_size)
+            {
+                outcome.record_failed(advice_size_u64, kind);
                 continue;
             }
 
@@ -746,7 +816,7 @@ impl GuestMemory {
 
 pub struct GuestMemoryRegion {
     range: GuestMemoryRange,
-    mapping: AnonymousMapping,
+    mapping: GuestMemoryMapping,
 }
 
 impl GuestMemoryRegion {
@@ -761,6 +831,21 @@ impl GuestMemoryRegion {
     pub const fn host_size(&self) -> usize {
         self.mapping.size()
     }
+
+    /// Return the backing profile for this region.
+    pub const fn backing(&self) -> GuestMemoryBacking {
+        self.mapping.backing()
+    }
+
+    /// Clone the descriptor-backed export metadata for a shared region.
+    ///
+    /// Anonymous regions return `Ok(None)`. The cloned descriptor owns the
+    /// same unlinked object and is independent of the mapping owner's handle.
+    pub fn try_clone_shared_backing(
+        &self,
+    ) -> Result<Option<GuestMemorySharedBacking>, GuestMemorySharedBackingError> {
+        self.mapping.try_clone_shared_backing()
+    }
 }
 
 impl fmt::Debug for GuestMemoryRegion {
@@ -769,6 +854,91 @@ impl fmt::Debug for GuestMemoryRegion {
             .field("range", &self.range)
             .field("host_size", &self.mapping.size())
             .finish_non_exhaustive()
+    }
+}
+
+/// An owned descriptor export for one shared guest-memory region.
+pub struct GuestMemorySharedBacking {
+    file: File,
+    offset: u64,
+    len: u64,
+}
+
+impl GuestMemorySharedBacking {
+    /// Return the byte offset at which this region starts in the descriptor.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Return the exact byte length of this region.
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Return whether this export describes an empty region.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl AsFd for GuestMemorySharedBacking {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
+impl fmt::Debug for GuestMemorySharedBacking {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GuestMemorySharedBacking")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub enum GuestMemorySharedBackingError {
+    DuplicateDescriptor { source: io::Error },
+    InspectDescriptor { source: io::Error },
+    UnexpectedLength { expected: u64, actual: u64 },
+    LengthTooLarge { size: usize },
+}
+
+impl fmt::Display for GuestMemorySharedBackingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateDescriptor { source } => {
+                write!(
+                    f,
+                    "failed to duplicate shared guest-memory descriptor: {source}"
+                )
+            }
+            Self::InspectDescriptor { source } => {
+                write!(
+                    f,
+                    "failed to inspect shared guest-memory descriptor: {source}"
+                )
+            }
+            Self::UnexpectedLength { expected, actual } => write!(
+                f,
+                "shared guest-memory descriptor length changed: expected {expected} bytes, found {actual} bytes"
+            ),
+            Self::LengthTooLarge { size } => write!(
+                f,
+                "shared guest-memory descriptor length {size} bytes cannot be represented"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GuestMemorySharedBackingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DuplicateDescriptor { source } | Self::InspectDescriptor { source } => {
+                Some(source)
+            }
+            Self::UnexpectedLength { .. } | Self::LengthTooLarge { .. } => None,
+        }
     }
 }
 
@@ -792,6 +962,57 @@ pub enum GuestMemoryAllocationError {
     AnonymousMmapReturnedNull {
         size: usize,
     },
+    SharedResourceLimitQueryFailed {
+        resource: GuestMemorySharedResource,
+        source: io::Error,
+    },
+    SharedFileSizeLimitExceeded {
+        size: u64,
+    },
+    SharedFileDescriptorLimitExceeded {
+        regions: usize,
+    },
+    SharedNameGenerationFailed {
+        source: getrandom::Error,
+    },
+    SharedBackingCreateFailed {
+        source: io::Error,
+    },
+    SharedBackingUnlinkFailed {
+        source: io::Error,
+    },
+    SharedBackingResizeFailed {
+        size: u64,
+        source: io::Error,
+    },
+    SharedBackingSizeTooLarge {
+        size: usize,
+    },
+    SharedBackingReservationMissing {
+        size: usize,
+    },
+    SharedMmapFailed {
+        size: usize,
+        source: io::Error,
+    },
+    SharedMmapReturnedNull {
+        size: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestMemorySharedResource {
+    FileSize,
+    FileDescriptors,
+}
+
+impl fmt::Display for GuestMemorySharedResource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FileSize => f.write_str("file-size limit"),
+            Self::FileDescriptors => f.write_str("file-descriptor limit"),
+        }
+    }
 }
 
 impl fmt::Display for GuestMemoryAllocationError {
@@ -828,6 +1049,55 @@ impl fmt::Display for GuestMemoryAllocationError {
                     "anonymous guest memory mapping of {size} bytes returned a null address"
                 )
             }
+            Self::SharedResourceLimitQueryFailed { resource, source } => {
+                write!(
+                    f,
+                    "failed to query shared guest-memory {resource}: {source}"
+                )
+            }
+            Self::SharedFileSizeLimitExceeded { size } => write!(
+                f,
+                "shared guest memory region of {size} bytes exceeds the process file-size limit"
+            ),
+            Self::SharedFileDescriptorLimitExceeded { regions } => write!(
+                f,
+                "shared guest memory could not reserve {regions} retained descriptors within the process file-descriptor limit"
+            ),
+            Self::SharedNameGenerationFailed { source } => {
+                write!(
+                    f,
+                    "failed to generate a private shared-memory name: {source}"
+                )
+            }
+            Self::SharedBackingCreateFailed { source } => {
+                write!(
+                    f,
+                    "failed to create an owner-only shared-memory object: {source}"
+                )
+            }
+            Self::SharedBackingUnlinkFailed { source } => {
+                write!(f, "failed to unlink a shared-memory object: {source}")
+            }
+            Self::SharedBackingResizeFailed { size, source } => write!(
+                f,
+                "failed to size a shared-memory object to {size} bytes: {source}"
+            ),
+            Self::SharedBackingSizeTooLarge { size } => write!(
+                f,
+                "shared guest-memory backing size {size} bytes cannot be represented"
+            ),
+            Self::SharedBackingReservationMissing { size } => write!(
+                f,
+                "shared guest-memory backing reservation is missing for {size} bytes"
+            ),
+            Self::SharedMmapFailed { size, source } => write!(
+                f,
+                "failed to map {size} bytes of descriptor-backed shared guest memory: {source}"
+            ),
+            Self::SharedMmapReturnedNull { size } => write!(
+                f,
+                "descriptor-backed shared guest memory mapping of {size} bytes returned a null address"
+            ),
         }
     }
 }
@@ -839,9 +1109,20 @@ impl std::error::Error for GuestMemoryAllocationError {
             Self::RegionMetadataAllocationFailed { source } => Some(source),
             Self::DirtyTrackingMetadata { source } => Some(source),
             Self::AnonymousMmapFailed { source, .. } => Some(source),
+            Self::SharedResourceLimitQueryFailed { source, .. }
+            | Self::SharedBackingCreateFailed { source }
+            | Self::SharedBackingUnlinkFailed { source }
+            | Self::SharedBackingResizeFailed { source, .. }
+            | Self::SharedMmapFailed { source, .. } => Some(source),
+            Self::SharedNameGenerationFailed { .. } => None,
             Self::InvalidHostPageSize
             | Self::SizeTooLarge { .. }
-            | Self::AnonymousMmapReturnedNull { .. } => None,
+            | Self::AnonymousMmapReturnedNull { .. }
+            | Self::SharedFileSizeLimitExceeded { .. }
+            | Self::SharedFileDescriptorLimitExceeded { .. }
+            | Self::SharedBackingSizeTooLarge { .. }
+            | Self::SharedBackingReservationMissing { .. }
+            | Self::SharedMmapReturnedNull { .. } => None,
         }
     }
 }
@@ -1244,7 +1525,7 @@ fn allocation_host_size(range: GuestMemoryRange) -> Result<usize, GuestMemoryAll
 fn allocate_region_with_mapper(
     range: GuestMemoryRange,
     page_size: u64,
-    mapper: &mut impl AnonymousMapper,
+    mapper: &mut impl GuestMemoryMapper,
 ) -> Result<GuestMemoryRegion, GuestMemoryAllocationError> {
     let host_size = validate_allocation_range(range, page_size)?;
 
@@ -1293,6 +1574,234 @@ fn validate_host_page_size(page_size: u64) -> Result<(), GuestMemoryAllocationEr
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SharedMemoryResourceLimits {
+    file_size: libc::rlim_t,
+    file_descriptors: libc::rlim_t,
+}
+
+fn preflight_shared_memory_resources(
+    region_count: usize,
+    ranges: &[GuestMemoryRange],
+) -> Result<(), GuestMemoryAllocationError> {
+    let limits = query_shared_memory_resource_limits()?;
+    preflight_shared_memory_resources_with_limits(region_count, ranges, limits)
+}
+
+fn preflight_shared_memory_resources_with_limits(
+    region_count: usize,
+    ranges: &[GuestMemoryRange],
+    limits: SharedMemoryResourceLimits,
+) -> Result<(), GuestMemoryAllocationError> {
+    let largest_region = ranges.iter().map(|range| range.size()).max().unwrap_or(0);
+    if limits.file_size != libc::RLIM_INFINITY && largest_region > limits.file_size {
+        return Err(GuestMemoryAllocationError::SharedFileSizeLimitExceeded {
+            size: largest_region,
+        });
+    }
+
+    let retained_descriptors = u64::try_from(region_count).unwrap_or(u64::MAX);
+    if limits.file_descriptors != libc::RLIM_INFINITY
+        && retained_descriptors > limits.file_descriptors
+    {
+        return Err(
+            GuestMemoryAllocationError::SharedFileDescriptorLimitExceeded {
+                regions: region_count,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn query_shared_memory_resource_limits()
+-> Result<SharedMemoryResourceLimits, GuestMemoryAllocationError> {
+    let mut file_size = MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `file_size` points to writable storage for one `rlimit`, and the
+    // resource selector has no additional pointer or lifetime requirements.
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, file_size.as_mut_ptr()) };
+    if result != 0 {
+        return Err(GuestMemoryAllocationError::SharedResourceLimitQueryFailed {
+            resource: GuestMemorySharedResource::FileSize,
+            source: io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful `getrlimit` initialized the complete structure.
+    let file_size = unsafe { file_size.assume_init() }.rlim_cur;
+
+    let mut file_descriptors = MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: as above, this points to valid writable storage for one result.
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, file_descriptors.as_mut_ptr()) };
+    if result != 0 {
+        return Err(GuestMemoryAllocationError::SharedResourceLimitQueryFailed {
+            resource: GuestMemorySharedResource::FileDescriptors,
+            source: io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful `getrlimit` initialized the complete structure.
+    let file_descriptors = unsafe { file_descriptors.assume_init() }.rlim_cur;
+
+    Ok(SharedMemoryResourceLimits {
+        file_size,
+        file_descriptors,
+    })
+}
+
+const SHARED_MEMORY_NAME_ATTEMPTS: usize = 16;
+
+fn create_shared_memory_file(size: usize) -> Result<File, GuestMemoryAllocationError> {
+    let size = u64::try_from(size)
+        .map_err(|_| GuestMemoryAllocationError::SharedBackingSizeTooLarge { size })?;
+    let mut directories = Vec::with_capacity(2);
+    if let Ok(current_directory) = std::env::current_dir() {
+        directories.push(current_directory);
+    }
+    let temporary_directory = std::env::temp_dir();
+    if !directories.contains(&temporary_directory) {
+        directories.push(temporary_directory);
+    }
+
+    let mut last_create_error = None;
+    for directory in directories {
+        match create_unlinked_shared_memory_file(&directory) {
+            Ok(file) => {
+                file.set_len(size).map_err(|source| {
+                    GuestMemoryAllocationError::SharedBackingResizeFailed { size, source }
+                })?;
+                return Ok(file);
+            }
+            Err(SharedMemoryFileCreationError::Random(source)) => {
+                return Err(GuestMemoryAllocationError::SharedNameGenerationFailed { source });
+            }
+            Err(SharedMemoryFileCreationError::Unlink(source)) => {
+                return Err(GuestMemoryAllocationError::SharedBackingUnlinkFailed { source });
+            }
+            Err(SharedMemoryFileCreationError::Create(source))
+                if source.raw_os_error() == Some(libc::EMFILE) =>
+            {
+                return Err(GuestMemoryAllocationError::SharedBackingCreateFailed { source });
+            }
+            Err(SharedMemoryFileCreationError::Create(source)) => {
+                last_create_error = Some(source);
+            }
+        }
+    }
+
+    Err(GuestMemoryAllocationError::SharedBackingCreateFailed {
+        source: last_create_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no shared-memory creation directory is available",
+            )
+        }),
+    })
+}
+
+fn prepare_shared_memory_files(
+    ranges: &[GuestMemoryRange],
+) -> Result<VecDeque<File>, GuestMemoryAllocationError> {
+    let mut files = VecDeque::new();
+    files
+        .try_reserve_exact(ranges.len())
+        .map_err(|source| GuestMemoryAllocationError::RegionMetadataAllocationFailed { source })?;
+    for range in ranges {
+        let size = allocation_host_size(*range)?;
+        match create_shared_memory_file(size) {
+            Ok(file) => files.push_back(file),
+            Err(GuestMemoryAllocationError::SharedBackingCreateFailed { source })
+                if source.raw_os_error() == Some(libc::EMFILE) =>
+            {
+                return Err(
+                    GuestMemoryAllocationError::SharedFileDescriptorLimitExceeded {
+                        regions: ranges.len(),
+                    },
+                );
+            }
+            Err(source) => return Err(source),
+        }
+    }
+    Ok(files)
+}
+
+#[derive(Debug)]
+enum SharedMemoryFileCreationError {
+    Random(getrandom::Error),
+    Create(io::Error),
+    Unlink(io::Error),
+}
+
+fn create_unlinked_shared_memory_file(
+    directory: &Path,
+) -> Result<File, SharedMemoryFileCreationError> {
+    let mut last_collision = None;
+    for _ in 0..SHARED_MEMORY_NAME_ATTEMPTS {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(SharedMemoryFileCreationError::Random)?;
+        let name = format!(".bangbang-memory-{:032x}", u128::from_le_bytes(random));
+        let path = directory.join(name);
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                last_collision = Some(source);
+                continue;
+            }
+            Err(source) => return Err(SharedMemoryFileCreationError::Create(source)),
+        };
+
+        return LinkedSharedMemoryFile::new(path, file).unlink();
+    }
+
+    Err(SharedMemoryFileCreationError::Create(
+        last_collision.unwrap_or_else(|| io::Error::other("shared-memory name attempts exhausted")),
+    ))
+}
+
+#[derive(Debug)]
+struct LinkedSharedMemoryFile {
+    path: Option<PathBuf>,
+    file: Option<File>,
+}
+
+impl LinkedSharedMemoryFile {
+    fn new(path: PathBuf, file: File) -> Self {
+        Self {
+            path: Some(path),
+            file: Some(file),
+        }
+    }
+
+    fn unlink(mut self) -> Result<File, SharedMemoryFileCreationError> {
+        let Some(path) = self.path.as_ref() else {
+            return Err(SharedMemoryFileCreationError::Unlink(io::Error::other(
+                "shared-memory path ownership is missing",
+            )));
+        };
+        fs::remove_file(path).map_err(SharedMemoryFileCreationError::Unlink)?;
+        self.path = None;
+        self.file.take().ok_or_else(|| {
+            SharedMemoryFileCreationError::Create(io::Error::other(
+                "shared-memory descriptor ownership is missing",
+            ))
+        })
+    }
+}
+
+impl Drop for LinkedSharedMemoryFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+        self.file.take();
+    }
+}
+
 impl GuestMemoryDiscardAdviser for SystemGuestMemoryDiscardAdviser {
     fn host_page_size(&mut self) -> Result<u64, GuestMemoryDiscardFailureKind> {
         #[cfg(target_os = "macos")]
@@ -1337,6 +1846,62 @@ impl GuestMemoryDiscardAdviser for SystemGuestMemoryDiscardAdviser {
             ))
         }
     }
+
+    fn reclaim(
+        &mut self,
+        mapping: &GuestMemoryMapping,
+        offset: usize,
+        address: NonNull<c_void>,
+        size: usize,
+    ) -> Result<(), GuestMemoryDiscardFailureKind> {
+        if let Some(file) = mapping.shared_file() {
+            #[cfg(target_os = "macos")]
+            {
+                return punch_shared_memory_hole(file, offset, size)
+                    .map_err(|_| GuestMemoryDiscardFailureKind::SharedReclaim);
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (file, offset, address, size);
+                return Err(GuestMemoryDiscardFailureKind::UnsupportedTarget);
+            }
+        }
+
+        self.zero(address, size)
+            .map_err(|_| GuestMemoryDiscardFailureKind::ZeroAdvice)?;
+        self.free(address, size)
+            .map_err(|_| GuestMemoryDiscardFailureKind::FreeAdvice)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn punch_shared_memory_hole(file: &File, offset: usize, size: usize) -> io::Result<()> {
+    let offset = libc::off_t::try_from(offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset is too large"))?;
+    let size = libc::off_t::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "size is too large"))?;
+    let mut request = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset,
+        fp_length: size,
+    };
+
+    // SAFETY: the descriptor and request pointer remain live for the complete
+    // variadic call, and the requested range was validated within the file.
+    let result = unsafe {
+        libc::fcntl(
+            file.as_fd().as_raw_fd(),
+            libc::F_PUNCHHOLE,
+            ptr::from_mut(&mut request),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1364,37 +1929,73 @@ fn checked_madvise_result(result: libc::c_int) -> io::Result<()> {
     }
 }
 
-trait AnonymousMapper {
-    fn map(&mut self, size: usize) -> Result<AnonymousMapping, GuestMemoryAllocationError>;
-}
+trait GuestMemoryMapper {
+    fn map(&mut self, size: usize) -> Result<GuestMemoryMapping, GuestMemoryAllocationError>;
 
-#[derive(Debug)]
-struct SystemAnonymousMapper;
-
-impl AnonymousMapper for SystemAnonymousMapper {
-    fn map(&mut self, size: usize) -> Result<AnonymousMapping, GuestMemoryAllocationError> {
-        AnonymousMapping::map(size)
+    fn backing(&self) -> GuestMemoryBacking {
+        GuestMemoryBacking::Anonymous
     }
 }
 
-struct AnonymousMapping {
-    address: NonNull<c_void>,
-    size: usize,
-    kind: AnonymousMappingKind,
+#[derive(Debug)]
+struct SystemGuestMemoryMapper {
+    backing: GuestMemoryBacking,
+    shared_files: VecDeque<File>,
 }
 
-// SAFETY: `AnonymousMapping` owns a process-local mmap region. Moving ownership
+impl SystemGuestMemoryMapper {
+    fn anonymous() -> Self {
+        Self {
+            backing: GuestMemoryBacking::Anonymous,
+            shared_files: VecDeque::new(),
+        }
+    }
+
+    fn shared(shared_files: VecDeque<File>) -> Self {
+        Self {
+            backing: GuestMemoryBacking::Shared,
+            shared_files,
+        }
+    }
+}
+
+impl GuestMemoryMapper for SystemGuestMemoryMapper {
+    fn map(&mut self, size: usize) -> Result<GuestMemoryMapping, GuestMemoryAllocationError> {
+        match self.backing {
+            GuestMemoryBacking::Anonymous => GuestMemoryMapping::map_anonymous(size),
+            GuestMemoryBacking::Shared => {
+                let file = self
+                    .shared_files
+                    .pop_front()
+                    .ok_or(GuestMemoryAllocationError::SharedBackingReservationMissing { size })?;
+                GuestMemoryMapping::map_shared(size, file)
+            }
+        }
+    }
+
+    fn backing(&self) -> GuestMemoryBacking {
+        self.backing
+    }
+}
+
+pub(crate) struct GuestMemoryMapping {
+    address: NonNull<c_void>,
+    size: usize,
+    kind: GuestMemoryMappingKind,
+}
+
+// SAFETY: `GuestMemoryMapping` owns a process-local mmap region. Moving ownership
 // to another thread does not invalidate the mapping, and `munmap` may run from
 // any thread when the owner is dropped.
-unsafe impl Send for AnonymousMapping {}
+unsafe impl Send for GuestMemoryMapping {}
 
 // SAFETY: Shared references expose only copyable metadata and a raw pointer.
 // Safe Rust cannot mutate the mapped bytes through this type, and unsafe users
 // must uphold the usual raw-pointer aliasing and lifetime requirements.
-unsafe impl Sync for AnonymousMapping {}
+unsafe impl Sync for GuestMemoryMapping {}
 
-impl AnonymousMapping {
-    fn map(size: usize) -> Result<Self, GuestMemoryAllocationError> {
+impl GuestMemoryMapping {
+    fn map_anonymous(size: usize) -> Result<Self, GuestMemoryAllocationError> {
         // SAFETY: The call requests a new private anonymous read/write mapping.
         // `size` was validated from a non-empty guest memory range before this
         // function is called. No aliasing Rust reference is created here.
@@ -1429,7 +2030,44 @@ impl AnonymousMapping {
         Ok(Self {
             address,
             size,
-            kind: AnonymousMappingKind::System,
+            kind: GuestMemoryMappingKind::Anonymous,
+        })
+    }
+
+    fn map_shared(size: usize, file: File) -> Result<Self, GuestMemoryAllocationError> {
+        // SAFETY: The descriptor owns an exact-sized object and remains live in
+        // the returned mapping owner. No Rust reference is created here.
+        let address = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_NORESERVE,
+                file.as_fd().as_raw_fd(),
+                0,
+            )
+        };
+
+        if address == libc::MAP_FAILED {
+            return Err(GuestMemoryAllocationError::SharedMmapFailed {
+                size,
+                source: io::Error::last_os_error(),
+            });
+        }
+
+        let Some(address) = NonNull::new(address) else {
+            // SAFETY: `mmap` reported success, so this address and size still
+            // identify a live mapping even if the address is null.
+            unsafe {
+                let _ = libc::munmap(address, size);
+            }
+            return Err(GuestMemoryAllocationError::SharedMmapReturnedNull { size });
+        };
+
+        Ok(Self {
+            address,
+            size,
+            kind: GuestMemoryMappingKind::Shared { file },
         })
     }
 
@@ -1438,7 +2076,7 @@ impl AnonymousMapping {
         Self {
             address: NonNull::<u8>::dangling().cast(),
             size,
-            kind: AnonymousMappingKind::Test { drop_count },
+            kind: GuestMemoryMappingKind::Test { drop_count },
         }
     }
 
@@ -1449,38 +2087,85 @@ impl AnonymousMapping {
     const fn size(&self) -> usize {
         self.size
     }
+
+    const fn backing(&self) -> GuestMemoryBacking {
+        match &self.kind {
+            GuestMemoryMappingKind::Anonymous => GuestMemoryBacking::Anonymous,
+            GuestMemoryMappingKind::Shared { .. } => GuestMemoryBacking::Shared,
+            #[cfg(test)]
+            GuestMemoryMappingKind::Test { .. } => GuestMemoryBacking::Anonymous,
+        }
+    }
+
+    fn shared_file(&self) -> Option<&File> {
+        match &self.kind {
+            GuestMemoryMappingKind::Shared { file } => Some(file),
+            GuestMemoryMappingKind::Anonymous => None,
+            #[cfg(test)]
+            GuestMemoryMappingKind::Test { .. } => None,
+        }
+    }
+
+    fn try_clone_shared_backing(
+        &self,
+    ) -> Result<Option<GuestMemorySharedBacking>, GuestMemorySharedBackingError> {
+        let GuestMemoryMappingKind::Shared { file } = &self.kind else {
+            return Ok(None);
+        };
+        let expected = u64::try_from(self.size)
+            .map_err(|_| GuestMemorySharedBackingError::LengthTooLarge { size: self.size })?;
+        let actual = file
+            .metadata()
+            .map_err(|source| GuestMemorySharedBackingError::InspectDescriptor { source })?
+            .len();
+        if actual != expected {
+            return Err(GuestMemorySharedBackingError::UnexpectedLength { expected, actual });
+        }
+        let file = file
+            .try_clone()
+            .map_err(|source| GuestMemorySharedBackingError::DuplicateDescriptor { source })?;
+
+        Ok(Some(GuestMemorySharedBacking {
+            file,
+            offset: 0,
+            len: expected,
+        }))
+    }
 }
 
-impl fmt::Debug for AnonymousMapping {
+impl fmt::Debug for GuestMemoryMapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AnonymousMapping")
+        f.debug_struct("GuestMemoryMapping")
             .field("size", &self.size)
-            .field("kind", &self.kind)
+            .field("backing", &self.backing())
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Debug)]
-enum AnonymousMappingKind {
-    System,
+enum GuestMemoryMappingKind {
+    Anonymous,
+    Shared {
+        file: File,
+    },
     #[cfg(test)]
     Test {
         drop_count: Arc<AtomicUsize>,
     },
 }
 
-impl Drop for AnonymousMapping {
+impl Drop for GuestMemoryMapping {
     fn drop(&mut self) {
         match &self.kind {
-            AnonymousMappingKind::System => {
-                // SAFETY: `AnonymousMapping::map` stores only successful mmap
-                // results, and each `AnonymousMapping` owns exactly one mapping.
+            GuestMemoryMappingKind::Anonymous | GuestMemoryMappingKind::Shared { .. } => {
+                // SAFETY: the constructors store only successful mmap results,
+                // and each `GuestMemoryMapping` owns exactly one mapping.
                 unsafe {
                     let _ = libc::munmap(self.address.as_ptr(), self.size);
                 }
             }
             #[cfg(test)]
-            AnonymousMappingKind::Test { drop_count } => {
+            GuestMemoryMappingKind::Test { drop_count } => {
                 drop_count.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1492,16 +2177,20 @@ mod tests {
     use std::collections::HashSet;
     use std::ffi::c_void;
     use std::io;
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::fs::{FileExt, MetadataExt};
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::{
-        AnonymousMapper, AnonymousMapping, AnonymousMappingKind, GuestAddress, GuestMemory,
-        GuestMemoryAccessError, GuestMemoryAllocationError, GuestMemoryDiscardAdviser,
-        GuestMemoryDiscardFailureKind, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange,
-        GuestMemoryRegion, aarch64, host_page_size,
+        GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError,
+        GuestMemoryBacking, GuestMemoryDiscardAdviser, GuestMemoryDiscardFailureKind,
+        GuestMemoryError, GuestMemoryLayout, GuestMemoryMapper, GuestMemoryMapping,
+        GuestMemoryMappingKind, GuestMemoryRange, GuestMemoryRegion, GuestMemorySharedBackingError,
+        SharedMemoryResourceLimits, aarch64, host_page_size,
+        preflight_shared_memory_resources_with_limits,
     };
 
     const PAGE_SIZE: u64 = 4096;
@@ -1923,15 +2612,16 @@ mod tests {
         let memory = GuestMemory {
             regions: vec![GuestMemoryRegion {
                 range: range(0, PAGE_SIZE),
-                mapping: AnonymousMapping {
+                mapping: GuestMemoryMapping {
                     address: host_address,
                     size: page_size,
-                    kind: AnonymousMappingKind::Test {
+                    kind: GuestMemoryMappingKind::Test {
                         drop_count: Arc::clone(&drop_count),
                     },
                 },
             }],
             dirty_tracker: None,
+            backing: super::GuestMemoryBacking::Anonymous,
         };
         let mut adviser = TestDiscardAdviser::new(PAGE_SIZE);
 
@@ -3052,6 +3742,250 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_guest_memory_remains_the_default_and_has_no_descriptor_export() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+            .expect("page-aligned layout should be valid");
+
+        let memory = GuestMemory::allocate(&layout).expect("anonymous allocation should succeed");
+        let region = memory
+            .regions()
+            .first()
+            .expect("anonymous allocation should contain one region");
+
+        assert_eq!(memory.backing(), GuestMemoryBacking::Anonymous);
+        assert_eq!(region.backing(), GuestMemoryBacking::Anonymous);
+        assert!(
+            region
+                .try_clone_shared_backing()
+                .expect("anonymous export query should succeed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shared_guest_memory_is_exact_unlinked_cloexec_and_coherent() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+            .expect("page-aligned layout should be valid");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared allocation should succeed");
+        let region = memory
+            .regions()
+            .first()
+            .expect("shared allocation should contain one region");
+        assert_eq!(region.backing(), GuestMemoryBacking::Shared);
+        let region_debug = format!("{region:?}");
+        let host_address = format!("{:p}", region.host_address());
+        let export = region
+            .try_clone_shared_backing()
+            .expect("shared descriptor should clone")
+            .expect("shared region should have an export");
+        let metadata = export
+            .file
+            .metadata()
+            .expect("shared descriptor metadata should be readable");
+
+        assert_eq!(memory.backing(), GuestMemoryBacking::Shared);
+        assert_eq!(export.offset(), 0);
+        assert_eq!(export.len(), page_size);
+        assert!(!export.is_empty());
+        assert_eq!(metadata.len(), page_size);
+        assert_eq!(metadata.nlink(), 0);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        // SAFETY: F_GETFD only inspects flags on this live borrowed descriptor.
+        let descriptor_flags = unsafe { libc::fcntl(export.as_fd().as_raw_fd(), libc::F_GETFD) };
+        assert!(descriptor_flags >= 0);
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+
+        let from_memory = [0x11, 0x22, 0x33, 0x44];
+        memory
+            .write_slice(&from_memory, GuestAddress::new(0))
+            .expect("guest-memory write should succeed");
+        let mut descriptor_read = [0_u8; 4];
+        export
+            .file
+            .read_exact_at(&mut descriptor_read, 0)
+            .expect("descriptor should observe guest-memory writes");
+        assert_eq!(descriptor_read, from_memory);
+
+        let from_descriptor = [0xaa, 0xbb, 0xcc, 0xdd];
+        export
+            .file
+            .write_all_at(&from_descriptor, 8)
+            .expect("descriptor write should succeed");
+        let mut memory_read = [0_u8; 4];
+        memory
+            .read_slice(&mut memory_read, GuestAddress::new(8))
+            .expect("guest memory should observe descriptor writes");
+        assert_eq!(memory_read, from_descriptor);
+
+        let export_debug = format!("{export:?}");
+        assert!(!export_debug.contains("File"));
+        assert!(!export_debug.contains("fd"));
+        assert!(!export_debug.contains("bangbang-memory"));
+        assert!(!region_debug.contains(&host_address));
+    }
+
+    #[test]
+    fn shared_region_export_rejects_a_changed_descriptor_length() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+            .expect("page-aligned layout should be valid");
+        let memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared allocation should succeed");
+        let region = memory
+            .regions()
+            .first()
+            .expect("shared allocation should contain one region");
+        let export = region
+            .try_clone_shared_backing()
+            .expect("initial shared descriptor should clone")
+            .expect("shared region should have an export");
+        let shortened = page_size / 2;
+        export
+            .file
+            .set_len(shortened)
+            .expect("test descriptor should be resizable");
+
+        let error = region
+            .try_clone_shared_backing()
+            .expect_err("changed descriptor length should be rejected");
+        assert!(matches!(
+            error,
+            GuestMemorySharedBackingError::UnexpectedLength { expected, actual }
+                if expected == page_size && actual == shortened
+        ));
+
+        export
+            .file
+            .set_len(page_size)
+            .expect("test descriptor length should be restored before unmapping");
+    }
+
+    #[test]
+    fn shared_guest_memory_dynamic_regions_inherit_the_backing_profile() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let first_range = range(0, page_size);
+        let second_range = range(page_size, page_size);
+        let layout =
+            GuestMemoryLayout::new(vec![first_range]).expect("page-aligned layout should be valid");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared allocation should succeed");
+
+        memory
+            .insert_region(second_range)
+            .expect("shared dynamic region should allocate");
+        assert!(memory.regions().iter().all(|region| {
+            region.backing() == GuestMemoryBacking::Shared
+                && region
+                    .try_clone_shared_backing()
+                    .expect("shared descriptor should clone")
+                    .is_some()
+        }));
+
+        let surviving_export = memory.regions()[1]
+            .try_clone_shared_backing()
+            .expect("dynamic shared descriptor should clone")
+            .expect("dynamic region should have an export");
+        memory
+            .remove_region(second_range)
+            .expect("dynamic shared region should be removable");
+        assert_eq!(memory_ranges(&memory), vec![first_range]);
+        assert_eq!(
+            surviving_export
+                .file
+                .metadata()
+                .expect("independent export should remain live")
+                .len(),
+            page_size
+        );
+    }
+
+    #[test]
+    fn shared_guest_memory_writes_participate_in_dirty_tracking() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+            .expect("page-aligned layout should be valid");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared allocation should succeed");
+        let tracker = memory
+            .enable_dirty_tracking()
+            .expect("shared dirty tracking should enable");
+
+        memory
+            .write_slice(&[0x55], GuestAddress::new(1))
+            .expect("tracked shared write should succeed");
+
+        assert_eq!(
+            tracker
+                .dirty_pages()
+                .expect("shared dirty pages should query"),
+            vec![GuestAddress::new(0)]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_guest_memory_supports_zero_safe_discard() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+            .expect("page-aligned layout should be valid");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared allocation should succeed");
+        memory
+            .write_slice(
+                &vec![0x7f; usize::try_from(page_size).expect("page size should fit")],
+                GuestAddress::new(0),
+            )
+            .expect("shared page population should succeed");
+
+        let outcome = memory.discard_range(range(0, page_size));
+
+        assert!(outcome.is_complete(), "discard outcome: {outcome:?}");
+        assert_eq!(outcome.advised_bytes(), page_size);
+        let mut contents = vec![0xff; usize::try_from(page_size).expect("page size should fit")];
+        memory
+            .read_slice(&mut contents, GuestAddress::new(0))
+            .expect("discarded shared page should remain readable");
+        assert!(contents.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn shared_guest_memory_preflight_rejects_resource_limits() {
+        let ranges = [range(0, PAGE_SIZE), range(PAGE_SIZE, PAGE_SIZE)];
+
+        let error = preflight_shared_memory_resources_with_limits(
+            ranges.len(),
+            &ranges,
+            SharedMemoryResourceLimits {
+                file_size: PAGE_SIZE - 1,
+                file_descriptors: libc::RLIM_INFINITY,
+            },
+        )
+        .expect_err("low file-size limit should reject shared memory");
+        assert!(matches!(
+            error,
+            GuestMemoryAllocationError::SharedFileSizeLimitExceeded { size }
+                if size == PAGE_SIZE
+        ));
+
+        let error = preflight_shared_memory_resources_with_limits(
+            ranges.len(),
+            &ranges,
+            SharedMemoryResourceLimits {
+                file_size: libc::RLIM_INFINITY,
+                file_descriptors: 1,
+            },
+        )
+        .expect_err("low descriptor limit should reject shared memory");
+        assert!(matches!(
+            error,
+            GuestMemoryAllocationError::SharedFileDescriptorLimitExceeded { regions: 2 }
+        ));
+    }
+
+    #[test]
     fn guest_memory_allocations_are_independent_across_threads() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let thread_count = 4;
@@ -3156,10 +4090,10 @@ mod tests {
         drop_count: Arc<AtomicUsize>,
     }
 
-    impl AnonymousMapper for CountingMapper {
-        fn map(&mut self, size: usize) -> Result<AnonymousMapping, GuestMemoryAllocationError> {
+    impl GuestMemoryMapper for CountingMapper {
+        fn map(&mut self, size: usize) -> Result<GuestMemoryMapping, GuestMemoryAllocationError> {
             self.maps += 1;
-            Ok(AnonymousMapping::test_mapping(
+            Ok(GuestMemoryMapping::test_mapping(
                 size,
                 Arc::clone(&self.drop_count),
             ))
@@ -3173,8 +4107,8 @@ mod tests {
         drop_count: Arc<AtomicUsize>,
     }
 
-    impl AnonymousMapper for FailingMapper {
-        fn map(&mut self, size: usize) -> Result<AnonymousMapping, GuestMemoryAllocationError> {
+    impl GuestMemoryMapper for FailingMapper {
+        fn map(&mut self, size: usize) -> Result<GuestMemoryMapping, GuestMemoryAllocationError> {
             self.maps += 1;
 
             if self.maps == self.fail_on {
@@ -3184,7 +4118,7 @@ mod tests {
                 });
             }
 
-            Ok(AnonymousMapping::test_mapping(
+            Ok(GuestMemoryMapping::test_mapping(
                 size,
                 Arc::clone(&self.drop_count),
             ))

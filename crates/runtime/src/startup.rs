@@ -43,7 +43,7 @@ use crate::interrupt::GuestInterruptLine;
 use crate::machine::MachineConfig;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError,
-    GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64,
+    GuestMemoryBacking, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64,
 };
 use crate::memory_dirty::GuestMemoryDirtyTrackerError;
 use crate::memory_hotplug::{
@@ -111,6 +111,15 @@ pub struct VmStartupResources {
     pmem_backings: BTreeMap<String, PmemFileBacking>,
     serial_output: Option<SerialOutputFile>,
     supplied_vsock_listener: Option<SuppliedVsockListener>,
+    guest_memory_backing: GuestMemoryBacking,
+}
+
+struct VmStartupResourceParts {
+    boot_files: BootSourceFiles,
+    block_backings: BTreeMap<String, BlockFileBacking>,
+    pmem_backings: BTreeMap<String, PmemFileBacking>,
+    supplied_vsock_listener: Option<SuppliedVsockListener>,
+    guest_memory_backing: GuestMemoryBacking,
 }
 
 impl fmt::Debug for VmStartupResources {
@@ -134,6 +143,7 @@ impl fmt::Debug for VmStartupResources {
                 "supplied_vsock_listener",
                 &self.supplied_vsock_listener.as_ref().map(|_| "<owned>"),
             )
+            .field("guest_memory_backing", &self.guest_memory_backing)
             .finish()
     }
 }
@@ -151,6 +161,7 @@ impl VmStartupResources {
             pmem_backings,
             serial_output: None,
             supplied_vsock_listener: None,
+            guest_memory_backing: GuestMemoryBacking::Anonymous,
         }
     }
 
@@ -178,6 +189,13 @@ impl VmStartupResources {
         self
     }
 
+    /// Selects the backing profile used for every guest-memory region.
+    #[must_use]
+    pub fn with_guest_memory_backing(mut self, backing: GuestMemoryBacking) -> Self {
+        self.guest_memory_backing = backing;
+        self
+    }
+
     /// Returns whether every startup resource should use its configured path.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -186,23 +204,18 @@ impl VmStartupResources {
             && self.pmem_backings.is_empty()
             && self.serial_output.is_none()
             && self.supplied_vsock_listener.is_none()
+            && self.guest_memory_backing == GuestMemoryBacking::Anonymous
     }
 
-    fn into_parts(
-        self,
-    ) -> (
-        BootSourceFiles,
-        BTreeMap<String, BlockFileBacking>,
-        BTreeMap<String, PmemFileBacking>,
-        Option<SuppliedVsockListener>,
-    ) {
+    fn into_parts(self) -> VmStartupResourceParts {
         debug_assert!(self.serial_output.is_none());
-        (
-            self.boot_files,
-            self.block_backings,
-            self.pmem_backings,
-            self.supplied_vsock_listener,
-        )
+        VmStartupResourceParts {
+            boot_files: self.boot_files,
+            block_backings: self.block_backings,
+            pmem_backings: self.pmem_backings,
+            supplied_vsock_listener: self.supplied_vsock_listener,
+            guest_memory_backing: self.guest_memory_backing,
+        }
     }
 }
 const ARM64_BOOT_VMCLOCK_STATUS_UNKNOWN: u8 = 0;
@@ -3752,8 +3765,13 @@ impl Arm64BootResources {
         startup_resources: VmStartupResources,
         pci_validation: Option<Arm64BootPciValidationConfig>,
     ) -> Result<Self, Arm64BootResourceError> {
-        let (boot_files, block_backings, pmem_backings, supplied_vsock_listener) =
-            startup_resources.into_parts();
+        let VmStartupResourceParts {
+            boot_files,
+            block_backings,
+            pmem_backings,
+            supplied_vsock_listener,
+            guest_memory_backing,
+        } = startup_resources.into_parts();
         let Arm64BootResourceConfig {
             vcpu_mpidrs,
             cache_hierarchy,
@@ -3826,7 +3844,7 @@ impl Arm64BootResources {
         let memory_size = memory_size_bytes(machine_config)?;
         let layout = aarch64::dram_layout(memory_size)
             .map_err(|source| Arm64BootResourceError::MemoryLayout { source })?;
-        let mut memory = GuestMemory::allocate(&layout)
+        let mut memory = GuestMemory::allocate_with_backing(&layout, guest_memory_backing)
             .map_err(|source| Arm64BootResourceError::GuestMemoryAllocation { source })?;
         if machine_config.track_dirty_pages() {
             memory
@@ -4875,7 +4893,9 @@ mod tests {
     };
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::{MachineConfig, MachineConfigInput};
-    use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange, aarch64};
+    use crate::memory::{
+        GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange, aarch64,
+    };
     use crate::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
         VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
@@ -5043,6 +5063,44 @@ mod tests {
         assert!(!debug.contains(fixture.path().to_string_lossy().as_ref()));
         assert!(resources.take_serial_output().is_some());
         assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn startup_resources_select_shared_guest_memory_explicitly() {
+        let resources =
+            VmStartupResources::default().with_guest_memory_backing(GuestMemoryBacking::Shared);
+
+        assert!(!resources.is_empty());
+        assert!(format!("{resources:?}").contains("guest_memory_backing: Shared"));
+
+        assert_eq!(
+            resources.into_parts().guest_memory_backing,
+            GuestMemoryBacking::Shared
+        );
+    }
+
+    #[test]
+    fn startup_assembly_uses_the_selected_shared_guest_memory_profile() {
+        let kernel = temp_file("kernel-shared-guest-memory", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let startup_resources =
+            VmStartupResources::default().with_guest_memory_backing(GuestMemoryBacking::Shared);
+
+        let resources = Arm64BootResources::assemble_from_controller_with_startup_resources(
+            &controller,
+            valid_config(&[]),
+            startup_resources,
+        )
+        .expect("shared guest memory should assemble");
+
+        assert_eq!(resources.memory.backing(), GuestMemoryBacking::Shared);
+        assert!(resources.memory.regions().iter().all(|region| {
+            region.backing() == GuestMemoryBacking::Shared
+                && region
+                    .try_clone_shared_backing()
+                    .expect("shared startup descriptor should clone")
+                    .is_some()
+        }));
     }
 
     fn arm64_image() -> Vec<u8> {

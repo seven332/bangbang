@@ -5287,8 +5287,8 @@ mod tests {
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{
-        GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryDiscardFailureKind,
-        GuestMemoryError, GuestMemoryLayout, GuestMemoryRange,
+        GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking,
+        GuestMemoryDiscardFailureKind, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange,
     };
     use crate::metrics::{
         BalloonDeviceMetrics, BalloonDiscardMetrics, BalloonFreePageReportMetrics,
@@ -5479,12 +5479,17 @@ mod tests {
     }
 
     fn pfn_descriptor_memory() -> GuestMemory {
+        pfn_descriptor_memory_with_backing(GuestMemoryBacking::Anonymous)
+    }
+
+    fn pfn_descriptor_memory_with_backing(backing: GuestMemoryBacking) -> GuestMemory {
         let layout = GuestMemoryLayout::new(vec![
             GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
                 .expect("test memory range should be valid"),
         ])
         .expect("test memory layout should be valid");
-        GuestMemory::allocate(&layout).expect("test guest memory should allocate")
+        GuestMemory::allocate_with_backing(&layout, backing)
+            .expect("test guest memory should allocate")
     }
 
     fn write_guest_bytes(memory: &mut GuestMemory, address: GuestAddress, bytes: &[u8]) {
@@ -7157,6 +7162,69 @@ mod tests {
         assert_eq!(adviser.zero_calls, 1);
         assert_eq!(adviser.free_calls, 1);
         assert_eq!(read_used_idx(&memory, inflate_used_ring()), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inflate_queue_dispatch_reclaims_shared_backing_to_zeroes() {
+        use std::fs::File;
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::FileExt;
+
+        let mut memory = pfn_descriptor_memory_with_backing(GuestMemoryBacking::Shared);
+        let inflated_start = GuestAddress::new(40 * VIRTIO_BALLOON_PAGE_SIZE);
+        let inflated_len = VIRTIO_BALLOON_PAGE_SIZE * 4;
+        let inflated_len_usize =
+            usize::try_from(inflated_len).expect("inflated test range should fit usize");
+        memory
+            .write_slice(&vec![0xa5; inflated_len_usize], inflated_start)
+            .expect("shared balloon pages should initialize");
+        let export = memory.regions()[0]
+            .try_clone_shared_backing()
+            .expect("shared balloon descriptor should clone")
+            .expect("shared balloon memory should expose a descriptor");
+        let export_file = File::from(
+            export
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("shared balloon descriptor clone should be independent"),
+        );
+        let bytes = pfn_payload_bytes(&[40, 41, 42, 43]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_inflate_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(&mut memory, inflate_available_ring(), &[0]);
+        let mut queue = inflate_queue();
+
+        let dispatch = queue
+            .dispatch_inflate(&mut memory)
+            .expect("shared inflate descriptor should dispatch");
+
+        assert_eq!(dispatch.completed_descriptors(), 1);
+        assert_eq!(
+            dispatch.inflate_discard(),
+            VirtioBalloonDiscardOutcome {
+                attempts: 1,
+                requested_bytes: inflated_len,
+                advised_bytes: inflated_len,
+                skipped_bytes: 0,
+                failed_bytes: 0,
+                failures: 0,
+            }
+        );
+        let mut mapped_bytes = vec![0xff; inflated_len_usize];
+        memory
+            .read_slice(&mut mapped_bytes, inflated_start)
+            .expect("reclaimed shared balloon pages should read");
+        assert!(mapped_bytes.iter().all(|byte| *byte == 0));
+        let mut descriptor_bytes = vec![0xff; inflated_len_usize];
+        export_file
+            .read_exact_at(&mut descriptor_bytes, inflated_start.raw_value())
+            .expect("shared descriptor should read reclaimed balloon pages");
+        assert!(descriptor_bytes.iter().all(|byte| *byte == 0));
     }
 
     #[test]
