@@ -150,6 +150,7 @@ const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k pan
 const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
 const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
 const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
+const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
 const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
 const BLOCK_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_ONE";
 const BLOCK_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_ONE";
@@ -166,6 +167,11 @@ const PMEM_HOTPLUG_CONTINUE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_CONTINUE";
 const PMEM_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_HOST_TWO";
 const PMEM_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_GUEST_TWO";
 const PMEM_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_SUCCESS";
+const NETWORK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_NETWORK_HOTPLUG_READY";
+const NETWORK_HOTPLUG_FIRST_CONTINUE_MARKER: &[u8] = b"BANGBANG_NETWORK_HOTPLUG_FIRST_CONTINUE";
+const NETWORK_HOTPLUG_FIRST_REMOVED_MARKER: &[u8] = b"BANGBANG_NETWORK_HOTPLUG_FIRST_REMOVED";
+const NETWORK_HOTPLUG_SECOND_CONTINUE_MARKER: &[u8] = b"BANGBANG_NETWORK_HOTPLUG_SECOND_CONTINUE";
+const NETWORK_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_NETWORK_HOTPLUG_SUCCESS";
 const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
 const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
 const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
@@ -2609,6 +2615,224 @@ fn normal_bundle_hotplugs_runtime_block_from_exact_unused_grants() {
     }
 
     stop_running_launcher(&mut running, "contained runtime block hotplug guest");
+}
+
+#[test]
+fn normal_bundle_hotplugs_mmds_network_without_vmnet_authority() {
+    let bundle = production_bundle();
+    let fixture = GuestDeviceGrantFixture::new("runtime-network-hotplug");
+    resize_and_write_file_marker_at(&fixture.data, 1536, 0, &[]);
+    let mut running = spawn_ready_device_grant_api_launcher_with_extra_args(
+        &bundle,
+        &fixture,
+        "runtime-network-hotplug",
+        &["--enable-pci"],
+    );
+    fixture.replace_source_pathnames();
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT contained network-hotplug machine config",
+    );
+    let sealed_kernel = worker_bundle(&bundle).join("Contents/Resources/guest-kernel");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&sealed_kernel),
+        "boot_args": DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot request should serialize"),
+        ),
+        204,
+        "PUT contained network-hotplug boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": GUEST_ROOTFS_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT contained network-hotplug rootfs",
+        ),
+        (
+            "/drives/control",
+            serde_json::json!({
+                "drive_id": "control",
+                "path_on_host": GUEST_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+            }),
+            "PUT contained network-hotplug control drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("drive request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    let network_body =
+        r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:42"}"#;
+    assert_http_status(
+        &http_put(&running.socket, "/network-interfaces/eth0", network_body),
+        204,
+        "PUT contained startup MMDS network",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/mmds/config",
+            r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
+        ),
+        204,
+        "PUT contained network-hotplug MMDS config",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/mmds",
+            r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_GUEST_VALUE"}}"#,
+        ),
+        204,
+        "PUT contained network-hotplug MMDS data",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start contained network-hotplug guest",
+    );
+    wait_for_file_prefix(
+        &fixture.opened_data,
+        NETWORK_HOTPLUG_READY_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("contained network-hotplug guest should remove its startup function: {error}")
+    });
+
+    let denied = http_put(
+        &running.socket,
+        "/network-interfaces/private_iface",
+        r#"{"iface_id":"private_iface","host_dev_name":"vmnet:bridged:private_bridge","guest_mac":"06:00:00:00:00:43"}"#,
+    );
+    assert_http_status(&denied, 400, "contained runtime vmnet denial");
+    assert!(denied.contains(r#"{"fault_message":"system host networking is not authorized"}"#));
+    assert!(!denied.contains("private_iface"));
+    assert!(!denied.contains("private_bridge"));
+    assert!(!denied.contains("06:00:00:00:00:43"));
+    let unchanged = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &unchanged,
+        200,
+        "GET /vm/config after contained runtime vmnet denial",
+    );
+    assert!(unchanged.contains(r#""iface_id":"eth0""#));
+    assert!(!unchanged.contains("private_iface"));
+
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/network-interfaces/eth0", ""),
+        204,
+        "DELETE contained startup MMDS network",
+    );
+    assert_http_status(
+        &http_put(&running.socket, "/network-interfaces/eth0", network_body),
+        204,
+        "runtime PUT contained first MMDS network",
+    );
+    resize_and_write_file_marker_at(
+        &fixture.opened_data,
+        1536,
+        512,
+        NETWORK_HOTPLUG_FIRST_CONTINUE_MARKER,
+    );
+    wait_for_file_prefix(
+        &fixture.opened_data,
+        NETWORK_HOTPLUG_FIRST_REMOVED_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("contained first runtime network should exchange MMDS traffic: {error}")
+    });
+
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/network-interfaces/eth0", ""),
+        204,
+        "DELETE contained first runtime MMDS network",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause contained guest before network reuse",
+    );
+    assert_http_status(
+        &http_put(&running.socket, "/network-interfaces/eth0", network_body),
+        204,
+        "paused PUT contained reused MMDS network",
+    );
+    let reused = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &reused,
+        200,
+        "GET /vm/config after contained runtime network reuse",
+    );
+    assert!(reused.contains(r#""iface_id":"eth0""#));
+    resize_and_write_file_marker_at(
+        &fixture.opened_data,
+        1536,
+        1024,
+        NETWORK_HOTPLUG_SECOND_CONTINUE_MARKER,
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume contained guest after network reuse",
+    );
+    wait_for_file_prefix(
+        &fixture.opened_data,
+        NETWORK_HOTPLUG_SUCCESS_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("contained reused runtime network should preserve PCI/MMDS identity: {error}")
+    });
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/network-interfaces/eth0", ""),
+        204,
+        "final DELETE contained runtime MMDS network",
+    );
+    let removed = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &removed,
+        200,
+        "GET /vm/config after contained final network DELETE",
+    );
+    assert!(removed.contains(r#""network-interfaces":[]"#));
+    assert_eq!(
+        file_bytes_at(&fixture.data, 0, NETWORK_HOTPLUG_SUCCESS_MARKER.len()),
+        vec![0; NETWORK_HOTPLUG_SUCCESS_MARKER.len()],
+        "replacement source pathname must not receive contained network markers"
+    );
+
+    stop_running_launcher(&mut running, "contained runtime network hotplug guest");
 }
 
 #[test]

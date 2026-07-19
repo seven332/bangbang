@@ -680,11 +680,55 @@
     {
       "id": "api-operation:PUT /network-interfaces/{iface_id}",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /network-interfaces/{iface_id}.",
+      "summary": "Configure a validated virtio-net interface before startup, or transactionally attach one after startup when public all-virtio PCI transport is enabled. Running and Paused insertion prepares one independent MMDS-only or vmnet packet-I/O owner, validates actual contained vmnet authority, publishes generation-bound metrics and PCI resources on the owner thread, and commits live configuration last. Existing interfaces keep their queues and host resources. Default MMIO, duplicate ID/MAC, invalid, unauthorized, and exhausted-capacity requests are stable, redacted, and nonmutating.",
       "source_refs": [
         "api-operation:PUT /network-interfaces/{iface_id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::put_network_interface and ProcessHvfBootSession::insert_runtime_network_device"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "HvfArm64BootPciDataDevices::insert_runtime_network"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "SharedNetworkInterfaceMetricsRegistry::prepare_interface"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "NetworkInterfaceConfigs::prepare_runtime_insert"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "pci_runtime_network_put_delete_updates_live_vm_config"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "runtime network provider, authority, rollback, projection, paused FIFO, and terminal-state tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_hotplugs_mmds_network_and_reuses_product_pci_slot"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_hotplugs_mmds_network_without_vmnet_authority"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /pmem/{id}",
@@ -5858,11 +5902,55 @@
     {
       "id": "non-swagger-route:DELETE /network-interfaces/{iface_id}",
       "family": "network-and-mmds",
-      "summary": "Audit the pinned non-Swagger runtime route DELETE /network-interfaces/{iface_id}.",
+      "summary": "Remove one live virtio-net endpoint through the pinned bodyless Firecracker route when public all-virtio PCI transport is enabled. Owner-thread teardown makes the exact PCI endpoint reversibly unreachable, takes and explicitly stops its independent packet-I/O owner, then commits release of queues, limiter retry state, metrics generation, MMDS detour or vmnet handle, MSI-X, BAR, function, dispatcher, and configuration ownership. Failed preparation restores the prior endpoint; uncertain vmnet cleanup, failed restoration, or post-boundary corruption is terminal. Missing and default-MMIO requests are nonmutating.",
       "source_refs": [
         "non-swagger-route:DELETE /network-interfaces/{iface_id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::remove_network_interface and ProcessHvfBootSession::remove_runtime_network_device"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "prepare_runtime_network_removal, rollback_runtime_network_removal, and commit_runtime_network_removal"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "NetworkInterfaceMetricsLease"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "prepare_teardown, rollback_prepared_teardown, and commit_prepared_teardown"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "bodyless network DELETE, default-MMIO, live configuration, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "packet-I/O stop/restore, endpoint rollback, supervisor terminal, snapshot, and shutdown tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_hotplugs_mmds_network_and_reuses_product_pci_slot"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_hotplugs_mmds_network_without_vmnet_authority"
+        }
+      ]
     },
     {
       "id": "non-swagger-route:DELETE /pmem/{id}",

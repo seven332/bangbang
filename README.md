@@ -22,9 +22,10 @@ virtio-rng, targeted and rate-limited virtio-pmem flush, a block-granular
 virtio-mem plug/unplug lifecycle, the no-interrupt aarch64 PL031 RTC,
 DeviceTree VMGenID including native-v1 replacement notification, and startup
 VMClock discovery. Non-root PCI pmem attach/delete now includes exact dynamic
-mapping, flush, teardown, and range reuse; runtime PCI network attach/delete,
-ARM PVTime, pmem root or direct file-backed mapping, optional-device snapshots,
-and mutable VMClock restore remain explicit limits. Host discard never promises
+mapping, flush, teardown, and range reuse; PCI network attach/delete now owns
+per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime, pmem
+root or direct file-backed mapping, optional-device snapshots, and mutable
+VMClock restore remain explicit limits. Host discard never promises
 synchronous RSS or footprint reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
@@ -50,8 +51,10 @@ network, and pmem in-place PATCH keeps working in either startup transport;
 PCI-mode block and non-root pmem PUT/DELETE use failure-atomic owner-thread
 transactions in Running or Paused state, with explicit guest rescan/removal and
 exact capacity reuse. Pmem additionally owns a dynamic HVF shadow, targeted
-flush/unmap, and reusable aligned guest range. Runtime network attach/delete,
-automatic guest hotplug notification, PCI snapshot persistence, external vmnet connectivity
+flush/unmap, and reusable aligned guest range. PCI-mode network PUT/DELETE uses
+the same owner-thread boundary with independent MMDS-only or vmnet packet I/O,
+generation-safe metrics, and exact cleanup. Automatic guest hotplug
+notification, PCI snapshot persistence, external vmnet connectivity
 certification, and Firecracker's KVM ITS identity remain explicit limits.
 Native-v1 create/load rejects PCI profiles before artifact or VM mutation,
 while the default MMIO snapshot profile is unchanged.
@@ -740,8 +743,8 @@ curl --unix-socket /tmp/bangbang.socket \
   -X DELETE http://localhost/pmem/pmem0
 ```
 
-Runtime block and pmem PUT plus bodyless DELETE are accepted in `Running` and
-`Paused`. They commit `/vm/config` only after the live owner-thread operation
+Runtime block, pmem, and network PUT plus bodyless DELETE are accepted in
+`Running` and `Paused` when public PCI is enabled. They commit `/vm/config` only after the live owner-thread operation
 succeeds; root, duplicate, missing, capacity, backing, mapping, or publication
 failures leave the prior configuration intact. Default MMIO sessions reject
 the operations before opening the proposed path. In production-contained mode,
@@ -804,6 +807,23 @@ curl --unix-socket /tmp/bangbang.socket \
 
 Set a bucket's `size` or `refill_time` to `0` to disable only that bucket.
 
+With `--enable-pci`, the same PUT endpoint can add a new interface after start.
+Rescan PCI inside Linux before using it, remove its PCI function through guest
+sysfs before the host-side DELETE, and then release it with:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket \
+  -X DELETE http://localhost/network-interfaces/eth0
+```
+
+The immutable pre-boot MMDS interface list selects whether a later interface ID
+can use process-local MMDS-only packet I/O. Existing packet-I/O entries retain
+their startup class; an initially mixed vmnet session keeps later entries on
+vmnet, while an initially empty or all-MMDS session can use MMDS-only packet I/O
+for a selected ID. Removal releases the exact queues, retry deadline, metrics
+generation, packet-I/O owner, and PCI resources before the ID/MAC/slot can be
+reused. Default MMIO rejects runtime PUT/DELETE without mutation.
+
 The configured `mtu` is advertised to the guest virtio-net device. Current
 signed Network/MMDS scenarios select every configured interface in MMDS config,
 so startup uses process-local MMDS-only packet I/O without opening vmnet; they
@@ -814,11 +834,11 @@ routing/NAT, resource, and distribution policy. See the
 [compatibility scope](docs/firecracker-compatibility.md#internal-network-interface-configuration),
 [vmnet security boundary](docs/security.md#vmnet-host-policy-boundary), and
 [testing guide](docs/testing.md) for the exact supported subset and exclusions.
-Contained startup additionally enforces the authenticated lifecycle-v4 mode,
-bridge-name, and active-count authority before backend construction. The current
-networkless production profile rejects every nonempty authority before worker
-spawn, so this enforcement is preparation for a later approved signed profile,
-not a production-connectivity claim.
+Contained startup and runtime insertion additionally enforce the authenticated
+lifecycle-v4 mode, bridge name, and actual live-vmnet count before backend
+construction. The current networkless production profile rejects every positive
+vmnet authority before worker spawn, but supports all-MMDS startup and hotplug
+without that authority. This is not a production-connectivity claim.
 
 Record a pre-boot vsock configuration:
 
@@ -986,7 +1006,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 76 implemented-and-verified, 322 audit-required, three
+delivery overlay with 78 implemented-and-verified, 320 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7

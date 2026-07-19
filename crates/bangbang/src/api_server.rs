@@ -2276,6 +2276,7 @@ mod tests {
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
+    use bangbang_runtime::network::NetworkRuntimeMutationError;
     use bangbang_runtime::serial::SerialConfig;
     use bangbang_runtime::snapshot::{SnapshotLoadInput, SnapshotV1ControllerCommit};
     use bangbang_runtime::snapshot_artifact::{
@@ -2291,7 +2292,7 @@ mod tests {
         BlockBackingUpdate, InstanceStartExecutor, NativeV1SnapshotCaptureCancellation,
         NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
         NativeV1SnapshotPublicationProducerError, ProcessSessionDiagnostics,
-        ProcessSessionExitStatus, ProcessVmm, SnapshotV1LoadSuccess,
+        ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority, SnapshotV1LoadSuccess,
     };
 
     use super::*;
@@ -2462,6 +2463,21 @@ mod tests {
             &mut self,
             _update: NetworkInterfaceUpdate,
         ) -> Result<(), NetworkInterfaceUpdateError> {
+            Ok(())
+        }
+
+        fn insert_runtime_network_device(
+            &mut self,
+            _config: NetworkInterfaceConfig,
+            _authority: ProcessVmnetAuthority,
+        ) -> Result<(), NetworkRuntimeMutationError> {
+            Ok(())
+        }
+
+        fn remove_runtime_network_device(
+            &mut self,
+            _iface_id: &str,
+        ) -> Result<(), NetworkRuntimeMutationError> {
             Ok(())
         }
 
@@ -9489,7 +9505,7 @@ mod tests {
             (
                 "net-delete-running",
                 "DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
-                "Network interface updates are not supported.",
+                "runtime network insertion and removal require PCI transport",
                 "eth0",
             ),
             (
@@ -9518,6 +9534,75 @@ mod tests {
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running
         );
+    }
+
+    #[test]
+    fn pci_runtime_network_put_delete_updates_live_vm_config() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success())
+            .with_test_pci_enabled(true);
+        let boot_request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "nhs", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let put_response = request_over_socket(
+            &mut vmm,
+            "nhp",
+            &request_with_body(
+                "PUT",
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"12:34:56:78:9a:bc"}"#,
+            ),
+        );
+        assert!(
+            put_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{put_response}"
+        );
+        let config_response = request_over_socket(
+            &mut vmm,
+            "nhc",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(config_response.contains(r#""network-interfaces":[{"#));
+        assert!(config_response.contains(r#""iface_id":"eth0""#));
+
+        let pause_response = request_over_socket(
+            &mut vmm,
+            "nhz",
+            &request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#),
+        );
+        assert!(pause_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let delete_response = request_over_socket(
+            &mut vmm,
+            "nhd",
+            "DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(
+            delete_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{delete_response}"
+        );
+        let config_response = request_over_socket(
+            &mut vmm,
+            "nhe",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(config_response.contains(r#""network-interfaces":[]"#));
+
+        let missing_response = request_over_socket(
+            &mut vmm,
+            "nhm",
+            "DELETE /network-interfaces/private_missing HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(missing_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(missing_response.contains("network interface is not configured"));
+        assert!(!missing_response.contains("private_missing"));
     }
 
     #[test]

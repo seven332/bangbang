@@ -25,8 +25,8 @@ use bangbang_hvf::{
     HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle,
     HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
     HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfVcpuRunCoordinatorError,
-    OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError, PreparedHvfSnapshotV1Load,
-    PreparedHvfSnapshotV1State,
+    OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError, PreparedHvfArm64BootPciNetworkRemoval,
+    PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -63,9 +63,14 @@ use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkInterfaceConfigInput,
     NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
-    NetworkMmioLayout, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition,
-    VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
+    NetworkMmioLayout, NetworkRuntimeMutationError, PreparedNetworkDevice,
+    validate_network_interface_count,
+};
+#[cfg(test)]
+use bangbang_runtime::network::{
+    VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
+    VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+    VirtioNetworkTxPacketSinkError,
 };
 use bangbang_runtime::pmem::{
     PmemConfig, PmemConfigInput, PmemFileBacking, PmemMmioLayout, PmemRuntimeMutationError,
@@ -124,10 +129,12 @@ use crate::contained_session::{
     GrantAuthority, GrantClaimError, PreparedFileGrantClaim, grant_reference_id,
 };
 use crate::host_network::virtio_vmnet::{
-    MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError,
-    MmdsOnlyVirtioNetworkPacketIoProvider, MmdsOnlyVirtioNetworkPacketIoProviderBuildError,
-    MmdsOnlyVirtioNetworkPacketIoProviderEntry, MmdsPacketDetour, MmdsResponseQueue,
-    VmnetVirtioNetworkPacketIo, VmnetVirtioNetworkPacketIoBuildError,
+    MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour,
+    MmdsResponseQueue, VmnetVirtioNetworkPacketIo, VmnetVirtioNetworkPacketIoBuildError,
+    VmnetVirtioNetworkPacketIoStopError,
+};
+#[cfg(test)]
+use crate::host_network::virtio_vmnet::{
     VmnetVirtioNetworkPacketIoProvider, VmnetVirtioNetworkPacketIoProviderBuildError,
     VmnetVirtioNetworkPacketIoProviderEntry,
 };
@@ -526,6 +533,21 @@ pub(crate) trait ProcessSessionDiagnostics {
         _pmem_id: &str,
     ) -> Result<(), PmemRuntimeMutationError> {
         Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn insert_runtime_network_device(
+        &mut self,
+        _config: NetworkInterfaceConfig,
+        _authority: ProcessVmnetAuthority,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn remove_runtime_network_device(
+        &mut self,
+        _iface_id: &str,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
     }
 
     fn update_network_interface(
@@ -1567,6 +1589,12 @@ where
     S: InstanceStartExecutor,
 {
     #[cfg(test)]
+    pub(crate) fn with_test_pci_enabled(mut self, enabled: bool) -> Self {
+        self.pci_enabled = enabled;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_starter(
         instance_id: impl Into<String>,
         vmm_version: impl Into<String>,
@@ -1723,6 +1751,7 @@ where
             VmmAction::PutDrive(input) => self.put_drive(input),
             VmmAction::PutLogger(input) => self.put_logger(input),
             VmmAction::PutMetrics(input) => self.put_metrics(input),
+            VmmAction::PutNetworkInterface(input) => self.put_network_interface(input),
             VmmAction::PutPmem(input) => self.put_pmem(input),
             VmmAction::PutSerial(input) => self.put_serial(input),
             VmmAction::PutVsock(input) => self.put_vsock(input),
@@ -1736,6 +1765,11 @@ where
             }
             VmmAction::HotUnplugDevice(input) if input.kind() == HotUnplugDeviceKind::Pmem => {
                 self.remove_pmem(input.id())
+            }
+            VmmAction::HotUnplugDevice(input)
+                if input.kind() == HotUnplugDeviceKind::NetworkInterface =>
+            {
+                self.remove_network_interface(input.id())
             }
             VmmAction::UpdateNetworkInterface(input) => self.update_network_interface(input),
             VmmAction::PatchPmem(input) => self.update_pmem(input),
@@ -2104,6 +2138,66 @@ where
             .map_err(VmmActionError::DriveRuntimeMutation)?;
         self.drive_grant_states.remove(prepared.drive_id());
         self.controller.commit_runtime_drive_removal(prepared);
+        Ok(VmmData::Empty)
+    }
+
+    fn put_network_interface(
+        &mut self,
+        input: NetworkInterfaceConfigInput,
+    ) -> Result<VmmData, VmmActionError> {
+        if self.controller.instance_info().state == bangbang_runtime::InstanceState::NotStarted {
+            return self
+                .controller
+                .handle_action(VmmAction::PutNetworkInterface(input));
+        }
+        if !self.pci_enabled {
+            return Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::PciNotEnabled,
+            ));
+        }
+        let prepared = self
+            .controller
+            .prepare_runtime_network_interface_insert(input)?;
+        let config = prepared.config().clone();
+        let session = self.started_session.as_mut().ok_or({
+            VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::ActiveSessionUnavailable,
+            )
+        })?;
+        session
+            .insert_runtime_network_device(config, self.vmnet_authority)
+            .map_err(VmmActionError::NetworkRuntimeMutation)?;
+        self.controller
+            .commit_runtime_network_interface_insert(prepared);
+        Ok(VmmData::Empty)
+    }
+
+    fn remove_network_interface(&mut self, iface_id: &str) -> Result<VmmData, VmmActionError> {
+        let state = self.controller.instance_info().state;
+        if state == bangbang_runtime::InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "HotUnplugDevice",
+                state,
+            });
+        }
+        if !self.pci_enabled {
+            return Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::PciNotEnabled,
+            ));
+        }
+        let prepared = self
+            .controller
+            .prepare_runtime_network_interface_removal(iface_id)?;
+        let session = self.started_session.as_mut().ok_or({
+            VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::ActiveSessionUnavailable,
+            )
+        })?;
+        session
+            .remove_runtime_network_device(prepared.iface_id())
+            .map_err(VmmActionError::NetworkRuntimeMutation)?;
+        self.controller
+            .commit_runtime_network_interface_removal(prepared);
         Ok(VmmData::Empty)
     }
 
@@ -3588,6 +3682,108 @@ impl<S, P> ProcessHvfBootSession<S, P> {
     }
 }
 
+impl<S, P> ProcessHvfBootSession<S, P>
+where
+    S: NetworkPacketIoRunLoopSession,
+    P: ProcessRuntimeNetworkPacketIoProvider,
+{
+    fn insert_runtime_network_device(
+        &mut self,
+        config: &NetworkInterfaceConfig,
+        authority: ProcessVmnetAuthority,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        let prepared = self.packet_io.prepare_runtime_entry(config, authority)?;
+        let published = self.packet_io.publish_prepared_entry(prepared);
+
+        let endpoint = PreparedNetworkDevice::from_config(config);
+        if let Err(primary) = self.session.insert_runtime_network_device(endpoint) {
+            let mut removed = match self.packet_io.take_published_entry(&published) {
+                Ok(removed) => removed,
+                Err(cleanup) => {
+                    return Err(NetworkRuntimeMutationError::TerminalInsertion {
+                        message: format!(
+                            "{primary}; also failed to remove unpublished packet I/O: {cleanup}"
+                        ),
+                    });
+                }
+            };
+            if let Err(cleanup) = P::stop_removed_entry(&mut removed) {
+                let restore = self.packet_io.restore_removed_entry(removed);
+                let message = match restore {
+                    Ok(()) => {
+                        format!("{primary}; also failed to stop unpublished packet I/O: {cleanup}")
+                    }
+                    Err(restore) => format!(
+                        "{primary}; also failed to stop unpublished packet I/O: {cleanup}; also failed to retain its cleanup owner: {restore}"
+                    ),
+                };
+                return Err(NetworkRuntimeMutationError::TerminalInsertion { message });
+            }
+            return Err(primary);
+        }
+        Ok(())
+    }
+
+    fn update_runtime_network_interface(
+        &mut self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        self.session.update_runtime_network_interface(update)
+    }
+
+    fn remove_runtime_network_device(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        let prepared = self
+            .session
+            .prepare_runtime_network_device_removal(iface_id)?;
+        let mut removed = match self.packet_io.take_interface_entry(iface_id) {
+            Ok(removed) => removed,
+            Err(primary) => {
+                return match self
+                    .session
+                    .rollback_runtime_network_device_removal(prepared)
+                {
+                    Ok(()) => Err(NetworkRuntimeMutationError::TerminalRemoval {
+                        message: primary.to_string(),
+                    }),
+                    Err(rollback) => Err(NetworkRuntimeMutationError::TerminalRemoval {
+                        message: format!(
+                            "{primary}; also failed to restore runtime network endpoint: {rollback}"
+                        ),
+                    }),
+                };
+            }
+        };
+
+        if let Err(primary) = P::stop_removed_entry(&mut removed) {
+            let provider_restore = self.packet_io.restore_removed_entry(removed);
+            let endpoint_restore = self
+                .session
+                .rollback_runtime_network_device_removal(prepared);
+            let mut message = primary.to_string();
+            if let Err(restore) = provider_restore {
+                message.push_str("; also failed to restore packet-I/O ownership: ");
+                message.push_str(&restore.to_string());
+            }
+            if let Err(restore) = endpoint_restore {
+                message.push_str("; also failed to restore runtime network endpoint: ");
+                message.push_str(&restore.to_string());
+            }
+            return Err(NetworkRuntimeMutationError::TerminalRemoval { message });
+        }
+
+        match self.session.commit_runtime_network_device_removal(prepared) {
+            Ok(()) => Ok(()),
+            Err(error @ NetworkRuntimeMutationError::TerminalRemoval { .. }) => Err(error),
+            Err(error) => Err(NetworkRuntimeMutationError::TerminalRemoval {
+                message: error.to_string(),
+            }),
+        }
+    }
+}
+
 impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
     fn capture_snapshot_v1_device_state_at(
         &self,
@@ -3636,7 +3832,7 @@ impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
 
 impl<P> NativeV1SnapshotCaptureSession for ProcessHvfBootSession<OwnedHvfArm64BootSession, P>
 where
-    P: Arm64BootNetworkPacketIoProvider + Send + 'static,
+    P: ProcessRuntimeNetworkPacketIoProvider + Send + 'static,
 {
     type DetachedState = HvfSnapshotV1State;
     type SnapshotBundle = HvfSnapshotV1Bundle;
@@ -3706,36 +3902,117 @@ where
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct NoopProcessNetworkPacketIoProvider {
-    tx_sink: NoopProcessNetworkTxPacketSink,
-    rx_source: EmptyProcessNetworkRxPacketSource,
+pub(crate) type ProcessNetworkPacketIoProvider =
+    ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend>;
+
+pub(crate) trait ProcessVmnetBackend:
+    VmnetInterfaceBackend + VmnetPacketIoBackend<Interface = <Self as VmnetInterfaceBackend>::Interface>
+{
 }
 
-impl Arm64BootNetworkPacketIoProvider for NoopProcessNetworkPacketIoProvider {
-    fn packet_io(
-        &mut self,
-        _interface: Arm64BootNetworkInterface<'_>,
-    ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
-        Ok(Arm64BootNetworkPacketIo::new(
-            &mut self.tx_sink,
-            &mut self.rx_source,
-        ))
+impl<T> ProcessVmnetBackend for T where
+    T: VmnetInterfaceBackend
+        + VmnetPacketIoBackend<Interface = <T as VmnetInterfaceBackend>::Interface>
+{
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessNetworkPacketIoStartupPolicy {
+    MmdsPreferred,
+    Vmnet,
+}
+
+#[derive(Debug)]
+enum ProcessNetworkPacketIo<B>
+where
+    B: ProcessVmnetBackend,
+{
+    MmdsOnly(MmdsOnlyVirtioNetworkPacketIo),
+    Vmnet(VmnetVirtioNetworkPacketIo<StartedVmnetPacketIoBackend<B>>),
+}
+
+impl<B> ProcessNetworkPacketIo<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn as_packet_io(&mut self) -> Arm64BootNetworkPacketIo<'_> {
+        match self {
+            Self::MmdsOnly(packet_io) => {
+                let MmdsOnlyVirtioNetworkPacketIo { tx_sink, rx_source } = packet_io;
+                Arm64BootNetworkPacketIo::new(tx_sink, rx_source)
+            }
+            Self::Vmnet(packet_io) => packet_io.as_packet_io(),
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), ProcessNetworkPacketIoStopError> {
+        match self {
+            Self::MmdsOnly(_) => Ok(()),
+            Self::Vmnet(packet_io) => packet_io
+                .stop()
+                .map_err(|source| ProcessNetworkPacketIoStopError::Vmnet { source }),
+        }
+    }
+
+    const fn is_vmnet(&self) -> bool {
+        matches!(self, Self::Vmnet(_))
     }
 }
 
-type SystemStartedVmnetPacketIoBackend = StartedVmnetPacketIoBackend<SystemVmnetInterfaceBackend>;
-type SystemProcessVmnetPacketIoProvider =
-    VmnetVirtioNetworkPacketIoProvider<SystemStartedVmnetPacketIoBackend>;
-
 #[derive(Debug)]
-pub(crate) enum ProcessNetworkPacketIoProvider {
-    Noop(NoopProcessNetworkPacketIoProvider),
-    MmdsOnly(MmdsOnlyVirtioNetworkPacketIoProvider),
-    Vmnet(SystemProcessVmnetPacketIoProvider),
+struct ProcessNetworkPacketIoEntry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    generation: u64,
+    iface_id: String,
+    packet_io: ProcessNetworkPacketIo<B>,
 }
 
-impl ProcessNetworkPacketIoProvider {
+#[derive(Debug)]
+pub(crate) struct PreparedProcessNetworkPacketIoEntry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    entry: ProcessNetworkPacketIoEntry<B>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublishedProcessNetworkPacketIoEntry {
+    generation: u64,
+    iface_id: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct RemovedProcessNetworkPacketIoEntry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    index: usize,
+    entry: ProcessNetworkPacketIoEntry<B>,
+}
+
+impl<B> RemovedProcessNetworkPacketIoEntry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn stop(&mut self) -> Result<(), ProcessNetworkPacketIoStopError> {
+        self.entry.packet_io.stop()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ProcessNetworkPacketIoRegistry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    entries: Vec<ProcessNetworkPacketIoEntry<B>>,
+    next_generation: u64,
+    startup_policy: ProcessNetworkPacketIoStartupPolicy,
+    mmds_detour: Option<ProcessMmdsPacketDetourConfig>,
+}
+
+impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
     fn from_controller(
         controller: &VmmController,
     ) -> Result<(Self, Option<SharedMmdsMetrics>), ProcessNetworkPacketIoProviderBuildError> {
@@ -3773,28 +4050,464 @@ impl ProcessNetworkPacketIoProvider {
         configs: &[NetworkInterfaceConfig],
         mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
     ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
+        let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+        Self::from_network_configs_and_mmds_detour_with_factory(configs, mmds_detour, &mut factory)
+    }
+
+    fn prepare_runtime_entry(
+        &mut self,
+        config: &NetworkInterfaceConfig,
+        authority: ProcessVmnetAuthority,
+    ) -> Result<
+        PreparedProcessNetworkPacketIoEntry<SystemVmnetInterfaceBackend>,
+        NetworkRuntimeMutationError,
+    > {
+        let class = self.class_for_interface(config.iface_id());
+        let vmnet_config = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
+            .map_err(|_| NetworkRuntimeMutationError::PreparePacketIo {
+                message: "network host device configuration is unsupported".to_string(),
+            })?;
+        self.validate_runtime_authority(class, &vmnet_config, authority)?;
+        let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+        self.prepare_entry_with_factory(config, class, &mut factory)
+            .map_err(runtime_network_packet_io_preparation_error)
+    }
+}
+
+fn runtime_network_packet_io_preparation_error(
+    source: ProcessNetworkPacketIoProviderBuildError,
+) -> NetworkRuntimeMutationError {
+    let message = match source {
+        ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. } => {
+            "network interface count is unsupported"
+        }
+        ProcessNetworkPacketIoProviderBuildError::DuplicateInterface => {
+            "network packet-I/O identity is already registered"
+        }
+        ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
+        | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity => {
+            "network packet-I/O capacity is exhausted"
+        }
+        ProcessNetworkPacketIoProviderBuildError::GenerationExhausted => {
+            "network packet-I/O ownership generation is exhausted"
+        }
+        ProcessNetworkPacketIoProviderBuildError::MmdsState { .. } => "MMDS state is unavailable",
+        ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. } => {
+            "network host device configuration is unsupported"
+        }
+        ProcessNetworkPacketIoProviderBuildError::Start { .. } => "vmnet interface start failed",
+        ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. } => {
+            "vmnet packet-I/O initialization failed"
+        }
+        ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
+        | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. } => {
+            "MMDS packet-I/O initialization failed"
+        }
+        #[cfg(test)]
+        ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
+            "vmnet packet-I/O registry initialization failed"
+        }
+    };
+    NetworkRuntimeMutationError::PreparePacketIo {
+        message: message.to_string(),
+    }
+}
+
+impl<B> ProcessNetworkPacketIoRegistry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn from_network_configs_and_mmds_detour_with_factory<F>(
+        configs: &[NetworkInterfaceConfig],
+        mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
+        factory: &mut F,
+    ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError>
+    where
+        F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    {
         validate_network_interface_count(configs.len()).map_err(|source| {
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source }
         })?;
-
-        if configs.is_empty() {
-            return Ok(Self::Noop(NoopProcessNetworkPacketIoProvider::default()));
-        }
-
-        if let Some(mmds_detour) = mmds_detour
-            && mmds_detour.covers_all_interfaces(configs)
+        let startup_policy = if configs.is_empty()
+            || mmds_detour.is_some_and(|detour| detour.covers_all_interfaces(configs))
         {
-            return process_mmds_only_packet_io_provider_from_configs(configs, mmds_detour)
-                .map(Self::MmdsOnly);
+            ProcessNetworkPacketIoStartupPolicy::MmdsPreferred
+        } else {
+            ProcessNetworkPacketIoStartupPolicy::Vmnet
+        };
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT)
+            .map_err(
+                |source| ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { source },
+            )?;
+        let mut provider = Self {
+            entries,
+            next_generation: 0,
+            startup_policy,
+            mmds_detour: mmds_detour.cloned(),
+        };
+        for config in configs {
+            let class = provider.class_for_interface(config.iface_id());
+            let prepared = provider.prepare_entry_with_factory(config, class, factory)?;
+            provider.publish_prepared(prepared);
         }
+        Ok(provider)
+    }
 
-        let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-        process_vmnet_packet_io_provider_from_configs_with_mmds_detour(
-            configs,
-            &mut factory,
-            mmds_detour,
-        )
-        .map(Self::Vmnet)
+    fn class_for_interface(&self, iface_id: &str) -> ProcessNetworkPacketIoEntryClass {
+        if self.startup_policy == ProcessNetworkPacketIoStartupPolicy::MmdsPreferred
+            && self
+                .mmds_detour
+                .as_ref()
+                .is_some_and(|detour| detour.interface_is_configured(iface_id))
+        {
+            ProcessNetworkPacketIoEntryClass::MmdsOnly
+        } else {
+            ProcessNetworkPacketIoEntryClass::Vmnet
+        }
+    }
+
+    fn validate_runtime_authority(
+        &self,
+        class: ProcessNetworkPacketIoEntryClass,
+        vmnet: &VmnetInterfaceConfig,
+        authority: ProcessVmnetAuthority,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        if class == ProcessNetworkPacketIoEntryClass::MmdsOnly
+            || matches!(authority, ProcessVmnetAuthority::Direct)
+        {
+            return Ok(());
+        }
+        let ProcessVmnetAuthority::Contained(authority) = authority else {
+            return Ok(());
+        };
+        let max_interfaces = authority
+            .max_interfaces()
+            .ok_or(NetworkRuntimeMutationError::HostNetworkNotAuthorized)?;
+        if self.vmnet_count() >= usize::from(max_interfaces) {
+            return Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized);
+        }
+        let allowed = match vmnet.mode() {
+            VmnetMode::Host => authority.allows_host(),
+            VmnetMode::Shared => authority.allows_shared(),
+            VmnetMode::Bridged => vmnet
+                .bridged_interface_name()
+                .is_some_and(|bridge| authority.allows_bridge(bridge)),
+        };
+        if !allowed {
+            return Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized);
+        }
+        Ok(())
+    }
+
+    fn prepare_entry_with_factory<F>(
+        &mut self,
+        config: &NetworkInterfaceConfig,
+        class: ProcessNetworkPacketIoEntryClass,
+        factory: &mut F,
+    ) -> Result<PreparedProcessNetworkPacketIoEntry<B>, ProcessNetworkPacketIoProviderBuildError>
+    where
+        F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.iface_id == config.iface_id())
+        {
+            return Err(ProcessNetworkPacketIoProviderBuildError::DuplicateInterface);
+        }
+        if self.entries.len() == self.entries.capacity() {
+            return Err(ProcessNetworkPacketIoProviderBuildError::RegistryCapacity);
+        }
+        let next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or(ProcessNetworkPacketIoProviderBuildError::GenerationExhausted)?;
+        let iface_id = config.iface_id();
+        let packet_io = match class {
+            ProcessNetworkPacketIoEntryClass::MmdsOnly => {
+                VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(
+                    |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
+                        iface_id: iface_id.to_string(),
+                        source,
+                    },
+                )?;
+                let Some(detour) = self
+                    .mmds_detour
+                    .as_ref()
+                    .and_then(|detour| detour.detour_for_interface(iface_id))
+                else {
+                    return Err(
+                        ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour {
+                            iface_id: iface_id.to_string(),
+                        },
+                    );
+                };
+                let packet_io = MmdsOnlyVirtioNetworkPacketIo::new(detour).map_err(|source| {
+                    ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild {
+                        iface_id: iface_id.to_string(),
+                        source,
+                    }
+                })?;
+                ProcessNetworkPacketIo::MmdsOnly(packet_io)
+            }
+            ProcessNetworkPacketIoEntryClass::Vmnet => {
+                let vmnet_config = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
+                    .map_err(
+                        |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
+                            iface_id: iface_id.to_string(),
+                            source,
+                        },
+                    )?;
+                let backend = factory.new_backend(iface_id);
+                let (backend, interface) =
+                    StartedVmnetPacketIoBackend::start(backend, &vmnet_config).map_err(
+                        |source| ProcessNetworkPacketIoProviderBuildError::Start {
+                            iface_id: iface_id.to_string(),
+                            source,
+                        },
+                    )?;
+                let detour = self
+                    .mmds_detour
+                    .as_ref()
+                    .and_then(|detour| detour.detour_for_interface(iface_id));
+                let packet_io = match detour {
+                    Some(detour) => {
+                        VmnetVirtioNetworkPacketIo::with_mmds_detour(backend, interface, detour)
+                    }
+                    None => VmnetVirtioNetworkPacketIo::new(backend, interface),
+                }
+                .map_err(|source| {
+                    ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
+                        iface_id: iface_id.to_string(),
+                        source,
+                    }
+                })?;
+                ProcessNetworkPacketIo::Vmnet(packet_io)
+            }
+        };
+        let generation = self.next_generation;
+        self.next_generation = next_generation;
+        Ok(PreparedProcessNetworkPacketIoEntry {
+            entry: ProcessNetworkPacketIoEntry {
+                generation,
+                iface_id: iface_id.to_string(),
+                packet_io,
+            },
+        })
+    }
+
+    fn publish_prepared(
+        &mut self,
+        prepared: PreparedProcessNetworkPacketIoEntry<B>,
+    ) -> PublishedProcessNetworkPacketIoEntry {
+        assert!(
+            !self
+                .entries
+                .iter()
+                .any(|entry| entry.iface_id == prepared.entry.iface_id),
+            "prepared network packet-I/O publication must remain unique"
+        );
+        assert!(
+            self.entries.len() < self.entries.capacity(),
+            "prepared network packet-I/O publication must retain reserved capacity"
+        );
+        let published = PublishedProcessNetworkPacketIoEntry {
+            generation: prepared.entry.generation,
+            iface_id: prepared.entry.iface_id.clone(),
+        };
+        self.entries.push(prepared.entry);
+        published
+    }
+
+    fn take_interface(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<RemovedProcessNetworkPacketIoEntry<B>, ProcessNetworkPacketIoRegistryError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.iface_id == iface_id)
+            .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
+        Ok(RemovedProcessNetworkPacketIoEntry {
+            index,
+            entry: self.entries.remove(index),
+        })
+    }
+
+    fn take_published(
+        &mut self,
+        published: &PublishedProcessNetworkPacketIoEntry,
+    ) -> Result<RemovedProcessNetworkPacketIoEntry<B>, ProcessNetworkPacketIoRegistryError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.generation == published.generation && entry.iface_id == published.iface_id
+            })
+            .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
+        Ok(RemovedProcessNetworkPacketIoEntry {
+            index,
+            entry: self.entries.remove(index),
+        })
+    }
+
+    fn restore_removed(
+        &mut self,
+        removed: RemovedProcessNetworkPacketIoEntry<B>,
+    ) -> Result<(), ProcessNetworkPacketIoRegistryError> {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.iface_id == removed.entry.iface_id)
+        {
+            return Err(ProcessNetworkPacketIoRegistryError::DuplicateInterface);
+        }
+        if self.entries.len() == self.entries.capacity() || removed.index > self.entries.len() {
+            return Err(ProcessNetworkPacketIoRegistryError::Capacity);
+        }
+        self.entries.insert(removed.index, removed.entry);
+        Ok(())
+    }
+
+    fn vmnet_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.packet_io.is_vmnet())
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessNetworkPacketIoEntryClass {
+    MmdsOnly,
+    Vmnet,
+}
+
+#[derive(Debug)]
+pub(crate) enum ProcessNetworkPacketIoRegistryError {
+    DuplicateInterface,
+    UnknownInterface,
+    Capacity,
+}
+
+impl fmt::Display for ProcessNetworkPacketIoRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateInterface => {
+                formatter.write_str("network packet-I/O interface is already registered")
+            }
+            Self::UnknownInterface => {
+                formatter.write_str("network packet-I/O interface is not registered")
+            }
+            Self::Capacity => formatter.write_str("network packet-I/O registry is full"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessNetworkPacketIoRegistryError {}
+
+#[derive(Debug)]
+pub(crate) enum ProcessNetworkPacketIoStopError {
+    Vmnet {
+        source: VmnetVirtioNetworkPacketIoStopError,
+    },
+}
+
+impl fmt::Display for ProcessNetworkPacketIoStopError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vmnet { source } => write!(formatter, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessNetworkPacketIoStopError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Vmnet { source } => Some(source),
+        }
+    }
+}
+
+pub(crate) trait ProcessRuntimeNetworkPacketIoProvider:
+    Arm64BootNetworkPacketIoProvider
+{
+    type PreparedEntry;
+    type PublishedEntry;
+    type RemovedEntry;
+
+    fn prepare_runtime_entry(
+        &mut self,
+        config: &NetworkInterfaceConfig,
+        authority: ProcessVmnetAuthority,
+    ) -> Result<Self::PreparedEntry, NetworkRuntimeMutationError>;
+
+    fn publish_prepared_entry(&mut self, prepared: Self::PreparedEntry) -> Self::PublishedEntry;
+
+    fn take_published_entry(
+        &mut self,
+        published: &Self::PublishedEntry,
+    ) -> Result<Self::RemovedEntry, ProcessNetworkPacketIoRegistryError>;
+
+    fn take_interface_entry(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<Self::RemovedEntry, ProcessNetworkPacketIoRegistryError>;
+
+    fn stop_removed_entry(
+        removed: &mut Self::RemovedEntry,
+    ) -> Result<(), ProcessNetworkPacketIoStopError>;
+
+    fn restore_removed_entry(
+        &mut self,
+        removed: Self::RemovedEntry,
+    ) -> Result<(), ProcessNetworkPacketIoRegistryError>;
+}
+
+impl ProcessRuntimeNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
+    type PreparedEntry = PreparedProcessNetworkPacketIoEntry<SystemVmnetInterfaceBackend>;
+    type PublishedEntry = PublishedProcessNetworkPacketIoEntry;
+    type RemovedEntry = RemovedProcessNetworkPacketIoEntry<SystemVmnetInterfaceBackend>;
+
+    fn prepare_runtime_entry(
+        &mut self,
+        config: &NetworkInterfaceConfig,
+        authority: ProcessVmnetAuthority,
+    ) -> Result<Self::PreparedEntry, NetworkRuntimeMutationError> {
+        ProcessNetworkPacketIoRegistry::prepare_runtime_entry(self, config, authority)
+    }
+
+    fn publish_prepared_entry(&mut self, prepared: Self::PreparedEntry) -> Self::PublishedEntry {
+        self.publish_prepared(prepared)
+    }
+
+    fn take_published_entry(
+        &mut self,
+        published: &Self::PublishedEntry,
+    ) -> Result<Self::RemovedEntry, ProcessNetworkPacketIoRegistryError> {
+        self.take_published(published)
+    }
+
+    fn take_interface_entry(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<Self::RemovedEntry, ProcessNetworkPacketIoRegistryError> {
+        self.take_interface(iface_id)
+    }
+
+    fn stop_removed_entry(
+        removed: &mut Self::RemovedEntry,
+    ) -> Result<(), ProcessNetworkPacketIoStopError> {
+        removed.stop()
+    }
+
+    fn restore_removed_entry(
+        &mut self,
+        removed: Self::RemovedEntry,
+    ) -> Result<(), ProcessNetworkPacketIoRegistryError> {
+        self.restore_removed(removed)
     }
 }
 
@@ -3850,16 +4563,24 @@ impl ProcessMmdsPacketDetourConfig {
     }
 }
 
-impl Arm64BootNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
+impl<B> Arm64BootNetworkPacketIoProvider for ProcessNetworkPacketIoRegistry<B>
+where
+    B: ProcessVmnetBackend,
+{
     fn packet_io(
         &mut self,
         interface: Arm64BootNetworkInterface<'_>,
     ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
-        match self {
-            Self::Noop(provider) => provider.packet_io(interface),
-            Self::MmdsOnly(provider) => provider.packet_io(interface),
-            Self::Vmnet(provider) => provider.packet_io(interface),
-        }
+        let iface_id = interface.iface_id();
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.iface_id == iface_id)
+            .map(|entry| entry.packet_io.as_packet_io())
+            .ok_or_else(|| {
+                Arm64BootNetworkPacketIoError::new(format!(
+                    "missing process packet I/O for interface {iface_id}"
+                ))
+            })
     }
 }
 
@@ -3868,6 +4589,12 @@ enum ProcessNetworkPacketIoProviderBuildError {
     NetworkInterfaceCount {
         source: NetworkInterfaceConfigError,
     },
+    DuplicateInterface,
+    ProviderCapacity {
+        source: TryReserveError,
+    },
+    RegistryCapacity,
+    GenerationExhausted,
     MmdsState {
         source: MmdsStateLockError,
     },
@@ -3890,9 +4617,7 @@ enum ProcessNetworkPacketIoProviderBuildError {
     MissingMmdsDetour {
         iface_id: String,
     },
-    MmdsOnlyProviderBuild {
-        source: MmdsOnlyVirtioNetworkPacketIoProviderBuildError,
-    },
+    #[cfg(test)]
     ProviderBuild {
         source: VmnetVirtioNetworkPacketIoProviderBuildError,
     },
@@ -3903,6 +4628,16 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
         match self {
             Self::NetworkInterfaceCount { source } => {
                 write!(f, "unsupported network interface count: {source}")
+            }
+            Self::DuplicateInterface => {
+                f.write_str("network packet I/O interface is already configured")
+            }
+            Self::ProviderCapacity { source } => {
+                write!(f, "failed to reserve network packet I/O registry: {source}")
+            }
+            Self::RegistryCapacity => f.write_str("network packet I/O registry is full"),
+            Self::GenerationExhausted => {
+                f.write_str("network packet I/O ownership generation is exhausted")
             }
             Self::MmdsState { source } => {
                 write!(f, "failed to access MMDS state: {source}")
@@ -3934,9 +4669,7 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
             Self::MissingMmdsDetour { iface_id } => {
                 write!(f, "missing MMDS packet detour for interface {iface_id}")
             }
-            Self::MmdsOnlyProviderBuild { source } => {
-                write!(f, "failed to build MMDS-only packet I/O provider: {source}")
-            }
+            #[cfg(test)]
             Self::ProviderBuild { source } => {
                 write!(f, "failed to build vmnet packet I/O provider: {source}")
             }
@@ -3948,13 +4681,17 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NetworkInterfaceCount { source } => Some(source),
+            Self::ProviderCapacity { source } => Some(source),
             Self::MmdsState { source } => Some(source),
             Self::HostDeviceName { source, .. } => Some(source),
             Self::Start { source, .. } => Some(source),
             Self::PacketIoBuild { source, .. } => Some(source),
             Self::MmdsOnlyPacketIoBuild { source, .. } => Some(source),
-            Self::MissingMmdsDetour { .. } => None,
-            Self::MmdsOnlyProviderBuild { source } => Some(source),
+            Self::DuplicateInterface
+            | Self::RegistryCapacity
+            | Self::GenerationExhausted
+            | Self::MissingMmdsDetour { .. } => None,
+            #[cfg(test)]
             Self::ProviderBuild { source } => Some(source),
         }
     }
@@ -4084,6 +4821,7 @@ where
     process_vmnet_packet_io_provider_from_configs_with_mmds_detour(configs, factory, None)
 }
 
+#[cfg(test)]
 fn process_vmnet_packet_io_provider_from_configs_with_mmds_detour<F>(
     configs: &[NetworkInterfaceConfig],
     factory: &mut F,
@@ -4140,46 +4878,11 @@ where
         .map_err(|source| ProcessNetworkPacketIoProviderBuildError::ProviderBuild { source })
 }
 
-fn process_mmds_only_packet_io_provider_from_configs(
-    configs: &[NetworkInterfaceConfig],
-    mmds_detour: &ProcessMmdsPacketDetourConfig,
-) -> Result<MmdsOnlyVirtioNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError> {
-    let mut entries = Vec::new();
-
-    for config in configs {
-        let iface_id = config.iface_id();
-        VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(|source| {
-            ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
-                iface_id: iface_id.to_string(),
-                source,
-            }
-        })?;
-        let Some(detour) = mmds_detour.detour_for_interface(iface_id) else {
-            return Err(
-                ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour {
-                    iface_id: iface_id.to_string(),
-                },
-            );
-        };
-        let packet_io = MmdsOnlyVirtioNetworkPacketIo::new(detour).map_err(|source| {
-            ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild {
-                iface_id: iface_id.to_string(),
-                source,
-            }
-        })?;
-        entries.push(MmdsOnlyVirtioNetworkPacketIoProviderEntry::new(
-            iface_id, packet_io,
-        ));
-    }
-
-    MmdsOnlyVirtioNetworkPacketIoProvider::new(entries).map_err(|source| {
-        ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { source }
-    })
-}
-
 #[derive(Debug, Default)]
+#[cfg(test)]
 struct NoopProcessNetworkTxPacketSink;
 
+#[cfg(test)]
 impl VirtioNetworkTxPacketSink for NoopProcessNetworkTxPacketSink {
     fn transmit_frame(
         &mut self,
@@ -4191,8 +4894,10 @@ impl VirtioNetworkTxPacketSink for NoopProcessNetworkTxPacketSink {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 struct EmptyProcessNetworkRxPacketSource;
 
+#[cfg(test)]
 impl VirtioNetworkRxPacketSource for EmptyProcessNetworkRxPacketSource {
     fn peek_packet(
         &mut self,
@@ -4218,6 +4923,7 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
     type Error: fmt::Display + Send + 'static;
     type Outcome: Clone + fmt::Debug + Send + 'static;
     type SnapshotAuxiliaryQuiescenceGuard: Send + 'static;
+    type PreparedNetworkRemoval: Send + 'static;
 
     fn run_loop_control(&self) -> Self::Control;
 
@@ -4267,6 +4973,43 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         _pmem_id: &str,
     ) -> Result<(), PmemRuntimeMutationError> {
         Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn insert_runtime_network_device(
+        &mut self,
+        _prepared: PreparedNetworkDevice,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn update_runtime_network_interface(
+        &mut self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        self.network_interface_updater()
+            .ok_or(NetworkInterfaceUpdateError::ActiveSessionUnavailable)?
+            .update_network_interface(update)
+    }
+
+    fn prepare_runtime_network_device_removal(
+        &mut self,
+        _iface_id: &str,
+    ) -> Result<Self::PreparedNetworkRemoval, NetworkRuntimeMutationError> {
+        Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn rollback_runtime_network_device_removal(
+        &mut self,
+        _prepared: Self::PreparedNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn commit_runtime_network_device_removal(
+        &mut self,
+        _prepared: Self::PreparedNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
     }
 
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
@@ -4353,6 +5096,7 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
     type Error = HvfArm64BootRunLoopError;
     type Outcome = HvfArm64BootRunLoopOutcome;
     type SnapshotAuxiliaryQuiescenceGuard = HvfArm64BootLimiterRetryWakeupQuiescenceGuard;
+    type PreparedNetworkRemoval = PreparedHvfArm64BootPciNetworkRemoval;
 
     fn run_loop_control(&self) -> Self::Control {
         OwnedHvfArm64BootSession::run_loop_control(self)
@@ -4421,6 +5165,46 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         pmem_id: &str,
     ) -> Result<(), PmemRuntimeMutationError> {
         OwnedHvfArm64BootSession::remove_runtime_pmem_device(self, pmem_id)
+    }
+
+    fn insert_runtime_network_device(
+        &mut self,
+        prepared: PreparedNetworkDevice,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        OwnedHvfArm64BootSession::insert_runtime_network_device(self, prepared)
+    }
+
+    fn update_runtime_network_interface(
+        &mut self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        if self.uses_pci_data_devices() {
+            return OwnedHvfArm64BootSession::update_runtime_network_interface(self, update);
+        }
+        NetworkPacketIoRunLoopSession::network_interface_updater(self)
+            .ok_or(NetworkInterfaceUpdateError::ActiveSessionUnavailable)?
+            .update_network_interface(update)
+    }
+
+    fn prepare_runtime_network_device_removal(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<Self::PreparedNetworkRemoval, NetworkRuntimeMutationError> {
+        OwnedHvfArm64BootSession::prepare_runtime_network_device_removal(self, iface_id)
+    }
+
+    fn rollback_runtime_network_device_removal(
+        &mut self,
+        prepared: Self::PreparedNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        OwnedHvfArm64BootSession::rollback_runtime_network_device_removal(self, prepared)
+    }
+
+    fn commit_runtime_network_device_removal(
+        &mut self,
+        prepared: Self::PreparedNetworkRemoval,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        OwnedHvfArm64BootSession::commit_runtime_network_device_removal(self, prepared)
     }
 
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
@@ -4634,6 +5418,30 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         _pmem_id: &str,
     ) -> Result<(), PmemRuntimeMutationError> {
         Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn insert_runtime_network_device(
+        &mut self,
+        _config: NetworkInterfaceConfig,
+        _authority: ProcessVmnetAuthority,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn remove_runtime_network_device(
+        &mut self,
+        _iface_id: &str,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn update_network_interface(
+        &mut self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        self.network_interface_updater()
+            .ok_or(NetworkInterfaceUpdateError::ActiveSessionUnavailable)?
+            .update_network_interface(update)
     }
 
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
@@ -4921,7 +5729,7 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
 impl<S, P> BootRunLoopSession for ProcessHvfBootSession<S, P>
 where
     S: NetworkPacketIoRunLoopSession,
-    P: Arm64BootNetworkPacketIoProvider + Send + 'static,
+    P: ProcessRuntimeNetworkPacketIoProvider + Send + 'static,
 {
     type Control = S::Control;
     type Error = S::Error;
@@ -4979,6 +5787,28 @@ where
         pmem_id: &str,
     ) -> Result<(), PmemRuntimeMutationError> {
         self.session.remove_runtime_pmem_device(pmem_id)
+    }
+
+    fn insert_runtime_network_device(
+        &mut self,
+        config: NetworkInterfaceConfig,
+        authority: ProcessVmnetAuthority,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        ProcessHvfBootSession::insert_runtime_network_device(self, &config, authority)
+    }
+
+    fn remove_runtime_network_device(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        ProcessHvfBootSession::remove_runtime_network_device(self, iface_id)
+    }
+
+    fn update_network_interface(
+        &mut self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        ProcessHvfBootSession::update_runtime_network_interface(self, update)
     }
 
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
@@ -5562,6 +6392,20 @@ where
     match err {
         BootRunLoopCommandError::Command { source } => source,
         other => PmemRuntimeMutationError::ActiveSessionCommand {
+            message: other.to_string(),
+        },
+    }
+}
+
+fn network_runtime_mutation_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, NetworkRuntimeMutationError>,
+) -> NetworkRuntimeMutationError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        other => NetworkRuntimeMutationError::ActiveSessionCommand {
             message: other.to_string(),
         },
     }
@@ -6369,6 +7213,14 @@ where
         let _ = self.control.request_stop();
     }
 
+    fn fail_runtime_network_mutation(&self, error: &NetworkRuntimeMutationError) {
+        self.status
+            .record(BootRunLoopWorkerStatus::Failed(error.to_string()));
+        self.admission.shutdown();
+        self.pause_gate.shutdown();
+        let _ = self.control.request_stop();
+    }
+
     fn stop_and_join(&mut self) {
         let Some(worker) = self.worker.take() else {
             return;
@@ -6919,14 +7771,50 @@ where
         result
     }
 
+    fn insert_runtime_network_device(
+        &mut self,
+        config: NetworkInterfaceConfig,
+        authority: ProcessVmnetAuthority,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(NetworkRuntimeMutationError::ActiveSessionUnavailable);
+        }
+        let result = self
+            .run_command(move |session| session.insert_runtime_network_device(config, authority))
+            .map_err(network_runtime_mutation_error_from_boot_run_loop_command);
+        if let Err(error @ NetworkRuntimeMutationError::TerminalInsertion { .. }) = &result {
+            self.fail_runtime_network_mutation(error);
+        }
+        result
+    }
+
+    fn remove_runtime_network_device(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(NetworkRuntimeMutationError::ActiveSessionUnavailable);
+        }
+        let iface_id = iface_id.to_string();
+        let result = self
+            .run_command(move |session| session.remove_runtime_network_device(&iface_id))
+            .map_err(network_runtime_mutation_error_from_boot_run_loop_command);
+        if let Err(error @ NetworkRuntimeMutationError::TerminalRemoval { .. }) = &result {
+            self.fail_runtime_network_mutation(error);
+        }
+        result
+    }
+
     fn update_network_interface(
         &mut self,
         update: NetworkInterfaceUpdate,
     ) -> Result<(), NetworkInterfaceUpdateError> {
-        let Some(updater) = self.network_interface_updater.as_ref() else {
-            return Err(NetworkInterfaceUpdateError::ActiveSessionUnavailable);
-        };
-
         if !matches!(
             self.status(),
             BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
@@ -6934,8 +7822,7 @@ where
             return Err(NetworkInterfaceUpdateError::ActiveSessionUnavailable);
         }
 
-        let updater = updater.clone();
-        self.run_command(move |_| updater.update_network_interface(&update))
+        self.run_command(move |session| session.update_network_interface(&update))
             .map_err(network_interface_update_error_from_boot_run_loop_command)
     }
 
@@ -7228,7 +8115,8 @@ mod tests {
         MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig, NetworkInterfaceConfigError,
         NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkInterfaceUpdate,
         NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput, NetworkMmioLayout,
-        NetworkRateLimiterConfig, NetworkTokenBucketConfig, PreparedNetworkDevices,
+        NetworkRateLimiterConfig, NetworkRuntimeMutationError, NetworkTokenBucketConfig,
+        PreparedNetworkDevice, PreparedNetworkDevices,
     };
     use bangbang_runtime::pmem::{
         PmemConfig, PmemConfigInput, PmemConfigs, PmemFileBacking, PmemMmioLayout,
@@ -7269,6 +8157,7 @@ mod tests {
     };
     use bangbang_session::VmnetAuthority;
 
+    use crate::host_network::virtio_vmnet::VmnetVirtioNetworkPacketIoStopError;
     use crate::host_network::vmnet::{
         VmnetError, VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceDescriptor,
         VmnetInterfaceDescriptorError, VmnetOperation, VmnetPacketIoBackend, VmnetPacketIoError,
@@ -7295,6 +8184,8 @@ mod tests {
         NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
         NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
         ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
+        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
+        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
         ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
         ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
         SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
@@ -7673,6 +8564,13 @@ mod tests {
         block_remove_count: usize,
         last_block_remove: Option<String>,
         block_remove_result: Option<DriveRuntimeMutationError>,
+        network_insert_count: usize,
+        last_network_insert: Option<String>,
+        last_network_authority: Option<ProcessVmnetAuthority>,
+        network_insert_result: Option<NetworkRuntimeMutationError>,
+        network_remove_count: usize,
+        last_network_remove: Option<String>,
+        network_remove_result: Option<NetworkRuntimeMutationError>,
         network_update_count: usize,
         last_network_update: Option<NetworkInterfaceUpdate>,
         network_update_result: Option<NetworkInterfaceUpdateError>,
@@ -7735,6 +8633,13 @@ mod tests {
                 block_remove_count: 0,
                 last_block_remove: None,
                 block_remove_result: None,
+                network_insert_count: 0,
+                last_network_insert: None,
+                last_network_authority: None,
+                network_insert_result: None,
+                network_remove_count: 0,
+                last_network_remove: None,
+                network_remove_result: None,
                 network_update_count: 0,
                 last_network_update: None,
                 network_update_result: None,
@@ -7789,6 +8694,18 @@ mod tests {
         fn with_block_remove_result(id: u64, result: DriveRuntimeMutationError) -> Self {
             let mut session = Self::new(id);
             session.block_remove_result = Some(result);
+            session
+        }
+
+        fn with_network_insert_result(id: u64, result: NetworkRuntimeMutationError) -> Self {
+            let mut session = Self::new(id);
+            session.network_insert_result = Some(result);
+            session
+        }
+
+        fn with_network_remove_result(id: u64, result: NetworkRuntimeMutationError) -> Self {
+            let mut session = Self::new(id);
+            session.network_remove_result = Some(result);
             session
         }
 
@@ -7966,6 +8883,32 @@ mod tests {
             self.block_remove_count += 1;
             self.last_block_remove = Some(drive_id.to_string());
             match self.block_remove_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn insert_runtime_network_device(
+            &mut self,
+            config: NetworkInterfaceConfig,
+            authority: ProcessVmnetAuthority,
+        ) -> Result<(), NetworkRuntimeMutationError> {
+            self.network_insert_count += 1;
+            self.last_network_insert = Some(config.iface_id().to_string());
+            self.last_network_authority = Some(authority);
+            match self.network_insert_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn remove_runtime_network_device(
+            &mut self,
+            iface_id: &str,
+        ) -> Result<(), NetworkRuntimeMutationError> {
+            self.network_remove_count += 1;
+            self.last_network_remove = Some(iface_id.to_string());
+            match self.network_remove_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
             }
@@ -8666,6 +9609,9 @@ mod tests {
         runtime_pmem_events: Arc<Mutex<Vec<String>>>,
         runtime_pmem_insert_result: Option<PmemRuntimeMutationError>,
         runtime_pmem_remove_result: Option<PmemRuntimeMutationError>,
+        runtime_network_events: Arc<Mutex<Vec<String>>>,
+        runtime_network_insert_result: Option<NetworkRuntimeMutationError>,
+        runtime_network_remove_result: Option<NetworkRuntimeMutationError>,
         network_interface_updater: Option<BootRunLoopNetworkInterfaceUpdater>,
         pmem_device_updater: Option<BootRunLoopPmemDeviceUpdater>,
         pmem_retry_wakeup_after_updates: Arc<Mutex<Vec<bool>>>,
@@ -8712,6 +9658,9 @@ mod tests {
                 runtime_pmem_events: Arc::default(),
                 runtime_pmem_insert_result: None,
                 runtime_pmem_remove_result: None,
+                runtime_network_events: Arc::default(),
+                runtime_network_insert_result: None,
+                runtime_network_remove_result: None,
                 network_interface_updater: None,
                 pmem_device_updater: None,
                 pmem_retry_wakeup_after_updates: Arc::default(),
@@ -8869,6 +9818,26 @@ mod tests {
 
         fn with_runtime_pmem_remove_result(mut self, result: PmemRuntimeMutationError) -> Self {
             self.runtime_pmem_remove_result = Some(result);
+            self
+        }
+
+        fn runtime_network_events(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.runtime_network_events)
+        }
+
+        fn with_runtime_network_insert_result(
+            mut self,
+            result: NetworkRuntimeMutationError,
+        ) -> Self {
+            self.runtime_network_insert_result = Some(result);
+            self
+        }
+
+        fn with_runtime_network_remove_result(
+            mut self,
+            result: NetworkRuntimeMutationError,
+        ) -> Self {
+            self.runtime_network_remove_result = Some(result);
             self
         }
 
@@ -9051,6 +10020,35 @@ mod tests {
                 .expect("fake runtime pmem events should lock")
                 .push(format!("remove:{pmem_id}"));
             match self.runtime_pmem_remove_result.clone() {
+                Some(source) => Err(source),
+                None => Ok(()),
+            }
+        }
+
+        fn insert_runtime_network_device(
+            &mut self,
+            config: NetworkInterfaceConfig,
+            _authority: ProcessVmnetAuthority,
+        ) -> Result<(), NetworkRuntimeMutationError> {
+            self.runtime_network_events
+                .lock()
+                .expect("fake runtime network events should lock")
+                .push(format!("insert:{}", config.iface_id()));
+            match self.runtime_network_insert_result.clone() {
+                Some(source) => Err(source),
+                None => Ok(()),
+            }
+        }
+
+        fn remove_runtime_network_device(
+            &mut self,
+            iface_id: &str,
+        ) -> Result<(), NetworkRuntimeMutationError> {
+            self.runtime_network_events
+                .lock()
+                .expect("fake runtime network events should lock")
+                .push(format!("remove:{iface_id}"));
+            match self.runtime_network_remove_result.clone() {
                 Some(source) => Err(source),
                 None => Ok(()),
             }
@@ -9269,6 +10267,7 @@ mod tests {
         type Error = FakeRunLoopError;
         type Outcome = FakeRunLoopOutcome;
         type SnapshotAuxiliaryQuiescenceGuard = ();
+        type PreparedNetworkRemoval = ();
 
         fn run_loop_control(&self) -> Self::Control {
             self.control.clone()
@@ -9333,6 +10332,332 @@ mod tests {
         }
     }
 
+    impl ProcessRuntimeNetworkPacketIoProvider for RecordingProcessNetworkPacketIoProvider {
+        type PreparedEntry = ();
+        type PublishedEntry = ();
+        type RemovedEntry = ();
+
+        fn prepare_runtime_entry(
+            &mut self,
+            _config: &NetworkInterfaceConfig,
+            _authority: ProcessVmnetAuthority,
+        ) -> Result<Self::PreparedEntry, NetworkRuntimeMutationError> {
+            Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
+        }
+
+        fn publish_prepared_entry(
+            &mut self,
+            _prepared: Self::PreparedEntry,
+        ) -> Self::PublishedEntry {
+        }
+
+        fn take_published_entry(
+            &mut self,
+            _published: &Self::PublishedEntry,
+        ) -> Result<Self::RemovedEntry, ProcessNetworkPacketIoRegistryError> {
+            Err(ProcessNetworkPacketIoRegistryError::UnknownInterface)
+        }
+
+        fn take_interface_entry(
+            &mut self,
+            _iface_id: &str,
+        ) -> Result<Self::RemovedEntry, ProcessNetworkPacketIoRegistryError> {
+            Err(ProcessNetworkPacketIoRegistryError::UnknownInterface)
+        }
+
+        fn stop_removed_entry(
+            _removed: &mut Self::RemovedEntry,
+        ) -> Result<(), ProcessNetworkPacketIoStopError> {
+            Ok(())
+        }
+
+        fn restore_removed_entry(
+            &mut self,
+            _removed: Self::RemovedEntry,
+        ) -> Result<(), ProcessNetworkPacketIoRegistryError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RuntimeNetworkTransactionSession {
+        control: FakeRunLoopControl,
+        events: Arc<Mutex<Vec<String>>>,
+        insert_error: Option<NetworkRuntimeMutationError>,
+        prepare_removal_error: Option<NetworkRuntimeMutationError>,
+        rollback_error: Option<NetworkRuntimeMutationError>,
+        commit_error: Option<NetworkRuntimeMutationError>,
+    }
+
+    impl RuntimeNetworkTransactionSession {
+        fn new(events: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                control: FakeRunLoopControl::default(),
+                events,
+                insert_error: None,
+                prepare_removal_error: None,
+                rollback_error: None,
+                commit_error: None,
+            }
+        }
+
+        fn with_insert_error(mut self, error: NetworkRuntimeMutationError) -> Self {
+            self.insert_error = Some(error);
+            self
+        }
+
+        fn with_commit_error(mut self, error: NetworkRuntimeMutationError) -> Self {
+            self.commit_error = Some(error);
+            self
+        }
+    }
+
+    impl NetworkPacketIoRunLoopSession for RuntimeNetworkTransactionSession {
+        type Control = FakeRunLoopControl;
+        type Error = FakeRunLoopError;
+        type Outcome = FakeRunLoopOutcome;
+        type SnapshotAuxiliaryQuiescenceGuard = ();
+        type PreparedNetworkRemoval = String;
+
+        fn run_loop_control(&self) -> Self::Control {
+            self.control.clone()
+        }
+
+        fn quiesce_snapshot_auxiliary_work(
+            &self,
+        ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError> {
+            Ok(())
+        }
+
+        fn insert_runtime_network_device(
+            &mut self,
+            prepared: PreparedNetworkDevice,
+        ) -> Result<(), NetworkRuntimeMutationError> {
+            push_recorded_event(
+                &self.events,
+                format!("endpoint-publish:{}", prepared.iface_id()),
+            );
+            match self.insert_error.clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        fn prepare_runtime_network_device_removal(
+            &mut self,
+            iface_id: &str,
+        ) -> Result<Self::PreparedNetworkRemoval, NetworkRuntimeMutationError> {
+            push_recorded_event(&self.events, format!("endpoint-prepare-remove:{iface_id}"));
+            match self.prepare_removal_error.clone() {
+                Some(error) => Err(error),
+                None => Ok(iface_id.to_string()),
+            }
+        }
+
+        fn rollback_runtime_network_device_removal(
+            &mut self,
+            prepared: Self::PreparedNetworkRemoval,
+        ) -> Result<(), NetworkRuntimeMutationError> {
+            push_recorded_event(&self.events, format!("endpoint-rollback:{prepared}"));
+            match self.rollback_error.clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        fn commit_runtime_network_device_removal(
+            &mut self,
+            prepared: Self::PreparedNetworkRemoval,
+        ) -> Result<(), NetworkRuntimeMutationError> {
+            push_recorded_event(&self.events, format!("endpoint-commit:{prepared}"));
+            match self.commit_error.clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        fn run_loop_with_network_packet_io<P>(
+            &mut self,
+            _stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
+            _max_steps: NonZeroUsize,
+            _packet_io: &mut P,
+        ) -> Result<Self::Outcome, Self::Error>
+        where
+            P: Arm64BootNetworkPacketIoProvider,
+        {
+            Ok(FakeRunLoopOutcome::Terminal)
+        }
+
+        fn should_continue_after_outcome(_outcome: &Self::Outcome) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug)]
+    struct RuntimeNetworkTransactionEntry {
+        iface_id: String,
+        events: Arc<Mutex<Vec<String>>>,
+        stop_fails: bool,
+    }
+
+    #[derive(Debug)]
+    struct RuntimeNetworkTransactionProvider {
+        events: Arc<Mutex<Vec<String>>>,
+        live_iface: Option<String>,
+        prepare_error: Option<NetworkRuntimeMutationError>,
+        take_fails: bool,
+        stop_fails: bool,
+        restore_fails: bool,
+    }
+
+    impl RuntimeNetworkTransactionProvider {
+        fn empty(events: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                events,
+                live_iface: None,
+                prepare_error: None,
+                take_fails: false,
+                stop_fails: false,
+                restore_fails: false,
+            }
+        }
+
+        fn with_live_iface(events: Arc<Mutex<Vec<String>>>, iface_id: &str) -> Self {
+            Self {
+                live_iface: Some(iface_id.to_string()),
+                ..Self::empty(events)
+            }
+        }
+
+        fn with_take_failure(mut self) -> Self {
+            self.take_fails = true;
+            self
+        }
+
+        fn with_stop_failure(mut self) -> Self {
+            self.stop_fails = true;
+            self
+        }
+
+        fn with_restore_failure(mut self) -> Self {
+            self.restore_fails = true;
+            self
+        }
+    }
+
+    impl Arm64BootNetworkPacketIoProvider for RuntimeNetworkTransactionProvider {
+        fn packet_io(
+            &mut self,
+            _interface: Arm64BootNetworkInterface<'_>,
+        ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
+            Err(Arm64BootNetworkPacketIoError::new(
+                "transaction test does not dispatch packets",
+            ))
+        }
+    }
+
+    impl ProcessRuntimeNetworkPacketIoProvider for RuntimeNetworkTransactionProvider {
+        type PreparedEntry = RuntimeNetworkTransactionEntry;
+        type PublishedEntry = String;
+        type RemovedEntry = RuntimeNetworkTransactionEntry;
+
+        fn prepare_runtime_entry(
+            &mut self,
+            config: &NetworkInterfaceConfig,
+            _authority: ProcessVmnetAuthority,
+        ) -> Result<Self::PreparedEntry, NetworkRuntimeMutationError> {
+            push_recorded_event(
+                &self.events,
+                format!("provider-prepare:{}", config.iface_id()),
+            );
+            if let Some(error) = self.prepare_error.clone() {
+                return Err(error);
+            }
+            Ok(RuntimeNetworkTransactionEntry {
+                iface_id: config.iface_id().to_string(),
+                events: Arc::clone(&self.events),
+                stop_fails: self.stop_fails,
+            })
+        }
+
+        fn publish_prepared_entry(
+            &mut self,
+            prepared: Self::PreparedEntry,
+        ) -> Self::PublishedEntry {
+            push_recorded_event(
+                &self.events,
+                format!("provider-publish:{}", prepared.iface_id),
+            );
+            assert!(self.live_iface.is_none());
+            self.live_iface = Some(prepared.iface_id.clone());
+            prepared.iface_id
+        }
+
+        fn take_published_entry(
+            &mut self,
+            published: &Self::PublishedEntry,
+        ) -> Result<Self::RemovedEntry, ProcessNetworkPacketIoRegistryError> {
+            push_recorded_event(&self.events, format!("provider-take-published:{published}"));
+            self.take_entry(published)
+        }
+
+        fn take_interface_entry(
+            &mut self,
+            iface_id: &str,
+        ) -> Result<Self::RemovedEntry, ProcessNetworkPacketIoRegistryError> {
+            push_recorded_event(&self.events, format!("provider-take:{iface_id}"));
+            self.take_entry(iface_id)
+        }
+
+        fn stop_removed_entry(
+            removed: &mut Self::RemovedEntry,
+        ) -> Result<(), ProcessNetworkPacketIoStopError> {
+            push_recorded_event(
+                &removed.events,
+                format!("provider-stop:{}", removed.iface_id),
+            );
+            if removed.stop_fails {
+                Err(ProcessNetworkPacketIoStopError::Vmnet {
+                    source: VmnetVirtioNetworkPacketIoStopError::StatePoisoned,
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        fn restore_removed_entry(
+            &mut self,
+            removed: Self::RemovedEntry,
+        ) -> Result<(), ProcessNetworkPacketIoRegistryError> {
+            push_recorded_event(
+                &self.events,
+                format!("provider-restore:{}", removed.iface_id),
+            );
+            if self.restore_fails {
+                return Err(ProcessNetworkPacketIoRegistryError::Capacity);
+            }
+            self.live_iface = Some(removed.iface_id);
+            Ok(())
+        }
+    }
+
+    impl RuntimeNetworkTransactionProvider {
+        fn take_entry(
+            &mut self,
+            iface_id: &str,
+        ) -> Result<RuntimeNetworkTransactionEntry, ProcessNetworkPacketIoRegistryError> {
+            if self.take_fails || self.live_iface.as_deref() != Some(iface_id) {
+                return Err(ProcessNetworkPacketIoRegistryError::UnknownInterface);
+            }
+            self.live_iface = None;
+            Ok(RuntimeNetworkTransactionEntry {
+                iface_id: iface_id.to_string(),
+                events: Arc::clone(&self.events),
+                stop_fails: self.stop_fails,
+            })
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RecordingVmnetInterface {
         iface_id: String,
@@ -9343,6 +10668,7 @@ mod tests {
         iface_id: String,
         events: Arc<Mutex<Vec<String>>>,
         start_status: Option<VmnetStatus>,
+        stop_status: Option<VmnetStatus>,
     }
 
     impl VmnetInterfaceBackend for RecordingVmnetPacketIoBackend {
@@ -9375,6 +10701,9 @@ mod tests {
 
         fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
             push_recorded_event(&self.events, format!("stop:{}", interface.iface_id));
+            if let Some(status) = self.stop_status {
+                return Err(VmnetError::new(VmnetOperation::StopInterface, status));
+            }
             Ok(())
         }
     }
@@ -9405,6 +10734,7 @@ mod tests {
     struct RecordingVmnetPacketIoBackendFactory {
         events: Arc<Mutex<Vec<String>>>,
         start_statuses: VecDeque<Option<VmnetStatus>>,
+        stop_statuses: VecDeque<Option<VmnetStatus>>,
     }
 
     impl RecordingVmnetPacketIoBackendFactory {
@@ -9414,6 +10744,11 @@ mod tests {
 
         fn with_next_start_status(mut self, status: Option<VmnetStatus>) -> Self {
             self.start_statuses.push_back(status);
+            self
+        }
+
+        fn with_next_stop_status(mut self, status: Option<VmnetStatus>) -> Self {
+            self.stop_statuses.push_back(status);
             self
         }
     }
@@ -9427,6 +10762,7 @@ mod tests {
                 iface_id: iface_id.to_string(),
                 events: Arc::clone(&self.events),
                 start_status: self.start_statuses.pop_front().unwrap_or(None),
+                stop_status: self.stop_statuses.pop_front().unwrap_or(None),
             }
         }
     }
@@ -10378,20 +11714,211 @@ mod tests {
     }
 
     #[test]
-    fn process_network_packet_io_provider_empty_configs_use_noop() {
-        let mut provider = ProcessNetworkPacketIoProvider::from_network_configs(&[])
-            .expect("empty network configs should build a no-op provider");
+    fn process_hvf_boot_session_publishes_provider_before_runtime_network_endpoint() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inner = RuntimeNetworkTransactionSession::new(Arc::clone(&events));
+        let provider = RuntimeNetworkTransactionProvider::empty(Arc::clone(&events));
+        let mut session = ProcessHvfBootSession::new(inner, provider, None);
+        let config = network_configs([("eth0", "vmnet:shared")]).remove(0);
 
-        match &provider {
-            ProcessNetworkPacketIoProvider::Noop(_) => {}
-            ProcessNetworkPacketIoProvider::MmdsOnly(_)
-            | ProcessNetworkPacketIoProvider::Vmnet(_) => {
-                panic!("empty network configs should not build a network provider");
-            }
-        }
-        provider
+        session
+            .insert_runtime_network_device(&config, ProcessVmnetAuthority::Direct)
+            .expect("runtime network insertion should commit");
+
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "provider-prepare:eth0".to_string(),
+                "provider-publish:eth0".to_string(),
+                "endpoint-publish:eth0".to_string(),
+            ]
+        );
+        assert_eq!(session.packet_io.live_iface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn process_hvf_boot_session_cleans_hidden_provider_after_endpoint_publish_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inner = RuntimeNetworkTransactionSession::new(Arc::clone(&events)).with_insert_error(
+            NetworkRuntimeMutationError::PublishDevice {
+                message: "injected endpoint publication failure".to_string(),
+            },
+        );
+        let provider = RuntimeNetworkTransactionProvider::empty(Arc::clone(&events));
+        let mut session = ProcessHvfBootSession::new(inner, provider, None);
+        let config = network_configs([("eth0", "vmnet:shared")]).remove(0);
+
+        assert!(matches!(
+            session.insert_runtime_network_device(&config, ProcessVmnetAuthority::Direct),
+            Err(NetworkRuntimeMutationError::PublishDevice { .. })
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "provider-prepare:eth0".to_string(),
+                "provider-publish:eth0".to_string(),
+                "endpoint-publish:eth0".to_string(),
+                "provider-take-published:eth0".to_string(),
+                "provider-stop:eth0".to_string(),
+            ]
+        );
+        assert!(session.packet_io.live_iface.is_none());
+    }
+
+    #[test]
+    fn process_hvf_boot_session_failed_insertion_cleanup_is_terminal() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inner = RuntimeNetworkTransactionSession::new(Arc::clone(&events)).with_insert_error(
+            NetworkRuntimeMutationError::PublishDevice {
+                message: "injected endpoint publication failure".to_string(),
+            },
+        );
+        let provider = RuntimeNetworkTransactionProvider::empty(Arc::clone(&events))
+            .with_stop_failure()
+            .with_restore_failure();
+        let mut session = ProcessHvfBootSession::new(inner, provider, None);
+        let config = network_configs([("eth0", "vmnet:shared")]).remove(0);
+
+        assert!(matches!(
+            session.insert_runtime_network_device(&config, ProcessVmnetAuthority::Direct),
+            Err(NetworkRuntimeMutationError::TerminalInsertion { .. })
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "provider-prepare:eth0".to_string(),
+                "provider-publish:eth0".to_string(),
+                "endpoint-publish:eth0".to_string(),
+                "provider-take-published:eth0".to_string(),
+                "provider-stop:eth0".to_string(),
+                "provider-restore:eth0".to_string(),
+            ]
+        );
+        assert!(session.packet_io.live_iface.is_none());
+    }
+
+    #[test]
+    fn process_hvf_boot_session_commits_runtime_network_removal_after_provider_stop() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inner = RuntimeNetworkTransactionSession::new(Arc::clone(&events));
+        let provider =
+            RuntimeNetworkTransactionProvider::with_live_iface(Arc::clone(&events), "eth0");
+        let mut session = ProcessHvfBootSession::new(inner, provider, None);
+
+        session
+            .remove_runtime_network_device("eth0")
+            .expect("runtime network removal should commit");
+
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "endpoint-prepare-remove:eth0".to_string(),
+                "provider-take:eth0".to_string(),
+                "provider-stop:eth0".to_string(),
+                "endpoint-commit:eth0".to_string(),
+            ]
+        );
+        assert!(session.packet_io.live_iface.is_none());
+    }
+
+    #[test]
+    fn process_hvf_boot_session_vmnet_stop_failure_restores_owners_and_is_terminal() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inner = RuntimeNetworkTransactionSession::new(Arc::clone(&events));
+        let provider = RuntimeNetworkTransactionProvider::with_live_iface(
+            Arc::clone(&events),
+            "private_iface",
+        )
+        .with_stop_failure();
+        let mut session = ProcessHvfBootSession::new(inner, provider, None);
+
+        let error = session
+            .remove_runtime_network_device("private_iface")
+            .expect_err("uncertain vmnet stop should be terminal");
+
+        assert!(matches!(
+            error,
+            NetworkRuntimeMutationError::TerminalRemoval { .. }
+        ));
+        assert!(!error.to_string().contains("private_iface"));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "endpoint-prepare-remove:private_iface".to_string(),
+                "provider-take:private_iface".to_string(),
+                "provider-stop:private_iface".to_string(),
+                "provider-restore:private_iface".to_string(),
+                "endpoint-rollback:private_iface".to_string(),
+            ]
+        );
+        assert_eq!(
+            session.packet_io.live_iface.as_deref(),
+            Some("private_iface")
+        );
+    }
+
+    #[test]
+    fn process_hvf_boot_session_provider_take_failure_rolls_back_endpoint_and_is_terminal() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inner = RuntimeNetworkTransactionSession::new(Arc::clone(&events));
+        let provider =
+            RuntimeNetworkTransactionProvider::with_live_iface(Arc::clone(&events), "eth0")
+                .with_take_failure();
+        let mut session = ProcessHvfBootSession::new(inner, provider, None);
+
+        assert!(matches!(
+            session.remove_runtime_network_device("eth0"),
+            Err(NetworkRuntimeMutationError::TerminalRemoval { .. })
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "endpoint-prepare-remove:eth0".to_string(),
+                "provider-take:eth0".to_string(),
+                "endpoint-rollback:eth0".to_string(),
+            ]
+        );
+        assert_eq!(session.packet_io.live_iface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn process_hvf_boot_session_endpoint_commit_failure_is_terminal_after_provider_stop() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inner = RuntimeNetworkTransactionSession::new(Arc::clone(&events)).with_commit_error(
+            NetworkRuntimeMutationError::RemoveDevice {
+                message: "injected endpoint commit failure".to_string(),
+            },
+        );
+        let provider =
+            RuntimeNetworkTransactionProvider::with_live_iface(Arc::clone(&events), "eth0");
+        let mut session = ProcessHvfBootSession::new(inner, provider, None);
+
+        assert!(matches!(
+            session.remove_runtime_network_device("eth0"),
+            Err(NetworkRuntimeMutationError::TerminalRemoval { .. })
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "endpoint-prepare-remove:eth0".to_string(),
+                "provider-take:eth0".to_string(),
+                "provider-stop:eth0".to_string(),
+                "endpoint-commit:eth0".to_string(),
+            ]
+        );
+        assert!(session.packet_io.live_iface.is_none());
+    }
+
+    #[test]
+    fn process_network_packet_io_provider_empty_configs_have_no_entries() {
+        let mut provider = ProcessNetworkPacketIoProvider::from_network_configs(&[])
+            .expect("empty network configs should build an empty provider");
+
+        assert!(provider.entries.is_empty());
+        let error = provider
             .packet_io(test_boot_network_device().interface())
-            .expect("no-op provider should return packet I/O for any device");
+            .expect_err("empty provider should reject an unknown device");
+        assert!(error.to_string().contains("missing process packet I/O"));
     }
 
     #[test]
@@ -10497,15 +12024,192 @@ mod tests {
         )
         .expect("all-MMDS network configs should build an MMDS-only provider");
 
-        match &provider {
-            ProcessNetworkPacketIoProvider::MmdsOnly(_) => {}
-            ProcessNetworkPacketIoProvider::Noop(_) | ProcessNetworkPacketIoProvider::Vmnet(_) => {
-                panic!("all-MMDS network configs should not open vmnet resources");
-            }
-        }
+        assert_eq!(provider.entries.len(), configs.len());
+        assert!(
+            provider
+                .entries
+                .iter()
+                .all(|entry| !entry.packet_io.is_vmnet()),
+            "all-MMDS network configs should not open vmnet resources"
+        );
         provider
             .packet_io(test_boot_network_device().interface())
             .expect("MMDS-only provider should return packet I/O for configured device");
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_keeps_startup_mode_for_later_entries() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mmds_config = MmdsConfigInput::new(vec!["eth0".to_string()])
+            .validate(&configs)
+            .expect("MMDS config should validate");
+        let detour_config = ProcessMmdsPacketDetourConfig::from_mmds_config(
+            MmdsStateHandle::default(),
+            &mmds_config,
+            SharedMmdsMetrics::default(),
+        );
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let events = factory.events();
+        let mut provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                Some(&detour_config),
+                &mut factory,
+            )
+            .expect("all-MMDS provider should build");
+        assert_eq!(
+            provider.startup_policy,
+            super::ProcessNetworkPacketIoStartupPolicy::MmdsPreferred
+        );
+        assert!(recorded_events(&events).is_empty());
+
+        let removed = provider
+            .take_interface("eth0")
+            .expect("startup MMDS entry should be removable");
+        drop(removed);
+        let class = provider.class_for_interface("eth0");
+        assert_eq!(class, super::ProcessNetworkPacketIoEntryClass::MmdsOnly);
+        let prepared = provider
+            .prepare_entry_with_factory(&configs[0], class, &mut factory)
+            .expect("predeclared MMDS identity should prepare without vmnet");
+        provider.publish_prepared(prepared);
+        assert_eq!(provider.entries.len(), 1);
+        assert!(!provider.entries[0].packet_io.is_vmnet());
+        assert!(recorded_events(&events).is_empty());
+
+        let new_config = NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:shared")
+            .validate()
+            .expect("new runtime network config should validate");
+        assert_eq!(
+            provider.class_for_interface(new_config.iface_id()),
+            super::ProcessNetworkPacketIoEntryClass::Vmnet
+        );
+        let prepared = provider
+            .prepare_entry_with_factory(
+                &new_config,
+                super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                &mut factory,
+            )
+            .expect("non-MMDS runtime identity should prepare vmnet");
+        provider.publish_prepared(prepared);
+        assert_eq!(provider.vmnet_count(), 1);
+        drop(provider);
+        assert!(
+            recorded_events(&events)
+                .iter()
+                .any(|event| event == "stop:eth1")
+        );
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_mixed_startup_keeps_every_entry_on_vmnet() {
+        let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "vmnet:shared")]);
+        let mmds_config = MmdsConfigInput::new(vec!["eth0".to_string()])
+            .validate(&configs)
+            .expect("MMDS config should validate");
+        let detour_config = ProcessMmdsPacketDetourConfig::from_mmds_config(
+            MmdsStateHandle::default(),
+            &mmds_config,
+            SharedMmdsMetrics::default(),
+        );
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let events = factory.events();
+        let provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                Some(&detour_config),
+                &mut factory,
+            )
+            .expect("mixed provider should build");
+
+        assert_eq!(
+            provider.startup_policy,
+            super::ProcessNetworkPacketIoStartupPolicy::Vmnet
+        );
+        assert_eq!(provider.vmnet_count(), 2);
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "backend:eth1".to_string(),
+                "descriptor:eth1:shared".to_string(),
+                "start:eth1".to_string(),
+            ]
+        );
+        drop(provider);
+        let events = recorded_events(&events);
+        assert!(events.iter().any(|event| event == "stop:eth0"));
+        assert!(events.iter().any(|event| event == "stop:eth1"));
+    }
+
+    #[test]
+    fn contained_runtime_vmnet_authority_counts_only_live_vmnet_entries() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect("startup vmnet provider should build");
+        let one_shared = VmnetAuthority::try_new(false, true, 1, &[])
+            .expect("bounded shared authority should validate");
+        let shared = VmnetInterfaceConfig::from_host_dev_name("vmnet:shared")
+            .expect("shared mode should parse");
+        assert_eq!(
+            provider.validate_runtime_authority(
+                super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                &shared,
+                ProcessVmnetAuthority::Contained(one_shared),
+            ),
+            Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized)
+        );
+        assert_eq!(
+            provider.validate_runtime_authority(
+                super::ProcessNetworkPacketIoEntryClass::MmdsOnly,
+                &shared,
+                ProcessVmnetAuthority::Contained(VmnetAuthority::denied()),
+            ),
+            Ok(()),
+            "MMDS-only entries must not consume vmnet authority"
+        );
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_stop_failure_retains_exact_owner_for_cleanup() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_stop_status(Some(VmnetStatus::Failure));
+        let events = factory.events();
+        let mut provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect("vmnet provider should build");
+
+        let mut removed = provider
+            .take_interface("eth0")
+            .expect("exact vmnet entry should be taken");
+        assert!(removed.stop().is_err());
+        provider
+            .restore_removed(removed)
+            .expect("failed stop owner should remain restorable");
+        assert_eq!(provider.entries.len(), 1);
+        assert_eq!(provider.entries[0].iface_id, "eth0");
+        drop(provider);
+        assert_eq!(
+            recorded_events(&events)
+                .iter()
+                .filter(|event| event.as_str() == "stop:eth0")
+                .count(),
+            2,
+            "explicit failure and best-effort owner drop should both attempt cleanup"
+        );
     }
 
     #[test]
@@ -10531,12 +12235,15 @@ mod tests {
                 assert_eq!(iface_id, "eth0");
             }
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
+            | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
+            | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
+            | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
-            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
                 panic!("unsupported host_dev_name should be reported as config failure");
             }
@@ -10562,12 +12269,15 @@ mod tests {
                 );
             }
             ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. }
+            | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
+            | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
+            | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
+            | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
-            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
                 panic!("over-limit configs should fail before vmnet backend start");
             }
@@ -10588,12 +12298,15 @@ mod tests {
                 assert_eq!(iface_id, "eth0");
             }
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
+            | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
+            | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
+            | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
-            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
                 panic!("unsupported host_dev_name should fail before vmnet backend start");
             }
@@ -10614,12 +12327,15 @@ mod tests {
                 assert_eq!(iface_id, "eth1");
             }
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
+            | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
+            | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
+            | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
-            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
                 panic!("unsupported host_dev_name should be reported as config failure");
             }
@@ -10700,6 +12416,7 @@ mod tests {
             | VmmActionError::MmdsDataStore(_)
             | VmmActionError::MmdsState(_)
             | VmmActionError::NetworkInterfaceConfig(_)
+            | VmmActionError::NetworkRuntimeMutation(_)
             | VmmActionError::NetworkInterfaceUpdate(_)
             | VmmActionError::NetworkInterfaceUpdateUnsupported
             | VmmActionError::MemoryHotplugConfig(_)
@@ -11363,12 +13080,14 @@ mod tests {
         let memory_update = memory_hotplug_config()
             .validate_size_update(memory_hotplug_size_update_input(256))
             .expect("memory hotplug update should validate");
+        let network_config = network_configs([("eth0", "vmnet:shared")]).remove(0);
         let session =
             FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
                 .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
                 .with_wait_for_stop(false)
                 .with_wait_for_wakeup(true);
         let memory_updates = session.memory_hotplug_updates();
+        let network_events = session.runtime_network_events();
         let mut supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(20).expect("non-zero limit"))
                 .expect("supervisor should start");
@@ -11434,10 +13153,24 @@ mod tests {
                     message: "boot run loop snapshot quiescence is active".to_string(),
                 }
             );
+            assert_eq!(
+                supervisor
+                    .insert_runtime_network_device(network_config, ProcessVmnetAuthority::Direct,)
+                    .expect_err("network mutation should reject during snapshot scope"),
+                NetworkRuntimeMutationError::ActiveSessionCommand {
+                    message: "boot run loop snapshot quiescence is active".to_string(),
+                }
+            );
             assert!(
                 memory_updates
                     .lock()
                     .expect("memory hotplug updates should lock")
+                    .is_empty()
+            );
+            assert!(
+                network_events
+                    .lock()
+                    .expect("runtime network events should lock")
                     .is_empty()
             );
 
@@ -12842,6 +14575,161 @@ mod tests {
     }
 
     #[test]
+    fn boot_run_loop_supervisor_orders_runtime_network_mutations_while_paused() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true)
+            .with_outcomes([
+                Ok(FakeRunLoopOutcome::Wakeup),
+                Ok(FakeRunLoopOutcome::Terminal),
+            ]);
+        let events = session.runtime_network_events();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(38).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            38
+        );
+        supervisor.pause().expect("worker should pause");
+        let config = network_configs([("eth0", "vmnet:shared")]).remove(0);
+
+        supervisor
+            .insert_runtime_network_device(config, ProcessVmnetAuthority::Direct)
+            .expect("paused worker should insert network device");
+        supervisor
+            .remove_runtime_network_device("eth0")
+            .expect("paused worker should remove network device");
+
+        assert_eq!(
+            *events.lock().expect("runtime network events should lock"),
+            ["insert:eth0".to_string(), "remove:eth0".to_string()]
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_keeps_recoverable_runtime_network_failure_live() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_runtime_network_insert_result(NetworkRuntimeMutationError::PublishDevice {
+                message: "injected network publication failure".to_string(),
+            })
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true)
+            .with_outcomes([
+                Ok(FakeRunLoopOutcome::Wakeup),
+                Ok(FakeRunLoopOutcome::Terminal),
+            ]);
+        let events = session.runtime_network_events();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(39).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            39
+        );
+        let config = network_configs([("eth0", "vmnet:shared")]).remove(0);
+
+        let error = supervisor
+            .insert_runtime_network_device(config, ProcessVmnetAuthority::Direct)
+            .expect_err("recoverable network publication failure should return");
+
+        assert!(matches!(
+            error,
+            NetworkRuntimeMutationError::PublishDevice { message }
+                if message == "injected network publication failure"
+        ));
+        assert_eq!(
+            *events.lock().expect("runtime network events should lock"),
+            ["insert:eth0".to_string()]
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Running);
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Ordinary
+        );
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_marks_terminal_runtime_network_mutations_failed() {
+        for (insert, error) in [
+            (
+                true,
+                NetworkRuntimeMutationError::TerminalInsertion {
+                    message: "injected network insertion cleanup failure".to_string(),
+                },
+            ),
+            (
+                false,
+                NetworkRuntimeMutationError::TerminalRemoval {
+                    message: "injected network removal cleanup failure".to_string(),
+                },
+            ),
+        ] {
+            let control = FakeRunLoopControl::default();
+            let drop_count = Arc::new(AtomicU64::new(0));
+            let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+            let mut session =
+                FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                    .with_wait_for_stop(false)
+                    .with_wait_for_wakeup(true)
+                    .with_outcomes([
+                        Ok(FakeRunLoopOutcome::Wakeup),
+                        Ok(FakeRunLoopOutcome::Terminal),
+                    ]);
+            session = if insert {
+                session.with_runtime_network_insert_result(error.clone())
+            } else {
+                session.with_runtime_network_remove_result(error.clone())
+            };
+            let mut supervisor = BootRunLoopSupervisor::start(
+                session,
+                NonZeroUsize::new(40).expect("non-zero limit"),
+            )
+            .expect("supervisor should start");
+            assert_eq!(
+                max_steps_receiver
+                    .recv()
+                    .expect("worker should enter run loop"),
+                40
+            );
+
+            let result = if insert {
+                let config = network_configs([("eth0", "vmnet:shared")]).remove(0);
+                supervisor.insert_runtime_network_device(config, ProcessVmnetAuthority::Direct)
+            } else {
+                supervisor.remove_runtime_network_device("eth0")
+            };
+            assert_eq!(result, Err(error));
+            assert!(matches!(
+                supervisor.status(),
+                BootRunLoopWorkerStatus::Failed(_)
+            ));
+            assert_eq!(
+                supervisor.admission_state(),
+                BootRunLoopCommandAdmissionState::Shutdown
+            );
+            assert_eq!(control.request_stop_count(), 1);
+            drop(supervisor);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
     fn boot_run_loop_supervisor_returns_command_failure_without_terminal_status() {
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
@@ -12893,8 +14781,9 @@ mod tests {
         let session =
             FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
                 .with_wait_for_stop(false);
+        let network_events = session.runtime_network_events();
 
-        let supervisor =
+        let mut supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(31).expect("non-zero limit"))
                 .expect("supervisor should start");
 
@@ -12914,6 +14803,18 @@ mod tests {
             .expect_err("terminal worker should reject commands");
 
         assert_eq!(error, super::BootRunLoopCommandError::WorkerNotRunning);
+        let network_config = network_configs([("eth0", "vmnet:shared")]).remove(0);
+        assert_eq!(
+            supervisor
+                .insert_runtime_network_device(network_config, ProcessVmnetAuthority::Direct,),
+            Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
+        );
+        assert!(
+            network_events
+                .lock()
+                .expect("runtime network events should lock")
+                .is_empty()
+        );
         assert_eq!(control.request_wakeup_count(), 0);
 
         drop(supervisor);
@@ -15103,6 +17004,187 @@ mod tests {
             .expect("started session should remain available");
         assert_eq!(session.block_insert_count, 0);
         assert_eq!(session.block_remove_count, 0);
+    }
+
+    #[test]
+    fn runtime_network_insert_and_remove_commit_live_configuration_in_running_and_paused() {
+        let mut vmm = configured_vmm(FakeStarter::success(78));
+        vmm.pci_enabled = true;
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+                .with_guest_mac("12:34:56:78:9a:bc"),
+        ))
+        .expect("running network insertion should publish");
+        assert_eq!(vmm.controller.network_interface_configs().len(), 1);
+        let VmmData::VmConfiguration(config) = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("live VM config should be returned")
+        else {
+            panic!("expected live VM configuration");
+        };
+        assert_eq!(config.network_interface_configs().len(), 1);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.network_insert_count, 1);
+        assert_eq!(session.last_network_insert.as_deref(), Some("eth0"));
+        assert_eq!(
+            session.last_network_authority,
+            Some(ProcessVmnetAuthority::Direct)
+        );
+
+        vmm.handle_action(VmmAction::Pause)
+            .expect("VM should pause");
+        vmm.handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+            HotUnplugDeviceKind::NetworkInterface,
+            "eth0",
+        )))
+        .expect("paused network removal should commit");
+        assert!(vmm.controller.network_interface_configs().is_empty());
+
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+                .with_guest_mac("12:34:56:78:9a:bc"),
+        ))
+        .expect("same-ID paused insertion should reuse released ownership");
+        assert_eq!(vmm.controller.network_interface_configs().len(), 1);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.network_insert_count, 2);
+        assert_eq!(session.network_remove_count, 1);
+        assert_eq!(session.last_network_remove.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn runtime_network_passes_contained_vmnet_authority_to_owner_thread() {
+        let authority = VmnetAuthority::try_new(false, true, 2, &[])
+            .expect("contained shared authority should validate");
+        let mut vmm = configured_vmm(FakeStarter::success(79));
+        vmm.pci_enabled = true;
+        vmm.vmnet_authority = ProcessVmnetAuthority::Contained(authority);
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+        ))
+        .expect("authorized runtime network should publish");
+
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(
+            session.last_network_authority,
+            Some(ProcessVmnetAuthority::Contained(authority))
+        );
+    }
+
+    #[test]
+    fn runtime_network_session_failures_preserve_configuration_projection() {
+        let mut insert_vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_network_insert_result(
+                80,
+                NetworkRuntimeMutationError::PublishDevice {
+                    message: "injected publication failure".to_string(),
+                },
+            ),
+        ));
+        insert_vmm.pci_enabled = true;
+        insert_vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        assert!(matches!(
+            insert_vmm.handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(
+                    "private_iface",
+                    "private_iface",
+                    "vmnet:bridged:private_bridge",
+                ),
+            )),
+            Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::PublishDevice { .. }
+            ))
+        ));
+        assert!(insert_vmm.controller.network_interface_configs().is_empty());
+
+        let mut remove_vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_network_remove_result(
+                81,
+                NetworkRuntimeMutationError::RemoveDevice {
+                    message: "injected recoverable removal failure".to_string(),
+                },
+            ),
+        ));
+        remove_vmm.pci_enabled = true;
+        remove_vmm
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+            ))
+            .expect("network should configure before startup");
+        remove_vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        assert!(matches!(
+            remove_vmm.handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                HotUnplugDeviceKind::NetworkInterface,
+                "eth0",
+            ))),
+            Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::RemoveDevice { .. }
+            ))
+        ));
+        assert_eq!(remove_vmm.controller.network_interface_configs().len(), 1);
+        assert_eq!(
+            remove_vmm.controller.network_interface_configs()[0].iface_id(),
+            "eth0"
+        );
+    }
+
+    #[test]
+    fn default_mmio_runtime_network_mutation_is_nonmutating_rejection() {
+        let mut vmm = configured_vmm(FakeStarter::success(82));
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+        ))
+        .expect("network should configure before startup");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(
+                    "private_iface",
+                    "private_iface",
+                    "vmnet:bridged:private_bridge",
+                ),
+            )),
+            Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::PciNotEnabled
+            ))
+        );
+        assert_eq!(
+            vmm.handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                HotUnplugDeviceKind::NetworkInterface,
+                "private_iface",
+            ))),
+            Err(VmmActionError::NetworkRuntimeMutation(
+                NetworkRuntimeMutationError::PciNotEnabled
+            ))
+        );
+        assert_eq!(vmm.controller.network_interface_configs().len(), 1);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.network_insert_count, 0);
+        assert_eq!(session.network_remove_count, 0);
     }
 
     #[test]

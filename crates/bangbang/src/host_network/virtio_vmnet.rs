@@ -10,9 +10,13 @@ pub(crate) use bangbang_runtime::mmds_network::{
     DEFAULT_MMDS_REQUEST_BUFFER_CAPACITY, DEFAULT_MMDS_REQUEST_BUFFER_LEN_LIMIT,
 };
 pub(crate) use bangbang_runtime::mmds_network::{
-    MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError,
+    MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour,
+    MmdsResponseQueue,
+};
+#[cfg(test)]
+pub(crate) use bangbang_runtime::mmds_network::{
     MmdsOnlyVirtioNetworkPacketIoProvider, MmdsOnlyVirtioNetworkPacketIoProviderBuildError,
-    MmdsOnlyVirtioNetworkPacketIoProviderEntry, MmdsPacketDetour, MmdsResponseQueue,
+    MmdsOnlyVirtioNetworkPacketIoProviderEntry,
 };
 use bangbang_runtime::mmds_network::{MmdsPacketDetourError, MmdsResponseQueueError};
 use bangbang_runtime::network::{
@@ -26,8 +30,8 @@ use bangbang_runtime::startup::{
 };
 
 use crate::host_network::vmnet::{
-    VmnetPacketDescriptorError, VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket,
-    VmnetWritePacket,
+    StartedVmnetPacketIoBackend, VmnetError, VmnetInterfaceBackend, VmnetPacketDescriptorError,
+    VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket, VmnetWritePacket,
 };
 
 pub const DEFAULT_VMNET_VIRTIO_NETWORK_RX_BUFFER_LEN: usize = VIRTIO_NET_MAX_BUFFER_SIZE as usize;
@@ -35,6 +39,32 @@ pub const DEFAULT_VMNET_VIRTIO_NETWORK_RX_BUFFER_LEN: usize = VIRTIO_NET_MAX_BUF
 pub enum VmnetVirtioNetworkPacketIoBuildError {
     EmptyRxBuffer,
     RxBufferAllocation { len: usize, source: TryReserveError },
+}
+
+#[derive(Debug)]
+pub enum VmnetVirtioNetworkPacketIoStopError {
+    StatePoisoned,
+    Stop { source: VmnetError },
+}
+
+impl fmt::Display for VmnetVirtioNetworkPacketIoStopError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StatePoisoned => {
+                f.write_str("vmnet virtio-net packet state is unavailable during stop")
+            }
+            Self::Stop { source } => write!(f, "failed to stop vmnet packet I/O: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for VmnetVirtioNetworkPacketIoStopError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Stop { source } => Some(source),
+            Self::StatePoisoned => None,
+        }
+    }
 }
 
 impl fmt::Display for VmnetVirtioNetworkPacketIoBuildError {
@@ -133,6 +163,29 @@ where
 
     pub fn rx_source(&mut self) -> &mut VmnetVirtioNetworkRxPacketSource<B> {
         &mut self.rx_source
+    }
+
+    pub fn as_packet_io(&mut self) -> Arm64BootNetworkPacketIo<'_> {
+        let Self { tx_sink, rx_source } = self;
+        Arm64BootNetworkPacketIo::new(tx_sink, rx_source)
+    }
+}
+
+impl<B> VmnetVirtioNetworkPacketIo<StartedVmnetPacketIoBackend<B>>
+where
+    B: VmnetInterfaceBackend
+        + VmnetPacketIoBackend<Interface = <B as VmnetInterfaceBackend>::Interface>,
+{
+    pub fn stop(&mut self) -> Result<(), VmnetVirtioNetworkPacketIoStopError> {
+        let mut state = self
+            .tx_sink
+            .shared
+            .lock()
+            .map_err(|_| VmnetVirtioNetworkPacketIoStopError::StatePoisoned)?;
+        state
+            .backend
+            .stop()
+            .map_err(|source| VmnetVirtioNetworkPacketIoStopError::Stop { source })
     }
 }
 

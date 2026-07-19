@@ -155,8 +155,8 @@ fn machine_lifecycle_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 76);
-    assert_eq!(count(Disposition::AuditRequired), 322);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 78);
+    assert_eq!(count(Disposition::AuditRequired), 320);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 

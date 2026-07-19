@@ -3244,25 +3244,325 @@ struct SharedNetworkInterfaceMetricsInner {
     tx_queue_event_count: AtomicU64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SharedNetworkInterfaceMetricsRegistry {
     aggregate: SharedNetworkInterfaceMetrics,
-    per_interface: Arc<BTreeMap<String, SharedNetworkInterfaceMetrics>>,
+    per_interface: Arc<Mutex<NetworkInterfaceMetricsRegistryState>>,
+}
+
+#[derive(Debug, Default)]
+struct NetworkInterfaceMetricsRegistryState {
+    entries: Vec<NetworkInterfaceMetricsRegistryEntry>,
+    reservations: Vec<NetworkInterfaceMetricsReservation>,
+    next_generation: u64,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct NetworkInterfaceMetricsRegistryEntry {
+    generation: u64,
+    iface_id: String,
+    metrics: SharedNetworkInterfaceMetrics,
+    lease_claimed: bool,
+}
+
+#[derive(Debug)]
+struct NetworkInterfaceMetricsReservation {
+    generation: u64,
+    iface_id: String,
+}
+
+/// Prepared per-interface metrics ownership that is invisible until
+/// publication.
+pub struct PreparedNetworkInterfaceMetrics {
+    registry: SharedNetworkInterfaceMetricsRegistry,
+    generation: u64,
+    iface_id: String,
+    metrics: SharedNetworkInterfaceMetrics,
+    reserved: bool,
+}
+
+/// Exact live per-interface metrics ownership removed automatically on drop.
+pub struct NetworkInterfaceMetricsLease {
+    registry: SharedNetworkInterfaceMetricsRegistry,
+    generation: u64,
+    iface_id: String,
+    registered: bool,
+}
+
+impl fmt::Debug for PreparedNetworkInterfaceMetrics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedNetworkInterfaceMetrics")
+            .field("ownership", &"<redacted>")
+            .field("reserved", &self.reserved)
+            .finish()
+    }
+}
+
+impl fmt::Debug for NetworkInterfaceMetricsLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NetworkInterfaceMetricsLease")
+            .field("ownership", &"<redacted>")
+            .field("registered", &self.registered)
+            .finish()
+    }
+}
+
+impl PreparedNetworkInterfaceMetrics {
+    pub fn publish(mut self) -> NetworkInterfaceMetricsLease {
+        let mut state = lock_network_metrics_registry(&self.registry.per_interface);
+        let reservation_count = state.reservations.len();
+        state.reservations.retain(|reservation| {
+            reservation.generation != self.generation || reservation.iface_id != self.iface_id
+        });
+        debug_assert_eq!(
+            state.reservations.len().checked_add(1),
+            Some(reservation_count)
+        );
+        self.reserved = false;
+        debug_assert!(state.entries.len() < state.capacity);
+        debug_assert!(
+            !state
+                .entries
+                .iter()
+                .any(|entry| entry.iface_id == self.iface_id)
+        );
+        state.entries.push(NetworkInterfaceMetricsRegistryEntry {
+            generation: self.generation,
+            iface_id: self.iface_id.clone(),
+            metrics: self.metrics.clone(),
+            lease_claimed: true,
+        });
+        drop(state);
+        NetworkInterfaceMetricsLease {
+            registry: self.registry.clone(),
+            generation: self.generation,
+            iface_id: self.iface_id.clone(),
+            registered: true,
+        }
+    }
+}
+
+impl Drop for PreparedNetworkInterfaceMetrics {
+    fn drop(&mut self) {
+        if !self.reserved {
+            return;
+        }
+        let mut state = lock_network_metrics_registry(&self.registry.per_interface);
+        if let Some(index) = state.reservations.iter().position(|reservation| {
+            reservation.generation == self.generation && reservation.iface_id == self.iface_id
+        }) {
+            state.reservations.remove(index);
+        }
+        self.reserved = false;
+    }
+}
+
+impl Drop for NetworkInterfaceMetricsLease {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut state = lock_network_metrics_registry(&self.registry.per_interface);
+        if let Some(index) = state.entries.iter().position(|entry| {
+            entry.generation == self.generation && entry.iface_id == self.iface_id
+        }) {
+            state.entries.remove(index);
+        }
+        self.registered = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkInterfaceMetricsRegistryError {
+    DuplicateInterface,
+    UnknownInterface,
+    LeaseAlreadyClaimed,
+    Capacity,
+    GenerationExhausted,
+}
+
+impl fmt::Display for NetworkInterfaceMetricsRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateInterface => {
+                formatter.write_str("network metrics interface is already registered")
+            }
+            Self::UnknownInterface => {
+                formatter.write_str("network metrics interface is not registered")
+            }
+            Self::LeaseAlreadyClaimed => {
+                formatter.write_str("network metrics interface lease is already claimed")
+            }
+            Self::Capacity => formatter.write_str("failed to reserve network metrics capacity"),
+            Self::GenerationExhausted => {
+                formatter.write_str("network metrics ownership generation is exhausted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NetworkInterfaceMetricsRegistryError {}
+
+impl Default for SharedNetworkInterfaceMetricsRegistry {
+    fn default() -> Self {
+        Self {
+            aggregate: SharedNetworkInterfaceMetrics::default(),
+            per_interface: Arc::new(Mutex::new(NetworkInterfaceMetricsRegistryState::default())),
+        }
+    }
 }
 
 impl SharedNetworkInterfaceMetricsRegistry {
     pub fn from_interface_ids<'a>(iface_ids: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut per_interface = BTreeMap::new();
+        let mut entries = Vec::new();
         for iface_id in iface_ids {
-            per_interface
-                .entry(iface_id.to_string())
-                .or_insert_with(SharedNetworkInterfaceMetrics::default);
+            if entries
+                .iter()
+                .any(|entry: &NetworkInterfaceMetricsRegistryEntry| entry.iface_id == iface_id)
+            {
+                continue;
+            }
+            let generation = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+            entries.push(NetworkInterfaceMetricsRegistryEntry {
+                generation,
+                iface_id: iface_id.to_string(),
+                metrics: SharedNetworkInterfaceMetrics::default(),
+                lease_claimed: false,
+            });
         }
-
+        let next_generation = u64::try_from(entries.len()).unwrap_or(u64::MAX);
         Self {
             aggregate: SharedNetworkInterfaceMetrics::default(),
-            per_interface: Arc::new(per_interface),
+            per_interface: Arc::new(Mutex::new(NetworkInterfaceMetricsRegistryState {
+                capacity: entries.len(),
+                entries,
+                reservations: Vec::new(),
+                next_generation,
+            })),
         }
+    }
+
+    pub fn from_interface_ids_with_capacity<'a>(
+        iface_ids: impl IntoIterator<Item = &'a str>,
+        capacity: usize,
+    ) -> Result<Self, NetworkInterfaceMetricsRegistryError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| NetworkInterfaceMetricsRegistryError::Capacity)?;
+        let mut reservations = Vec::new();
+        reservations
+            .try_reserve_exact(capacity)
+            .map_err(|_| NetworkInterfaceMetricsRegistryError::Capacity)?;
+        for iface_id in iface_ids {
+            if entries
+                .iter()
+                .any(|entry: &NetworkInterfaceMetricsRegistryEntry| entry.iface_id == iface_id)
+            {
+                continue;
+            }
+            if entries.len() == capacity {
+                return Err(NetworkInterfaceMetricsRegistryError::Capacity);
+            }
+            let generation = u64::try_from(entries.len())
+                .map_err(|_| NetworkInterfaceMetricsRegistryError::GenerationExhausted)?;
+            entries.push(NetworkInterfaceMetricsRegistryEntry {
+                generation,
+                iface_id: iface_id.to_string(),
+                metrics: SharedNetworkInterfaceMetrics::default(),
+                lease_claimed: false,
+            });
+        }
+        let next_generation = u64::try_from(entries.len())
+            .map_err(|_| NetworkInterfaceMetricsRegistryError::GenerationExhausted)?;
+        Ok(Self {
+            aggregate: SharedNetworkInterfaceMetrics::default(),
+            per_interface: Arc::new(Mutex::new(NetworkInterfaceMetricsRegistryState {
+                entries,
+                reservations,
+                next_generation,
+                capacity,
+            })),
+        })
+    }
+
+    pub fn prepare_interface(
+        &self,
+        iface_id: impl Into<String>,
+    ) -> Result<PreparedNetworkInterfaceMetrics, NetworkInterfaceMetricsRegistryError> {
+        let iface_id = iface_id.into();
+        let mut state = lock_network_metrics_registry(&self.per_interface);
+        if state.entries.iter().any(|entry| entry.iface_id == iface_id)
+            || state
+                .reservations
+                .iter()
+                .any(|reservation| reservation.iface_id == iface_id)
+        {
+            return Err(NetworkInterfaceMetricsRegistryError::DuplicateInterface);
+        }
+        let claimed_capacity = state
+            .entries
+            .len()
+            .checked_add(state.reservations.len())
+            .ok_or(NetworkInterfaceMetricsRegistryError::Capacity)?;
+        if claimed_capacity >= state.capacity {
+            return Err(NetworkInterfaceMetricsRegistryError::Capacity);
+        }
+        state
+            .entries
+            .try_reserve_exact(1)
+            .map_err(|_| NetworkInterfaceMetricsRegistryError::Capacity)?;
+        state
+            .reservations
+            .try_reserve_exact(1)
+            .map_err(|_| NetworkInterfaceMetricsRegistryError::Capacity)?;
+        let next_generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or(NetworkInterfaceMetricsRegistryError::GenerationExhausted)?;
+        let generation = state.next_generation;
+        state.next_generation = next_generation;
+        state.reservations.push(NetworkInterfaceMetricsReservation {
+            generation,
+            iface_id: iface_id.clone(),
+        });
+        drop(state);
+        Ok(PreparedNetworkInterfaceMetrics {
+            registry: self.clone(),
+            generation,
+            iface_id,
+            metrics: SharedNetworkInterfaceMetrics::default(),
+            reserved: true,
+        })
+    }
+
+    /// Claims drop ownership for one interface registered during bounded
+    /// startup.
+    pub fn claim_interface_lease(
+        &self,
+        iface_id: &str,
+    ) -> Result<NetworkInterfaceMetricsLease, NetworkInterfaceMetricsRegistryError> {
+        let mut state = lock_network_metrics_registry(&self.per_interface);
+        let entry = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.iface_id == iface_id)
+            .ok_or(NetworkInterfaceMetricsRegistryError::UnknownInterface)?;
+        if entry.lease_claimed {
+            return Err(NetworkInterfaceMetricsRegistryError::LeaseAlreadyClaimed);
+        }
+        entry.lease_claimed = true;
+        let generation = entry.generation;
+        drop(state);
+        Ok(NetworkInterfaceMetricsLease {
+            registry: self.clone(),
+            generation,
+            iface_id: iface_id.to_string(),
+            registered: true,
+        })
     }
 
     pub fn aggregate(&self) -> SharedNetworkInterfaceMetrics {
@@ -3270,7 +3570,10 @@ impl SharedNetworkInterfaceMetricsRegistry {
     }
 
     pub fn per_interface(&self, iface_id: &str) -> Option<SharedNetworkInterfaceMetrics> {
-        self.per_interface.get(iface_id).cloned()
+        lock_network_metrics_registry(&self.per_interface)
+            .entries
+            .iter()
+            .find_map(|entry| (entry.iface_id == iface_id).then(|| entry.metrics.clone()))
     }
 
     pub fn record_notification_dispatch_for_interface(
@@ -3366,13 +3669,22 @@ impl SharedNetworkInterfaceMetricsRegistry {
 
     pub fn per_interface_snapshot(&self) -> NetworkInterfaceMetricsByInterface {
         let mut snapshot = NetworkInterfaceMetricsByInterface::new();
-        for (iface_id, metrics) in self.per_interface.iter() {
-            let metrics = metrics.snapshot();
+        for entry in &lock_network_metrics_registry(&self.per_interface).entries {
+            let metrics = entry.metrics.snapshot();
             if !metrics.is_empty() {
-                snapshot.insert_interface_metrics(iface_id.clone(), metrics);
+                snapshot.insert_interface_metrics(entry.iface_id.clone(), metrics);
             }
         }
         snapshot
+    }
+}
+
+fn lock_network_metrics_registry(
+    registry: &Mutex<NetworkInterfaceMetricsRegistryState>,
+) -> MutexGuard<'_, NetworkInterfaceMetricsRegistryState> {
+    match registry.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -6576,13 +6888,13 @@ mod tests {
         BlockDeviceMetrics, BlockDeviceMetricsByDrive, BlockDeviceMetricsRegistryError,
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
         MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics,
-        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
-        PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError, RtcDeviceMetrics,
-        SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry,
-        SharedEntropyDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetrics,
-        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetrics,
-        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
-        SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
+        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface,
+        NetworkInterfaceMetricsRegistryError, PmemDeviceMetrics, PmemDeviceMetricsByDevice,
+        PmemDeviceMetricsRegistryError, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
+        SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::logger::SharedLoggerMetrics;
@@ -7976,6 +8288,99 @@ mod tests {
             NetworkInterfaceMetrics::default()
         );
         assert!(second.per_interface_snapshot().is_empty());
+    }
+
+    #[test]
+    fn network_metrics_preparation_is_invisible_and_published_lease_is_exact() {
+        let registry =
+            SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(["eth0"], 2)
+                .expect("bounded network metrics registry should allocate");
+        let prepared = registry
+            .prepare_interface("eth1")
+            .expect("second metrics entry should prepare");
+        assert!(registry.per_interface("eth1").is_none());
+        assert_eq!(
+            registry.prepare_interface("eth1").unwrap_err(),
+            NetworkInterfaceMetricsRegistryError::DuplicateInterface
+        );
+        assert_eq!(
+            registry.prepare_interface("eth2").unwrap_err(),
+            NetworkInterfaceMetricsRegistryError::Capacity
+        );
+        drop(prepared);
+
+        let lease = registry
+            .prepare_interface("eth1")
+            .expect("abandoned reservation should release identity and capacity")
+            .publish();
+        assert!(registry.per_interface("eth1").is_some());
+        registry.record_event_failure_for_interface("eth1");
+        assert_eq!(
+            registry
+                .per_interface("eth1")
+                .expect("published metrics should remain visible")
+                .snapshot()
+                .event_fails(),
+            1
+        );
+        drop(lease);
+        assert!(registry.per_interface("eth1").is_none());
+
+        let replacement = registry
+            .prepare_interface("eth1")
+            .expect("released identity should be reusable")
+            .publish();
+        assert_eq!(
+            registry
+                .per_interface("eth1")
+                .expect("replacement metrics should be visible")
+                .snapshot(),
+            NetworkInterfaceMetrics::default(),
+            "same-ID reuse must receive a fresh metrics generation"
+        );
+        drop(replacement);
+    }
+
+    #[test]
+    fn network_metrics_registry_enforces_configured_capacity() {
+        let registry =
+            SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(["eth0"], 1)
+                .expect("single-entry network metrics registry should allocate");
+
+        assert_eq!(
+            registry.prepare_interface("eth1").unwrap_err(),
+            NetworkInterfaceMetricsRegistryError::Capacity
+        );
+        assert!(registry.per_interface("eth0").is_some());
+    }
+
+    #[test]
+    fn network_metrics_startup_lease_releases_exact_entry_for_same_id_reuse() {
+        let registry = SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(
+            ["eth0", "eth1"],
+            2,
+        )
+        .expect("bounded startup network metrics registry should allocate");
+        let lease = registry
+            .claim_interface_lease("eth1")
+            .expect("startup interface metrics should have exact ownership");
+        assert_eq!(
+            registry.claim_interface_lease("eth1").unwrap_err(),
+            NetworkInterfaceMetricsRegistryError::LeaseAlreadyClaimed
+        );
+        assert_eq!(
+            registry.claim_interface_lease("missing").unwrap_err(),
+            NetworkInterfaceMetricsRegistryError::UnknownInterface
+        );
+
+        drop(lease);
+        assert!(registry.per_interface("eth1").is_none());
+        let replacement = registry
+            .prepare_interface("eth1")
+            .expect("released startup identity should be reusable")
+            .publish();
+        assert!(registry.per_interface("eth1").is_some());
+        drop(replacement);
     }
 
     #[test]
