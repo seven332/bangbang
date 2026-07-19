@@ -63,6 +63,7 @@ const GUEST_REPLACEMENT_ID: &str = "grant-guest-replacement-1362";
 const GUEST_HOTPLUG_REUSE_ID: &str = "grant-guest-hotplug-reuse-1420";
 const GUEST_PMEM_ID: &str = "grant-guest-pmem-1362";
 const GUEST_PMEM_REUSE_ID: &str = "grant-guest-pmem-reuse-1421";
+const GUEST_PMEM_ROOT_ID: &str = "grant-guest-pmem-root-1444";
 const GUEST_READ_ONLY_DATA_ID: &str = "grant-guest-read-only-data-1362";
 const GUEST_ROOTFS_REF: &str = "bangbang-grant:grant-guest-rootfs-1362";
 const GUEST_DATA_REF: &str = "bangbang-grant:grant-guest-data-1362";
@@ -70,6 +71,7 @@ const GUEST_REPLACEMENT_REF: &str = "bangbang-grant:grant-guest-replacement-1362
 const GUEST_HOTPLUG_REUSE_REF: &str = "bangbang-grant:grant-guest-hotplug-reuse-1420";
 const GUEST_PMEM_REF: &str = "bangbang-grant:grant-guest-pmem-1362";
 const GUEST_PMEM_REUSE_REF: &str = "bangbang-grant:grant-guest-pmem-reuse-1421";
+const GUEST_PMEM_ROOT_REF: &str = "bangbang-grant:grant-guest-pmem-root-1444";
 const GUEST_READ_ONLY_DATA_REF: &str = "bangbang-grant:grant-guest-read-only-data-1362";
 const GUEST_MISSING_REF: &str = "bangbang-grant:grant-guest-missing-1362";
 const OUTPUT_LOGGER_ID: &str = "grant-logger-sink-1364";
@@ -146,6 +148,8 @@ const GRANTED_HOST_VSOCK_GUEST_SEED: u8 = 0x3d;
 const GRANTED_HOST_VSOCK_HOST_SEED: u8 = 0xa7;
 const GUEST_SERIAL_MARKER: &[u8] = b"Linux version";
 const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
+const DIRECT_ROOTFS_PMEM_ROOT_RO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.pmem-root=ro";
+const DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER: &[u8] = b"BANGBANG_PMEM_ROOT_RO_OK";
 const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
 const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
 const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
@@ -2226,6 +2230,139 @@ fn normal_bundle_adopts_delayed_block_and_pmem_grants_by_descriptor_identity() {
     );
 
     stop_running_launcher(&mut running, "delayed block and pmem grant guest");
+}
+
+#[test]
+fn normal_bundle_boots_read_only_pmem_root_from_exact_granted_descriptor() {
+    let bundle = production_bundle();
+    let fixture = GuestDeviceGrantFixture::new("pmem-root");
+    let pmem_root = fixture
+        .rootfs
+        .parent()
+        .expect("pmem-root fixture should have a parent")
+        .join("external-pmem-root.ext4");
+    let opened_pmem_root = pmem_root.with_file_name("opened-pmem-root.ext4");
+    fs::copy(guest_ext4_rootfs(), &pmem_root).expect("contained pmem-root fixture should copy");
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(&fixture.manifest).expect("device grant manifest should read"),
+    )
+    .expect("device grant manifest should parse");
+    manifest["grants"]
+        .as_array_mut()
+        .expect("device grant manifest grants should be an array")
+        .push(serde_json::json!({
+            "id": GUEST_PMEM_ROOT_ID,
+            "role": "pmem-backing",
+            "access": "read-only",
+            "source": path_text(&pmem_root),
+        }));
+    fs::write(
+        &fixture.manifest,
+        serde_json::to_vec(&manifest).expect("extended device grant manifest should serialize"),
+    )
+    .expect("extended device grant manifest should write");
+    let mut running = spawn_ready_device_grant_api_launcher(&bundle, &fixture, "pmem-root");
+    running.sensitive.extend([
+        path_text(&pmem_root).to_string(),
+        path_text(&opened_pmem_root).to_string(),
+        GUEST_PMEM_ROOT_ID.to_string(),
+        GUEST_PMEM_ROOT_REF.to_string(),
+    ]);
+    fixture.replace_source_pathnames();
+    fs::rename(&pmem_root, &opened_pmem_root)
+        .expect("launcher-opened pmem-root source should move");
+    create_sized_file(&pmem_root, 512);
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT contained pmem-root machine config",
+    );
+    let sealed_kernel = worker_bundle(&bundle).join("Contents/Resources/guest-kernel");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&sealed_kernel),
+        "boot_args": DIRECT_ROOTFS_PMEM_ROOT_RO_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("pmem-root boot request should serialize"),
+        ),
+        204,
+        "PUT contained pmem-root boot source",
+    );
+    let control = serde_json::json!({
+        "drive_id": "control",
+        "path_on_host": GUEST_DATA_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+        "cache_type": "Writeback",
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/control",
+            &serde_json::to_string(&control).expect("pmem-root control drive should serialize"),
+        ),
+        204,
+        "PUT contained pmem-root control drive",
+    );
+    let root = serde_json::json!({
+        "id": "root_pmem",
+        "path_on_host": GUEST_PMEM_ROOT_REF,
+        "root_device": true,
+        "read_only": true,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/pmem/root_pmem",
+            &serde_json::to_string(&root).expect("pmem root request should serialize"),
+        ),
+        204,
+        "PUT contained read-only pmem root",
+    );
+
+    let config = http_get(&running.socket, "/vm/config");
+    assert_http_status(&config, 200, "GET contained pmem-root config");
+    assert!(config.contains(GUEST_PMEM_ROOT_REF));
+    assert!(config.contains(r#""root_device":true"#));
+    assert!(config.contains(r#""read_only":true"#));
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start contained read-only pmem-root guest",
+    );
+    wait_for_file_prefix(
+        &fixture.opened_data,
+        DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("contained read-only pmem root should boot: {error}"));
+    assert_eq!(
+        file_bytes_at(&fixture.data, 0, DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER.len(),),
+        vec![0; DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER.len()],
+        "replacement control pathname must not receive the pmem-root guest marker"
+    );
+    assert_eq!(
+        fs::metadata(&pmem_root)
+            .expect("replacement pmem-root pathname should remain present")
+            .len(),
+        512,
+        "the worker must boot the launcher-opened rootfs object instead of reopening its replacement pathname"
+    );
+
+    stop_running_launcher(&mut running, "contained read-only pmem-root guest");
 }
 
 #[test]
@@ -4317,6 +4454,7 @@ impl GuestDeviceGrantFixture {
             GUEST_HOTPLUG_REUSE_ID,
             GUEST_PMEM_ID,
             GUEST_PMEM_REUSE_ID,
+            GUEST_PMEM_ROOT_ID,
             GUEST_READ_ONLY_DATA_ID,
             GUEST_ROOTFS_REF,
             GUEST_DATA_REF,
@@ -4324,6 +4462,7 @@ impl GuestDeviceGrantFixture {
             GUEST_HOTPLUG_REUSE_REF,
             GUEST_PMEM_REF,
             GUEST_PMEM_REUSE_REF,
+            GUEST_PMEM_ROOT_REF,
             GUEST_READ_ONLY_DATA_REF,
             std::str::from_utf8(PMEM_HOST_MARKER).expect("pmem marker should be UTF-8"),
         ]

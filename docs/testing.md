@@ -162,11 +162,27 @@ second host backings. The guest records the first PCI BDF and pmem namespace
 resource and accepts the second round only when both are reused. The contained
 case must inject a failed access claim without consuming the exact pmem grant,
 then consume two distinct initially unused grants and prove pathname
-replacement cannot redirect either writeback. Unit companions must cover
+replacement cannot redirect either direct mapping. Unit companions must cover
 transactional configuration projection, first-fit range exclusion and reuse,
 generation-safe metrics ownership, dynamic HVF map/take/restore, failed
 map/unmap isolation, endpoint rollback, recoverable versus terminal owner
 failures, paused FIFO admission, and default-MMIO rejection before backing use.
+
+Direct pmem or pmem-root changes additionally require the signed
+`hvf_lifecycle` cases
+`guest_write_to_writable_pmem_is_visible_before_any_pmem_flush` and
+`guest_write_to_read_only_pmem_faults_without_mutating_backing`, plus
+`direct_pmem_mapping_has_bounded_process_memory_growth`, the
+`guest_boot` cases `boots_read_only_ext4_root_directly_from_mmio_pmem` and
+`boots_writable_ext4_root_directly_from_modern_pci_pmem`, the public-process
+case `macos_arm64::signed_executable_boots_read_only_and_writable_pmem_roots`,
+and the normal-bundle case
+`normal_bundle_boots_read_only_pmem_root_from_exact_granted_descriptor`.
+Together they must prove one authoritative mapping before flush, exact guest
+protection, no second full-size virtual mapping with a generous resident-size
+bound, `/dev/pmem<i>` plus `ro`/`rw`, MMIO/PCI enumeration, runtime-root
+rejection, and exact contained descriptor identity after pathname replacement.
+The wrapper must run on Apple Silicon without `--allow-unsupported`.
 
 Runtime network hotplug changes additionally require both
 `macos_arm64::signed_executable_hotplugs_mmds_network_and_reuses_product_pci_slot`
@@ -332,14 +348,19 @@ with deadlines and deterministic yields rather than fixed sleeps.
 
 For virtio-pmem changes, unit tests should cover MMIO registration, FDT
 metadata, config-space `start`/`size`, deterministic multi-device layout,
-queue parsing/completion, shadow writeback, and cleanup/error paths. Targeted
-flush tests must prove empty and malformed-only events do not synchronize,
+queue parsing/completion, direct mapping lease lifetime, exact-prefix
+`MS_SYNC`, and cleanup/error paths. Targeted flush tests must prove empty and
+malformed-only events do not synchronize,
 one valid request caches one selected-device result, peer backings are not
 traversed, one operation plus exact backing length is charged before flush,
 throttled cursors retry, and live limiter replacement is failure-atomic. Signed
-HVF coverage validates startup assembly and mapped pmem ownership through the
-lifecycle target; signed executable coverage should retain initial limiter,
-live PATCH, guest read/write, and selected-backing flush proof.
+HVF coverage validates the exact host address/GPA/size/protection, proves a
+writable guest store is visible through an independent backing handle before
+flush, and proves a read-only guest store faults without mutating the backing.
+Signed guest and executable coverage should retain read-only MMIO and writable
+PCI pmem-root boot, initial limiter, live PATCH, guest read/write, and
+selected-backing flush proof. The production-bundle target must also retain the
+exact launcher-opened descriptor after pathname replacement.
 
 For virtio-mem changes, focused tests should cover block-aligned validation,
 adjacent sequential plugs, partial multi-block unplug, split/combined exact
@@ -1053,6 +1074,9 @@ may skip execution. On supported Apple Silicon it proves:
   source-path replacement after the launcher opened every file, guest-visible
   writable block persistence, pmem marker read and flush persistence, and
   path-free block/pmem limiter updates retaining their backing ownership;
+- read-only pmem root boot from an exact launcher-opened descriptor after its
+  source pathname is replaced, with `/dev/pmem0`, `ro`, an unchanged
+  replacement file, and unchanged App Sandbox plus Hypervisor entitlements;
 - read-only drive authority reaching a real guest as a failed write while the
   original opened backing remains unchanged; and
 - preauthorized after-start block replacement synchronized by the guest's
@@ -1623,6 +1647,11 @@ device path, and emits `BANGBANG_PMEM_READ_FLUSH_OK` only after those steps
 complete. The signed executable scenario configures a valid initial pmem
 limiter and applies a live partial replacement through `PATCH /pmem/{id}`;
 deterministic unit tests cover throttle timing, cursor retention, and retry.
+When the boot args include `bangbang.pmem-root=ro` or
+`bangbang.pmem-root=rw`, the init requires `/dev/pmem0`, the exact
+`root=/dev/pmem0` command-line argument, and the matching root mount mode. The
+read-only case proves a write fails; the writable case writes, reads, and syncs
+a root-filesystem probe before emitting its mode-specific success marker.
 When the boot args include `bangbang.vsock-guest-connect=1`,
 the same init script uses the rootfs-provided Python `AF_VSOCK` support to
 connect to host CID 2 on the test port, stream and incrementally verify exactly

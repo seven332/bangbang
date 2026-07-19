@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v48"
+direct_boot_variant="direct-boot-v50"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -424,6 +424,15 @@ write_vdb_marker_at_sector() {
 
 write_vdb_marker() {
   write_vdb_marker_at_sector "$1" 0
+}
+
+write_vda_marker() {
+  marker=$1
+  if [ -b /dev/vda ]; then
+    printf '%-512s' "$marker" \
+      | dd of=/dev/vda bs=512 count=1 conv=notrunc 2>/dev/null \
+      || true
+  fi
 }
 
 pci_function_has_identity() {
@@ -1979,6 +1988,71 @@ read_flush_pmem_marker() {
   write_vdb_marker BANGBANG_PMEM_READ_FLUSH_OK
 }
 
+pmem_root_fail() {
+  reason=$1
+  marker="BANGBANG_PMEM_ROOT_FAIL_$reason"
+  emit_line "$marker"
+  write_vda_marker "$marker"
+  sync /dev/vda 2>/dev/null || true
+}
+
+check_pmem_root_marker() {
+  expected_mode=$1
+  if [ "$expected_mode" = ro ]; then
+    success_marker=BANGBANG_PMEM_ROOT_RO_OK
+  else
+    success_marker=BANGBANG_PMEM_ROOT_RW_OK
+  fi
+
+  if [ ! -b /dev/pmem0 ]; then
+    pmem_root_fail NO_PMEM0
+    return
+  fi
+  if ! cmdline_has root=/dev/pmem0; then
+    pmem_root_fail CMDLINE
+    return
+  fi
+  if cmdline_has bangbang.expect-pci-data=1; then
+    if ! pci_function_has_identity 0000:00:01.0 0x105b; then
+      pmem_root_fail PCI_IDENTITY
+      return
+    fi
+    emit_line BANGBANG_PCI_PMEM_IDENTITIES_OK
+  fi
+
+  root_options=$(awk '$2 == "/" { print $4; exit }' /proc/mounts 2>/dev/null || true)
+  case ",$root_options," in
+    *,"$expected_mode",*) ;;
+    *)
+      pmem_root_fail "MOUNT_${expected_mode}"
+      return
+      ;;
+  esac
+
+  if [ "$expected_mode" = ro ]; then
+    if touch /bangbang-pmem-root-ro-probe 2>/dev/null; then
+      pmem_root_fail RO_WRITE
+      return
+    fi
+  else
+    if ! printf '%s' BANGBANG_PMEM_ROOT_RW_PROBE \
+      > /bangbang-pmem-root-rw-probe 2>/dev/null; then
+      pmem_root_fail RW_WRITE
+      return
+    fi
+    sync /bangbang-pmem-root-rw-probe 2>/dev/null || sync
+    probe=$(cat /bangbang-pmem-root-rw-probe 2>/dev/null || true)
+    if [ "$probe" != BANGBANG_PMEM_ROOT_RW_PROBE ]; then
+      pmem_root_fail RW_READ
+      return
+    fi
+  fi
+
+  emit_line "$success_marker"
+  write_vda_marker "$success_marker"
+  sync /dev/vda 2>/dev/null || true
+}
+
 request_mmds_v2_token() {
   failure_prefix=$1
   failure_marker=$2
@@ -2653,7 +2727,11 @@ if [ -r /proc/cmdline ]; then
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if cmdline_has bangbang.network-hotplug=1; then
+if cmdline_has bangbang.pmem-root=ro; then
+  check_pmem_root_marker ro
+elif cmdline_has bangbang.pmem-root=rw; then
+  check_pmem_root_marker rw
+elif cmdline_has bangbang.network-hotplug=1; then
   check_network_hotplug_marker
 elif cmdline_has bangbang.pmem-hotplug=1; then
   check_pmem_hotplug_marker

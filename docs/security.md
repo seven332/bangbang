@@ -936,23 +936,23 @@ is resource-specific:
   handed to startup without reopening the tag; same-ID replacement is
   failure-atomic. Ordinary mode opens each configured path with nonblocking
   access according to the configured read-only flag. Both paths verify a
-  non-zero regular file, mmap it to a 2 MiB-aligned host range, and keep the file
-  handles and mappings with the boot resources. Startup also assigns
-  deterministic non-overlapping 2 MiB-aligned guest physical ranges after the
-  aarch64 MMIO64 gap, skipping current guest RAM, and records those ranges in
-  the internal virtio-pmem config-space `start`/`size` fields. HVF startup
-  creates the VM with the framework-reported maximum IPA size, copies each
-  prepared pmem mapping into an HVF-compatible anonymous shadow, and registers
-  that shadow at the guest physical range after DRAM mapping, using read-only
-  HVF permissions for read-only pmem and read/write non-executable permissions
-  for writable pmem. Writable shadows are copied back to the backing file with
-  positional writes and a data sync for guest queue-driven flush requests and
-  after clean HVF unmap; read-only shadows never write back, and failed unmap
-  cleanup does not flush memory that HVF may still reference. Startup also
+  non-zero regular file, mmap it to one 2 MiB-rounded retained host range, and
+  keep the file handles and mapping leases with the boot resources. The host
+  pointer is host-page aligned; the assigned guest physical address and mapped
+  length are 2 MiB aligned. Startup skips current guest RAM and records the
+  deterministic range in the internal virtio-pmem config-space `start`/`size`
+  fields. HVF registers that exact mapping after DRAM with no anonymous copy.
+  Writable backings use a shared read/write host mapping and read/write,
+  non-executable guest permissions. Because HVF requires a write-capable host
+  mapping even for a read-only guest slot, read-only backings use a private
+  read/write host mapping from the retained read-only descriptor while the
+  guest mapping remains read-only and non-executable; accidental host writes
+  are copy-on-write and cannot modify that backing. A real signed guest-write
+  test retains the unchanged-backing boundary. Startup also
   attaches each prepared pmem device over the selected virtio-MMIO/FDT or modern PCI transport
   whose config-space exposes the assigned `start` and `size` values. It does
-  not normalize stored host paths, and shadow allocation, HVF registration,
-  MMIO attachment, flush, or writeback errors
+  not normalize stored host paths, and mapping, HVF registration, MMIO
+  attachment, or flush errors
   identify the pmem ID and guest range without echoing `path_on_host`.
   Per-device bandwidth and operation rate limiters are validated before
   startup, reported through `GET /vm/config`, and charged once per non-empty
@@ -966,14 +966,24 @@ is resource-specific:
   bucket values or backing paths. An operator can deliberately configure the
   same external file for multiple devices or processes; that alias is outside
   bangbang's isolation guarantee and requires operator-owned access and
-  coordination. Public PCI runtime PUT opens or reserves one exact direct or
+  coordination. A same-user operator can also truncate a direct writable
+  backing after validation and cause later mapped access to fault; Darwin has
+  no file-seal equivalent, so this is an explicit availability boundary rather
+  than a racy size-check promise. Queue flush and graceful removal call
+  `msync(mapping_start, file_len, MS_SYNC)` over only the persistent prefix;
+  the private alignment tail is volatile and no stronger power-loss guarantee
+  is claimed. Public PCI runtime PUT opens or reserves one exact direct or
   contained backing before owner publication, allocates a non-overlapping
-  aligned guest range, and registers only its private shadow. DELETE first
-  removes endpoint reachability, then flushes/unregisters that exact shadow and
-  releases the backing, range, and metrics generation; pre-commit failure
+  aligned guest range, and registers a cloned lease on that mapping. DELETE
+  first removes endpoint reachability, then synchronizes and unregisters that
+  exact mapping and releases the backing, range, and metrics generation;
+  failed unmap retains every lease HVF may still reference. Pre-commit failure
   restores reachability or mapping, while incomplete restoration is terminal.
-  Consumed contained authority is never recreated. Root-device boot semantics,
-  direct file-backed HVF mapping, and dirty-range tracking remain deferred.
+  Consumed contained authority is never recreated. Pre-boot configuration
+  permits one root across ordinary block and pmem devices; a pmem root boots as
+  its stable `/dev/pmem<i>` index with `ro` or `rw`, while runtime root mutation
+  remains rejected. Pmem remains outside ordinary RAM dirty epochs and native-v1
+  optional-device snapshots remain deferred.
 - `/entropy` accepts Firecracker-shaped bandwidth and ops rate-limiter buckets.
   The limiter is process-local runtime state, is applied before host entropy is
   read or guest memory is written, and must not sleep or busy-wait while budget
@@ -1598,7 +1608,7 @@ conformance, and the signed product process booting every configured virtio
 class with positive queue/configuration MSI-X and real I/O. Separate direct
 and contained signed block, pmem, and all-MMDS network gates prove the retained
 PCI manager's manual rescan/removal lifecycle and capacity reuse; pmem adds
-exact shadow/range reuse, while network adds packet-I/O/metrics teardown and
+exact direct-mapping/range reuse, while network adds packet-I/O/metrics teardown and
 real MMDS exchange without vmnet authority. This evidence does not prove
 interrupt remapping, external vmnet connectivity, or Firecracker's KVM ITS
 behavior. MSI-bearing GIC metadata is rejected by the native-v1 snapshot

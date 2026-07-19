@@ -49,6 +49,10 @@ const VMGENID_GUEST_CHECK_MARKER: &[u8] = b"BANGBANG_VMGENID_GUEST_CHECK_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PMEM_ROOT_RO_MARKER: &[u8] = b"BANGBANG_PMEM_ROOT_RO_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PMEM_ROOT_RW_MARKER: &[u8] = b"BANGBANG_PMEM_ROOT_RW_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BLOCK_WRITEBACK_FLUSH_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITEBACK_FLUSH_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PCI_BLOCK_IDENTITIES_MARKER: &[u8] = b"BANGBANG_PCI_BLOCK_IDENTITIES_OK";
@@ -954,6 +958,125 @@ fn boots_firecracker_kernel_reads_and_flushes_virtio_pmem() {
         PMEM_GUEST_FLUSH_MARKER,
         "guest pmem flush should persist the guest marker to the host backing file"
     );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_read_only_ext4_root_directly_from_mmio_pmem() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::pmem::PmemConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let boot_args = format!("{DIRECT_ROOTFS_BOOT_ARGS} rootwait bangbang.pmem-root=ro");
+    let observation = run_guest_boot_without_initrd_until_marker(
+        "guest-pmem-root-ro",
+        PMEM_ROOT_RO_MARKER,
+        &boot_args,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutPmem(
+                    PmemConfigInput::new("root_pmem", rootfs_path.to_string_lossy().into_owned())
+                        .with_root_device(true)
+                        .with_read_only(true),
+                ))
+                .expect("read-only pmem root should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        PMEM_ROOT_RO_MARKER,
+        "read-only pmem root marker",
+    );
+    let cmdline = guest_cmdline_capture(&observation);
+    assert_guest_cmdline_contains_arg(cmdline, b"root=/dev/pmem0");
+    assert_guest_cmdline_contains_arg(cmdline, b"ro");
+    assert_guest_cmdline_contains_arg(cmdline, b"bangbang.pmem-root=ro");
+    assert!(
+        !guest_cmdline_contains_arg(cmdline, b"root=/dev/vda"),
+        "pmem root boot must not retain the block-root argument: {}",
+        String::from_utf8_lossy(cmdline)
+    );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, b"BANGBANG_PMEM_ROOT_FAIL_"),
+        "read-only pmem root boot must not report a root validation failure\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_writable_ext4_root_directly_from_modern_pci_pmem() {
+    use std::num::NonZeroU32;
+
+    use bangbang_hvf::{HvfArm64BootPciDataDeviceKind, HvfGicMsiConfiguration};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::pmem::PmemConfigInput;
+    use bangbang_runtime::startup::Arm64BootPciValidationConfig;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let source_rootfs = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let writable_rootfs = GuestWritableRootfs::copy_from(&source_rootfs)
+        .expect("writable pmem root fixture should copy");
+    let boot_args = format!(
+        "{DIRECT_ROOTFS_BOOT_ARGS} rootwait bangbang.pmem-root=rw bangbang.expect-pci-data=1"
+    );
+    let observation = run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
+        "guest-pci-pmem-root-rw",
+        PMEM_ROOT_RW_MARKER,
+        None,
+        &boot_args,
+        Some(HvfGicMsiConfiguration::new(
+            NonZeroU32::new(2).expect("one pmem endpoint needs two MSI-X routes"),
+        )),
+        Some(Arm64BootPciValidationConfig::data_devices()),
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutPmem(
+                    PmemConfigInput::new("root_pmem", writable_rootfs.path_text())
+                        .with_root_device(true),
+                ))
+                .expect("writable PCI pmem root should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        PMEM_ROOT_RW_MARKER,
+        "writable PCI pmem root marker",
+    );
+    let cmdline = guest_cmdline_capture(&observation);
+    assert_guest_cmdline_contains_arg(cmdline, b"root=/dev/pmem0");
+    assert_guest_cmdline_contains_arg(cmdline, b"rw");
+    assert_guest_cmdline_contains_arg(cmdline, b"bangbang.pmem-root=rw");
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, PCI_PMEM_IDENTITIES_MARKER),
+        "writable pmem root should enumerate the modern PCI identity\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, b"BANGBANG_PMEM_ROOT_FAIL_"),
+        "writable pmem root boot must not report a root validation failure\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    let diagnostics = observation
+        .pci_data_devices
+        .as_ref()
+        .expect("writable PCI pmem root should retain endpoint diagnostics");
+    assert_eq!(diagnostics.len(), 1);
+    assert_pci_data_endpoint(
+        &diagnostics[0],
+        HvfArm64BootPciDataDeviceKind::Pmem,
+        "root_pmem",
+        1,
+    );
+    assert_eq!(observation.data_mmio_device_counts, (0, 0, 0));
+    assert!(observation.pci_data_device_teardown);
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1947,6 +2070,39 @@ impl GuestPmemBacking {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for GuestPmemBacking {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct GuestWritableRootfs {
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GuestWritableRootfs {
+    fn copy_from(source: &std::path::Path) -> std::io::Result<Self> {
+        let unique = format!(
+            "bangbang-guest-pmem-root-{}-{}.ext4",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("guest pmem root timestamp should be after epoch")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::copy(source, &path)?;
+        Ok(Self { path })
+    }
+
+    fn path_text(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for GuestWritableRootfs {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }

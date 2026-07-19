@@ -9,8 +9,9 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::ptr::{self, NonNull};
-#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -1679,10 +1680,6 @@ impl TryFrom<PmemConfigInput> for PmemConfig {
             return Err(PmemConfigError::EmptyPathOnHost);
         }
 
-        if input.root_device {
-            return Err(PmemConfigError::UnsupportedRootDevice);
-        }
-
         Ok(Self {
             id: input.id,
             path_on_host: input.path_on_host,
@@ -1751,6 +1748,36 @@ impl PmemConfigs {
 
     pub fn as_slice(&self) -> &[PmemConfig] {
         &self.configs
+    }
+
+    pub fn insert(&mut self, input: PmemConfigInput) -> Result<(), PmemConfigError> {
+        let config = self.validate_insert(input)?;
+        self.commit_insert(config);
+        Ok(())
+    }
+
+    /// Validates a preboot insertion without changing the configured devices.
+    pub fn validate_insert(&self, input: PmemConfigInput) -> Result<PmemConfig, PmemConfigError> {
+        let config: PmemConfig = input.try_into()?;
+        if config.root_device()
+            && self
+                .configs
+                .iter()
+                .any(|existing| existing.root_device() && existing.id() != config.id())
+        {
+            return Err(PmemConfigError::RootDeviceAlreadyConfigured);
+        }
+
+        Ok(config)
+    }
+
+    /// Commits a pmem configuration checked by [`Self::validate_insert`].
+    pub fn commit_insert(&mut self, config: PmemConfig) {
+        self.upsert(config);
+    }
+
+    pub fn has_root_device(&self) -> bool {
+        self.configs.iter().any(PmemConfig::root_device)
     }
 
     pub fn upsert(&mut self, config: PmemConfig) {
@@ -1988,24 +2015,30 @@ impl std::error::Error for PmemFileBackingError {
     }
 }
 
+#[derive(Clone)]
 pub struct PmemBackingMapping {
+    inner: Arc<PmemBackingMappingInner>,
+}
+
+struct PmemBackingMappingInner {
     address: NonNull<c_void>,
     file_len: u64,
     mapped_len: u64,
+    file_size: usize,
     host_size: usize,
     read_only: bool,
     kind: PmemBackingMappingKind,
 }
 
-// SAFETY: `PmemBackingMapping` owns a process-local mmap region. Moving the
-// owner to another thread does not invalidate the mapping, and `munmap` may run
-// from any thread when ownership is dropped.
-unsafe impl Send for PmemBackingMapping {}
+// SAFETY: `PmemBackingMappingInner` owns a process-local mmap region. Moving
+// the final `Arc` owner to another thread does not invalidate the mapping, and
+// `munmap` may run from any thread when the final lease is dropped.
+unsafe impl Send for PmemBackingMappingInner {}
 
 // SAFETY: Shared references expose only copyable metadata and a raw pointer.
 // Safe Rust cannot mutate mapped bytes through this type, and unsafe users must
 // uphold normal raw-pointer aliasing and lifetime requirements.
-unsafe impl Sync for PmemBackingMapping {}
+unsafe impl Sync for PmemBackingMappingInner {}
 
 impl PmemBackingMapping {
     pub fn map(backing: &PmemFileBacking) -> Result<Self, PmemBackingMappingError> {
@@ -2018,16 +2051,21 @@ impl PmemBackingMapping {
                 mapped_len,
             }
         })?;
-        let prot = pmem_mapping_protection(backing.is_read_only());
-        let address = map_pmem_file(backing.file(), prot, file_len, host_size)?;
+        let read_only = backing.is_read_only();
+        let prot = pmem_host_mapping_protection();
+        let file_flags = pmem_file_mapping_flags(read_only);
+        let address = map_pmem_file(backing.file(), prot, file_flags, file_len, host_size)?;
 
         Ok(Self {
-            address,
-            file_len: backing.len(),
-            mapped_len,
-            host_size,
-            read_only: backing.is_read_only(),
-            kind: PmemBackingMappingKind::System,
+            inner: Arc::new(PmemBackingMappingInner {
+                address,
+                file_len: backing.len(),
+                mapped_len,
+                file_size: file_len,
+                host_size,
+                read_only,
+                kind: PmemBackingMappingKind::System,
+            }),
         })
     }
 
@@ -2038,45 +2076,116 @@ impl PmemBackingMapping {
         read_only: bool,
         drop_count: Arc<AtomicUsize>,
     ) -> Self {
+        Self::test_mapping_with_flush(file_len, mapped_len, read_only, drop_count, None, None)
+    }
+
+    #[cfg(test)]
+    fn test_mapping_with_flush(
+        file_len: u64,
+        mapped_len: u64,
+        read_only: bool,
+        drop_count: Arc<AtomicUsize>,
+        flush_calls: Option<Arc<Mutex<Vec<PmemBackingFlushCall>>>>,
+        flush_errno: Option<i32>,
+    ) -> Self {
         Self {
-            address: NonNull::<u8>::dangling().cast(),
-            file_len,
-            mapped_len,
-            host_size: usize::try_from(mapped_len).expect("test mapped length should fit in usize"),
-            read_only,
-            kind: PmemBackingMappingKind::Test { drop_count },
+            inner: Arc::new(PmemBackingMappingInner {
+                address: NonNull::<u8>::dangling().cast(),
+                file_len,
+                mapped_len,
+                file_size: usize::try_from(file_len).expect("test file length should fit in usize"),
+                host_size: usize::try_from(mapped_len)
+                    .expect("test mapped length should fit in usize"),
+                read_only,
+                kind: PmemBackingMappingKind::Test {
+                    drop_count,
+                    flush_calls,
+                    flush_errno,
+                },
+            }),
         }
     }
 
-    pub const fn host_address(&self) -> NonNull<c_void> {
-        self.address
+    pub fn host_address(&self) -> NonNull<c_void> {
+        self.inner.address
     }
 
-    pub const fn file_len(&self) -> u64 {
-        self.file_len
+    pub fn file_len(&self) -> u64 {
+        self.inner.file_len
     }
 
-    pub const fn mapped_len(&self) -> u64 {
-        self.mapped_len
+    pub fn mapped_len(&self) -> u64 {
+        self.inner.mapped_len
     }
 
-    pub const fn host_size(&self) -> usize {
-        self.host_size
+    pub fn host_size(&self) -> usize {
+        self.inner.host_size
     }
 
-    pub const fn is_read_only(&self) -> bool {
-        self.read_only
+    pub fn is_read_only(&self) -> bool {
+        self.inner.read_only
+    }
+
+    /// Synchronizes exactly the persistent file-backed prefix of this mapping.
+    ///
+    /// The private alignment tail is intentionally excluded. This matches the
+    /// virtio-pmem persistence operation used by the pinned Firecracker source.
+    pub fn flush(&self) -> Result<(), PmemBackingFlushError> {
+        match &self.inner.kind {
+            PmemBackingMappingKind::System => {
+                // SAFETY: the inner owner retains a live file-backed mapping
+                // at `address`; `file_size` is its nonzero persistent prefix
+                // and the address is host-page aligned.
+                let result = unsafe {
+                    libc::msync(
+                        self.inner.address.as_ptr(),
+                        self.inner.file_size,
+                        libc::MS_SYNC,
+                    )
+                };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(PmemBackingFlushError {
+                        source: io::Error::last_os_error(),
+                    })
+                }
+            }
+            #[cfg(test)]
+            PmemBackingMappingKind::Test {
+                flush_calls,
+                flush_errno,
+                ..
+            } => {
+                if let Some(flush_calls) = flush_calls {
+                    flush_calls
+                        .lock()
+                        .expect("pmem flush call recorder should not be poisoned")
+                        .push(PmemBackingFlushCall {
+                            address: self.inner.address.as_ptr() as usize,
+                            len: self.inner.file_size,
+                            flags: libc::MS_SYNC,
+                        });
+                }
+                match flush_errno {
+                    Some(errno) => Err(PmemBackingFlushError {
+                        source: io::Error::from_raw_os_error(*errno),
+                    }),
+                    None => Ok(()),
+                }
+            }
+        }
     }
 }
 
 impl fmt::Debug for PmemBackingMapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PmemBackingMapping")
-            .field("file_len", &self.file_len)
-            .field("mapped_len", &self.mapped_len)
-            .field("host_size", &self.host_size)
-            .field("read_only", &self.read_only)
-            .field("kind", &self.kind)
+            .field("file_len", &self.inner.file_len)
+            .field("mapped_len", &self.inner.mapped_len)
+            .field("host_size", &self.inner.host_size)
+            .field("read_only", &self.inner.read_only)
+            .field("kind", &self.inner.kind)
             .finish_non_exhaustive()
     }
 }
@@ -2087,10 +2196,20 @@ enum PmemBackingMappingKind {
     #[cfg(test)]
     Test {
         drop_count: Arc<AtomicUsize>,
+        flush_calls: Option<Arc<Mutex<Vec<PmemBackingFlushCall>>>>,
+        flush_errno: Option<i32>,
     },
 }
 
-impl Drop for PmemBackingMapping {
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PmemBackingFlushCall {
+    address: usize,
+    len: usize,
+    flags: libc::c_int,
+}
+
+impl Drop for PmemBackingMappingInner {
     fn drop(&mut self) {
         match &self.kind {
             PmemBackingMappingKind::System => {
@@ -2101,10 +2220,31 @@ impl Drop for PmemBackingMapping {
                 }
             }
             #[cfg(test)]
-            PmemBackingMappingKind::Test { drop_count } => {
+            PmemBackingMappingKind::Test { drop_count, .. } => {
                 drop_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct PmemBackingFlushError {
+    source: io::Error,
+}
+
+impl fmt::Display for PmemBackingFlushError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "failed to synchronize pmem backing mapping: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for PmemBackingFlushError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -2255,41 +2395,55 @@ fn align_pmem_mapping_len(len: u64) -> Result<u64, PmemBackingMappingError> {
         })
 }
 
-const fn pmem_mapping_protection(read_only: bool) -> libc::c_int {
-    let mut prot = libc::PROT_READ;
-    if !read_only {
-        prot |= libc::PROT_WRITE;
+const fn pmem_host_mapping_protection() -> libc::c_int {
+    // Hypervisor.framework rejects host mappings that are not write-capable,
+    // even when the guest mapping itself is read-only. Guest permissions are
+    // selected independently by the HVF backend.
+    libc::PROT_READ | libc::PROT_WRITE
+}
+
+const fn pmem_file_mapping_flags(read_only: bool) -> libc::c_int {
+    if read_only {
+        // A private mapping can be created from the read-only descriptor while
+        // satisfying HVF's host-page requirement. Guest writes remain blocked
+        // by HVF, and any accidental host write is copy-on-write rather than a
+        // mutation of the read-only backing.
+        libc::MAP_PRIVATE
+    } else {
+        libc::MAP_SHARED
     }
-    prot
 }
 
 fn map_pmem_file(
     file: &File,
     prot: libc::c_int,
+    file_flags: libc::c_int,
     file_len: usize,
     host_size: usize,
 ) -> Result<NonNull<c_void>, PmemBackingMappingError> {
     if file_len == host_size {
-        return map_pmem_file_exact(file, prot, file_len);
+        return map_pmem_file_exact(file, prot, file_flags, file_len);
     }
 
-    map_pmem_file_with_aligned_reservation(file, prot, file_len, host_size)
+    map_pmem_file_with_aligned_reservation(file, prot, file_flags, file_len, host_size)
 }
 
 fn map_pmem_file_exact(
     file: &File,
     prot: libc::c_int,
+    file_flags: libc::c_int,
     file_len: usize,
 ) -> Result<NonNull<c_void>, PmemBackingMappingError> {
-    // SAFETY: The call requests a new shared mapping for the already-open
-    // regular backing file. Lengths are non-zero, fit usize, and the result is
-    // checked before ownership is created.
+    // SAFETY: The call requests a new mapping with the validated shared or
+    // private flags for the already-open regular backing file. Lengths are
+    // non-zero, fit usize, and the result is checked before ownership is
+    // created.
     let address = unsafe {
         libc::mmap(
             ptr::null_mut(),
             file_len,
             prot,
-            libc::MAP_SHARED | libc::MAP_NORESERVE,
+            file_flags | libc::MAP_NORESERVE,
             file.as_raw_fd(),
             0,
         )
@@ -2308,6 +2462,7 @@ fn map_pmem_file_exact(
 fn map_pmem_file_with_aligned_reservation(
     file: &File,
     prot: libc::c_int,
+    file_flags: libc::c_int,
     file_len: usize,
     host_size: usize,
 ) -> Result<NonNull<c_void>, PmemBackingMappingError> {
@@ -2341,7 +2496,7 @@ fn map_pmem_file_with_aligned_reservation(
             reserved.as_ptr(),
             file_len,
             prot,
-            libc::MAP_SHARED | libc::MAP_FIXED | libc::MAP_NORESERVE,
+            file_flags | libc::MAP_FIXED | libc::MAP_NORESERVE,
             file.as_raw_fd(),
             0,
         )
@@ -3348,7 +3503,7 @@ pub enum PmemConfigError {
     EmptyPmemId,
     InvalidPmemId,
     EmptyPathOnHost,
-    UnsupportedRootDevice,
+    RootDeviceAlreadyConfigured,
 }
 
 /// Redacted failure while preparing or committing a post-start pmem mutation.
@@ -3417,7 +3572,7 @@ impl fmt::Display for PmemConfigError {
                 f.write_str("pmem id must contain only alphanumeric characters or '_'")
             }
             Self::EmptyPathOnHost => f.write_str("pmem path_on_host must not be empty"),
-            Self::UnsupportedRootDevice => f.write_str("pmem root_device is not supported"),
+            Self::RootDeviceAlreadyConfigured => f.write_str("a root device is already configured"),
         }
     }
 }
@@ -5219,14 +5374,50 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_root_device() {
-        let err = PmemConfig::try_from(
+    fn config_accepts_root_device() {
+        let config = PmemConfig::try_from(
             PmemConfigInput::new("pmem0", "/tmp/pmem.img").with_root_device(true),
         )
-        .expect_err("pmem root device should fail");
+        .expect("pmem root device should validate");
 
-        assert_eq!(err, PmemConfigError::UnsupportedRootDevice);
-        assert_eq!(err.to_string(), "pmem root_device is not supported");
+        assert!(config.root_device());
+    }
+
+    #[test]
+    fn configs_reject_second_root_without_mutating_and_preserve_replacement_order() {
+        let mut configs = PmemConfigs::new();
+        configs
+            .insert(PmemConfigInput::new("data", "/tmp/data.img"))
+            .expect("data pmem should insert");
+        configs
+            .insert(PmemConfigInput::new("root", "/tmp/root.img"))
+            .expect("second data pmem should insert in configured order");
+        configs
+            .insert(PmemConfigInput::new("root", "/tmp/root.img").with_root_device(true))
+            .expect("same-id root replacement should preserve configured order");
+        assert_eq!(configs.as_slice()[0].id(), "data");
+        assert_eq!(configs.as_slice()[1].id(), "root");
+
+        let err = configs
+            .insert(PmemConfigInput::new("other", "/tmp/other.img").with_root_device(true))
+            .expect_err("second root pmem should fail");
+        assert_eq!(err, PmemConfigError::RootDeviceAlreadyConfigured);
+        assert_eq!(err.to_string(), "a root device is already configured");
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(configs.as_slice()[0].id(), "data");
+        assert_eq!(configs.as_slice()[1].id(), "root");
+
+        configs
+            .insert(
+                PmemConfigInput::new("root", "/tmp/replaced.img")
+                    .with_root_device(true)
+                    .with_read_only(true),
+            )
+            .expect("same root id should replace in place");
+        assert_eq!(configs.as_slice()[0].id(), "data");
+        assert_eq!(configs.as_slice()[1].id(), "root");
+        assert_eq!(configs.as_slice()[1].path_on_host(), "/tmp/replaced.img");
+        assert!(configs.as_slice()[1].read_only());
     }
 
     #[test]
@@ -5592,19 +5783,118 @@ mod tests {
         // was opened with read_only=false. The write stays within file_len.
         unsafe {
             mapping.host_address().as_ptr().cast::<u8>().write(b'P');
-            let result = libc::msync(
-                mapping.host_address().as_ptr(),
-                usize::try_from(mapping.file_len()).expect("file length should fit usize"),
-                libc::MS_SYNC,
-            );
-            assert_eq!(result, 0, "msync failed: {}", io::Error::last_os_error());
         }
+        mapping.flush().expect("pmem mapping should synchronize");
         drop(mapping);
 
         assert_eq!(
             fs::read(file.as_path()).expect("test file should read"),
             b"Pmem"
         );
+    }
+
+    #[test]
+    fn backing_mapping_read_only_host_write_is_private() {
+        let file = temp_file("mapped-read-only-pmem.img", b"pmem");
+        let mapping = map_backing(file.as_path(), true);
+
+        // SAFETY: the direct host mapping is intentionally write-capable for
+        // HVF registration but private for a read-only backing. The write is
+        // bounded to the mapped file prefix and verifies the COW boundary.
+        unsafe {
+            mapping.host_address().as_ptr().cast::<u8>().write(b'P');
+        }
+        mapping
+            .flush()
+            .expect("private read-only mapping should accept synchronization");
+        drop(mapping);
+
+        assert_eq!(
+            fs::read(file.as_path()).expect("test file should read"),
+            b"pmem",
+            "host writes through a read-only pmem mapping must not mutate the backing"
+        );
+    }
+
+    #[test]
+    fn backing_mapping_clone_releases_mapping_on_final_drop() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mapping = PmemBackingMapping::test_mapping(
+            4,
+            VIRTIO_PMEM_ALIGNMENT,
+            false,
+            Arc::clone(&drop_count),
+        );
+        let lease = mapping.clone();
+
+        drop(mapping);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+
+        drop(lease);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn backing_mapping_flush_uses_one_shared_lease_operation() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let flush_calls = Arc::new(Mutex::new(Vec::new()));
+        let mapping = PmemBackingMapping::test_mapping_with_flush(
+            4,
+            VIRTIO_PMEM_ALIGNMENT,
+            true,
+            Arc::clone(&drop_count),
+            Some(Arc::clone(&flush_calls)),
+            None,
+        );
+        let lease = mapping.clone();
+        let address = mapping.host_address().as_ptr() as usize;
+
+        mapping
+            .flush()
+            .expect("read-only mapped prefix should synchronize");
+        lease.flush().expect("cloned lease should synchronize");
+
+        assert_eq!(
+            flush_calls
+                .lock()
+                .expect("pmem flush call recorder should not be poisoned")
+                .as_slice(),
+            [
+                PmemBackingFlushCall {
+                    address,
+                    len: 4,
+                    flags: libc::MS_SYNC,
+                },
+                PmemBackingFlushCall {
+                    address,
+                    len: 4,
+                    flags: libc::MS_SYNC,
+                },
+            ],
+            "each lease must synchronize only the exact file prefix, not the aligned tail"
+        );
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn backing_mapping_flush_failure_is_typed_and_redacted() {
+        let mapping = PmemBackingMapping::test_mapping_with_flush(
+            4,
+            VIRTIO_PMEM_ALIGNMENT,
+            false,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            Some(libc::EIO),
+        );
+
+        let err = mapping
+            .flush()
+            .expect_err("scripted synchronization should fail");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("failed to synchronize pmem backing mapping"));
+        assert!(!rendered.contains("0x"));
+        assert!(err.source().is_some());
     }
 
     #[test]

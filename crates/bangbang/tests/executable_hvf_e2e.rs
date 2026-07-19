@@ -47,6 +47,8 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_ENTROPY_MARKER: &[u8] = b"BANGBANG_ENTROPY_GUEST_READ_OK";
     const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
     const DIRECT_ROOTFS_PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
+    const DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER: &[u8] = b"BANGBANG_PMEM_ROOT_RO_OK";
+    const DIRECT_ROOTFS_PMEM_ROOT_RW_MARKER: &[u8] = b"BANGBANG_PMEM_ROOT_RW_OK";
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.pci-all-virtio=1";
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_MARKER: &[u8] = b"BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
@@ -3911,6 +3913,157 @@ mod macos_arm64 {
             &socket_path,
             "bangbang pmem direct rootfs",
         );
+    }
+
+    #[test]
+    fn signed_executable_boots_read_only_and_writable_pmem_roots() {
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let source_rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+
+        for (mode, read_only, enable_pci, success_marker) in [
+            ("ro", true, false, DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER),
+            ("rw", false, true, DIRECT_ROOTFS_PMEM_ROOT_RW_MARKER),
+        ] {
+            let test_dir = TestDir::new();
+            let socket_path = test_dir.path().join("api.socket");
+            let control_backing_path = test_dir
+                .path()
+                .join(format!("pmem-root-{mode}-control.img"));
+            let rootfs_path = if read_only {
+                source_rootfs_path.clone()
+            } else {
+                let copy = test_dir.path().join("pmem-root-rw.ext4");
+                fs::copy(&source_rootfs_path, &copy)
+                    .expect("writable process pmem root fixture should copy");
+                copy
+            };
+            create_zeroed_block_backing(&control_backing_path);
+            let instance_id = test_dir.instance_id();
+            let mut bangbang = if enable_pci {
+                BangbangProcess::start_with_extra_args(
+                    &socket_path,
+                    &instance_id,
+                    &["--enable-pci"],
+                )
+            } else {
+                BangbangProcess::start(&socket_path, &instance_id)
+            };
+
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/machine-config",
+                    r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+                ),
+                "PUT /machine-config pmem root",
+            );
+            let boot_args = format!(
+                "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.pmem-root={mode}"
+            );
+            let boot_body = format!(
+                r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+                json_string(path_text(&kernel_path)),
+                json_string(&boot_args),
+            );
+            assert_no_content_response(
+                &http_put_json(&socket_path, "/boot-source", &boot_body),
+                "PUT /boot-source pmem root",
+            );
+            let control_body = format!(
+                r#"{{"drive_id":"control","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+                json_string(path_text(&control_backing_path)),
+            );
+            assert_no_content_response(
+                &http_put_json(&socket_path, "/drives/control", &control_body),
+                "PUT /drives/control pmem root",
+            );
+            let rootfs_path_json = json_string(path_text(&rootfs_path));
+            let pmem_body = format!(
+                r#"{{"id":"root_pmem","path_on_host":{rootfs_path_json},"root_device":true,"read_only":{read_only}}}"#,
+            );
+            assert_no_content_response(
+                &http_put_json(&socket_path, "/pmem/root_pmem", &pmem_body),
+                "PUT /pmem/root_pmem",
+            );
+
+            let conflict = http_put_json(
+                &socket_path,
+                "/drives/conflict_root",
+                r#"{"drive_id":"conflict_root","path_on_host":"/private/conflict-root.ext4","is_root_device":true}"#,
+            );
+            assert_bad_request_response(&conflict, "PUT conflicting block root");
+            assert_response_contains(
+                &conflict,
+                r#"{"fault_message":"a root drive is already configured"}"#,
+                "PUT conflicting block root",
+            );
+            assert!(!conflict.contains("/private/conflict-root.ext4"));
+
+            let vm_config = http_get(&socket_path, "/vm/config");
+            assert_ok_response(&vm_config, "GET /vm/config before pmem root start");
+            assert_response_contains(
+                &vm_config,
+                r#""id":"root_pmem""#,
+                "GET /vm/config before pmem root start",
+            );
+            assert_response_contains(
+                &vm_config,
+                r#""root_device":true"#,
+                "GET /vm/config before pmem root start",
+            );
+            assert_response_contains(
+                &vm_config,
+                &format!(r#""read_only":{read_only}"#),
+                "GET /vm/config before pmem root start",
+            );
+            assert!(!vm_config.contains(r#""drive_id":"conflict_root""#));
+
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/actions",
+                    r#"{"action_type":"InstanceStart"}"#,
+                ),
+                "PUT /actions InstanceStart pmem root",
+            );
+            if let Err(err) = wait_for_file_prefix_marker(
+                &control_backing_path,
+                success_marker,
+                GUEST_EXECUTION_TIMEOUT,
+            ) {
+                let control_prefix = file_prefix_lossy(&control_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "{mode} pmem root guest did not report success: {err}; control prefix: {control_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+
+            if enable_pci {
+                let rejected_put = http_put_json(&socket_path, "/pmem/root_pmem", &pmem_body);
+                assert_bad_request_response(&rejected_put, "runtime PUT root pmem");
+                assert_response_contains(
+                    &rejected_put,
+                    r#"{"fault_message":"a root pmem device cannot be inserted after the microVM starts"}"#,
+                    "runtime PUT root pmem",
+                );
+                assert!(!rejected_put.contains(path_text(&rootfs_path)));
+
+                let rejected_delete = http_no_body(&socket_path, "DELETE", "/pmem/root_pmem");
+                assert_bad_request_response(&rejected_delete, "runtime DELETE root pmem");
+                assert_response_contains(
+                    &rejected_delete,
+                    r#"{"fault_message":"root pmem device cannot be removed"}"#,
+                    "runtime DELETE root pmem",
+                );
+            }
+
+            assert_clean_shutdown(
+                bangbang.terminate(),
+                &socket_path,
+                &format!("bangbang {mode} pmem root"),
+            );
+        }
     }
 
     #[test]
