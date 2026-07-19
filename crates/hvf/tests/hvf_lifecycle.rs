@@ -3858,6 +3858,135 @@ fn maps_guest_memory_and_unmaps_before_destroying_vm() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn maps_shared_guest_memory_and_exposes_guest_writes_through_its_descriptor() {
+    use std::fs::File;
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileExt;
+    use std::sync::{Arc, Mutex};
+
+    use bangbang_hvf::{
+        HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuRunStepOutcome,
+    };
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{
+        GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryRange, aarch64,
+    };
+    use bangbang_runtime::mmio::MmioDispatcher;
+
+    const MOV_W1_TEST_VALUE: u32 = 0x5280_0b41;
+    const STR_W1_X0: u32 = 0xb900_0001;
+    const DMB_ISH: u32 = 0xd503_3bbf;
+    const HVC_ZERO: u32 = 0xd400_0002;
+    const TEST_VALUE: u32 = 0x5a;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let page_size = host_page_size().expect("host page size should be valid");
+    let layout =
+        aarch64::dram_layout(page_size * 2).expect("shared guest memory layout should be valid");
+    let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+        .expect("shared guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_target = guest_entry
+        .checked_add(page_size)
+        .expect("guest write target should fit");
+    let guest_code = [MOV_W1_TEST_VALUE, STR_W1_X0, DMB_ISH, HVC_ZERO]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("shared guest code should be written");
+    let export = memory.regions()[0]
+        .try_clone_shared_backing()
+        .expect("shared descriptor should clone")
+        .expect("shared guest memory should expose a descriptor");
+    let export_file = File::from(
+        export
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("shared descriptor clone should be independent"),
+    );
+
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("shared guest memory should be mapped");
+    let dynamic_range = GuestMemoryRange::new(
+        guest_entry
+            .checked_add(page_size * 2)
+            .expect("dynamic shared range should fit"),
+        page_size,
+    )
+    .expect("dynamic shared range should validate");
+    backend
+        .map_dynamic_guest_memory_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+        .expect("dynamic shared guest memory should map");
+    let tracker = backend
+        .start_dirty_write_tracking()
+        .expect("shared guest memory should be write-protected");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("shared-memory vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_target,
+            })
+            .expect("shared-memory guest registers should configure");
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        assert_eq!(
+            runner
+                .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                .expect("first shared-memory write exit should be handled"),
+            HvfVcpuRunStepOutcome::DirtyWrite {
+                page: guest_target,
+                first_write: true,
+            }
+        );
+        assert!(matches!(
+            runner
+                .run_once_and_handle_mmio(dispatcher)
+                .expect("retried shared-memory guest should reach HVC"),
+            HvfVcpuRunStepOutcome::Hvc { exit, .. } if exit.immediate() == 0
+        ));
+        runner
+            .shutdown()
+            .expect("shared-memory vCPU runner should shut down");
+    }
+    assert_eq!(
+        tracker
+            .dirty_pages()
+            .expect("shared-memory dirty pages should query"),
+        vec![guest_target]
+    );
+    tracker
+        .stop()
+        .expect("owner-free shared-memory tracker should restore write access");
+    backend
+        .stop_dirty_write_tracking()
+        .expect("shared-memory tracker retention should clear");
+
+    let mut descriptor_value = [0_u8; std::mem::size_of::<u32>()];
+    export_file
+        .read_exact_at(&mut descriptor_value, page_size)
+        .expect("shared descriptor should observe the guest write");
+    assert_eq!(u32::from_le_bytes(descriptor_value), TEST_VALUE);
+
+    backend
+        .unmap_dynamic_guest_memory_region(dynamic_range)
+        .expect("dynamic shared guest memory should unmap");
+    backend
+        .unmap_guest_memory()
+        .expect("shared guest memory should unmap");
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn prepares_internal_hvf_arm64_boot_session() {
     use bangbang_hvf::{ARM64_LINUX_BOOT_CPSR, HvfArm64BootSessionConfig, HvfBackend};
     use bangbang_runtime::VmmAction;

@@ -3208,6 +3208,17 @@ fn signed_grants_authorize_only_typed_read_write_and_directory_operations() {
 }
 
 #[test]
+fn contained_worker_maps_unlinked_shared_guest_memory_with_hvf() {
+    let bundle = grant_test_bundle();
+    let fixture = GrantProbeFixture::new("shared-memory", false);
+    let output = run_grant_probe(&bundle, &fixture, "shared-memory");
+
+    assert_output_success(&output, "contained shared guest-memory probe");
+    fixture.assert_completed();
+    assert_grant_output_redacted(&output, &fixture);
+}
+
+#[test]
 fn signed_grant_mismatch_fails_closed_without_mutation() {
     let bundle = grant_test_bundle();
     let fixture = GrantProbeFixture::new("single", true);

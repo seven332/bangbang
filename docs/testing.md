@@ -401,7 +401,7 @@ lengths, offsets, alignment, ordering, overlap, identity, and integrity; and
 inject short, interrupted, zero-progress, seek, allocation, and guest-access
 failures. Length-preflight tests must prove zero-position restoration before a
 rejection, while late truncation/growth tests prove the final trailer/EOF guard
-and that partial anonymous memory never escapes. Cancellation tests check every
+and that partial guest memory never escapes. Cancellation tests check every
 fixed write stage and successive 1 MiB chunks, prove that no binding escapes,
 and then reuse a fresh writer successfully. Run the focused module with
 `cargo test -p bangbang-runtime snapshot_memory --locked`.
@@ -1035,6 +1035,9 @@ may skip execution. On supported Apple Silicon it proves:
   distinct grant authority cannot be interchanged;
 - rejection of the internal grant probe by the normal production worker with no
   resource mutation, proving the exerciser is absent from the shipped build;
+- unlinked shared guest-memory allocation, two-way descriptor coherence, and
+  real HVF map/unmap inside the nested App Sandbox worker without adding an
+  entitlement or enabling a public socket-backed drive;
 - both the sealed baseline and externally granted startup config, metadata,
   kernel, initrd, repeatable read-only/read-write drives, and repeatable
   read-only/read-write pmem launching real sandboxed HVF guests after committed
@@ -1338,6 +1341,17 @@ validation, per-region segmentation, inward alignment, 4-KiB-within-16-KiB
 neighbor safety, partial failures, byte accounting, repeats, and independent
 owners. A macOS-only real anonymous-mapping test requires zero contents after
 `MADV_ZERO` plus `MADV_FREE` reuse without asserting RSS.
+Shared-profile tests additionally require exact file length and zero offset,
+mode `0600`, link count zero, close-on-exec duplication, bidirectional
+descriptor/mapping coherence, redacted debug output, inherited dynamic-region
+backing, dirty writes, native snapshot round trips, typed low
+`RLIMIT_FSIZE`/`RLIMIT_NOFILE` preflights, and zero-safe `F_PUNCHHOLE` discard.
+The signed `hvf_lifecycle` case write-protects shared RAM, observes the first
+guest dirty fault, retries to HVC, reads the guest write through an independent
+descriptor, restores permissions, unmaps, and destroys the VM. The test-only
+production bundle repeats shared creation, descriptor coherence, and HVF
+map/unmap inside the real nested App Sandbox worker with the unchanged App
+Sandbox plus Hypervisor entitlements.
 It also includes a direct-rootfs writeback block scenario that configures a
 non-root data drive with `cache_type=Writeback`, writes through `/dev/vdb`,
 calls `fsync` on the block-device file descriptor, and writes a host-observable

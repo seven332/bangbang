@@ -1,4 +1,4 @@
-//! Native snapshot guest-memory image encoding and anonymous loading.
+//! Native snapshot guest-memory image encoding and selectable-profile loading.
 
 use std::collections::TryReserveError;
 use std::fmt;
@@ -8,7 +8,7 @@ use crc64::crc64;
 
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError,
-    GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64,
+    GuestMemoryBacking, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64,
 };
 use crate::snapshot_format::{
     NATIVE_V1_ARM64_ARCHITECTURE_ID, NATIVE_V1_GUEST_PAGE_SIZE,
@@ -852,6 +852,17 @@ pub fn load_snapshot_memory_image<R: Read + Seek>(
     reader: &mut R,
 ) -> Result<GuestMemory, SnapshotMemoryLoadError> {
     load_snapshot_memory_image_with_allocator(binding, reader, GuestMemory::allocate)
+}
+
+/// Loads a complete native-v1 image using an explicit guest-memory profile.
+pub fn load_snapshot_memory_image_with_backing<R: Read + Seek>(
+    binding: &SnapshotMemoryBinding,
+    reader: &mut R,
+    backing: GuestMemoryBacking,
+) -> Result<GuestMemory, SnapshotMemoryLoadError> {
+    load_snapshot_memory_image_with_allocator(binding, reader, |layout| {
+        GuestMemory::allocate_with_backing(layout, backing)
+    })
 }
 
 /// Verifies fixed output evidence against a trusted codec-produced binding.
@@ -2002,6 +2013,37 @@ mod tests {
         );
         let loaded = load_snapshot_memory_image(&binding, &mut Cursor::new(image))
             .expect("dynamic memory image should load");
+        assert_memory_bytes(&loaded, &expected);
+    }
+
+    #[test]
+    fn round_trips_descriptor_backed_shared_memory() {
+        let ranges = vec![
+            range(0, TEST_ALIGNMENT),
+            range(TEST_ALIGNMENT * 2, TEST_ALIGNMENT),
+        ];
+        let layout = GuestMemoryLayout::new(ranges).expect("shared test layout should be valid");
+        let mut guest_memory =
+            GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+                .expect("shared snapshot memory should allocate");
+        let expected = fill_memory(&mut guest_memory);
+        let (image, binding) = write_image(&guest_memory);
+
+        let loaded = load_snapshot_memory_image_with_backing(
+            &binding,
+            &mut Cursor::new(image),
+            GuestMemoryBacking::Shared,
+        )
+        .expect("snapshot image should load into shared memory");
+
+        assert_eq!(loaded.backing(), GuestMemoryBacking::Shared);
+        assert!(loaded.regions().iter().all(|region| {
+            region.backing() == GuestMemoryBacking::Shared
+                && region
+                    .try_clone_shared_backing()
+                    .expect("loaded shared descriptor should clone")
+                    .is_some()
+        }));
         assert_memory_bytes(&loaded, &expected);
     }
 

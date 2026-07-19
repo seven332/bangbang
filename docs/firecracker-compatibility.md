@@ -878,7 +878,7 @@ host-randomness failure, and event-failure activity, and runtime entropy queue
 dispatch exposes a backend-neutral retry delay when a limiter leaves a
 descriptor pending; `balloon` reports implemented virtio-balloon queue activity
 and failures, including separate inflate/hint/report discard attempts,
-zero-and-free-advised byte, skipped-edge byte, requested reporting byte, and
+zero-safe-reclaimed byte, skipped-edge byte, requested reporting byte, and
 failed-attempt fields;
 `signals.sigpipe` reports handled non-terminating `SIGPIPE`
 signals. HVF block, PMEM, network, and entropy limiter retry wakeups are wired
@@ -1354,8 +1354,9 @@ host or kernel buffers. bangbang has a native
 fixed outer state envelope with exact `1.0.0`, arm64, 4096-byte page-size and
 CRC-64/Jones validation. It also has internal handle-level memory image and
 state-binding primitives: exact GPA ranges map to canonical absolute offsets,
-full bytes stream through a bounded buffer, and a validated image loads into
-anonymous memory only after identity, length, CRC, and EOF checks. The public
+full bytes stream through a bounded buffer, and a validated image loads into an
+explicit internal anonymous or shared profile only after identity, length,
+CRC, and EOF checks. Public restore still selects anonymous memory. The public
 process create transaction publishes a close-proven composite capture, and the
 public load transaction decodes that HVF payload and commits an initially
 paused restored session.
@@ -1635,7 +1636,7 @@ The runtime crate models the backend-neutral guest physical address space used
 by later allocation, HVF mapping, boot, and device work. The current model
 contains guest physical addresses, checked RAM ranges, ordered non-overlapping
 layouts, the first aarch64 DRAM layout and boot placement helpers, safe byte
-slice access by guest address, and owned anonymous host memory allocation for
+slice access by guest address, and owned selectable host memory allocation for
 validated page-aligned layouts.
 
 The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
@@ -1648,13 +1649,29 @@ The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
   layout helper, while public machine configuration rejects them before storage
   so every successful configured size equals the realized layout
 
-The allocation model creates one anonymous read/write private host memory
-mapping for each validated guest RAM range and releases the mappings with
-runtime ownership cleanup. It preserves each guest range with its host mapping
-for HVF map/unmap work. It does not use Firecracker's `vm-memory` crate.
-`GuestMemory` now also owns the shared dirty bitmap used by bounded writes and
-native snapshot epochs; future direct file-backed guest RAM or new device-memory
-classes should evaluate the right abstraction from their concrete requirements.
+The default allocation model creates one anonymous read/write private host
+mapping for each validated guest RAM range. An internal startup resource can
+instead select descriptor-backed shared RAM before allocation. That profile
+preflights the largest region against `RLIMIT_FSIZE`, accounts one retained
+descriptor per region against `RLIMIT_NOFILE`, reserves every descriptor before
+the first mapping, creates exact-sized owner-only files, unlinks each name
+before publication, and maps them `MAP_SHARED`. A bounded export clones only
+the exact descriptor, zero offset, and live region length; debug and errors do
+not expose a pathname, descriptor number, or host address. Dynamic regions
+inherit the selected profile, and all mappings/descriptors close with runtime
+ownership cleanup.
+
+Both profiles use the same HVF map/protect/unmap, dirty bitmap, byte access,
+balloon, virtio-mem, and native snapshot streaming paths without a copy shadow.
+Darwin anonymous discard retains `MADV_ZERO` followed by `MADV_FREE`; shared
+file mappings use `F_PUNCHHOLE`, which tests require to produce immediate zero
+reads while deallocating the range. The native image loader has an explicit
+internal shared-profile entry point, while public native-v1 restore remains
+anonymous. macOS provides no `memfd` sealing equivalent, so a future external
+recipient of a writable descriptor is an explicit trusted capability boundary.
+This foundation hands no descriptor to a backend, does not accept a public
+vhost-user socket, and does not promote vhost-user or direct-pmem compatibility.
+The runtime does not use Firecracker's `vm-memory` crate.
 
 Guest memory byte access validates the whole requested guest address range
 before copying. Overflow, unmapped holes, and the aarch64 MMIO64 gap fail
@@ -3295,8 +3312,9 @@ macOS design work instead of direct implementation:
 
 - KVM-specific VM and vCPU operations need HVF equivalents rather than direct
   KVM ioctl usage.
-- HVF guest RAM is mapped with a backend-owned owner that holds the anonymous
-  host allocation until unmap or VM destruction. Startup can load payloads into
+- HVF guest RAM is mapped with a backend-owned owner that holds the selected
+  anonymous-private or descriptor-backed-shared host allocation until unmap or
+  VM destruction. Startup can load payloads into
   that memory and run the internal boot worker across bounded step windows; full
   run-loop control beyond pause/resume remains deferred.
 - HVF vCPU handles are thread-affine: creation, register access, run, and
