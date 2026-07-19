@@ -546,7 +546,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/src/vmm.rs",
-          "anchor": "runtime drive insertion, projection, paused FIFO, and terminal-state tests"
+          "anchor": "runtime drive insertion, projection, paused FIFO, terminal-state, and runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration tests"
         },
         {
           "kind": "local",
@@ -716,7 +716,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/src/vmm.rs",
-          "anchor": "runtime network provider, authority, rollback, projection, paused FIFO, and terminal-state tests"
+          "anchor": "runtime network provider, authority, rollback, projection, paused FIFO, terminal-state, and runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration tests"
         },
         {
           "kind": "local",
@@ -764,7 +764,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/src/vmm.rs",
-          "anchor": "runtime pmem projection, paused FIFO, recoverable failure, and terminal-state tests"
+          "anchor": "runtime pmem projection, paused FIFO, recoverable failure, terminal-state, and runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration tests"
         },
         {
           "kind": "local",
@@ -4684,11 +4684,55 @@
     {
       "id": "corpus:device-hotplug",
       "family": "runtime-device-management",
-      "summary": "The pinned developer-preview contract is implemented and signed for transactional non-root virtio-block and virtio-pmem Running/Paused PUT/DELETE under public PCI, including manual guest rescan/removal, failure rollback, exact direct or contained backing authority, flush/I/O, cleanup, and generation-safe capacity reuse. Continue auditing this broad corpus until the independent virtio-net attach/remove slice and all aggregate limitations are resolved.",
+      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification and PCI snapshot persistence remain outside the pinned live corpus and the supported native-v1 profile.",
       "source_refs": [
         "corpus:device-hotplug"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/device-hotplug-contract.md",
+          "anchor": "public boundary, ownership, guest coordination, and exclusions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm runtime block, pmem, and network mutation transactions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "HvfArm64BootPciDataDevices retained startup and runtime inventory"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "PublishedVirtioPciEndpoint publication and prepared teardown"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration and boot_run_loop_supervisor_serializes_concurrent_mixed_runtime_mutations"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed product PCI startup plus block, pmem, and network runtime hotplug gates"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "runtime_pci_endpoint_capacity_is_shared_across_mixed_device_types and mixed_full_pci_inventory_fits_reserved_runtime_vector_headroom"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained block, pmem, and networkless-MMDS runtime hotplug gates"
+        }
+      ]
     },
     {
       "id": "corpus:entropy",
@@ -5884,6 +5928,11 @@
         },
         {
           "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration"
+        },
+        {
+          "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
           "anchor": "signed_executable_hotplugs_and_reuses_runtime_block_over_product_pci"
         },
@@ -5938,7 +5987,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/src/vmm.rs",
-          "anchor": "packet-I/O stop/restore, endpoint rollback, supervisor terminal, snapshot, and shutdown tests"
+          "anchor": "packet-I/O stop/restore, endpoint rollback, supervisor terminal, snapshot, shutdown, and runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration tests"
         },
         {
           "kind": "local",
@@ -5987,6 +6036,11 @@
           "kind": "local",
           "path": "crates/api/src/http.rs",
           "anchor": "bodyless pmem DELETE parsing and malformed-body tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration"
         },
         {
           "kind": "local",
@@ -6194,11 +6248,60 @@
     {
       "id": "semantic.hotplug:runtime-device-manager",
       "family": "runtime-device-management",
-      "summary": "The failure-atomic owner-thread inventory and complete block and pmem attach/remove vertical slices are implemented and verified for public all-virtio PCI, including manual guest preconditions, rollback, exact direct/contained authority, dynamic pmem host mapping, flush, metrics, cleanup, and generation-safe slot/BAR/vector/dispatcher/ID/guest-range reuse. Continue auditing the aggregate record until network attach/remove completes its independent slice.",
+      "summary": "One bounded owner-thread manager implements failure-atomic Running and Paused attach/remove for non-root block, pmem, and network endpoints in the public PCI profile. It serializes concurrent requests and configuration commits, permits equal IDs across device types while rejecting same-type duplicates and duplicate network MACs, accounts every startup and runtime class against 31 shared slots, coordinates retry work and network/pmem owners, and releases generation-bound slot, BAR, vector, dispatcher, event, scheduler, metrics, backing, packet-I/O, mapping, and guest-range state before repeated reuse. Snapshot and shutdown admission close ordinary mutations; native-v1 rejects PCI rather than persisting partial manager state.",
       "source_refs": [
         "corpus:device-hotplug"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "BootRunLoopSupervisor runtime mutation commands and ProcessVmm configuration commits"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "HvfArm64BootPciDataDevices insert, remove, retry, and teardown ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveConfigs runtime prepare and commit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "NetworkInterfaceConfigs runtime prepare and commit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemConfigs runtime prepare and commit"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "mixed identity, duplicate MAC, live configuration, concurrent owner, paused FIFO, snapshot, shutdown, and terminal-state tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "two-round direct block, pmem, and network guest hotplug gates"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "mixed 31-slot/vector headroom, retry inventory, and teardown tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "exact-grant and networkless contained hotplug gates"
+        }
+      ]
     },
     {
       "id": "semantic.isolation:host-resource-authority-and-brokerage",
@@ -6656,12 +6759,66 @@
     {
       "id": "semantic.transport:pci-msi-and-coexistence",
       "family": "device-transport",
-      "summary": "Audit optional PCI host bridge, config/BAR layout, virtio-pci, MSI/MSI-X, limits, and MMIO coexistence.",
+      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and native-v1 rejects PCI before mutation rather than omitting transport state.",
       "source_refs": [
         "corpus:device-api",
         "corpus:device-hotplug"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "--enable-pci process selection and platform preflight"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/gic.rs",
+          "anchor": "GICv2m configuration, allocation, and message routing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "all-virtio PCI demand, publication, retained manager, and default-MMIO separation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pci.rs",
+          "anchor": "PciSegment, PciBarAllocator, and Arm64PciAddressPlan"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "modern virtio-pci transport and PublishedVirtioPciEndpoint"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_all_startup_virtio_devices_over_product_pci and runtime hotplug gates"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "mixed 31-endpoint resource demand and product preflight tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed modern virtio-pci MSI-X discovery, I/O, teardown, and exact resource reuse"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pci.rs",
+          "anchor": "31-slot, BAR exhaustion, generation, rollback, and reuse tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "capability, MSI-X, publication, drain, teardown, and stale-handle tests"
+        }
+      ]
     },
     {
       "id": "semantic.transport:virtio-mmio-activation",

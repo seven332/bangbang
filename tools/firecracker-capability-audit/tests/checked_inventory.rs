@@ -46,7 +46,7 @@ fn checked_source_manifest_is_canonical_and_deterministic() {
 }
 
 #[test]
-fn machine_lifecycle_closure_policy_is_stable() {
+fn delivery_closure_policy_is_stable() {
     const IMPLEMENTED_ORIGINAL: [&str; 5] = [
         "corpus:cpu-boot-protocol",
         "semantic.boot:kernel-rootfs-fdt-and-cache",
@@ -107,6 +107,15 @@ fn machine_lifecycle_closure_policy_is_stable() {
         "api-path:/pmem/{id}",
         "non-swagger-route:DELETE /pmem/{id}",
     ];
+    const RUNTIME_NETWORK_HOTPLUG: [&str; 2] = [
+        "api-operation:PUT /network-interfaces/{iface_id}",
+        "non-swagger-route:DELETE /network-interfaces/{iface_id}",
+    ];
+    const PCI_RUNTIME_HOTPLUG_AGGREGATES: [&str; 3] = [
+        "corpus:device-hotplug",
+        "semantic.hotplug:runtime-device-manager",
+        "semantic.transport:pci-msi-and-coexistence",
+    ];
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -155,8 +164,8 @@ fn machine_lifecycle_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 78);
-    assert_eq!(count(Disposition::AuditRequired), 320);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 81);
+    assert_eq!(count(Disposition::AuditRequired), 317);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -231,6 +240,32 @@ fn machine_lifecycle_closure_policy_is_stable() {
                 .disposition,
             Disposition::ImplementedAndVerified,
             "runtime pmem hotplug record must remain implemented: {id}"
+        );
+    }
+
+    for id in RUNTIME_NETWORK_HOTPLUG {
+        assert_eq!(
+            by_id
+                .get(id)
+                .expect("runtime network hotplug record must exist")
+                .disposition,
+            Disposition::ImplementedAndVerified,
+            "runtime network hotplug record must remain implemented: {id}"
+        );
+    }
+
+    for id in PCI_RUNTIME_HOTPLUG_AGGREGATES {
+        let capability = by_id
+            .get(id)
+            .expect("PCI/runtime-hotplug aggregate record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "PCI/runtime-hotplug aggregate must remain implemented: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "PCI/runtime-hotplug aggregate must retain concrete evidence: {id}"
         );
     }
 

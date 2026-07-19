@@ -165,6 +165,24 @@ const PCI_DATA_DEVICE_BAR_REGION_ID_BASE: u64 = 4100;
 const PCI_ENDPOINT_SLOT_COUNT: usize =
     (PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1) as usize;
 
+fn pci_data_endpoint_count(
+    block_count: usize,
+    network_count: usize,
+    pmem_count: usize,
+    balloon_configured: bool,
+    vsock_configured: bool,
+    entropy_configured: bool,
+    memory_hotplug_configured: bool,
+) -> usize {
+    block_count
+        .saturating_add(network_count)
+        .saturating_add(pmem_count)
+        .saturating_add(usize::from(balloon_configured))
+        .saturating_add(usize::from(vsock_configured))
+        .saturating_add(usize::from(entropy_configured))
+        .saturating_add(usize::from(memory_hotplug_configured))
+}
+
 #[derive(Debug, Clone)]
 pub struct HvfArm64BootSessionConfig {
     pub block_mmio_layout: BlockMmioLayout,
@@ -727,13 +745,15 @@ impl HvfArm64BootPciDataDevices {
     }
 
     fn endpoint_count(&self) -> usize {
-        self.block.len()
-            + self.network.len()
-            + self.pmem.len()
-            + usize::from(self.balloon.is_some())
-            + usize::from(self.vsock.is_some())
-            + usize::from(self.entropy.is_some())
-            + usize::from(self.memory_hotplug.is_some())
+        pci_data_endpoint_count(
+            self.block.len(),
+            self.network.len(),
+            self.pmem.len(),
+            self.balloon.is_some(),
+            self.vsock.is_some(),
+            self.entropy.is_some(),
+            self.memory_hotplug.is_some(),
+        )
     }
 
     fn available_region_id(
@@ -12969,10 +12989,11 @@ mod tests {
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
         lock_boot_mmio_dispatcher_runtime, pci_all_virtio_gic_msi_configuration,
         pci_all_virtio_resource_demand, pci_data_available_bar_count, pci_data_bar_plan,
-        pci_data_region_id, pci_data_resource_demand, preflight_pci_data_dispatcher,
-        quiesce_limiter_retry_wakeups, record_entropy_dispatch_metrics,
-        record_pmem_dispatch_metrics, replace_vmgenid_and_signal_with, run_boot_session_loop,
-        run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        pci_data_endpoint_count, pci_data_region_id, pci_data_resource_demand,
+        preflight_pci_data_dispatcher, quiesce_limiter_retry_wakeups,
+        record_entropy_dispatch_metrics, record_pmem_dispatch_metrics,
+        replace_vmgenid_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
+        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
         signal_network_queue_interrupts, signal_pmem_queue_interrupts,
         signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at,
@@ -21610,6 +21631,47 @@ mod tests {
             balloon_overflow.to_string(),
             "PCI all-virtio balloon MSI-X route count overflowed"
         );
+    }
+
+    #[test]
+    fn runtime_pci_endpoint_capacity_is_shared_across_mixed_device_types() {
+        let fixed = (true, true, true, true);
+        let full_count = pci_data_endpoint_count(8, 8, 11, fixed.0, fixed.1, fixed.2, fixed.3);
+        assert_eq!(full_count, PCI_ENDPOINT_SLOT_COUNT);
+
+        for (block_count, network_count, pmem_count) in [(7, 8, 11), (8, 7, 11), (8, 8, 10)] {
+            let released_count = pci_data_endpoint_count(
+                block_count,
+                network_count,
+                pmem_count,
+                fixed.0,
+                fixed.1,
+                fixed.2,
+                fixed.3,
+            );
+            assert_eq!(released_count, PCI_ENDPOINT_SLOT_COUNT - 1);
+            assert!(released_count < PCI_ENDPOINT_SLOT_COUNT);
+        }
+
+        assert_eq!(
+            pci_data_endpoint_count(usize::MAX, 1, 1, true, true, true, true),
+            usize::MAX,
+            "overflow must fail closed as exhausted capacity"
+        );
+    }
+
+    #[test]
+    fn mixed_full_pci_inventory_fits_reserved_runtime_vector_headroom() {
+        let balloon_queue_count = Some(1);
+        let full = pci_all_virtio_resource_demand(8, 8, 11, balloon_queue_count, true, true, true)
+            .expect("mixed full PCI inventory should have bounded resource demand");
+        assert_eq!(full.endpoints, PCI_ENDPOINT_SLOT_COUNT);
+
+        let fixed = pci_all_virtio_resource_demand(0, 0, 0, balloon_queue_count, true, true, true)
+            .expect("fixed PCI inventory should have bounded resource demand");
+        let dynamic_routes =
+            (PCI_ENDPOINT_SLOT_COUNT - fixed.endpoints) * (VIRTIO_NET_QUEUE_SIZES.len() + 1);
+        assert!(full.routes <= fixed.routes + dynamic_routes);
     }
 
     #[test]

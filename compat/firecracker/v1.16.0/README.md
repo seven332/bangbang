@@ -41,11 +41,11 @@ claims mechanically visible.
   related API aggregates, exact evidence, count arithmetic, and explicit Wave
   6/7/8 ownership without changing the generated source manifest.
 - [`device-hotplug-contract.md`](device-hotplug-contract.md) is the
-  #1420/#1421/#1422 runtime block, pmem, and network ledger. It binds the
+  #1420/#1421/#1422/#1423 runtime block, pmem, network, and aggregate ledger. It binds the
   promoted PUT/path/DELETE identities to owner-thread transactions, contained
   grant or vmnet-authority rollback, dynamic pmem mapping, per-entry network
-  packet I/O, guest lifecycle, signed evidence, and the still-open #1423
-  aggregate boundary.
+  packet I/O, guest lifecycle, signed evidence, shared capacity/identity, and
+  the completed live aggregate boundary.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -211,12 +211,21 @@ that checkpoint pending the independent network slice.
 bodyless `DELETE /network-interfaces/{iface_id}` route. Transactional direct
 and networkless-production signed gates prove Running/Paused attach, guest PCI
 rescan, real MMDS exchange, sysfs removal, teardown, contained non-MMDS denial,
-and exact same-ID/MAC/PCI-slot reuse without vmnet authority. The current
-overlay is therefore 78 `implemented-and-verified`, 320 `audit-required`,
+and exact same-ID/MAC/PCI-slot reuse without vmnet authority. At that checkpoint
+the overlay was 78 `implemented-and-verified`, 320 `audit-required`,
 three `missing-platform-feasible`, and 17 `proven-platform-impossible`
-records. The broad device-hotplug corpus and aggregate semantic record remain
-nonterminal for #1423 reconciliation; external vmnet evidence remains
-#1351/#1378-owned.
+records.
+
+#1423 subsequently certifies the shared 31-slot resource budget, type-scoped
+cross-device IDs, duplicate-MAC policy, mixed Running/Paused mutation order,
+concurrent owner serialization, repeated reuse, and success-authoritative live
+configuration. It terminalizes exactly `corpus:device-hotplug`,
+`semantic.hotplug:runtime-device-manager`, and
+`semantic.transport:pci-msi-and-coexistence`. The current overlay is therefore
+81 `implemented-and-verified`, 317 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` records.
+Native-v1 PCI persistence and external vmnet evidence remain respectively
+later-snapshot and #1351/#1378-owned.
 
 ## Commands
 

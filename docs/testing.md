@@ -187,6 +187,22 @@ shutdown admission, paused FIFO ordering, default-MMIO rejection, redaction,
 and exact PCI lease reuse. Apple-approved vmnet credentials and real external
 connectivity remain separate #1351/#1378 gates.
 
+Aggregate runtime PCI hotplug changes additionally require
+`runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration`
+and
+`boot_run_loop_supervisor_serializes_concurrent_mixed_runtime_mutations` in the
+`bangbang` binary tests, plus
+`runtime_pci_endpoint_capacity_is_shared_across_mixed_device_types` and
+`mixed_full_pci_inventory_fits_reserved_runtime_vector_headroom` in the HVF
+library tests. Together they pin equal cross-type IDs, same-type and
+duplicate-MAC rejection before session mutation, mixed insertion/removal and
+live-config truth, exactly-once owner-thread execution from concurrent command
+handles, the shared 31-endpoint boundary, fail-closed overflow, and vector
+headroom at that boundary. This #1423 aggregate gate must be run with all three
+class-specific signed block, pmem, and network gates above; it does not claim a
+single mixed signed guest scenario, automatic guest notification, PCI snapshot
+persistence, or external vmnet connectivity.
+
 Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` baseline
 that creates one VM and GIC before two permanent owner-thread runners, proves
 their exact ordered MPIDRs are `[0, 1]`, cancels both before their first bounded

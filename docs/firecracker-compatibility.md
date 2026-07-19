@@ -130,9 +130,9 @@ This foundation is not Firecracker's KVM-backed GICv3 ITS implementation and
 adds no interrupt remapping. Its MSI-X use serves focused conformance endpoints
 and the public all-virtio startup path described below. It is outside the
 accepted native-v1 snapshot profile, which rejects the immutable PCI process
-profile before capture/load mutation. Only the exact `--enable-pci` argument
-leaf is promoted; the broader PCI coexistence/hotplug/snapshot semantic record
-remains under audit.
+profile before capture/load mutation. The exact `--enable-pci` argument leaf
+and the live device-hotplug, runtime-manager, and PCI/MSI/coexistence aggregate
+records are promoted; PCI snapshot persistence remains under audit.
 
 ## PCI Segment and All-Virtio Startup
 
@@ -142,7 +142,9 @@ deterministic, generation-bound slot leases. Focused signed modes retain the
 identity-only `[0042:0000]` mock, modern virtio-rng, and static data-device
 proofs. Product `--enable-pci` instead publishes balloon, block, network, pmem,
 vsock, entropy, and virtio-mem in that Firecracker order after preflighting the
-complete endpoint, slot, BAR, dispatcher-region, and maximum MSI-X demand.
+complete endpoint, slot, BAR, and dispatcher-region demand plus exact fixed
+MSI-X demand and worst-case three-vector headroom for every remaining runtime
+slot.
 
 The arm64 plan reserves the full Firecracker configuration aperture at
 `0x70000000..0x80000000`, publishes only the bus-0 1 MiB ECAM window, uses
@@ -189,9 +191,14 @@ before VM destruction; the lower-level endpoint gate also rejects stale state
 and proves exact slot, BAR, and GICv2m vector reuse. The signed product gate then
 boots all seven virtio classes together, requires deterministic BDFs and no
 virtio-MMIO nodes, and performs positive block, MMDS/network, pmem, vsock,
-balloon, entropy, and virtio-mem interrupt/I/O. Runtime attach/delete, guest
-rescan/removal, hotplug, and PCI snapshot persistence do not reach production;
-the default product transport remains MMIO.
+balloon, entropy, and virtio-mem interrupt/I/O. Separate direct and contained
+signed gates perform two manual guest rescan/removal rounds for runtime block,
+pmem, and network PUT/DELETE and prove exact resource reuse. Focused aggregate
+tests pin type-scoped IDs, global network-MAC uniqueness, mixed configuration
+truth, concurrent owner-thread serialization, and one shared 31-endpoint
+budget that reopens after any runtime device class leaves. Automatic guest
+notification, PCI snapshot persistence, and externally certified vmnet
+connectivity remain deferred; the default product transport remains MMIO.
 
 ## Internal PSCI Power Sessions
 
@@ -654,9 +661,9 @@ handoffs.
 
 Following the remaining #1388 slices and the #1408 closure audit, the generated
 source manifest has 381 identities and the delivery overlay adds 37 local
-semantic identities. After the #1420 block, #1421 pmem, and #1422 network
-hotplug promotions, the current 418 records contain 78
-`implemented-and-verified`, 320 `audit-required`, three
+semantic identities. After the #1420 block, #1421 pmem, #1422 network, and
+#1423 aggregate runtime-hotplug promotions, the current 418 records contain 81
+`implemented-and-verified`, 317 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. The
 [machine and lifecycle closure ledger](../compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 accounts for the original 28 records and the directly related boot-source,
@@ -807,7 +814,7 @@ management remains deferred.
 | `--show-level` | enables level prefix for minimal logger events | Writes `level=Info` before minimal API request, action, and boot-timer log lines. |
 | `--show-log-origin` | enables origin field for implemented logger events | Writes `origin=<file>:<line>` before API request, action, and boot-timer log messages. |
 | `--boot-timer` | enables guest boot-time logging | Registers the Firecracker aarch64 pseudo-MMIO boot timer at `0x4000_0000`; a guest write of byte value `123` at offset `0` logs elapsed wall and process CPU time through the configured logger sink when level and module filters allow `Info` for `bangbang_runtime::boot_timer`. This is process observability state and is not exposed in `GET /vm/config`. |
-| `--enable-pci` | selects all-virtio PCI startup on supported macOS arm64/HVF hosts | Exact flag syntax is immutable for the process. Required target and GIC/MSI symbols are checked before API/no-api readiness; endpoint/slot/BAR/dispatcher/vector capacity is checked before `Running`. Balloon, block, network, pmem, vsock, entropy, and virtio-mem use deterministic modern PCI functions while serial, RTC, boot timer, GIC, VMGenID, and VMClock remain platform MMIO devices. PCI mode omits the VMM-supplied `pci=off` and publishes only the PCI/GICv2m transport FDT; default startup remains all-virtio-MMIO. Native-v1 create/load rejects the PCI profile. Running/Paused non-root block, pmem, and network PUT/DELETE are implemented with manual guest coordination; PCI snapshots remain deferred. |
+| `--enable-pci` | selects all-virtio PCI startup on supported macOS arm64/HVF hosts | Exact flag syntax is immutable for the process. Required target and GIC/MSI symbols are checked before API/no-api readiness; one shared 31-endpoint slot/BAR/dispatcher budget plus exact fixed and worst-case runtime vector demand is checked before `Running`. Balloon, block, network, pmem, vsock, entropy, and virtio-mem use deterministic modern PCI functions while serial, RTC, boot timer, GIC, VMGenID, and VMClock remain platform MMIO devices. PCI mode omits the VMM-supplied `pci=off` and publishes only the PCI/GICv2m transport FDT; default startup remains all-virtio-MMIO. Native-v1 create/load rejects the PCI profile. Running/Paused non-root block, pmem, and network PUT/DELETE share type-scoped identity and one owner-thread inventory with manual guest coordination; PCI snapshots remain deferred. |
 | `--mmds-size-limit <BYTES>` | configures the maximum serialized MMDS data-store size | When omitted, follows the effective HTTP API payload limit like Firecracker; with default HTTP settings this is `51200` bytes. The complete non-negative `usize` domain is accepted. A zero limit permits startup and rejects every serialized JSON object through the MMDS data-store-limit response. Malformed, overflowing, and duplicate values fail during argument parsing. |
 | `--metadata <PATH>` | initializes MMDS data before API serving or no-api readiness | Reads a readable regular UTF-8 JSON metadata file up to 1 MiB and applies it through the same runtime validation and serialized data-store limit as `PUT /mmds`. Malformed files, non-object data, oversized files, duplicate object keys, empty paths, control-character paths, and missing-value inputs fail before readiness. |
 | `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. In API-enabled mode, the API socket is published only after successful startup. Malformed files, oversized files, duplicate object keys, unknown sections, unsupported sections, or invalid sections fail before socket publication or no-api readiness. |
