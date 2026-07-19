@@ -18,8 +18,8 @@ use crate::balloon::{
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
     DriveConfig, DriveConfigInput, DriveIoEngine, DriveRateLimiterConfig, DriveUpdateError,
-    PreparedBlockDeviceError, PreparedBlockDevices, VirtioBlockConfigSpace, VirtioBlockDeviceId,
-    VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
+    PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices, VirtioBlockConfigSpace,
+    VirtioBlockDeviceId, VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
     VirtioBlockMmioHandler, VirtioBlockRuntimeRestoreInput,
 };
 use crate::boot::{
@@ -60,8 +60,8 @@ use crate::mmio::{
 };
 use crate::network::{
     NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioDeviceRegistration,
-    NetworkMmioLayout, NetworkMmioRegistrationError, PreparedNetworkDeviceError,
-    PreparedNetworkDevices, VirtioNetworkDeviceNotificationDispatch,
+    NetworkMmioLayout, NetworkMmioRegistrationError, PreparedNetworkDevice,
+    PreparedNetworkDeviceError, PreparedNetworkDevices, VirtioNetworkDeviceNotificationDispatch,
     VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource,
     VirtioNetworkTxPacketSink,
 };
@@ -249,6 +249,7 @@ pub struct Arm64BootPciValidationConfig {
     vendor_id: u16,
     device_id: u16,
     modern_virtio_rng: bool,
+    data_devices: bool,
 }
 
 impl Arm64BootPciValidationConfig {
@@ -260,6 +261,7 @@ impl Arm64BootPciValidationConfig {
             vendor_id: Self::FIRECRACKER_TEST_VENDOR_ID,
             device_id: Self::FIRECRACKER_TEST_DEVICE_ID,
             modern_virtio_rng: false,
+            data_devices: false,
         }
     }
 
@@ -273,6 +275,21 @@ impl Arm64BootPciValidationConfig {
             vendor_id: crate::virtio_pci::VIRTIO_PCI_VENDOR_ID,
             device_id: 0x1044,
             modern_virtio_rng: true,
+            data_devices: false,
+        }
+    }
+
+    /// Selects the internal block, network, and pmem modern virtio-pci proof.
+    ///
+    /// This remains test infrastructure: no process, API, or production
+    /// device configuration can select it.
+    #[doc(hidden)]
+    pub const fn data_devices() -> Self {
+        Self {
+            vendor_id: crate::virtio_pci::VIRTIO_PCI_VENDOR_ID,
+            device_id: 0,
+            modern_virtio_rng: false,
+            data_devices: true,
         }
     }
 
@@ -287,6 +304,11 @@ impl Arm64BootPciValidationConfig {
     #[doc(hidden)]
     pub const fn is_modern_virtio_rng(self) -> bool {
         self.modern_virtio_rng
+    }
+
+    #[doc(hidden)]
+    pub const fn is_data_devices(self) -> bool {
+        self.data_devices
     }
 }
 
@@ -368,9 +390,13 @@ pub struct Arm64BootResources {
     pub vmgenid_device: Arm64BootVmGenIdDevice,
     pub vmclock_device: Arm64BootVmClockDevice,
     pub block_devices: Vec<Arm64BootBlockDevice>,
+    #[doc(hidden)]
+    pub pci_block_devices: Vec<PreparedBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
     pub pmem_mmio_devices: Vec<Arm64BootPmemDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
+    #[doc(hidden)]
+    pub pci_network_devices: Vec<PreparedNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
     pub memory_hotplug_device: Option<Arm64BootMemoryHotplugDevice>,
@@ -396,6 +422,11 @@ impl Arm64BootPciValidationResources {
     #[doc(hidden)]
     pub const fn config(&self) -> Arm64BootPciValidationConfig {
         self.config
+    }
+
+    #[doc(hidden)]
+    pub const fn bar_allocator(&self) -> &PciBarAllocator {
+        &self.bar_allocator
     }
 
     #[doc(hidden)]
@@ -427,9 +458,13 @@ pub struct Arm64BootRuntimeResources {
     pub vmgenid_device: Arm64BootVmGenIdDevice,
     pub vmclock_device: Arm64BootVmClockDevice,
     pub block_devices: Vec<Arm64BootBlockDevice>,
+    #[doc(hidden)]
+    pub pci_block_devices: Vec<PreparedBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
     pub pmem_mmio_devices: Vec<Arm64BootPmemDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
+    #[doc(hidden)]
+    pub pci_network_devices: Vec<PreparedNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
     pub memory_hotplug_device: Option<Arm64BootMemoryHotplugDevice>,
@@ -1027,9 +1062,11 @@ pub fn install_snapshot_v1_runtime(
         vmgenid_device,
         vmclock_device,
         block_devices,
+        pci_block_devices: Vec::new(),
         pmem_devices: Vec::new(),
         pmem_mmio_devices: Vec::new(),
         network_devices: Vec::new(),
+        pci_network_devices: Vec::new(),
         vsock_device: None,
         balloon_device: None,
         memory_hotplug_device: None,
@@ -1556,12 +1593,45 @@ pub struct Arm64BootNetworkPacketIo<'a> {
     rx_source: &'a mut dyn VirtioNetworkRxPacketSource,
 }
 
+/// Transport-neutral identity used to select host packet I/O for one interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64BootNetworkInterface<'a> {
+    iface_id: &'a str,
+    host_dev_name: &'a str,
+}
+
+impl<'a> Arm64BootNetworkInterface<'a> {
+    pub const fn new(iface_id: &'a str, host_dev_name: &'a str) -> Self {
+        Self {
+            iface_id,
+            host_dev_name,
+        }
+    }
+
+    pub const fn iface_id(self) -> &'a str {
+        self.iface_id
+    }
+
+    pub const fn host_dev_name(self) -> &'a str {
+        self.host_dev_name
+    }
+}
+
 impl<'a> Arm64BootNetworkPacketIo<'a> {
     pub fn new(
         tx_sink: &'a mut dyn VirtioNetworkTxPacketSink,
         rx_source: &'a mut dyn VirtioNetworkRxPacketSource,
     ) -> Self {
         Self { tx_sink, rx_source }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        &'a mut dyn VirtioNetworkTxPacketSink,
+        &'a mut dyn VirtioNetworkRxPacketSource,
+    ) {
+        (self.tx_sink, self.rx_source)
     }
 }
 
@@ -1575,7 +1645,7 @@ impl fmt::Debug for Arm64BootNetworkPacketIo<'_> {
 pub trait Arm64BootNetworkPacketIoProvider {
     fn packet_io(
         &mut self,
-        device: &Arm64BootNetworkDevice,
+        interface: Arm64BootNetworkInterface<'_>,
     ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError>;
 }
 
@@ -2244,15 +2314,15 @@ pub struct Arm64BootPmemDevice {
 }
 
 pub trait Arm64BootPmemFlushProvider {
-    fn flush(&mut self, registration: &PmemMmioDeviceRegistration) -> VirtioPmemFlushStatus;
+    fn flush(&mut self, guest_range: GuestMemoryRange) -> VirtioPmemFlushStatus;
 }
 
 impl<F> Arm64BootPmemFlushProvider for F
 where
-    F: FnMut(&PmemMmioDeviceRegistration) -> VirtioPmemFlushStatus,
+    F: FnMut(GuestMemoryRange) -> VirtioPmemFlushStatus,
 {
-    fn flush(&mut self, registration: &PmemMmioDeviceRegistration) -> VirtioPmemFlushStatus {
-        self(registration)
+    fn flush(&mut self, guest_range: GuestMemoryRange) -> VirtioPmemFlushStatus {
+        self(guest_range)
     }
 }
 
@@ -2260,6 +2330,15 @@ where
 pub struct Arm64BootNetworkDevice {
     pub registration: NetworkMmioDeviceRegistration,
     pub fdt_device: Arm64FdtVirtioMmioDevice,
+}
+
+impl Arm64BootNetworkDevice {
+    pub fn interface(&self) -> Arm64BootNetworkInterface<'_> {
+        Arm64BootNetworkInterface::new(
+            self.registration.iface_id(),
+            self.registration.host_dev_name(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2518,7 +2597,7 @@ impl Arm64BootRuntimeResources {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioPmemMmioHandler>(region_id) {
                 Ok(handler) => {
-                    let mut flush = || flush_provider.flush(&device.registration);
+                    let mut flush = || flush_provider.flush(device.registration.guest_range());
                     match handler.dispatch_pmem_queue_notifications(memory, &mut flush) {
                         Ok(dispatch) => Arm64BootPmemNotificationOutcome::Dispatched(dispatch),
                         Err(source) => Arm64BootPmemNotificationOutcome::DispatchFailed(source),
@@ -2590,7 +2669,10 @@ impl Arm64BootRuntimeResources {
                             }
                         }
                     } else {
-                        match packet_io.packet_io(&device) {
+                        match packet_io.packet_io(Arm64BootNetworkInterface::new(
+                            device.registration.iface_id(),
+                            device.registration.host_dev_name(),
+                        )) {
                             Ok(packet_io) => {
                                 let Arm64BootNetworkPacketIo { tx_sink, rx_source } = packet_io;
                                 match handler.dispatch_network_queue_notifications_with_packet_io(
@@ -3601,16 +3683,29 @@ impl Arm64BootResources {
         let boot_source_config = controller
             .boot_source_config()
             .ok_or(Arm64BootResourceError::MissingBootSource)?;
+        let pci_data_devices = pci_validation.is_some_and(|config| config.is_data_devices());
         validate_block_interrupt_line_count(
-            controller.drive_configs().len(),
+            if pci_data_devices {
+                0
+            } else {
+                controller.drive_configs().len()
+            },
             block_interrupt_lines.len(),
         )?;
         validate_pmem_interrupt_line_count(
-            controller.pmem_configs().len(),
+            if pci_data_devices {
+                0
+            } else {
+                controller.pmem_configs().len()
+            },
             pmem_interrupt_lines.len(),
         )?;
         validate_network_interrupt_line_count(
-            controller.network_interface_configs().len(),
+            if pci_data_devices {
+                0
+            } else {
+                controller.network_interface_configs().len()
+            },
             network_interrupt_lines.len(),
         )?;
         validate_vsock_interrupt_line_count(
@@ -3654,41 +3749,80 @@ impl Arm64BootResources {
             block_backings,
         )
         .map_err(|source| Arm64BootResourceError::PrepareBlockDevices { source })?;
-        let block_mmio = prepared_blocks
-            .register_mmio(block_mmio_layout)
-            .map_err(|source| Arm64BootResourceError::RegisterBlockMmio {
-                source: Box::new(source),
-            })?;
-        let (mmio_dispatcher, registrations) = block_mmio.into_parts();
-        let (block_devices, mut fdt_devices) =
-            block_device_metadata(&registrations, block_interrupt_lines)?;
-        let pmem_mmio = prepared_pmems
-            .register_mmio_with_dispatcher(pmem_mmio_layout, mmio_dispatcher)
-            .map_err(|source| Arm64BootResourceError::RegisterPmemMmio {
-                source: Box::new(source),
-            })?;
-        let (mmio_dispatcher, pmem_registrations, pmem_devices) = pmem_mmio.into_parts();
-        let (pmem_mmio_devices, pmem_fdt_devices) =
-            pmem_device_metadata(&pmem_registrations, pmem_interrupt_lines)?;
-        fdt_devices
-            .try_reserve_exact(pmem_fdt_devices.len())
-            .map_err(|source| Arm64BootResourceError::PmemDeviceMetadataAllocation { source })?;
-        fdt_devices.extend(pmem_fdt_devices);
         let prepared_networks =
             PreparedNetworkDevices::from_config_slice(controller.network_interface_configs())
                 .map_err(|source| Arm64BootResourceError::PrepareNetworkDevices { source })?;
-        let network_mmio = prepared_networks
-            .register_mmio_with_dispatcher(network_mmio_layout, mmio_dispatcher)
-            .map_err(|source| Arm64BootResourceError::RegisterNetworkMmio {
-                source: Box::new(source),
-            })?;
-        let (mut mmio_dispatcher, network_registrations) = network_mmio.into_parts();
-        let (network_devices, network_fdt_devices) =
-            arm64_boot_network_device_metadata(&network_registrations, network_interrupt_lines)?;
-        fdt_devices
-            .try_reserve_exact(network_fdt_devices.len())
-            .map_err(|source| Arm64BootResourceError::NetworkDeviceMetadataAllocation { source })?;
-        fdt_devices.extend(network_fdt_devices);
+        let (
+            mut mmio_dispatcher,
+            block_devices,
+            pci_block_devices,
+            pmem_devices,
+            pmem_mmio_devices,
+            network_devices,
+            pci_network_devices,
+            mut fdt_devices,
+        ) = if pci_data_devices {
+            (
+                MmioDispatcher::new(),
+                Vec::new(),
+                prepared_blocks.into_vec(),
+                prepared_pmems.into_vec(),
+                Vec::new(),
+                Vec::new(),
+                prepared_networks.into_vec(),
+                Vec::new(),
+            )
+        } else {
+            let block_mmio =
+                prepared_blocks
+                    .register_mmio(block_mmio_layout)
+                    .map_err(|source| Arm64BootResourceError::RegisterBlockMmio {
+                        source: Box::new(source),
+                    })?;
+            let (mmio_dispatcher, registrations) = block_mmio.into_parts();
+            let (block_devices, mut fdt_devices) =
+                block_device_metadata(&registrations, block_interrupt_lines)?;
+            let pmem_mmio = prepared_pmems
+                .register_mmio_with_dispatcher(pmem_mmio_layout, mmio_dispatcher)
+                .map_err(|source| Arm64BootResourceError::RegisterPmemMmio {
+                    source: Box::new(source),
+                })?;
+            let (mmio_dispatcher, pmem_registrations, pmem_devices) = pmem_mmio.into_parts();
+            let (pmem_mmio_devices, pmem_fdt_devices) =
+                pmem_device_metadata(&pmem_registrations, pmem_interrupt_lines)?;
+            fdt_devices
+                .try_reserve_exact(pmem_fdt_devices.len())
+                .map_err(
+                    |source| Arm64BootResourceError::PmemDeviceMetadataAllocation { source },
+                )?;
+            fdt_devices.extend(pmem_fdt_devices);
+            let network_mmio = prepared_networks
+                .register_mmio_with_dispatcher(network_mmio_layout, mmio_dispatcher)
+                .map_err(|source| Arm64BootResourceError::RegisterNetworkMmio {
+                    source: Box::new(source),
+                })?;
+            let (mmio_dispatcher, network_registrations) = network_mmio.into_parts();
+            let (network_devices, network_fdt_devices) = arm64_boot_network_device_metadata(
+                &network_registrations,
+                network_interrupt_lines,
+            )?;
+            fdt_devices
+                .try_reserve_exact(network_fdt_devices.len())
+                .map_err(
+                    |source| Arm64BootResourceError::NetworkDeviceMetadataAllocation { source },
+                )?;
+            fdt_devices.extend(network_fdt_devices);
+            (
+                mmio_dispatcher,
+                block_devices,
+                Vec::new(),
+                pmem_devices,
+                pmem_mmio_devices,
+                network_devices,
+                Vec::new(),
+                fdt_devices,
+            )
+        };
         if supplied_vsock_listener.is_some() != controller.vsock_config().is_some()
             && supplied_vsock_listener.is_some()
         {
@@ -3898,9 +4032,11 @@ impl Arm64BootResources {
             vmgenid_device,
             vmclock_device,
             block_devices,
+            pci_block_devices,
             pmem_devices,
             pmem_mmio_devices,
             network_devices,
+            pci_network_devices,
             vsock_device,
             balloon_device,
             memory_hotplug_device,
@@ -3925,9 +4061,11 @@ impl Arm64BootResources {
                 vmgenid_device: self.vmgenid_device,
                 vmclock_device: self.vmclock_device,
                 block_devices: self.block_devices,
+                pci_block_devices: self.pci_block_devices,
                 pmem_devices: self.pmem_devices,
                 pmem_mmio_devices: self.pmem_mmio_devices,
                 network_devices: self.network_devices,
+                pci_network_devices: self.pci_network_devices,
                 vsock_device: self.vsock_device,
                 balloon_device: self.balloon_device,
                 memory_hotplug_device: self.memory_hotplug_device,
@@ -3945,7 +4083,7 @@ fn prepare_pci_validation(
     let plan = Arm64PciAddressPlan::firecracker_v1_16()
         .map_err(|source| Arm64BootResourceError::PciAddressPlan { source })?;
     let mut segment = PciSegment::new();
-    let function_lease = if config.is_modern_virtio_rng() {
+    let function_lease = if config.is_modern_virtio_rng() || config.is_data_devices() {
         None
     } else {
         Some(
@@ -6781,9 +6919,9 @@ mod tests {
     impl Arm64BootNetworkPacketIoProvider for RecordingNetworkPacketIoProvider {
         fn packet_io(
             &mut self,
-            device: &super::Arm64BootNetworkDevice,
+            interface: super::Arm64BootNetworkInterface<'_>,
         ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
-            let iface_id = device.registration.iface_id();
+            let iface_id = interface.iface_id();
             self.requested_ifaces.push(iface_id.to_string());
             if self.fail_iface.as_deref() == Some(iface_id) {
                 return Err(Arm64BootNetworkPacketIoError::new(format!(
@@ -7429,6 +7567,76 @@ mod tests {
 
         let parts = resources.into_parts();
         assert!(parts.runtime.pci_validation.is_some());
+    }
+
+    #[test]
+    fn assembles_internal_pci_data_devices_without_legacy_mmio_publication() {
+        let kernel = temp_file("kernel-with-pci-data", &arm64_image());
+        let block = temp_file("pci-data-block", &[0x5a; 512]);
+        let pmem = temp_file("pci-data-pmem", b"pmem");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        add_pmem(&mut controller, "pmem0", pmem.path(), false);
+        add_network(&mut controller, "eth0", "vmnet:shared");
+        let mut config = valid_config(&[]);
+        config.gic = valid_gic_with_msi();
+
+        let resources =
+            Arm64BootResources::assemble_from_controller_with_startup_resources_and_pci_validation(
+                &controller,
+                config,
+                VmStartupResources::default(),
+                Some(Arm64BootPciValidationConfig::data_devices()),
+            )
+            .expect("boot resources should assemble with PCI data devices");
+
+        assert!(resources.block_devices.is_empty());
+        assert_eq!(resources.pci_block_devices.len(), 1);
+        assert_eq!(resources.pci_block_devices[0].drive_id(), "rootfs");
+        assert_eq!(resources.pmem_devices.len(), 1);
+        assert_eq!(resources.pmem_devices[0].id(), "pmem0");
+        assert!(resources.pmem_mmio_devices.is_empty());
+        assert!(resources.network_devices.is_empty());
+        assert_eq!(resources.pci_network_devices.len(), 1);
+        assert_eq!(resources.pci_network_devices[0].iface_id(), "eth0");
+        assert_eq!(
+            resources.pci_network_devices[0].host_dev_name(),
+            "vmnet:shared"
+        );
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+        assert_eq!(
+            resources
+                .pci_validation
+                .as_ref()
+                .expect("PCI host resources should remain retained")
+                .segment()
+                .with_segment(|segment| segment.function_count())
+                .expect("PCI data segment should not be poisoned"),
+            1,
+            "runtime assembly should publish only the host bridge before HVF endpoint ownership"
+        );
+
+        let tree = read_fdt(&resources);
+        assert!(tree.find("/pci@70000000").is_some());
+        for address in [
+            TEST_BLOCK_MMIO_BASE,
+            TEST_PMEM_MMIO_BASE,
+            TEST_NETWORK_MMIO_BASE,
+        ] {
+            assert!(
+                tree.find(&format!("/virtio_mmio@{:x}", address.raw_value()))
+                    .is_none(),
+                "PCI data mode must not publish a data virtio-mmio node at {address}"
+            );
+        }
+
+        let parts = resources.into_parts();
+        assert_eq!(parts.runtime.pci_block_devices.len(), 1);
+        assert_eq!(parts.runtime.pmem_devices.len(), 1);
+        assert_eq!(parts.runtime.pci_network_devices.len(), 1);
+        assert!(parts.runtime.block_devices.is_empty());
+        assert!(parts.runtime.pmem_mmio_devices.is_empty());
+        assert!(parts.runtime.network_devices.is_empty());
     }
 
     #[test]

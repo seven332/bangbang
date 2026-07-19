@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use bangbang_runtime::balloon::{
     BalloonMmioLayout, BalloonUpdateError, VirtioBalloonDeviceNotificationError,
 };
-use bangbang_runtime::block::{BlockMmioLayout, DriveConfig};
+use bangbang_runtime::block::{
+    BlockMmioLayout, DriveConfig, VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_QUEUE_SIZES,
+    VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceNotificationError,
+};
 use bangbang_runtime::boot::BootSourceFiles;
 use bangbang_runtime::boot_timer::{
     BootTimerMmioLayout, BootTimerMmioRegistrationError, register_boot_timer_mmio,
@@ -28,7 +31,7 @@ use bangbang_runtime::fdt::{Arm64FdtCacheHierarchy, Arm64FdtError};
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
-use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
 use bangbang_runtime::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
     MemoryHotplugUpdateError, VirtioMemMmioLayout, VirtioMemMutationExecutor,
@@ -39,9 +42,18 @@ use bangbang_runtime::metrics::{
     SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegionId};
-use bangbang_runtime::network::NetworkMmioLayout;
-use bangbang_runtime::pci::{PCI_FIRST_ENDPOINT_DEVICE, PciClassCode, PciType0Configuration};
-use bangbang_runtime::pmem::{PmemMmioDeviceRegistration, PmemMmioLayout, VirtioPmemFlushStatus};
+use bangbang_runtime::network::{
+    NetworkMmioLayout, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_QUEUE_SIZES, VirtioNetworkConfigSpace,
+    VirtioNetworkDevice, VirtioNetworkDeviceNotificationError,
+};
+use bangbang_runtime::pci::{
+    PCI_FIRST_ENDPOINT_DEVICE, PciBarAddressSpace, PciBarAllocator, PciClassCode,
+    PciType0Configuration,
+};
+use bangbang_runtime::pmem::{
+    PmemMmioLayout, VIRTIO_PMEM_DEVICE_ID, VIRTIO_PMEM_QUEUE_SIZES, VirtioPmemConfigSpace,
+    VirtioPmemDevice, VirtioPmemFlushStatus,
+};
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{SerialConfig, SharedSerialOutput, SharedSerialOutputBuffer};
 use bangbang_runtime::snapshot_device::{SnapshotV1BlockRetryState, SnapshotV1DeviceState};
@@ -54,9 +66,10 @@ use bangbang_runtime::startup::{
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
     Arm64BootMemoryHotplugDeviceConfig as RuntimeArm64BootMemoryHotplugDeviceConfig,
     Arm64BootMemoryHotplugNotificationDispatch, Arm64BootMemoryHotplugNotificationDispatchError,
-    Arm64BootMemoryHotplugNotificationDispatches, Arm64BootNetworkNotificationDispatch,
-    Arm64BootNetworkNotificationDispatchError, Arm64BootNetworkNotificationDispatches,
-    Arm64BootNetworkPacketIoProvider, Arm64BootPciValidationConfig, Arm64BootPmemFlushProvider,
+    Arm64BootMemoryHotplugNotificationDispatches, Arm64BootNetworkInterface,
+    Arm64BootNetworkNotificationDispatch, Arm64BootNetworkNotificationDispatchError,
+    Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
+    Arm64BootPciValidationConfig, Arm64BootPciValidationResources, Arm64BootPmemFlushProvider,
     Arm64BootPmemNotificationDispatch, Arm64BootPmemNotificationDispatchError,
     Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
     Arm64BootResourceParts, Arm64BootResources,
@@ -74,8 +87,9 @@ use bangbang_runtime::virtio::{
     VirtioDeviceResetOutcome, VirtioDeviceType, VirtioDeviceTypeError, VirtioInterruptIntent,
 };
 use bangbang_runtime::virtio_pci::{
-    PublishedVirtioPciEndpoint, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciDiagnostics,
-    VirtioPciEndpointError, VirtioPciEndpointPhase, VirtioPciIdentity, VirtioPciPublicationError,
+    PublishedVirtioPciEndpoint, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciDeviceOperationError,
+    VirtioPciDiagnostics, VirtioPciEndpointError, VirtioPciEndpointPhase, VirtioPciIdentity,
+    VirtioPciPublicationError,
 };
 use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -132,6 +146,7 @@ const POLL_FOREVER: libc::c_int = -1;
 const PCI_VALIDATION_VIRTIO_RNG_BAR_REGION_ID: MmioRegionId = MmioRegionId::new(4001);
 const PCI_VALIDATION_VIRTIO_RNG_VECTOR_COUNT: usize = 2;
 const PCI_VALIDATION_VIRTIO_RNG_ENTROPY_BYTE: u8 = 0xa5;
+const PCI_DATA_DEVICE_BAR_REGION_ID_BASE: u64 = 4100;
 
 #[derive(Debug, Clone)]
 pub struct HvfArm64BootSessionConfig {
@@ -496,6 +511,436 @@ impl HvfArm64BootPciValidationEndpoint {
     }
 }
 
+type PublishedPciBlock = PublishedVirtioPciEndpoint<
+    VirtioBlockConfigSpace,
+    VirtioBlockDevice,
+    HvfGicMsiDeviceInterruptResources,
+>;
+type PublishedPciNetwork = PublishedVirtioPciEndpoint<
+    VirtioNetworkConfigSpace,
+    VirtioNetworkDevice,
+    HvfGicMsiDeviceInterruptResources,
+>;
+type PublishedPciPmem = PublishedVirtioPciEndpoint<
+    VirtioPmemConfigSpace,
+    VirtioPmemDevice,
+    HvfGicMsiDeviceInterruptResources,
+>;
+
+#[derive(Debug)]
+struct HvfArm64BootPciBlockDevice {
+    drive_id: String,
+    published: PublishedPciBlock,
+    queue_deliveries: usize,
+}
+
+#[derive(Debug)]
+struct HvfArm64BootPciNetworkDevice {
+    iface_id: String,
+    host_dev_name: String,
+    published: PublishedPciNetwork,
+    queue_deliveries: usize,
+}
+
+#[derive(Debug)]
+struct HvfArm64BootPciPmemDevice {
+    pmem_id: String,
+    guest_range: GuestMemoryRange,
+    published: PublishedPciPmem,
+    queue_deliveries: usize,
+}
+
+/// Stable class label in hidden PCI data-device diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64BootPciDataDeviceKind {
+    Block,
+    Network,
+    Pmem,
+}
+
+/// Redacted diagnostics for one hidden PCI data endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64BootPciDataDeviceDiagnostics {
+    pub kind: HvfArm64BootPciDataDeviceKind,
+    pub id: String,
+    pub transport: VirtioPciDiagnostics,
+    pub queue_deliveries: usize,
+}
+
+/// Value-redacted failure in hidden PCI data-device preparation or teardown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfArm64BootPciDataError {
+    message: String,
+}
+
+impl HvfArm64BootPciDataError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for HvfArm64BootPciDataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HvfArm64BootPciDataError {}
+
+#[derive(Debug)]
+struct HvfArm64BootPciDataDevices {
+    validation: Arm64BootPciValidationResources,
+    dispatcher: Arc<Mutex<MmioDispatcher>>,
+    block: Vec<HvfArm64BootPciBlockDevice>,
+    network: Vec<HvfArm64BootPciNetworkDevice>,
+    pmem: Vec<HvfArm64BootPciPmemDevice>,
+}
+
+impl HvfArm64BootPciDataDevices {
+    fn diagnostics(
+        &self,
+    ) -> Result<Vec<HvfArm64BootPciDataDeviceDiagnostics>, HvfArm64BootPciDataError> {
+        let mut diagnostics = Vec::new();
+        diagnostics
+            .try_reserve_exact(self.block.len() + self.network.len() + self.pmem.len())
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to allocate PCI data-device diagnostics: {source}"
+                ))
+            })?;
+        for device in &self.block {
+            diagnostics.push(HvfArm64BootPciDataDeviceDiagnostics {
+                kind: HvfArm64BootPciDataDeviceKind::Block,
+                id: device.drive_id.clone(),
+                transport: device
+                    .published
+                    .endpoint()
+                    .diagnostics()
+                    .map_err(pci_data_endpoint_error)?,
+                queue_deliveries: device.queue_deliveries,
+            });
+        }
+        for device in &self.network {
+            diagnostics.push(HvfArm64BootPciDataDeviceDiagnostics {
+                kind: HvfArm64BootPciDataDeviceKind::Network,
+                id: device.iface_id.clone(),
+                transport: device
+                    .published
+                    .endpoint()
+                    .diagnostics()
+                    .map_err(pci_data_endpoint_error)?,
+                queue_deliveries: device.queue_deliveries,
+            });
+        }
+        for device in &self.pmem {
+            diagnostics.push(HvfArm64BootPciDataDeviceDiagnostics {
+                kind: HvfArm64BootPciDataDeviceKind::Pmem,
+                id: device.pmem_id.clone(),
+                transport: device
+                    .published
+                    .endpoint()
+                    .diagnostics()
+                    .map_err(pci_data_endpoint_error)?,
+                queue_deliveries: device.queue_deliveries,
+            });
+        }
+        Ok(diagnostics)
+    }
+
+    fn dispatch_block(
+        &mut self,
+        memory: &mut GuestMemory,
+        metrics: &SharedBlockDeviceMetricsRegistry,
+    ) -> Option<Duration> {
+        let mut retry_after = None;
+        for device in &mut self.block {
+            let result = device
+                .published
+                .endpoint()
+                .dispatch_block_queue_notifications(memory);
+            match &result {
+                Ok(dispatch) => {
+                    metrics.record_notification_dispatch_for_drive(&device.drive_id, dispatch);
+                    retain_earliest_retry(
+                        &mut retry_after,
+                        dispatch
+                            .queue_dispatch()
+                            .and_then(|dispatch| dispatch.rate_limiter_retry_after()),
+                    );
+                    if dispatch.needs_queue_interrupt() {
+                        device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+                    }
+                }
+                Err(error) => {
+                    record_pci_block_operation_error(metrics, &device.drive_id, error);
+                    if let Some(completed) = error.completed_device_operation() {
+                        retain_earliest_retry(
+                            &mut retry_after,
+                            completed
+                                .queue_dispatch()
+                                .and_then(|dispatch| dispatch.rate_limiter_retry_after()),
+                        );
+                    }
+                    if let Some(source) = error.device_error() {
+                        retain_earliest_retry(
+                            &mut retry_after,
+                            source
+                                .completed_dispatch()
+                                .and_then(|dispatch| dispatch.rate_limiter_retry_after()),
+                        );
+                        if error.endpoint_error().is_none()
+                            && source
+                                .completed_dispatch()
+                                .is_some_and(|dispatch| dispatch.needs_queue_interrupt())
+                        {
+                            device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        retry_after
+    }
+
+    fn dispatch_pmem(
+        &mut self,
+        memory: &mut GuestMemory,
+        flush_provider: &mut impl Arm64BootPmemFlushProvider,
+        metrics: &SharedPmemDeviceMetricsRegistry,
+    ) -> Option<Duration> {
+        let mut retry_after = None;
+        for device in &mut self.pmem {
+            let mut flush = || flush_provider.flush(device.guest_range);
+            let result = device
+                .published
+                .endpoint()
+                .dispatch_pmem_queue_notifications(memory, &mut flush);
+            match &result {
+                Ok(dispatch) => {
+                    metrics.record_notification_dispatch_for_device(&device.pmem_id, dispatch);
+                    retain_earliest_retry(&mut retry_after, dispatch.rate_limiter_retry_after());
+                    if dispatch.needs_queue_interrupt() {
+                        device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+                    }
+                }
+                Err(error) => {
+                    if let Some(completed) = error.completed_device_operation() {
+                        metrics.record_notification_dispatch_for_device(&device.pmem_id, completed);
+                        retain_earliest_retry(
+                            &mut retry_after,
+                            completed.rate_limiter_retry_after(),
+                        );
+                    }
+                    if let Some(source) = error.device_error() {
+                        metrics.record_notification_error_for_device(&device.pmem_id, source);
+                        retain_earliest_retry(&mut retry_after, source.rate_limiter_retry_after());
+                        if error.endpoint_error().is_none()
+                            && source
+                                .completed_dispatch()
+                                .is_some_and(|dispatch| dispatch.needs_queue_interrupt())
+                        {
+                            device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+                        }
+                    }
+                    if error.endpoint_error().is_some() {
+                        metrics.record_event_failure_for_device(&device.pmem_id);
+                    }
+                }
+            }
+        }
+        retry_after
+    }
+
+    fn dispatch_network(
+        &mut self,
+        memory: &mut GuestMemory,
+        mut packet_io: Option<&mut dyn Arm64BootNetworkPacketIoProvider>,
+        metrics: &SharedNetworkInterfaceMetricsRegistry,
+    ) -> Option<Duration> {
+        let mut retry_after = None;
+        for device in &mut self.network {
+            let endpoint = device.published.endpoint();
+            let has_pending = match endpoint.has_pending_network_queue_work() {
+                Ok(has_pending) => has_pending,
+                Err(_) => {
+                    metrics.record_event_failure_for_interface(&device.iface_id);
+                    continue;
+                }
+            };
+            let result = if has_pending {
+                match packet_io.as_deref_mut() {
+                    Some(provider) => match provider.packet_io(Arm64BootNetworkInterface::new(
+                        &device.iface_id,
+                        &device.host_dev_name,
+                    )) {
+                        Ok(packet_io) => {
+                            let (tx_sink, rx_source) = packet_io.into_parts();
+                            endpoint.dispatch_network_queue_notifications_with_packet_io(
+                                memory, tx_sink, rx_source,
+                            )
+                        }
+                        Err(_) => {
+                            metrics.record_event_failure_for_interface(&device.iface_id);
+                            continue;
+                        }
+                    },
+                    None => endpoint.dispatch_network_queue_notifications(memory),
+                }
+            } else {
+                endpoint.dispatch_network_queue_notifications(memory)
+            };
+            match &result {
+                Ok(dispatch) => {
+                    metrics.record_notification_dispatch_for_interface(&device.iface_id, dispatch);
+                    retain_earliest_retry(&mut retry_after, dispatch.rate_limiter_retry_after());
+                    if dispatch.needs_queue_interrupt() {
+                        device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+                    }
+                }
+                Err(error) => {
+                    if let Some(completed) = error.completed_device_operation() {
+                        metrics.record_notification_dispatch_for_interface(
+                            &device.iface_id,
+                            completed,
+                        );
+                        retain_earliest_retry(
+                            &mut retry_after,
+                            completed.rate_limiter_retry_after(),
+                        );
+                    }
+                    if let Some(source) = error.device_error() {
+                        metrics.record_notification_error_for_interface(&device.iface_id, source);
+                        retain_earliest_retry(&mut retry_after, source.rate_limiter_retry_after());
+                        if error.endpoint_error().is_none()
+                            && network_error_needs_queue_interrupt(source)
+                        {
+                            device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+                        }
+                    }
+                    if error.endpoint_error().is_some() {
+                        metrics.record_event_failure_for_interface(&device.iface_id);
+                    }
+                }
+            }
+        }
+        retry_after
+    }
+
+    fn teardown(&mut self) -> Result<(), HvfArm64BootPciDataError> {
+        let mut dispatcher = self.dispatcher.lock().map_err(|_| {
+            HvfArm64BootPciDataError::new("PCI data-device MMIO dispatcher is unavailable")
+        })?;
+        while let Some(device) = self.pmem.last_mut() {
+            device
+                .published
+                .teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| pci_data_teardown_error("pmem", &device.pmem_id, source))?;
+            self.pmem.pop();
+        }
+        while let Some(device) = self.network.last_mut() {
+            device
+                .published
+                .teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| pci_data_teardown_error("network", &device.iface_id, source))?;
+            self.network.pop();
+        }
+        while let Some(device) = self.block.last_mut() {
+            device
+                .published
+                .teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| pci_data_teardown_error("block", &device.drive_id, source))?;
+            self.block.pop();
+        }
+        Ok(())
+    }
+}
+
+fn retain_earliest_retry(retained: &mut Option<Duration>, candidate: Option<Duration>) {
+    if let Some(candidate) = candidate {
+        *retained = Some(retained.map_or(candidate, |retained| retained.min(candidate)));
+    }
+}
+
+fn record_pci_block_operation_error(
+    metrics: &SharedBlockDeviceMetricsRegistry,
+    drive_id: &str,
+    error: &VirtioPciDeviceOperationError<
+        VirtioBlockDeviceNotificationError,
+        bangbang_runtime::block::VirtioBlockDeviceNotificationDispatch,
+    >,
+) {
+    if let Some(completed) = error.completed_device_operation() {
+        metrics.record_notification_dispatch_for_drive(drive_id, completed);
+    }
+    if let Some(source) = error.device_error() {
+        metrics.record_queue_events_for_drive(
+            drive_id,
+            usize_to_u64_saturating(source.drained_notifications().len()),
+        );
+        metrics.record_event_failure_for_drive(drive_id);
+        if let Some(completed) = source.completed_dispatch() {
+            metrics.record_queue_dispatch_for_drive(drive_id, completed);
+        }
+    }
+    if error.endpoint_error().is_some() {
+        metrics.record_event_failure_for_drive(drive_id);
+    }
+}
+
+fn network_error_needs_queue_interrupt(source: &VirtioNetworkDeviceNotificationError) -> bool {
+    source
+        .completed_initial_rx_dispatch()
+        .is_some_and(|dispatch| dispatch.needs_queue_interrupt())
+        || source
+            .completed_tx_dispatch()
+            .is_some_and(|dispatch| dispatch.needs_queue_interrupt())
+        || source
+            .completed_rx_dispatch()
+            .is_some_and(|dispatch| dispatch.needs_queue_interrupt())
+}
+
+impl Drop for HvfArm64BootPciDataDevices {
+    fn drop(&mut self) {
+        let _ = self.teardown();
+    }
+}
+
+fn pci_data_endpoint_error(source: VirtioPciEndpointError) -> HvfArm64BootPciDataError {
+    HvfArm64BootPciDataError::new(format!("PCI data endpoint is unavailable: {source}"))
+}
+
+fn pci_data_teardown_error(
+    kind: &str,
+    id: &str,
+    source: VirtioPciPublicationError,
+) -> HvfArm64BootPciDataError {
+    HvfArm64BootPciDataError::new(format!(
+        "failed to tear down PCI {kind} endpoint {id}: {source}"
+    ))
+}
+
+fn pci_data_region_id(index: usize) -> Result<MmioRegionId, HvfArm64BootPciDataError> {
+    let index = u64::try_from(index)
+        .map_err(|_| HvfArm64BootPciDataError::new("PCI data endpoint index does not fit u64"))?;
+    let id = PCI_DATA_DEVICE_BAR_REGION_ID_BASE
+        .checked_add(index)
+        .ok_or_else(|| HvfArm64BootPciDataError::new("PCI data BAR region id overflowed"))?;
+    Ok(MmioRegionId::new(id))
+}
+
+fn teardown_pci_data_devices(
+    devices: &mut Option<HvfArm64BootPciDataDevices>,
+) -> Result<(), HvfArm64BootPciDataError> {
+    let Some(manager) = devices.as_mut() else {
+        return Ok(());
+    };
+    manager.teardown()?;
+    devices.take();
+    Ok(())
+}
+
 fn dispatch_pci_validation_notifications(
     backend: &mut HvfBackend,
     endpoint: Option<&mut HvfArm64BootPciValidationEndpoint>,
@@ -787,6 +1232,7 @@ pub struct HvfArm64BootSession<'vm> {
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
     pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
+    pci_data_devices: Option<HvfArm64BootPciDataDevices>,
     cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
     cache_hierarchy: Option<Arm64FdtCacheHierarchy>,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
@@ -827,6 +1273,7 @@ pub struct OwnedHvfArm64BootSession {
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
     pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
+    pci_data_devices: Option<HvfArm64BootPciDataDevices>,
     cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
     cache_hierarchy: Option<Arm64FdtCacheHierarchy>,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
@@ -2123,20 +2570,20 @@ impl HvfArm64BootSession<'_> {
         self.pmem_retry_wakeup_scheduler.stop();
         self.network_retry_wakeup_scheduler.stop();
         self.entropy_retry_wakeup_scheduler.stop();
+        let pci_data_result = self.teardown_pci_data_devices();
         let pci_result = self.teardown_pci_validation_endpoint();
         let runner_result = self.runner.shutdown();
-        let destroy_result = <HvfBackend as VmBackend>::destroy_vm(self.backend);
-
-        match (runner_result, pci_result, destroy_result) {
-            (Err(source), _, _) => Err(HvfArm64BootSessionShutdownError::Vcpu { source }),
-            (Ok(()), Err(source), _) => {
-                Err(HvfArm64BootSessionShutdownError::PciValidation { source })
-            }
-            (Ok(()), Ok(_), Err(source)) => {
-                Err(HvfArm64BootSessionShutdownError::DestroyVm { source })
-            }
-            (Ok(()), Ok(_), Ok(())) => Ok(()),
+        if let Err(source) = runner_result {
+            return Err(HvfArm64BootSessionShutdownError::Vcpu { source });
         }
+        if let Err(source) = pci_data_result {
+            return Err(HvfArm64BootSessionShutdownError::PciData { source });
+        }
+        if let Err(source) = pci_result {
+            return Err(HvfArm64BootSessionShutdownError::PciValidation { source });
+        }
+        <HvfBackend as VmBackend>::destroy_vm(self.backend)
+            .map_err(|source| HvfArm64BootSessionShutdownError::DestroyVm { source })
     }
 
     pub const fn gic_metadata(&self) -> HvfGicMetadata {
@@ -2174,6 +2621,16 @@ impl HvfArm64BootSession<'_> {
             .map(HvfArm64BootPciValidationEndpoint::diagnostics)
     }
 
+    /// Returns value-redacted state from the hidden PCI data-device proof.
+    #[doc(hidden)]
+    pub fn pci_data_device_diagnostics(
+        &self,
+    ) -> Option<Result<Vec<HvfArm64BootPciDataDeviceDiagnostics>, HvfArm64BootPciDataError>> {
+        self.pci_data_devices
+            .as_ref()
+            .map(HvfArm64BootPciDataDevices::diagnostics)
+    }
+
     /// Tears down the internal endpoint and proves released capacity is reusable.
     #[doc(hidden)]
     pub fn teardown_pci_validation_endpoint(
@@ -2189,6 +2646,12 @@ impl HvfArm64BootSession<'_> {
             &self.mmio_dispatcher,
             signaler,
         )
+    }
+
+    /// Explicitly tears down every hidden PCI data endpoint in reverse order.
+    #[doc(hidden)]
+    pub fn teardown_pci_data_devices(&mut self) -> Result<(), HvfArm64BootPciDataError> {
+        teardown_pci_data_devices(&mut self.pci_data_devices)
     }
 
     pub fn primary_mpidr(&self) -> u64 {
@@ -2931,6 +3394,13 @@ impl HvfArm64BootSession<'_> {
         &mut self,
     ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
     {
+        if let Some(devices) = self.pci_data_devices.as_mut() {
+            return dispatch_pci_block_notifications(
+                self.backend,
+                devices,
+                &self.block_device_metrics,
+            );
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootBlockNotificationDispatchError::MapGuestMemory { source }
@@ -2969,6 +3439,13 @@ impl HvfArm64BootSession<'_> {
         &mut self,
     ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError>
     {
+        if let Some(devices) = self.pci_data_devices.as_mut() {
+            return dispatch_pci_pmem_notifications(
+                self.backend,
+                devices,
+                &self.pmem_device_metrics,
+            );
+        }
         dispatch_pmem_queue_notifications_and_signal_interrupts(
             self.backend,
             &self.mmio_dispatcher,
@@ -2984,6 +3461,14 @@ impl HvfArm64BootSession<'_> {
         HvfArm64BootNetworkNotificationDispatches,
         HvfArm64BootNetworkNotificationDispatchError,
     > {
+        if let Some(devices) = self.pci_data_devices.as_mut() {
+            return dispatch_pci_network_notifications(
+                self.backend,
+                devices,
+                None,
+                &self.network_interface_metrics,
+            );
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
@@ -3021,6 +3506,14 @@ impl HvfArm64BootSession<'_> {
         HvfArm64BootNetworkNotificationDispatches,
         HvfArm64BootNetworkNotificationDispatchError,
     > {
+        if let Some(devices) = self.pci_data_devices.as_mut() {
+            return dispatch_pci_network_notifications(
+                self.backend,
+                devices,
+                Some(packet_io),
+                &self.network_interface_metrics,
+            );
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
@@ -3300,6 +3793,7 @@ impl OwnedHvfArm64BootSession {
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
             pci_validation_endpoint: prepared.pci_validation_endpoint,
+            pci_data_devices: prepared.pci_data_devices,
             cache_source: prepared.cache_source,
             cache_hierarchy: Some(prepared.cache_hierarchy),
             control_wakeup: prepared.control_wakeup,
@@ -3616,6 +4110,7 @@ impl OwnedHvfArm64BootSession {
             mmio_dispatcher,
             runtime_resources,
             pci_validation_endpoint: None,
+            pci_data_devices: None,
             cache_source,
             cache_hierarchy: None,
             control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
@@ -3784,20 +4279,20 @@ impl OwnedHvfArm64BootSession {
         self.pmem_retry_wakeup_scheduler.stop();
         self.network_retry_wakeup_scheduler.stop();
         self.entropy_retry_wakeup_scheduler.stop();
+        let pci_data_result = self.teardown_pci_data_devices();
         let pci_result = self.teardown_pci_validation_endpoint();
         let runner_result = self.runner.shutdown();
-        let destroy_result = <HvfBackend as VmBackend>::destroy_vm(&mut self.backend);
-
-        match (runner_result, pci_result, destroy_result) {
-            (Err(source), _, _) => Err(HvfArm64BootSessionShutdownError::Vcpu { source }),
-            (Ok(()), Err(source), _) => {
-                Err(HvfArm64BootSessionShutdownError::PciValidation { source })
-            }
-            (Ok(()), Ok(_), Err(source)) => {
-                Err(HvfArm64BootSessionShutdownError::DestroyVm { source })
-            }
-            (Ok(()), Ok(_), Ok(())) => Ok(()),
+        if let Err(source) = runner_result {
+            return Err(HvfArm64BootSessionShutdownError::Vcpu { source });
         }
+        if let Err(source) = pci_data_result {
+            return Err(HvfArm64BootSessionShutdownError::PciData { source });
+        }
+        if let Err(source) = pci_result {
+            return Err(HvfArm64BootSessionShutdownError::PciValidation { source });
+        }
+        <HvfBackend as VmBackend>::destroy_vm(&mut self.backend)
+            .map_err(|source| HvfArm64BootSessionShutdownError::DestroyVm { source })
     }
 
     /// Explicit cleanup evidence for an uncommitted restored destination.
@@ -3858,6 +4353,16 @@ impl OwnedHvfArm64BootSession {
             .map(HvfArm64BootPciValidationEndpoint::diagnostics)
     }
 
+    /// Returns value-redacted state from the hidden PCI data-device proof.
+    #[doc(hidden)]
+    pub fn pci_data_device_diagnostics(
+        &self,
+    ) -> Option<Result<Vec<HvfArm64BootPciDataDeviceDiagnostics>, HvfArm64BootPciDataError>> {
+        self.pci_data_devices
+            .as_ref()
+            .map(HvfArm64BootPciDataDevices::diagnostics)
+    }
+
     /// Tears down the internal endpoint and proves released capacity is reusable.
     #[doc(hidden)]
     pub fn teardown_pci_validation_endpoint(
@@ -3873,6 +4378,12 @@ impl OwnedHvfArm64BootSession {
             &self.mmio_dispatcher,
             signaler,
         )
+    }
+
+    /// Explicitly tears down every hidden PCI data endpoint in reverse order.
+    #[doc(hidden)]
+    pub fn teardown_pci_data_devices(&mut self) -> Result<(), HvfArm64BootPciDataError> {
+        teardown_pci_data_devices(&mut self.pci_data_devices)
     }
 
     pub fn primary_mpidr(&self) -> u64 {
@@ -4604,6 +5115,13 @@ impl OwnedHvfArm64BootSession {
         &mut self,
     ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
     {
+        if let Some(devices) = self.pci_data_devices.as_mut() {
+            return dispatch_pci_block_notifications(
+                &mut self.backend,
+                devices,
+                &self.block_device_metrics,
+            );
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootBlockNotificationDispatchError::MapGuestMemory { source }
@@ -4642,6 +5160,13 @@ impl OwnedHvfArm64BootSession {
         &mut self,
     ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError>
     {
+        if let Some(devices) = self.pci_data_devices.as_mut() {
+            return dispatch_pci_pmem_notifications(
+                &mut self.backend,
+                devices,
+                &self.pmem_device_metrics,
+            );
+        }
         dispatch_pmem_queue_notifications_and_signal_interrupts(
             &mut self.backend,
             &self.mmio_dispatcher,
@@ -4657,6 +5182,14 @@ impl OwnedHvfArm64BootSession {
         HvfArm64BootNetworkNotificationDispatches,
         HvfArm64BootNetworkNotificationDispatchError,
     > {
+        if let Some(devices) = self.pci_data_devices.as_mut() {
+            return dispatch_pci_network_notifications(
+                &mut self.backend,
+                devices,
+                None,
+                &self.network_interface_metrics,
+            );
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
@@ -4694,6 +5227,14 @@ impl OwnedHvfArm64BootSession {
         HvfArm64BootNetworkNotificationDispatches,
         HvfArm64BootNetworkNotificationDispatchError,
     > {
+        if let Some(devices) = self.pci_data_devices.as_mut() {
+            return dispatch_pci_network_notifications(
+                &mut self.backend,
+                devices,
+                Some(packet_io),
+                &self.network_interface_metrics,
+            );
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
@@ -5238,6 +5779,13 @@ impl HvfArm64BootBlockNotificationDispatches {
         }
     }
 
+    fn from_pci_retry(rate_limiter_retry_after: Option<Duration>) -> Self {
+        Self {
+            devices: Vec::new(),
+            rate_limiter_retry_after,
+        }
+    }
+
     #[cfg(test)]
     fn new_for_test_with_rate_limiter_retry_after(retry_after: Duration) -> Self {
         Self {
@@ -5317,6 +5865,13 @@ impl HvfArm64BootPmemNotificationDispatches {
         }
     }
 
+    fn from_pci_retry(rate_limiter_retry_after: Option<Duration>) -> Self {
+        Self {
+            devices: Vec::new(),
+            rate_limiter_retry_after,
+        }
+    }
+
     #[cfg(test)]
     fn new_for_test_with_rate_limiter_retry_after(retry_after: Duration) -> Self {
         Self {
@@ -5392,6 +5947,13 @@ impl HvfArm64BootNetworkNotificationDispatches {
             .min();
         Self {
             devices,
+            rate_limiter_retry_after,
+        }
+    }
+
+    fn from_pci_retry(rate_limiter_retry_after: Option<Duration>) -> Self {
+        Self {
+            devices: Vec::new(),
             rate_limiter_retry_after,
         }
     }
@@ -5730,6 +6292,9 @@ pub enum HvfArm64BootBlockNotificationDispatchError {
     ResultAllocation {
         source: TryReserveError,
     },
+    PciData {
+        source: HvfArm64BootPciDataError,
+    },
 }
 
 #[derive(Debug)]
@@ -5749,6 +6314,9 @@ pub enum HvfArm64BootPmemNotificationDispatchError {
     ResultAllocation {
         source: TryReserveError,
     },
+    PciData {
+        source: HvfArm64BootPciDataError,
+    },
 }
 
 #[derive(Debug)]
@@ -5767,6 +6335,9 @@ pub enum HvfArm64BootNetworkNotificationDispatchError {
     },
     ResultAllocation {
         source: TryReserveError,
+    },
+    PciData {
+        source: HvfArm64BootPciDataError,
     },
 }
 
@@ -5879,6 +6450,9 @@ impl fmt::Display for HvfArm64BootNetworkNotificationDispatchError {
                     "failed to allocate HVF boot network notification results: {source}"
                 )
             }
+            Self::PciData { source } => {
+                write!(f, "failed to dispatch PCI network notifications: {source}")
+            }
         }
     }
 }
@@ -5915,6 +6489,9 @@ impl fmt::Display for HvfArm64BootPmemNotificationDispatchError {
                     f,
                     "failed to allocate HVF boot pmem notification results: {source}"
                 )
+            }
+            Self::PciData { source } => {
+                write!(f, "failed to dispatch PCI pmem notifications: {source}")
             }
         }
     }
@@ -6088,6 +6665,7 @@ impl std::error::Error for HvfArm64BootPmemNotificationDispatchError {
             Self::DispatchNotifications { source } => Some(source),
             Self::CreateSignalSink { source } => Some(source),
             Self::ResultAllocation { source } => Some(source),
+            Self::PciData { source } => Some(source),
         }
     }
 }
@@ -6136,6 +6714,7 @@ impl std::error::Error for HvfArm64BootNetworkNotificationDispatchError {
             Self::DispatchNotifications { source } => Some(source),
             Self::CreateSignalSink { source } => Some(source),
             Self::ResultAllocation { source } => Some(source),
+            Self::PciData { source } => Some(source),
         }
     }
 }
@@ -6173,6 +6752,9 @@ impl fmt::Display for HvfArm64BootBlockNotificationDispatchError {
                     "failed to allocate HVF boot block notification results: {source}"
                 )
             }
+            Self::PciData { source } => {
+                write!(f, "failed to dispatch PCI block notifications: {source}")
+            }
         }
     }
 }
@@ -6185,6 +6767,7 @@ impl std::error::Error for HvfArm64BootBlockNotificationDispatchError {
             Self::DispatchNotifications { source } => Some(source),
             Self::CreateSignalSink { source } => Some(source),
             Self::ResultAllocation { source } => Some(source),
+            Self::PciData { source } => Some(source),
         }
     }
 }
@@ -7393,6 +7976,48 @@ fn collect_entropy_notification_dispatches(
     Ok(HvfArm64BootEntropyNotificationDispatches::new(devices))
 }
 
+fn dispatch_pci_block_notifications(
+    backend: &mut HvfBackend,
+    devices: &mut HvfArm64BootPciDataDevices,
+    metrics: &SharedBlockDeviceMetricsRegistry,
+) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError> {
+    let memory = backend
+        .mapped_guest_memory_mut()
+        .map_err(|source| HvfArm64BootBlockNotificationDispatchError::MapGuestMemory { source })?;
+    Ok(HvfArm64BootBlockNotificationDispatches::from_pci_retry(
+        devices.dispatch_block(memory, metrics),
+    ))
+}
+
+fn dispatch_pci_pmem_notifications(
+    backend: &mut HvfBackend,
+    devices: &mut HvfArm64BootPciDataDevices,
+    metrics: &SharedPmemDeviceMetricsRegistry,
+) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
+    let (memory, executor) = backend
+        .mapped_guest_memory_and_pmem_flush_executor_mut()
+        .map_err(|source| HvfArm64BootPmemNotificationDispatchError::MapGuestMemory { source })?;
+    let mut flush_provider = HvfArm64BootPmemFlushProvider::new(executor);
+    Ok(HvfArm64BootPmemNotificationDispatches::from_pci_retry(
+        devices.dispatch_pmem(memory, &mut flush_provider, metrics),
+    ))
+}
+
+fn dispatch_pci_network_notifications(
+    backend: &mut HvfBackend,
+    devices: &mut HvfArm64BootPciDataDevices,
+    packet_io: Option<&mut dyn Arm64BootNetworkPacketIoProvider>,
+    metrics: &SharedNetworkInterfaceMetricsRegistry,
+) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
+{
+    let memory = backend.mapped_guest_memory_mut().map_err(|source| {
+        HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
+    })?;
+    Ok(HvfArm64BootNetworkNotificationDispatches::from_pci_retry(
+        devices.dispatch_network(memory, packet_io, metrics),
+    ))
+}
+
 fn dispatch_pmem_queue_notifications_and_signal_interrupts(
     backend: &mut HvfBackend,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
@@ -7454,8 +8079,8 @@ impl<'a> HvfArm64BootPmemFlushProvider<'a> {
 }
 
 impl Arm64BootPmemFlushProvider for HvfArm64BootPmemFlushProvider<'_> {
-    fn flush(&mut self, registration: &PmemMmioDeviceRegistration) -> VirtioPmemFlushStatus {
-        VirtioPmemFlushStatus::from_result(self.executor.flush(registration.guest_range()).is_ok())
+    fn flush(&mut self, guest_range: GuestMemoryRange) -> VirtioPmemFlushStatus {
+        VirtioPmemFlushStatus::from_result(self.executor.flush(guest_range).is_ok())
     }
 }
 
@@ -8307,6 +8932,9 @@ pub enum HvfArm64BootSessionError {
     PublishPciValidationEndpoint {
         source: VirtioPciPublicationError,
     },
+    PciData {
+        source: HvfArm64BootPciDataError,
+    },
     MapGuestMemory {
         source: HvfGuestMemoryMappingError,
     },
@@ -8416,6 +9044,9 @@ impl fmt::Display for HvfArm64BootSessionError {
             Self::PublishPciValidationEndpoint { source } => {
                 write!(f, "failed to publish PCI validation endpoint: {source}")
             }
+            Self::PciData { source } => {
+                write!(f, "failed to prepare PCI data devices: {source}")
+            }
             Self::MapGuestMemory { source } => {
                 write!(
                     f,
@@ -8456,6 +9087,7 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::PciValidationDeviceType { source } => Some(source),
             Self::PreparePciValidationInterrupts { source } => Some(source),
             Self::PublishPciValidationEndpoint { source } => Some(source),
+            Self::PciData { source } => Some(source),
             Self::MapGuestMemory { source } => Some(source),
             Self::ConfigureBootRegisters { source } => Some(source),
             Self::BackendAlreadyInitialized
@@ -8561,6 +9193,9 @@ pub enum HvfArm64BootSessionShutdownError {
     PciValidation {
         source: HvfArm64BootPciValidationTeardownError,
     },
+    PciData {
+        source: HvfArm64BootPciDataError,
+    },
     DestroyVm {
         source: BackendError,
     },
@@ -8578,6 +9213,9 @@ impl fmt::Display for HvfArm64BootSessionShutdownError {
             Self::PciValidation { source } => {
                 write!(f, "failed to tear down PCI validation endpoint: {source}")
             }
+            Self::PciData { source } => {
+                write!(f, "failed to tear down PCI data devices: {source}")
+            }
             Self::DestroyVm { source } => {
                 write!(f, "failed to destroy HVF boot-session VM: {source}")
             }
@@ -8590,6 +9228,7 @@ impl std::error::Error for HvfArm64BootSessionShutdownError {
         match self {
             Self::Vcpu { source } => Some(source),
             Self::PciValidation { source } => Some(source),
+            Self::PciData { source } => Some(source),
             Self::DestroyVm { source } => Some(source),
         }
     }
@@ -8601,6 +9240,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
     pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
+    pci_data_devices: Option<HvfArm64BootPciDataDevices>,
     cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
     cache_hierarchy: Arm64FdtCacheHierarchy,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
@@ -8688,6 +9328,7 @@ impl HvfBackend {
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
             pci_validation_endpoint: prepared.pci_validation_endpoint,
+            pci_data_devices: prepared.pci_data_devices,
             cache_source: prepared.cache_source,
             cache_hierarchy: Some(prepared.cache_hierarchy),
             control_wakeup: prepared.control_wakeup,
@@ -8769,12 +9410,27 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     let timer = gic
         .arm64_fdt_timer_interrupts()
         .map_err(|source| HvfArm64BootSessionError::TimerMetadata { source })?;
+    let pci_data_mode = config
+        .pci_validation
+        .is_some_and(|validation| validation.is_data_devices());
     let interrupt_lines = allocate_interrupt_lines(
         &gic,
         HvfArm64BootInterruptRequest {
-            block_device_count: controller.drive_configs().len(),
-            pmem_device_count: controller.pmem_configs().len(),
-            network_device_count: controller.network_interface_configs().len(),
+            block_device_count: if pci_data_mode {
+                0
+            } else {
+                controller.drive_configs().len()
+            },
+            pmem_device_count: if pci_data_mode {
+                0
+            } else {
+                controller.pmem_configs().len()
+            },
+            network_device_count: if pci_data_mode {
+                0
+            } else {
+                controller.network_interface_configs().len()
+            },
             vsock_configured: controller.vsock_config().is_some(),
             balloon_configured: controller.balloon_config().is_some()
                 && config.balloon_device.is_some(),
@@ -8890,7 +9546,13 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         runtime
             .block_devices
             .iter()
-            .map(|device| device.registration.drive_id()),
+            .map(|device| device.registration.drive_id())
+            .chain(
+                runtime
+                    .pci_block_devices
+                    .iter()
+                    .map(|device| device.drive_id()),
+            ),
     );
     let pmem_device_metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(
         runtime.pmem_devices.iter().map(|device| device.id()),
@@ -8899,10 +9561,22 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         runtime
             .network_devices
             .iter()
-            .map(|device| device.registration.iface_id()),
+            .map(|device| device.registration.iface_id())
+            .chain(
+                runtime
+                    .pci_network_devices
+                    .iter()
+                    .map(|device| device.iface_id()),
+            ),
     );
+    let has_block_devices =
+        !runtime.block_devices.is_empty() || !runtime.pci_block_devices.is_empty();
+    let has_network_devices =
+        !runtime.network_devices.is_empty() || !runtime.pci_network_devices.is_empty();
+    let pci_data_devices = prepare_pci_data_devices(backend, &mut runtime, &mmio_dispatcher)
+        .map_err(|source| HvfArm64BootSessionError::PciData { source })?;
     let block_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
-    let block_retry_wakeup_scheduler = if runtime.block_devices.is_empty() {
+    let block_retry_wakeup_scheduler = if !has_block_devices {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
     } else {
         let vcpu_control = runner.control();
@@ -8938,7 +9612,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         .map_err(|source| HvfArm64BootSessionError::StartEntropyRetryWakeupScheduler { source })?
     };
     let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
-    let network_retry_wakeup_scheduler = if runtime.network_devices.is_empty() {
+    let network_retry_wakeup_scheduler = if !has_network_devices {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
     } else {
         let vcpu_control = runner.control();
@@ -8957,6 +9631,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         mmio_dispatcher,
         runtime_resources: runtime,
         pci_validation_endpoint,
+        pci_data_devices,
         cache_source,
         cache_hierarchy: retained_cache_hierarchy,
         control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
@@ -9038,6 +9713,414 @@ fn prepare_pci_validation_virtio_rng_endpoint(
         config_deliveries: 0,
         config_interrupt_triggered: false,
     }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HvfArm64BootPciDataResourceDemand {
+    endpoints: usize,
+    routes: usize,
+}
+
+fn pci_data_resource_demand(
+    block_count: usize,
+    network_count: usize,
+    pmem_count: usize,
+) -> Result<HvfArm64BootPciDataResourceDemand, HvfArm64BootPciDataError> {
+    let endpoints = block_count
+        .checked_add(network_count)
+        .and_then(|count| count.checked_add(pmem_count))
+        .ok_or_else(|| HvfArm64BootPciDataError::new("PCI data endpoint count overflowed"))?;
+    let routes = block_count
+        .checked_mul(VIRTIO_BLOCK_QUEUE_SIZES.len() + 1)
+        .and_then(|count| {
+            network_count
+                .checked_mul(VIRTIO_NET_QUEUE_SIZES.len() + 1)
+                .and_then(|routes| count.checked_add(routes))
+        })
+        .and_then(|count| {
+            pmem_count
+                .checked_mul(VIRTIO_PMEM_QUEUE_SIZES.len() + 1)
+                .and_then(|routes| count.checked_add(routes))
+        })
+        .ok_or_else(|| HvfArm64BootPciDataError::new("PCI data MSI-X route count overflowed"))?;
+    Ok(HvfArm64BootPciDataResourceDemand { endpoints, routes })
+}
+
+fn pci_data_available_bar_count(
+    allocator: &PciBarAllocator,
+) -> Result<usize, HvfArm64BootPciDataError> {
+    if allocator.address_space() != PciBarAddressSpace::Memory64 {
+        return Err(HvfArm64BootPciDataError::new(
+            "PCI data capability BAR allocator is not 64-bit memory",
+        ));
+    }
+
+    allocator
+        .available_ranges()
+        .iter()
+        .try_fold(0usize, |total, range| {
+            let start = range.start().raw_value();
+            let remainder = start % VIRTIO_PCI_CAPABILITY_BAR_SIZE;
+            let aligned_start = if remainder == 0 {
+                start
+            } else {
+                start
+                    .checked_add(VIRTIO_PCI_CAPABILITY_BAR_SIZE - remainder)
+                    .ok_or_else(|| {
+                        HvfArm64BootPciDataError::new(
+                            "PCI data capability BAR alignment overflowed",
+                        )
+                    })?
+            };
+            let count = range
+                .end_exclusive()
+                .raw_value()
+                .saturating_sub(aligned_start)
+                / VIRTIO_PCI_CAPABILITY_BAR_SIZE;
+            let count = usize::try_from(count).map_err(|_| {
+                HvfArm64BootPciDataError::new("PCI data capability BAR count does not fit usize")
+            })?;
+            total.checked_add(count).ok_or_else(|| {
+                HvfArm64BootPciDataError::new("PCI data capability BAR count overflowed")
+            })
+        })
+}
+
+fn pci_data_bar_plan(
+    allocator: &PciBarAllocator,
+    endpoint_count: usize,
+) -> Result<Vec<GuestMemoryRange>, HvfArm64BootPciDataError> {
+    let mut plan = Vec::new();
+    plan.try_reserve_exact(endpoint_count).map_err(|source| {
+        HvfArm64BootPciDataError::new(format!(
+            "failed to reserve PCI data capability BAR preflight plan: {source}"
+        ))
+    })?;
+    if endpoint_count == 0 {
+        return Ok(plan);
+    }
+    for range in allocator.available_ranges() {
+        let start = range.start().raw_value();
+        let remainder = start % VIRTIO_PCI_CAPABILITY_BAR_SIZE;
+        let mut next = if remainder == 0 {
+            start
+        } else {
+            start
+                .checked_add(VIRTIO_PCI_CAPABILITY_BAR_SIZE - remainder)
+                .ok_or_else(|| {
+                    HvfArm64BootPciDataError::new("PCI data capability BAR alignment overflowed")
+                })?
+        };
+        while plan.len() < endpoint_count {
+            let end = next
+                .checked_add(VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+                .ok_or_else(|| {
+                    HvfArm64BootPciDataError::new("PCI data capability BAR plan overflowed")
+                })?;
+            if end > range.end_exclusive().raw_value() {
+                break;
+            }
+            plan.push(
+                GuestMemoryRange::new(GuestAddress::new(next), VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+                    .map_err(|source| {
+                        HvfArm64BootPciDataError::new(format!(
+                            "failed to build PCI data capability BAR plan: {source}"
+                        ))
+                    })?,
+            );
+            next = end;
+        }
+        if plan.len() == endpoint_count {
+            return Ok(plan);
+        }
+    }
+    Err(HvfArm64BootPciDataError::new(format!(
+        "PCI data endpoint count {endpoint_count} exceeds plannable capability BAR capacity {}",
+        plan.len()
+    )))
+}
+
+fn preflight_pci_data_dispatcher(
+    dispatcher: &MmioDispatcher,
+    bar_plan: &[GuestMemoryRange],
+) -> Result<(), HvfArm64BootPciDataError> {
+    for (endpoint_index, bar) in bar_plan.iter().copied().enumerate() {
+        let region_id = pci_data_region_id(endpoint_index)?;
+        if dispatcher.contains_region_or_handler(region_id) {
+            return Err(HvfArm64BootPciDataError::new(format!(
+                "PCI data MMIO region id {region_id} is already in use"
+            )));
+        }
+        if dispatcher
+            .regions()
+            .iter()
+            .any(|region| region.range().overlaps(bar))
+        {
+            return Err(HvfArm64BootPciDataError::new(format!(
+                "PCI data capability BAR {endpoint_index} overlaps an existing MMIO region"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_pci_data_devices(
+    backend: &HvfBackend,
+    runtime: &mut Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+) -> Result<Option<HvfArm64BootPciDataDevices>, HvfArm64BootPciDataError> {
+    let Some(validation) = runtime.pci_validation.as_ref() else {
+        return Ok(None);
+    };
+    if !validation.config().is_data_devices() {
+        return Ok(None);
+    }
+
+    let block_count = runtime.pci_block_devices.len();
+    let network_count = runtime.pci_network_devices.len();
+    let pmem_count = runtime.pmem_devices.len();
+    let demand = pci_data_resource_demand(block_count, network_count, pmem_count)?;
+    let available_slots = validation
+        .segment()
+        .with_segment(|segment| segment.available_endpoint_slots())
+        .map_err(|source| {
+            HvfArm64BootPciDataError::new(format!(
+                "failed to preflight PCI data endpoint slots: {source}"
+            ))
+        })?;
+    if demand.endpoints > available_slots {
+        return Err(HvfArm64BootPciDataError::new(format!(
+            "PCI data endpoint count {} exceeds available segment capacity {available_slots}",
+            demand.endpoints
+        )));
+    }
+    let available_bars = pci_data_available_bar_count(validation.bar_allocator())?;
+    if demand.endpoints > available_bars {
+        return Err(HvfArm64BootPciDataError::new(format!(
+            "PCI data endpoint count {} exceeds available capability BAR capacity {available_bars}",
+            demand.endpoints
+        )));
+    }
+    let bar_plan = pci_data_bar_plan(validation.bar_allocator(), demand.endpoints)?;
+    {
+        let dispatcher = dispatcher.lock().map_err(|_| {
+            HvfArm64BootPciDataError::new(
+                "PCI data-device MMIO dispatcher is unavailable during preflight",
+            )
+        })?;
+        preflight_pci_data_dispatcher(&dispatcher, &bar_plan)?;
+    }
+
+    let signaler = backend.gic_msi_signaler().ok_or_else(|| {
+        HvfArm64BootPciDataError::new("PCI data devices require a GICv2m MSI signaler")
+    })?;
+    let remaining_routes = usize::try_from(signaler.allocator().remaining()).unwrap_or(usize::MAX);
+    if demand.routes > remaining_routes {
+        return Err(HvfArm64BootPciDataError::new(format!(
+            "PCI data route demand {} exceeds remaining GICv2m capacity {remaining_routes}",
+            demand.routes
+        )));
+    }
+
+    let validation = runtime.pci_validation.take().ok_or_else(|| {
+        HvfArm64BootPciDataError::new("PCI data validation resources disappeared during prepare")
+    })?;
+    let mut manager = HvfArm64BootPciDataDevices {
+        validation,
+        dispatcher: Arc::clone(dispatcher),
+        block: Vec::new(),
+        network: Vec::new(),
+        pmem: Vec::new(),
+    };
+    manager
+        .block
+        .try_reserve_exact(block_count)
+        .map_err(|source| {
+            HvfArm64BootPciDataError::new(format!(
+                "failed to reserve PCI block endpoint storage: {source}"
+            ))
+        })?;
+    manager
+        .network
+        .try_reserve_exact(network_count)
+        .map_err(|source| {
+            HvfArm64BootPciDataError::new(format!(
+                "failed to reserve PCI network endpoint storage: {source}"
+            ))
+        })?;
+    manager
+        .pmem
+        .try_reserve_exact(pmem_count)
+        .map_err(|source| {
+            HvfArm64BootPciDataError::new(format!(
+                "failed to reserve PCI pmem endpoint storage: {source}"
+            ))
+        })?;
+
+    let block_type = VirtioDeviceType::new(VIRTIO_BLOCK_DEVICE_ID)
+        .map_err(|source| HvfArm64BootPciDataError::new(source.to_string()))?;
+    let network_type = VirtioDeviceType::new(VIRTIO_NET_DEVICE_ID)
+        .map_err(|source| HvfArm64BootPciDataError::new(source.to_string()))?;
+    let pmem_type = VirtioDeviceType::new(VIRTIO_PMEM_DEVICE_ID)
+        .map_err(|source| HvfArm64BootPciDataError::new(source.to_string()))?;
+    let blocks = std::mem::take(&mut runtime.pci_block_devices);
+    let networks = std::mem::take(&mut runtime.pci_network_devices);
+    let segment = manager.validation.segment().clone();
+    let mut endpoint_index = 0usize;
+
+    let publish_result: Result<(), HvfArm64BootPciDataError> = (|| {
+        for prepared in blocks {
+            let (drive_id, config_space, device) = prepared.into_parts();
+            let interrupts = HvfGicMsiDeviceInterruptResources::allocate(
+                signaler,
+                VIRTIO_BLOCK_QUEUE_SIZES.len() + 1,
+            )
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to allocate PCI block MSI-X routes: {source}"
+                ))
+            })?;
+            let region_id = pci_data_region_id(endpoint_index)?;
+            let published = {
+                let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
+                    HvfArm64BootPciDataError::new(
+                        "PCI data-device MMIO dispatcher is unavailable during publication",
+                    )
+                })?;
+                PublishedVirtioPciEndpoint::publish(
+                    VirtioPciIdentity::new(block_type, config_space.available_features()),
+                    &VIRTIO_BLOCK_QUEUE_SIZES,
+                    config_space,
+                    device,
+                    false,
+                    manager.validation.bar_allocator_mut(),
+                    segment.clone(),
+                    &mut dispatcher,
+                    region_id,
+                    interrupts,
+                )
+                .map_err(|source| {
+                    HvfArm64BootPciDataError::new(format!(
+                        "failed to publish PCI block endpoint {drive_id}: {source}"
+                    ))
+                })?
+            };
+            manager.block.push(HvfArm64BootPciBlockDevice {
+                drive_id,
+                published,
+                queue_deliveries: 0,
+            });
+            endpoint_index += 1;
+        }
+
+        for prepared in networks {
+            let (iface_id, host_dev_name, config_space, device) = prepared.into_parts();
+            let interrupts = HvfGicMsiDeviceInterruptResources::allocate(
+                signaler,
+                VIRTIO_NET_QUEUE_SIZES.len() + 1,
+            )
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to allocate PCI network MSI-X routes: {source}"
+                ))
+            })?;
+            let region_id = pci_data_region_id(endpoint_index)?;
+            let published = {
+                let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
+                    HvfArm64BootPciDataError::new(
+                        "PCI data-device MMIO dispatcher is unavailable during publication",
+                    )
+                })?;
+                PublishedVirtioPciEndpoint::publish(
+                    VirtioPciIdentity::new(network_type, config_space.available_features()),
+                    &VIRTIO_NET_QUEUE_SIZES,
+                    config_space,
+                    device,
+                    false,
+                    manager.validation.bar_allocator_mut(),
+                    segment.clone(),
+                    &mut dispatcher,
+                    region_id,
+                    interrupts,
+                )
+                .map_err(|source| {
+                    HvfArm64BootPciDataError::new(format!(
+                        "failed to publish PCI network endpoint {iface_id}: {source}"
+                    ))
+                })?
+            };
+            manager.network.push(HvfArm64BootPciNetworkDevice {
+                iface_id,
+                host_dev_name,
+                published,
+                queue_deliveries: 0,
+            });
+            endpoint_index += 1;
+        }
+
+        for prepared in &runtime.pmem_devices {
+            let pmem_id = prepared.id().to_string();
+            let guest_range = prepared.guest_range();
+            let config_space = prepared.config_space();
+            let device = VirtioPmemDevice::with_rate_limiter(
+                prepared.mapping().file_len(),
+                prepared.rate_limiter(),
+            );
+            let interrupts = HvfGicMsiDeviceInterruptResources::allocate(
+                signaler,
+                VIRTIO_PMEM_QUEUE_SIZES.len() + 1,
+            )
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to allocate PCI pmem MSI-X routes: {source}"
+                ))
+            })?;
+            let region_id = pci_data_region_id(endpoint_index)?;
+            let published = {
+                let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
+                    HvfArm64BootPciDataError::new(
+                        "PCI data-device MMIO dispatcher is unavailable during publication",
+                    )
+                })?;
+                PublishedVirtioPciEndpoint::publish(
+                    VirtioPciIdentity::new(pmem_type, config_space.available_features()),
+                    &VIRTIO_PMEM_QUEUE_SIZES,
+                    config_space,
+                    device,
+                    false,
+                    manager.validation.bar_allocator_mut(),
+                    segment.clone(),
+                    &mut dispatcher,
+                    region_id,
+                    interrupts,
+                )
+                .map_err(|source| {
+                    HvfArm64BootPciDataError::new(format!(
+                        "failed to publish PCI pmem endpoint {pmem_id}: {source}"
+                    ))
+                })?
+            };
+            manager.pmem.push(HvfArm64BootPciPmemDevice {
+                pmem_id,
+                guest_range,
+                published,
+                queue_deliveries: 0,
+            });
+            endpoint_index += 1;
+        }
+        Ok(())
+    })();
+
+    if let Err(primary) = publish_result {
+        let cleanup = manager.teardown().err();
+        let message = match cleanup {
+            Some(cleanup) => format!("{primary}; rollback also failed: {cleanup}"),
+            None => primary.to_string(),
+        };
+        return Err(HvfArm64BootPciDataError::new(message));
+    }
+
+    Ok(Some(manager))
 }
 
 fn allocate_interrupt_lines(
@@ -9240,10 +10323,10 @@ mod tests {
         VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition,
         VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
+    use bangbang_runtime::pci::{PciBarAddressSpace, PciBarAllocator};
     use bangbang_runtime::pmem::{
-        PmemConfigInput, PmemMmioDeviceRegistration, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT,
-        VIRTIO_PMEM_REQUEST_SIZE, VIRTIO_PMEM_REQUEST_TYPE_FLUSH, VIRTIO_PMEM_STATUS_SIZE,
-        VirtioPmemFlushStatus,
+        PmemConfigInput, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT, VIRTIO_PMEM_REQUEST_SIZE,
+        VIRTIO_PMEM_REQUEST_TYPE_FLUSH, VIRTIO_PMEM_STATUS_SIZE, VirtioPmemFlushStatus,
     };
     use bangbang_runtime::rtc::RtcMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
@@ -9295,10 +10378,11 @@ mod tests {
         collect_network_notification_dispatches, collect_vsock_notification_dispatches,
         dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
-        lock_boot_mmio_dispatcher_runtime, quiesce_limiter_retry_wakeups,
-        record_entropy_dispatch_metrics, record_pmem_dispatch_metrics,
-        replace_vmgenid_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
-        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        lock_boot_mmio_dispatcher_runtime, pci_data_available_bar_count, pci_data_bar_plan,
+        pci_data_region_id, pci_data_resource_demand, preflight_pci_data_dispatcher,
+        quiesce_limiter_retry_wakeups, record_entropy_dispatch_metrics,
+        record_pmem_dispatch_metrics, replace_vmgenid_and_signal_with, run_boot_session_loop,
+        run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
         signal_network_queue_interrupts, signal_pmem_queue_interrupts,
         signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at,
@@ -10614,9 +11698,9 @@ mod tests {
     impl Arm64BootNetworkPacketIoProvider for RecordingNetworkPacketIoProvider {
         fn packet_io(
             &mut self,
-            device: &bangbang_runtime::startup::Arm64BootNetworkDevice,
+            interface: bangbang_runtime::startup::Arm64BootNetworkInterface<'_>,
         ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
-            let iface_id = device.registration.iface_id();
+            let iface_id = interface.iface_id();
             self.requested_ifaces.push(iface_id.to_string());
             if iface_id != self.iface_id {
                 return Err(Arm64BootNetworkPacketIoError::new(format!(
@@ -11976,7 +13060,7 @@ mod tests {
         runtime: &mut Arm64BootRuntimeResources,
         mmio_dispatcher: &mut MmioDispatcher,
     ) -> Arm64BootPmemNotificationDispatches {
-        let mut flush_provider = |_: &PmemMmioDeviceRegistration| VirtioPmemFlushStatus::Success;
+        let mut flush_provider = |_: GuestMemoryRange| VirtioPmemFlushStatus::Success;
         dispatch_boot_pmem_notifications_with_provider(
             memory,
             runtime,
@@ -14297,12 +15381,8 @@ mod tests {
         notify_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 1);
         let selected = runtime.pmem_mmio_devices[1].registration.clone();
         let mut flush_calls = Vec::new();
-        let mut flush_provider = |registration: &PmemMmioDeviceRegistration| {
-            flush_calls.push((
-                registration.pmem_id().to_string(),
-                registration.guest_range(),
-                registration.file_len(),
-            ));
+        let mut flush_provider = |guest_range: GuestMemoryRange| {
+            flush_calls.push(guest_range);
             VirtioPmemFlushStatus::Failure
         };
 
@@ -14313,14 +15393,7 @@ mod tests {
             &mut flush_provider,
         );
 
-        assert_eq!(
-            flush_calls,
-            [(
-                selected.pmem_id().to_string(),
-                selected.guest_range(),
-                selected.file_len(),
-            )]
-        );
+        assert_eq!(flush_calls, [selected.guest_range()]);
         assert!(
             dispatches.as_slice()[0]
                 .outcome()
@@ -14350,7 +15423,7 @@ mod tests {
         write_partially_invalid_queued_pmem_flush_request(&mut memory);
         notify_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 0);
         let mut flush_calls = 0;
-        let mut flush_provider = |_: &PmemMmioDeviceRegistration| {
+        let mut flush_provider = |_: GuestMemoryRange| {
             flush_calls += 1;
             VirtioPmemFlushStatus::Success
         };
@@ -17845,6 +18918,106 @@ mod tests {
         assert_eq!(
             default.with_pci_validation(validation).pci_validation,
             Some(validation)
+        );
+    }
+
+    #[test]
+    fn pci_data_resource_demand_uses_exact_endpoint_and_msix_shapes() {
+        let demand = pci_data_resource_demand(2, 3, 5)
+            .expect("bounded PCI data-device counts should fit resource demand");
+        assert_eq!(demand.endpoints, 10);
+        assert_eq!(demand.routes, 2 * 2 + 3 * 3 + 5 * 2);
+
+        let endpoint_overflow = pci_data_resource_demand(usize::MAX, 1, 0)
+            .expect_err("endpoint count overflow should fail preflight");
+        assert_eq!(
+            endpoint_overflow.to_string(),
+            "PCI data endpoint count overflowed"
+        );
+
+        let route_overflow = pci_data_resource_demand(0, usize::MAX, 0)
+            .expect_err("MSI-X route count overflow should fail preflight");
+        assert_eq!(
+            route_overflow.to_string(),
+            "PCI data MSI-X route count overflowed"
+        );
+    }
+
+    #[test]
+    fn pci_data_local_preflight_is_complete_and_mutation_free() {
+        let bar_capacity = GuestMemoryRange::new(
+            GuestAddress::new(0x40_0000_0000),
+            2 * super::VIRTIO_PCI_CAPABILITY_BAR_SIZE,
+        )
+        .expect("test PCI BAR capacity should be valid");
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, bar_capacity);
+        assert!(
+            pci_data_bar_plan(&allocator, 0)
+                .expect("zero PCI data endpoints should produce an empty BAR plan")
+                .is_empty()
+        );
+        assert_eq!(
+            pci_data_available_bar_count(&allocator)
+                .expect("aligned test BAR capacity should be countable"),
+            2
+        );
+        let retained = allocator
+            .allocate(super::VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+            .expect("test should retain one BAR lease");
+        assert_eq!(
+            pci_data_available_bar_count(&allocator)
+                .expect("remaining test BAR capacity should be countable"),
+            1
+        );
+
+        let mut dispatcher = MmioDispatcher::new();
+        let bar_plan = pci_data_bar_plan(&allocator, 1)
+            .expect("remaining test BAR should produce an exact plan");
+        preflight_pci_data_dispatcher(&dispatcher, &bar_plan)
+            .expect("fresh PCI data region ids should pass preflight");
+        let conflicting_id = pci_data_region_id(0).expect("bounded region id should fit");
+        dispatcher
+            .insert_region(conflicting_id, GuestAddress::new(0x9000_0000), 0x1000)
+            .expect("test conflicting region should register");
+        let error = preflight_pci_data_dispatcher(&dispatcher, &bar_plan)
+            .expect_err("retained PCI data region id should fail preflight");
+        assert_eq!(
+            error.to_string(),
+            format!("PCI data MMIO region id {conflicting_id} is already in use")
+        );
+        assert_eq!(dispatcher.regions().len(), 1);
+
+        let mut overlap_dispatcher = MmioDispatcher::new();
+        let planned_bar = bar_plan
+            .first()
+            .copied()
+            .expect("one planned BAR should be retained");
+        overlap_dispatcher
+            .insert_region(
+                MmioRegionId::new(9_999),
+                planned_bar.start(),
+                planned_bar.size(),
+            )
+            .expect("test overlapping region should register");
+        let overlap = preflight_pci_data_dispatcher(&overlap_dispatcher, &bar_plan)
+            .expect_err("planned BAR overlap should fail preflight");
+        assert_eq!(
+            overlap.to_string(),
+            "PCI data capability BAR 0 overlaps an existing MMIO region"
+        );
+        assert_eq!(
+            pci_data_available_bar_count(&allocator)
+                .expect("failed region preflight must not consume BAR capacity"),
+            1
+        );
+
+        allocator
+            .release(&retained)
+            .expect("test BAR lease should release after preflight");
+        assert_eq!(
+            pci_data_available_bar_count(&allocator)
+                .expect("released BAR capacity should be reusable"),
+            2
         );
     }
 

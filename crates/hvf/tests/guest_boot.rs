@@ -49,6 +49,16 @@ const VMGENID_GUEST_CHECK_MARKER: &[u8] = b"BANGBANG_VMGENID_GUEST_CHECK_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const BLOCK_WRITEBACK_FLUSH_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITEBACK_FLUSH_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PCI_BLOCK_IDENTITIES_MARKER: &[u8] = b"BANGBANG_PCI_BLOCK_IDENTITIES_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PCI_PMEM_IDENTITIES_MARKER: &[u8] = b"BANGBANG_PCI_PMEM_IDENTITIES_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MMDS_FETCH_MARKER: &[u8] = b"BANGBANG_MMDS_FETCH_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PCI_NETWORK_IDENTITIES_MARKER: &[u8] = b"BANGBANG_PCI_NETWORK_IDENTITIES_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
@@ -947,6 +957,290 @@ fn boots_firecracker_kernel_reads_and_flushes_virtio_pmem() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_direct_rootfs_and_fsyncs_block_devices_over_modern_virtio_pci() {
+    use std::num::NonZeroU32;
+
+    use bangbang_hvf::{HvfArm64BootPciDataDeviceKind, HvfGicMsiConfiguration};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::{DriveCacheType, DriveConfigInput};
+    use bangbang_runtime::startup::Arm64BootPciValidationConfig;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let data_backing = GuestBlockBacking::zeroed();
+    let boot_args = format!(
+        "{DIRECT_ROOTFS_BOOT_ARGS} bangbang.block-writeback-flush=1 bangbang.expect-pci-data=1"
+    );
+    let observation = run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
+        "guest-pci-block-fsync",
+        DIRECT_ROOTFS_BOOT_MARKER,
+        None,
+        &boot_args,
+        Some(HvfGicMsiConfiguration::new(
+            NonZeroU32::new(4).expect("two block endpoints need four MSI-X routes"),
+        )),
+        Some(Arm64BootPciValidationConfig::data_devices()),
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("PCI rootfs drive should configure");
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("data", "data", data_backing.path(), false)
+                        .with_cache_type(DriveCacheType::Writeback),
+                ))
+                .expect("PCI writable data drive should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        DIRECT_ROOTFS_BOOT_MARKER,
+        "PCI direct-rootfs boot marker",
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, BLOCK_WRITEBACK_FLUSH_MARKER),
+        "PCI block guest did not complete write/fsync\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        data_backing
+            .bytes()
+            .starts_with(BLOCK_WRITEBACK_FLUSH_MARKER),
+        "PCI block fsync marker should persist in the writable backing"
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, PCI_BLOCK_IDENTITIES_MARKER),
+        "pinned Linux did not expose both modern PCI block identities in sysfs\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    let diagnostics = observation
+        .pci_data_devices
+        .as_ref()
+        .expect("PCI block proof should retain endpoint diagnostics");
+    assert_eq!(diagnostics.len(), 2);
+    assert_pci_data_endpoint(
+        &diagnostics[0],
+        HvfArm64BootPciDataDeviceKind::Block,
+        "rootfs",
+        1,
+    );
+    assert_pci_data_endpoint(
+        &diagnostics[1],
+        HvfArm64BootPciDataDeviceKind::Block,
+        "data",
+        1,
+    );
+    assert_eq!(observation.data_mmio_device_counts, (0, 0, 0));
+    assert!(observation.pci_data_device_teardown);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_direct_rootfs_and_flushes_pmem_over_modern_virtio_pci() {
+    use std::num::NonZeroU32;
+
+    use bangbang_hvf::{HvfArm64BootPciDataDeviceKind, HvfGicMsiConfiguration};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+    use bangbang_runtime::pmem::PmemConfigInput;
+    use bangbang_runtime::startup::Arm64BootPciValidationConfig;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let pmem_backing = GuestPmemBacking::new(PMEM_HOST_MARKER);
+    let boot_args =
+        format!("{DIRECT_ROOTFS_BOOT_ARGS} bangbang.pmem-read-flush=1 bangbang.expect-pci-data=1");
+    let observation = run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
+        "guest-pci-pmem-flush",
+        DIRECT_ROOTFS_BOOT_MARKER,
+        None,
+        &boot_args,
+        Some(HvfGicMsiConfiguration::new(
+            NonZeroU32::new(4).expect("block and pmem endpoints need four MSI-X routes"),
+        )),
+        Some(Arm64BootPciValidationConfig::data_devices()),
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("PCI rootfs drive should configure");
+            controller
+                .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                    "pmem0",
+                    pmem_backing.path_text(),
+                )))
+                .expect("PCI pmem device should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        DIRECT_ROOTFS_BOOT_MARKER,
+        "PCI pmem direct-rootfs boot marker",
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, PMEM_READ_FLUSH_MARKER),
+        "PCI pmem guest did not complete read/flush\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert_eq!(
+        pmem_backing.bytes_at(PMEM_GUEST_FLUSH_OFFSET, PMEM_GUEST_FLUSH_MARKER.len()),
+        PMEM_GUEST_FLUSH_MARKER,
+        "PCI pmem flush should persist the guest marker"
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, PCI_PMEM_IDENTITIES_MARKER),
+        "pinned Linux did not expose modern PCI block and pmem identities in sysfs\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    let diagnostics = observation
+        .pci_data_devices
+        .as_ref()
+        .expect("PCI pmem proof should retain endpoint diagnostics");
+    assert_eq!(diagnostics.len(), 2);
+    assert_pci_data_endpoint(
+        &diagnostics[0],
+        HvfArm64BootPciDataDeviceKind::Block,
+        "rootfs",
+        1,
+    );
+    assert_pci_data_endpoint(
+        &diagnostics[1],
+        HvfArm64BootPciDataDeviceKind::Pmem,
+        "pmem0",
+        1,
+    );
+    assert_eq!(observation.data_mmio_device_counts, (0, 0, 0));
+    assert!(observation.pci_data_device_teardown);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_direct_rootfs_and_fetches_mmds_over_modern_virtio_pci_network() {
+    use std::num::NonZeroU32;
+
+    use bangbang_hvf::{HvfArm64BootPciDataDeviceKind, HvfGicMsiConfiguration};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+    use bangbang_runtime::metrics::SharedMmdsMetrics;
+    use bangbang_runtime::mmds::{DEFAULT_MMDS_IPV4_ADDRESS, MmdsConfigInput, MmdsContentInput};
+    use bangbang_runtime::mmds_network::{
+        MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoProvider,
+        MmdsOnlyVirtioNetworkPacketIoProviderEntry, MmdsPacketDetour, MmdsResponseQueue,
+    };
+    use bangbang_runtime::network::NetworkInterfaceConfigInput;
+    use bangbang_runtime::startup::Arm64BootPciValidationConfig;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let boot_args =
+        format!("{DIRECT_ROOTFS_BOOT_ARGS} bangbang.mmds-fetch=1 bangbang.expect-pci-data=1");
+    let observation = run_guest_boot_with_boot_source_gic_msi_pci_validation_and_packet_io(
+        "guest-pci-network-mmds",
+        DIRECT_ROOTFS_BOOT_MARKER,
+        None,
+        &boot_args,
+        Some(HvfGicMsiConfiguration::new(NonZeroU32::new(5).expect(
+            "block and network endpoints need five MSI-X routes",
+        ))),
+        GuestBootPciIoSetup::new(
+            Some(Arm64BootPciValidationConfig::data_devices()),
+            |controller: &bangbang_runtime::VmmController| {
+                let detour = MmdsPacketDetour::new(
+                    controller.mmds_state_handle(),
+                    DEFAULT_MMDS_IPV4_ADDRESS,
+                    MmdsResponseQueue::default(),
+                    SharedMmdsMetrics::default(),
+                );
+                let packet_io = MmdsOnlyVirtioNetworkPacketIo::new(detour)
+                    .expect("MMDS-only PCI packet I/O should build");
+                Some(
+                    MmdsOnlyVirtioNetworkPacketIoProvider::new(vec![
+                        MmdsOnlyVirtioNetworkPacketIoProviderEntry::new("eth0", packet_io),
+                    ])
+                    .expect("MMDS-only PCI packet provider should build"),
+                )
+            },
+        ),
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("PCI rootfs drive should configure");
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+                ))
+                .expect("PCI MMDS network interface should configure");
+            controller
+                .handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+                    "eth0".to_string(),
+                ])))
+                .expect("PCI MMDS interface selection should configure");
+            controller
+                .handle_action(VmmAction::PutMmds(MmdsContentInput::new(
+                    serde_json::json!({
+                        "meta-data": {
+                            "bangbang-marker": "BANGBANG_MMDS_GUEST_VALUE"
+                        }
+                    }),
+                )))
+                .expect("PCI MMDS data should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        DIRECT_ROOTFS_BOOT_MARKER,
+        "PCI network direct-rootfs boot marker",
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, MMDS_FETCH_MARKER),
+        "PCI network guest did not fetch MMDS data\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, PCI_NETWORK_IDENTITIES_MARKER),
+        "pinned Linux did not expose modern PCI block and network identities in sysfs\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    let diagnostics = observation
+        .pci_data_devices
+        .as_ref()
+        .expect("PCI network proof should retain endpoint diagnostics");
+    assert_eq!(diagnostics.len(), 2);
+    assert_pci_data_endpoint(
+        &diagnostics[0],
+        HvfArm64BootPciDataDeviceKind::Block,
+        "rootfs",
+        1,
+    );
+    assert_pci_data_endpoint(
+        &diagnostics[1],
+        HvfArm64BootPciDataDeviceKind::Network,
+        "eth0",
+        2,
+    );
+    assert_eq!(observation.data_mmio_device_counts, (0, 0, 0));
+    assert!(observation.pci_data_device_teardown);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_guest_boot_until_marker(
     instance_id: &str,
     marker: &[u8],
@@ -1038,6 +1332,52 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
     pci_validation: Option<bangbang_runtime::startup::Arm64BootPciValidationConfig>,
     configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
 ) -> GuestBootObservation {
+    run_guest_boot_with_boot_source_gic_msi_pci_validation_and_packet_io(
+        instance_id,
+        marker,
+        initrd_path,
+        boot_args,
+        gic_msi,
+        GuestBootPciIoSetup::new(pci_validation, |_: &bangbang_runtime::VmmController| {
+            None::<bangbang_runtime::mmds_network::MmdsOnlyVirtioNetworkPacketIoProvider>
+        }),
+        configure_controller,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct GuestBootPciIoSetup<F> {
+    validation: Option<bangbang_runtime::startup::Arm64BootPciValidationConfig>,
+    packet_io_factory: F,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<F> GuestBootPciIoSetup<F> {
+    fn new(
+        validation: Option<bangbang_runtime::startup::Arm64BootPciValidationConfig>,
+        packet_io_factory: F,
+    ) -> Self {
+        Self {
+            validation,
+            packet_io_factory,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_guest_boot_with_boot_source_gic_msi_pci_validation_and_packet_io<P, F>(
+    instance_id: &str,
+    marker: &[u8],
+    initrd_path: Option<std::path::PathBuf>,
+    boot_args: &str,
+    gic_msi: Option<bangbang_hvf::HvfGicMsiConfiguration>,
+    pci_io: GuestBootPciIoSetup<F>,
+    configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
+) -> GuestBootObservation
+where
+    P: bangbang_runtime::startup::Arm64BootNetworkPacketIoProvider,
+    F: FnOnce(&bangbang_runtime::VmmController) -> Option<P>,
+{
     use std::num::NonZeroUsize;
     use std::time::Instant;
 
@@ -1055,6 +1395,11 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
     use bangbang_runtime::vsock::VsockMmioLayout;
     use bangbang_runtime::{VmmAction, VmmController};
 
+    let GuestBootPciIoSetup {
+        validation: pci_validation,
+        packet_io_factory,
+    } = pci_io;
+
     let kernel_path = env_path("BANGBANG_GUEST_KERNEL_PATH");
     let serial_output = SharedSerialOutputBuffer::default();
     let mut controller = VmmController::new(instance_id, "0.1.0", "bangbang");
@@ -1066,6 +1411,7 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
         .handle_action(VmmAction::PutBootSource(boot_source))
         .expect("guest boot test boot source should configure");
     configure_controller(&mut controller);
+    let mut packet_io = packet_io_factory(&controller);
     let serial_address = GuestAddress::new(SERIAL_MMIO_BASE);
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(BLOCK_MMIO_BASE), MmioRegionId::new(1)),
@@ -1099,6 +1445,11 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
     let gic_msi = session.gic_metadata().msi;
     let boot_diagnostics =
         GuestBootDiagnostics::from_session(&session, kernel_path, initrd_path, serial_address);
+    let data_mmio_device_counts = (
+        session.runtime_resources().block_devices.len(),
+        session.runtime_resources().pmem_mmio_devices.len(),
+        session.runtime_resources().network_devices.len(),
+    );
     validate_pre_run_boot_metadata(&session, &boot_diagnostics);
     let run_loop_control = session.run_loop_control();
     let stop_token = run_loop_control.stop_token();
@@ -1113,11 +1464,16 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
             break;
         }
 
-        let outcome = session
-            .run_loop_with_observer(&stop_token, one_step, |step| {
-                run_diagnostics.record_step(step);
-            })
-            .expect("guest boot test run-loop should not fail before marker");
+        let outcome = match packet_io.as_mut() {
+            Some(packet_io) => session
+                .run_loop_with_network_packet_io(&stop_token, one_step, packet_io)
+                .expect("guest boot network run-loop should not fail before marker"),
+            None => session
+                .run_loop_with_observer(&stop_token, one_step, |step| {
+                    run_diagnostics.record_step(step);
+                })
+                .expect("guest boot test run-loop should not fail before marker"),
+        };
         run_diagnostics.record_loop_outcome(&outcome);
         session
             .dispatch_pci_validation_notifications()
@@ -1164,6 +1520,13 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
     let pci_validation_teardown = session
         .teardown_pci_validation_endpoint()
         .expect("PCI validation endpoint teardown should succeed");
+    let pci_data_devices = session
+        .pci_data_device_diagnostics()
+        .map(|diagnostics| diagnostics.expect("PCI data diagnostics should be available"));
+    let pci_data_device_teardown = pci_data_devices.is_some();
+    session
+        .teardown_pci_data_devices()
+        .expect("PCI data devices should tear down");
     session
         .shutdown()
         .expect("guest boot test session should shut down");
@@ -1176,6 +1539,9 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
         gic_msi,
         pci_validation,
         pci_validation_teardown,
+        pci_data_devices,
+        pci_data_device_teardown,
+        data_mmio_device_counts,
     }
 }
 
@@ -1201,6 +1567,49 @@ fn assert_guest_boot_observed_marker(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_pci_data_endpoint(
+    diagnostics: &bangbang_hvf::HvfArm64BootPciDataDeviceDiagnostics,
+    kind: bangbang_hvf::HvfArm64BootPciDataDeviceKind,
+    id: &str,
+    queue_count: usize,
+) {
+    assert_eq!(diagnostics.kind, kind);
+    assert_eq!(diagnostics.id, id);
+    assert!(diagnostics.transport.device_activated);
+    assert!(diagnostics.transport.driver_ready);
+    assert!(diagnostics.transport.msix_enabled);
+    assert!(!diagnostics.transport.msix_function_masked);
+    assert_eq!(diagnostics.transport.queue_vectors.len(), queue_count);
+    assert!(
+        diagnostics
+            .transport
+            .queue_vectors
+            .iter()
+            .all(|vector| vector.is_some())
+    );
+    let config_vector = diagnostics
+        .transport
+        .config_vector
+        .expect("PCI data endpoint should program its config vector");
+    let mut distinct_vectors = diagnostics
+        .transport
+        .queue_vectors
+        .iter()
+        .map(|vector| vector.expect("PCI data queue vector should be programmed"))
+        .collect::<Vec<_>>();
+    distinct_vectors.push(config_vector);
+    distinct_vectors.sort_unstable();
+    distinct_vectors.dedup();
+    assert_eq!(distinct_vectors.len(), queue_count + 1);
+    assert_eq!(
+        diagnostics.transport.programmed_msix_entries,
+        queue_count + 1
+    );
+    assert_eq!(diagnostics.transport.unmasked_msix_entries, queue_count + 1);
+    assert!(diagnostics.queue_deliveries >= 1);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct GuestBootObservation {
     boot_diagnostics: GuestBootDiagnostics,
     run_diagnostics: GuestBootRunDiagnostics,
@@ -1209,6 +1618,9 @@ struct GuestBootObservation {
     gic_msi: Option<bangbang_hvf::HvfGicMsiMetadata>,
     pci_validation: Option<bangbang_hvf::HvfArm64BootPciValidationDiagnostics>,
     pci_validation_teardown: Option<bangbang_hvf::HvfArm64BootPciValidationTeardownEvidence>,
+    pci_data_devices: Option<Vec<bangbang_hvf::HvfArm64BootPciDataDeviceDiagnostics>>,
+    pci_data_device_teardown: bool,
+    data_mmio_device_counts: (usize, usize, usize),
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1974,8 +2386,10 @@ fn validate_pre_run_boot_metadata(
         }
     }
 
-    match resources.pci_validation.as_ref() {
-        Some(validation) => {
+    let pci_validation = resources.pci_validation.as_ref();
+    let pci_data_devices = session.pci_data_device_diagnostics().is_some();
+    if pci_validation.is_some() || pci_data_devices {
+        if let Some(validation) = pci_validation {
             assert_eq!(
                 validation
                     .segment()
@@ -1984,52 +2398,53 @@ fn validate_pre_run_boot_metadata(
                 2,
                 "PCI validation segment should retain the host bridge and endpoint"
             );
-            let pci = tree
-                .find("/pci@70000000")
-                .expect("PCI validation FDT should contain the ECAM host node");
-            assert_eq!(pci.prop_str("compatible").unwrap(), "pci-host-ecam-generic");
-            assert_eq!(pci.prop_str("device_type").unwrap(), "pci");
-            assert_eq!(prop_u64_cells(pci, "reg"), [0x7000_0000, 0x10_0000]);
-            assert_eq!(prop_u32_cells(pci, "bus-range"), [0, 0]);
-            assert_eq!(pci.prop_u32("linux,pci-domain").unwrap(), 0);
-            assert_eq!(pci.prop_u32("#address-cells").unwrap(), 3);
-            assert_eq!(pci.prop_u32("#size-cells").unwrap(), 2);
-            assert_eq!(pci.prop_u32("#interrupt-cells").unwrap(), 1);
-            assert_eq!(pci.prop_u32("msi-parent").unwrap(), 3);
-            assert_eq!(
-                prop_u32_cells(pci, "ranges"),
-                [
-                    0x0200_0000,
-                    0,
-                    0x4000_3000,
-                    0,
-                    0x4000_3000,
-                    0,
-                    0x2fff_d000,
-                    0x0300_0000,
-                    0x40,
-                    0,
-                    0x40,
-                    0,
-                    0x40,
-                    0,
-                ]
-            );
-            for property in ["interrupt-map", "interrupt-map-mask", "dma-coherent"] {
-                assert!(
-                    pci.prop_raw(property)
-                        .expect("empty PCI property should exist")
-                        .is_empty()
-                );
-            }
-            assert!(!pci.has_prop("msi-map"));
-            assert!(!pci.has_prop("iommu-map"));
-            assert!(tree.find("/intc/its").is_none());
         }
-        None => assert!(
+        let pci = tree
+            .find("/pci@70000000")
+            .expect("PCI-enabled FDT should contain the ECAM host node");
+        assert_eq!(pci.prop_str("compatible").unwrap(), "pci-host-ecam-generic");
+        assert_eq!(pci.prop_str("device_type").unwrap(), "pci");
+        assert_eq!(prop_u64_cells(pci, "reg"), [0x7000_0000, 0x10_0000]);
+        assert_eq!(prop_u32_cells(pci, "bus-range"), [0, 0]);
+        assert_eq!(pci.prop_u32("linux,pci-domain").unwrap(), 0);
+        assert_eq!(pci.prop_u32("#address-cells").unwrap(), 3);
+        assert_eq!(pci.prop_u32("#size-cells").unwrap(), 2);
+        assert_eq!(pci.prop_u32("#interrupt-cells").unwrap(), 1);
+        assert_eq!(pci.prop_u32("msi-parent").unwrap(), 3);
+        assert_eq!(
+            prop_u32_cells(pci, "ranges"),
+            [
+                0x0200_0000,
+                0,
+                0x4000_3000,
+                0,
+                0x4000_3000,
+                0,
+                0x2fff_d000,
+                0x0300_0000,
+                0x40,
+                0,
+                0x40,
+                0,
+                0x40,
+                0,
+            ]
+        );
+        for property in ["interrupt-map", "interrupt-map-mask", "dma-coherent"] {
+            assert!(
+                pci.prop_raw(property)
+                    .expect("empty PCI property should exist")
+                    .is_empty()
+            );
+        }
+        assert!(!pci.has_prop("msi-map"));
+        assert!(!pci.has_prop("iommu-map"));
+        assert!(tree.find("/intc/its").is_none());
+    } else {
+        assert!(
             tree.find("/pci@70000000").is_none(),
             "ordinary guest boot should not publish PCI"
-        ),
+        );
     }
 
     assert_eq!(session.vcpu_count(), diagnostics.vcpu_mpidrs.len());

@@ -460,6 +460,18 @@ impl MmioDispatcher {
         self.bus.regions()
     }
 
+    /// Reports whether a region identifier is already visible on the bus or
+    /// retained by a registered handler.
+    #[doc(hidden)]
+    pub fn contains_region_or_handler(&self, region_id: MmioRegionId) -> bool {
+        self.handlers.contains_key(&region_id)
+            || self
+                .bus
+                .regions()
+                .iter()
+                .any(|region| region.id() == region_id)
+    }
+
     pub fn insert_region(
         &mut self,
         id: MmioRegionId,

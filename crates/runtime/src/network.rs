@@ -13,12 +13,14 @@ use crate::mmio::{
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
 use crate::token_bucket::{TokenBucket, TokenBucketConfig, TokenBucketSnapshot};
+use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
     VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
+use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
@@ -53,6 +55,8 @@ const VIRTIO_NET_TX_QUEUE_INDEX_U32: u32 = 1;
 
 pub type VirtioNetworkMmioHandler =
     VirtioMmioRegisterHandler<VirtioNetworkConfigSpace, VirtioNetworkDevice>;
+pub type VirtioNetworkPciEndpoint =
+    VirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetworkRateLimiterConfig {
@@ -3039,6 +3043,115 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
         }
 
         dispatch
+    }
+}
+
+impl VirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice> {
+    pub fn update_network_rate_limiters(
+        &self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| core.activation.update_rate_limiters(update))
+    }
+
+    pub fn has_pending_network_queue_work(&self) -> Result<bool, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| {
+            !core
+                .queue_notifications
+                .pending_queue_notifications()
+                .is_empty()
+                || core.activation.has_pending_rate_limited_queue_work()
+        })
+    }
+
+    pub fn dispatch_network_queue_notifications_with_packet_io(
+        &self,
+        memory: &mut GuestMemory,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
+        rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
+    ) -> Result<
+        VirtioNetworkDeviceNotificationDispatch,
+        VirtioPciDeviceOperationError<
+            VirtioNetworkDeviceNotificationError,
+            VirtioNetworkDeviceNotificationDispatch,
+        >,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let drained_notifications =
+                    core.queue_notifications.take_pending_queue_notifications();
+                let dispatch = core
+                    .activation
+                    .dispatch_drained_queue_notifications_with_packet_io(
+                        memory,
+                        drained_notifications,
+                        tx_sink,
+                        rx_source,
+                    );
+                let (rx_interrupt, tx_interrupt) = network_queue_interrupts(&dispatch);
+                if rx_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue {
+                        queue_index: VIRTIO_NET_RX_QUEUE_INDEX as u16,
+                    });
+                }
+                if tx_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue {
+                        queue_index: VIRTIO_NET_TX_QUEUE_INDEX as u16,
+                    });
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let endpoint = work.drain_interrupt_intents();
+        VirtioPciDeviceOperationError::combine(dispatch, endpoint)
+    }
+
+    pub fn dispatch_network_queue_notifications(
+        &self,
+        memory: &mut GuestMemory,
+    ) -> Result<
+        VirtioNetworkDeviceNotificationDispatch,
+        VirtioPciDeviceOperationError<
+            VirtioNetworkDeviceNotificationError,
+            VirtioNetworkDeviceNotificationDispatch,
+        >,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let drained_notifications =
+                    core.queue_notifications.take_pending_queue_notifications();
+                let mut sink = NoopVirtioNetworkTxPacketSink;
+                let dispatch = core
+                    .activation
+                    .dispatch_drained_queue_notifications_with_tx_sink(
+                        memory,
+                        drained_notifications,
+                        &mut sink,
+                    );
+                let (rx_interrupt, tx_interrupt) = network_queue_interrupts(&dispatch);
+                if rx_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue {
+                        queue_index: VIRTIO_NET_RX_QUEUE_INDEX as u16,
+                    });
+                }
+                if tx_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue {
+                        queue_index: VIRTIO_NET_TX_QUEUE_INDEX as u16,
+                    });
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let endpoint = work.drain_interrupt_intents();
+        VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 }
 

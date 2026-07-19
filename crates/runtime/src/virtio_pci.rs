@@ -543,6 +543,21 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
 impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler>
     VirtioPciEndpointWork<'_, C, A>
 {
+    /// Runs one typed device operation while this admitted work transaction owns
+    /// the canonical endpoint state.
+    ///
+    /// This boundary intentionally remains crate-private. Device modules expose
+    /// semantic helpers instead of allowing transport callers to retain or mutate
+    /// the common core directly. Guest-message signaling must happen after the
+    /// closure returns and the endpoint mutex is released.
+    pub(crate) fn with_core_mut<R>(
+        &self,
+        operation: impl FnOnce(&mut VirtioDeviceCore<C, A>) -> R,
+    ) -> Result<R, VirtioPciEndpointError> {
+        let mut state = self.endpoint.lock_active()?;
+        Ok(operation(&mut state.core))
+    }
+
     pub fn pending_queue_notifications(&self) -> Result<Vec<usize>, VirtioPciEndpointError> {
         let state = self.endpoint.lock_active()?;
         Ok(state.core.queue_notifications.pending_queue_notifications())
@@ -594,6 +609,98 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler>
             state.msix.trigger(VirtioInterruptIntent::Configuration)?
         };
         self.endpoint.inner.signal_messages(messages)
+    }
+}
+
+/// Result of canonical device work followed by virtio-pci interrupt delivery.
+#[derive(Debug)]
+pub enum VirtioPciDeviceOperationError<E, T> {
+    Device(Box<E>),
+    Endpoint(VirtioPciEndpointError),
+    CompletedAndEndpoint {
+        completed: Box<T>,
+        endpoint: VirtioPciEndpointError,
+    },
+    DeviceAndEndpoint {
+        device: Box<E>,
+        endpoint: VirtioPciEndpointError,
+    },
+}
+
+impl<E, T> VirtioPciDeviceOperationError<E, T> {
+    pub fn combine(
+        device: Result<T, E>,
+        endpoint: Result<(), VirtioPciEndpointError>,
+    ) -> Result<T, Self> {
+        match (device, endpoint) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(device), Ok(())) => Err(Self::Device(Box::new(device))),
+            (Ok(completed), Err(endpoint)) => Err(Self::CompletedAndEndpoint {
+                completed: Box::new(completed),
+                endpoint,
+            }),
+            (Err(device), Err(endpoint)) => Err(Self::DeviceAndEndpoint {
+                device: Box::new(device),
+                endpoint,
+            }),
+        }
+    }
+
+    pub fn device_error(&self) -> Option<&E> {
+        match self {
+            Self::Device(device) | Self::DeviceAndEndpoint { device, .. } => Some(device.as_ref()),
+            Self::Endpoint(_) | Self::CompletedAndEndpoint { .. } => None,
+        }
+    }
+
+    pub fn completed_device_operation(&self) -> Option<&T> {
+        match self {
+            Self::CompletedAndEndpoint { completed, .. } => Some(completed.as_ref()),
+            Self::Device(_) | Self::Endpoint(_) | Self::DeviceAndEndpoint { .. } => None,
+        }
+    }
+
+    pub const fn endpoint_error(&self) -> Option<&VirtioPciEndpointError> {
+        match self {
+            Self::Endpoint(endpoint)
+            | Self::CompletedAndEndpoint { endpoint, .. }
+            | Self::DeviceAndEndpoint { endpoint, .. } => Some(endpoint),
+            Self::Device(_) => None,
+        }
+    }
+}
+
+impl<E: fmt::Display, T> fmt::Display for VirtioPciDeviceOperationError<E, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Device(device) => write!(f, "virtio device operation failed: {device}"),
+            Self::Endpoint(endpoint) => {
+                write!(f, "virtio-pci endpoint operation failed: {endpoint}")
+            }
+            Self::CompletedAndEndpoint { endpoint, .. } => write!(
+                f,
+                "virtio device operation completed, but virtio-pci endpoint operation failed: {endpoint}"
+            ),
+            Self::DeviceAndEndpoint { device, endpoint } => write!(
+                f,
+                "virtio device operation failed: {device}; virtio-pci endpoint operation also failed: {endpoint}"
+            ),
+        }
+    }
+}
+
+impl<E, T> std::error::Error for VirtioPciDeviceOperationError<E, T>
+where
+    E: std::error::Error + 'static,
+    T: fmt::Debug,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Device(device) | Self::DeviceAndEndpoint { device, .. } => Some(device.as_ref()),
+            Self::Endpoint(endpoint) | Self::CompletedAndEndpoint { endpoint, .. } => {
+                Some(endpoint)
+            }
+        }
     }
 }
 
@@ -3238,6 +3345,76 @@ mod tests {
             Err(VirtioPciEndpointError::NotActive {
                 phase: VirtioPciEndpointPhase::Released
             })
+        ));
+    }
+
+    #[test]
+    fn admitted_core_operation_mutates_only_the_canonical_endpoint_state() {
+        let fixture = fixture(&[8]);
+        let work = fixture
+            .endpoint
+            .admit_device_work()
+            .expect("active endpoint should admit canonical device work");
+
+        let intents = work
+            .with_core_mut(|core| {
+                assert!(core.take_interrupt_intents().is_empty());
+                core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
+                core.take_interrupt_intents()
+            })
+            .expect("admitted canonical device work should succeed");
+
+        assert_eq!(
+            intents,
+            vec![VirtioInterruptIntent::Queue { queue_index: 0 }]
+        );
+        assert!(
+            fixture
+                .endpoint
+                .admit_device_work()
+                .expect("a second work transaction should observe the same core")
+                .with_core_mut(|core| core.take_interrupt_intents())
+                .expect("canonical state should remain accessible")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn device_operation_error_preserves_device_and_endpoint_failures() {
+        assert_eq!(
+            VirtioPciDeviceOperationError::<&str, i32>::combine(Ok(42), Ok(()))
+                .expect("two successful phases should preserve the value"),
+            42
+        );
+
+        let device = VirtioPciDeviceOperationError::<&str, ()>::combine(Err("device"), Ok(()))
+            .expect_err("device failure should be retained");
+        assert_eq!(device.device_error(), Some(&"device"));
+        assert!(device.completed_device_operation().is_none());
+        assert!(device.endpoint_error().is_none());
+
+        let endpoint = VirtioPciDeviceOperationError::<&str, i32>::combine(
+            Ok(42),
+            Err(VirtioPciEndpointError::StatePoisoned),
+        )
+        .expect_err("endpoint failure should be retained");
+        assert!(endpoint.device_error().is_none());
+        assert_eq!(endpoint.completed_device_operation(), Some(&42));
+        assert!(matches!(
+            endpoint.endpoint_error(),
+            Some(VirtioPciEndpointError::StatePoisoned)
+        ));
+
+        let combined = VirtioPciDeviceOperationError::<&str, ()>::combine(
+            Err("device"),
+            Err(VirtioPciEndpointError::StatePoisoned),
+        )
+        .expect_err("both failures should be retained");
+        assert_eq!(combined.device_error(), Some(&"device"));
+        assert!(combined.completed_device_operation().is_none());
+        assert!(matches!(
+            combined.endpoint_error(),
+            Some(VirtioPciEndpointError::StatePoisoned)
         ));
     }
 
