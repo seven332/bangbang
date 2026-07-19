@@ -959,6 +959,7 @@ fn normalized_device(device: libc::dev_t) -> u64 {
 mod tests {
     use std::fs::{self, File};
     use std::os::fd::{AsRawFd, FromRawFd};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::macos::bookmark::create_implicit_bookmark;
     use crate::macos::grant_transport::ReceivedGrant;
@@ -972,6 +973,52 @@ mod tests {
         assert!(descriptor >= 100);
         // SAFETY: descriptor is the fresh duplicate above.
         unsafe { OwnedFd::from_raw_fd(descriptor) }
+    }
+
+    fn unlinked_file() -> File {
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+        for _ in 0..1_024 {
+            let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "bangbang-grant-registry-unlinked-{}-{sequence}",
+                std::process::id()
+            ));
+            let creator = match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("unlinked fixture should be created: {error}"),
+            };
+            let file = File::open(&path).expect("unlinked fixture should reopen read-only");
+            fs::remove_file(&path).expect("unlinked fixture name should be removed");
+            drop(creator);
+            return file;
+        }
+
+        panic!("bounded unlinked fixture attempts should succeed");
+    }
+
+    fn assert_descriptor_released(descriptor: RawFd, original_identity: ObjectIdentity) {
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: stat points to writable storage and fstat only observes the
+        // descriptor number, which may now be closed or reused by another test.
+        if unsafe { libc::fstat(descriptor, stat.as_mut_ptr()) } != 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+            return;
+        }
+        // SAFETY: Successful fstat initialized the complete structure.
+        let stat = unsafe { stat.assume_init() };
+        assert_ne!(
+            ObjectIdentity {
+                device: normalized_device(stat.st_dev),
+                inode: stat.st_ino,
+            },
+            original_identity,
+            "received descriptor must release its original open file"
+        );
     }
 
     fn receive(
@@ -1086,8 +1133,7 @@ mod tests {
                     ))
                     .is_err()
             );
-            // SAFETY: Rejection must drop the directly constructed received fd.
-            assert_eq!(unsafe { libc::fcntl(anchor_fd, libc::F_GETFD) }, -1);
+            assert_descriptor_released(anchor_fd, identity);
         }
 
         fs::remove_dir(directory).expect("directory fixture should clean up");
@@ -1436,11 +1482,14 @@ mod tests {
     fn rejection_poison_closes_staged_authority_and_rejects_late_records() {
         let session = SessionId::from_bytes([8; 32]);
         let batch = BatchId::from_bytes([9; 16]);
-        let file = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .expect("fixture should open");
+        let file = unlinked_file();
         let descriptor = duplicate(&file);
         let received_fd = descriptor.as_raw_fd();
         let stat = descriptor_stat(received_fd).expect("stat should read");
+        let identity = ObjectIdentity {
+            device: normalized_device(stat.st_dev),
+            inode: stat.st_ino,
+        };
         // SAFETY: F_GETFL inspects the live descriptor.
         let flags = unsafe { libc::fcntl(received_fd, libc::F_GETFL) };
         let id = GrantId::parse("kernel").expect("ID should parse");
@@ -1468,10 +1517,7 @@ mod tests {
                     role: ResourceRole::KernelImage,
                     access: GrantAccess::ReadOnly,
                     kind: GrantObjectKind::RegularFile,
-                    identity: ObjectIdentity {
-                        device: normalized_device(stat.st_dev),
-                        inode: stat.st_ino,
-                    },
+                    identity,
                     status_flags: u32::try_from(flags).expect("flags should fit"),
                 },
                 Some(descriptor),
@@ -1493,12 +1539,7 @@ mod tests {
                 .is_err(),
             "replayed sequence must reject the batch"
         );
-        // SAFETY: F_GETFD checks that poisoning dropped the staged owned fd.
-        assert_eq!(unsafe { libc::fcntl(received_fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
+        assert_descriptor_released(received_fd, identity);
         assert!(
             staged
                 .accept(receive(
@@ -1581,10 +1622,14 @@ mod tests {
                 .is_err()
         );
 
-        let file = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .expect("fixture should open");
+        let file = unlinked_file();
         let descriptor = duplicate(&file);
         let descriptor_fd = descriptor.as_raw_fd();
+        let stat = descriptor_stat(descriptor_fd).expect("stat should read");
+        let identity = ObjectIdentity {
+            device: normalized_device(stat.st_dev),
+            inode: stat.st_ino,
+        };
         // SAFETY: F_GETFL inspects the live descriptor.
         let flags = unsafe { libc::fcntl(descriptor_fd, libc::F_GETFL) };
         let mut mismatched = StagedGrantBatch::new(session);
@@ -1622,16 +1667,14 @@ mod tests {
                 ))
                 .is_err()
         );
-        // SAFETY: Rejection must drop the received descriptor immediately.
-        assert_eq!(unsafe { libc::fcntl(descriptor_fd, libc::F_GETFD) }, -1);
+        assert_descriptor_released(descriptor_fd, identity);
     }
 
     #[test]
     fn receiver_rejects_descriptor_aliases_and_closes_the_whole_batch() {
         let session = SessionId::from_bytes([15; 32]);
         let batch = BatchId::from_bytes([16; 16]);
-        let file = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .expect("fixture should open");
+        let file = unlinked_file();
         let first = duplicate(&file);
         let second = duplicate(&file);
         let first_fd = first.as_raw_fd();
@@ -1691,11 +1734,8 @@ mod tests {
                 ))
                 .is_err()
         );
-        // SAFETY: F_GETFD verifies both the earlier staged fd and the triggering
-        // fd were dropped when the alias poisoned the batch.
-        assert_eq!(unsafe { libc::fcntl(first_fd, libc::F_GETFD) }, -1);
-        // SAFETY: Same ownership check for the triggering descriptor.
-        assert_eq!(unsafe { libc::fcntl(second_fd, libc::F_GETFD) }, -1);
+        assert_descriptor_released(first_fd, identity);
+        assert_descriptor_released(second_fd, identity);
     }
 
     #[test]
