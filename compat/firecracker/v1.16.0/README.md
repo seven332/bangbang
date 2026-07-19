@@ -40,6 +40,10 @@ claims mechanically visible.
   closure ledger. It accounts for the original 28 Wave 2 records, directly
   related API aggregates, exact evidence, count arithmetic, and explicit Wave
   6/7/8 ownership without changing the generated source manifest.
+- [`device-hotplug-contract.md`](device-hotplug-contract.md) is the #1420
+  runtime block ledger. It binds the two promoted drive PUT/DELETE identities
+  to the owner-thread transaction, contained grant rollback, guest lifecycle,
+  signed evidence, and the still-open pmem/network aggregate boundary.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -172,13 +176,22 @@ reset. #1408 then performs the final #1388 audit: it promotes the three
 remaining bounded boot/lifecycle records and 18 single-purpose boot-source,
 machine, CPU, and VM-state API identities. The generated manifest remains 381
 identities; with 37 local semantic records, the current 418-record delivery
-overlay is 70 `implemented-and-verified`, 328 `audit-required`, three
+overlay is 73 `implemented-and-verified`, 325 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` records. Wave
 6 retains generalized snapshots and portability, Wave 7 retains the broad
 CPU/rootfs corpora, public `cpu-template-helper`, and applicable specification
 outcomes, and Wave 8 retains final cross-capability/export certification. The
 exact identities and boundaries are recorded in the
 [`machine-lifecycle-audit.md`](machine-lifecycle-audit.md) ledger.
+
+#1420 subsequently promotes exactly two storage API identities: the Swagger
+`PUT /drives/{drive_id}` operation and pinned non-Swagger bodyless
+`DELETE /drives/{drive_id}` route. Their post-start behavior is restricted to
+the public all-virtio PCI profile and is verified through direct and contained
+two-round guest attach/remove/reuse. The broad device-hotplug corpus and
+aggregate semantic record remain nonterminal pending the pmem and network
+slices. The exact boundary is recorded in
+[`device-hotplug-contract.md`](device-hotplug-contract.md).
 
 ## Commands
 

@@ -512,6 +512,31 @@ pub struct DriveConfigs {
     configs: Vec<DriveConfig>,
 }
 
+/// A validated runtime-only drive insertion whose backing device is not yet live.
+#[derive(Debug)]
+pub struct PreparedDriveConfigInsert {
+    config: DriveConfig,
+}
+
+impl PreparedDriveConfigInsert {
+    pub const fn config(&self) -> &DriveConfig {
+        &self.config
+    }
+}
+
+/// A validated runtime-only drive removal whose live device is not yet removed.
+#[derive(Debug)]
+pub struct PreparedDriveConfigRemoval {
+    drive_id: String,
+    index: usize,
+}
+
+impl PreparedDriveConfigRemoval {
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+}
+
 impl DriveConfigs {
     pub fn new() -> Self {
         Self::default()
@@ -600,6 +625,96 @@ impl DriveConfigs {
 
         *existing = config;
         Ok(())
+    }
+
+    /// Validates and reserves storage for a post-start insertion without changing
+    /// the configured drive projection.
+    pub fn prepare_runtime_insert(
+        &mut self,
+        input: DriveConfigInput,
+    ) -> Result<PreparedDriveConfigInsert, DriveRuntimeMutationError> {
+        let config = input
+            .validate()
+            .map_err(DriveRuntimeMutationError::InvalidConfig)?;
+        if config.is_root_device() {
+            return Err(DriveRuntimeMutationError::RootInsertUnsupported);
+        }
+        if self
+            .configs
+            .iter()
+            .any(|existing| existing.drive_id() == config.drive_id())
+        {
+            return Err(DriveRuntimeMutationError::DuplicateDrive {
+                drive_id: config.drive_id().to_string(),
+            });
+        }
+        self.configs
+            .try_reserve_exact(1)
+            .map_err(|_| DriveRuntimeMutationError::ConfigurationAllocation)?;
+        Ok(PreparedDriveConfigInsert { config })
+    }
+
+    /// Publishes a previously prepared runtime insertion after its live endpoint
+    /// has committed successfully.
+    pub fn commit_runtime_insert(&mut self, prepared: PreparedDriveConfigInsert) {
+        debug_assert!(!prepared.config.is_root_device());
+        debug_assert!(
+            !self
+                .configs
+                .iter()
+                .any(|existing| existing.drive_id() == prepared.config.drive_id())
+        );
+        debug_assert!(self.configs.len() < self.configs.capacity());
+        self.configs.push(prepared.config);
+    }
+
+    /// Validates a post-start removal without changing the configured drive
+    /// projection.
+    pub fn prepare_runtime_removal(
+        &self,
+        drive_id: &str,
+    ) -> Result<PreparedDriveConfigRemoval, DriveRuntimeMutationError> {
+        if drive_id.is_empty() {
+            return Err(DriveRuntimeMutationError::EmptyDriveId);
+        }
+        if !drive_id
+            .chars()
+            .all(|character| character == '_' || character.is_alphanumeric())
+        {
+            return Err(DriveRuntimeMutationError::InvalidDriveId {
+                drive_id: drive_id.to_string(),
+            });
+        }
+        let Some((index, config)) = self
+            .configs
+            .iter()
+            .enumerate()
+            .find(|(_, config)| config.drive_id() == drive_id)
+        else {
+            return Err(DriveRuntimeMutationError::UnknownDrive {
+                drive_id: drive_id.to_string(),
+            });
+        };
+        if config.is_root_device() {
+            return Err(DriveRuntimeMutationError::RootRemovalUnsupported {
+                drive_id: drive_id.to_string(),
+            });
+        }
+        Ok(PreparedDriveConfigRemoval {
+            drive_id: drive_id.to_string(),
+            index,
+        })
+    }
+
+    /// Commits a previously prepared removal after the live endpoint has been
+    /// removed. The process controller serializes configuration mutations, so the
+    /// prepared index remains stable until this call.
+    pub fn commit_runtime_removal(&mut self, prepared: PreparedDriveConfigRemoval) {
+        debug_assert_eq!(
+            self.configs.get(prepared.index).map(DriveConfig::drive_id),
+            Some(prepared.drive_id.as_str())
+        );
+        self.configs.remove(prepared.index);
     }
 }
 
@@ -779,6 +894,28 @@ pub enum DriveUpdateError {
     MmioDispatcherUnavailable,
 }
 
+/// Redacted failure while preparing or committing a post-start block-device
+/// insertion or removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveRuntimeMutationError {
+    InvalidConfig(DriveConfigError),
+    EmptyDriveId,
+    InvalidDriveId { drive_id: String },
+    DuplicateDrive { drive_id: String },
+    RootInsertUnsupported,
+    RootRemovalUnsupported { drive_id: String },
+    UnknownDrive { drive_id: String },
+    ConfigurationAllocation,
+    PciNotEnabled,
+    ActiveSessionUnavailable,
+    ActiveSessionCommand { message: String },
+    PrepareDevice { message: String },
+    PublishDevice { message: String },
+    TerminalInsertion { message: String },
+    RemoveDevice { message: String },
+    TerminalRemoval { message: String },
+}
+
 impl fmt::Display for DriveConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -842,6 +979,80 @@ impl fmt::Display for DriveUpdateError {
 }
 
 impl std::error::Error for DriveUpdateError {}
+
+impl fmt::Display for DriveRuntimeMutationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(source) => write!(f, "{source}"),
+            Self::EmptyDriveId => f.write_str("path drive_id must not be empty"),
+            Self::InvalidDriveId { .. } => {
+                f.write_str("path drive_id must contain only alphanumeric characters or '_'")
+            }
+            Self::DuplicateDrive { .. } => f.write_str("drive is already configured"),
+            Self::RootInsertUnsupported => {
+                f.write_str("a root drive cannot be inserted after the microVM starts")
+            }
+            Self::RootRemovalUnsupported { .. } => f.write_str("root drive cannot be removed"),
+            Self::UnknownDrive { .. } => f.write_str("drive is not configured"),
+            Self::ConfigurationAllocation => {
+                f.write_str("failed to reserve runtime drive configuration storage")
+            }
+            Self::PciNotEnabled => {
+                f.write_str("runtime drive insertion and removal require PCI transport")
+            }
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active runtime drive session is unavailable")
+            }
+            Self::ActiveSessionCommand { message } => {
+                write!(f, "runtime drive command failed: {message}")
+            }
+            Self::PrepareDevice { message } => {
+                write!(f, "failed to prepare runtime drive: {message}")
+            }
+            Self::PublishDevice { message } => {
+                write!(f, "failed to publish runtime drive: {message}")
+            }
+            Self::TerminalInsertion { message } => {
+                write!(
+                    f,
+                    "runtime drive insertion entered terminal cleanup: {message}"
+                )
+            }
+            Self::RemoveDevice { message } => {
+                write!(f, "failed to remove runtime drive: {message}")
+            }
+            Self::TerminalRemoval { message } => {
+                write!(
+                    f,
+                    "runtime drive removal entered terminal cleanup: {message}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DriveRuntimeMutationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidConfig(source) => Some(source),
+            Self::EmptyDriveId
+            | Self::InvalidDriveId { .. }
+            | Self::DuplicateDrive { .. }
+            | Self::RootInsertUnsupported
+            | Self::RootRemovalUnsupported { .. }
+            | Self::UnknownDrive { .. }
+            | Self::ConfigurationAllocation
+            | Self::PciNotEnabled
+            | Self::ActiveSessionUnavailable
+            | Self::ActiveSessionCommand { .. }
+            | Self::PrepareDevice { .. }
+            | Self::PublishDevice { .. }
+            | Self::TerminalInsertion { .. }
+            | Self::RemoveDevice { .. }
+            | Self::TerminalRemoval { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioBlockConfigSpace {
@@ -3975,12 +4186,13 @@ impl VirtioBlockDevice {
 #[derive(Debug)]
 pub struct PreparedBlockDevice {
     drive_id: String,
+    is_root_device: bool,
     config_space: VirtioBlockConfigSpace,
     device: VirtioBlockDevice,
 }
 
 impl PreparedBlockDevice {
-    fn from_config_with_backing(
+    pub fn from_config_with_backing(
         config: &DriveConfig,
         backing: Option<BlockFileBacking>,
     ) -> Result<Self, PreparedBlockDeviceError> {
@@ -4009,6 +4221,7 @@ impl PreparedBlockDevice {
 
         Ok(Self {
             drive_id: config.drive_id().to_string(),
+            is_root_device: config.is_root_device(),
             config_space,
             device,
         })
@@ -4016,6 +4229,10 @@ impl PreparedBlockDevice {
 
     pub fn drive_id(&self) -> &str {
         &self.drive_id
+    }
+
+    pub const fn is_root_device(&self) -> bool {
+        self.is_root_device
     }
 
     pub const fn config_space(&self) -> VirtioBlockConfigSpace {
@@ -4030,8 +4247,13 @@ impl PreparedBlockDevice {
         &mut self.device
     }
 
-    pub fn into_parts(self) -> (String, VirtioBlockConfigSpace, VirtioBlockDevice) {
-        (self.drive_id, self.config_space, self.device)
+    pub fn into_parts(self) -> (String, bool, VirtioBlockConfigSpace, VirtioBlockDevice) {
+        (
+            self.drive_id,
+            self.is_root_device,
+            self.config_space,
+            self.device,
+        )
     }
 }
 
@@ -4123,14 +4345,11 @@ impl fmt::Display for PreparedBlockDeviceError {
             Self::AllocateDevices { source } => {
                 write!(f, "failed to allocate prepared block devices: {source}")
             }
-            Self::OpenBacking { drive_id, source } => {
-                write!(f, "failed to prepare block device {drive_id}: {source}")
+            Self::OpenBacking { source, .. } => {
+                write!(f, "failed to prepare block device: {source}")
             }
-            Self::BackingModeMismatch { drive_id } => {
-                write!(
-                    f,
-                    "provided block backing mode does not match drive {drive_id}"
-                )
+            Self::BackingModeMismatch { .. } => {
+                f.write_str("provided block backing mode does not match drive")
             }
             Self::UnexpectedBacking => {
                 f.write_str("provided block backing does not match a configured drive")
@@ -4333,7 +4552,7 @@ impl BlockMmioDevices {
 
         let mut dispatcher = MmioDispatcher::new();
         for (prepared_device, placement) in prepared_devices.into_iter().zip(placements) {
-            let (drive_id, config_space, device) = prepared_device.into_parts();
+            let (drive_id, _is_root_device, config_space, device) = prepared_device.into_parts();
             let handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
                 VIRTIO_BLOCK_DEVICE_ID,
                 config_space.available_features(),
@@ -4990,22 +5209,22 @@ mod tests {
         BlockFileBacking, BlockFileBackingError, BlockMmioDevices, BlockMmioLayout,
         BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
         DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveRateLimiterConfig,
-        DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput, PreparedBlockDeviceError,
-        PreparedBlockDevices, SnapshotBlockFileBackingError, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE,
-        VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY,
-        VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE,
-        VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
-        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
-        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
-        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
-        VIRTIO_BLOCK_STATUS_SIZE, VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace,
-        VirtioBlockDevice, VirtioBlockDeviceActivationError, VirtioBlockDeviceId,
-        VirtioBlockDeviceNotificationError, VirtioBlockQueue, VirtioBlockQueueBuildError,
-        VirtioBlockQueueDispatchError, VirtioBlockQueueSnapshotError, VirtioBlockRateLimiter,
-        VirtioBlockRequest, VirtioBlockRequestCompletion, VirtioBlockRequestError,
-        VirtioBlockRequestExecutionError, VirtioBlockRequestExecutionOutcome,
-        VirtioBlockRequestType, normalize_completion_status,
+        DriveRuntimeMutationError, DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput,
+        PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
+        SnapshotBlockFileBackingError, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID,
+        VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
+        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
+        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
+        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
+        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
+        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace, VirtioBlockDevice,
+        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
+        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError,
+        VirtioBlockQueueSnapshotError, VirtioBlockRateLimiter, VirtioBlockRequest,
+        VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
+        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -6302,6 +6521,122 @@ mod tests {
         assert_eq!(err, DriveConfigError::EmptyPathOnHost);
         assert_eq!(configs.as_slice().len(), 1);
         assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+    }
+
+    #[test]
+    fn runtime_drive_insert_is_duplicate_only_and_commits_after_preparation() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive should configure");
+
+        let prepared = configs
+            .prepare_runtime_insert(DriveConfigInput::new(
+                "data",
+                "data",
+                "/tmp/data.ext4",
+                false,
+            ))
+            .expect("runtime data drive should prepare");
+        assert_eq!(prepared.config().drive_id(), "data");
+        assert_eq!(configs.as_slice().len(), 1);
+        configs.commit_runtime_insert(prepared);
+        assert_eq!(configs.as_slice().len(), 2);
+
+        assert!(matches!(
+            configs.prepare_runtime_insert(DriveConfigInput::new(
+                "data",
+                "data",
+                "/tmp/replacement.ext4",
+                false,
+            )),
+            Err(DriveRuntimeMutationError::DuplicateDrive { drive_id }) if drive_id == "data"
+        ));
+        assert!(matches!(
+            configs.prepare_runtime_insert(DriveConfigInput::new(
+                "late_root",
+                "late_root",
+                "/tmp/root.ext4",
+                true,
+            )),
+            Err(DriveRuntimeMutationError::RootInsertUnsupported)
+        ));
+        assert_eq!(configs.as_slice().len(), 2);
+    }
+
+    #[test]
+    fn runtime_drive_removal_rejects_root_and_missing_then_commits_exact_data_drive() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive should configure");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                "/tmp/data.ext4",
+                false,
+            ))
+            .expect("data drive should configure");
+
+        assert!(matches!(
+            configs.prepare_runtime_removal("missing"),
+            Err(DriveRuntimeMutationError::UnknownDrive { drive_id }) if drive_id == "missing"
+        ));
+        assert!(matches!(
+            configs.prepare_runtime_removal("rootfs"),
+            Err(DriveRuntimeMutationError::RootRemovalUnsupported { drive_id })
+                if drive_id == "rootfs"
+        ));
+        let prepared = configs
+            .prepare_runtime_removal("data")
+            .expect("data removal should prepare");
+        assert_eq!(configs.as_slice().len(), 2);
+        configs.commit_runtime_removal(prepared);
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+    }
+
+    #[test]
+    fn runtime_drive_mutation_diagnostics_redact_rejected_ids_and_backing_paths() {
+        let sensitive_id = "private_drive_1420";
+        for error in [
+            DriveRuntimeMutationError::InvalidConfig(DriveConfigError::InvalidDriveId {
+                source: DriveIdSource::Path,
+                drive_id: sensitive_id.to_string(),
+            }),
+            DriveRuntimeMutationError::DuplicateDrive {
+                drive_id: sensitive_id.to_string(),
+            },
+            DriveRuntimeMutationError::RootRemovalUnsupported {
+                drive_id: sensitive_id.to_string(),
+            },
+            DriveRuntimeMutationError::UnknownDrive {
+                drive_id: sensitive_id.to_string(),
+            },
+        ] {
+            assert!(!error.to_string().contains(sensitive_id));
+        }
+
+        let path = missing_path("private-runtime-backing-1420.img");
+        let config = DriveConfigInput::new(sensitive_id, sensitive_id, &path, false)
+            .validate()
+            .expect("runtime drive config should validate before backing preparation");
+        let error = PreparedBlockDevice::from_config_with_backing(&config, None)
+            .expect_err("missing runtime backing should fail preparation");
+        let rendered = error.to_string();
+        assert!(!rendered.contains(sensitive_id));
+        assert!(!rendered.contains("private-runtime-backing-1420"));
     }
 
     #[test]

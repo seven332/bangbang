@@ -515,11 +515,55 @@
     {
       "id": "api-operation:PUT /drives/{drive_id}",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /drives/{drive_id}.",
+      "summary": "Configure a validated file-backed virtio-block drive before startup, or transactionally attach one non-root drive after startup when public all-virtio PCI transport is enabled. Running and Paused insertion opens or adopts the exact backing before owner-thread publication and commits the configuration projection only after the live slot, BAR, MSI-X, MMIO/ECAM, event, metrics, and device leases publish. Default MMIO, duplicate, root, invalid backing, grant, and capacity failures are stable, redacted, and nonmutating.",
       "source_refs": [
         "api-operation:PUT /drives/{drive_id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::insert_runtime_drive"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "HvfArm64BootPciDataDevices::insert_runtime_block"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveConfigs::prepare_runtime_insert"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "PublishedVirtioPciEndpoint::publish"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "runtime drive insertion, projection, paused FIFO, and terminal-state tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_hotplugs_and_reuses_runtime_block_over_product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_hotplugs_runtime_block_from_exact_unused_grants"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "publication rollback and exact lease reuse tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /entropy",
@@ -5678,11 +5722,50 @@
     {
       "id": "non-swagger-route:DELETE /drives/{drive_id}",
       "family": "storage",
-      "summary": "Audit the pinned non-Swagger runtime route DELETE /drives/{drive_id}.",
+      "summary": "Remove one non-root live virtio-block endpoint through the pinned bodyless Firecracker route when public all-virtio PCI transport is enabled. Owner-thread teardown first removes MMIO and ECAM reachability, drains work and interrupt admission while retaining exact leases, then irreversibly releases device, MSI-X, BAR, function, dispatcher, backing, metrics, and configuration ownership. Recoverable preparation failures restore a usable endpoint; failed restoration or post-boundary corruption is terminal. Missing, root, and default-MMIO requests are nonmutating.",
       "source_refs": [
         "non-swagger-route:DELETE /drives/{drive_id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::remove_drive"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "HvfArm64BootPciDataDevices::remove_runtime_block"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "prepare_teardown, rollback_prepared_teardown, and commit_prepared_teardown"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "bodyless DELETE parsing and transport-specific response tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_hotplugs_and_reuses_runtime_block_over_product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_hotplugs_runtime_block_from_exact_unused_grants"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "prepared teardown rollback, drain, and exact slot reuse tests"
+        }
+      ]
     },
     {
       "id": "non-swagger-route:DELETE /network-interfaces/{iface_id}",
@@ -5891,7 +5974,7 @@
     {
       "id": "semantic.hotplug:runtime-device-manager",
       "family": "runtime-device-management",
-      "summary": "Audit failure-atomic runtime block, pmem, and network attach/remove with guest preconditions, rollback, metrics, and cleanup.",
+      "summary": "The failure-atomic owner-thread inventory and complete block attach/remove vertical slice are implemented and verified for public all-virtio PCI, including guest preconditions, rollback, contained authority, metrics, cleanup, and reuse. Continue auditing the aggregate record until pmem and network attach/remove complete their independent slices.",
       "source_refs": [
         "corpus:device-hotplug"
       ],

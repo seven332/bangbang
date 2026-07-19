@@ -21,10 +21,10 @@ virtio-balloon reporting and zero-safe best-effort Darwin discard, bounded
 virtio-rng, targeted and rate-limited virtio-pmem flush, a block-granular
 virtio-mem plug/unplug lifecycle, the no-interrupt aarch64 PL031 RTC,
 DeviceTree VMGenID including native-v1 replacement notification, and startup
-VMClock discovery. Optional PCI runtime attach/delete, ARM PVTime, pmem root or
-direct file-backed mapping, optional-device snapshots, and mutable VMClock
-restore remain explicit limits. Host discard never promises synchronous RSS or
-footprint reduction. See the
+VMClock discovery. Runtime PCI pmem/network attach/delete, ARM PVTime, pmem
+root or direct file-backed mapping, optional-device snapshots, and mutable
+VMClock restore remain explicit limits. Host discard never promises
+synchronous RSS or footprint reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
 
@@ -46,10 +46,13 @@ Silicon coverage boots pinned Firecracker Linux with all seven device classes,
 checks stable identities, and performs real block, MMDS/network, pmem, vsock,
 balloon, entropy, and virtio-mem interrupt/I/O operations. Runtime block,
 network, and pmem in-place PATCH keeps working in either startup transport;
-runtime attach/delete, guest rescan/removal, PCI snapshot persistence, external
-vmnet connectivity certification, and Firecracker's KVM ITS identity remain
-explicit limits. Native-v1 create/load rejects PCI profiles before artifact or
-VM mutation, while the default MMIO snapshot profile is unchanged.
+PCI-mode block PUT/DELETE now uses one failure-atomic owner-thread transaction
+in Running or Paused state, with explicit guest rescan/removal and exact
+capacity reuse. Runtime network/pmem attach/delete, automatic guest hotplug
+notification, PCI snapshot persistence, external vmnet connectivity
+certification, and Firecracker's KVM ITS identity remain explicit limits.
+Native-v1 create/load rejects PCI profiles before artifact or VM mutation,
+while the default MMIO snapshot profile is unchanged.
 
 ## Layout
 
@@ -706,6 +709,31 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true,"is_read_only":true}'
 ```
 
+With the process started using `--enable-pci`, attach and remove a non-root
+drive after startup:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket \
+  -X PUT http://localhost/drives/data \
+  -H 'Content-Type: application/json' \
+  -d '{"drive_id":"data","path_on_host":"/tmp/data.img","is_root_device":false,"is_read_only":false}'
+
+# Rescan PCI inside Linux, use and flush the disk, then remove its PCI function
+# through guest sysfs before issuing the host-side DELETE.
+curl --unix-socket /tmp/bangbang.socket \
+  -X DELETE http://localhost/drives/data
+```
+
+Runtime block PUT and bodyless DELETE are accepted in `Running` and `Paused`.
+They commit `/vm/config` only after the live owner-thread operation succeeds;
+root, duplicate, missing, capacity, backing, or publication failures leave the
+prior configuration intact. Default MMIO sessions reject both operations
+before opening the proposed path. In production-contained mode, runtime PUT
+can consume only an exact still-unused `drive-backing` grant from the initial
+manifest; an aborted insertion restores that authority without ambient path
+fallback. Incomplete publication cleanup is terminal rather than leaving a
+damaged worker live. See the [runtime block hotplug contract](compat/firecracker/v1.16.0/device-hotplug-contract.md).
+
 Create a supported full native-v1 snapshot after the VM is paused:
 
 ```sh
@@ -940,7 +968,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 70 implemented-and-verified, 328 audit-required, three
+delivery overlay with 73 implemented-and-verified, 325 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7

@@ -98,6 +98,10 @@ fn machine_lifecycle_closure_policy_is_stable() {
         "api-schema:MachineConfiguration",
         "api-schema:Vm",
     ];
+    const RUNTIME_BLOCK_HOTPLUG: [&str; 2] = [
+        "api-operation:PUT /drives/{drive_id}",
+        "non-swagger-route:DELETE /drives/{drive_id}",
+    ];
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -146,8 +150,8 @@ fn machine_lifecycle_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 71);
-    assert_eq!(count(Disposition::AuditRequired), 327);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 73);
+    assert_eq!(count(Disposition::AuditRequired), 325);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -200,6 +204,17 @@ fn machine_lifecycle_closure_policy_is_stable() {
                 .disposition,
             Disposition::ImplementedAndVerified,
             "bounded API record must remain terminal: {id}"
+        );
+    }
+
+    for id in RUNTIME_BLOCK_HOTPLUG {
+        assert_eq!(
+            by_id
+                .get(id)
+                .expect("runtime block hotplug record must exist")
+                .disposition,
+            Disposition::ImplementedAndVerified,
+            "runtime block hotplug record must remain implemented: {id}"
         );
     }
 

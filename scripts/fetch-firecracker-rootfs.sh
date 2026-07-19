@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v45"
+direct_boot_variant="direct-boot-v46"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -440,6 +440,147 @@ vdb_starts_with_marker() {
   [ -b /dev/vdb ] || return 1
   actual=$(dd if=/dev/vdb bs=1 count="${#marker}" 2>/dev/null || true)
   [ "$actual" = "$marker" ]
+}
+
+vdb_sector_starts_with_marker() {
+  marker=$1
+  sector=$2
+  [ -b /dev/vdb ] || return 1
+  actual=$(dd if=/dev/vdb bs=512 skip="$sector" count=1 2>/dev/null \
+    | dd bs=1 count="${#marker}" 2>/dev/null || true)
+  [ "$actual" = "$marker" ]
+}
+
+vdc_starts_with_marker() {
+  marker=$1
+  [ -b /dev/vdc ] || return 1
+  actual=$(dd if=/dev/vdc bs=1 count="${#marker}" 2>/dev/null || true)
+  [ "$actual" = "$marker" ]
+}
+
+block_hotplug_fail() {
+  reason=$1
+  marker="BANGBANG_BLOCK_HOTPLUG_FAIL_$reason"
+  emit_line "$marker"
+  write_vdb_marker "$marker"
+  sync /dev/vdb 2>/dev/null || sync
+}
+
+wait_for_runtime_block() {
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    if [ -b /dev/vdc ]; then
+      return 0
+    fi
+    printf '1\n' > /sys/bus/pci/rescan 2>/dev/null || return 1
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+runtime_block_pci_path() {
+  path=$(readlink -f /sys/class/block/vdc/device 2>/dev/null || true)
+  while [ -n "$path" ] && [ "$path" != / ]; do
+    if [ -e "$path/remove" ] && [ -r "$path/vendor" ] && [ -r "$path/device" ]; then
+      vendor=$(cat "$path/vendor" 2>/dev/null || true)
+      device=$(cat "$path/device" 2>/dev/null || true)
+      if [ "$vendor" = 0x1af4 ] && [ "$device" = 0x1042 ]; then
+        printf '%s\n' "$path"
+        return 0
+      fi
+    fi
+    parent=${path%/*}
+    if [ "$parent" = "$path" ]; then
+      break
+    fi
+    path=$parent
+  done
+  return 1
+}
+
+run_runtime_block_round() {
+  expected=$1
+  written=$2
+  removed=$3
+  phase=$4
+
+  if ! wait_for_runtime_block; then
+    block_hotplug_fail "${phase}_RESCAN"
+    return 1
+  fi
+  if ! vdc_starts_with_marker "$expected"; then
+    block_hotplug_fail "${phase}_READ"
+    return 1
+  fi
+  if ! printf '%-512s' "$written" \
+    | dd of=/dev/vdc bs=512 count=1 conv=notrunc,fsync 2>/dev/null; then
+    block_hotplug_fail "${phase}_WRITE"
+    return 1
+  fi
+  if ! vdc_starts_with_marker "$written"; then
+    block_hotplug_fail "${phase}_VERIFY"
+    return 1
+  fi
+
+  pci_path=$(runtime_block_pci_path) || {
+    block_hotplug_fail "${phase}_IDENTITY"
+    return 1
+  }
+  if ! printf '1\n' > "$pci_path/remove" 2>/dev/null; then
+    block_hotplug_fail "${phase}_REMOVE"
+    return 1
+  fi
+  attempts=0
+  while [ -b /dev/vdc ] && [ "$attempts" -lt 30 ]; do
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  if [ -b /dev/vdc ]; then
+    block_hotplug_fail "${phase}_REMOVE_WAIT"
+    return 1
+  fi
+
+  write_vdb_marker "$removed"
+  sync /dev/vdb 2>/dev/null || sync
+  emit_line "$removed"
+}
+
+check_block_hotplug_marker() {
+  if [ ! -b /dev/vdb ] || [ ! -e /sys/bus/pci/rescan ]; then
+    block_hotplug_fail PREREQUISITES
+    return
+  fi
+
+  write_vdb_marker BANGBANG_BLOCK_HOTPLUG_READY
+  sync /dev/vdb 2>/dev/null || sync
+  emit_line BANGBANG_BLOCK_HOTPLUG_READY
+
+  if ! run_runtime_block_round \
+    BANGBANG_BLOCK_HOTPLUG_HOST_ONE \
+    BANGBANG_BLOCK_HOTPLUG_GUEST_ONE \
+    BANGBANG_BLOCK_HOTPLUG_FIRST_REMOVED \
+    FIRST; then
+    return
+  fi
+
+  attempts=0
+  while ! vdb_sector_starts_with_marker BANGBANG_BLOCK_HOTPLUG_CONTINUE 1; do
+    if [ "$attempts" -ge 60 ]; then
+      block_hotplug_fail CONTINUE
+      return
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+
+  if ! run_runtime_block_round \
+    BANGBANG_BLOCK_HOTPLUG_HOST_TWO \
+    BANGBANG_BLOCK_HOTPLUG_GUEST_TWO \
+    BANGBANG_BLOCK_HOTPLUG_SUCCESS \
+    SECOND; then
+    return
+  fi
 }
 
 pci_all_virtio_fail() {
@@ -2186,7 +2327,9 @@ if [ -r /proc/cmdline ]; then
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if cmdline_has bangbang.pci-all-virtio=1; then
+if cmdline_has bangbang.block-hotplug=1; then
+  check_block_hotplug_marker
+elif cmdline_has bangbang.pci-all-virtio=1; then
   check_all_virtio_pci_marker
 elif cmdline_has bangbang.cpu-template-report=1; then
   report_cpu_template_ids

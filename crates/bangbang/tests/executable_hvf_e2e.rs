@@ -49,6 +49,15 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.pci-all-virtio=1";
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_MARKER: &[u8] = b"BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK";
+    const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
+    const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
+    const BLOCK_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_ONE";
+    const BLOCK_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_ONE";
+    const BLOCK_HOTPLUG_FIRST_REMOVED_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_FIRST_REMOVED";
+    const BLOCK_HOTPLUG_CONTINUE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_CONTINUE";
+    const BLOCK_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_TWO";
+    const BLOCK_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_TWO";
+    const BLOCK_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_SUCCESS";
     const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
     const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
     const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
@@ -403,7 +412,7 @@ mod macos_arm64 {
             (
                 "DELETE /drives/private_hot_unplug_drive after InstanceStart",
                 "/drives/private_hot_unplug_drive",
-                r#"{"fault_message":"Drive updates are not supported."}"#,
+                r#"{"fault_message":"runtime drive insertion and removal require PCI transport"}"#,
                 "private_hot_unplug_drive",
             ),
             (
@@ -494,7 +503,7 @@ mod macos_arm64 {
         );
         assert_response_contains(
             &drive_put_response,
-            r#"{"fault_message":"The requested operation is not supported in Running state: PutDrive"}"#,
+            r#"{"fault_message":"runtime drive insertion and removal require PCI transport"}"#,
             "PUT /drives/replacement after InstanceStart",
         );
         assert!(
@@ -3101,6 +3110,194 @@ mod macos_arm64 {
         assert!(
             !uds_path.exists(),
             "product PCI shutdown should remove the owned main vsock listener"
+        );
+    }
+
+    #[test]
+    fn signed_executable_hotplugs_and_reuses_runtime_block_over_product_pci() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let control_backing_path = test_dir.path().join("hotplug-control.img");
+        let first_backing_path = test_dir.path().join("hotplug-first.img");
+        let second_backing_path = test_dir.path().join("hotplug-second.img");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_block_backing_with_prefix(&control_backing_path, 2, &[]);
+        create_block_backing_with_prefix(&first_backing_path, 1, BLOCK_HOTPLUG_HOST_ONE_MARKER);
+        create_block_backing_with_prefix(&second_backing_path, 1, BLOCK_HOTPLUG_HOST_TWO_MARKER);
+
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT /machine-config block hotplug",
+        );
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/boot-source", &boot_body),
+            "PUT /boot-source block hotplug",
+        );
+        let rootfs_body = format!(
+            r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+            json_string(path_text(&rootfs_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/rootfs", &rootfs_body),
+            "PUT /drives/rootfs block hotplug",
+        );
+        let control_body = format!(
+            r#"{{"drive_id":"control","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+            json_string(path_text(&control_backing_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/control", &control_body),
+            "PUT /drives/control block hotplug",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "PUT /actions InstanceStart block hotplug",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            BLOCK_HOTPLUG_READY_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "block hotplug guest did not become ready: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        let first_body = format!(
+            r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+            json_string(path_text(&first_backing_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/hotdata", &first_body),
+            "runtime PUT /drives/hotdata first block",
+        );
+        let duplicate_body = format!(
+            r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false}}"#,
+            json_string(path_text(&second_backing_path)),
+        );
+        let duplicate = http_put_json(&socket_path, "/drives/hotdata", &duplicate_body);
+        assert_bad_request_response(&duplicate, "duplicate runtime PUT /drives/hotdata");
+        assert_response_contains(
+            &duplicate,
+            r#"{"fault_message":"drive is already configured"}"#,
+            "duplicate runtime PUT /drives/hotdata",
+        );
+        assert!(
+            !duplicate.contains(path_text(&second_backing_path)),
+            "duplicate runtime response must not echo the rejected backing path: {duplicate}"
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &first_backing_path,
+            BLOCK_HOTPLUG_GUEST_ONE_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "first runtime block did not complete guest read/write/fsync: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        if let Err(err) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            BLOCK_HOTPLUG_FIRST_REMOVED_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "guest did not remove the first runtime PCI function: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause before runtime block reuse",
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/drives/hotdata"),
+            "paused DELETE /drives/hotdata",
+        );
+        let removed_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&removed_config, "GET /vm/config after paused block DELETE");
+        assert!(
+            !removed_config.contains(r#""drive_id":"hotdata""#),
+            "successful DELETE must remove the live configuration projection: {removed_config}"
+        );
+
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/hotdata", &duplicate_body),
+            "paused runtime PUT /drives/hotdata reused block",
+        );
+        let reused_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&reused_config, "GET /vm/config after paused block reuse");
+        assert_response_contains(
+            &reused_config,
+            path_text(&second_backing_path),
+            "GET /vm/config after paused block reuse",
+        );
+        write_block_marker_at(
+            &control_backing_path,
+            bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+            BLOCK_HOTPLUG_CONTINUE_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume after runtime block reuse",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &second_backing_path,
+            BLOCK_HOTPLUG_GUEST_TWO_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "reused runtime block did not complete guest I/O: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        if let Err(err) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            BLOCK_HOTPLUG_SUCCESS_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "guest did not remove the reused runtime PCI function: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/drives/hotdata"),
+            "final DELETE /drives/hotdata",
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang runtime block hotplug product PCI",
         );
     }
 
@@ -6243,6 +6440,25 @@ mod macos_arm64 {
             .expect("guest block backing should create");
         file.set_len(len)
             .expect("guest block backing should have requested sectors");
+    }
+
+    fn create_block_backing_with_prefix(path: &Path, sectors: u64, marker: &[u8]) {
+        create_zeroed_block_backing_with_sectors(path, sectors);
+        if !marker.is_empty() {
+            write_block_marker_at(path, 0, marker);
+        }
+    }
+
+    fn write_block_marker_at(path: &Path, offset: u64, marker: &[u8]) {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("guest block backing should open for marker write");
+        file.seek(SeekFrom::Start(offset))
+            .expect("guest block marker offset should seek");
+        file.write_all(marker)
+            .expect("guest block marker should write");
+        file.sync_all().expect("guest block marker should fsync");
     }
 
     fn create_pmem_backing(path: &Path, marker: &[u8]) {

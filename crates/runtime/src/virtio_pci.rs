@@ -470,21 +470,71 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
         };
         gate.quiesce_and_wait()
             .map_err(|source| VirtioPciEndpointError::WorkGate { source })?;
+        if let Err(source) = self.inner.messages.quiesce_and_wait() {
+            let _ = gate.resume();
+            return Err(VirtioPciEndpointError::MessageRegistry { source });
+        }
+        let mut state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                let _ = self.inner.messages.resume();
+                let _ = gate.resume();
+                return Err(VirtioPciEndpointError::StatePoisoned);
+            }
+        };
+        if state.phase == VirtioPciEndpointPhase::Released {
+            let phase = state.phase;
+            drop(state);
+            let _ = self.inner.messages.resume();
+            let _ = gate.resume();
+            return Err(VirtioPciEndpointError::NotActive { phase });
+        }
+        state.phase = VirtioPciEndpointPhase::Quiescing;
+        Ok(())
+    }
+
+    /// Restores a quiesced endpoint after a recoverable removal abort.
+    pub fn resume(&self) -> Result<(), VirtioPciEndpointError> {
+        let gate = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| VirtioPciEndpointError::StatePoisoned)?;
+            match state.phase {
+                VirtioPciEndpointPhase::Active => return Ok(()),
+                VirtioPciEndpointPhase::Quiescing => state.core.work_gate().clone(),
+                VirtioPciEndpointPhase::Released => {
+                    return Err(VirtioPciEndpointError::NotActive { phase: state.phase });
+                }
+            }
+        };
+        self.inner
+            .messages
+            .resume()
+            .map_err(|source| VirtioPciEndpointError::MessageRegistry { source })?;
         {
             let mut state = self
                 .inner
                 .state
                 .lock()
                 .map_err(|_| VirtioPciEndpointError::StatePoisoned)?;
-            if state.phase == VirtioPciEndpointPhase::Released {
-                return Err(VirtioPciEndpointError::NotActive { phase: state.phase });
+            if state.phase != VirtioPciEndpointPhase::Quiescing {
+                let phase = state.phase;
+                drop(state);
+                let _ = self.inner.messages.begin_quiesce();
+                return Err(VirtioPciEndpointError::NotActive { phase });
             }
-            state.phase = VirtioPciEndpointPhase::Quiescing;
+            state.phase = VirtioPciEndpointPhase::Active;
         }
-        self.inner
-            .messages
-            .begin_quiesce()
-            .map_err(|source| VirtioPciEndpointError::MessageRegistry { source })
+        if let Err(source) = gate.resume() {
+            if let Ok(mut state) = self.inner.state.lock() {
+                state.phase = VirtioPciEndpointPhase::Quiescing;
+            }
+            let _ = self.inner.messages.begin_quiesce();
+            return Err(VirtioPciEndpointError::WorkGate { source });
+        }
+        Ok(())
     }
 
     pub fn release(&self) -> Result<(), VirtioPciEndpointError> {
@@ -1867,10 +1917,12 @@ pub struct PublishedVirtioPciEndpoint<C, A, I> {
     segment: SharedPciSegment,
     owner: MmioRegistrationOwner,
     mmio_lease: Option<MmioRegistrationLease>,
+    mmio_published: bool,
     function_lease: Option<PciFunctionLease>,
     function_published: bool,
     bar_lease: Option<PciBarLease>,
     interrupts: I,
+    teardown_prepared: bool,
     released: bool,
 }
 
@@ -2005,10 +2057,12 @@ where
             segment,
             owner,
             mmio_lease: Some(mmio_lease),
+            mmio_published: true,
             function_lease: Some(function_lease),
             function_published: true,
             bar_lease: Some(bar_lease),
             interrupts,
+            teardown_prepared: false,
             released: false,
         })
     }
@@ -2025,8 +2079,141 @@ where
         self.released
     }
 
-    /// Unpublish guest paths, drain work and messages, then return all leases.
-    pub fn teardown(
+    /// Suspends every guest-visible path and drains endpoint work while
+    /// retaining the exact resource leases needed for rollback.
+    pub fn prepare_teardown(
+        &mut self,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<(), VirtioPciPublicationError> {
+        if self.released || self.teardown_prepared {
+            return Ok(());
+        }
+        if self.mmio_published
+            && let Some(lease) = self.mmio_lease.as_ref()
+        {
+            dispatcher
+                .unpublish_owned_handler(&self.owner, lease)
+                .map_err(|source| VirtioPciPublicationError::MmioRelease { source })?;
+            self.mmio_published = false;
+        }
+        if self.function_published
+            && let Some(lease) = self.function_lease.as_ref()
+        {
+            let result = self
+                .segment
+                .with_segment(|segment| segment.unpublish_function(lease))
+                .map_err(|source| VirtioPciPublicationError::SegmentLock { source })?
+                .map_err(|source| VirtioPciPublicationError::FunctionRelease { source });
+            if let Err(primary) = result {
+                let mut cleanup = String::new();
+                if let Some(mmio_lease) = self.mmio_lease.as_ref() {
+                    match dispatcher.republish_owned_handler(&self.owner, mmio_lease) {
+                        Ok(()) => self.mmio_published = true,
+                        Err(source) => append_cleanup(&mut cleanup, "MMIO registration", &source),
+                    }
+                }
+                return Err(publication_rollback(primary, cleanup));
+            }
+            self.function_published = false;
+        }
+        if let Err(primary) = self.endpoint.begin_quiesce() {
+            let mut cleanup = String::new();
+            if let Some(lease) = self.function_lease.as_ref() {
+                match self
+                    .segment
+                    .with_segment(|segment| segment.republish_function(lease))
+                {
+                    Ok(Ok(())) => self.function_published = true,
+                    Ok(Err(source)) => append_cleanup(&mut cleanup, "PCI function", &source),
+                    Err(source) => append_cleanup(&mut cleanup, "PCI segment lock", &source),
+                }
+            }
+            if let Some(lease) = self.mmio_lease.as_ref() {
+                match dispatcher.republish_owned_handler(&self.owner, lease) {
+                    Ok(()) => self.mmio_published = true,
+                    Err(source) => append_cleanup(&mut cleanup, "MMIO registration", &source),
+                }
+            }
+            return Err(publication_rollback(
+                VirtioPciPublicationError::EndpointRelease { source: primary },
+                cleanup,
+            ));
+        }
+        self.teardown_prepared = true;
+        Ok(())
+    }
+
+    /// Restores the exact endpoint and guest paths retained by
+    /// [`Self::prepare_teardown`].
+    pub fn rollback_prepared_teardown(
+        &mut self,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<(), VirtioPciPublicationError> {
+        if self.released || !self.teardown_prepared {
+            return Ok(());
+        }
+        if !self.mmio_published
+            && let Some(lease) = self.mmio_lease.as_ref()
+        {
+            dispatcher
+                .republish_owned_handler(&self.owner, lease)
+                .map_err(|source| VirtioPciPublicationError::MmioRelease { source })?;
+            self.mmio_published = true;
+        }
+        if !self.function_published
+            && let Some(lease) = self.function_lease.as_ref()
+        {
+            let republish = self
+                .segment
+                .with_segment(|segment| segment.republish_function(lease))
+                .map_err(|source| VirtioPciPublicationError::SegmentLock { source })?
+                .map_err(|source| VirtioPciPublicationError::FunctionRelease { source });
+            if let Err(primary) = republish {
+                let mut cleanup = String::new();
+                if self.mmio_published
+                    && let Some(mmio_lease) = self.mmio_lease.as_ref()
+                {
+                    match dispatcher.unpublish_owned_handler(&self.owner, mmio_lease) {
+                        Ok(()) => self.mmio_published = false,
+                        Err(source) => append_cleanup(&mut cleanup, "MMIO registration", &source),
+                    }
+                }
+                return Err(publication_rollback(primary, cleanup));
+            }
+            self.function_published = true;
+        }
+        if let Err(source) = self.endpoint.resume() {
+            let primary = VirtioPciPublicationError::EndpointRelease { source };
+            let mut cleanup = String::new();
+            if self.function_published
+                && let Some(lease) = self.function_lease.as_ref()
+            {
+                match self
+                    .segment
+                    .with_segment(|segment| segment.unpublish_function(lease))
+                {
+                    Ok(Ok(())) => self.function_published = false,
+                    Ok(Err(source)) => append_cleanup(&mut cleanup, "PCI function", &source),
+                    Err(source) => append_cleanup(&mut cleanup, "PCI segment lock", &source),
+                }
+            }
+            if self.mmio_published
+                && let Some(lease) = self.mmio_lease.as_ref()
+            {
+                match dispatcher.unpublish_owned_handler(&self.owner, lease) {
+                    Ok(()) => self.mmio_published = false,
+                    Err(source) => append_cleanup(&mut cleanup, "MMIO registration", &source),
+                }
+            }
+            return Err(publication_rollback(primary, cleanup));
+        }
+        self.teardown_prepared = false;
+        Ok(())
+    }
+
+    /// Crosses the irreversible teardown boundary and returns every retained
+    /// lease. Failures here indicate terminal resource-state corruption.
+    pub fn commit_prepared_teardown(
         &mut self,
         dispatcher: &mut MmioDispatcher,
         bar_allocator: &mut PciBarAllocator,
@@ -2034,20 +2221,8 @@ where
         if self.released {
             return Ok(());
         }
-        if let Some(lease) = self.mmio_lease.as_ref() {
-            dispatcher
-                .release_owned_handler(&self.owner, lease)
-                .map_err(|source| VirtioPciPublicationError::MmioRelease { source })?;
-            self.mmio_lease = None;
-        }
-        if self.function_published
-            && let Some(lease) = self.function_lease.as_ref()
-        {
-            self.segment
-                .with_segment(|segment| segment.unpublish_function(lease))
-                .map_err(|source| VirtioPciPublicationError::SegmentLock { source })?
-                .map_err(|source| VirtioPciPublicationError::FunctionRelease { source })?;
-            self.function_published = false;
+        if !self.teardown_prepared {
+            return Err(VirtioPciPublicationError::TeardownNotPrepared);
         }
         self.endpoint
             .release()
@@ -2068,8 +2243,28 @@ where
                 .map_err(|source| VirtioPciPublicationError::FunctionRelease { source })?;
             self.function_lease = None;
         }
+        if let Some(lease) = self.mmio_lease.as_ref() {
+            dispatcher
+                .release_unpublished_handler(&self.owner, lease)
+                .map_err(|source| VirtioPciPublicationError::MmioRelease { source })?;
+            self.mmio_lease = None;
+        }
+        self.teardown_prepared = false;
         self.released = true;
         Ok(())
+    }
+
+    /// Unpublish guest paths, drain work and messages, then return all leases.
+    pub fn teardown(
+        &mut self,
+        dispatcher: &mut MmioDispatcher,
+        bar_allocator: &mut PciBarAllocator,
+    ) -> Result<(), VirtioPciPublicationError> {
+        if self.released {
+            return Ok(());
+        }
+        self.prepare_teardown(dispatcher)?;
+        self.commit_prepared_teardown(dispatcher, bar_allocator)
     }
 }
 
@@ -2121,6 +2316,7 @@ fn publication_rollback(
 
 #[derive(Debug)]
 pub enum VirtioPciPublicationError {
+    TeardownNotPrepared,
     BarAllocation {
         source: PciBarAllocationError,
     },
@@ -2160,6 +2356,7 @@ pub enum VirtioPciPublicationError {
 impl fmt::Display for VirtioPciPublicationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TeardownNotPrepared => f.write_str("virtio-pci teardown was not prepared"),
             Self::BarAllocation { source } => {
                 write!(f, "failed to allocate virtio-pci BAR: {source}")
             }
@@ -2198,6 +2395,7 @@ impl fmt::Display for VirtioPciPublicationError {
 impl std::error::Error for VirtioPciPublicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::TeardownNotPrepared => None,
             Self::BarAllocation { source } => Some(source),
             Self::Endpoint { source } => Some(source),
             Self::SegmentLock { source } => Some(source),
@@ -3630,6 +3828,36 @@ mod tests {
                 .with_segment(|segment| segment.function_count())
                 .unwrap(),
             2
+        );
+
+        published
+            .prepare_teardown(&mut dispatcher)
+            .expect("teardown preparation should suspend exact paths");
+        assert!(dispatcher.regions().is_empty());
+        assert_eq!(
+            segment
+                .with_segment(|segment| segment.function_count())
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            published.endpoint().phase().expect("phase should read"),
+            VirtioPciEndpointPhase::Quiescing
+        );
+        assert!(allocator.allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE).is_err());
+        published
+            .rollback_prepared_teardown(&mut dispatcher)
+            .expect("recoverable teardown abort should restore exact paths");
+        assert_eq!(dispatcher.regions().len(), 1);
+        assert_eq!(
+            segment
+                .with_segment(|segment| segment.function_count())
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            published.endpoint().phase().expect("phase should read"),
+            VirtioPciEndpointPhase::Active
         );
 
         published
