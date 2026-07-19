@@ -1047,6 +1047,13 @@ impl PciSegment {
         self.functions.len()
     }
 
+    /// Returns the exact number of endpoint slots not retained by a live lease.
+    #[doc(hidden)]
+    pub fn available_endpoint_slots(&self) -> usize {
+        usize::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1)
+            .saturating_sub(self.records.len())
+    }
+
     pub fn read_ecam(&mut self, offset: u64, data: &mut [u8]) -> Result<(), PciEcamAccessError> {
         let decoded = decode_ecam_access(offset, data.len())?;
         if decoded.bus != PCI_BUS_ZERO || decoded.function != PCI_FUNCTION_ZERO {

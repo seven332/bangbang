@@ -1532,11 +1532,12 @@ device owner must define its own retry and teardown policy. The modern
 virtio-pci transport does not blindly retry an ambiguous host send; its
 spec-defined masking path retains pending state for later unmask delivery.
 Current signed coverage separately proves raw host-to-vCPU delivery,
-pinned-Linux GICv2m discovery, identity-only PCI enumeration, and standard
-virtio-rng use of independently programmed queue/configuration MSI-X vectors.
-It does not prove interrupt remapping, production product-device transport, or
-Firecracker's KVM ITS behavior. MSI-bearing GIC metadata is rejected by the
-native-v1 snapshot profile rather than silently omitted.
+pinned-Linux GICv2m discovery, identity-only PCI enumeration, standard
+virtio-rng use of independently programmed queue/configuration MSI-X vectors,
+and hidden static block, network/MMDS, and pmem endpoints using exact per-device
+registries. It does not prove interrupt remapping, public product-device PCI
+selection, or Firecracker's KVM ITS behavior. MSI-bearing GIC metadata is
+rejected by the native-v1 snapshot profile rather than silently omitted.
 
 ## Internal PCI Ownership Boundary
 
@@ -1558,18 +1559,23 @@ redacted from capability `Debug` output.
 
 The identity-only `[0042:0000]` endpoint remains a pinned mock. A separate
 validation mode publishes `[1af4:1044]` behind a single exact 512-KiB BAR and
-two device-owned GICv2m vectors. PCI configuration, BAR publication, MSI-X
-routing, and the virtio device share one ordered endpoint lifecycle: teardown
-first removes the exact MMIO/function registrations, then closes and drains
-device work, revokes message routes, and releases BAR and vector leases. Signed
-teardown proves stale rejection and exact slot, BAR, and vector reuse,
-preventing an old endpoint from signaling or unpublishing its successor.
+two device-owned GICv2m vectors. A hidden data mode publishes canonical block,
+network, and pmem devices only after the complete slot/BAR/route demand passes,
+allocates no data legacy SPIs, and exposes no simultaneous data MMIO/FDT nodes.
+PCI configuration, BAR publication, MSI-X routing, and each virtio device share
+one ordered endpoint lifecycle: reverse teardown first removes the exact
+MMIO/function registrations, then closes and drains device work, revokes
+message routes, and releases BAR and vector leases. Signed teardown plus the
+lower-level reuse gate prevent an old endpoint from signaling or unpublishing
+its successor. The PCI MMDS proof uses only process-local runtime packet state
+and opens no vmnet resource or extra host authority.
 
-The endpoint's deterministic entropy source and diagnostic view exist only for
-the signed conformance harness. They grant no arbitrary host resource authority
-and establish no public product I/O, hotplug, attach/delete, or snapshot
-contract. Native-v1 treats any PCI validation resources as an unsupported
-inventory rather than persisting or silently dropping them.
+The deterministic entropy source, hidden data selector, and redacted diagnostic
+views exist only for the signed conformance harness. They grant no arbitrary
+host resource authority and establish no public PCI selection, hotplug,
+attach/delete, or snapshot contract. Native-v1 treats any PCI validation
+resources as an unsupported inventory rather than persisting or silently
+dropping them.
 
 ## HVF Entitlements
 

@@ -46,11 +46,17 @@ an atomically owned MMIO lease, and emits a generic ECAM FDT host. The pinned
 Linux gates enumerate the fixed `[8086:0d57]` host bridge, an identity-only
 `[0042:0000]` test endpoint from Firecracker's pinned PCI mock, and—under a
 separate internal mode—a standard non-transitional `[1af4:1044]` virtio-rng
-endpoint. That endpoint exercises Firecracker-shaped modern capability/BAR
-layout, deterministic guest I/O, and distinct queue/config MSI-X vectors through
-GICv2m, followed by checked teardown and resource reuse. Default process startup
-remains byte-for-byte PCI-free: there is no public flag or API path, product
-device adapter, runtime attach/delete, hotplug, or PCI snapshot state yet.
+endpoint. A second hidden conformance mode attaches the configured block,
+network, and pmem devices as `[1af4:1042]`, `[1af4:1041]`, and `[1af4:105b]`
+in stable block/network/pmem order. Those endpoints reuse each device's canonical
+runtime state, preflight the complete slot/BAR/MSI-X demand, omit their legacy
+SPI and virtio-MMIO/FDT publication, preserve limiter/metrics/flush and MMDS-only
+packet behavior, and tear down in reverse order before VM destruction. Signed
+Linux gates prove block read/write/`fsync`, pmem read/write/flush, and an
+authority-free MMDS request/response over independently programmed queue and
+configuration MSI-X vectors. Default process startup remains byte-for-byte
+PCI-free: there is no public flag or API path, runtime attach/delete, hotplug,
+or PCI snapshot state yet, and `--enable-pci` remains a tested rejection.
 
 ## Layout
 

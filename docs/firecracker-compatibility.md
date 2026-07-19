@@ -125,7 +125,7 @@ unmapping or destroying VM-owned resources.
 
 This foundation is not Firecracker's KVM-backed GICv3 ITS implementation. It
 adds no public API or CLI control and no interrupt remapping. Its MSI-X use is
-confined to the validation-only modern virtio-pci endpoint described below. It
+confined to the validation-only modern virtio-pci endpoints described below. It
 is also outside the accepted native-v1 snapshot profile, which rejects
 MSI-bearing GIC metadata. The capability inventory is therefore not promoted
 by this internal foundation alone.
@@ -138,7 +138,9 @@ host bridge, and devices 1 through 31 use deterministic, generation-bound slot
 leases. One signed gate installs the identity-only `[0042:0000]` endpoint from
 Firecracker's pinned PCI mock at `0000:00:01.0`; a separate mode publishes a
 standard modern non-transitional virtio-rng endpoint as `[1af4:1044]` at the
-same deterministic slot.
+same deterministic slot. A second hidden mode publishes configured block,
+network, and pmem devices as `[1af4:1042]`, `[1af4:1041]`, and `[1af4:105b]`
+in stable class order after preflighting the complete endpoint and MSI-X demand.
 
 The arm64 plan reserves the full Firecracker configuration aperture at
 `0x70000000..0x80000000`, publishes only the bus-0 1 MiB ECAM window, uses
@@ -164,20 +166,27 @@ capability BAR with common, ISR, device, notification, PCI-config, MSI-X table,
 and PBA regions. It supports checked capability chaining, guest feature and
 queue programming, notification decoding, ISR semantics, arbitrary guest
 MSI-X address/data programming constrained by the device registry, masking and
-pending-bit delivery, and ordered publication/teardown. Existing block,
-network, balloon, rng, pmem, memory-hotplug, and vsock devices emit the same
-transport-neutral queue/config intents while their production attachment
-remains virtio-MMIO.
+pending-bit delivery, and ordered publication/teardown. Block, network, and
+pmem now have typed internal PCI adapters over the same canonical device state;
+the hidden selector suppresses only those legacy SPI/MMIO/FDT registrations and
+retains their host adapters, limiter retries, metrics, and flush semantics.
+The authority-free MMDS packet path is runtime-owned and shared by the public
+MMIO process path and the PCI conformance harness. Other devices and all public
+production attachment remain virtio-MMIO.
 
 The signed Linux conformance gate binds the standard `virtio_rng` driver,
 programs distinct queue and configuration MSI-X vectors, consumes deterministic
-bytes through `/dev/hwrng`, and observes both vectors independently. It then
-unpublishes the function and BAR, rejects the stale endpoint, and proves exact
-slot, BAR, and GICv2m vector reuse. This is internal transport evidence, not a
-public device claim. No process flag, HTTP action, product virtio-pci adapter,
-runtime attach/delete, guest rescan/removal protocol, hotplug, or snapshot
-persistence reaches production, so the public capability inventory and the
-existing `--enable-pci` rejection do not change.
+bytes through `/dev/hwrng`, and observes both vectors independently. Additional
+signed gates perform block read/write/`fsync`, pmem read/write/flush, and MMDS
+request/response through static modern endpoints, require stable PCI identities
+and distinct queue/configuration MSI-X vectors, and prove the data classes have
+no simultaneous virtio-MMIO publication. Teardown unpublishes in reverse order
+before VM destruction; the lower-level endpoint gate also rejects stale state
+and proves exact slot, BAR, and GICv2m vector reuse. This is internal transport
+evidence, not a public device claim. No process flag, HTTP action, runtime
+attach/delete, guest rescan/removal protocol, hotplug, or snapshot persistence
+reaches production, so the public capability inventory and the existing
+`--enable-pci` rejection do not change.
 
 ## Internal PSCI Power Sessions
 

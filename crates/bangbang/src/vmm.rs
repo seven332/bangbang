@@ -91,12 +91,12 @@ use bangbang_runtime::snapshot_memory::{
     SnapshotMemoryIoStage, SnapshotMemoryWriteError, write_snapshot_memory_image_with_cancel,
 };
 use bangbang_runtime::startup::{
-    Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
-    Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootPmemDevice,
-    VmStartupResources, balloon_hinting_status_for_device, balloon_stats_for_device,
-    start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
-    update_balloon_config_for_device, update_balloon_statistics_for_device,
-    update_block_device_for_devices_with_opened,
+    Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice,
+    Arm64BootNetworkInterface, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
+    Arm64BootNetworkPacketIoProvider, Arm64BootPmemDevice, VmStartupResources,
+    balloon_hinting_status_for_device, balloon_stats_for_device, start_balloon_hinting_for_device,
+    stop_balloon_hinting_for_device, update_balloon_config_for_device,
+    update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
     update_network_interface_rate_limiters_for_devices, update_pmem_rate_limiter_for_devices,
 };
 #[cfg(target_os = "macos")]
@@ -3374,7 +3374,7 @@ pub(crate) struct NoopProcessNetworkPacketIoProvider {
 impl Arm64BootNetworkPacketIoProvider for NoopProcessNetworkPacketIoProvider {
     fn packet_io(
         &mut self,
-        _device: &Arm64BootNetworkDevice,
+        _interface: Arm64BootNetworkInterface<'_>,
     ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
         Ok(Arm64BootNetworkPacketIo::new(
             &mut self.tx_sink,
@@ -3512,12 +3512,12 @@ impl ProcessMmdsPacketDetourConfig {
 impl Arm64BootNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
     fn packet_io(
         &mut self,
-        device: &Arm64BootNetworkDevice,
+        interface: Arm64BootNetworkInterface<'_>,
     ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
         match self {
-            Self::Noop(provider) => provider.packet_io(device),
-            Self::MmdsOnly(provider) => provider.packet_io(device),
-            Self::Vmnet(provider) => provider.packet_io(device),
+            Self::Noop(provider) => provider.packet_io(interface),
+            Self::MmdsOnly(provider) => provider.packet_io(interface),
+            Self::Vmnet(provider) => provider.packet_io(interface),
         }
     }
 }
@@ -6519,9 +6519,9 @@ mod tests {
     use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
     use bangbang_runtime::snapshot_memory::{SnapshotMemoryBinding, write_snapshot_memory_image};
     use bangbang_runtime::startup::{
-        Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
-        Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootPmemDevice,
-        VmStartupResources,
+        Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkInterface,
+        Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
+        Arm64BootPmemDevice, VmStartupResources,
     };
     use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
     use bangbang_runtime::vsock::VsockConfigInput;
@@ -8347,7 +8347,7 @@ mod tests {
         {
             let _ = self.max_steps_sender.send(max_steps.get());
             packet_io
-                .packet_io(&test_boot_network_device())
+                .packet_io(test_boot_network_device().interface())
                 .map_err(|_| FakeRunLoopError)?;
             Ok(FakeRunLoopOutcome::Terminal)
         }
@@ -8376,12 +8376,12 @@ mod tests {
     impl Arm64BootNetworkPacketIoProvider for RecordingProcessNetworkPacketIoProvider {
         fn packet_io(
             &mut self,
-            device: &Arm64BootNetworkDevice,
+            interface: Arm64BootNetworkInterface<'_>,
         ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
             self.requested_ifaces
                 .lock()
                 .expect("requested ifaces should lock")
-                .push(device.registration.iface_id().to_string());
+                .push(interface.iface_id().to_string());
             Ok(Arm64BootNetworkPacketIo::new(
                 &mut self.tx_sink,
                 &mut self.rx_source,
@@ -9421,7 +9421,7 @@ mod tests {
             }
         }
         provider
-            .packet_io(&test_boot_network_device())
+            .packet_io(test_boot_network_device().interface())
             .expect("no-op provider should return packet I/O for any device");
     }
 
@@ -9436,7 +9436,7 @@ mod tests {
                 process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
                     .expect("supported vmnet configs should build provider");
             provider
-                .packet_io(&test_boot_network_device())
+                .packet_io(test_boot_network_device().interface())
                 .expect("provider should select packet I/O by iface id");
         }
 
@@ -9535,7 +9535,7 @@ mod tests {
             }
         }
         provider
-            .packet_io(&test_boot_network_device())
+            .packet_io(test_boot_network_device().interface())
             .expect("MMDS-only provider should return packet I/O for configured device");
     }
 

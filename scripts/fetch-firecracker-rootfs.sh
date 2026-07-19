@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v41"
+direct_boot_variant="direct-boot-v44"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -426,6 +426,15 @@ write_vdb_marker() {
   write_vdb_marker_at_sector "$1" 0
 }
 
+pci_function_has_identity() {
+  function=$1
+  expected_device=$2
+  function_path="/sys/bus/pci/devices/$function"
+  vendor=$(cat "$function_path/vendor" 2>/dev/null || true)
+  device=$(cat "$function_path/device" 2>/dev/null || true)
+  [ "$vendor" = 0x1af4 ] && [ "$device" = "$expected_device" ]
+}
+
 cpu_template_report_failure() {
   emit_line BANGBANG_CPU_TEMPLATE_GUEST_CHECK_FAIL
   write_vdb_marker BANGBANG_CPU_TEMPLATE_GUEST_CHECK_FAIL
@@ -618,6 +627,16 @@ prepare_mmds_network() {
 fetch_mmds_marker() {
   if ! prepare_mmds_network BANGBANG_MMDS_FETCH_FAIL BANGBANG_MMDS_FETCH_FAIL; then
     return
+  fi
+
+  if cmdline_has bangbang.expect-pci-data=1; then
+    if ! pci_function_has_identity 0000:00:01.0 0x1042 \
+      || ! pci_function_has_identity 0000:00:02.0 0x1041; then
+      emit_line BANGBANG_PCI_NETWORK_IDENTITIES_FAIL
+      write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
+      return
+    fi
+    emit_line BANGBANG_PCI_NETWORK_IDENTITIES_OK
   fi
 
   mmds_value=$(
@@ -1283,6 +1302,16 @@ flush_writeback_block_marker() {
     return
   fi
 
+  if cmdline_has bangbang.expect-pci-data=1; then
+    if ! pci_function_has_identity 0000:00:01.0 0x1042 \
+      || ! pci_function_has_identity 0000:00:02.0 0x1042; then
+      emit_line BANGBANG_PCI_BLOCK_IDENTITIES_FAIL
+      write_vdb_marker BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL
+      return
+    fi
+    emit_line BANGBANG_PCI_BLOCK_IDENTITIES_OK
+  fi
+
   block_flush_result=$(
     python3 - <<'PY' 2>/dev/null || true
 import os
@@ -1370,6 +1399,16 @@ read_flush_pmem_marker() {
     emit_line BANGBANG_PMEM_READ_FLUSH_FAIL_NO_DEVICE
     write_vdb_marker BANGBANG_PMEM_READ_FLUSH_FAIL
     return
+  fi
+
+  if cmdline_has bangbang.expect-pci-data=1; then
+    if ! pci_function_has_identity 0000:00:01.0 0x1042 \
+      || ! pci_function_has_identity 0000:00:02.0 0x105b; then
+      emit_line BANGBANG_PCI_PMEM_IDENTITIES_FAIL
+      write_vdb_marker BANGBANG_PMEM_READ_FLUSH_FAIL
+      return
+    fi
+    emit_line BANGBANG_PCI_PMEM_IDENTITIES_OK
   fi
 
   host_marker_value=$(

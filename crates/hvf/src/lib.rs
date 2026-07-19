@@ -89,6 +89,7 @@ pub use startup::{
     HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugDeviceConfig,
     HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatch,
     HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootNetworkNotificationDispatches,
+    HvfArm64BootPciDataDeviceDiagnostics, HvfArm64BootPciDataDeviceKind, HvfArm64BootPciDataError,
     HvfArm64BootPciValidationDiagnostics, HvfArm64BootPciValidationError,
     HvfArm64BootPciValidationTeardownError, HvfArm64BootPciValidationTeardownEvidence,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,

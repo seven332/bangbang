@@ -21,6 +21,7 @@ use crate::mmio::{
 use crate::token_bucket::{
     PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
 };
+use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
@@ -28,6 +29,7 @@ use crate::virtio_mmio::{
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError, VirtioMmioTransportState,
     VirtioMmioTransportStateError,
 };
+use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
@@ -59,6 +61,7 @@ pub const VIRTIO_BLOCK_STATUS_UNSUPPORTED: u8 = 2;
 
 pub type VirtioBlockMmioHandler =
     VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice>;
+pub type VirtioBlockPciEndpoint = VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice>;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct DriveConfigInput {
@@ -4623,6 +4626,62 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockD
         }
 
         dispatch
+    }
+}
+
+impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
+    pub fn has_pending_block_queue_work(&self) -> Result<bool, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| {
+            !core
+                .queue_notifications
+                .pending_queue_notifications()
+                .is_empty()
+        })
+    }
+
+    pub fn dispatch_block_queue_notifications(
+        &self,
+        memory: &mut GuestMemory,
+    ) -> Result<
+        VirtioBlockDeviceNotificationDispatch,
+        VirtioPciDeviceOperationError<
+            VirtioBlockDeviceNotificationError,
+            VirtioBlockDeviceNotificationDispatch,
+        >,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let drained_notifications =
+                    core.queue_notifications.take_pending_queue_notifications();
+                let dispatch = core
+                    .activation
+                    .dispatch_drained_queue_notifications(memory, drained_notifications);
+                let needs_queue_interrupt = match &dispatch {
+                    Ok(dispatch) => dispatch.needs_queue_interrupt(),
+                    Err(error) => error
+                        .completed_dispatch()
+                        .is_some_and(VirtioBlockQueueDispatch::needs_queue_interrupt),
+                };
+                if needs_queue_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let endpoint = work.drain_interrupt_intents();
+        VirtioPciDeviceOperationError::combine(dispatch, endpoint)
+    }
+
+    pub fn update_block_rate_limiter(
+        &self,
+        rate_limiter: DriveRateLimiterConfig,
+    ) -> Result<(), VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| core.activation.update_rate_limiter(rate_limiter))
     }
 }
 

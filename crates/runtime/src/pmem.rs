@@ -24,12 +24,14 @@ use crate::mmio::{
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
 use crate::token_bucket::{TokenBucket, TokenBucketConfig};
+use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
     VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
+use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
@@ -50,6 +52,7 @@ pub const VIRTIO_PMEM_STATUS_SUCCESS: i32 = 0;
 pub const VIRTIO_PMEM_STATUS_FAILURE: i32 = -1;
 
 pub type VirtioPmemMmioHandler = VirtioMmioRegisterHandler<VirtioPmemConfigSpace, VirtioPmemDevice>;
+pub type VirtioPmemPciEndpoint = VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VirtioPmemConfigSpace {
@@ -1044,6 +1047,69 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioPmemDe
         }
 
         dispatch
+    }
+}
+
+impl VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice> {
+    pub fn update_pmem_rate_limiter(
+        &self,
+        update: &PmemUpdate,
+    ) -> Result<bool, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| {
+            core.activation
+                .update_rate_limiter_at(update, Instant::now())
+        })
+    }
+
+    pub fn has_pending_pmem_queue_work(&self) -> Result<bool, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| {
+            !core
+                .queue_notifications
+                .pending_queue_notifications()
+                .is_empty()
+                || core.activation.has_pending_rate_limited_queue()
+        })
+    }
+
+    pub fn dispatch_pmem_queue_notifications(
+        &self,
+        memory: &mut GuestMemory,
+        flush: &mut impl FnMut() -> VirtioPmemFlushStatus,
+    ) -> Result<
+        VirtioPmemDeviceNotificationDispatch,
+        VirtioPciDeviceOperationError<
+            VirtioPmemDeviceNotificationError,
+            VirtioPmemDeviceNotificationDispatch,
+        >,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let drained_notifications =
+                    core.queue_notifications.take_pending_queue_notifications();
+                let dispatch = core.activation.dispatch_drained_queue_notifications(
+                    memory,
+                    drained_notifications,
+                    flush,
+                );
+                let needs_queue_interrupt = match &dispatch {
+                    Ok(dispatch) => dispatch.needs_queue_interrupt(),
+                    Err(error) => error
+                        .completed_dispatch()
+                        .is_some_and(VirtioPmemQueueDispatch::needs_queue_interrupt),
+                };
+                if needs_queue_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let endpoint = work.drain_interrupt_intents();
+        VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 }
 

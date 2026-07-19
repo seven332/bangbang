@@ -16,6 +16,8 @@ pub mod memory_hotplug;
 pub mod message_interrupt;
 pub mod metrics;
 pub mod mmds;
+#[doc(hidden)]
+pub mod mmds_network;
 pub mod mmio;
 pub mod network;
 pub(crate) mod output_file;
