@@ -897,13 +897,6 @@ fn executable_maps_firecracker_fatal_signals_to_exit_codes() {
 #[test]
 fn executable_rejects_unsupported_firecracker_process_flags_before_socket_publication() {
     let cases: &[(&str, &str, &[&str], &[&str])] = &[
-        ("enable-pci", "enable-pci", &["--enable-pci"], &[]),
-        (
-            "enable-pci-attached",
-            "enable-pci",
-            &["--enable-pci=secret-enable-pci-value"],
-            &["secret-enable-pci-value"],
-        ),
         ("no-seccomp", "no-seccomp", &["--no-seccomp"], &[]),
         (
             "no-seccomp-attached",
@@ -1014,6 +1007,49 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
             "unsupported {case_name} must fail before publishing the API socket"
         );
     }
+}
+
+#[test]
+fn executable_rejects_attached_enable_pci_value_before_socket_publication() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("enable-pci-attached.socket");
+    let instance_id = test_dir.instance_id();
+    let private_value = "secret-enable-pci-value";
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--enable-pci=secret-enable-pci-value"],
+    );
+
+    assert_eq!(output.status.code(), Some(ARGUMENT_PARSING_EXIT_CODE));
+    assert_eq!(
+        output.stderr,
+        "bangbang: unsupported argument syntax for --enable-pci; use --enable-pci\n"
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.contains(private_value));
+    assert!(!socket_path.exists());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn executable_accepts_enable_pci_after_host_preflight() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("enable-pci.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang =
+        BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / with PCI enabled");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / with PCI enabled",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "PCI-enabled bangbang");
 }
 
 #[test]

@@ -264,7 +264,7 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
         if vector_count > VIRTIO_PCI_MAX_MSIX_VECTORS {
             return Err(VirtioPciEndpointError::TooManyVectors { vector_count });
         }
-        if messages.route_count() != vector_count {
+        if messages.route_count() < vector_count {
             return Err(VirtioPciEndpointError::MessageRouteCount {
                 expected: vector_count,
                 actual: messages.route_count(),
@@ -2314,7 +2314,7 @@ impl fmt::Display for VirtioPciEndpointError {
             ),
             Self::MessageRouteCount { expected, actual } => write!(
                 f,
-                "virtio-pci message route count {actual} does not match required vector count {expected}"
+                "virtio-pci message route count {actual} is smaller than required vector count {expected}"
             ),
             Self::CapabilityBarSize { expected, actual } => write!(
                 f,
@@ -2854,6 +2854,18 @@ mod tests {
                 actual: 1
             })
         ));
+        assert!(
+            VirtioPciEndpoint::new(
+                identity,
+                &[8],
+                UnsupportedVirtioDeviceConfig,
+                NoopVirtioDeviceActivation,
+                false,
+                &bar,
+                registry_resources(3).registry(),
+            )
+            .is_ok()
+        );
         assert!(matches!(
             VirtioPciEndpoint::new(
                 identity,

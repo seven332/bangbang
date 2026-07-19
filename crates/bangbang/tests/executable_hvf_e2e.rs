@@ -47,6 +47,8 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_ENTROPY_MARKER: &[u8] = b"BANGBANG_ENTROPY_GUEST_READ_OK";
     const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
     const DIRECT_ROOTFS_PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
+    const DIRECT_ROOTFS_PCI_ALL_VIRTIO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.pci-all-virtio=1";
+    const DIRECT_ROOTFS_PCI_ALL_VIRTIO_MARKER: &[u8] = b"BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK";
     const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
     const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
     const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
@@ -147,6 +149,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
     const DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-multistream=1";
     const GUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+    const PCI_ALL_VIRTIO_GUEST_TIMEOUT: Duration = Duration::from_secs(90);
     const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
     const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
     const SNAPSHOT_GUEST_UART_ADDRESS: u64 = 0x4000_2000;
@@ -2785,6 +2788,319 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang entropy direct rootfs",
+        );
+    }
+
+    #[test]
+    fn signed_executable_runs_all_startup_virtio_devices_over_product_pci() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let data_backing_path = test_dir.path().join("data.img");
+        let pmem_backing_path = test_dir.path().join("pmem.img");
+        let serial_output_path = test_dir.path().join("serial.out");
+        let metrics_path = test_dir.path().join("metrics.out");
+        let uds_path = test_dir.path().join("pci-vsock.sock");
+        let host_port_path = vsock_port_path(&uds_path, DIRECT_ROOTFS_VSOCK_PORT);
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&data_backing_path);
+        create_pmem_backing(&pmem_backing_path, PMEM_HOST_MARKER);
+        let host_listener = UnixListener::bind(&host_port_path).unwrap_or_else(|err| {
+            panic!(
+                "product PCI vsock listener should bind before guest startup: {:?}",
+                err.kind()
+            )
+        });
+        host_listener
+            .set_nonblocking(true)
+            .expect("product PCI vsock listener should be nonblocking");
+
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
+
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT /machine-config product PCI",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/balloon",
+                r#"{"amount_mib":8,"deflate_on_oom":false,"free_page_hinting":true,"free_page_reporting":true}"#,
+            ),
+            "PUT /balloon product PCI",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/hotplug/memory",
+                r#"{"total_size_mib":128,"block_size_mib":2,"slot_size_mib":128}"#,
+            ),
+            "PUT /hotplug/memory product PCI",
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/entropy", "{}"),
+            "PUT /entropy product PCI",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:01"}"#,
+            ),
+            "PUT /network-interfaces/eth0 product PCI",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/mmds/config",
+                r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
+            ),
+            "PUT /mmds/config product PCI",
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/mmds", DIRECT_ROOTFS_MMDS_CONTENT),
+            "PUT /mmds product PCI",
+        );
+        let metrics_body = format!(
+            r#"{{"metrics_path":{}}}"#,
+            json_string(path_text(&metrics_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/metrics", &metrics_body),
+            "PUT /metrics product PCI",
+        );
+        let serial_body = format!(
+            r#"{{"serial_out_path":{}}}"#,
+            json_string(path_text(&serial_output_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/serial", &serial_body),
+            "PUT /serial product PCI",
+        );
+
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(DIRECT_ROOTFS_PCI_ALL_VIRTIO_BOOT_ARGS),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/boot-source", &boot_body),
+            "PUT /boot-source product PCI",
+        );
+
+        let rootfs_body = format!(
+            r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+            json_string(path_text(&rootfs_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/rootfs", &rootfs_body),
+            "PUT /drives/rootfs product PCI",
+        );
+        let data_body = format!(
+            r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+            json_string(path_text(&data_backing_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/data", &data_body),
+            "PUT /drives/data product PCI",
+        );
+        let pmem_body = format!(
+            r#"{{"id":"pmem0","path_on_host":{},"read_only":false}}"#,
+            json_string(path_text(&pmem_backing_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/pmem/pmem0", &pmem_body),
+            "PUT /pmem/pmem0 product PCI",
+        );
+        let vsock_body = format!(
+            r#"{{"guest_cid":3,"uds_path":{}}}"#,
+            json_string(path_text(&uds_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/vsock", &vsock_body),
+            "PUT /vsock product PCI",
+        );
+
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "PUT /actions InstanceStart product PCI",
+        );
+        let running = http_get(&socket_path, "/");
+        assert_ok_response(&running, "GET / after product PCI InstanceStart");
+        assert_response_contains(
+            &running,
+            r#""state":"Running""#,
+            "GET / after product PCI InstanceStart",
+        );
+
+        let mut host_stream = match wait_for_unix_listener_accept(
+            &host_listener,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            Ok(stream) => stream,
+            Err(err) => {
+                let metrics_flush = http_put_json(
+                    &socket_path,
+                    "/actions",
+                    r#"{"action_type":"FlushMetrics"}"#,
+                );
+                let metrics = file_tail_lossy(&metrics_path, 16 * 1024);
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let serial_tail = file_tail_lossy(&serial_output_path, 16 * 1024);
+                let output = bangbang.force_stop_and_collect();
+                let stdout_tail = text_tail_lossy(&output.stdout, 16 * 1024);
+                let stderr_tail = text_tail_lossy(&output.stderr, 16 * 1024);
+                panic!(
+                    "product PCI guest did not initiate vsock I/O: {err}; metrics flush: {metrics_flush:?}; metrics tail:\n{metrics}\nbacking prefix: {backing_prefix:?}; serial tail:\n{serial_tail}\nstatus: {:?}\nstdout tail:\n{stdout_tail}\nstderr tail:\n{stderr_tail}",
+                    output.status,
+                );
+            }
+        };
+        drop(host_listener);
+        host_stream
+            .set_nonblocking(false)
+            .expect("product PCI vsock stream should be blocking");
+        host_stream
+            .set_read_timeout(Some(PCI_ALL_VIRTIO_GUEST_TIMEOUT))
+            .expect("product PCI vsock read timeout should set");
+        host_stream
+            .set_write_timeout(Some(PCI_ALL_VIRTIO_GUEST_TIMEOUT))
+            .expect("product PCI vsock write timeout should set");
+        assert_eq!(
+            read_and_verify_deterministic_vsock_stream(
+                &mut host_stream,
+                DIRECT_ROOTFS_VSOCK_GUEST_STREAM_SEED,
+            )
+            .expect("product PCI guest-to-host vsock stream should verify"),
+            DIRECT_ROOTFS_VSOCK_STREAM_BYTES
+        );
+        assert_eq!(
+            write_deterministic_vsock_stream(
+                &mut host_stream,
+                DIRECT_ROOTFS_VSOCK_HOST_STREAM_SEED,
+            )
+            .expect("product PCI host-to-guest vsock stream should write"),
+            DIRECT_ROOTFS_VSOCK_STREAM_BYTES
+        );
+        shutdown_unix_stream_write(&host_stream)
+            .expect("product PCI host vsock write half should close");
+        read_unix_stream_eof(&mut host_stream)
+            .expect("product PCI guest should close its vsock stream");
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_MEMORY_HOTPLUG_READY_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "product PCI virtio-mem did not become ready: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":128}"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            ),
+            "PATCH /hotplug/memory grow product PCI",
+        );
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_MEMORY_HOTPLUG_GROWN_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "product PCI virtio-mem did not grow: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":0}"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            ),
+            "PATCH /hotplug/memory shrink product PCI",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_PCI_ALL_VIRTIO_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "product PCI guest did not complete all-class interrupt/I/O checks: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_eq!(
+            file_bytes_at(
+                &pmem_backing_path,
+                PMEM_GUEST_FLUSH_OFFSET,
+                PMEM_GUEST_FLUSH_MARKER.len(),
+            ),
+            PMEM_GUEST_FLUSH_MARKER,
+            "product PCI pmem flush should persist the guest marker"
+        );
+        wait_for_nonzero_balloon_actual_pages(&socket_path, PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("product PCI balloon should inflate through queue interrupts");
+
+        assert_no_content_response(
+            &http_json(
+                &socket_path,
+                "PATCH",
+                "/drives/data",
+                r#"{"drive_id":"data","rate_limiter":{"ops":{"size":2,"one_time_burst":1,"refill_time":100}}}"#,
+            ),
+            "PATCH /drives/data product PCI",
+        );
+        assert_no_content_response(
+            &http_json(
+                &socket_path,
+                "PATCH",
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth0","rx_rate_limiter":{"ops":{"size":2,"one_time_burst":1,"refill_time":100}}}"#,
+            ),
+            "PATCH /network-interfaces/eth0 product PCI",
+        );
+        assert_no_content_response(
+            &http_json(
+                &socket_path,
+                "PATCH",
+                "/pmem/pmem0",
+                r#"{"id":"pmem0","rate_limiter":{"ops":{"size":2,"one_time_burst":1,"refill_time":100}}}"#,
+            ),
+            "PATCH /pmem/pmem0 product PCI",
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang all-virtio product PCI",
+        );
+        assert!(
+            !uds_path.exists(),
+            "product PCI shutdown should remove the owned main vsock listener"
         );
     }
 
@@ -7008,6 +7324,19 @@ mod macos_arm64 {
             Ok(bytes) => String::from_utf8_lossy(&bytes[..bytes.len().min(len)]).into_owned(),
             Err(err) => format!("failed to read {}: {err}", path.display()),
         }
+    }
+
+    fn file_tail_lossy(path: &Path, len: usize) -> String {
+        match fs::read(path) {
+            Ok(bytes) => {
+                String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(len)..]).into_owned()
+            }
+            Err(err) => format!("failed to read {}: {err}", path.display()),
+        }
+    }
+
+    fn text_tail_lossy(text: &str, len: usize) -> String {
+        String::from_utf8_lossy(&text.as_bytes()[text.len().saturating_sub(len)..]).into_owned()
     }
 
     #[derive(Debug)]

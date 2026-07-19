@@ -10,12 +10,14 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
 };
+use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
     VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
+use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
@@ -493,6 +495,11 @@ impl PreparedVirtioMemDevice {
 
     pub const fn config_space(self) -> VirtioMemConfigSpace {
         self.config_space
+    }
+
+    #[doc(hidden)]
+    pub const fn into_parts(self) -> (VirtioMemConfigSpace, VirtioMemDevice) {
+        (self.config_space, VirtioMemDevice::new())
     }
 
     pub fn register_mmio(
@@ -2479,6 +2486,77 @@ impl VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice> {
         self.mark_config_interrupt_pending();
 
         Ok(())
+    }
+}
+
+impl VirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice> {
+    pub fn dispatch_mem_queue_notifications_with_executor(
+        &self,
+        memory: &mut GuestMemory,
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
+    ) -> Result<
+        VirtioMemDeviceNotificationDispatch,
+        VirtioPciDeviceOperationError<
+            VirtioMemDeviceNotificationError,
+            VirtioMemDeviceNotificationDispatch,
+        >,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let drained_notifications =
+                    core.queue_notifications.take_pending_queue_notifications();
+                let previous_config_space = core.device_config;
+                let dispatch = core
+                    .activation
+                    .dispatch_drained_queue_notifications_with_executor(
+                        memory,
+                        &mut core.device_config,
+                        drained_notifications,
+                        mutation_executor,
+                    );
+                if core.device_config != previous_config_space {
+                    core.device.increment_config_generation();
+                }
+                let needs_queue_interrupt = match &dispatch {
+                    Ok(dispatch) => dispatch.needs_queue_interrupt(),
+                    Err(error) => error
+                        .completed_dispatch()
+                        .is_some_and(VirtioMemQueueDispatch::needs_queue_interrupt),
+                };
+                if needs_queue_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        VirtioPciDeviceOperationError::combine(dispatch, work.drain_interrupt_intents())
+    }
+
+    pub fn update_mem_requested_size(
+        &self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), VirtioPciDeviceOperationError<MemoryHotplugUpdateError, ()>> {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let result = work
+            .with_core_mut(|core| {
+                let config_space = core.device_config.updated_requested_size(update)?;
+                core.device_config = config_space;
+                core.device.increment_config_generation();
+                core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
+                Ok(())
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        VirtioPciDeviceOperationError::combine(result, work.drain_interrupt_intents())
+    }
+
+    pub fn plugged_size(&self) -> Result<u64, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| core.device_config.plugged_size())
     }
 }
 

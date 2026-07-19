@@ -7,12 +7,14 @@ use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
 };
 use crate::token_bucket::{TokenBucket, TokenBucketConfig, TokenBucketSnapshot};
+use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     UnsupportedVirtioMmioDeviceConfig, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
     VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
     VirtioMmioQueueRegisterError, VirtioMmioQueueState, VirtioMmioRegisterHandler,
     VirtioMmioRegisterHandlerError,
 };
+use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
@@ -187,6 +189,11 @@ impl PreparedEntropyDevice {
 
     pub fn into_device(self) -> VirtioRngDevice {
         self.device
+    }
+
+    #[doc(hidden)]
+    pub fn into_parts(self) -> (UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice) {
+        (UnsupportedVirtioMmioDeviceConfig, self.device)
     }
 
     pub fn register_mmio(
@@ -901,6 +908,62 @@ impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevic
         }
 
         dispatch
+    }
+}
+
+impl VirtioPciEndpoint<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice> {
+    pub fn has_pending_rng_queue_work(&self) -> Result<bool, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| {
+            !core
+                .queue_notifications
+                .pending_queue_notifications()
+                .is_empty()
+                || core.activation.has_pending_rate_limited_queue()
+        })
+    }
+
+    pub fn dispatch_rng_queue_notifications(
+        &self,
+        memory: &mut GuestMemory,
+        entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+    ) -> Result<
+        VirtioRngDeviceNotificationDispatch,
+        VirtioPciDeviceOperationError<
+            VirtioRngDeviceNotificationError,
+            VirtioRngDeviceNotificationDispatch,
+        >,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let mut drained_notifications =
+                    core.queue_notifications.take_pending_queue_notifications();
+                if drained_notifications.is_empty()
+                    && core.activation.has_pending_rate_limited_queue()
+                {
+                    drained_notifications.push(VIRTIO_RNG_QUEUE_INDEX_USIZE);
+                }
+                let dispatch = core.activation.dispatch_drained_queue_notifications(
+                    memory,
+                    drained_notifications,
+                    entropy_source,
+                );
+                let needs_queue_interrupt = match &dispatch {
+                    Ok(dispatch) => dispatch.needs_queue_interrupt(),
+                    Err(error) => error
+                        .completed_dispatch()
+                        .is_some_and(VirtioRngQueueDispatch::needs_queue_interrupt),
+                };
+                if needs_queue_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        VirtioPciDeviceOperationError::combine(dispatch, work.drain_interrupt_intents())
     }
 }
 

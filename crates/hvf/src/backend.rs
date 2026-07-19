@@ -67,6 +67,22 @@ impl HvfBackend {
         cfg!(all(target_os = "macos", target_arch = "aarch64"))
     }
 
+    /// Validates fixed target and framework capabilities required by PCI/MSI.
+    pub fn validate_pci_support() -> Result<(), BackendError> {
+        if !Self::is_supported_target() {
+            return Err(BackendError::Unsupported(
+                crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+            ));
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            crate::gic::validate_real_gic_msi_support()
+                .map_err(|source| BackendError::Hypervisor(source.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub fn map_guest_memory(
         &mut self,
         memory: GuestMemory,

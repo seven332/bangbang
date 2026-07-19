@@ -22,17 +22,18 @@ path.
 - Create is paused-state-only and supports only `Full` for one vCPU, exactly
   one regular read-only root drive, default serial, and no optional devices or
   MMDS. Unsupported modes and profiles fail before artifact or capture work.
-- The optional internal GICv2m foundation is outside native-v1. Capture and
-  load validation reject MSI-bearing GIC metadata; the frame, reserved range,
-  allocator state, and any delivered or in-flight message are not persisted or
-  inferred during restore.
-- The validation-only PCI segment is also outside native-v1. Capture rejects
-  its retained ECAM owner/lease, segment/function lease, and any modern
-  virtio-pci endpoint rather than omitting them. No slot, BAR, capability/common
-  configuration, queue selection, MSI-X table/PBA/vector, pending-message,
-  endpoint lifecycle, or guest discovery state is serialized or reconstructed
-  on load. This includes the hidden static block, network, and pmem PCI
-  endpoints and their retained device/host-adapter state. The validation
+- The GICv2m foundation selected by `--enable-pci` is outside native-v1. The
+  immutable process profile rejects PCI create before pause/capture/artifact
+  work and rejects PCI load before file/grant/controller/VM mutation. The
+  frame, reserved range, shared registry/allocator state, and any delivered or
+  in-flight message are not persisted or inferred during restore. Default MMIO
+  create/load behavior is unchanged.
+- PCI endpoint state is likewise outside native-v1. No ECAM owner/lease,
+  segment/function lease, slot, BAR, capability/common configuration, queue
+  selection, MSI-X table/PBA/vector, pending message, endpoint lifecycle, or
+  guest discovery state is serialized or reconstructed. This covers product
+  balloon, block, network, pmem, vsock, entropy, and virtio-mem functions as
+  well as focused hidden endpoints and their host-adapter state. Signed
   teardown/reuse proofs are not a snapshot schema or restore contract.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
@@ -976,12 +977,12 @@ some of the required state:
   and SPI state access and interrupt injection primitives. They also expose a
   retained state object whose stable, versioned opaque bytes cover the GIC
   device except separately captured CPU system registers.
-  The implemented internal MSI foundation configures HVF's GICM region as a
-  Linux GICv2m frame and exposes a range-bound send capability, but it does not
-  add device state, delivery rollback, or portable migration semantics. The
-  validation-only PCI segment can bind its generic ECAM FDT host to that frame,
-  but its leases and configuration state likewise have no snapshot schema or
-  restore path.
+  The implemented PCI MSI foundation configures HVF's GICM region as a Linux
+  GICv2m frame and exposes a range-bound send capability, but it does not add
+  delivery rollback or portable migration semantics. Product PCI binds its
+  generic ECAM FDT host to that frame; its shared routes, leases, MSI-X tables,
+  and function/device state deliberately have no native-v1 schema or restore
+  path.
 
 The inspected headers do not expose a KVM-style dirty log or dirty-page tracking
 API, so Firecracker-style diff snapshot parity is not a direct HVF API mapping.

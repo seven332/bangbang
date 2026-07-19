@@ -4676,6 +4676,33 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 
+    pub fn update_block_device_with_opened(
+        &self,
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+    ) -> Result<(), VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        let backing_changed = backing.is_some();
+        work.with_core_mut(|core| {
+            if let Some(backing) = backing {
+                let config_space =
+                    VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
+                core.activation.refresh_backing(backing);
+                core.device_config = config_space;
+                core.device.increment_config_generation();
+                core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
+            }
+            if let Some(rate_limiter) = rate_limiter_update {
+                core.activation.update_rate_limiter(rate_limiter);
+            }
+        })?;
+        if backing_changed {
+            work.drain_interrupt_intents()?;
+        }
+        Ok(())
+    }
+
     pub fn update_block_rate_limiter(
         &self,
         rate_limiter: DriveRateLimiterConfig,

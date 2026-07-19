@@ -11,12 +11,14 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
 };
+use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
     VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
+use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
@@ -4282,6 +4284,190 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
     }
 }
 
+impl VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
+    pub fn dispatch_balloon_queue_notifications(
+        &self,
+        memory: &mut GuestMemory,
+    ) -> Result<
+        VirtioBalloonDeviceNotificationDispatch,
+        VirtioPciDeviceOperationError<
+            VirtioBalloonDeviceNotificationError,
+            VirtioBalloonDeviceNotificationDispatch,
+        >,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let drained_notifications =
+                    core.queue_notifications.take_pending_queue_notifications();
+                let dispatch = core
+                    .activation
+                    .dispatch_drained_queue_notifications(memory, drained_notifications);
+                let queue_layout = core.activation.queue_layout();
+                for queue_index in balloon_queue_interrupts(&dispatch, queue_layout) {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index });
+                }
+                let hinting_completed_run = match &dispatch {
+                    Ok(dispatch) => dispatch.hinting_completed_run(),
+                    Err(error) => error.completed_notification_dispatch().is_some_and(
+                        VirtioBalloonDeviceNotificationDispatch::hinting_completed_run,
+                    ),
+                };
+                if hinting_completed_run
+                    && let Some(cmd_id) = core.activation.acknowledge_completed_hinting_run()
+                {
+                    core.device_config = core.device_config.with_free_page_hint_cmd_id(cmd_id);
+                    core.device.increment_config_generation();
+                    core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let endpoint = work.drain_interrupt_intents();
+        VirtioPciDeviceOperationError::combine(dispatch, endpoint)
+    }
+
+    pub fn trigger_balloon_statistics_update(
+        &self,
+        memory: &mut GuestMemory,
+    ) -> Result<
+        VirtioBalloonDeviceNotificationDispatch,
+        VirtioPciDeviceOperationError<
+            VirtioBalloonDeviceNotificationError,
+            VirtioBalloonDeviceNotificationDispatch,
+        >,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let dispatch = core.activation.trigger_statistics_update(memory);
+                let needs_queue_interrupt = match &dispatch {
+                    Ok(dispatch) => dispatch.needs_queue_interrupt(),
+                    Err(error) => error.completed_notification_dispatch().is_some_and(
+                        VirtioBalloonDeviceNotificationDispatch::needs_queue_interrupt,
+                    ),
+                };
+                if needs_queue_interrupt
+                    && let Some(queue_index) = core
+                        .activation
+                        .queue_layout()
+                        .statistics()
+                        .and_then(|queue| u16::try_from(queue.index()).ok())
+                {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index });
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let endpoint = work.drain_interrupt_intents();
+        VirtioPciDeviceOperationError::combine(dispatch, endpoint)
+    }
+
+    pub fn update_balloon_config(
+        &self,
+        config: BalloonConfig,
+    ) -> Result<(), VirtioPciDeviceOperationError<BalloonUpdateError, ()>> {
+        let num_pages = mib_to_4k_pages(config.amount_mib()).map_err(|source| {
+            VirtioPciDeviceOperationError::Device(Box::new(BalloonUpdateError::PageCountOverflow(
+                source,
+            )))
+        })?;
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        work.with_core_mut(|core| {
+            core.device_config = core.device_config.with_num_pages(num_pages);
+            core.device.increment_config_generation();
+            core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
+        })
+        .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        VirtioPciDeviceOperationError::combine(Ok(()), work.drain_interrupt_intents())
+    }
+
+    pub fn update_balloon_statistics(
+        &self,
+        input: BalloonStatsUpdateInput,
+    ) -> Result<(), VirtioPciDeviceOperationError<BalloonUpdateError, ()>> {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let update = work
+            .with_core_mut(|core| core.activation.update_stats_polling_interval_s(input))
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        VirtioPciDeviceOperationError::combine(update, Ok(()))
+    }
+
+    pub fn start_balloon_hinting(
+        &self,
+        input: BalloonHintingStartInput,
+    ) -> Result<(), VirtioPciDeviceOperationError<BalloonHintingCommandError, ()>> {
+        self.update_balloon_hinting_command(|device| device.start_hinting(input))
+    }
+
+    pub fn stop_balloon_hinting(
+        &self,
+    ) -> Result<(), VirtioPciDeviceOperationError<BalloonHintingCommandError, ()>> {
+        self.update_balloon_hinting_command(VirtioBalloonDevice::stop_hinting)
+    }
+
+    fn update_balloon_hinting_command(
+        &self,
+        command: impl FnOnce(&mut VirtioBalloonDevice) -> Result<u32, BalloonHintingCommandError>,
+    ) -> Result<(), VirtioPciDeviceOperationError<BalloonHintingCommandError, ()>> {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let result = work
+            .with_core_mut(|core| {
+                let cmd_id = command(&mut core.activation)?;
+                core.device_config = core.device_config.with_free_page_hint_cmd_id(cmd_id);
+                core.device.increment_config_generation();
+                core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
+                Ok(())
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        VirtioPciDeviceOperationError::combine(result, work.drain_interrupt_intents())
+    }
+
+    pub fn balloon_stats(
+        &self,
+        config: BalloonConfig,
+    ) -> Result<BalloonStats, VirtioPciDeviceOperationError<BalloonStatsError, BalloonStats>> {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let result = work
+            .with_core_mut(|core| {
+                BalloonStats::from_config_actual_pages_and_optional_stats(
+                    config,
+                    core.activation.memory_accounting().inflated_page_count(),
+                    core.activation.statistics(),
+                )
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        VirtioPciDeviceOperationError::combine(result, Ok(()))
+    }
+
+    pub fn balloon_hinting_status(
+        &self,
+    ) -> Result<
+        BalloonHintingStatus,
+        VirtioPciDeviceOperationError<BalloonHintingStatusError, BalloonHintingStatus>,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let result = work
+            .with_core_mut(|core| core.activation.hinting_status())
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        VirtioPciDeviceOperationError::combine(result, Ok(()))
+    }
+}
+
 fn balloon_queue_interrupts(
     dispatch: &Result<
         VirtioBalloonDeviceNotificationDispatch,
@@ -4770,6 +4956,26 @@ impl PreparedBalloonDevice {
 
     pub fn queue_sizes(self) -> VirtioBalloonQueueSizes {
         self.queue_layout.queue_sizes()
+    }
+
+    #[doc(hidden)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        VirtioBalloonConfigSpace,
+        u64,
+        VirtioBalloonQueueSizes,
+        VirtioBalloonDevice,
+    ) {
+        (
+            self.config_space,
+            self.available_features,
+            self.queue_sizes(),
+            VirtioBalloonDevice::with_stats_polling_interval_s(
+                self.queue_layout,
+                self.stats_polling_interval_s,
+            ),
+        )
     }
 
     pub fn register_mmio(

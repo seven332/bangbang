@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v44"
+direct_boot_variant="direct-boot-v45"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -433,6 +433,86 @@ pci_function_has_identity() {
   vendor=$(cat "$function_path/vendor" 2>/dev/null || true)
   device=$(cat "$function_path/device" 2>/dev/null || true)
   [ "$vendor" = 0x1af4 ] && [ "$device" = "$expected_device" ]
+}
+
+vdb_starts_with_marker() {
+  marker=$1
+  [ -b /dev/vdb ] || return 1
+  actual=$(dd if=/dev/vdb bs=1 count="${#marker}" 2>/dev/null || true)
+  [ "$actual" = "$marker" ]
+}
+
+pci_all_virtio_fail() {
+  reason=$1
+  marker="BANGBANG_PCI_ALL_VIRTIO_FAIL_$reason"
+  emit_line "$marker"
+  write_vdb_marker "$marker"
+}
+
+check_all_virtio_pci_marker() {
+  if cmdline_has pci=off; then
+    pci_all_virtio_fail PCI_OFF
+    return
+  fi
+
+  if ! pci_function_has_identity 0000:00:01.0 0x1045 \
+    || ! pci_function_has_identity 0000:00:02.0 0x1042 \
+    || ! pci_function_has_identity 0000:00:03.0 0x1042 \
+    || ! pci_function_has_identity 0000:00:04.0 0x1041 \
+    || ! pci_function_has_identity 0000:00:05.0 0x105b \
+    || ! pci_function_has_identity 0000:00:06.0 0x1053 \
+    || ! pci_function_has_identity 0000:00:07.0 0x1044 \
+    || ! pci_function_has_identity 0000:00:08.0 0x1058; then
+    pci_all_virtio_fail IDENTITIES
+    return
+  fi
+  emit_line BANGBANG_PCI_ALL_VIRTIO_IDENTITIES_OK
+
+  if find /sys/firmware/devicetree/base -maxdepth 1 -name 'virtio_mmio@*' 2>/dev/null \
+    | grep -q .; then
+    pci_all_virtio_fail LEGACY_MMIO
+    return
+  fi
+
+  read_entropy_marker
+  if ! vdb_starts_with_marker BANGBANG_ENTROPY_GUEST_READ_OK; then
+    pci_all_virtio_fail ENTROPY
+    return
+  fi
+
+  check_balloon_marker
+  if ! vdb_starts_with_marker BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK; then
+    pci_all_virtio_fail BALLOON
+    return
+  fi
+
+  fetch_mmds_marker
+  if ! vdb_starts_with_marker BANGBANG_MMDS_GUEST_FETCH_OK; then
+    pci_all_virtio_fail NETWORK
+    return
+  fi
+
+  read_flush_pmem_marker
+  if ! vdb_starts_with_marker BANGBANG_PMEM_READ_FLUSH_OK; then
+    pci_all_virtio_fail PMEM
+    return
+  fi
+
+  fetch_vsock_marker
+  if ! vdb_starts_with_marker BANGBANG_VSOCK_GUEST_CONNECT_OK; then
+    pci_all_virtio_fail VSOCK
+    return
+  fi
+
+  check_memory_hotplug_marker
+  if ! vdb_starts_with_marker BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK; then
+    pci_all_virtio_fail MEMORY_HOTPLUG
+    return
+  fi
+
+  write_vdb_marker BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK
+  sync /dev/vdb 2>/dev/null || sync
+  emit_line BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK
 }
 
 cpu_template_report_failure() {
@@ -2106,7 +2186,9 @@ if [ -r /proc/cmdline ]; then
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if cmdline_has bangbang.cpu-template-report=1; then
+if cmdline_has bangbang.pci-all-virtio=1; then
+  check_all_virtio_pci_marker
+elif cmdline_has bangbang.cpu-template-report=1; then
   report_cpu_template_ids
 elif cmdline_has bangbang.cache-fdt-check=1; then
   check_cache_fdt_marker

@@ -28,35 +28,28 @@ footprint reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
 
-On macOS 15 and later, the HVF backend also has an internal, explicitly
-opt-in foundation for a demand-sized public-HVF GICv2m MSI frame. It reserves
-the requested interrupt range from the top of Linux's usable GICv2m SPI domain,
-keeps the legacy SPI allocator disjoint, advertises an `arm,gic-v2m-frame` FDT
-child, and retains generation-bound device vector resources behind an exact,
-value-redacted message-routing capability. Ordinary process startup and its FDT
-remain MSI-free. This is not Firecracker's KVM ITS path and exposes no CLI or
-API switch. Signed gates prove raw delivery, pinned Firecracker Linux discovery,
-and validation-only guest-programmed MSI-X delivery; native-v1 rejects
-MSI-bearing GIC metadata.
+On macOS arm64 hosts with the required macOS 15+ HVF GIC/MSI symbols,
+`--enable-pci` selects Firecracker's exclusive all-virtio startup transport.
+Balloon, block, network, pmem, vsock, entropy, and virtio-mem functions are
+published in that order on segment 0/bus 0; serial, RTC, boot timer, GIC,
+VMGenID, and VMClock remain platform MMIO devices. Startup preflights the target,
+symbols, endpoint slots, one 512-KiB BAR per function, dispatcher regions, and
+the exact maximum queue-plus-configuration MSI-X demand before guest-visible
+publication. Linux may allocate fewer vectors than a device's maximum table, so
+each independently revocable endpoint registry resolves the complete
+generation-bound VM GICv2m pool rather than predicting per-driver subranges.
 
-An additional validation-only boot-session option composes a backend-neutral
-PCI segment-0/bus-0 foundation with that frame. It reserves Firecracker's
-configuration and 32/64-bit BAR apertures, publishes a 1 MiB ECAM window through
-an atomically owned MMIO lease, and emits a generic ECAM FDT host. The pinned
-Linux gates enumerate the fixed `[8086:0d57]` host bridge, an identity-only
-`[0042:0000]` test endpoint from Firecracker's pinned PCI mock, and—under a
-separate internal mode—a standard non-transitional `[1af4:1044]` virtio-rng
-endpoint. A second hidden conformance mode attaches the configured block,
-network, and pmem devices as `[1af4:1042]`, `[1af4:1041]`, and `[1af4:105b]`
-in stable block/network/pmem order. Those endpoints reuse each device's canonical
-runtime state, preflight the complete slot/BAR/MSI-X demand, omit their legacy
-SPI and virtio-MMIO/FDT publication, preserve limiter/metrics/flush and MMDS-only
-packet behavior, and tear down in reverse order before VM destruction. Signed
-Linux gates prove block read/write/`fsync`, pmem read/write/flush, and an
-authority-free MMDS request/response over independently programmed queue and
-configuration MSI-X vectors. Default process startup remains byte-for-byte
-PCI-free: there is no public flag or API path, runtime attach/delete, hotplug,
-or PCI snapshot state yet, and `--enable-pci` remains a tested rejection.
+PCI mode omits the VMM-supplied `pci=off`, publishes the 1-MiB generic ECAM host
+and `arm,gic-v2m-frame`, and suppresses every virtio legacy SPI/MMIO/FDT node.
+Default startup remains all-virtio-MMIO and retains `pci=off`. Signed Apple
+Silicon coverage boots pinned Firecracker Linux with all seven device classes,
+checks stable identities, and performs real block, MMDS/network, pmem, vsock,
+balloon, entropy, and virtio-mem interrupt/I/O operations. Runtime block,
+network, and pmem in-place PATCH keeps working in either startup transport;
+runtime attach/delete, guest rescan/removal, PCI snapshot persistence, external
+vmnet connectivity certification, and Firecracker's KVM ITS identity remain
+explicit limits. Native-v1 create/load rejects PCI profiles before artifact or
+VM mutation, while the default MMIO snapshot profile is unchanged.
 
 ## Layout
 
@@ -790,7 +783,7 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"guest_cid":3,"uds_path":"./v.sock"}'
 ```
 
-Virtio-vsock is an **implemented supported live virtio-MMIO/Unix-socket subset**.
+Virtio-vsock is an **implemented supported live MMIO-or-PCI startup/Unix-socket subset**.
 Repeated valid pre-boot `PUT /vsock` requests replace the stored
 configuration; post-start PUT is rejected without mutation, and there is no
 PATCH, DELETE, runtime hotplug, or broader CID-routing contract. The live path

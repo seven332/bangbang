@@ -71,14 +71,15 @@ Each capability has exactly one disposition:
 The initial inventory is deliberately conservative. Existing prose or issue
 closure does not automatically promote a record from `audit-required`.
 
-The #1352 process audit plus #1368 snapshot-description delivery promote exactly
-21 of the 29 process-family records: 19 complete argument leaves plus the
-complete CLI/readiness and signal/exit/fd/cleanup semantics. #1384 additionally
-classifies the two seccomp argument leaves as `proven-platform-impossible`.
-Two argument leaves, the snapshot-containing identity/output semantic, the
-aggregate run operation, and both broad source corpora remain `audit-required`.
-The checked [`process-contract.md`](process-contract.md) records those six
-handoffs; a partially implemented composite is not a terminal claim.
+The #1352 process audit, #1368 snapshot-description delivery, and #1419 PCI
+startup delivery promote exactly 22 of the 29 process-family records: 20
+complete argument leaves plus the complete CLI/readiness and
+signal/exit/fd/cleanup semantics. #1384 additionally classifies the two seccomp
+argument leaves as `proven-platform-impossible`. One argument leaf, the
+snapshot-containing identity/output semantic, the aggregate run operation, and
+both broad source corpora remain `audit-required`. The checked
+[`process-contract.md`](process-contract.md) records those five handoffs; a
+partially implemented composite is not a terminal claim.
 
 The #1354 production-boundary audit moves exactly three composite isolation
 records to `missing-platform-feasible` with #1351 as their delivery owner. It
